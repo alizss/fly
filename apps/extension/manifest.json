@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Air Travel Wallet",
+  "version": "0.1.0",
+  "description": "Autofill traveler details, flag booking risks, and save trips from checkout pages.",
+  "permissions": ["storage", "activeTab", "tabs"],
+  "host_permissions": [
+    "<all_urls>",
+    "http://localhost:4173/*",
+    "https://*.skyscanner.com/*",
+    "https://*.skyscanner.net/*",
+    "https://*.croatiaairlines.com/*",
+    "https://*.croatiaairlines.hr/*",
+    "https://*.gotogate.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/service-worker.js"
+  },
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Air Travel Wallet"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://localhost:4173/demo/checkout*",
+        "https://*.skyscanner.com/*",
+        "https://*.skyscanner.net/*",
+        "https://*.croatiaairlines.com/*",
+        "https://*.croatiaairlines.hr/*",
+        "https://*.gotogate.com/*"
+      ],
+      "js": ["src/content/content.js"],
+      "css": ["src/content/sidebar.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

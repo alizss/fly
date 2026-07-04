@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Demo Air Checkout</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="checkout-page">
+    <main class="checkout-layout">
+      <section class="checkout-main">
+        <a class="back-link" href="/">← Dashboard</a>
+        <p class="eyebrow">Demo Air · airline direct</p>
+        <h1>Demo checkout</h1>
+        <div class="route-strip" data-route>
+          <div>
+            <span>Outbound</span>
+            <strong data-origin>SFO</strong> to <strong data-destination>LHR</strong>
+          </div>
+          <div>
+            <span>Departure</span>
+            <strong data-departure>2026-09-18T09:30</strong>
+          </div>
+          <div>
+            <span>Fare</span>
+            <strong data-price data-currency="USD">$642.00</strong>
+          </div>
+        </div>
+        <div class="warning-band" data-baggage-summary>
+          Basic fare: personal item only. No cabin bag and checked baggage not included.
+        </div>
+        <form class="checkout-form" id="demo-booking-form">
+          <div class="checkout-step is-active" data-checkout-step="passenger">
+            <h2>Passenger details</h2>
+            <div class="grid two">
+              <label>First name <input name="first_name" autocomplete="given-name" placeholder="Given name" /></label>
+              <label>Last name <input name="last_name" autocomplete="family-name" placeholder="Family name" /></label>
+              <label>Date of birth <input name="date_of_birth" type="date" /></label>
+              <label>Nationality <input name="nationality" placeholder="Citizenship" /></label>
+              <label>Passport number <input name="passport_number" placeholder="Travel document number" /></label>
+              <label>Passport expiry <input name="passport_expiry" type="date" /></label>
+              <label>Email <input name="email" type="email" placeholder="traveler@example.com" /></label>
+              <label>Phone <input name="phone" type="tel" placeholder="+1..." /></label>
+            </div>
+            <label>Baggage option
+              <select name="baggage_option">
+                <option>Personal item only</option>
+                <option>Cabin bag</option>
+                <option>Checked bag</option>
+              </select>
+            </label>
+            <div class="payment-box">
+              <h2>Invoice and billing</h2>
+              <p>The extension may fill these company details, but it should still leave actual payment confirmation to you.</p>
+              <div class="grid two">
+                <label>Company name <input name="billing_company" placeholder="Company legal name" /></label>
+                <label>Tax ID / VAT <input name="billing_tax_id" placeholder="Tax or VAT number" /></label>
+                <label>Billing email <input name="billing_email" type="email" placeholder="invoices@example.com" /></label>
+                <label>Billing address <input name="billing_address" placeholder="Company billing address" /></label>
+              </div>
+            </div>
+            <button type="button" class="primary" data-continue-step="extras" data-atw-safe-continue>Continue to extras</button>
+          </div>
+
+          <div class="checkout-step" data-checkout-step="extras" data-agent-decision>
+            <h2>Extras</h2>
+            <div class="choice-row">
+              <div>
+                <strong>Add cabin bag</strong>
+                <p>Cabin bag is not included in this fare.</p>
+              </div>
+              <strong>+$32</strong>
+            </div>
+            <div class="choice-row">
+              <div>
+                <strong>Choose seat</strong>
+                <p>Seat selection is optional and can be skipped.</p>
+              </div>
+              <strong>+$14</strong>
+            </div>
+            <div class="button-row">
+              <button type="button" class="button" data-demo-skip-extras data-continue-step="review">Skip extras</button>
+              <button type="button" class="primary" data-demo-add-bag data-continue-step="review">Add cabin bag</button>
+            </div>
+          </div>
+
+          <div class="checkout-step" data-checkout-step="review">
+            <h2>Review and payment</h2>
+            <div class="payment-box">
+              <p>Final review: passenger details, billing details, baggage, and price are ready. Payment remains explicit.</p>
+              <div class="grid two">
+                <label>Card number <input name="card_number" autocomplete="cc-number" placeholder="Use browser saved card" /></label>
+                <label>Security code <input name="card_cvc" autocomplete="cc-csc" placeholder="Enter manually" /></label>
+              </div>
+            </div>
+            <div class="button-row">
+              <button type="button" class="button" data-continue-step="passenger">Back</button>
+              <button type="button" class="primary" data-demo-pay>Confirm and pay</button>
+            </div>
+          </div>
+
+          <div class="checkout-step" data-checkout-step="confirmation">
+            <h2>Booking confirmed</h2>
+            <p class="security-note">Demo booking confirmed. In the real product, this is where the agent saves the final PNR and invoice status.</p>
+            <button type="button" class="primary" data-confirmation>Save confirmed trip</button>
+          </div>
+        </form>
+      </section>
+      <aside class="checkout-summary">
+        <h2>Trip summary</h2>
+        <dl>
+          <div><dt>Airline</dt><dd data-airline>Demo Air</dd></div>
+          <div><dt>Seller</dt><dd data-seller>airline direct</dd></div>
+          <div><dt>PNR</dt><dd data-booking-reference>DEMO42</dd></div>
+          <div><dt>Invoice</dt><dd>Missing company billing fields</dd></div>
+        </dl>
+      </aside>
+    </main>
+    <script src="/checkout-demo.js"></script>
+  </body>
+</html>
