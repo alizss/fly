@@ -179,6 +179,96 @@
   font-weight: 750;
 }
 
+.atw-plan {
+  display: grid;
+  gap: 8px;
+  border: 1px solid #e2e8e4;
+  border-radius: 16px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.atw-plan-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #17211c;
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.atw-plan-title small {
+  color: #66736c;
+  font-size: 11px;
+  text-transform: none;
+}
+
+.atw-plan ol {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.atw-plan-row {
+  display: grid;
+  grid-template-columns: 22px 1fr;
+  align-items: start;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: #f6f8f7;
+}
+
+.atw-plan-row.is-current {
+  border-color: rgba(14, 123, 101, 0.35);
+  background: #eaf7f3;
+}
+
+.atw-plan-row.is-complete {
+  opacity: 0.72;
+}
+
+.atw-plan-index {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: #dfe7e3;
+  color: #4f635b;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.atw-plan-row.is-current .atw-plan-index {
+  background: #0e7b65;
+  color: #ffffff;
+}
+
+.atw-plan-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.atw-plan-copy strong {
+  color: #17211c;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.atw-plan-copy em {
+  color: #66736c;
+  font-size: 11px;
+  font-style: normal;
+  line-height: 1.25;
+}
+
 .atw-chat {
   display: grid;
   gap: 8px;
@@ -306,13 +396,13 @@
   left: 38px;
   top: 28px;
   width: max-content;
-  max-width: 290px;
+  max-width: 360px;
   padding: 9px 11px;
   border-radius: 12px;
   background: #101828;
   color: #ffffff;
-  font-size: 12px;
-  line-height: 1.25;
+  font-size: 13px;
+  line-height: 1.28;
   font-weight: 800;
   white-space: pre-line;
   box-shadow: 0 12px 28px rgba(16, 24, 40, 0.25);
@@ -521,6 +611,16 @@
   box-shadow: 0 0 0 7px rgba(54, 209, 255, 0.14) !important;
 }
 
+.atw-section-highlight {
+  outline: 3px solid rgba(54, 209, 255, 0.72) !important;
+  outline-offset: 8px !important;
+  border-radius: 12px !important;
+  box-shadow:
+    0 0 0 9999px rgba(15, 23, 42, 0.035),
+    0 18px 58px rgba(54, 209, 255, 0.16) !important;
+  transition: outline-color 0.22s ease, box-shadow 0.22s ease !important;
+}
+
 #atw-agent-cursor {
   width: 46px;
   height: 46px;
@@ -569,12 +669,14 @@
   left: 48px;
   top: 26px;
   min-width: 128px;
-  max-width: 300px;
-  padding: 10px 12px;
+  max-width: 380px;
+  padding: 11px 13px;
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: 16px;
   background: rgba(5, 7, 18, 0.96);
   color: #ffffff;
+  font-size: 13px;
+  line-height: 1.28;
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.34);
 }
 

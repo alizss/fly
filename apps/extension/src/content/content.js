@@ -22,6 +22,8 @@
     phone: ["phone", "mobile", "telephone"]
   };
   const PAYMENT_TERMS = ["card", "cvc", "cvv", "security code", "payment", "cc-number", "cc-csc"];
+  const SLOW_STEP_MS = 2200;
+  const VERIFY_STEP_MS = 1400;
   const VALIDATION_TERMS = [
     "required",
     "must enter",
@@ -31,6 +33,10 @@
     "not valid",
     "confirm",
     "missing",
+    "select one option",
+    "select an option",
+    "choose one option",
+    "please select",
     "error"
   ];
 
@@ -49,10 +55,15 @@
     repeatClickCount: 0,
     skipPaidExtrasApproved: false,
     skipRoutineRunning: false,
+    autopilotMode: true,
     pendingUserMessage: "",
     currentAction: "",
     currentReason: "",
+    currentStage: "",
     actionHistory: [],
+    sectionProgress: {},
+    sectionPlan: [],
+    taskQueue: [],
     debugLog: [],
     pageMap: null
   };
@@ -85,14 +96,114 @@
       || /personal item|no checked|no bag|no baggage/i.test(t?.baggage_preference || "");
   }
 
+  function profileAllowsPaidExtras() {
+    return /allow paid|add baggage|checked bag|seat selection|add extras|wants extras|buy insurance|add bundle/i.test(travelerRules());
+  }
+
+  function shouldAutoDeclinePaidExtras() {
+    return agent.skipPaidExtrasApproved || prefersNoPaidExtras() || (agent.autopilotMode && !profileAllowsPaidExtras());
+  }
+
+  function resetSectionProgress() {
+    agent.sectionProgress = {};
+  }
+
+  function markSectionDone(key, label = key) {
+    agent.sectionProgress[key] = {
+      status: "done",
+      label,
+      at: Date.now()
+    };
+    logAgentEvent("section_progress", { key, status: "done", label });
+  }
+
+  function sectionDone(key) {
+    return agent.sectionProgress?.[key]?.status === "done";
+  }
+
+  function progressSummary() {
+    return Object.values(agent.sectionProgress || {})
+      .filter((item) => item.status === "done")
+      .map((item) => item.label)
+      .join(", ");
+  }
+
+  function rememberPagePlan(map) {
+    agent.sectionPlan = map?.sections || [];
+    agent.taskQueue = map?.taskQueue || [];
+    return map;
+  }
+
   function setAgentActivity(action, reason = "") {
     agent.currentAction = action;
     agent.currentReason = reason;
     const cursor = document.getElementById("atw-agent-cursor");
     if (cursor) {
-      cursor.dataset.action = action ? action.slice(0, 48) : "working";
-      cursor.dataset.reason = reason ? reason.slice(0, 120) : "";
+      cursor.dataset.action = action ? action.slice(0, 80) : "working";
+      cursor.dataset.reason = reason ? reason.slice(0, 520) : "";
     }
+  }
+
+  function pageContextSummary() {
+    const map = agent.pageMap;
+    if (!map) return `Context: ${inferCheckoutSite()} | ${location.pathname || location.hostname}`;
+    return `Context: ${map.site} | ${map.step.replace(/_/g, " ")} | ${map.summary?.knownFields || 0}/${map.summary?.fields || 0} fields | ${map.summary?.paidChoices || 0} paid areas`;
+  }
+
+  function activeRuleSummary(stage = "", action = "") {
+    const text = `${stage} ${action}`.toLowerCase();
+    if (/payment|pay|final/.test(text)) return "Rule: payment/final booking needs explicit confirmation.";
+    if (/dropdown|menu/.test(text)) return "Rule: finish the open dropdown before anything else.";
+    if (/popup|modal/.test(text)) return "Rule: modal owns the next action.";
+    if (/paid|extra|baggage|bundle|flexible|cancellation/.test(text)) return "Rule: saved preference says decline paid extras.";
+    if (/continue|advance/.test(text)) return "Rule: Continue only after all required sections verify complete.";
+    return "Rule: one action at a time, then verify.";
+  }
+
+  function inferLoopStep(stage = "", action = "") {
+    const text = `${stage} ${action}`.toLowerCase();
+    if (/observe|reading visible|reading page|queue/.test(text)) return "Observe";
+    if (/understand|classify|meaning|recognized|detected/.test(text)) return "Understand";
+    if (/planning|plan /.test(text)) return "Plan";
+    if (/waiting|watching|settle|page update|dom|loading/.test(text)) return "Wait";
+    if (/done:|checking:|verified|verify/.test(text)) return "Verify";
+    if (/remember|accepted|stored|locked/.test(text)) return "Remember";
+    if (/choosing|filling|clicking|selecting|opening|closing|confirming|type /.test(text)) return "Act";
+    return "Understand";
+  }
+
+  function formatLoopBubble(loopStep, stage, action, detail = "") {
+    return [
+      `${loopStep}: ${stage || "current page"}`,
+      detail,
+      pageContextSummary(),
+      activeRuleSummary(stage, action)
+    ].filter(Boolean).join("\n");
+  }
+
+  async function showAgentThought(anchor, stage, action, reason = "", pause = SLOW_STEP_MS) {
+    agent.currentStage = stage || agent.currentStage || "";
+    const loopStep = inferLoopStep(stage, action);
+    const detail = reason ? `Goal: ${reason}` : "";
+    const bubble = formatLoopBubble(loopStep, stage, action, detail);
+    setAgentActivity(`${loopStep} -> ${action}`, bubble);
+    if (anchor) showAgentCursor(anchor, `${loopStep}: ${action}`, bubble);
+    logAgentEvent("visible_step", { loopStep, stage, action, reason });
+    renderSidebar("agent");
+    await sleep(pause);
+  }
+
+  async function verifyAgentStep(anchor, stage, message, ok = true, pause = VERIFY_STEP_MS) {
+    const action = ok ? `Done: ${message}` : `Checking: ${message}`;
+    const detail = ok
+      ? `Result: verified on the live page. Remember: do not change it again unless a specific error appears.`
+      : "Result: not verified yet. Re-observe before the next action.";
+    const bubble = formatLoopBubble(ok ? "Remember" : "Verify", stage, action, detail);
+    setAgentActivity(`${ok ? "Remember" : "Verify"} -> ${action}`, bubble);
+    if (anchor) showAgentCursor(anchor, `${ok ? "Remember" : "Verify"}: ${action}`, bubble);
+    logAgentEvent("visible_verify", { stage, message, ok });
+    renderSidebar("agent");
+    await sleep(pause);
   }
 
   function labelText(input) {
@@ -329,6 +440,7 @@
         userLikeClick(option);
         flashElement(option);
         await sleep(220);
+        await settleAndHandleInterrupts("combobox option selected");
         return { ok: true, method: "combobox-option", value: currentElementValue(input), option: (option.innerText || "").slice(0, 120) };
       }
       await sleep(160);
@@ -466,9 +578,11 @@
       flashElement(option);
       userLikeClick(option);
       await sleep(420);
+      await settleAndHandleInterrupts("country code selected");
     } else if (control.tagName === "INPUT") {
       dispatchKey(control, "Enter");
       await sleep(260);
+      await settleAndHandleInterrupts("country code entered");
     }
     const value = controlText(control);
     const ok = normalizedValue(value, "country_code").includes(split.countryCode.replace(/\D/g, "")) || Boolean(option);
@@ -519,6 +633,8 @@
           option: result.option
         }
       });
+      const interrupt = await settleAndHandleInterrupts("phone country code");
+      if (interrupt.blocked && !interrupt.handled) return count;
     }
 
     if (localInput && split.local) {
@@ -535,6 +651,9 @@
         }
       }
     }
+
+    const interrupt = await settleAndHandleInterrupts("phone fields");
+    if (interrupt.blocked && !interrupt.handled) return count;
 
     if (count) {
       logAgentEvent("phone_fill", {
@@ -555,21 +674,22 @@
     if (typeof element.select === "function") element.select();
     setNativeElementValue(element, "");
     dispatchFieldEvents(element);
-    await sleep(50);
+    await sleep(180);
     for (const char of String(value)) {
       setNativeElementValue(element, `${element.value || ""}${char}`);
       element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: char }));
       element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: char }));
-      await sleep(8);
+      await sleep(45);
     }
     element.dispatchEvent(new Event("change", { bubbles: true }));
     element.blur?.();
-    await sleep(120);
+    await sleep(360);
   }
 
   async function setFieldValue(element, value, options = {}) {
     const mode = options.compareMode || "text";
     const fieldType = options.fieldType || "unknown";
+    const fieldLabel = fieldType.replace(/_/g, " ");
     const expected = String(value || "");
     const result = {
       ok: false,
@@ -584,6 +704,7 @@
       result.reason = "Missing element or value";
       recordAction("field_fill", result);
       setAgentActivity(result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok ? "Moving to the next required item" : "Will rescan and recover");
+      await verifyAgentStep(element, "Field", result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok, 700);
       reportActionResult({
         type: "field_fill",
         action: "fill_text",
@@ -596,10 +717,8 @@
     }
 
     element.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
-    await sleep(120);
-    const fieldLabel = fieldType.replace(/_/g, " ");
-    setAgentActivity(`Filling ${fieldLabel}`, "Checking saved traveler profile");
-    showAgentCursor(element, `Filling ${fieldLabel}`, "From saved traveler profile");
+    await sleep(360);
+    await showAgentThought(element, "Field", `Filling ${fieldLabel}`, "Using saved traveler profile, then verifying the value sticks.", 900);
     flashElement(element);
 
     if (element.tagName === "SELECT") {
@@ -624,13 +743,14 @@
       setNativeElementValue(element, expected);
       dispatchFieldEvents(element);
       element.blur?.();
-      await sleep(160);
+      await sleep(520);
       if (valueMatches(element, expected, mode)) {
         result.ok = true;
         result.method = "native-setter";
         result.actual = currentElementValue(element);
         recordAction("field_fill", result);
         setAgentActivity(`${fieldLabel} accepted`, "Moving to the next required item");
+        await verifyAgentStep(element, "Field", `${fieldLabel} accepted`, true, 700);
         reportActionResult({
           type: "field_fill",
           action: "fill_text",
@@ -683,7 +803,7 @@
     filledFields = [];
     const used = new Set();
     fillTitleRadio();
-    await fillPhoneFieldsFromMap(buildPageMap());
+    await fillPhoneFieldsFromMap(rememberPagePlan(buildPageMap()));
     for (const input of candidateInputs()) {
       const detected = detectField(input);
       if (!detected || used.has(detected.field)) continue;
@@ -764,7 +884,7 @@
           goal: "Complete this flight checkout safely with one-click assistance.",
           userIntent: `Complete checkout safely for ${traveler()?.first_name || "the traveler"}.`,
           traveler: traveler(),
-          page: compactPageMap(buildPageMap())
+          page: compactPageMap(agent.pageMap || rememberPagePlan(buildPageMap()))
         })
       });
       if (!response.ok) throw new Error(`session returned ${response.status}`);
@@ -783,7 +903,7 @@
     if (!agent.sessionId) return;
     try {
       const settings = await storageGet(["apiBase"]);
-      const map = buildPageMap();
+      const map = rememberPagePlan(buildPageMap());
       await fetch(`${settings.apiBase || DEFAULT_API}/agent/report`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -792,7 +912,7 @@
           result: {
             ...result,
             stage: result.stage || map.step,
-            errors: result.errors || map.errors
+            errors: result.errors || actionableCheckoutErrors(map.errors)
           },
           page: compactPageMap(map)
         })
@@ -870,7 +990,7 @@
       textarea.select();
       document.execCommand("copy");
       textarea.remove();
-      addAgentMessage("assistant", "Debug log copied with fallback copy. Paste it here.");
+      addAgentMessage("assistant", "Debug log copied with alternate clipboard method. Paste it here.");
     }
     renderSidebar("agent");
   }
@@ -945,6 +1065,318 @@
     setTimeout(() => element.classList.remove("atw-highlight"), 900);
   }
 
+  function sectionContainer(element) {
+    let current = element;
+    for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+      if (current.closest?.("#atw-sidebar")) return element;
+      const rect = current.getBoundingClientRect();
+      const text = (current.innerText || current.textContent || "").replace(/\s+/g, " ").trim();
+      if (isSummaryLikeElement(current)) continue;
+      if (rect.width > 260 && rect.height > 90 && text.length > 20 && text.length < 1800) return current;
+    }
+    return element;
+  }
+
+  function cardContainerForControl(control, headingPattern) {
+    let best = null;
+    let current = control;
+    for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+      if (current.closest?.("#atw-sidebar")) break;
+      const rect = current.getBoundingClientRect();
+      const text = (current.innerText || current.textContent || "").replace(/\s+/g, " ").trim();
+      if (rect.width < 260 || rect.height < 70 || !text) continue;
+      if (headingPattern.test(text) && !isSummaryLikeElement(current)) {
+        best = current;
+        if (text.length > 120 && text.length < 2800) break;
+      }
+    }
+    return best || sectionContainer(control);
+  }
+
+  function isSummaryLikeElement(element) {
+    const text = (element?.innerText || element?.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!text) return false;
+    const summarySignals = [/your order/, /price overview/, /total amount/, /amount to pay/, /departure.*return.*bags/];
+    const hasSummarySignal = summarySignals.some((pattern) => pattern.test(text));
+    if (!hasSummarySignal) return false;
+    const decisionControls = queryAllDeep("input[type='radio'], input[type='checkbox'], select, [role='combobox']", element)
+      .filter((control) => isVisible(control) && !control.closest("#atw-sidebar"));
+    return decisionControls.length === 0;
+  }
+
+  function checkoutHeadingCount(text) {
+    return [
+      /contact information/i,
+      /passenger\s+\d+/i,
+      /select baggage/i,
+      /upgrade your trip/i,
+      /flexible ticket/i,
+      /cancellation guarantee/i,
+      /your order/i,
+      /price overview/i
+    ].filter((pattern) => pattern.test(text)).length;
+  }
+
+  function sectionPlanDescription(section) {
+    const text = (section.element.innerText || section.element.textContent || "").replace(/\s+/g, " ").trim();
+    const controls = queryAllDeep("input[type='radio'], input[type='checkbox'], select, [role='combobox'], button, [role='button']", section.element)
+      .filter((control) => isVisible(control) && !control.closest("#atw-sidebar"));
+    const required = /\*|select one option|choose your bundle|mobile number|first name|surname|title/i.test(text);
+    const paid = /eur|bundle|flexible ticket|cancellation|baggage|add to cart/i.test(text);
+    return `${section.label}: ${controls.length} controls${required ? ", required" : ""}${paid ? ", paid-choice" : ""}`;
+  }
+
+  function plannedTargetForSection(label) {
+    const targets = {
+      contact: "fill email, confirm email, country code, phone",
+      passenger: "title, first name, surname",
+      baggage: "choose no checked baggage",
+      bundle: "choose bundle footer: No, thanks",
+      "flexible ticket": "choose None of the passengers",
+      cancellation: "choose No thanks",
+      continue: "click Continue only after verification"
+    };
+    return targets[label] || "resolve required controls";
+  }
+
+  function clearSectionHighlights() {
+    queryAllDeep(".atw-section-highlight").forEach((element) => element.classList.remove("atw-section-highlight"));
+  }
+
+  function highlightSection(element, label = "section") {
+    if (!element) return null;
+    const container = sectionContainer(element);
+    clearSectionHighlights();
+    container.classList.add("atw-section-highlight");
+    logAgentEvent("section_highlight", { label, text: (container.innerText || "").replace(/\s+/g, " ").slice(0, 180) });
+    return container;
+  }
+
+  function sectionAnchorByText(pattern) {
+    return queryAllDeep("section, article, form, div, fieldset")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+        if (!text || text.length < 12 || text.length > 2600 || rect.width < 220 || rect.height < 45) return null;
+        let score = pattern.test(text) ? 40 : 0;
+        if (!score) return null;
+        if (isSummaryLikeElement(element)) score -= 80;
+        const matchingControls = queryAllDeep("input, select, button, [role='button'], [role='combobox']", element)
+          .filter((control) => isVisible(control) && !control.closest("#atw-sidebar"))
+          .filter((control) => pattern.test(`${labelText(control)} ${controlText(control)} ${buttonText(control)}`));
+        if (matchingControls.length) score += 35;
+        const decisionControls = queryAllDeep("input[type='radio'], input[type='checkbox'], select, [role='combobox']", element)
+          .filter((control) => isVisible(control) && !control.closest("#atw-sidebar"));
+        if (decisionControls.length) score += Math.min(24, decisionControls.length * 4);
+        const headingCount = checkoutHeadingCount(text);
+        if (headingCount > 1) score -= headingCount * 22;
+        if (/configure your trip/i.test(text) && headingCount > 2) score -= 60;
+        if (/your order|price overview|total amount/i.test(text)) score -= 60;
+        score -= Math.max(0, text.length - 600) / 200;
+        score -= Math.max(0, rect.width - 900) / 40;
+        return { element, score, top: rect.top };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score || a.top - b.top)[0]?.element || null;
+  }
+
+  function detectCheckoutSections() {
+    const patterns = [
+      ["contact", /contact information|provide your contact details|e-?mail|mobile number/i],
+      ["passenger", /passenger\s+\d+|traveller information|traveler information|first name|surname|passport/i],
+      ["baggage", /select baggage|checked baggage|hand baggage|personal item/i],
+      ["bundle", /bundle|premium support|airhelp|booking number by sms/i],
+      ["flexible ticket", /flexible ticket|change your ticket/i],
+      ["cancellation", /cancellation guarantee|voucher refund/i],
+      ["continue", /we protect your personal data|continue/i]
+    ];
+    const seen = new Set();
+    return patterns
+      .map(([label, pattern]) => {
+        const element = sectionAnchorByText(pattern);
+        if (!element) return null;
+        const id = elementId(element);
+        if (seen.has(id)) return null;
+        seen.add(id);
+        return { label, element, box: elementBox(element) };
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.box.y - b.box.y);
+  }
+
+  function sectionTypeFor(label, text = "") {
+    const source = `${label} ${text}`.toLowerCase();
+    if (/contact|e-?mail|mobile/.test(source)) return "contact";
+    if (/passenger|traveller|traveler|surname|first name|passport|title/.test(source)) return "passenger";
+    if (/baggage|bag|personal item|hand baggage|checked/.test(source)) return "baggage";
+    if (/bundle|premium support|airhelp|sms/.test(source)) return "bundle";
+    if (/flexible ticket|reschedule|change your ticket/.test(source)) return "flexible_ticket";
+    if (/cancellation|voucher refund|insurance|refund/.test(source)) return "cancellation_insurance";
+    if (/continue|protect your personal data/.test(source)) return "continue";
+    if (/seat|reserve seating|seat map/.test(source)) return "seat";
+    if (/payment|pay|card|cvc/.test(source)) return "payment";
+    return "unknown";
+  }
+
+  function sectionFieldModels(section, fields) {
+    return fields
+      .filter((field) => field.element && section.element.contains(field.element))
+      .map((field) => ({
+        id: field.id,
+        label: field.label,
+        field: field.field,
+        kind: field.kind,
+        required: field.required,
+        hasValue: Boolean(field.value),
+        value: field.value ? "[filled]" : "",
+        box: field.box
+      }));
+  }
+
+  function sectionButtonModels(section, buttons) {
+    return buttons
+      .filter((button) => button.element && section.element.contains(button.element))
+      .map((button) => ({
+        id: button.id,
+        label: button.label,
+        risk: button.risk,
+        box: button.box
+      }));
+  }
+
+  function selectedControlLabels(section) {
+    return queryAllDeep("input[type='radio'], input[type='checkbox']", section.element)
+      .filter((input) => isVisible(input) && input.checked && !input.closest("#atw-sidebar"))
+      .map((input) => labelText(input) || input.value || controlText(input))
+      .filter(Boolean)
+      .map((text) => text.replace(/\s+/g, " ").trim())
+      .slice(0, 8);
+  }
+
+  function unfilledRequiredFields(fields = []) {
+    return fields.filter((field) => field.required && field.field !== "unknown" && !field.hasValue);
+  }
+
+  function inferSectionStatus(section, fields, buttons) {
+    const type = sectionTypeFor(section.label, section.text);
+    const selected = selectedControlLabels(section);
+    const lower = section.text.toLowerCase();
+    const requiredMissing = unfilledRequiredFields(fields);
+    const hasSelectPlaceholder = queryAllDeep("select, [role='combobox']", section.element)
+      .filter((control) => isVisible(control) && !control.closest("#atw-sidebar"))
+      .some((control) => /choose|select/.test(currentElementValue(control).toLowerCase() || controlText(control).toLowerCase()));
+    const hasValidationText = /select one option|select an option|please select|field required|must enter|invalid|not valid/.test(lower);
+
+    if (type === "contact" || type === "passenger") {
+      return requiredMissing.length || hasValidationText ? "incomplete" : "complete";
+    }
+    if (type === "baggage") {
+      return selected.some((label) => /no checked baggage|no baggage|without/i.test(label)) || /no baggage selected|no checked baggage/.test(lower)
+        ? "complete"
+        : "incomplete";
+    }
+    if (type === "bundle") {
+      return selected.some((label) => /no,?\s*thanks|none|standard/i.test(label)) || /no,?\s*thanks\s*(?:checked|selected)?/i.test(section.text)
+        ? "complete"
+        : "incomplete";
+    }
+    if (type === "flexible_ticket") {
+      return !hasSelectPlaceholder && !hasValidationText ? "complete" : "incomplete";
+    }
+    if (type === "cancellation_insurance") {
+      return selected.some((label) => /no,?\s*thanks|none|without/i.test(label)) && !hasValidationText ? "complete" : "incomplete";
+    }
+    if (type === "continue") return "locked";
+    if (type === "payment") return "blocked";
+    return hasValidationText || requiredMissing.length ? "incomplete" : "unknown";
+  }
+
+  function sectionObjective(section, type, status) {
+    if (status === "complete") return "Verified complete; do not change unless a specific error appears.";
+    const objectives = {
+      contact: "Fill saved email, confirm email, country code, and phone.",
+      passenger: "Fill saved traveler identity and title exactly from the profile.",
+      baggage: "Decline checked baggage and keep included personal/hand baggage only.",
+      bundle: "Decline bundle/support/SMS paid extras.",
+      flexible_ticket: "Choose the zero-cost/no-passenger option.",
+      cancellation_insurance: "Choose No thanks for paid cancellation/refund insurance.",
+      seat: "Skip paid seat selection unless already included.",
+      continue: "Click Continue only after all prior required sections are complete.",
+      payment: "Stop before real payment or final booking."
+    };
+    return objectives[type] || "Resolve required visible controls safely.";
+  }
+
+  function buildSectionModels(sections, fields, buttons) {
+    return sections.map((section, index) => {
+      const text = (section.element.innerText || section.element.textContent || "").replace(/\s+/g, " ").trim();
+      const type = sectionTypeFor(section.label, text);
+      const sectionFields = sectionFieldModels(section, fields);
+      const sectionButtons = sectionButtonModels(section, buttons);
+      const status = inferSectionStatus({ ...section, text }, sectionFields, sectionButtons);
+      const paidChoice = /eur|€|\$|add to cart|premium|bundle|insurance|cancellation|flexible|checked baggage|paid/i.test(text);
+      return {
+        id: elementId(section.element),
+        label: section.label,
+        type,
+        order: index + 1,
+        status,
+        required: /required|\*|select one option|choose your bundle|mobile number|first name|surname|title/i.test(text),
+        paidChoice,
+        objective: sectionObjective(section, type, status),
+        selected: selectedControlLabels(section),
+        fields: sectionFields,
+        buttons: sectionButtons,
+        box: section.box,
+        text: text.slice(0, 900)
+      };
+    });
+  }
+
+  function buildTaskQueue(sectionModels) {
+    const tasks = sectionModels
+      .filter((section) => section.type !== "continue" && section.status !== "complete" && section.status !== "blocked")
+      .map((section) => ({
+        id: `task-${section.id}`,
+        sectionId: section.id,
+        sectionLabel: section.label,
+        sectionType: section.type,
+        order: section.order,
+        status: "pending",
+        objective: section.objective,
+        rule: section.paidChoice ? "Saved traveler rules: no paid extras unless explicitly approved." : "Use saved traveler profile and verify the result."
+      }));
+    const continueSection = sectionModels.find((section) => section.type === "continue");
+    if (continueSection) {
+      tasks.push({
+        id: `task-${continueSection.id}`,
+        sectionId: continueSection.id,
+        sectionLabel: continueSection.label,
+        sectionType: "continue",
+        order: continueSection.order,
+        status: tasks.length ? "locked" : "pending",
+        objective: continueSection.objective,
+        rule: "Continue is locked until all required page sections are complete."
+      });
+    }
+    return tasks;
+  }
+
+  async function announceSectionQueue() {
+    const map = agent.pageMap || buildPageMap();
+    const sections = map.sections || [];
+    const label = sections.map((section) => `${section.order}. ${section.label}`).join(" -> ") || "current visible checkout page";
+    const details = sections.map((section) => `${section.order}. ${section.label}: ${section.status} -> ${section.objective}`).join("\n");
+    const anchor = elementById(sections[0]?.id) || queryAllDeep("main, form, body").find(isVisible) || document.body;
+    const section = highlightSection(anchor, "page structure");
+    await showAgentThought(section, "Observe", "Reading visible checkout sections", `Visible text, inputs, buttons, dropdowns, radios, checkboxes, prices, errors, URL, scroll, and coordinates.`);
+    await showAgentThought(section, "Plan", "Creating section action queue", `Order: ${label}\nTargets:\n${details}`);
+    addAgentMessage("assistant", `Plan: ${label}`);
+    logAgentEvent("section_plan", { order: sections.map((section) => section.label), tasks: map.taskQueue || [], details });
+    return sections;
+  }
+
   function showAgentCursor(element, actionLabel = "", reason = "") {
     if (!element) return;
     let cursor = document.getElementById("atw-agent-cursor");
@@ -961,8 +1393,8 @@
     }
     const rect = element.getBoundingClientRect();
     const derivedLabel = actionLabel || (element.innerText || element.value || element.getAttribute("aria-label") || "working").replace(/\s+/g, " ").trim();
-    cursor.dataset.action = derivedLabel ? derivedLabel.slice(0, 32) : "working";
-    cursor.dataset.reason = reason ? reason.slice(0, 96) : agent.currentReason || "";
+    cursor.dataset.action = derivedLabel ? derivedLabel.slice(0, 80) : "working";
+    cursor.dataset.reason = reason ? reason.slice(0, 520) : (agent.currentReason || "").slice(0, 520);
     const x = rect.left + Math.min(Math.max(rect.width / 2, 18), Math.max(rect.width - 18, 18));
     const y = rect.top + Math.min(Math.max(rect.height / 2, 18), Math.max(rect.height - 18, 18));
     cursor.style.transform = `translate3d(${Math.max(8, x - 23)}px, ${Math.max(8, y - 23)}px, 0)`;
@@ -986,10 +1418,23 @@
     element.dispatchEvent(new MouseEvent("click", eventInit));
   }
 
-  async function waitForUiSettle(ms = 650) {
-    setAgentActivity("Watching page update", "Waiting for popups, dropdowns, or validation to settle");
+  async function waitForPaint(ms = 300) {
     await sleep(ms);
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  }
+
+  function pressEscape(target = document.activeElement || document.body) {
+    const eventInit = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
+    target?.dispatchEvent?.(new KeyboardEvent("keydown", eventInit));
+    document.dispatchEvent(new KeyboardEvent("keydown", eventInit));
+    target?.dispatchEvent?.(new KeyboardEvent("keyup", eventInit));
+    document.dispatchEvent(new KeyboardEvent("keyup", eventInit));
+    target?.blur?.();
+  }
+
+  async function waitForUiSettle(ms = 650) {
+    await showAgentThought(document.activeElement || document.body, "Wait", "Watching page update", "Waiting for popups, dropdowns, validation, price/order changes, or URL changes.", 600);
+    await waitForPaint(ms);
   }
 
   function activeDemoStepName() {
@@ -1027,6 +1472,11 @@
   }
 
   function primaryPageText() {
+    const activeModal = activeOverlayElements().find((overlay) => !isTransientChoiceOverlay(overlay));
+    if (activeModal) {
+      const text = overlayText(activeModal);
+      if (text.length > 40) return text;
+    }
     const candidates = queryAllDeep("main, [role='main'], form, section, article")
       .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
       .map((element) => {
@@ -1045,13 +1495,15 @@
     const extrasEvidence = /select baggage|configure your trip|upgrade your trip|checked baggage|bundle|premium support|airhelp|cancellation guarantee|voucher refund|add to cart|no thanks|add baggage|choose your bundle/.test(lower);
     const travelerEvidence = /traveller information|traveler information|contact information|provide your contact details|passport|date of birth|surname|first name|first and middle names|mobile number|confirm e-?mail/.test(lower);
     const seatEvidence = /seat selection|select seat|choose seat/.test(lower);
+    const strongSeatEvidence = /reserve seating|seat map|seat map key|standard seat|not selected|select a seat|choose a seat/.test(lower);
     const travelerRouteEvidence = /\/rf\/traveler-details|\/rf\/traveller-details|traveler-details|traveller-details/.test(lower);
     const paymentFormEvidence = /card number|security code|cvc|cvv|pay now|complete booking|confirm and pay|submit payment|billing card|cardholder/.test(lower);
     const paymentRouteEvidence = /\/rf\/payment|\/payment\b|[#?&/]payment\b/.test(lower);
 
     if (/booking confirmed|confirmation|booking reference|reservation number|pnr/.test(lower)) return "confirmation";
-    if (travelerRouteEvidence) return "traveler_information";
     if (paymentFormEvidence) return "payment";
+    if (strongSeatEvidence) return "seats";
+    if (travelerRouteEvidence) return "traveler_information";
     if (paymentRouteEvidence && extrasEvidence) return "extras";
     if (paymentRouteEvidence && seatEvidence) return "seats";
     if (travelerEvidence) return "traveler_information";
@@ -1081,12 +1533,9 @@
   }
 
   function visibleOverlays() {
-    return queryAllDeep("[role='dialog'], [aria-modal='true'], [role='listbox'], [role='menu'], [data-headlessui-state], .modal, .popover")
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+    return activeOverlayElements()
       .map((element) => {
-        const text = (element.innerText || element.textContent || element.getAttribute("aria-label") || "")
-          .replace(/\s+/g, " ")
-          .trim();
+        const text = overlayText(element);
         return {
           id: elementId(element),
           label: text.slice(0, 220),
@@ -1096,6 +1545,162 @@
       })
       .filter((item) => item.label || item.role)
       .slice(0, 12);
+  }
+
+  function isInViewport(element) {
+    const rect = element.getBoundingClientRect();
+    return rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+  }
+
+  function activeOverlayElements() {
+    const selectors = "[role='dialog'], [aria-modal='true'], [role='listbox'], [role='menu'], [data-headlessui-state], .modal, .popover";
+    const explicit = queryAllDeep(selectors);
+    const floating = queryAllDeep("body *")
+      .filter((element) => {
+        if (!isVisible(element) || element.closest("#atw-sidebar")) return false;
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        const text = overlayText(element);
+        if (!/fixed|absolute/.test(style.position)) return false;
+        if (!isInViewport(element) || rect.width < 260 || rect.height < 120) return false;
+        if (!text || text.length > 5000) return false;
+        if (!overlayButtons(element).length) return false;
+        const z = Number.parseInt(style.zIndex || "0", 10);
+        return Number.isNaN(z) || z >= 1;
+      });
+    const candidates = [...new Set([...explicit, ...floating])]
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width < 12 || rect.height < 12) return false;
+        const text = overlayText(element);
+        const role = element.getAttribute("role") || "";
+        const style = getComputedStyle(element);
+        const modal = element.getAttribute("aria-modal") === "true" || role === "dialog";
+        const menu = role === "listbox" || role === "menu";
+        const expanded = element.getAttribute("aria-expanded") === "true";
+        const hasVisibleOption = queryAllDeep("[role='option']", element).some(isVisible);
+        const floating = /fixed|absolute|sticky/.test(style.position);
+        if (role === "option" || role === "combobox") return false;
+        if (modal) return Boolean(text);
+        if (!isInViewport(element)) return false;
+        if (/fixed|absolute/.test(style.position) && overlayButtons(element).length && text.length < 5000) return true;
+        if (menu || expanded || hasVisibleOption) return Boolean(text || role);
+        if (element.matches(".modal,.popover") || floating) return Boolean(text);
+        return false;
+      });
+    return candidates.filter((element) => !candidates.some((other) => other !== element && other.contains(element)));
+  }
+
+  function overlayText(element) {
+    if (!element) return "";
+    return (element.innerText || element.textContent || element.getAttribute("aria-label") || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function buttonText(element) {
+    return (element?.innerText || element?.textContent || element?.value || element?.getAttribute?.("aria-label") || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function overlayButtons(overlay) {
+    return queryAllDeep("button, [role='button'], input[type='button'], input[type='submit']", overlay.shadowRoot || overlay)
+      .filter((button) => isVisible(button) && !button.closest("#atw-sidebar"));
+  }
+
+  function isTransientChoiceOverlay(overlay) {
+    const role = overlay.getAttribute("role") || "";
+    const text = overlayText(overlay).toLowerCase();
+    if (role === "listbox" || role === "menu") return true;
+    return /slovenia\s*\(\+386\)|sierra leone\s*\(\+232\)|singapore\s*\(\+65\)|sint maarten|country code|calling code/.test(text);
+  }
+
+  function routineExtraOverlayKind(text) {
+    const lower = String(text || "").toLowerCase();
+    if (/seat|reserve seating|seat map/.test(lower)) return "seat selection popup";
+    if (/checked baggage|baggage|bag allowance|without baggage/.test(lower)) return "baggage popup";
+    if (/bundle|premium support|airhelp|sms|booking number by sms/.test(lower)) return "bundle popup";
+    if (/flexible ticket|change your ticket|reschedule/.test(lower)) return "flexible ticket popup";
+    if (/cancellation|voucher refund|insurance|refund product/.test(lower)) return "insurance/refund popup";
+    if (/add to my trip|add to cart|paid extra|add-?on/.test(lower)) return "paid extra popup";
+    return "";
+  }
+
+  function scoreAutoDeclineButton(button, overlayKind = "") {
+    const label = buttonText(button).toLowerCase();
+    if (!label) return 0;
+    if (/i.ll go without|go without|without baggage|without seat|continue without/.test(label)) return 120;
+    if (/no thanks|no, thanks|not now|skip|decline|none of the passengers|no seat|random seat/.test(label)) return 110;
+    if (/next|continue/.test(label) && /seat selection popup|seat/.test(overlayKind)) return 70;
+    if (/next|continue/.test(label) && /baggage popup|flexible ticket popup|insurance\/refund popup|bundle popup|paid extra popup/.test(overlayKind)) return 55;
+    if (/add|buy|select|upgrade|premium|cart|trip|choose/.test(label)) return -80;
+    return 0;
+  }
+
+  async function handleRoutineExtraOverlay(overlay, context = "") {
+    const text = overlayText(overlay);
+    const kind = routineExtraOverlayKind(text);
+    if (!kind || !shouldAutoDeclinePaidExtras()) return false;
+    const candidates = overlayButtons(overlay)
+      .map((button) => ({ button, score: scoreAutoDeclineButton(button, kind), label: buttonText(button) }))
+      .filter((item) => item.score > 0 && !item.button.disabled && item.button.getAttribute("aria-disabled") !== "true")
+      .sort((a, b) => b.score - a.score);
+    const pick = candidates[0];
+    if (!pick) return false;
+    await showAgentThought(
+      pick.button,
+      "Interrupt",
+      `Handle ${kind}`,
+      `Saved rules say no paid seats/extras. Choosing "${pick.label}" before doing anything in the background.`,
+      900
+    );
+    flashElement(pick.button);
+    userLikeClick(pick.button);
+    recordAction("auto_decline_overlay", { context, kind, label: pick.label });
+    await waitForUiSettle(900);
+    await verifyAgentStep(pick.button, "Interrupt", `${kind} handled with ${pick.label}`, true, 700);
+    return true;
+  }
+
+  async function closeTransientOverlay(overlay, context = "") {
+    if (!isTransientChoiceOverlay(overlay)) return false;
+    await showAgentThought(
+      overlay,
+      "Interrupt",
+      "Close open menu",
+      `The control menu is still open after ${context || "the last action"}; closing it before the next step.`,
+      650
+    );
+    dispatchKey(document.activeElement || document.body, "Escape");
+    await waitForUiSettle(500);
+    return true;
+  }
+
+  async function settleAndHandleInterrupts(context = "") {
+    await showAgentThought(document.activeElement || document.body, "Wait", "Letting the page react", `After ${context || "the last action"}: check modal, dropdown, loading, errors, disabled buttons, and DOM changes.`, 700);
+    await waitForPaint(1200);
+    const overlays = activeOverlayElements();
+    if (overlays.length) {
+      logAgentEvent("interrupt_detected", {
+        context,
+        overlays: overlays.map((overlay) => overlayText(overlay).slice(0, 160)).slice(0, 4)
+      });
+      const overlay = overlays[0];
+      if (await closeTransientOverlay(overlay, context)) {
+        await waitForPaint(400);
+        return { blocked: false, handled: true, overlays: overlays.length };
+      }
+      if (await handleRoutineExtraOverlay(overlay, context)) {
+        await waitForPaint(500);
+        return { blocked: false, handled: true, overlays: overlays.length };
+      }
+      await showAgentThought(overlay, "Observe", "Interrupt detected", "A popup or modal is active and I do not have a safe automatic choice. I will stop background actions and ask the AI/user only about this popup.", 1000);
+      return { blocked: true, handled: false, overlays: overlays.length };
+    }
+    await waitForPaint(500);
+    return { blocked: false, handled: false, overlays: overlays.length };
   }
 
   function fieldValue(input) {
@@ -1169,6 +1774,8 @@
     const errors = collectVisibleErrors(text);
     const paidChoices = collectPaidChoices(fullText);
     const overlays = visibleOverlays();
+    const sections = buildSectionModels(detectCheckoutSections(), fields, buttons);
+    const taskQueue = buildTaskQueue(sections);
     return {
       site: inferCheckoutSite(),
       step,
@@ -1180,13 +1787,18 @@
       overlays,
       errors,
       paidChoices,
+      sections,
+      taskQueue,
       summary: {
         fields: fields.length,
         knownFields: fields.filter((field) => field.field !== "unknown").length,
         buttons: buttons.length,
         overlays: overlays.length,
         errors: errors.length,
-        paidChoices: paidChoices.length
+        paidChoices: paidChoices.length,
+        sections: sections.length,
+        pendingTasks: taskQueue.filter((task) => task.status === "pending").length,
+        lockedTasks: taskQueue.filter((task) => task.status === "locked").length
       }
     };
   }
@@ -1208,7 +1820,7 @@
       if (/^\*?\s*field required\.?$/.test(normalized)) continue;
       if (/^passenger\s+\d+,\s*(adult|child|infant)\s+\*?field required\.?$/.test(normalized)) continue;
       if (/please enter your name and surname exactly/.test(normalized)) continue;
-      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /must enter|too long|too short|invalid|not valid|error|you must|required.+field|field.+required/.test(normalized)) {
+      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /must enter|too long|too short|invalid|not valid|error|you must|required.+field|field.+required|select.+option|choose.+option|please select/.test(normalized)) {
         issues.push(text.replace(/\s+/g, " "));
       }
       if (issues.length >= 4) break;
@@ -1250,7 +1862,10 @@
       flight_selection: "flight selection",
       unknown: "unknown step"
     };
-    return `I see ${stepCopy[map.step] || map.step}: ${map.summary.knownFields}/${map.summary.fields} recognizable fields, ${map.summary.buttons} actions, ${map.summary.paidChoices} paid-choice areas.`;
+    const planCopy = map.summary.sections
+      ? ` ${map.summary.sections} sections, ${map.summary.pendingTasks} pending tasks.`
+      : "";
+    return `I see ${stepCopy[map.step] || map.step}: ${map.summary.knownFields}/${map.summary.fields} recognizable fields, ${map.summary.buttons} actions, ${map.summary.paidChoices} paid-choice areas.${planCopy}`;
   }
 
   async function fillKnownFieldsFromMap(map) {
@@ -1285,126 +1900,11 @@
     return map.fields.find((field) => field.field === fieldType && field.element && field.element.type !== "radio" && field.element.type !== "checkbox");
   }
 
-  async function stepFillTravelerInformation(startMap = buildPageMap()) {
-    let map = startMap.step === "traveler_information" ? startMap : buildPageMap();
-    if (map.step !== "traveler_information") return false;
-
-    filledFields = [];
-    setAgentActivity("Preparing traveler details", "Will continue automatically once valid");
-    addAgentMessage("assistant", "Step mode: I will fill traveler details slowly, verify the page, then continue if it is valid.");
-    renderSidebar("agent");
-    await sleep(500);
-
-    const steps = [
-      { field: "email", label: "email" },
-      { field: "confirm_email", label: "confirm email" },
-      { field: "phone", label: "mobile number", phone: true },
-      { field: "title", label: "title", title: true },
-      { field: "first_name", label: "first name" },
-      { field: "last_name", label: "surname" },
-      { field: "date_of_birth", label: "date of birth" },
-      { field: "nationality", label: "nationality" },
-      { field: "passport_number", label: "passport number" },
-      { field: "passport_expiry", label: "passport expiry" }
-    ];
-
-    for (const step of steps) {
-      map = buildPageMap();
-      if (step.phone) {
-        setAgentActivity("Filling mobile number", "Country code + local number");
-        addAgentMessage("assistant", "Step: mobile number.");
-        renderSidebar("agent");
-        const count = await fillPhoneFieldsFromMap(map);
-        addAgentMessage("assistant", count ? "Mobile number accepted." : "Mobile number not filled; I could not identify a working phone control.");
-        renderSidebar("agent");
-        await sleep(850);
-        continue;
-      }
-
-      if (step.title) {
-        setAgentActivity("Selecting title", "From saved traveler gender");
-        addAgentMessage("assistant", "Step: title.");
-        renderSidebar("agent");
-        const ok = fillTitleRadio();
-        recordAction("step_title", { ok });
-        addAgentMessage("assistant", ok ? "Title selected." : "Title not selected; no matching saved gender/title or control found.");
-        renderSidebar("agent");
-        await sleep(850);
-        continue;
-      }
-
-      const value = travelerValue(step.field);
-      const field = firstFieldFor(map, step.field);
-      if (!value || !field) {
-        recordAction("step_fill_skip", { field: step.field, hasValue: Boolean(value), hasField: Boolean(field) });
-        continue;
-      }
-
-      addAgentMessage("assistant", `Step: ${step.label}.`);
-      setAgentActivity(`Filling ${step.label}`, "From saved traveler profile");
-      renderSidebar("agent");
-      const result = await setFieldValue(field.element, value, { fieldType: step.field });
-      if (result.ok) {
-        filledFields.push({
-          fieldType: step.field,
-          selector: field.element.name || field.element.id || field.element.tagName.toLowerCase(),
-          confidence: field.confidence
-        });
-      }
-      addAgentMessage("assistant", result.ok ? `${step.label} accepted.` : `${step.label} did not stick; I logged the failure.`);
-      renderSidebar("agent");
-      await sleep(850);
+  function sectionPatternForField(fieldType) {
+    if (["email", "confirm_email", "phone", "phone_country_code"].includes(fieldType)) {
+      return /contact information|provide your contact details|e-?mail|mobile number/i;
     }
-
-    let after = buildPageMap();
-    const phoneProblem = after.errors.some((issue) => /phone|mobile|too long|too short/i.test(issue));
-    if (phoneProblem) {
-      setAgentActivity("Repairing mobile number", "Country prefix or phone format still rejected");
-      addAgentMessage("assistant", "Phone validation is still visible, so I am retrying country code + local number before continuing.");
-      renderSidebar("agent");
-      await fillPhoneFieldsFromMap(after);
-      await sleep(600);
-      after = buildPageMap();
-    }
-    agent.pageMap = after;
-    agent.awaiting = "manual";
-    const issues = after.errors.slice(0, 3);
-    if (issues.length) {
-      agent.running = false;
-      addAgentMessage("assistant", `I filled traveler details, but the page still shows: ${issues.join("; ")}.`);
-      addAgentMessage("assistant", "I will not guess past a real validation error. Tell me what to use or fix it and type continue.");
-      renderSidebar("agent");
-      return true;
-    }
-    if (after.paidChoices.length && (agent.skipPaidExtrasApproved || prefersNoPaidExtras())) {
-      agent.skipPaidExtrasApproved = true;
-      setAgentActivity("Skipping paid extras", "Saved traveler rules prefer no paid add-ons");
-      addAgentMessage("assistant", "Traveler details are complete. I see paid extras on this page, so I am selecting the no-thanks choices before continuing.");
-      renderSidebar("agent");
-      const skipped = selectNoThanksOptions();
-      reportActionResult({
-        type: "skip_paid_extras",
-        action: "skip_paid_extras",
-        target: "paid extras on traveler page",
-        ok: true,
-        message: skipped ? `Selected ${skipped} no-thanks option${skipped === 1 ? "" : "s"}.` : "No visible no-thanks choices needed changing."
-      });
-      await sleep(700);
-      after = buildPageMap();
-      agent.pageMap = after;
-    }
-    const next = findPreferredContinueButton(after);
-    if (next) {
-      agent.awaiting = "";
-      addAgentMessage("assistant", "Traveler details look valid. Continuing to the next step.");
-      renderSidebar("agent");
-      await clickAndVerifyAdvance(next, next.innerText || next.value || "Continue");
-      return true;
-    }
-    agent.running = false;
-    addAgentMessage("assistant", "Traveler details look valid, but I do not see a safe Continue button yet.");
-    renderSidebar("agent");
-    return true;
+    return /passenger\s+\d+|traveller information|traveler information|first name|surname|title|passport/i;
   }
 
   function findButtonByRisk(map, risk) {
@@ -1422,7 +1922,59 @@
     if (exactContinue) return exactContinue;
     const containsContinue = safeButtons.find((button) => /\bcontinue\b/i.test(button.label))?.element;
     if (containsContinue) return containsContinue;
-    return safeButtons[0]?.element || findSafeContinueButton();
+    return safeButtons[0]?.element || findClickableByVisibleText(/^continue$/i) || findClickableByVisibleText(/\bcontinue\b/i) || findSafeContinueButton();
+  }
+
+  function isDisabledLike(element) {
+    if (!element) return false;
+    return Boolean(
+      element.disabled ||
+      element.getAttribute("aria-disabled") === "true" ||
+      /disabled|is-disabled/.test(element.className || "")
+    );
+  }
+
+  function clickableAncestor(element) {
+    let current = element;
+    for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+      if (current.closest?.("#atw-sidebar")) return null;
+      if (current.matches?.("button, a, input[type='button'], input[type='submit'], [role='button'], [tabindex]")) return current;
+      const style = getComputedStyle(current);
+      if (style.cursor === "pointer" && current.getBoundingClientRect().width > 40 && current.getBoundingClientRect().height > 24) return current;
+    }
+    return null;
+  }
+
+  function clickPointIsClear(element) {
+    const rect = element.getBoundingClientRect();
+    const x = Math.min(window.innerWidth - 2, Math.max(2, rect.left + rect.width / 2));
+    const y = Math.min(window.innerHeight - 2, Math.max(2, rect.top + rect.height / 2));
+    const top = document.elementFromPoint(x, y);
+    return Boolean(top && (top === element || element.contains(top) || top.contains(element)));
+  }
+
+  function findClickableByVisibleText(pattern) {
+    const candidates = queryAllDeep("button, a, input[type='button'], input[type='submit'], [role='button'], [tabindex], div, span")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .map((element) => {
+        const text = (element.innerText || element.value || element.getAttribute("aria-label") || element.textContent || "").replace(/\s+/g, " ").trim();
+        if (!text || text.length > 80 || !pattern.test(text) || isDangerousActionLabel(text)) return null;
+        const clickable = clickableAncestor(element) || element;
+        if (!isVisible(clickable) || isDisabledLike(clickable)) return null;
+        const rect = clickable.getBoundingClientRect();
+        let score = 40;
+        if (/^continue$/i.test(text)) score += 40;
+        if (clickable.matches?.("button, [role='button'], input[type='button'], input[type='submit']")) score += 20;
+        if (clickPointIsClear(clickable)) score += 12;
+        if (rect.width < 80 || rect.height < 28) score -= 30;
+        if (rect.top < 0 || rect.bottom > window.innerHeight) score -= 8;
+        return { element: clickable, score, text, box: elementBox(clickable) };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score || b.box.y - a.box.y);
+    const match = candidates[0]?.element || null;
+    if (match) logAgentEvent("visible_text_clickable", { text: candidates[0].text, score: candidates[0].score, box: candidates[0].box });
+    return match;
   }
 
   function compactPageMap(map) {
@@ -1432,13 +1984,53 @@
       step: map.step,
       text: map.text,
       fullText: map.fullText,
-      errors: map.errors,
+      errors: actionableCheckoutErrors(map.errors),
       paidChoices: map.paidChoices,
+      sectionProgress: agent.sectionProgress || {},
+      sections: (map.sections || []).map((section) => ({
+        id: section.id,
+        label: section.label,
+        type: section.type,
+        order: section.order,
+        status: section.status,
+        required: Boolean(section.required),
+        paidChoice: Boolean(section.paidChoice),
+        objective: section.objective,
+        selected: section.selected || [],
+        box: section.box,
+        fields: (section.fields || []).map((field) => ({
+          id: field.id,
+          label: field.label,
+          field: field.field,
+          kind: field.kind,
+          required: Boolean(field.required),
+          hasValue: Boolean(field.hasValue),
+          box: field.box
+        })).slice(0, 20),
+        buttons: (section.buttons || []).map((button) => ({
+          id: button.id,
+          label: button.label,
+          risk: button.risk,
+          box: button.box
+        })).slice(0, 20),
+        text: section.text
+      })).slice(0, 20),
+      taskQueue: (map.taskQueue || []).map((task) => ({
+        id: task.id,
+        sectionId: task.sectionId,
+        sectionLabel: task.sectionLabel,
+        sectionType: task.sectionType,
+        order: task.order,
+        status: task.status,
+        objective: task.objective,
+        rule: task.rule
+      })).slice(0, 30),
       summary: map.summary,
       coverage: map.coverage,
       fields: map.fields.map((field) => ({
         id: field.id,
         label: field.label,
+        box: field.box,
         kind: field.kind,
         field: field.field,
         required: field.required,
@@ -1475,34 +2067,6 @@
     }
   }
 
-  function localAgentDecision(map, reason = "local fallback") {
-    const safeButton = map.buttons.find((button) => button.risk === "safe_continue");
-    const skipButton = map.buttons.find((button) => button.risk === "skip_extra");
-    if (map.step === "payment") {
-      return { source: "local", action: "final_review", targetId: "", value: "", message: `I reached payment. Summary: ${routeSummary()}. I will not pay unless you explicitly confirm on the site.`, needsApproval: true, risk: "payment", reason };
-    }
-    if (map.step === "confirmation") {
-      return { source: "local", action: "save_trip", targetId: "", value: "", message: "Booking confirmation detected. I can save this confirmed trip to the dashboard.", needsApproval: false, risk: "safe", reason };
-    }
-    if ((map.step === "extras" || map.step === "seats") && !agent.skipPaidExtrasApproved) {
-      const paidCopy = map.paidChoices.length ? `I found ${map.paidChoices.join(", ")}.` : "I found optional baggage/seat/add-on choices.";
-      return { source: "local", action: "ask_user", targetId: "", value: "", message: `${paidCopy} Your default is to avoid paid extras unless you say otherwise. Skip paid extras and continue?`, needsApproval: true, risk: "money", reason };
-    }
-    if ((map.step === "extras" || map.step === "seats") && agent.skipPaidExtrasApproved) {
-      return { source: "local", action: "skip_paid_extras", targetId: skipButton?.id || "", value: "", message: "I will select no-thanks choices for paid extras, then continue if the page allows it.", needsApproval: false, risk: "safe", reason };
-    }
-    if (map.errors.length) {
-      return { source: "local", action: "ask_user", targetId: "", value: "", message: `I paused because the page still shows: ${map.errors.slice(0, 3).join("; ")}.`, needsApproval: true, risk: "uncertain", reason };
-    }
-    if (map.step === "traveler_information" || map.step === "unknown") {
-      return { source: "local", action: "fill_known_fields", targetId: "", value: "", message: "I will fill recognizable traveler fields from the saved profile.", needsApproval: false, risk: "safe", reason };
-    }
-    if (safeButton) {
-      return { source: "local", action: "click", targetId: safeButton.id, value: "", message: `Continuing safely: ${safeButton.label || "next step"}.`, needsApproval: false, risk: "safe", reason };
-    }
-    return { source: "local", action: "ask_user", targetId: "", value: "", message: `${describePageMap(map)} I do not see a safe next action. Tell me what to do.`, needsApproval: true, risk: "uncertain", reason };
-  }
-
   async function requestAgentDecision(map, userMessage = "") {
     logAgentEvent("agent_request", {
       userMessage: userMessage ? "[provided]" : "",
@@ -1523,7 +2087,7 @@
           userMessage,
           traveler: traveler(),
           approvalState: {
-            skipPaidExtrasApproved: agent.skipPaidExtrasApproved || prefersNoPaidExtras(),
+            skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
             paymentApproved: false
           },
           actionHistory: agent.actionHistory.slice(-12),
@@ -1546,7 +2110,16 @@
       });
       return decision;
     } catch (error) {
-      const decision = localAgentDecision(map, error.message);
+      const decision = {
+        source: "system",
+        action: "stop",
+        targetId: "",
+        value: "",
+        message: `AI agent unavailable: ${error.message}. I stopped because AI-only mode is enabled.`,
+        needsApproval: true,
+        risk: "uncertain",
+        reason: "AI-only mode: backend/OpenAI must provide the next action."
+      };
       logAgentEvent("agent_decision", {
         source: decision.source,
         action: decision.action,
@@ -1584,18 +2157,30 @@
     processCheckoutAgent();
   }
 
-  async function clickAndVerifyAdvance(element, label = "Continue", delay = 1200) {
+  function visibleValidationElement() {
+    return queryAllDeep("body *")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .map((element) => {
+        const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+        if (!text || text.length > 220) return null;
+        return /select one option|select an option|choose one option|please select|required|must enter|invalid|not valid|too long|too short/i.test(text)
+          ? { element, text }
+          : null;
+      })
+      .filter(Boolean)[0] || null;
+  }
+
+  async function clickAndVerifyAdvance(element, label = "Continue", delay = 1200, options = {}) {
     const before = pageSignature();
     addAgentMessage("assistant", `Clicking: ${label}.`);
-    setAgentActivity(`Clicking ${label}`, "Checking whether the page advances");
-    showAgentCursor(element, `Clicking ${label}`, "Safe navigation step");
+    await showAgentThought(element, "Exit", `Act: click ${label}`, "Checking whether the page advances.");
     flashElement(element);
     element.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
     await sleep(250);
     userLikeClick(element);
     await waitForUiSettle(700);
     await sleep(delay);
-    let afterMap = buildPageMap();
+    let afterMap = rememberPagePlan(buildPageMap());
     let advanced = before !== pageSignature(afterMap);
     agent.pageMap = afterMap;
     setAgentActivity(advanced ? `Advanced to ${afterMap.step.replace(/_/g, " ")}` : `${label} did not advance`, advanced ? "Reading the next page state" : "Looking for the remaining blocker");
@@ -1615,57 +2200,16 @@
       errors: afterMap.errors
     });
     if (!advanced && inferCheckoutSite() !== "demo") {
-      if (!afterMap.errors.length && agent.running) {
-        addAgentMessage("assistant", `${label} did not advance, so I am rescanning for a remaining required choice instead of stopping.`);
+      if (agent.running) {
+        addAgentMessage("assistant", `${label} did not advance, so I am rescanning and sending the updated page back to the AI.`);
+        if (afterMap.errors.length) addAgentMessage("assistant", `Visible issue: ${afterMap.errors.slice(0, 2).join("; ")}.`);
         await continueAfterAction(350);
         return false;
       }
-      agent.awaiting = "manual";
-      agent.running = false;
-      addAgentMessage("assistant", `I clicked ${label}, but the page did not advance. Something is still unresolved on this step.`);
-      if (afterMap.errors.length) addAgentMessage("assistant", `Visible issue: ${afterMap.errors.slice(0, 2).join("; ")}.`);
-      addAgentMessage("assistant", "Tell me what to select, or choose it on the page and type continue.");
-      renderSidebar("agent");
       return false;
     }
     await continueAfterAction(250);
     return true;
-  }
-
-  async function skipPaidExtrasAndContinue() {
-    if (agent.skipRoutineRunning) return;
-    agent.skipRoutineRunning = true;
-    agent.skipPaidExtrasApproved = true;
-    try {
-      const skipped = selectNoThanksOptions();
-      logAgentEvent("skip_paid_extras", { changedChoices: skipped });
-      reportActionResult({
-        type: "skip_paid_extras",
-        action: "skip_paid_extras",
-        target: "paid extras",
-        ok: true,
-        message: skipped ? `Selected ${skipped} no-thanks option${skipped === 1 ? "" : "s"}.` : "No unchecked paid-extra choices needed changing."
-      });
-      if (skipped) addAgentMessage("assistant", `Selected ${skipped} unchecked no-thanks option${skipped === 1 ? "" : "s"}.`);
-      renderSidebar("agent");
-      await sleep(700);
-
-      const refreshedMap = buildPageMap();
-      agent.pageMap = refreshedMap;
-      const next = findPreferredContinueButton(refreshedMap);
-      if (!next) {
-        agent.awaiting = "manual";
-        agent.running = false;
-        addAgentMessage("assistant", "I set the no-paid-extra choices I could find, but I do not see a safe Continue button. Tell me what to do next.");
-        renderSidebar("agent");
-        return;
-      }
-
-      if (!repeatGuardFor(next, "I tried Continue after setting no-paid-extra choices and the page did not advance. I stopped so I do not loop. Tell me which visible choice is still required, or choose it and say continue.")) return;
-      await clickAndVerifyAdvance(next, next.innerText || next.value || "Continue");
-    } finally {
-      agent.skipRoutineRunning = false;
-    }
   }
 
   async function executeAgentDecision(decision, map) {
@@ -1677,7 +2221,7 @@
     });
     const message = decision.message || "I have a next action.";
     if (!agent.messages.at(-1) || agent.messages.at(-1).text !== message) {
-      addAgentMessage("assistant", `${message}${decision.source === "openai" ? "" : " (fallback)"}`);
+      addAgentMessage("assistant", message);
     }
     if (decision.reason) {
       setAgentActivity(message, decision.reason);
@@ -1730,11 +2274,6 @@
       return;
     }
 
-    if (decision.action === "skip_paid_extras") {
-      await skipPaidExtrasAndContinue();
-      return;
-    }
-
     if (decision.action === "click") {
       const target = elementById(decision.targetId);
       if (!target) {
@@ -1746,10 +2285,6 @@
       }
       const button = map.buttons.find((item) => item.id === decision.targetId);
       const targetText = labelText(target) || target.innerText || button?.label || "";
-      if (agent.skipPaidExtrasApproved && (button?.risk === "skip_extra" || isSkipChoiceLabel(targetText))) {
-        await skipPaidExtrasAndContinue();
-        return;
-      }
       if (button?.risk === "payment" || isDangerousActionLabel(button?.label || "")) {
         agent.awaiting = "final";
         agent.running = false;
@@ -1802,177 +2337,69 @@
     agent.messages = [];
     agent.lastClickSignature = "";
     agent.repeatClickCount = 0;
-    agent.skipPaidExtrasApproved = prefersNoPaidExtras();
+    agent.skipPaidExtrasApproved = false;
+    agent.autopilotMode = true;
+    agent.skipPaidExtrasApproved = shouldAutoDeclinePaidExtras();
     agent.actionHistory = [];
+    resetSectionProgress();
     setAgentActivity("Starting checkout agent", travelerRules() || "Using saved traveler profile");
-    agent.pageMap = buildPageMap();
+    agent.pageMap = rememberPagePlan(buildPageMap());
     await startAgentSession();
     addAgentMessage("assistant", `${describePageMap(agent.pageMap)} I will work step by step and ask when money, payment, or uncertainty appears.`);
     renderSidebar("agent");
-    await sleep(450);
-    if (agent.pageMap.step === "traveler_information") {
-      await stepFillTravelerInformation(agent.pageMap);
-      return;
-    }
+    await announceSectionQueue();
+    await sleep(650);
     processCheckoutAgent();
   }
 
   async function processCheckoutAgent() {
     if (!agent.running) return;
     warnings = runRiskChecks();
-    const map = buildPageMap();
+    const map = rememberPagePlan(buildPageMap());
     agent.pageMap = map;
-    if ((map.step === "extras" || map.step === "seats") && agent.skipPaidExtrasApproved) {
-      await executeAgentDecision(localAgentDecision(map, "policy override after user approved skipping paid extras"), map);
+    const interrupt = await settleAndHandleInterrupts("agent loop");
+    if (interrupt.handled) {
+      await continueAfterAction(500);
       return;
     }
+    if (interrupt.blocked) {
+      agent.running = false;
+      agent.awaiting = "manual";
+      addAgentMessage("assistant", "A popup is open and I do not have a safe automatic choice. I stopped so I do not keep working in the background.");
+      renderSidebar("agent");
+      return;
+    }
+    let stableMap = rememberPagePlan(buildPageMap());
+    agent.pageMap = stableMap;
+
+    const hasProfileFillTargets = stableMap.fields.some((field) => {
+      if (!field.element || ["unknown", "phone_country_code"].includes(field.field)) return false;
+      const value = travelerValue(field.field);
+      if (!value) return false;
+      return !field.value || field.value.trim() !== String(value).trim();
+    });
+    const hasContactOrPassengerFields = /traveler|traveller|contact|passenger/i.test(stableMap.step)
+      || stableMap.fields.some((field) => ["email", "confirm_email", "phone", "first_name", "last_name", "title"].includes(field.field));
+    if (hasContactOrPassengerFields && hasProfileFillTargets) {
+      await showAgentThought(
+        document.body,
+        "Profile",
+        "Fill saved traveler details first",
+        "This is trusted wallet data, so the AI should not ask you for name, email, phone, or title.",
+        900
+      );
+      const count = await fillKnownFieldsFromMap(stableMap);
+      if (count) {
+        addAgentMessage("assistant", `Filled ${count} saved traveler field${count === 1 ? "" : "s"} before asking AI for the next page action.`);
+        stableMap = rememberPagePlan(buildPageMap());
+        agent.pageMap = stableMap;
+      }
+    }
+
     const userMessage = agent.pendingUserMessage;
     agent.pendingUserMessage = "";
-    const decision = await requestAgentDecision(map, userMessage);
-    await executeAgentDecision(decision, map);
-    return;
-
-    const demoStep = activeDemoStepName();
-
-    if (map.step === "payment") {
-      agent.awaiting = "final";
-      agent.running = false;
-      addAgentMessage("assistant", `I reached payment. Summary: ${routeSummary()}. I will not pay unless you explicitly confirm on the site.`);
-      renderSidebar("review");
-      return;
-    }
-
-    if (map.step === "confirmation") {
-      agent.awaiting = "";
-      agent.running = false;
-      addAgentMessage("assistant", "Booking confirmation detected. I can save this confirmed trip to the dashboard.");
-      renderSidebar("saved");
-      return;
-    }
-
-    if (map.step === "extras" || map.step === "seats") {
-      if (!agent.skipPaidExtrasApproved) {
-        agent.awaiting = "extras";
-        agent.running = false;
-        const paidCopy = map.paidChoices.length ? `I found ${map.paidChoices.join(", ")}.` : "I found optional baggage/seat/add-on choices.";
-        addAgentMessage("assistant", `${paidCopy} Your default is to avoid paid extras unless you say otherwise. Skip paid extras and continue?`);
-        renderSidebar("agent");
-        return;
-      }
-
-      const skipped = selectNoThanksOptions();
-      if (skipped) {
-        addAgentMessage("assistant", `Selected ${skipped} no-thanks/skip option${skipped === 1 ? "" : "s"}.`);
-        renderSidebar("agent");
-        await sleep(500);
-      }
-
-      const nextFromExtras = findButtonByRisk(buildPageMap(), "safe_continue") || findSafeContinueButton();
-      if (nextFromExtras) {
-        const signature = elementSignature(nextFromExtras);
-        if (signature === agent.lastClickSignature) {
-          agent.repeatClickCount += 1;
-        } else {
-          agent.lastClickSignature = signature;
-          agent.repeatClickCount = 0;
-        }
-        if (agent.repeatClickCount >= 1 && inferCheckoutSite() !== "demo") {
-          agent.awaiting = "manual";
-          agent.running = false;
-          addAgentMessage("assistant", "I tried Continue once after skipping extras and the page did not advance. I stopped so I do not loop. Tell me which visible choice to pick, or choose it and say continue.");
-          renderSidebar("agent");
-          return;
-        }
-        addAgentMessage("assistant", `Continuing safely: ${nextFromExtras.innerText || nextFromExtras.value || "next step"}.`);
-        showAgentCursor(nextFromExtras);
-        flashElement(nextFromExtras);
-        nextFromExtras.click();
-        renderSidebar("agent");
-        await sleep(900);
-        processCheckoutAgent();
-        return;
-      }
-
-      agent.awaiting = "manual";
-      agent.running = false;
-      addAgentMessage("assistant", "I skipped the no-thanks choices I could find, but I do not see a safe Continue button yet. Tell me what to do next.");
-      renderSidebar("agent");
-      return;
-    }
-
-    if (map.step === "traveler_information" || map.step === "unknown") {
-      const count = await fillKnownFieldsFromMap(map);
-      if (count) {
-        addAgentMessage("assistant", `Filled ${count} visible field${count === 1 ? "" : "s"} from the live page map.`);
-        renderSidebar("agent");
-        await sleep(450);
-      }
-    }
-
-    if (demoStep === "extras") {
-      agent.awaiting = "extras";
-      agent.running = false;
-      addAgentMessage("assistant", "Baggage is not included. Add cabin bag for $32 or skip extras?");
-      renderSidebar("agent");
-      return;
-    }
-
-    if (demoStep === "review") {
-      agent.awaiting = "final";
-      agent.running = false;
-      addAgentMessage("assistant", `Ready to book: ${routeSummary()}. Review payment yourself, then confirm or stop.`);
-      renderSidebar("review");
-      return;
-    }
-
-    if (demoStep === "confirmation") {
-      agent.awaiting = "";
-      agent.running = false;
-      addAgentMessage("assistant", "Booking confirmation detected. I can save this confirmed trip to the dashboard.");
-      renderSidebar("saved");
-      return;
-    }
-
-    const issues = map.errors;
-    if (issues.length) {
-      agent.awaiting = "manual";
-      agent.running = false;
-      addAgentMessage("assistant", `I paused because the page still shows: ${issues.slice(0, 3).join("; ")}.`);
-      addAgentMessage("assistant", "Tell me what to do in chat, or fix it on the page and say continue.");
-      renderSidebar("agent");
-      return;
-    }
-
-    const next = findButtonByRisk(map, "safe_continue") || findSafeContinueButton();
-    if (next) {
-      const signature = elementSignature(next);
-      if (signature === agent.lastClickSignature) {
-        agent.repeatClickCount += 1;
-      } else {
-        agent.lastClickSignature = signature;
-        agent.repeatClickCount = 0;
-      }
-      if (agent.repeatClickCount >= 1 && inferCheckoutSite() !== "demo") {
-        agent.awaiting = "manual";
-        agent.running = false;
-        addAgentMessage("assistant", "I tried Continue once and the page did not advance. I stopped so I do not loop. Please review the visible validation errors.");
-        addAgentMessage("assistant", "After you adjust the page, click 'I fixed it, continue'.");
-        renderSidebar("agent");
-        return;
-      }
-      addAgentMessage("assistant", `Continuing safely: ${next.innerText || next.value || "next step"}.`);
-      showAgentCursor(next);
-      flashElement(next);
-      next.click();
-      renderSidebar("agent");
-      await sleep(800);
-      processCheckoutAgent();
-      return;
-    }
-
-    agent.awaiting = "manual";
-    addAgentMessage("assistant", `${describePageMap(map)} I do not see a safe next action. Tell me what to do.`);
-    renderSidebar("agent");
+    const decision = await requestAgentDecision(stableMap, userMessage);
+    await executeAgentDecision(decision, stableMap);
   }
 
   function collectBlockingIssues() {
@@ -1985,7 +2412,7 @@
     for (const text of visibleText) {
       const normalized = text.toLowerCase();
       if (normalized.length > 180) continue;
-      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /required|must enter|too long|invalid|not valid|error/.test(normalized)) {
+      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /required|must enter|too long|invalid|not valid|error|select.+option|choose.+option|please select/.test(normalized)) {
         issues.push(text.replace(/\s+/g, " "));
       }
       if (issues.length >= 4) break;
@@ -2014,7 +2441,8 @@
       document.querySelector("[data-demo-skip-extras]")?.click();
       agent.awaiting = "";
       agent.running = true;
-      await skipPaidExtrasAndContinue();
+      agent.pendingUserMessage = "Use my saved no-extras preference and continue safely.";
+      await processCheckoutAgent();
     }
 
     if (choice === "add_bag") {
@@ -2062,7 +2490,8 @@
       agent.skipPaidExtrasApproved = true;
       agent.running = true;
       agent.awaiting = "";
-      await skipPaidExtrasAndContinue();
+      agent.pendingUserMessage = "Use my saved no-extras preference and continue safely.";
+      await processCheckoutAgent();
     }
   }
 
@@ -2081,18 +2510,18 @@
       return;
     }
 
-    if (/skip|no thanks|no extra|no add|do not add|dont add|don't add/.test(normalized)) {
-      await handleAgentChoice("skip_paid");
-      return;
-    }
-
     if (/add.*bag|checked bag|baggage/.test(normalized) && !/no|skip|dont|don't/.test(normalized)) {
       await handleAgentChoice("add_bag");
       return;
     }
 
     if (agent.awaiting === "extras" && /continue|try again|fixed|done|yes|ok|go ahead|proceed/.test(normalized)) {
-      await handleAgentChoice("skip_paid");
+      agent.pendingUserMessage = text;
+      agent.running = true;
+      agent.awaiting = "";
+      renderSidebar("agent");
+      await sleep(300);
+      processCheckoutAgent();
       return;
     }
 
@@ -2116,56 +2545,8 @@
     processCheckoutAgent();
   }
 
-  function clickUncheckedInputByLabel(pattern, description) {
-    const inputs = queryAllDeep("input[type='radio'], input[type='checkbox']")
-      .filter((candidate) => isVisible(candidate) && !candidate.closest("#atw-sidebar"));
-    const match = inputs.find((candidate) => pattern.test(labelText(candidate)) && !candidate.checked);
-    if (!match) return false;
-
-    setAgentActivity(`Selecting ${description}`, "Traveler rules avoid paid extras");
-    showAgentCursor(match, description, "Rule: avoid paid extras");
-    userLikeClick(match);
-    match.dispatchEvent(new Event("input", { bubbles: true }));
-    match.dispatchEvent(new Event("change", { bubbles: true }));
-    flashElement(match);
-    logAgentEvent("adapter_click", { description, label: labelText(match).slice(0, 160) });
-    return true;
-  }
-
-  function selectGoToGateNoPaidExtras() {
-    if (inferCheckoutSite() !== "gotogate") return 0;
-    const changed = [
-      clickUncheckedInputByLabel(/checkinbaggage.*false|no checked baggage/i, "no checked baggage"),
-      clickUncheckedInputByLabel(/ancillarybundle.*no,?\s+thanks|continue without bundle/i, "no bundle"),
-      clickUncheckedInputByLabel(/cancellationguarantee_false|cancellation.*no,?\s+thanks/i, "no cancellation guarantee")
-    ].filter(Boolean).length;
-    if (changed) logAgentEvent("gotogate_adapter", { changed });
-    return changed;
-  }
-
-  function selectNoThanksOptions() {
-    let clicked = selectGoToGateNoPaidExtras();
-    const candidates = queryAllDeep("input[type='radio'], input[type='checkbox'], button, [role='button']")
-      .filter((candidate) => isVisible(candidate) && !candidate.closest("#atw-sidebar"));
-    for (const candidate of candidates) {
-      const text = labelText(candidate) || candidate.innerText?.toLowerCase() || "";
-      if (!isSkipChoiceLabel(text)) continue;
-      if ((candidate.type === "radio" || candidate.type === "checkbox") && candidate.checked) continue;
-      if (/skip to main content|skip to next step/i.test(text)) continue;
-
-      try {
-        setAgentActivity("Selecting No thanks", "Traveler rules avoid paid extras");
-        showAgentCursor(candidate, "No thanks", "Rule: avoid paid extras");
-        userLikeClick(candidate);
-        candidate.dispatchEvent(new Event("input", { bubbles: true }));
-        candidate.dispatchEvent(new Event("change", { bubbles: true }));
-        flashElement(candidate);
-        clicked += 1;
-      } catch (error) {
-        logAgentEvent("skip_click_failed", { label: text.slice(0, 120), error: error.message });
-      }
-    }
-    return clicked;
+  function actionableCheckoutErrors(errors = []) {
+    return errors;
   }
 
   function monthsAfter(dateString, months) {
@@ -2309,6 +2690,43 @@
     `;
   }
 
+  function safeText(value = "") {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function agentPlanHtml(map) {
+    const sections = map.sections || agent.sectionPlan || [];
+    const tasks = map.taskQueue || agent.taskQueue || [];
+    if (!sections.length && !tasks.length) return "";
+    const currentTask = tasks.find((task) => task.status === "pending") || tasks.find((task) => task.status === "locked") || null;
+    const rows = sections.slice(0, 8).map((section) => {
+      const isCurrent = currentTask?.sectionId === section.id;
+      const status = section.status || "unknown";
+      return `
+        <li class="atw-plan-row ${isCurrent ? "is-current" : ""} is-${safeText(status)}">
+          <span class="atw-plan-index">${section.order}</span>
+          <span class="atw-plan-copy">
+            <strong>${safeText(section.label)}</strong>
+            <em>${safeText(status)} · ${safeText(section.objective)}</em>
+          </span>
+        </li>
+      `;
+    }).join("");
+    return `
+      <div class="atw-plan">
+        <div class="atw-plan-title">
+          <span>Page plan</span>
+          <small>${tasks.filter((task) => task.status === "pending").length} pending</small>
+        </div>
+        <ol>${rows}</ol>
+      </div>
+    `;
+  }
+
   function agentChatHtml() {
     const shouldShowThread = Boolean(agent.awaiting) || !agent.running;
     const visibleMessages = shouldShowThread
@@ -2319,10 +2737,11 @@
     const messages = visibleMessages.length
       ? visibleMessages
       : [{ role: "assistant", text: `I found ${routeSummary()}. Want me to complete checkout for ${traveler()?.first_name || "this traveler"}?` }];
-    const map = agent.pageMap || buildPageMap();
+    const map = agent.pageMap || rememberPagePlan(buildPageMap());
     return `
       ${agentStatusHtml(map)}
       <div class="atw-map-line">Reading ${map.site}: ${map.step.replace(/_/g, " ")} · ${map.summary.knownFields}/${map.summary.fields} fields · ${map.summary.paidChoices} paid areas</div>
+      ${agentPlanHtml(map)}
       ${shouldShowThread ? `
         <div class="atw-chat">
           ${messages.slice(-3).map((message) => `<div class="atw-message ${message.role}">${message.text}</div>`).join("")}
