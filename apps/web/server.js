@@ -983,9 +983,25 @@ function noExtrasApprovedForPayload(payload) {
 
 function safeDeclineSurfaceOption(activeSurface) {
   const options = [...(activeSurface?.options || []), ...(activeSurface?.buttons || [])]
-    .filter((option) => option?.id && !option.selected);
-  return options.find((option) => /safe_decline/i.test(option.risk || "") || /decline_paid_extra/i.test(option.semantic || ""))
-    || options.find((option) => /none of the passengers|none of the travellers|none of the travelers|no,?\s*thanks|not now|skip|decline|0\s*(eur|€|usd|\$)/i.test(option.label || ""));
+    .filter((option, index, list) => option?.id && !option.selected && list.findIndex((item) => item?.id === option.id) === index);
+  const surfaceText = `${activeSurface?.taskHint || ""} ${activeSurface?.label || ""}`.toLowerCase();
+  const isSeatSurface = /seat|reserve seating|seat map/.test(surfaceText);
+  const scoreOption = (option) => {
+    const label = String(option.label || "").toLowerCase();
+    if (!label) return -1000;
+    if (/add|buy|upgrade|premium|cart|add to my trip/.test(label) && !/no|none|without|0\s*(eur|€|usd|\$)/.test(label)) return -100;
+    if (/safe_decline/i.test(option.risk || "") || /decline_paid_extra/i.test(option.semantic || "")) return 120;
+    if (/none of the passengers|none of the travellers|none of the travelers/.test(label)) return 115;
+    if (/0\s*(eur|€|usd|\$)|free/.test(label)) return 105;
+    if (/i.ll go without|go without|continue without/.test(label)) return 95;
+    if (/no,?\s*thanks|not now|skip|decline|no checked baggage|no baggage/.test(label)) return 90;
+    if (isSeatSurface && /\bnext\b|skip seat selection|random seat|no seat/.test(label)) return 70;
+    return -10;
+  };
+  return options
+    .map((option) => ({ option, score: scoreOption(option) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)[0]?.option || null;
 }
 
 function sanitizeAgentError(reason) {

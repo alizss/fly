@@ -2122,29 +2122,77 @@
     return 0;
   }
 
+  function overlaySignature(overlay) {
+    if (!overlay || !document.contains(overlay) || !isVisible(overlay)) return "";
+    const role = overlay.getAttribute("role") || "";
+    const rect = overlay.getBoundingClientRect();
+    const selectedState = overlayButtons(overlay)
+      .map((button) => `${normalizeMatchText(overlayChoiceText(button)).slice(0, 80)}:${isChoiceSelected(button) || button.getAttribute?.("aria-selected") === "true" || button.getAttribute?.("aria-checked") === "true" ? "1" : "0"}`)
+      .join(";");
+    return [
+      role,
+      Math.round(rect.left),
+      Math.round(rect.top),
+      Math.round(rect.width),
+      Math.round(rect.height),
+      selectedState,
+      overlayText(overlay).slice(0, 1200)
+    ].join("|");
+  }
+
+  async function waitForOverlayProgress(overlay, beforeSignature, timeout = 2200) {
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+      await waitForPaint(240);
+      const overlays = activeOverlayElements();
+      if (!overlays.length) return { ok: true, reason: "overlay closed" };
+      if (!overlay || !document.contains(overlay) || !isVisible(overlay)) {
+        return { ok: true, reason: "overlay removed" };
+      }
+      if (!overlays.includes(overlay)) return { ok: true, reason: "active overlay changed" };
+      const afterSignature = overlaySignature(overlay);
+      if (beforeSignature && afterSignature && afterSignature !== beforeSignature) {
+        return { ok: true, reason: "overlay content changed" };
+      }
+    }
+    return { ok: false, reason: "overlay did not change" };
+  }
+
+  function uniqueOverlayCandidates(items) {
+    const seen = new Set();
+    return items.filter((item) => {
+      const key = `${normalizeMatchText(item.label)}:${Math.round(item.button.getBoundingClientRect().top / 8)}`;
+      if (!normalizeMatchText(item.label) || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
   async function handleRoutineExtraOverlay(overlay, context = "", task = null) {
     const text = overlayText(overlay);
     const kind = routineExtraOverlayKind(text, task);
     if (!kind || !shouldAutoDeclinePaidExtras()) return false;
-    const candidates = overlayButtons(overlay)
+    const candidates = uniqueOverlayCandidates(overlayButtons(overlay)
       .map((button) => ({ button, score: scoreAutoDeclineButton(button, kind), label: overlayChoiceText(button) }))
       .filter((item) => item.score > 0 && !item.button.disabled && item.button.getAttribute("aria-disabled") !== "true")
-      .sort((a, b) => b.score - a.score);
-    const pick = candidates[0];
-    if (!pick) return false;
-    await showAgentThought(
-      pick.button,
-      "Interrupt",
-      `Handle ${kind}`,
-      `Saved rules say no paid seats/extras. Choosing "${pick.label}" before doing anything in the background.`,
-      900
-    );
-    flashElement(pick.button);
-    userLikeClick(pick.button);
-    recordAction("auto_decline_overlay", { context, kind, label: pick.label });
-    await waitForUiSettle(900);
-    await verifyAgentStep(pick.button, "Interrupt", `${kind} handled with ${pick.label}`, true, 700);
-    return true;
+      .sort((a, b) => b.score - a.score));
+    for (const pick of candidates.slice(0, 5)) {
+      const before = overlaySignature(overlay);
+      await showAgentThought(
+        pick.button,
+        "Interrupt",
+        `Handle ${kind}`,
+        `Saved rules say no paid seats/extras. Trying "${pick.label}" and verifying the popup changes before moving on.`,
+        900
+      );
+      flashElement(pick.button);
+      userLikeClick(pick.button);
+      recordAction("auto_decline_overlay", { context, kind, label: pick.label });
+      const progress = await waitForOverlayProgress(overlay, before, 1800);
+      await verifyAgentStep(pick.button, "Interrupt", `${kind}: ${progress.reason}`, progress.ok, 600);
+      if (progress.ok) return true;
+    }
+    return false;
   }
 
   async function closeTransientOverlay(overlay, context = "") {
@@ -2195,7 +2243,7 @@
         return { blocked: false, handled: true, overlays: overlays.length };
       }
       const activeSurface = buildActiveSurface([overlay]);
-      if (/agent loop/i.test(context) && activeSurface.type === "dropdown") {
+      if (/agent loop/i.test(context) && shouldDeferActiveSurfaceToAgent(activeSurface)) {
         logAgentEvent("active_surface_deferred", {
           context,
           type: activeSurface.type,
@@ -2209,8 +2257,8 @@
         await showAgentThought(
           overlay,
           "Observe",
-          "Dropdown active",
-          "This open dropdown is the active screen. I will send its visible options to the agent instead of stopping.",
+          "Active surface",
+          "This open popup/dropdown is the active screen. I will send its visible options to the agent instead of stopping or working behind it.",
           750
         );
         return { blocked: false, handled: false, overlays: overlays.length, activeSurface };
@@ -2280,6 +2328,31 @@
     if (semantic === "decline_paid_extra") return "safe_decline";
     if (semantic === "add_paid_extra") return "paid";
     return "unknown";
+  }
+
+  function activeSurfaceEntries(surface) {
+    return [...(surface?.options || []), ...(surface?.buttons || [])]
+      .filter((entry, index, list) => entry?.id && list.findIndex((item) => item?.id === entry.id) === index);
+  }
+
+  function activeSurfaceHasSafeChoice(surface) {
+    return activeSurfaceEntries(surface).some((entry) => {
+      const label = entry.label || "";
+      return entry.risk === "safe_decline"
+        || entry.semantic === "decline_paid_extra"
+        || /none of the passengers|none of the travellers|none of the travelers|no,?\s*thanks|not now|skip|decline|go without|without|0\s*(eur|€|usd|\$)/i.test(label);
+    });
+  }
+
+  function activeSurfaceLooksDangerous(surface) {
+    const text = `${surface?.label || ""} ${activeSurfaceEntries(surface).map((entry) => entry.label).join(" ")}`;
+    return /pay now|submit payment|confirm payment|confirm booking|complete booking|book now|accept terms|terms and conditions/i.test(text);
+  }
+
+  function shouldDeferActiveSurfaceToAgent(surface) {
+    if (!surface || surface.type === "page") return false;
+    if (activeSurfaceLooksDangerous(surface) && !activeSurfaceHasSafeChoice(surface)) return false;
+    return true;
   }
 
   function buildActiveSurface(overlays = activeOverlayElements()) {
@@ -3105,9 +3178,23 @@
         return;
       }
       const actedSection = liveSectionForElement(map, target);
+      const surfaceWasActive = Boolean(map.activeSurface?.type && map.activeSurface.type !== "page");
+      const beforeOverlay = surfaceWasActive ? activeOverlayElements()[0] : null;
+      const beforeOverlaySignature = beforeOverlay ? overlaySignature(beforeOverlay) : "";
       showAgentCursor(target, button?.label || "clicking");
       flashElement(target);
-      target.click();
+      userLikeClick(target);
+      if (surfaceWasActive) {
+        const progress = await waitForOverlayProgress(beforeOverlay, beforeOverlaySignature, 2200);
+        await verifyAgentStep(target, "Interrupt", progress.ok ? `active surface ${progress.reason}` : "active surface did not change", progress.ok, 650);
+        if (!progress.ok) {
+          addAgentMessage("assistant", "That visible popup/dropdown did not change after the click, so I am rescanning it instead of marking it done.");
+          await continueAfterAction(450);
+          return;
+        }
+        await continueAfterAction(500);
+        return;
+      }
       await waitForUiSettle(800);
       if (actedSection?.type && actedSection.type !== "unknown") {
         await verifyAndRememberSection(actedSection.type, actedSection.label);
