@@ -895,14 +895,47 @@ function activeSurfaceTargetIds(activeSurface) {
   ].filter(Boolean);
 }
 
+function defaultActiveSurface() {
+  return { type: "page", id: "", label: "", role: "", taskHint: "", options: [], buttons: [] };
+}
+
 function scopePayloadToCurrentTask(payload) {
   const page = payload.page || {};
+  const activeSurface = page.activeSurface || defaultActiveSurface();
+  const surfaceActive = activeSurface.type && activeSurface.type !== "page";
+  if (surfaceActive) {
+    const allowedTargetIds = new Set(activeSurfaceTargetIds(activeSurface));
+    const surfaceTask = {
+      id: `active_surface:${activeSurface.type}:${activeSurface.id || "visible"}`,
+      sectionId: activeSurface.id || "",
+      sectionLabel: activeSurface.label || activeSurface.taskHint || activeSurface.type,
+      sectionType: "active_surface",
+      order: 0,
+      status: "pending",
+      objective: `Resolve the visible ${activeSurface.type} before touching the background page.`,
+      rule: "Foreground surfaces own the next action. Use visible options/buttons and safety policy."
+    };
+
+    return {
+      ...payload,
+      page: {
+        ...page,
+        currentTask: surfaceTask,
+        allowedTargetIds: [...allowedTargetIds],
+        activeSurface,
+        sections: (page.sections || []).map((section) => scopedSection(section, false)),
+        fields: [],
+        buttons: [],
+        paidChoices: (page.paidChoices || []).slice(0, 4)
+      }
+    };
+  }
+
   const nextTask = page.reconciliation?.nextTask || null;
   const currentSection = nextTask
     ? (page.sections || []).find((section) => section.id === nextTask.sectionId)
     : null;
   const allowedTargetIds = new Set(allowedTargetIdsForSection(currentSection));
-  for (const id of activeSurfaceTargetIds(page.activeSurface)) allowedTargetIds.add(id);
   if (page.stageExit?.continueAllowed && page.stageExit.continueTargetId) allowedTargetIds.add(page.stageExit.continueTargetId);
   const allowed = [...allowedTargetIds];
 
@@ -912,7 +945,7 @@ function scopePayloadToCurrentTask(payload) {
       ...page,
       currentTask: nextTask,
       allowedTargetIds: allowed,
-      activeSurface: page.activeSurface || { type: "page", id: "", label: "", role: "", taskHint: "", options: [], buttons: [] },
+      activeSurface,
       sections: (page.sections || []).map((section) => scopedSection(section, !nextTask || section.id === nextTask.sectionId)),
       fields: (page.fields || []).filter((field) => !allowed.length || allowedTargetIds.has(field.id)),
       buttons: (page.buttons || []).filter((button) => !allowed.length || allowedTargetIds.has(button.id) || button.id === page.stageExit?.continueTargetId),
@@ -925,6 +958,8 @@ function decisionInsideCurrentScope(decision, payload) {
   if (!["click", "type", "select"].includes(decision?.action)) return true;
   const allowed = new Set(payload.page?.allowedTargetIds || []);
   if (!allowed.size) return true;
+  const activeSurface = payload.page?.activeSurface || {};
+  if (activeSurface.type && activeSurface.type !== "page" && !decision.targetId && decision.value) return true;
   return allowed.has(decision.targetId);
 }
 
@@ -1061,9 +1096,14 @@ async function callOpenAiAgent(payload) {
         "Do not ask the user for saved traveler/profile details that are present in traveler or can be filled by fill_known_fields.",
         "If contact or passenger fields are visible and empty, prefer fill_known_fields before asking the user.",
         "If traveler.booking_rules says avoid/no paid extras, no seats, no insurance, no bundles, or no add-ons, treat routine decline/skip/no-thanks choices as safe.",
+        "Operate visual-first: decide from the current visible screen using the screenshot plus DOM controls, then let the extension execute precisely.",
+        "page.activeSurface is an authoritative mini-page. If activeSurface.type is dropdown, modal, popover, or confirmation, resolve it before considering background sections.",
+        "When activeSurface is not page, ignore background section tasks except for context and safety. Choose from activeSurface.options/buttons.",
+        "For activeSurface dropdown/listbox options, prefer options marked safe_decline when saved traveler rules approve skipping paid extras. Avoid options marked paid unless the user explicitly approves.",
+        "If the visible activeSurface option is obvious but its targetId is missing or stale, put the exact visible label in value so the extension can match it on the live page.",
         "Use page.sections as the current page decomposition. Each section has type, status, objective, fields, buttons, selected values, and coordinates.",
-        "Use page.taskQueue as the ordered work plan. Prefer the first task with status pending, and do not jump ahead unless a visible interrupt requires it.",
-        "Use page.currentTask as the only normal section you may act inside. Completed sections are context only.",
+        "Use page.taskQueue as progress memory for the background checkout page. Prefer the first task with status pending only when no activeSurface is present.",
+        "Use page.currentTask as the only normal background section you may act inside. Completed sections are context only.",
         "Choose targetId only from page.allowedTargetIds unless you are returning wait, stop, ask_user, or final_review.",
         "If any page.taskQueue item before Continue is pending, do not click Continue yet. Resolve the pending section first.",
         "Continue is represented by page.stageExit, not as a normal task. If page.stageExit.continueAllowed is true, choose page.stageExit.continueTargetId.",
@@ -1076,8 +1116,6 @@ async function callOpenAiAgent(payload) {
         "Use the screenshot as visual context when DOM text is incomplete or confusing.",
         "If page.overlays contains a visible dialog, menu, or listbox, resolve that overlay before assuming the previous page is done.",
         "If page.overlays is non-empty, the overlay owns the next action. Do not continue working on background page sections until it closes.",
-        "page.activeSurface is the current foreground screen. If activeSurface.type is dropdown, modal, popover, or confirmation, choose from activeSurface.options/buttons before using background sections.",
-        "For activeSurface dropdown/listbox options, prefer options marked safe_decline when saved traveler rules approve skipping paid extras. Avoid options marked paid unless the user explicitly approves.",
         "Use actionHistory to avoid repeating actions that already failed verification.",
         "Use adapter hints as guidance, but trust current visible page state over assumptions.",
         "Choose targetId only from the provided fields/buttons. Use empty string when no target is needed.",

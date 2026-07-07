@@ -1101,6 +1101,91 @@
     return queryAllDeep(`[data-atw-element-id="${CSS.escape(id)}"]`)[0] || null;
   }
 
+  function normalizeMatchText(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/€|eur/g, " eur ")
+      .replace(/[^\p{L}\p{N}]+/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function liveElementText(element) {
+    if (!element) return "";
+    return [
+      currentElementValue(element),
+      element.innerText,
+      element.textContent,
+      element.getAttribute?.("aria-label"),
+      element.getAttribute?.("title"),
+      labelText(element)
+    ].filter(Boolean).join(" ");
+  }
+
+  function textMatchesIntent(element, intent) {
+    const wanted = normalizeMatchText(intent);
+    if (!wanted) return false;
+    const actual = normalizeMatchText(liveElementText(element));
+    if (!actual) return false;
+    if (actual === wanted || actual.includes(wanted) || wanted.includes(actual)) return true;
+    const wantedNoPrice = wanted.replace(/\b\d+(?:\s*[\.,]\s*\d+)?\s*(eur|usd|gbp|dollars?)\b/g, "").replace(/\s+/g, " ").trim();
+    const actualNoPrice = actual.replace(/\b\d+(?:\s*[\.,]\s*\d+)?\s*(eur|usd|gbp|dollars?)\b/g, "").replace(/\s+/g, " ").trim();
+    return Boolean(wantedNoPrice && actualNoPrice && (actualNoPrice.includes(wantedNoPrice) || wantedNoPrice.includes(actualNoPrice)));
+  }
+
+  function activeSurfaceEntries(map) {
+    return [
+      ...(map?.activeSurface?.options || []),
+      ...(map?.activeSurface?.buttons || [])
+    ].filter(Boolean);
+  }
+
+  function activeSurfaceEntryForElement(map, element) {
+    if (!element) return null;
+    const id = elementId(element);
+    return activeSurfaceEntries(map).find((entry) => entry.id === id) || null;
+  }
+
+  function resolveDecisionTarget(decision, map) {
+    const direct = elementById(decision.targetId);
+    if (direct) return direct;
+
+    const labels = [
+      decision.value,
+      decision.message,
+      decision.reason,
+      ...activeSurfaceEntries(map)
+        .filter((entry) => entry.id === decision.targetId)
+        .map((entry) => entry.label)
+    ].filter(Boolean);
+
+    for (const label of labels) {
+      const entry = activeSurfaceEntries(map).find((item) => textMatchesIntent(elementById(item.id), label) || normalizeMatchText(item.label) === normalizeMatchText(label));
+      const entryElement = elementById(entry?.id);
+      if (entryElement) return entryElement;
+    }
+
+    const candidates = queryAllDeep([
+      "button",
+      "[role='button']",
+      "[role='option']",
+      "[role='menuitem']",
+      "[role='checkbox']",
+      "[role='radio']",
+      "label",
+      "input[type='checkbox']",
+      "input[type='radio']"
+    ].join(","))
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"));
+
+    for (const label of labels) {
+      const target = candidates.find((element) => textMatchesIntent(element, label));
+      if (target) return target;
+    }
+
+    return null;
+  }
+
   function flashElement(element) {
     if (!element) return;
     element.classList.add("atw-highlight");
@@ -2501,6 +2586,7 @@
   function actionAllowedForCurrentTask(map, element) {
     const task = nextPendingTask(map);
     if (!task || !element) return true;
+    if (map.activeSurface?.type && map.activeSurface.type !== "page") return true;
     const surfaceIds = new Set([
       ...(map.activeSurface?.options || []).map((option) => option.id),
       ...(map.activeSurface?.buttons || []).map((button) => button.id)
@@ -2960,11 +3046,11 @@
     }
 
     if (decision.action === "click") {
-      const target = elementById(decision.targetId);
+      const target = resolveDecisionTarget(decision, map);
       if (!target) {
         agent.awaiting = "manual";
         agent.running = false;
-        addAgentMessage("assistant", "The AI chose an element that is no longer visible. I rescanned and stopped so you can guide me.");
+        addAgentMessage("assistant", "The AI chose an element that is no longer visible, and I could not match its visible label on the active screen. I rescanned and stopped so you can guide me.");
         renderSidebar("agent");
         return;
       }
@@ -2986,8 +3072,17 @@
         await continueAfterAction(400);
         return;
       }
-      const button = map.buttons.find((item) => item.id === decision.targetId);
+      const resolvedTargetId = elementId(target);
+      const button = map.buttons.find((item) => item.id === decision.targetId || item.id === resolvedTargetId);
+      const surfaceEntry = activeSurfaceEntryForElement(map, target);
       const targetText = labelText(target) || target.innerText || button?.label || "";
+      if (surfaceEntry?.risk === "paid") {
+        agent.awaiting = "extras";
+        agent.running = false;
+        addAgentMessage("assistant", `I stopped before selecting a paid option: ${surfaceEntry.label}.`);
+        renderSidebar("agent");
+        return;
+      }
       if (button?.risk === "payment" || isDangerousActionLabel(button?.label || "")) {
         agent.awaiting = "final";
         agent.running = false;
@@ -3022,7 +3117,7 @@
     }
 
     if (decision.action === "type" || decision.action === "select") {
-      const target = elementById(decision.targetId);
+      const target = resolveDecisionTarget(decision, map);
       if (!target || isPaymentField(target)) {
         agent.awaiting = "manual";
         agent.running = false;
