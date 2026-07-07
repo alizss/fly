@@ -39,6 +39,7 @@ function summarizeAgentSession(session) {
     travelerName: session.travelerName,
     approvals: session.approvals,
     completedFields: [...session.completedFields].slice(-30),
+    completedSections: session.completedSections || {},
     lockedFields: session.lockedFields || {},
     retryCounts: session.retryCounts,
     lastAction: session.lastAction,
@@ -73,6 +74,7 @@ function createAgentSession(body = {}) {
       legalApproved: false
     },
     completedFields: [],
+    completedSections: {},
     lockedFields: {},
     retryCounts: {},
     lastAction: null,
@@ -115,6 +117,27 @@ function updateAgentSessionFromPayload(session, payload) {
     ...session.approvals,
     ...(payload.approvalState || {})
   };
+  if (payload.page?.completedFields && typeof payload.page.completedFields === "object") {
+    session.completedFields = [
+      ...new Set([
+        ...session.completedFields,
+        ...Object.keys(payload.page.completedFields).map((field) => clampText(field, 80))
+      ])
+    ].slice(-60);
+    session.lockedFields = {
+      ...(session.lockedFields || {}),
+      ...Object.fromEntries(Object.entries(payload.page.completedFields).map(([field, value]) => [
+        clampText(field, 80),
+        clampText(value?.actual || value?.selector || "accepted", 180)
+      ]))
+    };
+  }
+  if (payload.page?.completedSections && typeof payload.page.completedSections === "object") {
+    session.completedSections = {
+      ...(session.completedSections || {}),
+      ...payload.page.completedSections
+    };
+  }
   session.lastPageSummary = {
     site: payload.page?.site,
     step: payload.page?.step,
@@ -122,11 +145,16 @@ function updateAgentSessionFromPayload(session, payload) {
     paidChoices: payload.page?.paidChoices || [],
     overlays: payload.page?.overlays || [],
     sectionProgress: payload.page?.sectionProgress || {},
+    completedSections: payload.page?.completedSections || {},
+    completedFields: payload.page?.completedFields || {},
+    stageExit: payload.page?.stageExit || {},
+    reconciliation: payload.page?.reconciliation || {},
     sections: (payload.page?.sections || []).map((section) => ({
       label: section.label,
       type: section.type,
       status: section.status,
-      objective: section.objective
+      objective: section.objective,
+      selected: section.selected || []
     })).slice(0, 20),
     taskQueue: (payload.page?.taskQueue || []).map((task) => ({
       sectionLabel: task.sectionLabel,
@@ -150,6 +178,14 @@ function updateAgentSessionFromPayload(session, payload) {
 function reportAgentResult(body = {}) {
   const session = getAgentSession(body.sessionId);
   if (!session) return null;
+  if (body.page) {
+    const payload = compactAgentPayload({
+      sessionId: body.sessionId,
+      page: body.page,
+      approvalState: session.approvals || {}
+    });
+    updateAgentSessionFromPayload(session, reconcilePageState(payload, session));
+  }
   const result = body.result || {};
   const action = result.action || result.type || "";
   const target = result.target || result.fieldType || result.label || "";
@@ -436,6 +472,223 @@ function clampText(value, max = 4000) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
+function lowerText(value) {
+  return clampText(value, 4000).toLowerCase();
+}
+
+function includesAny(value, patterns) {
+  const text = lowerText(value);
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function selectedChoiceLabels(section) {
+  return Array.isArray(section.choices)
+    ? section.choices.filter((choice) => choice.selected).map((choice) => choice.label || "")
+    : [];
+}
+
+function sectionHasChoice(section, matcher) {
+  return Array.isArray(section.choices) && section.choices.some((choice) => matcher(choice));
+}
+
+function sectionHasSelectedChoice(section, matcher) {
+  return Array.isArray(section.choices) && section.choices.some((choice) => choice.selected && matcher(choice));
+}
+
+function meaningfulActionBox(box = {}) {
+  return Boolean(
+    box &&
+    Number(box.width || 0) >= 24 &&
+    Number(box.height || 0) >= 16 &&
+    Number(box.centerX ?? box.x ?? 0) > -200
+  );
+}
+
+function fieldBySemantic(section, names) {
+  const wanted = new Set(names);
+  return (section.fields || []).filter((field) => wanted.has(field.semantic || field.field));
+}
+
+function fieldsComplete(section, names) {
+  const fields = fieldBySemantic(section, names);
+  if (!fields.length) return false;
+  return fields.every((field) => field.hasValue);
+}
+
+function checkedFieldLabels(section) {
+  return (section.fields || [])
+    .filter((field) => /radio|checkbox/i.test(field.kind || "") && field.hasValue)
+    .map((field) => field.label || "")
+    .filter(Boolean)
+    .map((text) => clampText(text, 240));
+}
+
+function hasBlockingErrorsForSection(page, section) {
+  const text = lowerText([section.label, section.type, section.text].join(" "));
+  return (page.errors || []).some((error) => {
+    const err = lowerText(error);
+    if (/select one option|select an option|choose one option|please select/.test(err)) return false;
+    if (section.type === "contact" && /email|phone|mobile|contact/.test(err)) return true;
+    if (section.type === "passenger" && /title|gender|first|surname|last|passenger|traveller|traveler/.test(err)) return true;
+    return text && err.includes(text.slice(0, 30));
+  });
+}
+
+function deriveSectionStatus(section, page) {
+  const type = section.type || "unknown";
+  const text = lowerText(`${section.label} ${section.text}`);
+  const selectedLabels = selectedChoiceLabels(section).join(" ");
+  const selectedText = lowerText(`${selectedLabels} ${(section.selected || []).join(" ")}`);
+  const hasRequiredChoice = sectionHasChoice(section, (choice) => (
+    /required_dropdown_choice|decline_baggage|decline_paid_extra|add_paid_extra|traveler_title/.test(choice.semantic || "")
+    || /select one|select an option|choose|no checked baggage|no,?\s*thanks|add to cart|premium|standard|mrs|mr\b/i.test(choice.label || "")
+  ));
+  const hasSelectedChoice = sectionHasSelectedChoice(section, () => true);
+  const hasBlockingError = hasBlockingErrorsForSection(page, section);
+
+  if (type === "continue") return "gate";
+  if (type === "payment") return "blocked";
+
+  if (type === "contact") {
+    const hasContactFields = fieldBySemantic(section, ["email", "confirm_email", "phone", "phone_country_code"]).length > 0;
+    const missingRequired = (section.fields || []).some((field) => field.required && !field.hasValue);
+    return hasContactFields && !missingRequired && !hasBlockingError ? "complete" : "incomplete";
+  }
+
+  if (type === "passenger") {
+    const namesDone = fieldsComplete(section, ["first_name", "last_name"]);
+    const titleDone = sectionHasSelectedChoice(section, (choice) => choice.semantic === "traveler_title" || /\bmr\b|mrs|ms/i.test(choice.label || ""))
+      || sectionHasSelectedChoice(section, () => /title|gender/i.test(text));
+    return namesDone && titleDone && !hasBlockingError ? "complete" : "incomplete";
+  }
+
+  if (type === "baggage") {
+    const selectedNoBaggage = /no checked baggage|no baggage|without baggage|go without/.test(selectedText)
+      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_baggage")
+      || checkedFieldLabels(section).some((label) => /no checked baggage|no baggage|without baggage|go without/.test(lowerText(label)));
+    const summarySaysNoBaggage = /checked baggage\s+no baggage selected/.test(lowerText(page.visibleText));
+    const hasBaggageDecision = hasRequiredChoice
+      || sectionHasChoice(section, (choice) => /decline_baggage|add_paid_extra/.test(choice.semantic || "") || /checked baggage|no checked baggage|\d+\s*x\s*\d+\s*kg|eur|€|\$/.test(choice.label || ""))
+      || /checked baggage|no checked baggage|\d+\s*x\s*\d+\s*kg/.test(text);
+    if (hasBaggageDecision) return selectedNoBaggage && !hasBlockingError ? "complete" : "incomplete";
+    return summarySaysNoBaggage ? "complete" : "unknown";
+  }
+
+  if (type === "bundle") {
+    const selectedDecline = /no,?\s*thanks|none/.test(selectedText)
+      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_paid_extra")
+      || checkedFieldLabels(section).some((label) => /no,?\s*thanks|none|without bundle/.test(lowerText(label)));
+    return selectedDecline && !hasBlockingError ? "complete" : "incomplete";
+  }
+
+  if (type === "flexible_ticket") {
+    const dropdowns = fieldBySemantic(section, ["required_dropdown_choice", "unknown"]).filter((field) => /choose|select|option|dropdown|combobox/i.test(`${field.label} ${field.kind}`));
+    const dropdownDone = dropdowns.length ? dropdowns.every((field) => field.hasValue) : false;
+    const selectedDecline = /none of the passengers|none|no,?\s*thanks|without/.test(selectedText)
+      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_paid_extra");
+    return (dropdownDone || selectedDecline) && !hasBlockingError ? "complete" : "incomplete";
+  }
+
+  if (type === "cancellation_insurance" || /cancellation|insurance|refund/.test(text)) {
+    const selectedDecline = /no,?\s*thanks|none|without/.test(selectedText)
+      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_paid_extra")
+      || checkedFieldLabels(section).some((label) => /no,?\s*thanks|none|without/.test(lowerText(label)));
+    return selectedDecline && !hasBlockingError ? "complete" : "incomplete";
+  }
+
+  if (hasRequiredChoice) return hasSelectedChoice ? "complete" : "incomplete";
+  if ((section.fields || []).some((field) => field.required && !field.hasValue)) return "incomplete";
+  if (hasBlockingError) return "incomplete";
+  return section.status || "unknown";
+}
+
+function objectiveForSection(section, status) {
+  if (status === "complete") return "Verified from current page state; do not touch unless a targeted error appears.";
+  const objectives = {
+    contact: "Fill contact fields from saved traveler profile.",
+    passenger: "Fill passenger title, first name, and surname from saved traveler profile.",
+    baggage: "Choose no checked baggage unless user explicitly approved paid bags.",
+    bundle: "Choose No thanks for paid bundle/support/SMS extras.",
+    flexible_ticket: "Choose None/no-passenger/zero-cost option for flexible ticket.",
+    cancellation_insurance: "Choose No thanks for cancellation/refund insurance.",
+    seat: "Skip paid seat selection unless included or explicitly approved.",
+    continue: "Stage exit gate; click only when no required tasks remain.",
+    payment: "Stop before real payment or final booking."
+  };
+  return objectives[section.type] || section.objective || "Resolve required visible controls safely.";
+}
+
+function reconcilePageState(payload, session) {
+  const page = payload.page || {};
+  const sections = (page.sections || []).map((section) => {
+    const status = deriveSectionStatus(section, page);
+    return {
+      ...section,
+      status,
+      objective: objectiveForSection(section, status)
+    };
+  });
+  const pendingTasks = sections
+    .filter((section) => !["continue", "payment"].includes(section.type))
+    .filter((section) => section.status !== "complete" && section.status !== "blocked")
+    .filter((section) => section.required || section.paidChoice || ["contact", "passenger", "baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"].includes(section.type))
+    .map((section) => ({
+      id: `task-${section.id}`,
+      sectionId: section.id,
+      sectionLabel: section.label,
+      sectionType: section.type,
+      order: section.order,
+      status: "pending",
+      objective: section.objective,
+      rule: section.paidChoice ? "Saved traveler rules decide routine paid extras before asking." : "Use saved traveler profile and verify current page state."
+    }));
+  const continueButton = (page.buttons || []).find((button) => (
+    button.risk === "safe_continue" &&
+    !/skip to/i.test(button.label || "") &&
+    meaningfulActionBox(button.box)
+  ));
+  const blockers = [];
+  if (pendingTasks.length) blockers.push(`pending: ${pendingTasks[0].sectionLabel}`);
+  if ((page.overlays || []).length) blockers.push("visible overlay/menu/modal");
+  if ((page.errors || []).length) blockers.push(`visible errors: ${page.errors.slice(0, 2).join("; ")}`);
+  if (!continueButton) blockers.push("no safe Continue button");
+  const stageExit = {
+    continueAllowed: Boolean(!pendingTasks.length && !(page.overlays || []).length && !(page.errors || []).length && continueButton && !["payment", "confirmation"].includes(page.step)),
+    continueTargetId: continueButton?.id || "",
+    blockers
+  };
+
+  if (session) {
+    session.completedSections = session.completedSections || {};
+    for (const section of sections) {
+      if (section.status === "complete") {
+        session.completedSections[section.type] = {
+          label: section.label,
+          at: now()
+        };
+      }
+    }
+  }
+
+  payload.page = {
+    ...page,
+    sections,
+    taskQueue: pendingTasks,
+    stageExit,
+    reconciliation: {
+      completedSections: sections.filter((section) => section.status === "complete").map((section) => section.type),
+      pendingSections: pendingTasks.map((task) => task.sectionType),
+      nextTask: pendingTasks[0] || null
+    },
+    summary: {
+      ...(page.summary || {}),
+      pendingTasks: pendingTasks.length,
+      completedSections: sections.filter((section) => section.status === "complete").length
+    }
+  };
+  return payload;
+}
+
 function compactAgentPayload(body) {
   const page = body.page || {};
   const traveler = body.traveler || {};
@@ -458,9 +711,19 @@ function compactAgentPayload(body) {
               label: clampText(field.label, 160),
               field: clampText(field.field, 80),
               kind: clampText(field.kind, 40),
+              semantic: clampText(field.semantic || field.field, 80),
               required: Boolean(field.required),
               hasValue: Boolean(field.hasValue),
               box: field.box || null
+            })).slice(0, 20)
+          : [],
+        choices: Array.isArray(section.choices)
+          ? section.choices.map((choice) => ({
+              id: clampText(choice.id, 80),
+              label: clampText(choice.label, 160),
+              selected: Boolean(choice.selected),
+              semantic: clampText(choice.semantic, 80),
+              box: choice.box || null
             })).slice(0, 20)
           : [],
         buttons: Array.isArray(section.buttons)
@@ -486,6 +749,36 @@ function compactAgentPayload(body) {
         rule: clampText(task.rule, 260)
       })).slice(0, 30)
     : [];
+  const activeSurface = page.activeSurface && typeof page.activeSurface === "object"
+    ? {
+        type: clampText(page.activeSurface.type || "page", 40),
+        id: clampText(page.activeSurface.id || "", 80),
+        label: clampText(page.activeSurface.label || "", 1200),
+        role: clampText(page.activeSurface.role || "", 80),
+        taskHint: clampText(page.activeSurface.taskHint || "", 120),
+        box: page.activeSurface.box || null,
+        options: Array.isArray(page.activeSurface.options)
+          ? page.activeSurface.options.map((option) => ({
+              id: clampText(option.id, 80),
+              label: clampText(option.label, 220),
+              semantic: clampText(option.semantic, 80),
+              risk: clampText(option.risk, 80),
+              selected: Boolean(option.selected),
+              box: option.box || null
+            })).slice(0, 24)
+          : [],
+        buttons: Array.isArray(page.activeSurface.buttons)
+          ? page.activeSurface.buttons.map((button) => ({
+              id: clampText(button.id, 80),
+              label: clampText(button.label, 220),
+              semantic: clampText(button.semantic, 80),
+              risk: clampText(button.risk, 80),
+              selected: Boolean(button.selected),
+              box: button.box || null
+            })).slice(0, 24)
+          : []
+      }
+    : { type: "page", id: "", label: "", role: "", taskHint: "", box: null, options: [], buttons: [] };
   return {
     sessionId: clampText(body.sessionId || "", 120),
     userIntent: clampText(body.userIntent || "Complete checkout safely for the selected traveler.", 800),
@@ -533,8 +826,13 @@ function compactAgentPayload(body) {
       errors: Array.isArray(page.errors) ? page.errors.map((item) => clampText(item, 220)).slice(0, 8) : [],
       paidChoices: Array.isArray(page.paidChoices) ? page.paidChoices.map((item) => clampText(item, 160)).slice(0, 8) : [],
       sectionProgress: page.sectionProgress && typeof page.sectionProgress === "object" ? page.sectionProgress : {},
+      completedSections: page.completedSections && typeof page.completedSections === "object" ? page.completedSections : {},
+      completedFields: page.completedFields && typeof page.completedFields === "object" ? page.completedFields : {},
       sections,
       taskQueue,
+      stageExit: page.stageExit || {},
+      reconciliation: page.reconciliation || {},
+      activeSurface,
       fields: Array.isArray(page.fields)
         ? page.fields.map((field) => ({
             id: clampText(field.id, 80),
@@ -542,6 +840,7 @@ function compactAgentPayload(body) {
             box: field.box || null,
             kind: clampText(field.kind, 40),
             field: clampText(field.field, 80),
+            semantic: clampText(field.semantic || field.field, 80),
             required: Boolean(field.required),
             hasValue: Boolean(field.value),
             confidence: Number(field.confidence || 0)
@@ -568,6 +867,67 @@ function compactAgentPayload(body) {
   };
 }
 
+function scopedSection(section, isCurrent) {
+  if (isCurrent) return section;
+  return {
+    ...section,
+    fields: [],
+    choices: [],
+    buttons: [],
+    text: clampText(section.text, 260)
+  };
+}
+
+function allowedTargetIdsForSection(section) {
+  if (!section) return [];
+  return [
+    ...(section.fields || []).map((field) => field.id),
+    ...(section.choices || []).map((choice) => choice.id),
+    ...(section.buttons || []).map((button) => button.id)
+  ].filter(Boolean);
+}
+
+function activeSurfaceTargetIds(activeSurface) {
+  if (!activeSurface || activeSurface.type === "page") return [];
+  return [
+    ...(activeSurface.options || []).map((option) => option.id),
+    ...(activeSurface.buttons || []).map((button) => button.id)
+  ].filter(Boolean);
+}
+
+function scopePayloadToCurrentTask(payload) {
+  const page = payload.page || {};
+  const nextTask = page.reconciliation?.nextTask || null;
+  const currentSection = nextTask
+    ? (page.sections || []).find((section) => section.id === nextTask.sectionId)
+    : null;
+  const allowedTargetIds = new Set(allowedTargetIdsForSection(currentSection));
+  for (const id of activeSurfaceTargetIds(page.activeSurface)) allowedTargetIds.add(id);
+  if (page.stageExit?.continueAllowed && page.stageExit.continueTargetId) allowedTargetIds.add(page.stageExit.continueTargetId);
+  const allowed = [...allowedTargetIds];
+
+  return {
+    ...payload,
+    page: {
+      ...page,
+      currentTask: nextTask,
+      allowedTargetIds: allowed,
+      activeSurface: page.activeSurface || { type: "page", id: "", label: "", role: "", taskHint: "", options: [], buttons: [] },
+      sections: (page.sections || []).map((section) => scopedSection(section, !nextTask || section.id === nextTask.sectionId)),
+      fields: (page.fields || []).filter((field) => !allowed.length || allowedTargetIds.has(field.id)),
+      buttons: (page.buttons || []).filter((button) => !allowed.length || allowedTargetIds.has(button.id) || button.id === page.stageExit?.continueTargetId),
+      paidChoices: (page.paidChoices || []).slice(0, 4)
+    }
+  };
+}
+
+function decisionInsideCurrentScope(decision, payload) {
+  if (!["click", "type", "select"].includes(decision?.action)) return true;
+  const allowed = new Set(payload.page?.allowedTargetIds || []);
+  if (!allowed.size) return true;
+  return allowed.has(decision.targetId);
+}
+
 function aiUnavailableDecision(reason) {
   return {
     source: "system",
@@ -579,6 +939,18 @@ function aiUnavailableDecision(reason) {
     risk: "uncertain",
     reason: "AI-only mode: OpenAI must provide the next browser action."
   };
+}
+
+function noExtrasApprovedForPayload(payload) {
+  return payload.approvalState?.skipPaidExtrasApproved
+    || includesAny(payload.traveler?.booking_rules, [/no paid/i, /no extras/i, /no add-?ons/i, /no seat/i, /no insurance/i, /no bundle/i]);
+}
+
+function safeDeclineSurfaceOption(activeSurface) {
+  const options = [...(activeSurface?.options || []), ...(activeSurface?.buttons || [])]
+    .filter((option) => option?.id && !option.selected);
+  return options.find((option) => /safe_decline/i.test(option.risk || "") || /decline_paid_extra/i.test(option.semantic || ""))
+    || options.find((option) => /none of the passengers|none of the travellers|none of the travelers|no,?\s*thanks|not now|skip|decline|0\s*(eur|€|usd|\$)/i.test(option.label || ""));
 }
 
 function sanitizeAgentError(reason) {
@@ -596,7 +968,7 @@ function normalizeAgentDecision(decision) {
   const action = allowedActions.has(decision?.action) ? decision.action : "stop";
   const risk = allowedRisks.has(decision?.risk) ? decision.risk : "uncertain";
   return {
-    source: "openai",
+    source: clampText(decision?.source || "openai", 40),
     action,
     targetId: clampText(decision?.targetId || "", 120),
     value: clampText(decision?.value || "", 600),
@@ -691,8 +1063,10 @@ async function callOpenAiAgent(payload) {
         "If traveler.booking_rules says avoid/no paid extras, no seats, no insurance, no bundles, or no add-ons, treat routine decline/skip/no-thanks choices as safe.",
         "Use page.sections as the current page decomposition. Each section has type, status, objective, fields, buttons, selected values, and coordinates.",
         "Use page.taskQueue as the ordered work plan. Prefer the first task with status pending, and do not jump ahead unless a visible interrupt requires it.",
+        "Use page.currentTask as the only normal section you may act inside. Completed sections are context only.",
+        "Choose targetId only from page.allowedTargetIds unless you are returning wait, stop, ask_user, or final_review.",
         "If any page.taskQueue item before Continue is pending, do not click Continue yet. Resolve the pending section first.",
-        "If the only pending task is Continue and no overlay/dropdown/error/loading state is active, choose the visible safe Continue/Next button.",
+        "Continue is represented by page.stageExit, not as a normal task. If page.stageExit.continueAllowed is true, choose page.stageExit.continueTargetId.",
         "Do not modify sections whose status is complete unless page.errors explicitly targets that section.",
         "Prefer filling known traveler fields, declining routine paid extras when approvalState.skipPaidExtrasApproved is true, and clicking safe Continue buttons.",
         "When skipPaidExtrasApproved is true and an overlay is a seat, baggage, bundle, cancellation, flexible ticket, insurance, or add-on popup, do not ask the user; choose the safe decline/skip/next action if one is available.",
@@ -702,6 +1076,8 @@ async function callOpenAiAgent(payload) {
         "Use the screenshot as visual context when DOM text is incomplete or confusing.",
         "If page.overlays contains a visible dialog, menu, or listbox, resolve that overlay before assuming the previous page is done.",
         "If page.overlays is non-empty, the overlay owns the next action. Do not continue working on background page sections until it closes.",
+        "page.activeSurface is the current foreground screen. If activeSurface.type is dropdown, modal, popover, or confirmation, choose from activeSurface.options/buttons before using background sections.",
+        "For activeSurface dropdown/listbox options, prefer options marked safe_decline when saved traveler rules approve skipping paid extras. Avoid options marked paid unless the user explicitly approves.",
         "Use actionHistory to avoid repeating actions that already failed verification.",
         "Use adapter hints as guidance, but trust current visible page state over assumptions.",
         "Choose targetId only from the provided fields/buttons. Use empty string when no target is needed.",
@@ -736,15 +1112,118 @@ async function callOpenAiAgent(payload) {
   return JSON.parse(extractResponseText(data));
 }
 
+function deterministicReconciledDecision(payload) {
+  const page = payload.page || {};
+  const nextTask = page.reconciliation?.nextTask;
+  const activeSurface = page.activeSurface || {};
+  const noExtrasApproved = noExtrasApprovedForPayload(payload);
+  if (activeSurface.type && activeSurface.type !== "page" && noExtrasApproved) {
+    const decline = safeDeclineSurfaceOption(activeSurface);
+    if (decline?.id) {
+      return normalizeAgentDecision({
+        source: "reconciler",
+        action: "click",
+        targetId: decline.id,
+        value: "",
+        message: `Resolving the open ${activeSurface.type}: ${decline.label}.`,
+        needsApproval: false,
+        risk: "safe",
+        reason: "Active surface resolver found a visible safe decline / zero-cost option and saved traveler rules approve skipping paid extras."
+      });
+    }
+  }
+  if (page.stageExit?.continueAllowed && page.stageExit.continueTargetId) {
+    return normalizeAgentDecision({
+      source: "reconciler",
+      action: "click",
+      targetId: page.stageExit.continueTargetId,
+      value: "",
+      message: "All required sections are verified. Continuing to the next checkout step.",
+      needsApproval: false,
+      risk: "safe",
+      reason: "Backend reconciler found no pending tasks, no overlays, no errors, and a safe Continue button."
+    });
+  }
+
+  if (nextTask && ["contact", "passenger"].includes(nextTask.sectionType)) {
+    return normalizeAgentDecision({
+      source: "reconciler",
+      action: "fill_known_fields",
+      targetId: nextTask.sectionId,
+      value: "",
+      message: `Filling ${nextTask.sectionLabel} from the saved traveler profile.`,
+      needsApproval: false,
+      risk: "safe",
+      reason: "Backend reconciler found a pending profile section."
+    });
+  }
+
+  if (nextTask && noExtrasApproved && /baggage|bundle|flexible_ticket|cancellation_insurance|seat/.test(nextTask.sectionType)) {
+    const section = (page.sections || []).find((item) => item.id === nextTask.sectionId);
+    const decline = (section?.choices || []).find((choice) => (
+      /decline_baggage|decline_paid_extra/.test(choice.semantic || "")
+      || /no checked baggage|no,?\s*thanks|none of the passengers|go without|random seat/i.test(choice.label || "")
+    ));
+    if (decline?.id) {
+      return normalizeAgentDecision({
+        source: "reconciler",
+        action: "click",
+        targetId: decline.id,
+        value: "",
+        message: `Applying saved no-extras rule: ${decline.label}.`,
+        needsApproval: false,
+        risk: "safe",
+        reason: `Backend reconciler selected the safe decline choice for ${nextTask.sectionLabel}.`
+      });
+    }
+    const dropdown = (section?.fields || []).find((field) => (
+      /required_dropdown_choice|unknown/.test(field.semantic || field.field || "")
+      && /choose|select|option|dropdown|combobox/i.test(`${field.label || ""} ${field.kind || ""}`)
+      && !field.hasValue
+    ));
+    if (dropdown?.id) {
+      return normalizeAgentDecision({
+        source: "reconciler",
+        action: "select",
+        targetId: dropdown.id,
+        value: "None of the passengers",
+        message: `Applying saved no-extras rule for ${nextTask.sectionLabel}: selecting the zero-cost/no-passenger option.`,
+        needsApproval: false,
+        risk: "safe",
+        reason: "Backend reconciler found a pending no-extras dropdown and selected the safe decline value."
+      });
+    }
+  }
+
+  return null;
+}
+
 async function decideAgentNextAction(body) {
   const payload = compactAgentPayload(body);
   const existingSession = getAgentSession(payload.sessionId);
-  const session = updateAgentSessionFromPayload(existingSession, payload);
-  if (session) payload.taskState = summarizeAgentSession(session);
+  const reconciledPayload = reconcilePageState(payload, existingSession);
+  const session = updateAgentSessionFromPayload(existingSession, reconciledPayload);
+  const scopedPayload = scopePayloadToCurrentTask(reconciledPayload);
+  const deterministicDecision = deterministicReconciledDecision(scopedPayload);
+  if (deterministicDecision) return deterministicDecision;
   try {
-    const aiDecision = await callOpenAiAgent(payload);
+    if (session) scopedPayload.taskState = summarizeAgentSession(session);
+    const aiDecision = await callOpenAiAgent(scopedPayload);
     if (!aiDecision) return aiUnavailableDecision("OpenAI returned no decision");
-    return normalizeAgentDecision({ ...aiDecision, source: "openai" });
+    const normalized = normalizeAgentDecision({ ...aiDecision, source: "openai" });
+    if (!decisionInsideCurrentScope(normalized, scopedPayload)) {
+      return normalizeAgentDecision({
+        source: "reconciler",
+        action: "wait",
+        targetId: "",
+        value: "",
+        message: "The AI selected a control outside the current unfinished section, so I rejected it and will rescan.",
+        needsApproval: false,
+        risk: "safe",
+        reason: `Current task is ${scopedPayload.page?.currentTask?.sectionLabel || "unknown"}; completed sections are locked.`
+      });
+    }
+    return normalized;
   } catch (error) {
     return aiUnavailableDecision(error.message);
   }
