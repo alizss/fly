@@ -932,10 +932,11 @@ function scopePayloadToCurrentTask(payload) {
   }
 
   const nextTask = page.reconciliation?.nextTask || null;
-  const currentSection = nextTask
-    ? (page.sections || []).find((section) => section.id === nextTask.sectionId)
-    : null;
-  const allowedTargetIds = new Set(allowedTargetIdsForSection(currentSection));
+  const allowedTargetIds = new Set([
+    ...(page.fields || []).map((field) => field.id),
+    ...(page.buttons || []).map((button) => button.id),
+    ...(page.sections || []).flatMap((section) => allowedTargetIdsForSection(section))
+  ].filter(Boolean));
   if (page.stageExit?.continueAllowed && page.stageExit.continueTargetId) allowedTargetIds.add(page.stageExit.continueTargetId);
   const allowed = [...allowedTargetIds];
 
@@ -946,9 +947,9 @@ function scopePayloadToCurrentTask(payload) {
       currentTask: nextTask,
       allowedTargetIds: allowed,
       activeSurface,
-      sections: (page.sections || []).map((section) => scopedSection(section, !nextTask || section.id === nextTask.sectionId)),
-      fields: (page.fields || []).filter((field) => !allowed.length || allowedTargetIds.has(field.id)),
-      buttons: (page.buttons || []).filter((button) => !allowed.length || allowedTargetIds.has(button.id) || button.id === page.stageExit?.continueTargetId),
+      sections: (page.sections || []).map((section) => scopedSection(section, true)),
+      fields: page.fields || [],
+      buttons: page.buttons || [],
       paidChoices: (page.paidChoices || []).slice(0, 4)
     }
   };
@@ -1117,11 +1118,11 @@ async function callOpenAiAgent(payload) {
         "When activeSurface is not page, ignore background section tasks except for context and safety. Choose from activeSurface.options/buttons.",
         "For activeSurface dropdown/listbox options, prefer options marked safe_decline when saved traveler rules approve skipping paid extras. Avoid options marked paid unless the user explicitly approves.",
         "If the visible activeSurface option is obvious but its targetId is missing or stale, put the exact visible label in value so the extension can match it on the live page.",
-        "Use page.sections as the current page decomposition. Each section has type, status, objective, fields, buttons, selected values, and coordinates.",
-        "Use page.taskQueue as progress memory for the background checkout page. Prefer the first task with status pending only when no activeSurface is present.",
-        "Use page.currentTask as the only normal background section you may act inside. Completed sections are context only.",
-        "Choose targetId only from page.allowedTargetIds unless you are returning wait, stop, ask_user, or final_review.",
-        "If any page.taskQueue item before Continue is pending, do not click Continue yet. Resolve the pending section first.",
+        "Use page.sections as visual decomposition and memory, not as a hard script. Each section has type, status, objective, fields, buttons, selected values, and coordinates.",
+        "Use page.taskQueue and page.currentTask as hints for unresolved background work, but choose the best next visible safe action from the whole screen.",
+        "Choose targetId only from page.allowedTargetIds unless you are returning wait, stop, ask_user, or final_review. For normal pages this contains all visible actionable controls.",
+        "Do not let a stale section/task label block an obvious visible safe action. Active visible UI and latest screenshot are more authoritative than old queue assumptions.",
+        "Click Continue/Next when the visible page appears complete, there are no active surfaces/errors, and stageExit says continueAllowed. Do not require perfect section parsing.",
         "Continue is represented by page.stageExit, not as a normal task. If page.stageExit.continueAllowed is true, choose page.stageExit.continueTargetId.",
         "Do not modify sections whose status is complete unless page.errors explicitly targets that section.",
         "Prefer filling known traveler fields, declining routine paid extras when approvalState.skipPaidExtrasApproved is true, and clicking safe Continue buttons.",
@@ -1258,8 +1259,6 @@ async function decideAgentNextAction(body) {
   const reconciledPayload = reconcilePageState(payload, existingSession);
   const session = updateAgentSessionFromPayload(existingSession, reconciledPayload);
   const scopedPayload = scopePayloadToCurrentTask(reconciledPayload);
-  const deterministicDecision = deterministicReconciledDecision(scopedPayload);
-  if (deterministicDecision) return deterministicDecision;
   try {
     if (session) scopedPayload.taskState = summarizeAgentSession(session);
     const aiDecision = await callOpenAiAgent(scopedPayload);

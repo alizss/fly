@@ -2238,10 +2238,6 @@
       const overlay = overlays[0];
       const map = agent.pageMap || buildPageMap();
       const task = (map.taskQueue || []).find((item) => item.status === "pending" && /baggage|bundle|flexible_ticket|cancellation_insurance|seat/.test(item.sectionType));
-      if (await handleRoutineExtraOverlay(overlay, context, task)) {
-        await waitForPaint(500);
-        return { blocked: false, handled: true, overlays: overlays.length };
-      }
       const activeSurface = buildActiveSurface([overlay]);
       if (/agent loop/i.test(context) && shouldDeferActiveSurfaceToAgent(activeSurface)) {
         logAgentEvent("active_surface_deferred", {
@@ -2258,10 +2254,14 @@
           overlay,
           "Observe",
           "Active surface",
-          "This open popup/dropdown is the active screen. I will send its visible options to the agent instead of stopping or working behind it.",
+          "This open popup/dropdown is the active screen. I will send its visible options to the visual agent before doing any local fallback.",
           750
         );
         return { blocked: false, handled: false, overlays: overlays.length, activeSurface };
+      }
+      if (await handleRoutineExtraOverlay(overlay, context, task)) {
+        await waitForPaint(500);
+        return { blocked: false, handled: true, overlays: overlays.length };
       }
       if (await closeTransientOverlay(overlay, context)) {
         await waitForPaint(400);
@@ -2657,17 +2657,16 @@
   }
 
   function actionAllowedForCurrentTask(map, element) {
-    const task = nextPendingTask(map);
-    if (!task || !element) return true;
+    if (!element) return true;
     if (map.activeSurface?.type && map.activeSurface.type !== "page") return true;
     const surfaceIds = new Set([
       ...(map.activeSurface?.options || []).map((option) => option.id),
       ...(map.activeSurface?.buttons || []).map((button) => button.id)
     ].filter(Boolean));
     if (surfaceIds.has(elementId(element))) return true;
-    const section = liveSectionForElement(map, element);
-    if (!section) return true;
-    return section.id === task.sectionId || section.type === task.sectionType;
+    const text = `${buttonText(element)} ${labelText(element)} ${element.innerText || ""}`;
+    if (isDangerousActionLabel(text)) return false;
+    return isVisible(element) && !element.closest("#atw-sidebar");
   }
 
   async function autoResolveNoExtrasSection(map) {
