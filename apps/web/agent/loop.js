@@ -917,4 +917,19 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
   };
 }
 
-module.exports = { runLoopTurn, toClientDecision, askUserDecision };
+module.exports = {
+  runLoopTurn,
+  toClientDecision,
+  askUserDecision,
+  __private: {
+    actionableMissingRequired,
+    bindTargetSnapshot,
+    controlDecisionGroupId,
+    decisionGroupForRequirement,
+    deterministicRequirementEvidence,
+    reconcileRequirements,
+    requirementsWithDecisionGroups,
+    targetSnapshotForAction,
+    updateEvidenceMatchesRequirement
+  }
+};
