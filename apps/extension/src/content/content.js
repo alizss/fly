@@ -2,6 +2,7 @@
   if (document.getElementById("atw-sidebar")) return;
 
   const DEFAULT_API = "http://localhost:4173/api";
+  const AGENT_SINGLE_BRAIN = true;
   const BAGGAGE_TERMS = ["no cabin bag", "baggage not included", "personal item only", "without baggage", "checked baggage not included"];
   const MULTI_AIRPORT_CODES = new Set(["LHR", "LGW", "LTN", "STN", "LCY", "CDG", "ORY", "BVA", "IST", "SAW"]);
   const FIELD_MATCHERS = {
@@ -49,6 +50,7 @@
   let agent = {
     running: false,
     sessionId: "",
+    apiBase: DEFAULT_API,
     awaiting: "",
     messages: [],
     lastClickSignature: "",
@@ -60,6 +62,8 @@
     currentAction: "",
     currentReason: "",
     currentStage: "",
+    userGoal: "",
+    reasoningLog: [],
     actionHistory: [],
     sectionProgress: {},
     completedSections: {},
@@ -67,16 +71,64 @@
     sectionPlan: [],
     taskQueue: [],
     debugLog: [],
-    pageMap: null
+    flowLog: [],
+    flowSeq: 0,
+    activeTurnId: "",
+    activeObservationId: "",
+    activeExecutionActionId: "",
+    activeExecutionObservationId: "",
+    activeExecutionDecisionAction: "",
+    actionLedger: [],
+    lastActionResult: null,
+    lastBackendDebug: null,
+    pageMap: null,
+    pageUnderstanding: null,
+    observerTab: "summary"
   };
 
   function storageGet(keys) {
     return chrome.storage.local.get(keys);
   }
 
+  const RESUME_KEY = "atwAgentResume";
+  const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
+
+  async function saveResumeMarker() {
+    try {
+      if (!agent.running) {
+        await chrome.storage.local.remove(RESUME_KEY);
+        return;
+      }
+      await chrome.storage.local.set({
+        [RESUME_KEY]: {
+          travelerId: selectedTravelerId,
+          sessionId: agent.sessionId,
+          skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
+          savedAt: Date.now()
+        }
+      });
+    } catch (error) {
+      // Best-effort: if the page is already tearing down, storage may be unavailable. Nothing to do.
+    }
+  }
+
+  async function clearResumeMarker() {
+    try {
+      await chrome.storage.local.remove(RESUME_KEY);
+    } catch (error) {
+      // ignore
+    }
+  }
+
+  async function readResumeMarker() {
+    const stored = await chrome.storage.local.get(RESUME_KEY);
+    return stored?.[RESUME_KEY] || null;
+  }
+
   async function fetchData() {
     const settings = await storageGet(["apiBase", "selectedTravelerId"]);
     const apiBase = settings.apiBase || DEFAULT_API;
+    agent.apiBase = apiBase;
     const response = await fetch(`${apiBase}/extension/bootstrap`);
     if (!response.ok) throw new Error("Could not connect to dashboard API");
     appData = await response.json();
@@ -90,6 +142,12 @@
 
   function travelerRules() {
     return traveler()?.booking_rules || "";
+  }
+
+  function userIntentText() {
+    const base = `Complete this flight checkout safely using the selected traveler profile. Traveler rules: ${travelerRules() || "Ask before paid extras and stop at real payment."}`;
+    const oneOff = (agent.userGoal || "").trim();
+    return oneOff ? `${base} For this booking specifically, the user also said: "${oneOff}" — treat this as an explicit instruction for this session, on top of the saved traveler rules.` : base;
   }
 
   function prefersNoPaidExtras() {
@@ -127,6 +185,14 @@
 
   function sectionDone(key) {
     return agent.sectionProgress?.[key]?.status === "done";
+  }
+
+  function canUseCompletionMemoryForSectionType(type = "") {
+    // Completion memory is safe for durable one-per-page profile sections.
+    // Repeated paid-extra cards often share a coarse type like "bundle", while
+    // each card has its own required choice. Those must be re-derived from the
+    // current DOM every scan.
+    return /^(contact|passenger)$/.test(String(type || ""));
   }
 
   function progressSummary() {
@@ -196,13 +262,26 @@
     ].filter(Boolean).join("\n");
   }
 
+  // Same info as formatLoopBubble but without the Context/Rule lines, which repeat
+  // near-identically on every step and drown out the one thing that actually changes:
+  // what the agent is looking at and why. Used for the on-page cursor tooltip only.
+  function formatCursorBubble(loopStep, stage, detail = "") {
+    return [`${loopStep}: ${stage || "current page"}`, detail].filter(Boolean).join("\n");
+  }
+
+  function pushReasoningLog(loopStep, stage, action, reason = "", ok = null) {
+    agent.reasoningLog.push({ loopStep, stage, action, reason, ok, ts: Date.now() });
+    agent.reasoningLog = agent.reasoningLog.slice(-8);
+  }
+
   async function showAgentThought(anchor, stage, action, reason = "", pause = SLOW_STEP_MS) {
     agent.currentStage = stage || agent.currentStage || "";
     const loopStep = inferLoopStep(stage, action);
     const detail = reason ? `Goal: ${reason}` : "";
     const bubble = formatLoopBubble(loopStep, stage, action, detail);
     setAgentActivity(`${loopStep} -> ${action}`, bubble);
-    if (anchor) showAgentCursor(anchor, `${loopStep}: ${action}`, bubble);
+    if (anchor) showAgentCursor(anchor, `${loopStep}: ${action}`, formatCursorBubble(loopStep, stage, detail));
+    pushReasoningLog(loopStep, stage, action, reason);
     logAgentEvent("visible_step", { loopStep, stage, action, reason });
     renderSidebar("agent");
     await sleep(pause);
@@ -213,9 +292,11 @@
     const detail = ok
       ? `Result: verified on the live page. Remember: do not change it again unless a specific error appears.`
       : "Result: not verified yet. Re-observe before the next action.";
-    const bubble = formatLoopBubble(ok ? "Remember" : "Verify", stage, action, detail);
-    setAgentActivity(`${ok ? "Remember" : "Verify"} -> ${action}`, bubble);
-    if (anchor) showAgentCursor(anchor, `${ok ? "Remember" : "Verify"}: ${action}`, bubble);
+    const loopStep = ok ? "Remember" : "Verify";
+    const bubble = formatLoopBubble(loopStep, stage, action, detail);
+    setAgentActivity(`${loopStep} -> ${action}`, bubble);
+    if (anchor) showAgentCursor(anchor, `${loopStep}: ${action}`, formatCursorBubble(loopStep, stage, detail));
+    pushReasoningLog(loopStep, stage, message, "", ok);
     logAgentEvent("visible_verify", { stage, message, ok });
     renderSidebar("agent");
     await sleep(pause);
@@ -442,6 +523,63 @@
     };
   }
 
+  function optionControlElement(option) {
+    if (option.matches?.("input[type='checkbox'], input[type='radio']")) return option;
+    return option.querySelector?.("input[type='checkbox'], input[type='radio']") || null;
+  }
+
+  function optionSelectedSignature(option, control) {
+    if (control) {
+      if (control.type === "checkbox" || control.type === "radio") return control.checked ? "checked" : "unchecked";
+      const aria = control.getAttribute?.("aria-checked") || control.getAttribute?.("aria-selected");
+      if (aria) return aria;
+    }
+    const optionAria = option.getAttribute?.("aria-checked") || option.getAttribute?.("aria-selected");
+    if (optionAria) return optionAria;
+    return option.className || "";
+  }
+
+  function optionControlCount(option) {
+    if (!option?.querySelectorAll) return option?.matches?.("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']") ? 1 : 0;
+    return option.querySelectorAll("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']").length;
+  }
+
+  function optionMatchText(option) {
+    return (overlayChoiceText(option) || option?.innerText || option?.textContent || option?.value || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function optionMatchScore(option, wanted) {
+    if (!option || !isVisible(option) || option.closest?.("#atw-sidebar")) return null;
+    const text = optionMatchText(option);
+    const normalized = normalizeMatchText(text);
+    if (!normalized || !wanted.some((term) => normalized.includes(normalizeMatchText(term)))) return null;
+    const rect = option.getBoundingClientRect();
+    const controls = optionControlCount(option);
+    const noExtra = /none of the passengers|none of the travellers|none of the travelers|no thanks|no thanks|without|decline|0 eur|0 €|0eur/i.test(text);
+    let score = 100;
+    if (option.matches?.("input[type='checkbox'], input[type='radio']")) score += 35;
+    if (option.matches?.("label, [role='option'], li, [role='checkbox'], [role='radio']")) score += 25;
+    if (/none of the passengers|none of the travellers|none of the travelers/i.test(text)) score += 160;
+    if (/0\s*(eur|€|usd|\$)|free/i.test(text)) score += 80;
+    if (/all passengers|all travellers|all travelers|passenger\s+\d|adult/i.test(text) && !/none/i.test(text)) score -= 200;
+    if (/all passengers|passenger\s+\d|adult/i.test(text) && /none of the passengers|none of the travellers|none of the travelers/i.test(text)) score -= 240;
+    if (controls > 1) score -= controls * 75;
+    if (text.length > 180) score -= Math.min(260, Math.round((text.length - 180) / 2));
+    if (rect.width > 420 || rect.height > 140) score -= 80;
+    if (noExtra) score += 20;
+    return { option, score, text };
+  }
+
+  function bestVisibleOptionForTerms(terms) {
+    const wanted = terms.map((term) => String(term || "").toLowerCase()).filter((term) => term.length >= 2);
+    return queryAllDeep("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio'], [role='option'], li, label, button, [data-headlessui-state]")
+      .map((element) => optionMatchScore(element, wanted))
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score)[0] || null;
+  }
+
   async function selectComboboxOption(input, terms) {
     showAgentCursor(input, "open dropdown");
     userLikeClick(input);
@@ -450,19 +588,36 @@
     await sleep(180);
     const wanted = terms.map((term) => String(term || "").toLowerCase()).filter((term) => term.length >= 2);
     for (let attempt = 0; attempt < 4; attempt += 1) {
-      const option = queryAllDeep("[role='option'], li, button, [data-headlessui-state]")
-        .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
-        .find((element) => {
-          const text = (element.innerText || element.textContent || element.value || "").replace(/\s+/g, " ").toLowerCase();
-          return wanted.some((term) => text.includes(term));
-        });
-      if (option) {
-        showAgentCursor(option, option.innerText || "country code");
+      const pick = bestVisibleOptionForTerms(wanted);
+      if (pick?.option) {
+        const option = pick.option;
+        const control = optionControlElement(option);
+        const before = optionSelectedSignature(option, control);
+        const beforeInputValue = normalizedValue(currentElementValue(input), "country_code");
+        showAgentCursor(option, pick.text || option.innerText || "option");
         userLikeClick(option);
         flashElement(option);
         await sleep(220);
         await settleAndHandleInterrupts("combobox option selected");
-        return { ok: true, method: "combobox-option", value: currentElementValue(input), option: (option.innerText || "").slice(0, 120) };
+
+        let verified = control
+          ? optionSelectedSignature(option, control) !== before
+          : normalizedValue(currentElementValue(input), "country_code") !== beforeInputValue || valueMatches(input, terms[0], "country_code");
+
+        if (!verified && control) {
+          showAgentCursor(control, "retry: click checkbox directly");
+          userLikeClick(control);
+          await sleep(220);
+          verified = optionSelectedSignature(option, control) !== before;
+        }
+
+        return {
+          ok: verified,
+          method: "combobox-option",
+          value: currentElementValue(input),
+          option: pick.text.slice(0, 160),
+          reason: verified ? "" : "Clicked the option but its selected state did not change."
+        };
       }
       await sleep(160);
     }
@@ -889,6 +1044,488 @@
     agent.debugLog = agent.debugLog.slice(-80);
   }
 
+  function nextFlowId(prefix = "flow") {
+    agent.flowSeq += 1;
+    return `${prefix}_${Date.now().toString(36)}_${agent.flowSeq}`;
+  }
+
+  function compactText(value = "", max = 140) {
+    return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+  }
+
+  function elementDescriptor(element) {
+    if (!element) return null;
+    const box = isVisible(element) ? elementBox(element) : null;
+    const centerX = box ? Math.min(window.innerWidth - 1, Math.max(0, box.centerX)) : 0;
+    const centerY = box ? Math.min(window.innerHeight - 1, Math.max(0, box.centerY)) : 0;
+    const top = box ? document.elementFromPoint(centerX, centerY) : null;
+    return {
+      id: element.dataset?.atwElementId || "",
+      tag: element.tagName || "",
+      role: implicitRole(element),
+      accessibleName: accessibleName(element),
+      accessibilityState: accessibilityState(element),
+      type: element.getAttribute?.("type") || "",
+      text: compactText(buttonText(element) || element.innerText || element.textContent || element.getAttribute?.("aria-label") || labelText(element)),
+      value: compactText(currentElementValue(element), 80),
+      visible: isVisible(element),
+      disabled: isDisabledLike(element),
+      box,
+      topAtCenter: top ? {
+        tag: top.tagName || "",
+        role: top.getAttribute?.("role") || "",
+        id: top.dataset?.atwElementId || "",
+        text: compactText(buttonText(top) || top.innerText || top.textContent || top.getAttribute?.("aria-label"))
+      } : null,
+      clickClear: box ? clickPointIsClear(element) : false
+    };
+  }
+
+  function targetFingerprint(element, decision = {}) {
+    const descriptor = elementDescriptor(element);
+    if (!descriptor) return null;
+    const parent = element.parentElement && !element.parentElement.closest?.("#atw-sidebar")
+      ? compactText(element.parentElement.innerText || element.parentElement.textContent || "", 220)
+      : "";
+    return {
+      ...descriptor,
+      requested: {
+        targetId: decision.targetId || "",
+        targetLabel: decision.targetLabel || "",
+        value: decision.value || ""
+      },
+      nearbyText: parent,
+      surface: compactText(agent.pageMap?.activeSurface?.label || "", 220)
+    };
+  }
+
+  function normalizedElementLabel(element) {
+    return normalizeMatchText(buttonText(element) || labelText(element) || element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || "");
+  }
+
+  function shortNavLabel(label = "") {
+    return /^(continue|next|back|close|done|confirm|skip|proceed)$/i.test(String(label || "").trim());
+  }
+
+  function validTargetId(id = "") {
+    return Boolean(String(id || "").trim() && !/^(false|true|null|undefined|\[object object\])$/i.test(String(id || "").trim()));
+  }
+
+  function liveTargetSnapshot(element, map = agent.pageMap || buildPageMap()) {
+    if (!element) return null;
+    const descriptor = elementDescriptor(element);
+    const activeSurface = map?.activeSurface || {};
+    let surfaceId = "";
+    let surfaceType = "page";
+    let surfaceLabel = "";
+    if (activeSurface?.type && activeSurface.type !== "page") {
+      const surfaceElement = elementById(activeSurface.id);
+      if (surfaceElement && (surfaceElement === element || surfaceElement.contains(element))) {
+        surfaceId = activeSurface.id || "";
+        surfaceType = activeSurface.type || "modal";
+        surfaceLabel = activeSurface.label || "";
+      }
+    }
+    const section = liveSectionForElement(map, element);
+    const label = buttonText(element) || labelText(element) || element.innerText || element.textContent || "";
+    const control = canonicalControlForElement(element, { section });
+    return {
+      id: elementId(element),
+      label,
+      normalizedLabel: normalizedElementLabel(element),
+      role: implicitRole(element),
+      accessibleName: accessibleName(element),
+      accessibilityState: accessibilityState(element),
+      kind: /radio|checkbox/i.test(element.type || "") ? "choice" : (element.tagName || "").toLowerCase(),
+      semantic: semanticChoiceType(label),
+      risk: choiceRisk(label),
+      box: descriptor?.box || null,
+      surfaceId,
+      surfaceType,
+      surfaceLabel,
+      surfaceNormalizedLabel: normalizeMatchText(surfaceLabel),
+      sectionId: section?.id || "",
+      sectionType: section?.type || "",
+      sectionLabel: section?.label || "",
+      controlId: control?.controlId || element.dataset?.atwControlId || "",
+      controlKind: control?.kind || "",
+      state: control?.state || null,
+      actuators: control?.actuators || [],
+      stateElementId: control?.stateElementId || "",
+      preferredActivationElementId: control?.preferredActivationElementId || "",
+      visualRegion: control?.visualRegion || descriptor?.box || null
+    };
+  }
+
+  function boxesCloseEnough(expectedBox, liveBox) {
+    if (!expectedBox || !liveBox) return true;
+    const expectedX = Number(expectedBox.centerX);
+    const expectedY = Number(expectedBox.centerY);
+    if (!Number.isFinite(expectedX) || !Number.isFinite(expectedY)) return true;
+    const dx = Math.abs(expectedX - liveBox.centerX);
+    const dy = Math.abs(expectedY - liveBox.centerY);
+    const tolerance = Math.max(90, Math.min(220, Math.max(Number(expectedBox.width) || 0, Number(expectedBox.height) || 0) + 60));
+    return dx <= tolerance && dy <= tolerance;
+  }
+
+  function isStrictActionSurfaceType(surfaceType = "") {
+    const normalized = String(surfaceType || "page").toLowerCase();
+    return ["modal", "dialog", "popup", "popover", "dropdown", "overlay", "active_surface"].includes(normalized);
+  }
+
+  function targetBelongsToCurrentSurface(map = agent.pageMap || buildPageMap(), element) {
+    const surface = map.currentSurface || map.activeSurface || {};
+    if (!surface?.type || surface.type === "page") return true;
+    const surfaceElement = elementById(surface.id);
+    if (!surfaceElement) return false;
+    return surfaceElement === element || surfaceElement.contains(element);
+  }
+
+  function validateResolvedTarget(decision = {}, element, map = agent.pageMap || buildPageMap()) {
+    const expected = decision.targetSnapshot;
+    const live = liveTargetSnapshot(element, map);
+    if (!targetBelongsToCurrentSurface(map, element)) {
+      return {
+        ok: false,
+        code: "TARGET_OUTSIDE_CURRENT_SURFACE",
+        expected: expected || {
+          surfaceId: map.currentSurface?.id || map.activeSurface?.id || "",
+          surfaceType: map.currentSurface?.type || map.activeSurface?.type || "page",
+          surfaceLabel: map.currentSurface?.label || map.activeSurface?.label || ""
+        },
+        live
+      };
+    }
+    if (!expected) return { ok: true, live, expected: null };
+    if (!live) return { ok: false, code: "TARGET_MISSING", expected, live: null };
+    const warnings = [];
+    const strictSurface = isStrictActionSurfaceType(expected.surfaceType);
+    const expectedControlId = expected.controlId || decision.controlId || "";
+    const liveControlId = live.controlId || element?.dataset?.atwControlId || "";
+    const expectedActuatorIds = new Set([
+      expected.stateElementId,
+      expected.preferredActivationElementId,
+      ...(expected.actuators || []).map((item) => item.nodeId)
+    ].filter(validTargetId));
+    const liveActuatorIds = new Set([
+      live.id,
+      live.stateElementId,
+      live.preferredActivationElementId,
+      ...(live.actuators || []).map((item) => item.nodeId)
+    ].filter(validTargetId));
+    const controlMatches = Boolean(
+      expectedControlId
+      && liveControlId
+      && expectedControlId === liveControlId
+    ) || [...expectedActuatorIds].some((id) => liveActuatorIds.has(id));
+    let idMatches = true;
+    let exactIdMatch = false;
+    const expectedIds = [expected.id, decision.targetId].filter(validTargetId);
+
+    if (expectedIds.length) {
+      const expectedElements = expectedIds.map((id) => elementById(id)).filter(Boolean);
+      exactIdMatch = expectedIds.includes(live.id);
+      if (!controlMatches && !exactIdMatch && !expectedElements.some((expectedElement) => expectedElement === element || expectedElement.contains(element))) {
+        return { ok: false, code: "TARGET_ID_MISMATCH", expected, live };
+      }
+      idMatches = exactIdMatch || controlMatches;
+    }
+
+    const expectedLabel = normalizeMatchText(expected.normalizedLabel || expected.label || decision.targetLabel || decision.value || "");
+    let labelMatches = true;
+    if (expectedLabel) {
+      const exactRequired = shortNavLabel(expectedLabel) || ["continue", "next", "choose seat"].includes(expectedLabel) || isDangerousActionLabel(expectedLabel);
+      labelMatches = exactRequired
+        ? live.normalizedLabel === expectedLabel
+        : live.normalizedLabel === expectedLabel || live.normalizedLabel.includes(expectedLabel) || expectedLabel.includes(live.normalizedLabel);
+      if (!labelMatches) {
+        const liveLooksDangerous = isDangerousActionLabel(`${live.label || ""} ${live.normalizedLabel || ""}`);
+        if (!controlMatches && (!exactIdMatch || exactRequired || strictSurface || liveLooksDangerous)) {
+          return { ok: false, code: "TARGET_LABEL_MISMATCH", expected, live };
+        }
+        warnings.push("TARGET_LABEL_DRIFT");
+      }
+    }
+
+    if (strictSurface) {
+      if (validTargetId(expected.surfaceId)) {
+        const expectedSurface = elementById(expected.surfaceId);
+        if (!expectedSurface || (expectedSurface !== element && !expectedSurface.contains(element))) {
+          return { ok: false, code: "TARGET_SURFACE_MISMATCH", expected, live };
+        }
+      } else if (!live.surfaceId && map?.activeSurface?.type && map.activeSurface.type !== "page") {
+        return { ok: false, code: "TARGET_NOT_IN_ACTIVE_SURFACE", expected, live };
+      }
+    }
+
+    if (!boxesCloseEnough(expected.visualRegion || expected.box, live.visualRegion || live.box)) {
+      if (strictSurface && !controlMatches) {
+        return { ok: false, code: "TARGET_BOX_DRIFT", expected, live };
+      }
+      warnings.push("TARGET_BOX_DRIFT");
+    }
+
+    if (live.box && !clickPointIsClear(element)) {
+      if (live.box.inViewport && strictSurface && !controlMatches && !(expected.id && labelMatches && idMatches)) {
+        return { ok: false, code: "TARGET_COVERED", expected, live };
+      }
+      warnings.push("TARGET_COVERED");
+    }
+
+    return { ok: true, expected, live, warnings };
+  }
+
+  function pageSnapshot(label = "") {
+    const map = agent.pageMap || buildPageMap();
+    return {
+      label,
+      url: location.href,
+      site: map.site,
+      step: map.step,
+      signature: pageSignature(map).slice(0, 900),
+      snapshotHash: observationHashForMap(map),
+      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || map.activeSurface || {}),
+      visualState: map.visualState || visualPageState(map),
+      accessibility: map.accessibility ? {
+        foregroundSurfaceId: map.accessibility.foregroundSurfaceId,
+        foregroundSurfaceType: map.accessibility.foregroundSurfaceType,
+        controls: (map.accessibility.controls || []).slice(0, 40)
+      } : null,
+      activeSurface: map.activeSurface ? {
+        type: map.activeSurface.type,
+        taskHint: map.activeSurface.taskHint,
+        label: compactText(map.activeSurface.label, 220),
+        visualState: map.activeSurface.visualState || null,
+        accessibility: map.activeSurface.accessibility || null,
+        options: (map.activeSurface.options || []).slice(0, 8).map((option) => ({
+          id: option.id,
+          label: compactText(option.label, 120),
+          risk: option.risk,
+          semantic: option.semantic,
+          selected: Boolean(option.selected),
+          accessibility: option.accessibility || null,
+          box: option.box
+        }))
+      } : null,
+      currentSurface: map.currentSurface ? {
+        id: map.currentSurface.id || "",
+        type: map.currentSurface.type || "page",
+        label: compactText(map.currentSurface.label, 220),
+        taskHint: map.currentSurface.taskHint || "",
+        blocksBackground: Boolean(map.currentSurface.blocksBackground),
+        expectedResolution: map.currentSurface.expectedResolution || "",
+        foreground: map.currentSurface.foreground || foregroundSurfaceState(map.currentSurface),
+        visualState: map.currentSurface.visualState || null,
+        options: (map.currentSurface.options || []).slice(0, 20).map((option) => ({
+          id: option.id,
+          label: option.label,
+          risk: option.risk,
+          semantic: option.semantic,
+          selected: Boolean(option.selected),
+          accessibility: option.accessibility || null,
+          box: option.box
+        })),
+        buttons: (map.currentSurface.buttons || []).slice(0, 20).map((button) => ({
+          id: button.id,
+          label: button.label,
+          risk: button.risk,
+          semantic: button.semantic,
+          selected: Boolean(button.selected),
+          accessibility: button.accessibility || null,
+          box: button.box
+        })),
+        taskQueue: (map.currentSurface.taskQueue || []).map((task) => ({
+          id: task.id,
+          sectionType: task.sectionType,
+          sectionLabel: task.sectionLabel,
+          status: task.status
+        })).slice(0, 8)
+      } : null,
+      surfaceStack: (map.surfaceStack || []).map((surface) => ({
+        id: surface.id || "",
+        type: surface.type || "page",
+        label: compactText(surface.label, 160),
+        isCurrent: Boolean(surface.isCurrent),
+        blocksBackground: Boolean(surface.blocksBackground),
+        taskTypes: (surface.taskQueue || []).map((task) => task.sectionType).slice(0, 8),
+        expectedResolution: surface.expectedResolution || ""
+      })),
+      summary: map.summary,
+      errors: actionableCheckoutErrors(map.errors),
+      visibleControls: [...(map.buttons || []), ...(map.fields || [])]
+        .filter((item) => item.box?.inViewport)
+        .slice(0, 24)
+        .map((item) => ({
+          id: item.id,
+          label: compactText(item.label || item.field || "", 100),
+          risk: item.risk || "",
+          field: item.field || "",
+          box: item.box
+        }))
+    };
+  }
+
+  function sendFlowLog(entry) {
+    const apiBase = agent.apiBase || DEFAULT_API;
+    fetch(`${apiBase}/agent/client-log`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        sessionId: agent.sessionId || "",
+        clientTurnId: entry.turnId || agent.activeTurnId || "",
+        entry
+      })
+    }).catch(() => {
+      // Logging must never slow or break the checkout agent.
+    });
+  }
+
+  function sendActionLedger(row) {
+    const apiBase = agent.apiBase || DEFAULT_API;
+    fetch(`${apiBase}/agent/action-ledger`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(row)
+    }).catch(() => {
+      // Best-effort durable audit trail; execution must not depend on logging.
+    });
+  }
+
+  function logFlow(phase, payload = {}) {
+    const entry = {
+      seq: agent.flowSeq + 1,
+      at: new Date().toISOString(),
+      turnId: agent.activeTurnId || "",
+      phase,
+      payload
+    };
+    agent.flowSeq += 1;
+    agent.flowLog.push(entry);
+    agent.flowLog = agent.flowLog.slice(-160);
+    logAgentEvent(`flow:${phase}`, payload);
+    // eslint-disable-next-line no-console
+    console.debug("[atw-flow]", phase, payload);
+    sendFlowLog(entry);
+    return entry;
+  }
+
+  function pushActionLedger(entry = {}) {
+    const row = {
+      at: new Date().toISOString(),
+      transactionId: agent.sessionId || "",
+      observationId: entry.observationId || agent.activeObservationId || "",
+      turnId: entry.turnId || agent.activeTurnId || "",
+      actionId: entry.actionId || nextFlowId("act"),
+      ...entry
+    };
+    agent.actionLedger.push(row);
+    agent.actionLedger = agent.actionLedger.slice(-120);
+    sendActionLedger(row);
+    logFlow("ledger.action", {
+      actionId: row.actionId,
+      observationId: row.observationId,
+      turnId: row.turnId,
+      stage: row.stage || "",
+      action: row.action?.action || row.action?.type || row.actionType || "",
+      result: row.result || null
+    });
+    return row;
+  }
+
+  function mapObservationSnapshot(map = buildPageMap()) {
+    const signature = pageSignature(map);
+    const structuralSignature = structuralPageSignature(map);
+    return {
+      observationId: agent.activeObservationId || "",
+      signature,
+      structuralSignature,
+      snapshotHash: stableHash(structuralSignature),
+      pageHash: stableHash(signature),
+      url: location.href,
+      site: map.site,
+      step: map.step,
+        activeSurfaceLabel: map.activeSurface?.label || "",
+        activeSurfaceType: map.activeSurface?.type || "page",
+      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || map.activeSurface || {}),
+      visualState: map.visualState || visualPageState(map),
+      currentSurfaceLabel: map.currentSurface?.label || map.activeSurface?.label || "",
+      currentSurfaceType: map.currentSurface?.type || map.activeSurface?.type || "page",
+      currentSurfaceTasks: (map.currentSurfaceTasks || map.currentSurface?.taskQueue || []).map((task) => task.sectionType || task.sectionLabel).filter(Boolean).slice(0, 8),
+      backgroundTasks: (map.backgroundTasks || []).map((task) => task.sectionType || task.sectionLabel).filter(Boolean).slice(0, 8),
+      controls: [...(map.buttons || []), ...(map.fields || [])].length
+    };
+  }
+
+  function observationChangedSince(map) {
+    if (!map) return false;
+    const before = observationHashForMap(map);
+    const current = observationHashForMap(rememberPagePlan(buildPageMap()));
+    return Boolean(before && current && before !== current);
+  }
+
+  function clearExecutionContext() {
+    agent.activeExecutionActionId = "";
+    agent.activeExecutionObservationId = "";
+    agent.activeExecutionDecisionAction = "";
+  }
+
+  function rememberActionExecutionResult(actionId, observationId, decision = {}, expectedOutcome = {}, verification = {}) {
+    const result = {
+      at: new Date().toISOString(),
+      actionId,
+      observationId,
+      plannedObservationId: decision.observationId || "",
+      observationHash: decision.observationHash || "",
+      requirementId: decision.requirementId || "",
+      intent: decision.intent || "",
+      executed: true,
+      verified: Boolean(verification.ok),
+      action: {
+        id: decision.actionId || decision.id || actionId,
+        action: decision.action || "",
+        intent: decision.intent || "",
+        targetId: decision.targetId || "",
+        targetLabel: decision.targetLabel || "",
+        value: decision.value || "",
+        risk: decision.risk || "",
+        reason: decision.reason || ""
+      },
+      targetSnapshot: decision.targetSnapshot || null,
+      expectedOutcome,
+      outcome: verification
+    };
+    agent.lastActionResult = result;
+    agent.actionHistory.push({
+      at: result.at,
+      type: "action_result",
+      actionId,
+      observationId,
+      observationHash: result.observationHash,
+      intent: result.intent,
+      requirementId: result.requirementId,
+      verified: result.verified,
+      payload: result
+    });
+    agent.actionHistory = agent.actionHistory.slice(-40);
+    return result;
+  }
+
+  function guardedHelperAllowed(helperName, allowedActions = []) {
+    const currentAction = agent.activeExecutionDecisionAction || "";
+    const ok = Boolean(agent.running && agent.activeExecutionActionId && allowedActions.includes(currentAction));
+    if (!ok) {
+      logFlow("helper.blocked_ungoverned", {
+        helperName,
+        allowedActions,
+        currentAction,
+        actionId: agent.activeExecutionActionId || "",
+        observationId: agent.activeExecutionObservationId || agent.activeObservationId || "",
+        reason: "Checkout-mutating helper refused because it is not executing under a matching backend-approved action."
+      });
+    }
+    return ok;
+  }
+
   function recordAction(type, payload = {}) {
     if (type === "field_fill" && payload?.ok && payload.fieldType) {
       agent.completedFields[payload.fieldType] = {
@@ -914,6 +1551,19 @@
     });
     agent.actionHistory = agent.actionHistory.slice(-40);
     logAgentEvent(type, payload);
+    if (agent.activeExecutionActionId) {
+      pushActionLedger({
+        actionId: `${agent.activeExecutionActionId}:atomic_${agent.actionHistory.length}`,
+        parentActionId: agent.activeExecutionActionId,
+        observationId: agent.activeExecutionObservationId || agent.activeObservationId || "",
+        stage: "atomic_result",
+        actionType: type,
+        result: {
+          ok: payload?.ok !== false,
+          payload
+        }
+      });
+    }
   }
 
   async function startAgentSession() {
@@ -923,8 +1573,8 @@
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          goal: "Complete this flight checkout safely with one-click assistance.",
-          userIntent: `Complete checkout safely for ${traveler()?.first_name || "the traveler"}.`,
+          goal: agent.userGoal || "Complete this flight checkout safely with one-click assistance.",
+          userIntent: userIntentText(),
           traveler: traveler(),
           page: compactPageMap(agent.pageMap || rememberPagePlan(buildPageMap()))
         })
@@ -943,6 +1593,10 @@
 
   async function reportActionResult(result = {}) {
     if (!agent.sessionId) return;
+    logFlow("action.report", {
+      result,
+      page: pageSnapshot("report-action-result")
+    });
     try {
       const settings = await storageGet(["apiBase"]);
       const map = rememberPagePlan(buildPageMap());
@@ -975,6 +1629,8 @@
         sessionId: agent.sessionId,
         running: agent.running,
         awaiting: agent.awaiting,
+        activeTurnId: agent.activeTurnId,
+        activeObservationId: agent.activeObservationId,
         skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
         skipRoutineRunning: agent.skipRoutineRunning,
         repeatClickCount: agent.repeatClickCount
@@ -1012,6 +1668,10 @@
       },
       messages: agent.messages,
       actionHistory: agent.actionHistory,
+      lastActionResult: agent.lastActionResult,
+      actionLedger: agent.actionLedger,
+      flowLog: agent.flowLog,
+      lastBackendDebug: agent.lastBackendDebug,
       filledFields,
       warnings,
       events: agent.debugLog
@@ -1070,11 +1730,18 @@
 
   function elementSignature(element) {
     if (!element) return "";
+    const box = isVisible(element) ? elementBox(element) : null;
+    const surface = element.closest?.("[role='dialog'], [aria-modal='true'], .modal, .popover, [role='listbox'], [role='menu']")
+      || activeOverlayElements()[0]
+      || null;
+    const surfaceText = surface ? overlayText(surface).slice(0, 260) : "";
     return [
       location.href,
       element.tagName,
       element.id,
       element.name,
+      box ? `${Math.round(box.centerX)}:${Math.round(box.centerY)}:${Math.round(box.width)}x${Math.round(box.height)}` : "",
+      surfaceText,
       element.innerText || element.value || element.getAttribute("aria-label") || ""
     ].join("|").slice(0, 500);
   }
@@ -1086,6 +1753,49 @@
       map.errors.join("|"),
       map.text.slice(0, 800)
     ].join("||");
+  }
+
+  function stableHash(value = "") {
+    const text = String(value || "");
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return `h${(hash >>> 0).toString(36)}`;
+  }
+
+  function structuralPageSignature(map = buildPageMap()) {
+    const activeSurface = map.activeSurface || {};
+    const stableSection = (section) => [
+      section.type || "",
+      normalizeMatchText(section.label || ""),
+      section.status || "",
+      (section.selected || []).map(normalizeMatchText).join(",")
+    ].join(":");
+    const stableControl = (control) => [
+      control.kind || control.role || control.type || "",
+      control.field || "",
+      normalizeMatchText(control.label || control.field || ""),
+      control.hasValue ? "1" : "0",
+      control.selected ? "1" : "0"
+    ].join(":");
+    const sections = (map.sections || [])
+      .map(stableSection)
+      .join("|");
+    const controls = [...(map.buttons || []), ...(map.fields || [])]
+      .map(stableControl)
+      .join("|");
+    return [
+      pageSignature(map),
+      `surface:${activeSurface.type || "page"}:${normalizeMatchText(activeSurface.label || "")}`,
+      `sections:${sections}`,
+      `controls:${controls}`
+    ].join("||").slice(0, 4000);
+  }
+
+  function observationHashForMap(map = buildPageMap()) {
+    return stableHash(structuralPageSignature(map));
   }
 
   function elementId(element) {
@@ -1122,6 +1832,108 @@
     ].filter(Boolean).join(" ");
   }
 
+  function textFromIds(ids = "") {
+    return String(ids || "")
+      .split(/\s+/)
+      .map((id) => id && document.getElementById(id)?.innerText)
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function implicitRole(element) {
+    if (!element) return "";
+    const tag = (element.tagName || "").toLowerCase();
+    const type = (element.getAttribute?.("type") || "").toLowerCase();
+    if (element.getAttribute?.("role")) return element.getAttribute("role");
+    if (tag === "button" || ["button", "submit", "reset"].includes(type)) return "button";
+    if (tag === "a" && element.getAttribute("href")) return "link";
+    if (tag === "select") return "combobox";
+    if (tag === "textarea") return "textbox";
+    if (tag === "input") {
+      if (type === "checkbox") return "checkbox";
+      if (type === "radio") return "radio";
+      if (type === "range") return "slider";
+      return "textbox";
+    }
+    if (tag === "dialog") return "dialog";
+    return "";
+  }
+
+  function accessibleName(element) {
+    if (!element) return "";
+    return [
+      element.getAttribute?.("aria-label"),
+      textFromIds(element.getAttribute?.("aria-labelledby")),
+      labelText(element),
+      element.getAttribute?.("alt"),
+      element.getAttribute?.("title"),
+      element.value && /button|submit|reset/.test(element.type || "") ? element.value : "",
+      buttonText(element),
+      element.innerText || element.textContent
+    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
+  }
+
+  function accessibilityState(element) {
+    if (!element) return {};
+    return {
+      disabled: isDisabledLike(element),
+      checked: element.checked === true || element.getAttribute?.("aria-checked") === "true",
+      selected: element.selected === true || element.getAttribute?.("aria-selected") === "true",
+      expanded: element.getAttribute?.("aria-expanded") || "",
+      pressed: element.getAttribute?.("aria-pressed") || "",
+      required: element.required === true || element.getAttribute?.("aria-required") === "true",
+      invalid: element.getAttribute?.("aria-invalid") === "true",
+      hasPopup: element.getAttribute?.("aria-haspopup") || "",
+      controls: element.getAttribute?.("aria-controls") || "",
+      describedBy: textFromIds(element.getAttribute?.("aria-describedby")).slice(0, 240)
+    };
+  }
+
+  function accessibilityNode(element, map = agent.pageMap || null) {
+    if (!element || !isVisible(element) || element.closest?.("#atw-sidebar")) return null;
+    const section = map ? liveSectionForElement(map, element) : null;
+    const surface = map?.currentSurface || map?.activeSurface || {};
+    const box = elementBox(element);
+    return {
+      id: elementId(element),
+      controlId: element.dataset?.atwControlId || canonicalControlForElement(element, { section })?.controlId || "",
+      role: implicitRole(element),
+      name: accessibleName(element),
+      state: accessibilityState(element),
+      box,
+      tag: (element.tagName || "").toLowerCase(),
+      kind: /radio|checkbox/i.test(element.type || "") ? "choice" : ((element.tagName || "").toLowerCase()),
+      sectionId: section?.id || "",
+      sectionType: section?.type || "",
+      sectionLabel: section?.label || "",
+      surfaceId: surface?.id || "",
+      surfaceType: surface?.type || "page",
+      inViewport: Boolean(box?.inViewport)
+    };
+  }
+
+  function accessibilitySnapshot(map = agent.pageMap || buildPageMap()) {
+    const surface = map.currentSurface || map.activeSurface || {};
+    const controls = [
+      ...(map.fields || []).map((item) => item.element),
+      ...(map.buttons || []).map((item) => item.element),
+      ...(surface.id ? [elementById(surface.id)] : []),
+      ...(surface.options || []).map((item) => elementById(item.id)),
+      ...(surface.buttons || []).map((item) => elementById(item.id))
+    ]
+      .filter(Boolean)
+      .map((element) => accessibilityNode(element, map))
+      .filter(Boolean)
+      .filter((node, index, list) => list.findIndex((item) => item.id === node.id) === index)
+      .slice(0, 120);
+    return {
+      foregroundSurfaceId: surface.id || "",
+      foregroundSurfaceType: surface.type || "page",
+      controls,
+      landmarkCount: queryAllDeep("main, [role='main'], form, nav, header, footer, aside").filter(isVisible).length
+    };
+  }
+
   function textMatchesIntent(element, intent) {
     const wanted = normalizeMatchText(intent);
     if (!wanted) return false;
@@ -1133,40 +1945,22 @@
     return Boolean(wantedNoPrice && actualNoPrice && (actualNoPrice.includes(wantedNoPrice) || wantedNoPrice.includes(actualNoPrice)));
   }
 
-  function activeSurfaceEntries(map) {
-    return [
-      ...(map?.activeSurface?.options || []),
-      ...(map?.activeSurface?.buttons || [])
-    ].filter(Boolean);
-  }
-
   function activeSurfaceEntryForElement(map, element) {
     if (!element) return null;
     const id = elementId(element);
     return activeSurfaceEntries(map).find((entry) => entry.id === id) || null;
   }
 
-  function resolveDecisionTarget(decision, map) {
-    const direct = elementById(decision.targetId);
-    if (direct) return direct;
+  function isActionableClickTarget(element) {
+    return Boolean(element?.matches?.("button, a, input[type='button'], input[type='submit'], [role='button'], [role='option'], [role='checkbox'], [role='radio'], label, input[type='checkbox'], input[type='radio'], [tabindex]"));
+  }
 
-    const labels = [
-      decision.value,
-      decision.message,
-      decision.reason,
-      ...activeSurfaceEntries(map)
-        .filter((entry) => entry.id === decision.targetId)
-        .map((entry) => entry.label)
-    ].filter(Boolean);
-
-    for (const label of labels) {
-      const entry = activeSurfaceEntries(map).find((item) => textMatchesIntent(elementById(item.id), label) || normalizeMatchText(item.label) === normalizeMatchText(label));
-      const entryElement = elementById(entry?.id);
-      if (entryElement) return entryElement;
-    }
-
-    const candidates = queryAllDeep([
+  function visibleClickableCandidates(root = document) {
+    return queryAllDeep([
       "button",
+      "a",
+      "input[type='button']",
+      "input[type='submit']",
       "[role='button']",
       "[role='option']",
       "[role='menuitem']",
@@ -1174,15 +1968,198 @@
       "[role='radio']",
       "label",
       "input[type='checkbox']",
-      "input[type='radio']"
-    ].join(","))
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"));
+      "input[type='radio']",
+      "li",
+      "[tabindex]"
+    ].join(","), root.shadowRoot || root)
+      .map((element) => clickableAncestor(element) || element)
+      .filter((element, index, list) => element && list.indexOf(element) === index)
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar") && !isPaymentField(element) && !isDisabledLike(element));
+  }
 
-    for (const label of labels) {
-      const target = candidates.find((element) => textMatchesIntent(element, label));
-      if (target) return target;
+  function scoreTargetCandidate(element, labels = []) {
+    const descriptor = elementDescriptor(element);
+    if (!descriptor?.box) return -Infinity;
+    const text = normalizeMatchText(buttonText(element) || labelText(element) || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
+    const wanted = labels.map(normalizeMatchText).filter(Boolean);
+    if (!wanted.length) return 0;
+    const exact = wanted.some((label) => text === label);
+    const contains = wanted.some((label) => text.includes(label) || label.includes(text));
+    if (!exact && !contains) return -Infinity;
+    let score = exact ? 200 : 100;
+    if (isActionableClickTarget(element)) score += 60;
+    if (descriptor.clickClear) score += 25;
+    if (descriptor.box.inViewport) score += 25;
+    if (descriptor.box.width > 520 || descriptor.box.height > 180) score -= 160;
+    if ((descriptor.text || "").length > 180) score -= 120;
+    if (/^(next|continue|back|close|skip|done)$/i.test(descriptor.text || "")) score += 80;
+    return score;
+  }
+
+  function bestClickableForLabels(labels = [], root = document) {
+    return visibleClickableCandidates(root)
+      .map((element) => ({ element, score: scoreTargetCandidate(element, labels) }))
+      .filter((item) => item.score > -Infinity)
+      .sort((a, b) => b.score - a.score)[0]?.element || null;
+  }
+
+  function exactClickableForLabel(label = "", root = document) {
+    const wanted = normalizeMatchText(label);
+    if (!wanted) return null;
+    return visibleClickableCandidates(root)
+      .map((element) => {
+        const descriptor = elementDescriptor(element);
+        const text = normalizeMatchText(buttonText(element) || labelText(element) || element.innerText || element.textContent || element.getAttribute?.("aria-label") || "");
+        if (text !== wanted) return null;
+        let score = 200;
+        if (descriptor?.box?.inViewport) score += 25;
+        if (descriptor?.clickClear) score += 25;
+        if ((descriptor?.text || "").length > 80) score -= 80;
+        return { element, score };
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score)[0]?.element || null;
+  }
+
+  function resolveDecisionTarget(decision, map) {
+    const primaryLabels = [
+      decision.targetLabel,
+      decision.value,
+      ...activeSurfaceEntries(map)
+        .filter((entry) => entry.id === decision.targetId)
+        .map((entry) => entry.label)
+    ].filter(Boolean);
+    const labels = [
+      ...primaryLabels,
+      decision.message,
+      decision.reason
+    ].filter(Boolean);
+
+    const activeSurfaceRoot = map?.activeSurface?.type && map.activeSurface.type !== "page" ? elementById(map.activeSurface.id) : null;
+    const requestedControlId = decision.controlId || decision.targetSnapshot?.controlId || "";
+    if (requestedControlId) {
+      const control = (map.controls || []).find((item) => item.controlId === requestedControlId);
+      const activationIds = [
+        control?.preferredActivationElementId,
+        ...(control?.actuators || [])
+          .filter((item) => /activation|label|wrapper|state/.test(item.relation || ""))
+          .map((item) => item.nodeId),
+        control?.stateElementId
+      ].filter(validTargetId);
+      const controlTarget = activationIds.map((id) => elementById(id)).find((element) => element && isVisible(element) && !isDisabledLike(element));
+      if (controlTarget) {
+        logFlow("target.resolve", {
+          method: "canonical-control",
+          requested: { controlId: requestedControlId, targetId: decision.targetId, targetLabel: decision.targetLabel, value: decision.value },
+          control: control ? {
+            controlId: control.controlId,
+            label: control.label,
+            kind: control.kind,
+            semantic: control.semantic,
+            state: control.state
+          } : null,
+          resolved: elementDescriptor(controlTarget)
+        });
+        return controlTarget;
+      }
+    }
+    const direct = validTargetId(decision.targetId) ? elementById(decision.targetId) : null;
+    if (direct) {
+      const directBox = isVisible(direct) ? elementBox(direct) : null;
+      const directText = compactText(buttonText(direct) || labelText(direct) || direct.innerText || direct.textContent || "", 260);
+      const directLooksLikeContainer = directBox && (directBox.width > 520 || directBox.height > 220 || directText.length > 220) && !isActionableClickTarget(direct);
+      if (directLooksLikeContainer || scoreTargetCandidate(direct, primaryLabels.length ? primaryLabels : labels) < 0) {
+        const nested = primaryLabels.map((label) => exactClickableForLabel(label, direct)).find(Boolean)
+          || bestClickableForLabels(primaryLabels.length ? primaryLabels : labels, direct);
+        if (nested) {
+          logFlow("target.resolve", {
+            method: "direct-id-descendant",
+            requested: { targetId: decision.targetId, targetLabel: decision.targetLabel, value: decision.value },
+            direct: elementDescriptor(direct),
+            resolved: elementDescriptor(nested)
+          });
+          return nested;
+        }
+      }
+      logFlow("target.resolve", {
+        method: "direct-id",
+        requested: { targetId: decision.targetId, targetLabel: decision.targetLabel, value: decision.value },
+        resolved: elementDescriptor(direct)
+      });
+      return direct;
     }
 
+    if (activeSurfaceRoot && primaryLabels.length) {
+      const exactSurfaceTarget = primaryLabels.map((label) => exactClickableForLabel(label, activeSurfaceRoot)).find(Boolean);
+      const surfaceTarget = exactSurfaceTarget || bestClickableForLabels(primaryLabels, activeSurfaceRoot);
+      if (surfaceTarget) {
+        logFlow("target.resolve", {
+          method: "active-surface-descendant",
+          requested: { targetId: decision.targetId, targetLabel: decision.targetLabel, value: decision.value },
+          activeSurface: map.activeSurface,
+          resolved: elementDescriptor(surfaceTarget)
+        });
+        return surfaceTarget;
+      }
+    }
+
+    const ambiguousDecline = primaryLabels.some((label) => /^(no,?\s*thanks|none|without|decline)$/i.test(String(label || "").trim()));
+    if (ambiguousDecline && shouldAutoDeclinePaidExtras()) {
+      const pending = nextPendingTask(map, ["baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"]);
+      const pendingSection = (map.sections || []).find((section) => section.id === pending?.sectionId);
+      const pendingRoot = elementById(pendingSection?.id);
+      if (pendingRoot) {
+        const scopedTarget = primaryLabels.map((label) => exactClickableForLabel(label, pendingRoot)).find(Boolean)
+          || bestClickableForLabels(primaryLabels, pendingRoot);
+        if (scopedTarget) {
+          logFlow("target.resolve", {
+            method: "pending-section-label",
+            requested: { targetId: decision.targetId, targetLabel: decision.targetLabel, value: decision.value },
+            pendingSection: { id: pendingSection.id, label: pendingSection.label, type: pendingSection.type },
+            resolved: elementDescriptor(scopedTarget)
+          });
+          return scopedTarget;
+        }
+      }
+    }
+
+    for (const label of primaryLabels) {
+      const entry = activeSurfaceEntries(map).find((item) => textMatchesIntent(elementById(item.id), label) || normalizeMatchText(item.label) === normalizeMatchText(label));
+      const entryElement = elementById(entry?.id);
+      if (entryElement) {
+        const nested = exactClickableForLabel(label, entryElement) || bestClickableForLabels([label], entryElement);
+        const resolved = nested || entryElement;
+        logFlow("target.resolve", {
+          method: "active-surface-label",
+          label: compactText(label, 180),
+          entry,
+          resolved: elementDescriptor(resolved)
+        });
+        return resolved;
+      }
+    }
+
+    const candidates = visibleClickableCandidates(document);
+
+    for (const label of primaryLabels.length ? primaryLabels : labels) {
+      const target = exactClickableForLabel(label, document) || bestClickableForLabels([label], document) || candidates.find((element) => textMatchesIntent(element, label));
+      if (target) {
+        logFlow("target.resolve", {
+          method: "visible-text",
+          label: compactText(label, 180),
+          resolved: elementDescriptor(target),
+          candidates: candidates.slice(0, 20).map((element) => elementDescriptor(element))
+        });
+        return target;
+      }
+    }
+
+    logFlow("target.resolve_failed", {
+      requested: { targetId: decision.targetId, targetLabel: decision.targetLabel, value: decision.value },
+      labels: labels.map((label) => compactText(label, 180)).slice(0, 8),
+      activeSurface: map.activeSurface,
+      candidates: candidates.slice(0, 30).map((element) => elementDescriptor(element))
+    });
     return null;
   }
 
@@ -1276,12 +2253,15 @@
   }
 
   function highlightSection(element, label = "section") {
-    if (!element) return null;
-    const container = sectionContainer(element);
+    // Retired for the same reason as outlineCoreSections: this box was only ever
+    // refreshed by two narrow legacy code paths (the initial announceSectionQueue
+    // call, and the JS auto-fill helper for simple named fields) — the main
+    // AI-decision execution path never called or cleared it, so it froze on
+    // whatever it last touched (usually "contact") while the cursor and the
+    // sidebar's section checklist had already moved on. Those two are the
+    // accurate, always-current source of "what's it working on" now.
     clearSectionHighlights();
-    container.classList.add("atw-section-highlight");
-    logAgentEvent("section_highlight", { label, text: (container.innerText || "").replace(/\s+/g, " ").slice(0, 180) });
-    return container;
+    return element || null;
   }
 
   function displaySectionStatus(section) {
@@ -1292,44 +2272,14 @@
   }
 
   function outlineCoreSections(sections = []) {
+    // Retired: the on-page section boxes guessed boundaries from DOM proximity
+    // (sectionBand/sectionContainer), which can't reliably find pixel-accurate
+    // edges on arbitrary site markup — they routinely overlapped adjacent
+    // sections even with no modal involved. The sidebar's section checklist
+    // (agentSectionsHtml) shows the same done/current/pending state without
+    // guessing page coordinates, so this just clears any leftover boxes now.
     clearSectionOutlines();
-    const visibleSections = liveSectionModels(sections)
-      .filter((section) => section.element && isVisible(section.element));
-    visibleSections.forEach((section) => {
-      const band = sectionBand(section, visibleSections);
-      const rect = {
-        left: band.left,
-        top: band.top,
-        width: Math.max(0, band.right - band.left),
-        height: Math.max(0, band.bottom - band.top)
-      };
-      if (rect.width < 80 || rect.height < 35) return;
-      section.element.classList.add("atw-section-outline-source");
-      const outline = document.createElement("div");
-      const visualStatus = displaySectionStatus(section);
-      outline.className = `atw-section-outline is-${section.status || "unknown"}`;
-      outline.style.left = `${Math.max(0, window.scrollX + rect.left)}px`;
-      outline.style.top = `${Math.max(0, window.scrollY + rect.top)}px`;
-      outline.style.width = `${Math.round(rect.width)}px`;
-      outline.style.height = `${Math.round(rect.height)}px`;
-      outline.innerHTML = `
-        <span class="atw-section-badge">
-          <strong>${section.order}</strong>
-          ${section.label}
-          <em>${visualStatus}</em>
-        </span>
-      `;
-      document.body.appendChild(outline);
-    });
-    logAgentEvent("section_outlines", {
-      sections: visibleSections.map((section) => ({
-        order: section.order,
-        label: section.label,
-        status: section.status,
-        objective: section.objective
-      }))
-    });
-    return visibleSections;
+    return liveSectionModels(sections).filter((section) => section.element && isVisible(section.element));
   }
 
   function sectionAnchorByText(pattern) {
@@ -1477,7 +2427,7 @@
       )]
     ];
     const seen = new Set();
-    return patterns
+    const named = patterns
       .map(([label, pattern, resolver]) => {
         const element = resolver ? resolver() : sectionAnchorByText(pattern);
         if (!element) return null;
@@ -1486,8 +2436,59 @@
         seen.add(id);
         return { label, element, box: elementBox(element) };
       })
+      .filter(Boolean);
+    const generic = detectGenericSections(named.map((section) => section.element))
+      .filter((section) => {
+        const id = elementId(section.element);
+        if (seen.has(id)) return false;
+        seen.add(id);
+        return true;
+      });
+    return [...named, ...generic].sort((a, b) => a.box.y - b.box.y);
+  }
+
+  function genericSectionLabel(text) {
+    const firstLine = (text.split(/\n|(?<=[.!?])\s{2,}/)[0] || text).replace(/\s+/g, " ").trim();
+    return (firstLine.length >= 4 ? firstLine : text.replace(/\s+/g, " ").trim()).slice(0, 60) || "additional section";
+  }
+
+  function detectGenericSections(claimedElements = []) {
+    const isClaimed = (element) => claimedElements.some((claimed) => claimed === element || claimed.contains(element) || element.contains(claimed));
+    const candidates = queryAllDeep("section, article, form, fieldset, div")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar, .atw-section-outline, #atw-agent-cursor"))
+      .filter((element) => !isClaimed(element))
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        if (rect.width < 260 || rect.height < 90 || rect.height > 1400) return null;
+        const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+        if (!text || text.length < 8 || text.length > 2600) return null;
+        if (isSummaryLikeElement(element)) return null;
+        const decisionControls = queryAllDeep("input[type='radio'], input[type='checkbox'], select, [role='combobox'], [role='listbox']", element)
+          .filter((control) => isVisible(control) && !control.closest("#atw-sidebar"));
+        const emptyRequiredFields = candidateInputs()
+          .filter((input) => element.contains(input) && isVisible(input) && !input.closest("#atw-sidebar") && !fieldValue(input) && (input.required || /\*/.test(labelText(input))));
+        if (!decisionControls.length && !emptyRequiredFields.length) return null;
+        const headingCount = checkoutHeadingCount(text);
+        let score = 60;
+        score += Math.min(40, decisionControls.length * 8);
+        score += Math.min(40, emptyRequiredFields.length * 10);
+        score -= headingCount > 1 ? headingCount * 20 : 0;
+        score -= Math.abs(rect.width - 760) / 100;
+        return { element, score, area: rect.width * rect.height, text };
+      })
       .filter(Boolean)
-      .sort((a, b) => a.box.y - b.box.y);
+      .sort((a, b) => b.score - a.score || a.area - b.area);
+    const accepted = [];
+    for (const candidate of candidates) {
+      const overlapsAccepted = accepted.some((item) => item.element.contains(candidate.element) || candidate.element.contains(item.element));
+      if (overlapsAccepted) continue;
+      accepted.push(candidate);
+    }
+    return accepted.map(({ element, text }) => ({
+      label: genericSectionLabel(text),
+      element,
+      box: elementBox(element)
+    }));
   }
 
   function liveSectionModels(sections = []) {
@@ -1552,17 +2553,29 @@
   function sectionFieldModels(section, fields, allSections = []) {
     return fields
       .filter((field) => field.element && elementBelongsToSectionBand(field.element, section, allSections))
-      .map((field) => ({
-        id: field.id,
-        label: field.label,
-        field: field.field,
-        kind: field.kind,
-        semantic: semanticFieldType(field),
-        required: field.required,
-        hasValue: Boolean(field.value),
-        value: field.value ? "[filled]" : "",
-        box: field.box
-      }));
+      .map((field) => {
+        const control = canonicalControlForElement(field.element, {
+          section,
+          sectionId: section.id,
+          sectionType: section.type,
+          sectionLabel: section.label,
+          field: field.field,
+          required: field.required
+        });
+        return applyControlToModel({
+          id: field.id,
+          label: field.label,
+          field: field.field,
+          kind: field.kind,
+          semantic: semanticFieldType(field),
+          role: field.role || field.accessibility?.role || "",
+          accessibility: field.accessibility || null,
+          required: field.required,
+          hasValue: Boolean(field.value),
+          value: field.value ? "[filled]" : "",
+          box: field.box
+        }, control);
+      });
   }
 
   function semanticFieldType(field) {
@@ -1579,12 +2592,24 @@
   function sectionButtonModels(section, buttons, allSections = []) {
     return buttons
       .filter((button) => button.element && elementBelongsToSectionBand(button.element, section, allSections))
-      .map((button) => ({
-        id: button.id,
-        label: button.label,
-        risk: button.risk,
-        box: button.box
-      }));
+      .map((button) => {
+        const control = canonicalControlForElement(button.element, {
+          section,
+          sectionId: section.id,
+          sectionType: section.type,
+          sectionLabel: section.label,
+          field: button.semantic
+        });
+        return applyControlToModel({
+          id: button.id,
+          label: button.label,
+          risk: button.risk,
+          semantic: button.semantic,
+          role: button.role || button.accessibility?.role || "",
+          accessibility: button.accessibility || null,
+          box: button.box
+        }, control);
+      });
   }
 
   function selectedControlLabels(section, allSections = []) {
@@ -1650,17 +2675,279 @@
     return "choice";
   }
 
+  function choiceRisk(label = "") {
+    const semantic = semanticChoiceType(label);
+    if (/decline_/.test(semantic)) return "safe_decline";
+    if (semantic === "add_paid_extra") return "money";
+    if (semantic === "continue" || semantic === "traveler_title") return "safe";
+    return "uncertain";
+  }
+
+  function slugControlPart(value = "") {
+    return normalizeMatchText(value).replace(/\s+/g, "-").slice(0, 54) || "unknown";
+  }
+
+  function labelElementForInput(input) {
+    if (!input) return null;
+    const id = input.getAttribute?.("id");
+    if (id) {
+      const explicit = queryAllDeep(`label[for="${CSS.escape(id)}"]`)[0];
+      if (explicit) return explicit;
+    }
+    return input.closest?.("label") || null;
+  }
+
+  function controlWrapperForElement(element, stateElement = element) {
+    const root = stateElement || element;
+    return root?.closest?.("label, [role='radio'], [role='checkbox'], [role='option'], [role='button'], li, tr, fieldset, [role='radiogroup'], [role='group'], div") || element;
+  }
+
+  function controlKindForElement(element) {
+    const tag = (element?.tagName || "").toLowerCase();
+    const type = (element?.getAttribute?.("type") || "").toLowerCase();
+    const role = implicitRole(element);
+    if (type === "radio" || role === "radio") return "radio";
+    if (type === "checkbox" || role === "checkbox") return "checkbox";
+    if (tag === "select" || role === "combobox" || role === "listbox") return "select";
+    if (tag === "textarea" || (tag === "input" && !["button", "submit", "reset", "radio", "checkbox"].includes(type))) return "field";
+    if (tag === "button" || role === "button" || ["button", "submit", "reset"].includes(type)) return "button";
+    if (role === "option") return "option";
+    return role || tag || "control";
+  }
+
+  function stateElementForControl(element) {
+    if (!element) return null;
+    if (element.matches?.("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], [role='button'], button")) return element;
+    const labelledInput = element.getAttribute?.("for")
+      ? document.getElementById(element.getAttribute("for"))
+      : null;
+    if (labelledInput) return labelledInput;
+    return queryAllDeep("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], button, [role='button']", element)
+      .filter((candidate) => isVisible(candidate) && !candidate.closest("#atw-sidebar"))[0] || element;
+  }
+
+  function controlStateForElement(element) {
+    const value = currentElementValue(element);
+    return {
+      checked: Boolean(element?.checked === true || element?.getAttribute?.("aria-checked") === "true"),
+      selected: Boolean(element?.selected === true || element?.getAttribute?.("aria-selected") === "true" || isChoiceSelected(element)),
+      valuePresent: Boolean(value && String(value).trim()),
+      value: value ? "[filled]" : "",
+      disabled: isDisabledLike(element),
+      required: Boolean(element?.required === true || element?.getAttribute?.("aria-required") === "true"),
+      expanded: element?.getAttribute?.("aria-expanded") || "",
+      pressed: element?.getAttribute?.("aria-pressed") || ""
+    };
+  }
+
+  function unionBoxes(boxes = []) {
+    const valid = boxes.filter((box) => box && Number.isFinite(Number(box.x)) && Number.isFinite(Number(box.y)));
+    if (!valid.length) return null;
+    const left = Math.min(...valid.map((box) => Number(box.x)));
+    const top = Math.min(...valid.map((box) => Number(box.y)));
+    const right = Math.max(...valid.map((box) => Number(box.x) + Number(box.width || 0)));
+    const bottom = Math.max(...valid.map((box) => Number(box.y) + Number(box.height || 0)));
+    const width = Math.max(0, right - left);
+    const height = Math.max(0, bottom - top);
+    return {
+      x: Math.round(left),
+      y: Math.round(top),
+      width: Math.round(width),
+      height: Math.round(height),
+      centerX: Math.round(left + width / 2),
+      centerY: Math.round(top + height / 2),
+      inViewport: valid.some((box) => box.inViewport)
+    };
+  }
+
+  function actuatorEntry(element, relation) {
+    if (!element) return null;
+    return {
+      nodeId: elementId(element),
+      relation,
+      role: implicitRole(element),
+      label: compactText(buttonText(element) || labelText(element) || element.innerText || element.textContent || accessibleName(element), 180),
+      box: elementBox(element)
+    };
+  }
+
+  function canonicalControlForElement(element, context = {}) {
+    if (!element || element.closest?.("#atw-sidebar")) return null;
+    const stateElement = stateElementForControl(element);
+    if (!stateElement || stateElement.closest?.("#atw-sidebar")) return null;
+    const labelElement = labelElementForInput(stateElement);
+    const wrapper = controlWrapperForElement(element, stateElement);
+    const activationElement = labelElement || clickableAncestor(element) || clickableAncestor(wrapper) || wrapper || stateElement;
+    const label = compactText(
+      choiceLabel(stateElement)
+      || buttonText(element)
+      || labelText(stateElement)
+      || accessibleName(element)
+      || accessibleName(stateElement)
+      || controlText(stateElement),
+      220
+    );
+    const kind = controlKindForElement(stateElement);
+    const semantic = /radio|checkbox|option/.test(kind) ? semanticChoiceType(label) : (semanticFieldType({ label, kind, field: context.field || "" }) || semanticChoiceType(label));
+    const sectionType = context.sectionType || context.section?.type || "";
+    const sectionLabel = context.sectionLabel || context.section?.label || "";
+    const sectionId = context.sectionId || context.section?.id || "";
+    const surface = context.surface || {};
+    const members = [
+      { element: stateElement, relation: "state" },
+      { element: labelElement, relation: "label" },
+      { element: wrapper, relation: "wrapper" },
+      { element: activationElement, relation: "activation" },
+      { element, relation: "source" }
+    ].filter((item) => item.element);
+    const boxes = members.map((item) => isVisible(item.element) ? elementBox(item.element) : null).filter(Boolean);
+    const state = controlStateForElement(stateElement);
+    const base = [
+      surface.id || surface.type || "page",
+      sectionId || sectionType || sectionLabel || "section",
+      kind,
+      semantic,
+      label,
+      elementId(stateElement)
+    ].map(slugControlPart).join("_");
+    const controlId = `ctrl_${base}`.slice(0, 118);
+    members.forEach((item) => {
+      try {
+        item.element.dataset.atwControlId = controlId;
+      } catch (_) {
+        // Some SVG/foreign elements may not expose dataset. They still remain in the graph.
+      }
+    });
+    const actuators = members
+      .map((item) => actuatorEntry(item.element, item.relation))
+      .filter(Boolean)
+      .filter((entry, index, list) => list.findIndex((other) => other.nodeId === entry.nodeId && other.relation === entry.relation) === index);
+    return {
+      controlId,
+      id: controlId,
+      label,
+      accessibleName: accessibleName(stateElement) || accessibleName(element),
+      kind,
+      role: implicitRole(stateElement) || implicitRole(element),
+      semantic,
+      risk: choiceRisk(label),
+      state,
+      selected: Boolean(state.checked || state.selected),
+      required: Boolean(state.required || context.required),
+      sectionId,
+      sectionType,
+      sectionLabel,
+      surfaceId: surface.id || "",
+      surfaceType: surface.type || "page",
+      surfaceLabel: surface.label || "",
+      stateElementId: elementId(stateElement),
+      preferredActivationElementId: elementId(activationElement || stateElement),
+      actuators,
+      visualRegion: unionBoxes(boxes) || elementBox(stateElement)
+    };
+  }
+
+  function applyControlToModel(model, control) {
+    if (!model || !control) return model;
+    model.controlId = control.controlId;
+    model.controlKind = control.kind;
+    model.controlState = control.state;
+    model.stateElementId = control.stateElementId;
+    model.preferredActivationElementId = control.preferredActivationElementId;
+    model.actuators = control.actuators;
+    model.visualRegion = control.visualRegion;
+    return model;
+  }
+
+  function buildCanonicalControlGraph(sections = [], fields = [], buttons = [], activeSurface = {}) {
+    const controls = new Map();
+    const remember = (control) => {
+      if (!control?.controlId) return;
+      const existing = controls.get(control.controlId) || {};
+      const actuators = [...(existing.actuators || []), ...(control.actuators || [])]
+        .filter((entry, index, list) => entry?.nodeId && list.findIndex((other) => other.nodeId === entry.nodeId && other.relation === entry.relation) === index);
+      controls.set(control.controlId, {
+        ...existing,
+        ...control,
+        actuators,
+        visualRegion: unionBoxes([existing.visualRegion, control.visualRegion].filter(Boolean)) || control.visualRegion || existing.visualRegion
+      });
+    };
+
+    for (const field of fields || []) {
+      const section = (sections || []).find((item) => field.element && elementById(item.id)?.contains?.(field.element));
+      const control = canonicalControlForElement(field.element, {
+        section,
+        sectionId: section?.id || "",
+        sectionType: section?.type || "",
+        sectionLabel: section?.label || "",
+        field: field.field,
+        required: field.required
+      });
+      remember(control);
+      applyControlToModel(field, control);
+    }
+
+    for (const button of buttons || []) {
+      const control = canonicalControlForElement(button.element, {
+        field: button.semantic,
+        required: false
+      });
+      remember(control);
+      applyControlToModel(button, control);
+    }
+
+    for (const section of sections || []) {
+      for (const group of [section.fields || [], section.choices || [], section.buttons || []]) {
+        for (const item of group) {
+          const source = elementById(item.stateElementId || item.id);
+          const control = source ? canonicalControlForElement(source, {
+            section,
+            sectionId: section.id,
+            sectionType: section.type,
+            sectionLabel: section.label,
+            required: item.required
+          }) : null;
+          remember(control);
+          applyControlToModel(item, control);
+        }
+      }
+    }
+
+    const surface = activeSurface?.type && activeSurface.type !== "page" ? activeSurface : null;
+    if (surface) {
+      for (const item of [...(surface.options || []), ...(surface.buttons || [])]) {
+        const source = elementById(item.id);
+        const control = source ? canonicalControlForElement(source, { surface }) : null;
+        remember(control);
+        applyControlToModel(item, control);
+      }
+    }
+
+    return [...controls.values()].slice(0, 180);
+  }
+
   function sectionChoiceModels(section, allSections = []) {
     return sectionChoiceInputs(section, allSections)
       .map((input) => {
         const label = choiceLabel(input);
-        return {
+        const control = canonicalControlForElement(input, {
+          section,
+          sectionId: section.id,
+          sectionType: section.type,
+          sectionLabel: section.label,
+          required: true
+        });
+        return applyControlToModel({
           id: elementId(input),
           label,
           selected: Boolean(isChoiceSelected(input)),
           semantic: semanticChoiceType(label),
+          risk: choiceRisk(label),
+          role: implicitRole(input),
+          accessibility: accessibilityNode(input, null),
           box: elementBox(input)
-        };
+        }, control);
       })
       .filter((choice) => choice.label)
       .slice(0, 20);
@@ -1675,13 +2962,19 @@
     const selected = selectedControlLabels(section, allSections);
     const lower = section.text.toLowerCase();
     const requiredMissing = unfilledRequiredFields(fields);
-    const hasSelectPlaceholder = queryAllDeep("select, [role='combobox']", section.element)
+    const PLACEHOLDER_TEXT = /^(choose|select|please select|select one|select one option|please choose)$/i;
+    const hasSelectPlaceholder = queryAllDeep("select, [role='combobox'], button, [role='button'], [tabindex]", section.element)
       .filter((control) => isVisible(control) && !control.closest("#atw-sidebar"))
-      .some((control) => /choose|select/.test(currentElementValue(control).toLowerCase() || controlText(control).toLowerCase()));
-    const hasDecisionPrompt = /select one option|select an option|choose one option|please select/.test(lower);
+      .some((control) => {
+        const value = (currentElementValue(control) || controlText(control) || "").trim();
+        return PLACEHOLDER_TEXT.test(value);
+      });
+    // Note: intentionally NOT counting a static "select an option" / "please select" prompt
+    // label as validation text — that label is always present regardless of whether a
+    // choice has already been made, so treating it as an error blocked sections (like
+    // cancellation_insurance, flexible_ticket) from ever reaching "complete".
     const hasValidationText = /must enter|invalid|not valid|too long|too short/.test(lower)
-      || (/\bfield required\b/.test(lower) && requiredMissing.length > 0)
-      || hasDecisionPrompt;
+      || (/\bfield required\b/.test(lower) && requiredMissing.length > 0);
 
     if (type === "contact" || type === "passenger") {
       const stillMissing = requiredMissing.length || /must enter|invalid|not valid|too long|too short/.test(lower);
@@ -1692,8 +2985,19 @@
       const checkedFields = checkedFieldLabels(fields);
       const hasBaggageDecision = choices.some((input) => /baggage|checked|kg|without|no checked/i.test(choiceLabel(input)));
       const selectedNoBaggage = [...selected, ...checkedFields].some((label) => /no checked baggage|no baggage|without/i.test(label));
-      if (hasBaggageDecision) return selectedNoBaggage ? "complete" : "incomplete";
-      return /checked baggage\s+no baggage selected/i.test(lower) && !hasValidationText ? "complete" : "incomplete";
+      // A section like this can bundle more than one required radio group (e.g. cabin
+      // baggage AND checked baggage on a self-transfer route) — resolving one used to be
+      // enough to mark the whole section complete, silently leaving the other group
+      // (its own required "Select one option") untouched and never queued as a task.
+      // Every group of radio inputs sharing a name must have its own selection.
+      const radioGroups = new Map();
+      choices.filter((input) => input.type === "radio" && input.name).forEach((input) => {
+        if (!radioGroups.has(input.name)) radioGroups.set(input.name, []);
+        radioGroups.get(input.name).push(input);
+      });
+      const everyGroupResolved = [...radioGroups.values()].every((group) => group.some((input) => isChoiceSelected(input)));
+      if (hasBaggageDecision) return selectedNoBaggage && everyGroupResolved ? "complete" : "incomplete";
+      return /checked baggage\s+no baggage selected/i.test(lower) && !hasValidationText && everyGroupResolved ? "complete" : "incomplete";
     }
     if (type === "bundle") {
       const checkedFields = checkedFieldLabels(fields);
@@ -1734,13 +3038,15 @@
     return sections.map((section, index) => {
       const text = (section.element.innerText || section.element.textContent || "").replace(/\s+/g, " ").trim();
       const type = sectionTypeFor(section.label, text);
-      const sectionFields = sectionFieldModels(section, fields, sections);
-      const sectionButtons = sectionButtonModels(section, buttons, sections);
-      let status = inferSectionStatus({ ...section, text }, sectionFields, sectionButtons, sections);
-      if (type !== "continue" && sectionDone(type) && status !== "incomplete" && status !== "blocked") status = "complete";
+      const sectionId = elementId(section.element);
+      const sectionContext = { ...section, id: sectionId, type, text };
+      const sectionFields = sectionFieldModels(sectionContext, fields, sections);
+      const sectionButtons = sectionButtonModels(sectionContext, buttons, sections);
+      let status = inferSectionStatus(sectionContext, sectionFields, sectionButtons, sections);
+      if (type !== "continue" && canUseCompletionMemoryForSectionType(type) && sectionDone(type) && status !== "incomplete" && status !== "blocked") status = "complete";
       const paidChoice = /eur|€|\$|add to cart|premium|bundle|insurance|cancellation|flexible|checked baggage|paid/i.test(text);
       return {
-        id: elementId(section.element),
+        id: sectionId,
         label: section.label,
         type,
         order: index + 1,
@@ -1749,7 +3055,7 @@
         paidChoice,
         objective: sectionObjective(section, type, status),
         selected: selectedControlLabels(section, sections),
-        choices: sectionChoiceModels(section, sections),
+        choices: sectionChoiceModels(sectionContext, sections),
         fields: sectionFields,
         buttons: sectionButtons,
         box: section.box,
@@ -1797,6 +3103,298 @@
     };
   }
 
+  function stageExitBlockers(map = buildPageMap(), decision = {}) {
+    const blockers = [];
+    const label = normalizeMatchText(`${decision.targetLabel || ""} ${decision.value || ""}`);
+    const navLabel = stageExitIntentLabel(decision, map);
+    const currentSurface = map.currentSurface || map.activeSurface || { type: "page" };
+    const surfaceActive = Boolean(currentSurface.type && currentSurface.type !== "page");
+    const seatNoSelectionContinue = isSeatNoSelectionContinue(decision, map);
+    const allowSeatSkipNavigation = seatNoSelectionContinue || (shouldAutoDeclinePaidExtras()
+      && map.step === "seats"
+      && Boolean(navLabel)
+      && !/\b(choose|select|pick)\b.*\bseat\b|\bseat\b.*\b(choose|select|pick)\b/.test(label));
+    const targetIsActiveSurfaceNavigation = surfaceActive
+      && Boolean(navLabel);
+    const pendingTasks = (surfaceActive ? (currentSurface.taskQueue || map.currentSurfaceTasks || []) : (map.taskQueue || []))
+      .filter((task) => task.status === "pending");
+    const actionableTasks = allowSeatSkipNavigation
+      ? pendingTasks.filter((task) => task.sectionType !== "seat")
+      : pendingTasks;
+    if (actionableTasks.length) {
+      const task = actionableTasks[0];
+      blockers.push({
+        code: "PENDING_REQUIRED_SECTION",
+        message: `${task.sectionLabel || task.sectionType || "A required section"} is still unresolved.`
+      });
+    }
+    const overlays = (map.overlays || []).filter((overlay) => overlay?.label || overlay?.text);
+    if (overlays.length && !targetIsActiveSurfaceNavigation && !seatNoSelectionContinue) {
+      blockers.push({
+        code: "ACTIVE_SURFACE_PRESENT",
+        message: "A visible popup/dropdown/modal is still active."
+      });
+    }
+    const errors = surfaceActive
+      ? actionableCheckoutErrors(currentSurface.errors || [])
+      : actionableCheckoutErrors(map.errors || []);
+    if (errors.length) {
+      blockers.push({
+        code: "VISIBLE_VALIDATION_ERRORS",
+        message: errors.slice(0, 2).join("; ")
+      });
+    }
+    if (!surfaceActive) {
+      const unresolvedChoice = (map.sections || []).find((section) => {
+        if (!section || section.status === "complete" || section.status === "blocked") return false;
+        if (allowSeatSkipNavigation && section.type === "seat") return false;
+        return Boolean(section.required || section.choices?.length || section.paidChoice);
+      });
+      if (unresolvedChoice && !blockers.some((blocker) => blocker.code === "PENDING_REQUIRED_SECTION")) {
+        blockers.push({
+          code: "UNRESOLVED_VISIBLE_CHOICE",
+          message: `${unresolvedChoice.label || unresolvedChoice.type || "A visible choice"} still needs a verified decision.`
+        });
+      }
+    }
+    return blockers;
+  }
+
+  function expectedOutcomeForDecision(decision = {}, map = buildPageMap(), target = null) {
+    const targetId = target ? elementId(target) : decision.targetId || "";
+    const targetControl = target ? canonicalControlForElement(target, { section: liveSectionForElement(map, target) }) : null;
+    const snapshotControlId = decision.controlId || decision.targetSnapshot?.controlId || targetControl?.controlId || "";
+    const label = decision.targetLabel || decision.value || (target ? buttonText(target) || labelText(target) || target.innerText || "" : "");
+    const section = target ? liveSectionForElement(map, target) : null;
+    const activeSurface = map.currentSurface || map.activeSurface || {};
+    const base = {
+      action: decision.action || "",
+      targetId,
+      controlId: snapshotControlId,
+      stateElementId: decision.targetSnapshot?.stateElementId || targetControl?.stateElementId || "",
+      targetLabel: String(label || "").replace(/\s+/g, " ").trim().slice(0, 180),
+      beforeSignature: structuralPageSignature(map),
+      beforeVisualState: visualPageState(map)
+    };
+    if (decision.expectedOutcome && typeof decision.expectedOutcome === "object") {
+      return { ...base, ...decision.expectedOutcome };
+    }
+    if (decision.action === "type" || decision.action === "select") {
+      return {
+        ...base,
+        type: "field_value_changed",
+        expectedValue: decision.value || ""
+      };
+    }
+    if (decision.action === "click" || decision.action === "click_xy") {
+      const button = (map.buttons || []).find((item) => item.id === decision.targetId || item.id === targetId);
+      if (button?.risk === "safe_continue" || isStageExitDecision(decision, map)) {
+        return {
+          ...base,
+          type: "stage_exit_or_feedback",
+          blockersBefore: stageExitBlockers(map, decision)
+        };
+      }
+      if (activeSurface.type && activeSurface.type !== "page") {
+        return {
+          ...base,
+          type: "active_surface_change",
+          surfaceType: activeSurface.type,
+          surfaceLabel: activeSurface.label || "",
+          surfaceSignature: `${activeSurface.type || ""}:${activeSurface.label || ""}:${(activeSurface.options || []).map((entry) => entry.id).join(",")}`
+        };
+      }
+      if (section?.type) {
+        return {
+          ...base,
+          type: "section_choice_verified",
+          sectionId: section.id || "",
+          sectionType: section.type || "",
+          sectionLabel: section.label || ""
+        };
+      }
+    }
+    return {
+      ...base,
+      type: "observable_change"
+    };
+  }
+
+  function verifyExpectedOutcome(expected = {}, beforeMap = buildPageMap(), afterMap = buildPageMap(), target = null) {
+    const beforeSignature = expected.beforeSignature || structuralPageSignature(beforeMap);
+    const afterSignature = structuralPageSignature(afterMap);
+    const changed = beforeSignature !== afterSignature;
+    const beforeVisualState = expected.beforeVisualState || visualPageState(beforeMap);
+    const afterVisualState = visualPageState(afterMap);
+    const visualChanged = beforeVisualState?.fingerprint && afterVisualState?.fingerprint && beforeVisualState.fingerprint !== afterVisualState.fingerprint;
+    const foregroundChanged = beforeVisualState?.foreground?.fingerprint && afterVisualState?.foreground?.fingerprint
+      && beforeVisualState.foreground.fingerprint !== afterVisualState.foreground.fingerprint;
+    const progressMarkerChanged = JSON.stringify(beforeVisualState?.foreground?.progressMarkers || {}) !== JSON.stringify(afterVisualState?.foreground?.progressMarkers || {});
+    const evidence = {
+      beforeStep: beforeMap.step,
+      afterStep: afterMap.step,
+      beforeUrl: beforeMap.url || location.href,
+      afterUrl: location.href,
+      beforeSurface: beforeMap.activeSurface?.label || "",
+      afterSurface: afterMap.activeSurface?.label || "",
+      visual: {
+        beforeFingerprint: beforeVisualState?.fingerprint || "",
+        afterFingerprint: afterVisualState?.fingerprint || "",
+        visualChanged: Boolean(visualChanged),
+        foregroundChanged: Boolean(foregroundChanged),
+        progressMarkerChanged: Boolean(progressMarkerChanged),
+        beforeForeground: beforeVisualState?.foreground || null,
+        afterForeground: afterVisualState?.foreground || null
+      },
+      errors: actionableCheckoutErrors(afterMap.errors || []),
+      blockers: stageExitBlockers(afterMap, expected)
+    };
+    const expectedControlId = expected.controlId || expected.targetSnapshot?.controlId || "";
+    const afterControl = expectedControlId
+      ? (afterMap.controls || []).find((control) => control.controlId === expectedControlId)
+      : null;
+    const afterControlState = afterControl?.state || null;
+    const logicalControlSatisfied = Boolean(
+      afterControl
+      && (
+        afterControl.selected
+        || afterControlState?.checked
+        || afterControlState?.selected
+        || afterControlState?.valuePresent
+      )
+    );
+    if (expected.type === "field_value_changed") {
+      const liveTarget = target && isVisible(target) ? target : elementById(expected.stateElementId || expected.targetId);
+      const value = currentElementValue(liveTarget);
+      const ok = (Boolean(value) && (!expected.expectedValue || normalizeMatchText(value).includes(normalizeMatchText(expected.expectedValue).slice(0, 24))))
+        || Boolean(afterControlState?.valuePresent);
+      return {
+        ok,
+        code: ok ? "FIELD_VALUE_VERIFIED" : "FIELD_VALUE_NOT_VERIFIED",
+        message: ok ? "Field value is present after the action." : "Field value was not retained after the action.",
+        evidence: { ...evidence, value, control: afterControl || null }
+      };
+    }
+    if (expected.type === "section_choice_verified") {
+      const section = (afterMap.sections || []).find((item) => item.id === expected.sectionId)
+        || (afterMap.sections || []).find((item) => item.type === expected.sectionType && item.label === expected.sectionLabel)
+        || (afterMap.sections || []).find((item) => item.type === expected.sectionType);
+      const ok = section?.status === "complete";
+      return {
+        ok,
+        code: ok ? "SECTION_COMPLETE" : "SECTION_STILL_INCOMPLETE",
+        message: ok ? `${expected.sectionLabel || expected.sectionType} is complete.` : `${expected.sectionLabel || expected.sectionType || "Section"} is still incomplete.`,
+        evidence: { ...evidence, section: section ? { id: section.id, label: section.label, type: section.type, status: section.status, selected: section.selected || [] } : null }
+      };
+    }
+    if (expected.type === "requirement_status") {
+      const expectedRequirement = normalizeMatchText(expected.requirementId || expected.sectionLabel || expected.intent || "");
+      const matchedSection = (afterMap.sections || []).find((item) =>
+        item.id === expected.sectionId
+        || item.id === expected.targetId
+        || (expectedRequirement && normalizeMatchText(item.type || "") === expectedRequirement)
+        || (expectedRequirement && normalizeMatchText(item.label || "").includes(expectedRequirement))
+        || (normalizeMatchText(item.label || "") && normalizeMatchText(expected.sectionLabel || "").includes(normalizeMatchText(item.label || "")))
+      );
+      const targetSelected = expected.targetId
+        ? [...(afterMap.buttons || []), ...(afterMap.fields || []), ...(afterMap.sections || []).flatMap((section) => section.choices || [])]
+          .some((item) => (item.id === expected.targetId || item.controlId === expected.targetId || item.controlId === expectedControlId) && (item.selected || item.hasValue || item.controlState?.checked || item.controlState?.selected || item.controlState?.valuePresent))
+        : false;
+      const activeSurfaceProgress = beforeMap.activeSurface?.label && beforeMap.activeSurface?.label !== afterMap.activeSurface?.label;
+      const ok = logicalControlSatisfied || targetSelected || matchedSection?.status === "complete" || (activeSurfaceProgress && !evidence.errors.length);
+      return {
+        ok,
+        code: ok ? "REQUIREMENT_EVIDENCE_VERIFIED" : "REQUIREMENT_NOT_VERIFIED",
+        message: ok
+          ? `${expected.requirementId || expected.sectionLabel || "Requirement"} has evidence after the action.`
+          : `${expected.requirementId || expected.sectionLabel || "Requirement"} is still missing evidence after the action.`,
+        evidence: {
+          ...evidence,
+          control: afterControl || null,
+          logicalControlSatisfied,
+          targetSelected,
+          section: matchedSection ? {
+            id: matchedSection.id,
+            label: matchedSection.label,
+            type: matchedSection.type,
+            status: matchedSection.status,
+            selected: matchedSection.selected || []
+          } : null
+        }
+      };
+    }
+    if (expected.type === "active_surface_change") {
+      const afterSurface = afterMap.activeSurface || {};
+      const afterSurfaceSignature = `${afterSurface.type || ""}:${afterSurface.label || ""}:${(afterSurface.options || []).map((entry) => entry.id).join(",")}`;
+      const beforeSurface = beforeMap.activeSurface || {};
+      const beforeSurfaceSignature = `${beforeSurface.type || ""}:${beforeSurface.label || ""}:${(beforeSurface.options || []).map((entry) => entry.id).join(",")}`;
+      const ok = expected.surfaceSignature
+        ? expected.surfaceSignature !== afterSurfaceSignature
+        : beforeSurfaceSignature !== afterSurfaceSignature || foregroundChanged || progressMarkerChanged || Boolean(afterSurface.type && afterSurface.type !== "page" && visualChanged);
+      return {
+        ok,
+        code: ok ? "ACTIVE_SURFACE_CHANGED" : "ACTIVE_SURFACE_UNCHANGED",
+        message: ok ? "Active surface changed after the action." : "Active surface did not change after the action.",
+        evidence: { ...evidence, beforeSurfaceSignature, afterSurfaceSignature }
+      };
+    }
+    if (expected.type === "stage_exit_or_feedback") {
+      const errors = actionableCheckoutErrors(afterMap.errors || []);
+      const blockers = stageExitBlockers(afterMap, expected);
+      if (changed && beforeMap.step !== afterMap.step) {
+        return { ok: true, code: "STAGE_CHANGED", message: `Stage changed to ${afterMap.step}.`, evidence };
+      }
+      if ((changed || visualChanged) && !blockers.length) {
+        return { ok: true, code: "PAGE_CHANGED", message: "Page structure changed after navigation action.", evidence };
+      }
+      if (errors.length || blockers.length) {
+        return {
+          ok: false,
+          code: errors.length ? "STAGE_BLOCKED_BY_VALIDATION" : "STAGE_BLOCKED_BY_REQUIREMENT",
+          message: (errors[0] || blockers[0]?.message || "Navigation revealed a blocker."),
+          evidence: { ...evidence, blockers }
+        };
+      }
+      return {
+        ok: changed || visualChanged,
+        code: changed || visualChanged ? "PAGE_CHANGED" : "NO_OBSERVABLE_STAGE_CHANGE",
+        message: changed || visualChanged ? "Page changed after navigation action." : "Navigation action did not produce an observable page change.",
+        evidence
+      };
+    }
+    return {
+      ok: changed || visualChanged,
+      code: changed || visualChanged ? "OBSERVABLE_CHANGE" : "NO_OBSERVABLE_CHANGE",
+      message: changed || visualChanged ? "Page changed after the action." : "No observable page change after the action.",
+      evidence
+    };
+  }
+
+  function pushVerificationLedger(actionId, observationId, decision, expectedOutcome, verification) {
+    const executionResult = rememberActionExecutionResult(actionId, observationId, decision, expectedOutcome, verification);
+    pushActionLedger({
+      actionId,
+      observationId,
+      stage: "verified",
+      action: decision,
+      expectedOutcome,
+      executionResult,
+      result: {
+        ok: Boolean(verification.ok),
+        code: verification.code,
+        message: verification.message,
+        evidence: verification.evidence
+      }
+    });
+    logFlow("outcome.verify", {
+      actionId,
+      observationId,
+      expectedOutcome,
+      verification,
+      executionResult
+    });
+  }
+
   async function announceSectionQueue() {
     const map = agent.pageMap || buildPageMap();
     const sections = map.sections || [];
@@ -1837,7 +3435,7 @@
     setTimeout(() => cursor.classList.remove("is-clicking"), 350);
   }
 
-  function userLikeClick(element) {
+  function userLikeClick(element, meta = {}) {
     const rect = element.getBoundingClientRect();
     const eventInit = {
       bubbles: true,
@@ -1846,6 +3444,12 @@
       clientX: Math.round(rect.left + rect.width / 2),
       clientY: Math.round(rect.top + rect.height / 2)
     };
+    logFlow("dom.click.dispatch", {
+      meta,
+      point: { x: eventInit.clientX, y: eventInit.clientY },
+      target: elementDescriptor(element),
+      pageBefore: pageSnapshot("before-click")
+    });
     element.dispatchEvent(new PointerEvent("pointerdown", eventInit));
     element.dispatchEvent(new MouseEvent("mousedown", eventInit));
     element.dispatchEvent(new PointerEvent("pointerup", eventInit));
@@ -1867,7 +3471,7 @@
     target?.blur?.();
   }
 
-  function clickViewportPoint(x = 18, y = 18) {
+  function clickViewportPoint(x = 18, y = 18, meta = {}) {
     const target = document.elementFromPoint(x, y) || document.body;
     const eventInit = {
       bubbles: true,
@@ -1876,6 +3480,12 @@
       clientX: x,
       clientY: y
     };
+    logFlow("dom.click_xy.dispatch", {
+      meta,
+      point: { x, y },
+      topElement: elementDescriptor(target),
+      pageBefore: pageSnapshot("before-click-xy")
+    });
     target.dispatchEvent(new PointerEvent("pointerdown", eventInit));
     target.dispatchEvent(new MouseEvent("mousedown", eventInit));
     target.dispatchEvent(new PointerEvent("pointerup", eventInit));
@@ -1970,6 +3580,35 @@
     return "unknown";
   }
 
+  // Self-contained variant of classifyStep() that also returns a confidence score.
+  // Kept separate from classifyStep() so existing callers are untouched; used only
+  // by the Observer Mode page-understanding output.
+  function classifyStepDetailed(text) {
+    const lower = text.toLowerCase();
+    const extrasEvidence = /select baggage|configure your trip|upgrade your trip|checked baggage|bundle|premium support|airhelp|cancellation guarantee|voucher refund|add to cart|no thanks|add baggage|choose your bundle/.test(lower);
+    const travelerEvidence = /traveller information|traveler information|contact information|provide your contact details|passport|date of birth|surname|first name|first and middle names|mobile number|confirm e-?mail/.test(lower);
+    const seatEvidence = /seat selection|select seat|choose seat/.test(lower);
+    const strongSeatEvidence = /reserve seating|seat map|seat map key|standard seat|not selected|select a seat|choose a seat/.test(lower);
+    const travelerRouteEvidence = /\/rf\/traveler-details|\/rf\/traveller-details|traveler-details|traveller-details/.test(lower);
+    const paymentFormEvidence = /card number|security code|cvc|cvv|pay now|complete booking|confirm and pay|submit payment|billing card|cardholder/.test(lower);
+    const paymentRouteEvidence = /\/rf\/payment|\/payment\b|[#?&/]payment\b/.test(lower);
+    const confirmationEvidence = /booking confirmed|confirmation|booking reference|reservation number|pnr/.test(lower);
+    const flightSelectionEvidence = /flight selection|select flight|choose flight|fare/.test(lower);
+
+    if (confirmationEvidence) return { step: "confirmation", confidence: 0.95 };
+    if (paymentFormEvidence) return { step: "payment", confidence: 0.95 };
+    if (strongSeatEvidence) return { step: "seats", confidence: 0.9 };
+    if (travelerRouteEvidence) return { step: "traveler_information", confidence: 0.9 };
+    if (paymentRouteEvidence && extrasEvidence) return { step: "extras", confidence: 0.75 };
+    if (paymentRouteEvidence && seatEvidence) return { step: "seats", confidence: 0.75 };
+    if (travelerEvidence) return { step: "traveler_information", confidence: 0.8 };
+    if (seatEvidence) return { step: "seats", confidence: 0.7 };
+    if (extrasEvidence) return { step: "extras", confidence: 0.7 };
+    if (paymentRouteEvidence) return { step: "payment", confidence: 0.6 };
+    if (flightSelectionEvidence) return { step: "flight_selection", confidence: 0.6 };
+    return { step: "unknown", confidence: 0.2 };
+  }
+
   function pageCoverage() {
     const iframes = [...document.querySelectorAll("iframe")];
     let accessibleIframes = 0;
@@ -2006,6 +3645,160 @@
   function isInViewport(element) {
     const rect = element.getBoundingClientRect();
     return rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+  }
+
+  function numericZIndex(element) {
+    const value = Number.parseInt(getComputedStyle(element).zIndex || "0", 10);
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function pointBelongsToElement(point, element) {
+    const top = document.elementFromPoint(point.x, point.y);
+    return Boolean(top && (top === element || element.contains(top)));
+  }
+
+  function overlayTopHitCount(element) {
+    if (!element || !isVisible(element) || !isInViewport(element)) return 0;
+    const rect = element.getBoundingClientRect();
+    const left = Math.max(2, rect.left + Math.min(28, rect.width * 0.18));
+    const right = Math.min(window.innerWidth - 2, rect.right - Math.min(28, rect.width * 0.18));
+    const top = Math.max(2, rect.top + Math.min(28, rect.height * 0.18));
+    const bottom = Math.min(window.innerHeight - 2, rect.bottom - Math.min(28, rect.height * 0.18));
+    const centerX = Math.min(window.innerWidth - 2, Math.max(2, rect.left + rect.width / 2));
+    const centerY = Math.min(window.innerHeight - 2, Math.max(2, rect.top + rect.height / 2));
+    const points = [
+      { x: centerX, y: centerY },
+      { x: left, y: top },
+      { x: right, y: top },
+      { x: left, y: bottom },
+      { x: right, y: bottom }
+    ];
+    return points.filter((point) => pointBelongsToElement(point, element)).length;
+  }
+
+  function overlayVisualScore(element) {
+    const rect = element.getBoundingClientRect();
+    return (overlayTopHitCount(element) * 1000000) + (numericZIndex(element) * 1000) + Math.round(Math.min(rect.width * rect.height, 900000));
+  }
+
+  function surfaceProgressMarkers(text = "") {
+    const clean = String(text || "").replace(/\s+/g, " ");
+    return {
+      flightOrdinal: clean.match(/\bflight\s+\d+\s+of\s+\d+\b/i)?.[0] || "",
+      route: clean.match(/\b[A-Z]{3}\s*(?:-|–|to)\s*[A-Z]{3}\b/)?.[0] || "",
+      selectedText: clean.match(/\b(not selected|selected|seat not selected|random seating)\b/i)?.[0] || "",
+      priceText: clean.match(/\b\d+(?:[.,]\d{1,2})?\s*(?:EUR|USD|GBP|€|\$|£)\b/i)?.[0] || ""
+    };
+  }
+
+  function surfaceVisualFingerprint(surface = {}) {
+    return stableHash([
+      surface.type || "",
+      normalizeMatchText(surface.label || ""),
+      (surface.options || []).map((option) => `${normalizeMatchText(option.label)}:${option.selected ? "1" : "0"}`).join("|"),
+      JSON.stringify(surfaceProgressMarkers(surface.label || ""))
+    ].join("||"));
+  }
+
+  function foregroundSurfaceState(activeSurface = {}) {
+    const active = Boolean(activeSurface?.type && activeSurface.type !== "page");
+    const text = surfaceText(activeSurface);
+    const optionCount = (activeSurface.options || []).length;
+    const navCount = (activeSurface.options || []).filter((option) => /^(next|continue|close|done|confirm)\b/i.test(option.label || "")).length;
+    const confidence = !active ? 0 : Math.min(0.99, 0.45
+      + (activeSurface.role ? 0.1 : 0)
+      + (activeSurface.box?.inViewport ? 0.15 : 0)
+      + (optionCount ? 0.15 : 0)
+      + (navCount ? 0.1 : 0)
+      + (/seat|baggage|bundle|insurance|extra|are you sure|not selected/i.test(text) ? 0.05 : 0));
+    return {
+      active,
+      id: activeSurface.id || "",
+      type: activeSurface.type || "page",
+      label: activeSurface.label || "",
+      blocksBackground: active,
+      confidence,
+      reason: active ? "Visible foreground surface owns the next action until it closes or changes." : "No foreground surface detected.",
+      progressMarkers: surfaceProgressMarkers(text),
+      fingerprint: surfaceVisualFingerprint(activeSurface),
+      optionCount,
+      navigationControlCount: navCount,
+      box: activeSurface.box || null
+    };
+  }
+
+  function compactVisualControl(item = {}) {
+    const box = item.box || {};
+    const role = item.accessibility?.role || item.role || "";
+    const name = item.accessibility?.name || item.label || item.field || "";
+    return {
+      id: item.id || "",
+      role,
+      name: String(name || "").replace(/\s+/g, " ").trim().slice(0, 160),
+      label: String(item.label || item.field || "").replace(/\s+/g, " ").trim().slice(0, 160),
+      kind: item.kind || item.field || "",
+      semantic: item.semantic || item.field || "",
+      risk: item.risk || "",
+      selected: Boolean(item.selected),
+      required: Boolean(item.required),
+      hasValue: Boolean(item.hasValue || item.value),
+      state: item.accessibility?.state || null,
+      box: box ? {
+        x: Math.round(box.x || 0),
+        y: Math.round(box.y || 0),
+        width: Math.round(box.width || 0),
+        height: Math.round(box.height || 0),
+        centerX: Math.round(box.centerX || 0),
+        centerY: Math.round(box.centerY || 0),
+        inViewport: Boolean(box.inViewport)
+      } : null
+    };
+  }
+
+  function visualPageState(map = agent.pageMap || {}) {
+    const activeSurface = map.currentSurface && map.currentSurface.type !== "page" ? map.currentSurface : (map.activeSurface || {});
+    const foreground = foregroundSurfaceState(activeSurface);
+    const surfaceControls = foreground.active
+      ? [...(activeSurface.buttons || []), ...(activeSurface.options || [])]
+      : [];
+    const pageControls = !foreground.active
+      ? [
+          ...(map.fields || []),
+          ...(map.buttons || []),
+          ...(map.sections || []).flatMap((section) => section.choices || [])
+        ]
+      : [];
+    const controls = [...surfaceControls, ...pageControls]
+      .filter((item, index, list) => item && (item.id || item.label || item.field) && list.findIndex((other) => other?.id === item.id && other?.label === item.label) === index)
+      .map(compactVisualControl)
+      .filter((item) => item.box?.inViewport || foreground.active)
+      .slice(0, 120);
+    const signature = [
+      map.step || "",
+      location.pathname,
+      foreground.fingerprint || "",
+      controls.map((item) => [
+        item.id,
+        normalizeMatchText(item.name || item.label),
+        item.role,
+        item.selected ? "1" : "0",
+        item.hasValue ? "v" : "",
+        item.box ? `${Math.round(item.box.centerX / 8)}:${Math.round(item.box.centerY / 8)}` : ""
+      ].join(":")).join("|")
+    ].join("||");
+    return {
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        scrollX: Math.round(window.scrollX),
+        scrollY: Math.round(window.scrollY),
+        devicePixelRatio: window.devicePixelRatio || 1
+      },
+      foreground,
+      controls,
+      controlCount: controls.length,
+      fingerprint: stableHash(signature)
+    };
   }
 
   function activeOverlayElements() {
@@ -2045,7 +3838,12 @@
         if (element.matches(".modal,.popover") || floating) return Boolean(text);
         return false;
       });
-    return candidates.filter((element) => !candidates.some((other) => other !== element && other.contains(element)));
+    return candidates
+      .filter((element) => !candidates.some((other) => other !== element && element.contains(other) && overlayTopHitCount(other) > 0))
+      .map((element) => ({ element, hitCount: overlayTopHitCount(element), score: overlayVisualScore(element) }))
+      .filter((item) => item.hitCount > 0)
+      .sort((a, b) => b.score - a.score)
+      .map((item) => item.element);
   }
 
   function overlayText(element) {
@@ -2090,6 +3888,12 @@
     const role = overlay.getAttribute("role") || "";
     const text = overlayText(overlay).toLowerCase();
     if (role === "listbox" || role === "menu") return true;
+    // HeadlessUI-style comboboxes often mark the outer wrapper with
+    // data-headlessui-state="open" while role="listbox"/"option" lives on a nested
+    // child — checking only the overlay's own role misses these, so the popover
+    // never gets the auto-close (Escape/outside-click) treatment after a choice is
+    // made and just lingers open, which is exactly what got mistaken for a stall.
+    if (queryAllDeep("[role='listbox'], [role='option']", overlay).length) return true;
     return /slovenia\s*\(\+386\)|sierra leone\s*\(\+232\)|singapore\s*\(\+65\)|sint maarten|country code|calling code/.test(text);
   }
 
@@ -2112,6 +3916,9 @@
   function scoreAutoDeclineButton(button, overlayKind = "") {
     const label = overlayChoiceText(button).toLowerCase();
     if (!label) return 0;
+    const controls = optionControlCount(button);
+    if (controls > 1 && /none of the passengers|none\s+of\s+the\s+travellers|none\s+of\s+the\s+travelers/.test(label) && /all passengers|all travellers|all travelers|passenger\s+\d|\badult\b/.test(label)) return -120;
+    if (/none of the passengers|none\s+of\s+the\s+travellers|none\s+of\s+the\s+travelers/.test(label) && /0\s*(eur|€|usd|\$)|free/.test(label)) return 180;
     if (/flexible ticket popup/.test(overlayKind) && /none of the passengers|none\s+of\s+the\s+travellers|none\s+of\s+the\s+travelers|0\s*eur|0\s*€/.test(label)) return 160;
     if (/flexible ticket popup/.test(overlayKind) && /all passengers|all travellers|all travelers|\badult\b/.test(label) && !/none/.test(label)) return -120;
     if (/i.ll go without|go without|without baggage|without seat|continue without/.test(label)) return 120;
@@ -2169,9 +3976,24 @@
   }
 
   async function handleRoutineExtraOverlay(overlay, context = "", task = null) {
+    if (!guardedHelperAllowed("handleRoutineExtraOverlay", ["skip_optional_extra"])) return false;
     const text = overlayText(overlay);
-    const kind = routineExtraOverlayKind(text, task);
-    if (!kind || !shouldAutoDeclinePaidExtras()) return false;
+    let kind = routineExtraOverlayKind(text, task);
+    const buttons = overlayButtons(overlay);
+    const hasSafeNoExtraOption = buttons.some((button) => {
+      const label = overlayChoiceText(button);
+      return overlayOptionRisk(label) === "safe_decline" || /none of the passengers|none of the travellers|none of the travelers|no,?\s*thanks|not now|without|0\s*(eur|€|usd|\$)|free/i.test(label);
+    });
+    if (!kind && hasSafeNoExtraOption) kind = "no-extra choice overlay";
+    if (!kind || !shouldAutoDeclinePaidExtras()) {
+      logAgentEvent("auto_decline_overlay_skipped", {
+        context,
+        reason: !kind ? "no routine kind or safe no-extra option detected" : "auto-decline not approved",
+        text: text.slice(0, 180),
+        options: buttons.map((button) => overlayChoiceText(button)).filter(Boolean).slice(0, 8)
+      });
+      return false;
+    }
     const candidates = uniqueOverlayCandidates(overlayButtons(overlay)
       .map((button) => ({ button, score: scoreAutoDeclineButton(button, kind), label: overlayChoiceText(button) }))
       .filter((item) => item.score > 0 && !item.button.disabled && item.button.getAttribute("aria-disabled") !== "true")
@@ -2193,6 +4015,159 @@
       if (progress.ok) return true;
     }
     return false;
+  }
+
+  function safeActiveSurfaceExitCandidate(overlay) {
+    const kind = routineExtraOverlayKind(overlayText(overlay), null);
+    return uniqueOverlayCandidates(overlayButtons(overlay)
+      .map((button) => {
+        const label = overlayChoiceText(button);
+        let score = scoreAutoDeclineButton(button, kind);
+        if (/^(next|continue|done|close|skip|no,?\s*thanks|not now|without|continue without)\b/i.test(label)) score += 80;
+        if (isDangerousActionLabel(label)) score -= 200;
+        if (overlayOptionRisk(label) === "paid") score -= 160;
+        return { button, label, score };
+      })
+      .filter((item) => item.score > 0 && !item.button.disabled && item.button.getAttribute("aria-disabled") !== "true")
+      .sort((a, b) => b.score - a.score))[0] || null;
+  }
+
+  async function skipOptionalExtraSurface(map = buildPageMap()) {
+    if (!guardedHelperAllowed("skipOptionalExtraSurface", ["skip_optional_extra"])) return false;
+    const overlay = activeOverlayElements()[0];
+    const task = (map.taskQueue || []).find((item) => /baggage|bundle|flexible_ticket|cancellation_insurance|seat/.test(item.sectionType));
+    if (overlay) {
+      if (await handleRoutineExtraOverlay(overlay, "agent loop skip optional extra", task)) return true;
+      const pick = safeActiveSurfaceExitCandidate(overlay);
+      if (pick) {
+        const before = overlaySignature(overlay);
+        await showAgentThought(
+          pick.button,
+          "Active surface",
+          `Skip optional extra`,
+          `Using the safe visible control "${pick.label}" instead of selecting a paid seat/add-on.`,
+          800
+        );
+        flashElement(pick.button);
+        userLikeClick(pick.button);
+        recordAction("skip_optional_extra", { label: pick.label, surface: routineExtraOverlayKind(overlayText(overlay), task) || "active surface" });
+        const progress = await waitForOverlayProgress(overlay, before, 2200);
+        await verifyAgentStep(pick.button, "Active surface", progress.ok ? `optional surface ${progress.reason}` : "optional surface did not change", progress.ok, 650);
+        return progress.ok;
+      }
+      return false;
+    }
+
+    if (await skipNoExtraDropdownChoice(map)) return true;
+    if (await autoResolveNoExtrasSection(map)) return true;
+    const skip = findButtonByRisk(map, "skip_extra") || findClickableByVisibleText(/no,?\s*thanks|skip|without|none of the passengers/i);
+    if (skip) {
+      await showAgentThought(skip, "Extras", "Skip optional extra", "Saved rules say no paid seats/extras for this booking.", 800);
+      flashElement(skip);
+      userLikeClick(skip);
+      recordAction("skip_optional_extra", { label: buttonText(skip) || labelText(skip) });
+      await waitForUiSettle(700);
+      return true;
+    }
+    return false;
+  }
+
+  function noExtraChoiceTerms() {
+    return [
+      "none of the passengers",
+      "none of the travellers",
+      "none of the travelers",
+      "no thanks",
+      "no, thanks",
+      "not now",
+      "without",
+      "go without",
+      "continue without",
+      "0 eur",
+      "0eur",
+      "0 €",
+      "no flexible",
+      "no ticket",
+      "decline"
+    ];
+  }
+
+  async function chooseNoExtraFromControl(control, context = "optional extra") {
+    if (!guardedHelperAllowed("chooseNoExtraFromControl", ["skip_optional_extra"])) return false;
+    if (!control || !isVisible(control) || isPaymentField(control)) return false;
+    const label = `${buttonText(control)} ${labelText(control)} ${control.innerText || ""}`.toLowerCase();
+    if (isDangerousActionLabel(label)) return false;
+    await showAgentThought(control, "Extras", "Choose no-extra option", `Saved rules say no paid extras. Opening ${context} and selecting the no-cost/no-thanks option.`, 650);
+    let result = { ok: false };
+    if (control.tagName === "SELECT") {
+      result = await setSelectValue(control, noExtraChoiceTerms());
+    } else {
+      result = await selectComboboxOption(control, noExtraChoiceTerms());
+    }
+    recordAction("skip_optional_extra_dropdown", {
+      ok: result.ok,
+      context,
+      method: result.method,
+      option: result.option || result.value || "",
+      reason: result.reason || "",
+      target: control.id || control.name || buttonText(control) || labelText(control)
+    });
+    return Boolean(result.ok);
+  }
+
+  async function skipNoExtraDropdownChoice(map = buildPageMap(), decision = null) {
+    if (!guardedHelperAllowed("skipNoExtraDropdownChoice", ["skip_optional_extra"])) return false;
+    if (!shouldAutoDeclinePaidExtras()) return false;
+    const explicit = decision ? resolveDecisionTarget(decision, map) : null;
+    if (explicit && await chooseNoExtraFromControl(explicit, decision.targetLabel || decision.value || "optional extra")) return true;
+
+    const pending = nextPendingTask(map, ["flexible_ticket", "bundle", "cancellation_insurance", "seat", "baggage"]);
+    const pendingSection = (map.sections || []).find((section) => section.id === pending?.sectionId);
+    const scopedControls = pendingSection
+      ? queryAllDeep("select, [role='combobox'], button, [role='button'], [tabindex]", elementById(pendingSection.id) || document)
+      : [];
+    const candidates = [
+      ...scopedControls,
+      ...queryAllDeep("select, [role='combobox'], button, [role='button'], [tabindex]")
+    ]
+      .filter((element, index, list) => list.indexOf(element) === index)
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar") && !isPaymentField(element))
+      .map((element) => {
+        const text = `${currentElementValue(element)} ${buttonText(element)} ${labelText(element)} ${element.innerText || ""}`.replace(/\s+/g, " ").trim();
+        const lower = text.toLowerCase();
+        let score = 0;
+        if (/choose|select an option|select one option|please select/.test(lower)) score += 70;
+        if (/flexible ticket|premium support|airhelp|insurance|bundle|baggage|seat/.test(lower)) score += 40;
+        if (pendingSection && elementBelongsToSectionBand(element, pendingSection, liveSectionModels(map.sections || []))) score += 50;
+        if (/add to cart|premium|\b[1-9]\d*([.,]\d+)?\s*(eur|€|usd|\$)/.test(lower)) score -= 50;
+        return { element, score, text };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    for (const candidate of candidates.slice(0, 3)) {
+      if (await chooseNoExtraFromControl(candidate.element, pending?.sectionLabel || candidate.text || "optional extra")) return true;
+    }
+    return false;
+  }
+
+  async function closeActiveSurface(map = buildPageMap()) {
+    if (!guardedHelperAllowed("closeActiveSurface", ["close_modal"])) return false;
+    const overlay = activeOverlayElements()[0];
+    if (!overlay) return false;
+    const closeButton = overlayButtons(overlay).find((button) => /^(close|done|no,?\s*thanks|not now|skip)\b|×|x$/i.test(overlayChoiceText(button)));
+    const target = closeButton || elementById(map.activeSurface?.id) || overlay;
+    const before = overlaySignature(overlay);
+    await showAgentThought(target, "Active surface", closeButton ? "Close modal" : "Close modal with Escape", "Closing the active popup before continuing.", 700);
+    if (closeButton) {
+      flashElement(closeButton);
+      userLikeClick(closeButton);
+    } else {
+      pressEscape(document.activeElement || document.body);
+    }
+    const progress = await waitForOverlayProgress(overlay, before, 1600);
+    await verifyAgentStep(target, "Active surface", progress.ok ? `surface ${progress.reason}` : "surface still open", progress.ok, 550);
+    return progress.ok;
   }
 
   async function closeTransientOverlay(overlay, context = "") {
@@ -2237,8 +4212,38 @@
       });
       const overlay = overlays[0];
       const map = agent.pageMap || buildPageMap();
-      const task = (map.taskQueue || []).find((item) => item.status === "pending" && /baggage|bundle|flexible_ticket|cancellation_insurance|seat/.test(item.sectionType));
       const activeSurface = buildActiveSurface([overlay]);
+      if (AGENT_SINGLE_BRAIN) {
+        logAgentEvent("active_surface_observed_single_brain", {
+          context,
+          type: activeSurface.type,
+          taskHint: activeSurface.taskHint,
+          options: activeSurface.options.map((option) => ({
+            label: option.label,
+            risk: option.risk,
+            semantic: option.semantic
+          })).slice(0, 8)
+        });
+        await showAgentThought(
+          overlay,
+          "Observe",
+          "Active surface",
+          "A popup/dropdown is active. I will send it to the backend planner instead of taking a local action.",
+          650
+        );
+        return { blocked: false, handled: false, overlays: overlays.length, activeSurface };
+      }
+      const task = (map.taskQueue || []).find((item) => item.status === "pending" && /baggage|bundle|flexible_ticket|cancellation_insurance|seat/.test(item.sectionType));
+      if (await handleRoutineExtraOverlay(overlay, context, task)) {
+        logAgentEvent("active_surface_local_resolved", {
+          context,
+          type: activeSurface.type,
+          taskHint: activeSurface.taskHint,
+          reason: "routine no-extra active surface handled before backend"
+        });
+        await waitForPaint(500);
+        return { blocked: false, handled: true, overlays: overlays.length };
+      }
       if (/agent loop/i.test(context) && shouldDeferActiveSurfaceToAgent(activeSurface)) {
         logAgentEvent("active_surface_deferred", {
           context,
@@ -2254,14 +4259,10 @@
           overlay,
           "Observe",
           "Active surface",
-          "This open popup/dropdown is the active screen. I will send its visible options to the visual agent before doing any local fallback.",
+          "This popup/dropdown is the active screen. No deterministic no-extra action resolved it, so I will ask the visual agent.",
           750
         );
         return { blocked: false, handled: false, overlays: overlays.length, activeSurface };
-      }
-      if (await handleRoutineExtraOverlay(overlay, context, task)) {
-        await waitForPaint(500);
-        return { blocked: false, handled: true, overlays: overlays.length };
       }
       if (await closeTransientOverlay(overlay, context)) {
         await waitForPaint(400);
@@ -2330,8 +4331,124 @@
     return "unknown";
   }
 
-  function activeSurfaceEntries(surface) {
-    return [...(surface?.options || []), ...(surface?.buttons || [])]
+  function isSeatNoSelectionConfirmationContext(map = agent.pageMap || buildPageMap()) {
+    if (!shouldAutoDeclinePaidExtras()) return false;
+    const surfaceText = [
+      map?.activeSurface?.label,
+      map?.activeSurface?.text,
+      ...(map?.overlays || []).map((overlay) => `${overlay.label || ""} ${overlay.text || ""}`),
+      map?.text
+    ].filter(Boolean).join(" ").toLowerCase();
+    return /are you sure|haven.?t selected a seat|not selected.*seat|seat.*not selected|without.*seat/.test(surfaceText)
+      && /choose seat/.test(surfaceText)
+      && /\bcontinue\b/.test(surfaceText);
+  }
+
+  function isSeatNoSelectionContinue(decision = {}, map = agent.pageMap || buildPageMap()) {
+    const label = normalizeMatchText(`${decision.targetLabel || ""} ${decision.value || ""}`);
+    return /\b(continue|next|proceed)\b/.test(label)
+      && !/\b(choose|select|pick)\b.*\bseat\b|\bseat\b.*\b(choose|select|pick)\b/.test(label)
+      && isSeatNoSelectionConfirmationContext(map);
+  }
+
+  function exactNavigationText(label = "") {
+    const text = normalizeMatchText(label);
+    return /^(continue|next|proceed|skip to next step)$/.test(text)
+      || /^(continue|next|proceed)\s+(button|navigation|action)$/.test(text);
+  }
+
+  function declineChoiceIntent(decision = {}) {
+    const snapshot = decision.targetSnapshot || {};
+    if (decision.intent === "decline_optional_extra"
+      || snapshot.semantic === "decline_paid_extra"
+      || snapshot.semantic === "safe_decline"
+      || snapshot.risk === "safe_decline") {
+      return true;
+    }
+    const targetText = `${decision.targetLabel || ""} ${decision.value || ""}`.toLowerCase();
+    const contextText = `${targetText} ${decision.reason || ""}`.toLowerCase();
+    return overlayOptionRisk(targetText) === "safe_decline"
+      || /no checked baggage|no baggage selected|no baggage|no,?\s*thanks|none of the passengers|i.?ll go without|go without|without bundle|without baggage|decline|skip|0\s*(eur|€|usd|\$)|no-cost|no cost/.test(contextText);
+  }
+
+  function stageExitIntentLabel(decision = {}, map = agent.pageMap || buildPageMap()) {
+    const raw = `${decision.targetLabel || ""} ${decision.value || ""}`.trim();
+    const snapshot = decision.targetSnapshot || {};
+    const snapshotLabel = snapshot.normalizedLabel || snapshot.label || "";
+    if (isSeatNoSelectionContinue(decision, map)) return normalizeMatchText(raw) || "continue";
+    if (exactNavigationText(raw)) return normalizeMatchText(raw);
+    if (exactNavigationText(snapshotLabel)) return normalizeMatchText(snapshotLabel);
+    if (snapshot.risk === "safe_continue" || snapshot.semantic === "continue") return normalizeMatchText(snapshotLabel || raw);
+    const targetId = decision.targetId || snapshot.id || "";
+    const targetButton = targetId ? (map.buttons || []).find((button) => button.id === targetId) : null;
+    if (targetButton?.risk === "safe_continue" || exactNavigationText(targetButton?.label || "")) {
+      return normalizeMatchText(targetButton.label || raw);
+    }
+    return "";
+  }
+
+  function isStageExitDecision(decision = {}, map = agent.pageMap || buildPageMap()) {
+    if (!["click", "click_xy", "keypress"].includes(decision.action)) return false;
+    if (declineChoiceIntent(decision) && !exactNavigationText(`${decision.targetLabel || ""} ${decision.value || ""}`)) return false;
+    return Boolean(stageExitIntentLabel(decision, map));
+  }
+
+  function backendApprovedSafeDeclineDecision(decision = {}, map = agent.pageMap || buildPageMap()) {
+    const snapshot = decision.targetSnapshot || {};
+    const targetText = `${decision.targetLabel || ""} ${decision.value || ""}`.toLowerCase();
+    const contextText = `${targetText} ${decision.reason || ""}`.toLowerCase();
+    if (!shouldAutoDeclinePaidExtras()) return false;
+    if (!["click", "select", "skip_optional_extra", "keypress", "close_modal"].includes(decision.action)) return false;
+    if (decision.intent === "decline_optional_extra"
+      || snapshot.semantic === "decline_paid_extra"
+      || snapshot.semantic === "safe_decline"
+      || snapshot.risk === "safe_decline") {
+      return true;
+    }
+    if (isDangerousActionLabel(targetText) || /add to cart|upgrade|premium\+|premium\b|all passengers|\badult\b.*\b(29|44|122|eur|€|\$)/i.test(targetText)) return false;
+    if (isSeatNoSelectionContinue(decision, map)) return true;
+    return declineChoiceIntent({ ...decision, targetLabel: targetText, reason: contextText });
+  }
+
+  function backendApprovedOpenChoiceControl(decision = {}) {
+    const snapshot = decision.targetSnapshot || {};
+    const text = normalizeMatchText(`${decision.targetLabel || ""} ${decision.value || ""} ${snapshot.label || ""} ${snapshot.sectionLabel || ""} ${snapshot.sectionType || ""}`);
+    return decision.intent === "open_choice_control"
+      || (decision.action === "click"
+        && /\b(choose|select option|select one option|open)\b/.test(text)
+        && !["money", "payment"].includes(snapshot.risk || "")
+        && snapshot.semantic !== "add_paid_extra");
+  }
+
+  function transactionInvariantViolation(decision = {}, map = buildPageMap(), options = {}) {
+    const label = `${decision.targetLabel || ""} ${decision.value || ""}`.trim();
+    const text = label.toLowerCase();
+    if (["ask_user", "stop", "wait", "scroll"].includes(decision.action)) return null;
+    if (isDangerousActionLabel(label) || decision.risk === "payment") {
+      return { code: "PAYMENT_OR_FINAL_ACTION", message: "Payment/final booking actions are blocked in the current agent mode." };
+    }
+    if (decision.risk === "money" && !options.safeDeclineDecision && !options.openChoiceControl) {
+      return { code: "UNAPPROVED_MONEY_ACTION", message: "Money-risk action is not an approved no-cost decline option." };
+    }
+    if (/add to cart|upgrade|premium\+|all passengers|\badult\b.*\b(29|44|122|eur|€|\$)/i.test(text) && !options.safeDeclineDecision && !options.openChoiceControl) {
+      return { code: "PAID_EXTRA_TARGET", message: "Target appears to select a paid extra." };
+    }
+    if (isStageExitDecision(decision, map)) {
+      const blockers = stageExitBlockers(map, decision);
+      if (blockers.length) {
+        return {
+          code: blockers[0].code || "STAGE_EXIT_BLOCKED",
+          message: blockers[0].message || "A required visible section is unresolved before navigation.",
+          blockers
+        };
+      }
+    }
+    return null;
+  }
+
+  function activeSurfaceEntries(surfaceOrMap) {
+    const surface = surfaceOrMap?.activeSurface || surfaceOrMap || {};
+    return [...(surface.options || []), ...(surface.buttons || [])]
       .filter((entry, index, list) => entry?.id && list.findIndex((item) => item?.id === entry.id) === index);
   }
 
@@ -2366,10 +4483,12 @@
         taskHint: "",
         options: [],
         buttons: [],
-        box: null
+        box: null,
+        accessibility: null,
+        visualState: foregroundSurfaceState({ type: "page" })
       };
     }
-    const role = overlay.getAttribute("role") || "";
+    const role = implicitRole(overlay);
     const text = overlayText(overlay);
     const type = isTransientChoiceOverlay(overlay) ? "dropdown" : /dialog|modal/i.test(role) || overlay.getAttribute("aria-modal") === "true" ? "modal" : "popover";
     const map = agent.pageMap || null;
@@ -2382,18 +4501,103 @@
         semantic: overlayOptionSemantic(label),
         risk: overlayOptionRisk(label),
         selected: isChoiceSelected(option) || option.getAttribute?.("aria-selected") === "true",
-        box: elementBox(option)
+        box: elementBox(option),
+        accessibility: accessibilityNode(option, map)
       };
     }).filter((option) => option.label);
-    return {
+    // Large surfaces (a seat map can have 80+ individual seat buttons) blow past the
+    // slice(0, 20) cap in raw DOM order, which is exactly backwards: seats are near the
+    // top of the DOM, but the dialog's own dismiss/confirm control (Next/Close/Continue/
+    // Done) is in the footer, last in DOM order — so it silently never made it into the
+    // list the model could choose from. It correctly registers the choice, then has no
+    // way to leave the dialog and stalls. Put navigation controls first so truncation
+    // trims individual seat/choice buttons before it ever touches these.
+    const NAV_CONTROL_LABEL = /^(next|continue|close( window)?|done|confirm|submit)\b/i;
+    const prioritized = [
+      ...options.filter((option) => NAV_CONTROL_LABEL.test(option.label)),
+      ...options.filter((option) => !NAV_CONTROL_LABEL.test(option.label))
+    ];
+    const surface = {
       type,
       id: elementId(overlay),
       label: text.slice(0, 800),
       role,
       taskHint: task?.sectionType || routineExtraOverlayKind(text, task) || "",
-      options: options.slice(0, 20),
-      buttons: options.slice(0, 20),
-      box: elementBox(overlay)
+      options: prioritized.slice(0, 20),
+      buttons: prioritized.slice(0, 20),
+      box: elementBox(overlay),
+      accessibility: accessibilityNode(overlay, map)
+    };
+    return {
+      ...surface,
+      visualState: foregroundSurfaceState(surface)
+    };
+  }
+
+  function surfaceText(surface = {}) {
+    return `${surface.label || ""} ${surface.text || ""} ${(surface.options || []).map((option) => option.label || "").join(" ")}`.replace(/\s+/g, " ").trim();
+  }
+
+  function surfaceLooksLikeSeatSkip(surface = {}) {
+    const text = surfaceText(surface).toLowerCase();
+    return /are you sure|haven.?t selected a seat|not selected.*seat|seat.*not selected|without.*seat|skip seat selection/.test(text)
+      && /\b(continue|next|proceed)\b/.test(text)
+      && !/choose seat only|select seat only/.test(text);
+  }
+
+  function surfaceOwnsTask(surface = {}, task = {}) {
+    if (!surface || surface.type === "page" || !task) return false;
+    const text = surfaceText(surface).toLowerCase();
+    const type = String(task.sectionType || "").toLowerCase();
+    const label = String(task.sectionLabel || "").toLowerCase();
+    if (surface.taskHint && surface.taskHint === task.sectionType) return true;
+    if (type === "seat" && /seat|seating/.test(text)) return true;
+    if (type === "baggage" && /bag|baggage|luggage/.test(text)) return true;
+    if (type === "bundle" && /bundle|support|sms|premium/.test(text)) return true;
+    if (type === "flexible_ticket" && /flexible ticket|reschedule|change your ticket/.test(text)) return true;
+    if (type === "cancellation_insurance" && /cancellation|insurance|refund|protection/.test(text)) return true;
+    return Boolean(label && normalizeMatchText(text).includes(normalizeMatchText(label).slice(0, 48)));
+  }
+
+  function buildSurfaceStack(activeSurface, sections = [], taskQueue = [], overlays = [], step = "unknown") {
+    const pageSurface = {
+      id: "surface-page",
+      type: "page",
+      label: step,
+      role: "document",
+      blocksBackground: false,
+      isCurrent: !activeSurface?.type || activeSurface.type === "page",
+      taskQueue,
+      backgroundTaskQueue: [],
+      sectionIds: (sections || []).map((section) => section.id).filter(Boolean),
+      options: [],
+      buttons: [],
+      box: null
+    };
+    if (!activeSurface?.type || activeSurface.type === "page") {
+      return {
+        surfaceStack: [pageSurface],
+        currentSurface: pageSurface,
+        backgroundTasks: [],
+        currentSurfaceTasks: taskQueue
+      };
+    }
+    const ownedTasks = taskQueue.filter((task) => surfaceOwnsTask(activeSurface, task));
+    const surface = {
+      ...activeSurface,
+      text: activeSurface.label || "",
+      blocksBackground: true,
+      isCurrent: true,
+      taskQueue: ownedTasks,
+      backgroundTaskQueue: taskQueue.filter((task) => !ownedTasks.some((owned) => owned.id === task.id)),
+      expectedResolution: surfaceLooksLikeSeatSkip(activeSurface) ? "waive_or_skip_seat_selection" : "resolve_active_surface",
+      foreground: foregroundSurfaceState(activeSurface)
+    };
+    return {
+      surfaceStack: [{ ...pageSurface, isCurrent: false, backgroundTaskQueue: [] }, surface],
+      currentSurface: surface,
+      backgroundTasks: surface.backgroundTaskQueue,
+      currentSurfaceTasks: ownedTasks
     };
   }
 
@@ -2403,20 +4607,24 @@
     const step = classifyStep(`${location.href} ${text} ${fullText.slice(0, 2500)}`);
     const fields = candidateInputs().map((input) => {
       const detected = detectField(input);
+      const semantic = detected?.field || "unknown";
       return {
         element: input,
         id: elementId(input),
         label: labelText(input),
         box: elementBox(input),
         kind: input.type || input.tagName.toLowerCase(),
-        field: detected?.field || "unknown",
+        role: implicitRole(input),
+        field: semantic,
+        semantic,
         required: input.required || /\*/.test(labelText(input)),
         value: fieldValue(input),
-        confidence: detected?.confidence || 0
+        confidence: detected?.confidence || 0,
+        accessibility: accessibilityNode(input, null)
       };
     });
-    const buttons = queryAllDeep("button, a, input[type='button'], input[type='submit'], [role='button']")
-      .filter((button) => isVisible(button) && !button.closest("#atw-sidebar"))
+    const buttons = queryAllDeep("button, a, input[type='button'], input[type='submit'], [role='button'], [role='option'], [role='menuitem'], [role='checkbox'], [role='radio']")
+      .filter((button) => isVisible(button) && !button.closest("#atw-sidebar") && !isPaymentField(button))
       .map((button) => {
         const label = (button.innerText || button.value || button.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
         const lower = label.toLowerCase();
@@ -2426,17 +4634,23 @@
           id: elementId(button),
           label,
           box,
-          risk: meaningfulActionBox(box) ? actionRisk(lower) : "choice"
+          role: implicitRole(button),
+          semantic: semanticChoiceType(label),
+          risk: meaningfulActionBox(box) ? actionRisk(lower) : "choice",
+          accessibility: accessibilityNode(button, null)
         };
       });
     const errors = collectVisibleErrors(text);
     const paidChoices = collectPaidChoices(fullText);
+    const price = priceFromText(fullText);
     const overlays = visibleOverlays();
     const activeSurface = buildActiveSurface(activeOverlayElements());
     const sections = buildSectionModels(detectCheckoutSections(), fields, buttons);
+    const controls = buildCanonicalControlGraph(sections, fields, buttons, activeSurface);
     const taskQueue = buildTaskQueue(sections);
+    const surfaceModel = buildSurfaceStack(activeSurface, sections, taskQueue, overlays, step);
     const stageExit = buildStageExit(taskQueue, buttons, overlays, errors, step);
-    return {
+    const map = {
       site: inferCheckoutSite(),
       step,
       text,
@@ -2446,8 +4660,15 @@
       buttons,
       overlays,
       activeSurface,
+      surfaceStack: surfaceModel.surfaceStack,
+      currentSurface: surfaceModel.currentSurface,
+      currentSurfaceTasks: surfaceModel.currentSurfaceTasks,
+      backgroundTasks: surfaceModel.backgroundTasks,
       errors,
       paidChoices,
+      price,
+      priceText: price ? `${price.amount} ${price.currency}` : "",
+      controls,
       sections,
       taskQueue,
       stageExit,
@@ -2455,15 +4676,22 @@
         fields: fields.length,
         knownFields: fields.filter((field) => field.field !== "unknown").length,
         buttons: buttons.length,
+        controls: controls.length,
         overlays: overlays.length,
         errors: errors.length,
         paidChoices: paidChoices.length,
         sections: sections.length,
         pendingTasks: taskQueue.filter((task) => task.status === "pending").length,
         lockedTasks: taskQueue.filter((task) => task.status === "locked").length,
-        continueAllowed: stageExit.continueAllowed
+        continueAllowed: stageExit.continueAllowed,
+        priceText: price ? `${price.amount} ${price.currency}` : "",
+        price
       }
     };
+    map.accessibility = accessibilitySnapshot(map);
+    map.foreground = foregroundSurfaceState(map.currentSurface || map.activeSurface || {});
+    map.visualState = visualPageState(map);
+    return map;
   }
 
   function collectVisibleErrors(pageText) {
@@ -2542,13 +4770,15 @@
     return (map.sections || []).find((section) => section.type === sectionType && section.status !== "complete" && section.status !== "blocked") || null;
   }
 
-  async function verifyAndRememberSection(sectionType, label = sectionType) {
+  async function verifyAndRememberSection(sectionType, label = sectionType, sectionId = "") {
     const updated = rememberPagePlan(buildPageMap());
     outlineCoreSections(updated.sections || []);
-    const section = (updated.sections || []).find((item) => item.type === sectionType);
+    const section = (updated.sections || []).find((item) => item.id === sectionId)
+      || (updated.sections || []).find((item) => item.type === sectionType && item.label === label)
+      || (updated.sections || []).find((item) => item.type === sectionType);
     const target = elementById(section?.id) || document.body;
     if (section?.status === "complete") {
-      markSectionDone(sectionType, label);
+      if (canUseCompletionMemoryForSectionType(sectionType)) markSectionDone(sectionType, label);
       await verifyAgentStep(target, "Section", `${label} complete`, true, 900);
       return true;
     }
@@ -2607,8 +4837,73 @@
     return 0;
   }
 
-  async function fillKnownFieldsFromMap(map) {
+  function visibleProfileFillCandidates(map, targetIds = []) {
+    const wanted = new Set((targetIds || []).filter(Boolean));
+    const seenFields = new Set();
+    return (map.fields || [])
+      .filter((field) => {
+        if (!field?.element || !isVisible(field.element) || isPaymentField(field.element)) return false;
+        if (wanted.size && !wanted.has(field.id)) return false;
+        if (!field.field || field.field === "unknown") return false;
+        if (field.element.type === "radio" || field.element.type === "checkbox") return false;
+        const value = travelerValue(field.field);
+        if (!value) return false;
+        if (field.value && valueMatches(field.element, value, field.field === "phone" ? "digits" : "text")) return false;
+        const key = `${field.field}:${Math.round((field.box?.y || 0) / 12)}`;
+        if (seenFields.has(key) && !wanted.size) return false;
+        seenFields.add(key);
+        return true;
+      })
+      .sort((a, b) => (a.box?.y || 0) - (b.box?.y || 0) || (a.box?.x || 0) - (b.box?.x || 0));
+  }
+
+  async function fillVisibleProfileFieldsFromMap(map, options = {}) {
+    if (!guardedHelperAllowed("fillVisibleProfileFieldsFromMap", ["fill_known_fields", "fill_visible_profile_fields"])) return 0;
     filledFields = [];
+    let count = 0;
+    const targetIds = options.targetIds || [];
+    const activeSurface = map.activeSurface;
+    if (activeSurface?.type && activeSurface.type !== "page" && !visibleProfileFillCandidates(map, targetIds).length) {
+      logAgentEvent("fill_visible_profile_fields_skipped", { reason: "active surface has no profile fields", surfaceType: activeSurface.type });
+      return 0;
+    }
+
+    if (!targetIds.length && fillTitleRadio(document)) count += 1;
+
+    const phoneCount = await fillPhoneFieldsFromMap(map);
+    count += phoneCount;
+    if (transientOverlayOpen()) return count;
+
+    for (const field of visibleProfileFillCandidates(rememberPagePlan(buildPageMap()), targetIds)) {
+      const value = travelerValue(field.field);
+      const result = await setFieldValue(field.element, value, {
+        fieldType: field.field,
+        compareMode: field.field === "phone" ? "digits" : "text"
+      });
+      if (result.ok) {
+        count += 1;
+        filledFields.push({
+          fieldType: field.field,
+          selector: field.element.name || field.element.id || field.element.tagName.toLowerCase(),
+          confidence: field.confidence
+        });
+      }
+      const interrupt = await settleAndHandleInterrupts(`${field.field} field`);
+      if (interrupt.blocked && !interrupt.handled) return count;
+    }
+
+    if (count) {
+      recordAction("visible_profile_fields_filled", { count, targetIds });
+      logAgentEvent("visible_profile_fields_filled", { count, targetIds });
+    }
+    return count;
+  }
+
+  async function fillKnownFieldsFromMap(map) {
+    if (!guardedHelperAllowed("fillKnownFieldsFromMap", ["fill_known_fields", "fill_visible_profile_fields"])) return 0;
+    filledFields = [];
+    const directCount = await fillVisibleProfileFieldsFromMap(map);
+    if (directCount) return directCount;
     const section = currentSectionTask(map, ["contact", "passenger"]) || sectionStillPending(map, "contact") || sectionStillPending(map, "passenger");
     if (!section) return 0;
     const count = await fillKnownFieldsFromSection(map, section);
@@ -2629,20 +4924,6 @@
 
   function findButtonByRisk(map, risk) {
     return map.buttons.find((button) => button.risk === risk)?.element || null;
-  }
-
-  function findPreferredContinueButton(map = buildPageMap()) {
-    const safeButtons = map.buttons.filter((button) => {
-      if (button.risk !== "safe_continue") return false;
-      if (/skip to main content|skip to next step/i.test(button.label)) return false;
-      if (button.box && (button.box.width <= 2 || button.box.height <= 2)) return false;
-      return true;
-    });
-    const exactContinue = safeButtons.find((button) => /^continue$/i.test(button.label))?.element;
-    if (exactContinue) return exactContinue;
-    const containsContinue = safeButtons.find((button) => /\bcontinue\b/i.test(button.label))?.element;
-    if (containsContinue) return containsContinue;
-    return safeButtons[0]?.element || findClickableByVisibleText(/^continue$/i) || findClickableByVisibleText(/\bcontinue\b/i) || findSafeContinueButton();
   }
 
   function nextPendingTask(map, types = []) {
@@ -2670,6 +4951,7 @@
   }
 
   async function autoResolveNoExtrasSection(map) {
+    if (!guardedHelperAllowed("autoResolveNoExtrasSection", ["skip_optional_extra"])) return false;
     if (!shouldAutoDeclinePaidExtras()) return false;
     const task = nextPendingTask(map, ["baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"]);
     const section = (map.sections || []).find((item) => item.id === task?.sectionId);
@@ -2700,38 +4982,12 @@
     await settleAndHandleInterrupts(`${section.label} choice`);
     const updated = rememberPagePlan(buildPageMap());
     outlineCoreSections(updated.sections || []);
-    const updatedSection = (updated.sections || []).find((item) => item.type === section.type);
+    const updatedSection = (updated.sections || []).find((item) => item.id === section.id)
+      || (updated.sections || []).find((item) => item.type === section.type && item.label === section.label);
     const verified = updatedSection?.status === "complete";
-    if (verified) markSectionDone(section.type, section.label);
+    if (verified && canUseCompletionMemoryForSectionType(section.type)) markSectionDone(section.type, section.label);
     await verifyAgentStep(elementById(updatedSection?.id) || target, "Section", verified ? `${section.label} complete` : `${section.label} still needs another choice`, verified, 800);
     return verified;
-  }
-
-  function canUseContinueGate(map) {
-    if (!map || ["payment", "confirmation"].includes(map.step)) return false;
-    if (!map.stageExit?.continueAllowed) return false;
-    if ((map.taskQueue || []).some((task) => task.status === "pending")) return false;
-    if (actionableCheckoutErrors(map.errors).length) return false;
-    if (transientOverlayOpen()) return false;
-    const blockingModal = activeOverlayElements().find((overlay) => !isTransientChoiceOverlay(overlay));
-    if (blockingModal) return false;
-    const button = findPreferredContinueButton(map);
-    return Boolean(button && isVisible(button) && !isDisabledLike(button));
-  }
-
-  async function clickContinueGate(map) {
-    const button = elementById(map.stageExit?.continueTargetId) || findPreferredContinueButton(map);
-    if (!button || isDisabledLike(button)) return false;
-    outlineCoreSections(map.sections || []);
-    await showAgentThought(
-      button,
-      "Gate",
-      "All required sections verified",
-      "Task queue is empty, no modal/dropdown/error is open, so Continue is now allowed.",
-      900
-    );
-    await clickAndVerifyAdvance(button, "Continue");
-    return true;
   }
 
   function isDisabledLike(element) {
@@ -2788,12 +5044,76 @@
   }
 
   function compactPageMap(map) {
+    // Everything below (sections/status/stageExit especially) is a client-side
+    // heuristic best guess, not verified truth — the backend's requirement
+    // extractor + verifier independently re-derive what's actually required
+    // from the screenshot and do not treat these as authoritative. Keep
+    // sending them; they're useful context, just not a gate.
     return {
       site: map.site,
       url: location.href,
       step: map.step,
+      viewport: {
+        width: window.innerWidth,
+        height: window.innerHeight,
+        scrollX: Math.round(window.scrollX),
+        scrollY: Math.round(window.scrollY),
+        devicePixelRatio: window.devicePixelRatio || 1
+      },
       text: map.text,
       fullText: map.fullText,
+      snapshotHash: observationHashForMap(map),
+      price: map.price || null,
+      priceText: map.priceText || map.summary?.priceText || "",
+      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || map.activeSurface || {}),
+      visualState: map.visualState || visualPageState(map),
+      accessibility: map.accessibility ? {
+        foregroundSurfaceId: map.accessibility.foregroundSurfaceId,
+        foregroundSurfaceType: map.accessibility.foregroundSurfaceType,
+        landmarkCount: map.accessibility.landmarkCount,
+        controls: (map.accessibility.controls || []).map((node) => ({
+          id: node.id,
+          role: node.role,
+          controlId: node.controlId || "",
+          name: node.name,
+          state: node.state,
+          kind: node.kind,
+          sectionId: node.sectionId,
+          sectionType: node.sectionType,
+          sectionLabel: node.sectionLabel,
+          surfaceId: node.surfaceId,
+          surfaceType: node.surfaceType,
+          box: node.box
+        })).slice(0, 120)
+      } : null,
+      controls: (map.controls || []).map((control) => ({
+        controlId: control.controlId,
+        label: control.label,
+        accessibleName: control.accessibleName,
+        kind: control.kind,
+        role: control.role,
+        semantic: control.semantic,
+        risk: control.risk,
+        state: control.state,
+        selected: Boolean(control.selected),
+        required: Boolean(control.required),
+        sectionId: control.sectionId,
+        sectionType: control.sectionType,
+        sectionLabel: control.sectionLabel,
+        surfaceId: control.surfaceId,
+        surfaceType: control.surfaceType,
+        surfaceLabel: control.surfaceLabel,
+        stateElementId: control.stateElementId,
+        preferredActivationElementId: control.preferredActivationElementId,
+        actuators: (control.actuators || []).map((item) => ({
+          nodeId: item.nodeId,
+          relation: item.relation,
+          role: item.role,
+          label: item.label,
+          box: item.box
+        })).slice(0, 8),
+        visualRegion: control.visualRegion
+      })).slice(0, 180),
       errors: actionableCheckoutErrors(map.errors),
       paidChoices: map.paidChoices,
       sectionProgress: agent.sectionProgress || {},
@@ -2811,26 +5131,52 @@
         selected: section.selected || [],
         choices: (section.choices || []).map((choice) => ({
           id: choice.id,
+          controlId: choice.controlId || "",
           label: choice.label,
           selected: Boolean(choice.selected),
           semantic: choice.semantic,
+          risk: choice.risk,
+          role: choice.role || "",
+          accessibility: choice.accessibility || null,
+          controlState: choice.controlState || null,
+          stateElementId: choice.stateElementId || "",
+          preferredActivationElementId: choice.preferredActivationElementId || "",
+          actuators: (choice.actuators || []).slice(0, 8),
+          visualRegion: choice.visualRegion || null,
           box: choice.box
         })),
         box: section.box,
         fields: (section.fields || []).map((field) => ({
           id: field.id,
+          controlId: field.controlId || "",
           label: field.label,
           field: field.field,
           kind: field.kind,
           semantic: field.semantic,
+          role: field.role || "",
+          accessibility: field.accessibility || null,
           required: Boolean(field.required),
           hasValue: Boolean(field.hasValue),
+          controlState: field.controlState || null,
+          stateElementId: field.stateElementId || "",
+          preferredActivationElementId: field.preferredActivationElementId || "",
+          actuators: (field.actuators || []).slice(0, 8),
+          visualRegion: field.visualRegion || null,
           box: field.box
         })).slice(0, 20),
         buttons: (section.buttons || []).map((button) => ({
           id: button.id,
+          controlId: button.controlId || "",
           label: button.label,
           risk: button.risk,
+          semantic: button.semantic,
+          role: button.role || "",
+          accessibility: button.accessibility || null,
+          controlState: button.controlState || null,
+          stateElementId: button.stateElementId || "",
+          preferredActivationElementId: button.preferredActivationElementId || "",
+          actuators: (button.actuators || []).slice(0, 8),
+          visualRegion: button.visualRegion || null,
           box: button.box
         })).slice(0, 20),
         text: section.text
@@ -2850,19 +5196,37 @@
       coverage: map.coverage,
       fields: map.fields.map((field) => ({
         id: field.id,
+        controlId: field.controlId || "",
         label: field.label,
         box: field.box,
         kind: field.kind,
         field: field.field,
+        semantic: field.semantic || field.field,
+        role: field.role || "",
+        accessibility: field.accessibility || null,
         required: field.required,
         value: field.value ? "[filled]" : "",
+        controlState: field.controlState || null,
+        stateElementId: field.stateElementId || "",
+        preferredActivationElementId: field.preferredActivationElementId || "",
+        actuators: (field.actuators || []).slice(0, 8),
+        visualRegion: field.visualRegion || null,
         confidence: field.confidence
       })),
       buttons: map.buttons.map((button) => ({
         id: button.id,
+        controlId: button.controlId || "",
         label: button.label,
         box: button.box,
-        risk: button.risk
+        role: button.role || "",
+        semantic: button.semantic || "",
+        risk: button.risk,
+        controlState: button.controlState || null,
+        stateElementId: button.stateElementId || "",
+        preferredActivationElementId: button.preferredActivationElementId || "",
+        actuators: (button.actuators || []).slice(0, 8),
+        visualRegion: button.visualRegion || null,
+        accessibility: button.accessibility || null
       })),
       activeSurface: map.activeSurface || {
         type: "page",
@@ -2874,6 +5238,15 @@
         buttons: [],
         box: null
       },
+      currentSurface: map.currentSurface || map.activeSurface || {
+        type: "page",
+        id: "",
+        label: "",
+        taskQueue: []
+      },
+      surfaceStack: map.surfaceStack || [],
+      currentSurfaceTasks: map.currentSurfaceTasks || [],
+      backgroundTasks: map.backgroundTasks || [],
       overlays: (map.overlays || []).map((overlay) => ({
         id: overlay.id,
         label: overlay.label,
@@ -2899,29 +5272,68 @@
   }
 
   async function requestAgentDecision(map, userMessage = "") {
+    const turnId = nextFlowId("turn");
+    const observationId = nextFlowId("obs");
+    agent.activeTurnId = turnId;
+    agent.activeObservationId = observationId;
+    const observationSnapshot = mapObservationSnapshot(map);
     logAgentEvent("agent_request", {
+      turnId,
+      observationId,
       userMessage: userMessage ? "[provided]" : "",
       step: map.step,
       summary: map.summary,
       errors: map.errors,
       paidChoices: map.paidChoices
     });
+	    logFlow("backend.request.prepare", {
+	      turnId,
+	      observationId,
+	      userMessage: Boolean(userMessage),
+	      observation: observationSnapshot,
+	      page: pageSnapshot("before-backend"),
+	      lastAction: agent.lastActionResult || agent.actionHistory[agent.actionHistory.length - 1] || null
+	    });
     try {
       const settings = await storageGet(["apiBase"]);
       const screenshotDataUrl = await captureVisibleScreenshot();
+      logFlow("backend.request.send", {
+        turnId,
+        api: `${settings.apiBase || DEFAULT_API}/agent/next-action`,
+        screenshotBytes: screenshotDataUrl.length,
+        activeSurface: map.activeSurface ? {
+          type: map.activeSurface.type,
+          taskHint: map.activeSurface.taskHint,
+          options: (map.activeSurface.options || []).map((option) => ({
+            id: option.id,
+            label: compactText(option.label, 100),
+            risk: option.risk,
+            semantic: option.semantic,
+            selected: Boolean(option.selected),
+            box: option.box
+          })).slice(0, 12)
+        } : null
+      });
       const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/next-action`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           sessionId: agent.sessionId,
-          userIntent: `Complete this flight checkout safely using the selected traveler profile. Traveler rules: ${travelerRules() || "Ask before paid extras and stop at real payment."}`,
+          clientTurnId: turnId,
+          observationId,
+          observationSnapshot,
+          userIntent: userIntentText(),
           userMessage,
           traveler: traveler(),
-          approvalState: {
-            skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
-            paymentApproved: false
-          },
-          actionHistory: agent.actionHistory.slice(-12),
+	          approvalState: {
+	            skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
+	            paymentApproved: false
+	          },
+	          actionHistory: agent.actionHistory.slice(-12),
+          // Best-effort context for the backend verifier — it independently judges
+          // whether the last action actually worked from the fresh screenshot/DOM
+          // rather than trusting this, so it doesn't need to be a strict schema.
+	          lastActionResult: agent.lastActionResult || agent.actionHistory[agent.actionHistory.length - 1] || null,
           page: {
             ...compactPageMap(map),
             screenshotDataUrl
@@ -2930,36 +5342,81 @@
       });
       if (!response.ok) throw new Error(`agent returned ${response.status}`);
       const decision = await response.json();
+      agent.lastBackendDebug = decision.debug || null;
       logAgentEvent("agent_decision", {
+        turnId,
+        actionId: decision.actionId || decision.id || "",
+        observationId: decision.observationId || "",
         source: decision.source,
         action: decision.action,
+        intent: decision.intent || "",
+        requirementId: decision.requirementId || "",
         targetId: decision.targetId,
+        targetLabel: decision.targetLabel,
+        targetSnapshot: decision.targetSnapshot || null,
+        expectedOutcome: decision.expectedOutcome || null,
         risk: decision.risk,
         needsApproval: decision.needsApproval,
         message: decision.message,
-        reason: decision.reason
+        reason: decision.reason,
+        debug: decision.debug || null
+      });
+      logFlow("backend.response", {
+        turnId,
+        decision: {
+          source: decision.source,
+          actionId: decision.actionId || decision.id || "",
+          observationId: decision.observationId || "",
+          action: decision.action,
+          intent: decision.intent || "",
+          requirementId: decision.requirementId || "",
+          targetId: decision.targetId,
+          targetLabel: decision.targetLabel,
+          targetSnapshot: decision.targetSnapshot || null,
+          expectedOutcome: decision.expectedOutcome || null,
+          value: decision.value,
+          x: decision.x,
+          y: decision.y,
+          risk: decision.risk,
+          needsApproval: decision.needsApproval,
+          reason: decision.reason
+        },
+        backendDebug: decision.debug || null
       });
       return decision;
     } catch (error) {
+      const contextInvalidated = /extension context invalidated|context invalidated|receiving end does not exist/i.test(error.message || "");
       const decision = {
         source: "system",
         action: "stop",
         targetId: "",
         value: "",
-        message: `AI agent unavailable: ${error.message}. I stopped because AI-only mode is enabled.`,
+        message: contextInvalidated
+          ? "Chrome invalidated the extension context after reload. Refresh this checkout tab, then start the agent again."
+          : `AI agent unavailable: ${error.message}. I stopped because AI-only mode is enabled.`,
         needsApproval: true,
         risk: "uncertain",
-        reason: "AI-only mode: backend/OpenAI must provide the next action."
+        reason: contextInvalidated
+          ? "Extension lifecycle error: this page is still running the old content script after extension reload."
+          : "AI-only mode: backend/OpenAI must provide the next action."
       };
       logAgentEvent("agent_decision", {
+        turnId,
+        actionId: decision.actionId || decision.id || "",
+        observationId: decision.observationId || observationId,
         source: decision.source,
         action: decision.action,
+        intent: decision.intent || "",
+        requirementId: decision.requirementId || "",
         targetId: decision.targetId,
+        targetSnapshot: decision.targetSnapshot || null,
+        expectedOutcome: decision.expectedOutcome || null,
         risk: decision.risk,
         needsApproval: decision.needsApproval,
         message: decision.message,
         reason: decision.reason
       });
+      logFlow(contextInvalidated ? "extension.context_invalidated" : "backend.error", { turnId, error: error.message, decision });
       return decision;
     }
   }
@@ -2983,6 +5440,12 @@
   }
 
   async function continueAfterAction(delay = 800) {
+    logFlow("loop.schedule_next", {
+      delay,
+      pageAfterAction: pageSnapshot("after-action-before-next-loop"),
+      lastAction: agent.actionHistory[agent.actionHistory.length - 1] || null
+    });
+    clearExecutionContext();
     renderSidebar("agent");
     await sleep(delay);
     processCheckoutAgent();
@@ -3002,7 +5465,27 @@
   }
 
   async function clickAndVerifyAdvance(element, label = "Continue", delay = 1200, options = {}) {
-    const before = pageSignature();
+    if (!guardedHelperAllowed("clickAndVerifyAdvance", ["click"])) return false;
+    const beforeMap = options.beforeMap || rememberPagePlan(buildPageMap());
+    const expectedOutcome = options.expectedOutcome || expectedOutcomeForDecision({ action: "click", targetLabel: label }, beforeMap, element);
+    const blockers = stageExitBlockers(beforeMap, { action: "click", targetLabel: label });
+    if (blockers.length) {
+      pushVerificationLedger(
+        options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
+        options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
+        { action: "click", targetLabel: label },
+        expectedOutcome,
+        {
+          ok: false,
+          code: blockers[0].code || "STAGE_EXIT_BLOCKED",
+          message: blockers[0].message || "Stage exit is blocked.",
+          evidence: { blockers }
+        }
+      );
+      addAgentMessage("assistant", `I did not click ${label}: ${blockers[0].message}`);
+      await continueAfterAction(250);
+      return false;
+    }
     addAgentMessage("assistant", `Clicking: ${label}.`);
     await showAgentThought(element, "Exit", `Act: click ${label}`, "Checking whether the page advances.");
     flashElement(element);
@@ -3012,23 +5495,33 @@
     await waitForUiSettle(700);
     await sleep(delay);
     let afterMap = rememberPagePlan(buildPageMap());
-    let advanced = before !== pageSignature(afterMap);
+    const verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, element);
+    let advanced = verification.ok;
     agent.pageMap = afterMap;
     setAgentActivity(advanced ? `Advanced to ${afterMap.step.replace(/_/g, " ")}` : `${label} did not advance`, advanced ? "Reading the next page state" : "Looking for the remaining blocker");
+    pushVerificationLedger(
+      options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
+      options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
+      { action: "click", targetLabel: label },
+      expectedOutcome,
+      verification
+    );
     logAgentEvent("verify_advance", {
       label,
       advanced,
       step: afterMap.step,
       errors: afterMap.errors,
-      url: location.href
+      url: location.href,
+      verification
     });
     reportActionResult({
       type: "navigation",
       action: "click_continue",
       target: label,
       ok: advanced && !afterMap.errors.length,
-      message: advanced ? `Clicked ${label} and reached ${afterMap.step.replace(/_/g, " ")}.` : `Clicked ${label}, but the page did not advance.`,
-      errors: afterMap.errors
+      message: advanced ? `Clicked ${label} and reached ${afterMap.step.replace(/_/g, " ")}.` : verification.message || `Clicked ${label}, but the page did not advance.`,
+      errors: afterMap.errors,
+      verification
     });
     if (!advanced && inferCheckoutSite() !== "demo") {
       if (agent.running) {
@@ -3044,12 +5537,83 @@
   }
 
   async function executeAgentDecision(decision, map) {
+    const actionId = decision.actionId || decision.id || nextFlowId("act");
+    const executionId = nextFlowId("exec");
+    const observation = mapObservationSnapshot(map);
+    const actionObservationId = decision.observationId || observation.observationId || agent.activeObservationId || "";
+    const actionObservationHash = decision.observationHash || observation.snapshotHash || "";
+    agent.activeExecutionActionId = actionId;
+    agent.activeExecutionObservationId = actionObservationId;
+    agent.activeExecutionDecisionAction = decision.action || "";
+    logFlow("execute.start", {
+      executionId,
+      actionId,
+      observationId: actionObservationId,
+      decision: {
+        source: decision.source,
+        observationId: decision.observationId || "",
+        observationHash: decision.observationHash || "",
+        action: decision.action,
+        intent: decision.intent || "",
+        requirementId: decision.requirementId || "",
+        targetId: decision.targetId,
+        targetLabel: decision.targetLabel,
+        targetSnapshot: decision.targetSnapshot || null,
+        expectedOutcome: decision.expectedOutcome || null,
+        value: decision.value,
+        x: decision.x,
+        y: decision.y,
+        risk: decision.risk,
+        needsApproval: decision.needsApproval,
+        reason: decision.reason
+      },
+      backendDebug: decision.debug || agent.lastBackendDebug || null,
+      observation,
+      pageBefore: pageSnapshot("before-execute")
+    });
+    pushActionLedger({
+      actionId,
+      observationId: actionObservationId,
+      stage: "planned",
+      action: decision,
+      observation,
+      observationHash: actionObservationHash
+    });
     logAgentEvent("execute", {
+      executionId,
+      actionId,
       action: decision.action,
       targetId: decision.targetId,
       risk: decision.risk,
       source: decision.source
     });
+    const currentObservation = mapObservationSnapshot(rememberPagePlan(buildPageMap()));
+    if ((decision.observationHash && decision.observationHash !== currentObservation.snapshotHash) || observationChangedSince(map)) {
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "rejected",
+        action: decision,
+        observationHash: actionObservationHash,
+        result: {
+          ok: false,
+          code: "OBSERVATION_HASH_MISMATCH",
+          reason: "Observation changed before execution",
+          expectedHash: decision.observationHash || "",
+          currentHash: currentObservation.snapshotHash || ""
+        }
+      });
+      logFlow("execute.stale_observation", {
+        actionId,
+        observationId: actionObservationId,
+        expectedHash: decision.observationHash || "",
+        currentHash: currentObservation.snapshotHash || "",
+        before: observation,
+        current: currentObservation
+      });
+      await continueAfterAction(150);
+      return;
+    }
     const message = decision.message || "I have a next action.";
     if (!agent.messages.at(-1) || agent.messages.at(-1).text !== message) {
       addAgentMessage("assistant", message);
@@ -3058,8 +5622,35 @@
       setAgentActivity(message, decision.reason);
     }
 
-    if ((decision.risk === "money" || decision.action === "ask_user") && shouldAutoDeclinePaidExtras()) {
+    const seatNoSelectionContinue = isSeatNoSelectionContinue(decision, map);
+    const safeDeclineDecision = backendApprovedSafeDeclineDecision(decision, map);
+    const openChoiceControl = backendApprovedOpenChoiceControl(decision);
+    if (!["ask_user", "stop", "wait", "scroll"].includes(decision.action)
+      && decision.risk === "money"
+      && shouldAutoDeclinePaidExtras()
+      && !safeDeclineDecision
+      && !openChoiceControl) {
       agent.skipPaidExtrasApproved = true;
+      if (AGENT_SINGLE_BRAIN) {
+        pushActionLedger({
+          actionId,
+          observationId: actionObservationId,
+          stage: "blocked",
+          action: decision,
+          result: { ok: false, code: "UNAPPROVED_MONEY_ACTION", message: "Money-risk action was not a verified no-cost/no-thanks decline option." }
+        });
+        logFlow("invariant.blocked_action", {
+          actionId,
+          observationId: actionObservationId,
+          violation: { code: "UNAPPROVED_MONEY_ACTION" },
+          target: decision.targetLabel || decision.value || ""
+        });
+        agent.awaiting = "extras";
+        agent.running = false;
+        addAgentMessage("assistant", "I stopped before a money-risk action because it was not clearly a no-cost/no-thanks decline option.");
+        renderSidebar("agent");
+        return;
+      }
       const handled = await autoResolveNoExtrasSection(map);
       if (handled) {
         await continueAfterAction(350);
@@ -3067,6 +5658,44 @@
       }
       agent.pendingUserMessage = "Use the saved traveler rule: decline paid extras and continue without asking unless payment/final booking appears.";
       await continueAfterAction(350);
+      return;
+    }
+
+    if (safeDeclineDecision) {
+      decision = {
+        ...decision,
+        risk: "safe",
+        needsApproval: false,
+        reason: decision.reason || "Backend chose a no-cost/no-thanks decline option under saved no-extras rules."
+      };
+      logFlow("policy.safe_decline_allowed", {
+        actionId,
+        observationId: actionObservationId,
+        target: decision.targetLabel || decision.value || "",
+        reason: decision.reason,
+        seatNoSelectionContinue
+      });
+    }
+
+    const invariantViolation = transactionInvariantViolation(decision, map, { safeDeclineDecision, openChoiceControl });
+    if (invariantViolation) {
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "blocked",
+        action: decision,
+        result: { ok: false, ...invariantViolation }
+      });
+      logFlow("invariant.blocked_action", {
+        actionId,
+        observationId: actionObservationId,
+        violation: invariantViolation,
+        target: decision.targetLabel || decision.value || ""
+      });
+      agent.awaiting = invariantViolation.code === "PAYMENT_OR_FINAL_ACTION" ? "final" : "manual";
+      agent.running = false;
+      addAgentMessage("assistant", invariantViolation.message);
+      renderSidebar(invariantViolation.code === "PAYMENT_OR_FINAL_ACTION" ? "review" : "agent");
       return;
     }
 
@@ -3110,9 +5739,181 @@
       return;
     }
 
-    if (decision.action === "fill_known_fields") {
-      const count = await fillKnownFieldsFromMap(map);
+    if (decision.action === "scroll") {
+      const amount = Number.isFinite(Number(decision.scrollY)) && Number(decision.scrollY) !== 0 ? Number(decision.scrollY) : 520;
+      window.scrollBy({ top: amount, left: 0, behavior: "smooth" });
+      recordAction("scroll", { amount });
+      await waitForUiSettle(600);
+      await continueAfterAction(350);
+      return;
+    }
+
+    if (decision.action === "keypress") {
+      const key = /escape/i.test(decision.keys || decision.value || "") ? "Escape" : /enter/i.test(decision.keys || decision.value || "") ? "Enter" : "";
+      if (!key) {
+        agent.awaiting = "manual";
+        agent.running = false;
+        addAgentMessage("assistant", "The AI requested an unsupported keypress, so I stopped.");
+        renderSidebar("agent");
+        return;
+      }
+      dispatchKey(document.activeElement || document.body, key);
+      recordAction("keypress", { key });
+      await waitForUiSettle(500);
+      await continueAfterAction(350);
+      return;
+    }
+
+    if (decision.action === "close_modal") {
+      const closed = await closeActiveSurface(map);
+      if (!closed) {
+        agent.awaiting = "manual";
+        agent.running = false;
+        addAgentMessage("assistant", "I could not safely close the active popup, so I stopped.");
+        renderSidebar("agent");
+        return;
+      }
+      await continueAfterAction(450);
+      return;
+    }
+
+    if (decision.action === "skip_optional_extra") {
+      const skipped = await skipNoExtraDropdownChoice(map, decision) || await skipOptionalExtraSurface(map);
+      if (!skipped) {
+        agent.awaiting = "manual";
+        agent.running = false;
+        addAgentMessage("assistant", "I could not find a safe way to skip the optional extra on the active screen.");
+        renderSidebar("agent");
+        return;
+      }
+      await continueAfterAction(500);
+      return;
+    }
+
+    if (decision.action === "fill_known_fields" || decision.action === "fill_visible_profile_fields") {
+      const count = await fillVisibleProfileFieldsFromMap(map, { targetIds: [decision.targetId].filter(Boolean) });
       if (count) addAgentMessage("assistant", `Filled ${count} visible field${count === 1 ? "" : "s"} from the live page map.`);
+      if (!count && decision.action === "fill_known_fields") {
+        const fallbackCount = await fillKnownFieldsFromMap(map);
+        if (fallbackCount) addAgentMessage("assistant", `Filled ${fallbackCount} field${fallbackCount === 1 ? "" : "s"} from the current checkout section.`);
+      }
+      await continueAfterAction(500);
+      return;
+    }
+
+    if (decision.action === "click_xy") {
+      const labelTarget = bestClickableForLabels([decision.targetLabel, decision.value].filter(Boolean), document);
+      if (labelTarget) {
+        const validation = validateResolvedTarget(decision, labelTarget, map);
+        if (!validation.ok) {
+          pushActionLedger({
+            actionId,
+            observationId: actionObservationId,
+            stage: "rejected",
+            action: decision,
+            targetFingerprint: targetFingerprint(labelTarget, decision),
+            result: { ok: false, code: validation.code, expected: validation.expected, live: validation.live }
+          });
+          logFlow("target.validation_failed", {
+            actionId,
+            observationId: actionObservationId,
+            code: validation.code,
+            expected: validation.expected,
+            live: validation.live
+          });
+          await continueAfterAction(150);
+          return;
+        }
+        await showAgentThought(labelTarget, "Act", `Click visible control`, decision.targetLabel ? `Target: ${decision.targetLabel}` : "Resolved coordinate action to a visible control.", 650);
+        pushActionLedger({
+          actionId,
+          observationId: actionObservationId,
+          stage: "target_resolved",
+          action: decision,
+          targetFingerprint: targetFingerprint(labelTarget, decision),
+          expectedOutcome: expectedOutcomeForDecision(decision, map, labelTarget),
+          resolution: "click_xy_label_to_dom"
+        });
+        showAgentCursor(labelTarget, decision.targetLabel || decision.value || "click");
+        flashElement(labelTarget);
+        userLikeClick(labelTarget);
+        recordAction("click_xy_resolved_to_dom", { label: decision.targetLabel || decision.value || buttonText(labelTarget) || labelText(labelTarget) });
+        await waitForUiSettle(700);
+        {
+          const afterMap = rememberPagePlan(buildPageMap());
+          const expectedOutcome = expectedOutcomeForDecision(decision, map, labelTarget);
+          const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, labelTarget);
+          pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
+        }
+        await continueAfterAction(500);
+        return;
+      }
+      const x = Number(decision.x);
+      const y = Number(decision.y);
+      if (decision.x == null || decision.y == null || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
+        agent.awaiting = "manual";
+        agent.running = false;
+        addAgentMessage("assistant", "The AI gave an invalid click coordinate, so I stopped and rescanned.");
+        renderSidebar("agent");
+        return;
+      }
+      const hit = document.elementFromPoint(x, y);
+      const target = clickableAncestor(hit) || hit;
+      if (!target || target.closest?.("#atw-sidebar") || isPaymentField(target)) {
+        agent.awaiting = "manual";
+        agent.running = false;
+        addAgentMessage("assistant", "The coordinate target is unavailable or sensitive, so I stopped.");
+        renderSidebar("agent");
+        return;
+      }
+      const coordinateValidation = validateResolvedTarget(decision, target, map);
+      if (!coordinateValidation.ok) {
+        pushActionLedger({
+          actionId,
+          observationId: actionObservationId,
+          stage: "rejected",
+          action: decision,
+          targetFingerprint: targetFingerprint(target, decision),
+          result: { ok: false, code: coordinateValidation.code, expected: coordinateValidation.expected, live: coordinateValidation.live }
+        });
+        logFlow("target.validation_failed", {
+          actionId,
+          observationId: actionObservationId,
+          code: coordinateValidation.code,
+          expected: coordinateValidation.expected,
+          live: coordinateValidation.live
+        });
+        await continueAfterAction(150);
+        return;
+      }
+      const targetLabel = decision.targetLabel || decision.value || buttonText(target) || labelText(target);
+      if (isDangerousActionLabel(targetLabel)) {
+        agent.awaiting = "final";
+        agent.running = false;
+        addAgentMessage("assistant", "I will not click payment or final booking coordinates automatically.");
+        renderSidebar("review");
+        return;
+      }
+      await showAgentThought(target, "Act", `Click visible point`, targetLabel ? `Target: ${targetLabel}` : "Coordinate fallback on the active visual surface.", 700);
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "target_resolved",
+        action: decision,
+        targetFingerprint: targetFingerprint(target, decision),
+        expectedOutcome: expectedOutcomeForDecision(decision, map, target)
+      });
+      showAgentCursor(target, targetLabel || "click point");
+      flashElement(target);
+      clickViewportPoint(Math.round(x), Math.round(y));
+      recordAction("click_xy", { x: Math.round(x), y: Math.round(y), label: targetLabel });
+      await waitForUiSettle(700);
+      {
+        const afterMap = rememberPagePlan(buildPageMap());
+        const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
+        const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+        pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
+      }
       await continueAfterAction(500);
       return;
     }
@@ -3126,6 +5927,46 @@
         renderSidebar("agent");
         return;
       }
+      const validation = validateResolvedTarget(decision, target, map);
+      if (!validation.ok) {
+        pushActionLedger({
+          actionId,
+          observationId: actionObservationId,
+          stage: "rejected",
+          action: decision,
+          targetFingerprint: targetFingerprint(target, decision),
+          result: { ok: false, code: validation.code, expected: validation.expected, live: validation.live }
+        });
+        logFlow("target.validation_failed", {
+          actionId,
+          observationId: actionObservationId,
+          code: validation.code,
+          expected: validation.expected,
+          live: validation.live,
+          decision: {
+            targetId: decision.targetId,
+            targetLabel: decision.targetLabel,
+            value: decision.value
+          }
+        });
+        await showAgentThought(
+          target,
+          "Verify",
+          "Rejecting stale target",
+          `The planned target no longer matches the live control (${validation.code}). Re-observing instead of clicking.`,
+          650
+        );
+        await continueAfterAction(150);
+        return;
+      }
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "target_resolved",
+        action: decision,
+        targetFingerprint: targetFingerprint(target, decision),
+        expectedOutcome: expectedOutcomeForDecision(decision, map, target)
+      });
       if (!actionAllowedForCurrentTask(map, target)) {
         const pending = nextPendingTask(map);
         const targetSection = liveSectionForElement(map, target);
@@ -3166,25 +6007,47 @@
         || /true/.test(target.getAttribute?.("aria-checked") || "")) {
         const section = liveSectionForElement(map, target);
         if (section) {
-          await verifyAndRememberSection(section.type, section.label);
+          await verifyAndRememberSection(section.type, section.label, section.id);
           await continueAfterAction(350);
           return;
         }
       }
-      if (!repeatGuardFor(target, "I tried the same action once and the page did not advance. I stopped so I do not loop.")) return;
+      if (!seatNoSelectionContinue && !repeatGuardFor(target, "I tried the same action once and the page did not advance. I stopped so I do not loop.")) return;
+      if (seatNoSelectionContinue) {
+        logFlow("policy.seat_no_selection_continue_allowed", {
+          actionId,
+          observationId: actionObservationId,
+          target: elementDescriptor(target),
+          activeSurface: map.activeSurface
+        });
+      }
       if (button?.risk === "safe_continue") {
-        await clickAndVerifyAdvance(target, button.label || "Continue");
+        await clickAndVerifyAdvance(target, button.label || "Continue", 1200, {
+          actionId,
+          observationId: actionObservationId,
+          beforeMap: map,
+          expectedOutcome: expectedOutcomeForDecision(decision, map, target)
+        });
         return;
       }
       const actedSection = liveSectionForElement(map, target);
       const surfaceWasActive = Boolean(map.activeSurface?.type && map.activeSurface.type !== "page");
       const beforeOverlay = surfaceWasActive ? activeOverlayElements()[0] : null;
       const beforeOverlaySignature = beforeOverlay ? overlaySignature(beforeOverlay) : "";
+      const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
       showAgentCursor(target, button?.label || "clicking");
       flashElement(target);
       userLikeClick(target);
       if (surfaceWasActive) {
         const progress = await waitForOverlayProgress(beforeOverlay, beforeOverlaySignature, 2200);
+        const afterMap = rememberPagePlan(buildPageMap());
+        const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+        pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, {
+          ...verification,
+          ok: progress.ok || verification.ok,
+          code: progress.ok ? "ACTIVE_SURFACE_PROGRESS" : verification.code,
+          message: progress.ok ? `Active surface ${progress.reason}.` : verification.message
+        });
         await verifyAgentStep(target, "Interrupt", progress.ok ? `active surface ${progress.reason}` : "active surface did not change", progress.ok, 650);
         if (!progress.ok) {
           addAgentMessage("assistant", "That visible popup/dropdown did not change after the click, so I am rescanning it instead of marking it done.");
@@ -3195,8 +6058,11 @@
         return;
       }
       await waitForUiSettle(800);
+      const afterMap = rememberPagePlan(buildPageMap());
+      const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+      pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
       if (actedSection?.type && actedSection.type !== "unknown") {
-        await verifyAndRememberSection(actedSection.type, actedSection.label);
+        await verifyAndRememberSection(actedSection.type, actedSection.label, actedSection.id);
       }
       await continueAfterAction(900);
       return;
@@ -3246,7 +6112,13 @@
           return;
         }
         const section = liveSectionForElement(map, target);
-        if (section?.type) await verifyAndRememberSection(section.type, section.label);
+        if (section?.type) await verifyAndRememberSection(section.type, section.label, section.id);
+        {
+          const afterMap = rememberPagePlan(buildPageMap());
+          const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
+          const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+          pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
+        }
         await continueAfterAction(700);
         return;
       }
@@ -3258,6 +6130,12 @@
         renderSidebar("agent");
         return;
       }
+      {
+        const afterMap = rememberPagePlan(buildPageMap());
+        const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
+        const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+        pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
+      }
       await continueAfterAction(500);
       return;
     }
@@ -3267,11 +6145,263 @@
     renderSidebar("agent");
   }
 
+  // ---- Observer Mode: page-understanding projection (read-only, no actions) ----
+
+  function maskFieldPreview(fieldType, value) {
+    const text = String(value || "");
+    if (!text) return "";
+    if (["passport_number", "phone", "phone_country_code"].includes(fieldType)) {
+      return text.length > 4 ? `${text.slice(0, Math.max(2, text.length - 4))}${"*".repeat(4)}` : "****";
+    }
+    if (fieldType === "email" || fieldType === "confirm_email") {
+      const [user, domain] = text.split("@");
+      if (!domain) return "***";
+      return `${user.slice(0, 2)}${"*".repeat(Math.max(2, user.length - 2))}@${domain}`;
+    }
+    return text.length > 60 ? `${text.slice(0, 60)}…` : text;
+  }
+
+  function sectionEvidence(section) {
+    const evidence = [];
+    const filledFields = (section.fields || []).filter((field) => field.hasValue);
+    const emptyRequired = (section.fields || []).filter((field) => field.required && !field.hasValue);
+    if (filledFields.length) {
+      evidence.push(`${filledFields.length} field(s) filled: ${filledFields.map((field) => (field.field !== "unknown" ? field.field : field.label.slice(0, 24))).join(", ")}`);
+    }
+    if (emptyRequired.length) {
+      evidence.push(`${emptyRequired.length} required field(s) empty: ${emptyRequired.map((field) => (field.field !== "unknown" ? field.field : field.label.slice(0, 24))).join(", ")}`);
+    }
+    if (section.selected && section.selected.length) evidence.push(`Selected: ${section.selected.join(", ")}`);
+    if (!evidence.length) evidence.push(`Status inferred as ${section.status}.`);
+    return evidence;
+  }
+
+  function fieldEvidence(field) {
+    const evidence = [`Label/placeholder: "${(field.label || "").slice(0, 60)}"`];
+    evidence.push(field.hasValue ? "Field currently has a value" : "Field appears empty");
+    if (field.required) evidence.push("Marked required");
+    return evidence;
+  }
+
+  function priceFromText(text = "") {
+    const normalized = String(text || "").replace(/\s+/g, " ");
+    const totalMatch = normalized.match(/(?:amount to pay|total amount|total price|grand total|subtotal)[^0-9€$£]{0,80}(?:(EUR|USD|GBP|[€$£])\s?(\d+(?:[.,]\d{1,2})?)|(\d+(?:[.,]\d{1,2})?)\s?(EUR|USD|GBP|[€$£]))/i);
+    const match = totalMatch
+      || normalized.match(/(EUR|USD|GBP|[€$£])\s?(\d+(?:[.,]\d{1,2})?)/i)
+      || text.match(/(\d+(?:[.,]\d{1,2})?)\s?(EUR|USD|GBP|[€$£])/i);
+    if (!match) return null;
+    const currencyMap = { "€": "EUR", "$": "USD", "£": "GBP" };
+    const currencyToken = /[a-z€$£]/i.test(match[1] || "") ? match[1] : (match[4] || match[2]);
+    const amountToken = currencyToken === match[1] ? match[2] : (match[3] || match[1]);
+    const currency = currencyMap[currencyToken] || currencyToken.toUpperCase();
+    const amount = Number(amountToken.replace(",", "."));
+    return Number.isFinite(amount) ? { amount, currency } : null;
+  }
+
+  function includedBaggageOptions(section) {
+    if (section.type !== "baggage") return [];
+    const text = section.text || "";
+    const items = [];
+    if (/personal item[^.]{0,80}?included/i.test(text)) {
+      items.push({
+        id: `${section.id}-personal-item`,
+        category: "baggage",
+        label: "Personal item",
+        status: "included",
+        description: "Small bag included for all passengers.",
+        confidence: 0.85,
+        evidence: ["Section text mentions personal item as included"]
+      });
+    }
+    if (/hand baggage[^.]{0,80}?included/i.test(text)) {
+      items.push({
+        id: `${section.id}-hand-baggage`,
+        category: "baggage",
+        label: "Hand baggage",
+        status: "included",
+        description: "Cabin bag included for all passengers.",
+        confidence: 0.85,
+        evidence: ["Section text mentions hand baggage as included"]
+      });
+    }
+    return items;
+  }
+
+  function categoryForSectionType(type) {
+    if (type === "baggage") return "baggage";
+    if (type === "seat") return "seat";
+    if (type === "cancellation_insurance") return "insurance";
+    if (type === "payment") return "payment";
+    return "unknown";
+  }
+
+  function extractPageOptions(sections = []) {
+    const options = [];
+    for (const section of sections) {
+      options.push(...includedBaggageOptions(section));
+      const category = categoryForSectionType(section.type);
+      for (const choice of section.choices || []) {
+        let status = "unknown";
+        if (choice.selected) status = "selected";
+        else if (choice.semantic === "add_paid_extra") status = "paid_extra";
+        else if (choice.semantic === "decline_paid_extra" || choice.semantic === "decline_baggage") status = "not_selected";
+        const price = priceFromText(choice.label);
+        options.push({
+          id: choice.id,
+          category,
+          label: (choice.label || "").slice(0, 80),
+          status,
+          price: price || undefined,
+          confidence: status === "unknown" ? 0.5 : 0.8,
+          evidence: [`Detected as a ${section.label} choice`, `Selected: ${choice.selected}`]
+        });
+      }
+    }
+    return options;
+  }
+
+  function actionTypeForSectionType(type) {
+    if (type === "contact" || type === "passenger") return "fill_field";
+    if (["baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"].includes(type)) return "select_option";
+    if (type === "continue") return "click_continue";
+    return "ask_user";
+  }
+
+  function riskLevelForTask(task) {
+    return task.rule && /no paid extras/i.test(task.rule) ? "safe" : "medium";
+  }
+
+  function buildProposedNextActions(taskQueue = []) {
+    return taskQueue.slice(0, 8).map((task, index) => ({
+      id: `action-${task.sectionId || index}`,
+      actionType: actionTypeForSectionType(task.sectionType),
+      label: task.objective || `Resolve ${task.sectionLabel}`,
+      targetElementId: task.sectionId,
+      riskLevel: riskLevelForTask(task),
+      executableInObserverMode: false,
+      reason: task.rule || "Pending section needs attention before continuing.",
+      confidence: 0.75
+    }));
+  }
+
+  function buildReasoningSummary(map, stepInfo, sections) {
+    const incomplete = sections.filter((section) => section.status === "incomplete");
+    const complete = sections.filter((section) => section.status === "complete");
+    const blockerText = incomplete.length
+      ? `${incomplete.length} incomplete: ${incomplete.map((section) => section.label).join(", ")}`
+      : "no incomplete sections";
+    const shortSummary = `This is a ${map.site} ${stepInfo.step.replace(/_/g, " ")} page. ${complete.length} section${complete.length === 1 ? "" : "s"} complete, ${blockerText}.`;
+    const keyEvidence = sections.slice(0, 6).flatMap((section) => (section.evidence || []).slice(0, 1).map((item) => `${section.label}: ${item}`));
+    const uncertainty = [
+      ...map.fields.filter((field) => field.field !== "unknown" && field.confidence < 0.7).map((field) => `Low confidence field match: "${(field.label || "").slice(0, 40)}" (${Math.round(field.confidence * 100)}%)`),
+      ...sections.filter((section) => section.status === "unknown").map((section) => `Section "${section.label}" status could not be determined.`)
+    ].slice(0, 6);
+    return { shortSummary, keyEvidence, uncertainty };
+  }
+
+  function buildPageUnderstanding(map) {
+    const stepInfo = classifyStepDetailed(`${location.href} ${map.text} ${map.fullText.slice(0, 2500)}`);
+    const sections = (map.sections || []).map((section) => ({
+      id: section.id,
+      label: section.label,
+      type: section.type,
+      status: section.status,
+      confidence: section.type === "unknown" ? 0.5 : 0.85,
+      evidence: sectionEvidence(section),
+      box: section.box
+    }));
+    const fields = map.fields.map((field) => ({
+      id: field.id,
+      label: field.label,
+      semanticType: field.field,
+      required: field.required,
+      visible: true,
+      filled: Boolean(field.value),
+      valuePreview: field.value ? maskFieldPreview(field.field, field.value) : undefined,
+      confidence: field.confidence,
+      evidence: fieldEvidence(field),
+      box: field.box
+    }));
+    const options = extractPageOptions(map.sections || []);
+    const warnings = runRiskChecks();
+    const proposedNextActions = buildProposedNextActions(map.taskQueue || []);
+    const reasoningSummary = buildReasoningSummary(map, stepInfo, sections);
+    const blockers = sections
+      .filter((section) => section.status === "incomplete")
+      .map((section) => ({
+        type: "incomplete_section",
+        message: `${section.label} is incomplete.`,
+        severity: section.type === "passenger" || section.type === "contact" ? "high" : "medium"
+      }));
+
+    return {
+      pageIdentity: {
+        host: location.host,
+        url: location.href,
+        siteName: map.site,
+        pageType: stepInfo.step,
+        confidence: stepInfo.confidence
+      },
+      checkoutState: {
+        overallStatus: stepInfo.step === "unknown" ? "not_checkout" : (map.summary.continueAllowed ? "ready_to_continue" : (blockers.length ? "blocked" : "in_progress")),
+        currentStep: stepInfo.step,
+        completedSteps: sections.filter((section) => section.status === "complete").map((section) => section.label),
+        incompleteSteps: sections.filter((section) => section.status === "incomplete").map((section) => section.label),
+        blockers
+      },
+      sections,
+      fields,
+      options,
+      warnings,
+      proposedNextActions,
+      reasoningSummary,
+      debug: {
+        scanId: `scan_${Date.now().toString(36)}`,
+        scannedAt: new Date().toISOString(),
+        engineVersion: "observer-v1",
+        latencyMs: 0
+      }
+    };
+  }
+
+  // TEMP: perception-only debugging mode. Builds the page map and shows the section/field
+  // breakdown in the sidebar + on-page outlines, but never calls the backend and never
+  // fills/clicks anything. Safe to run repeatedly on any site while we tune section detection.
+  async function observePageOnly() {
+    agent.running = false;
+    agent.awaiting = "";
+    agent.messages = [];
+    agent.reasoningLog = [];
+    agent.actionHistory = [];
+    agent.observerTab = agent.observerTab || "summary";
+    setAgentActivity("Observing page (no actions will be taken)", travelerRules() || "Using saved traveler profile");
+    agent.pageMap = rememberPagePlan(buildPageMap());
+    const map = agent.pageMap;
+    const started = Date.now();
+    agent.pageUnderstanding = buildPageUnderstanding(map);
+    agent.pageUnderstanding.debug.latencyMs = Date.now() - started;
+    outlineCoreSections(map.sections || []);
+    renderSidebar("observer");
+    logAgentEvent("observe_only", {
+      pageType: agent.pageUnderstanding.pageIdentity.pageType,
+      pageConfidence: agent.pageUnderstanding.pageIdentity.confidence,
+      sections: agent.pageUnderstanding.sections.map((s) => ({ label: s.label, type: s.type, status: s.status })),
+      options: agent.pageUnderstanding.options.length,
+      warnings: agent.pageUnderstanding.warnings.length
+    });
+  }
+
+  function setObserverTab(tab) {
+    agent.observerTab = tab;
+    renderSidebar("observer");
+  }
+
   async function takeOverCheckout() {
     agent.running = true;
     agent.sessionId = "";
     agent.awaiting = "";
     agent.messages = [];
+    agent.reasoningLog = [];
     agent.lastClickSignature = "";
     agent.repeatClickCount = 0;
     agent.skipPaidExtrasApproved = false;
@@ -3282,7 +6412,31 @@
     setAgentActivity("Starting checkout agent", travelerRules() || "Using saved traveler profile");
     agent.pageMap = rememberPagePlan(buildPageMap());
     await startAgentSession();
+    await saveResumeMarker();
     addAgentMessage("assistant", `${describePageMap(agent.pageMap)} I will work step by step and ask when money, payment, or uncertainty appears.`);
+    renderSidebar("agent");
+    await announceSectionQueue();
+    await sleep(650);
+    processCheckoutAgent();
+  }
+
+  async function resumeCheckoutAfterNavigation(marker) {
+    agent.running = true;
+    agent.sessionId = marker.sessionId || "";
+    agent.awaiting = "";
+    agent.messages = [];
+    agent.reasoningLog = [];
+    agent.lastClickSignature = "";
+    agent.repeatClickCount = 0;
+    agent.skipPaidExtrasApproved = Boolean(marker.skipPaidExtrasApproved);
+    agent.autopilotMode = true;
+    agent.actionHistory = [];
+    resetSectionProgress();
+    setAgentActivity("Continuing checkout agent after page change", travelerRules() || "Using saved traveler profile");
+    agent.pageMap = rememberPagePlan(buildPageMap());
+    if (!agent.sessionId) await startAgentSession();
+    await saveResumeMarker();
+    addAgentMessage("assistant", "Picking back up where I left off after the page changed.");
     renderSidebar("agent");
     await announceSectionQueue();
     await sleep(650);
@@ -3292,21 +6446,16 @@
   async function processCheckoutAgent() {
     if (!agent.running) return;
     warnings = runRiskChecks();
-    const map = rememberPagePlan(buildPageMap());
-    agent.pageMap = map;
-    const interrupt = await settleAndHandleInterrupts("agent loop");
-    if (interrupt.handled) {
-      await continueAfterAction(500);
-      return;
-    }
-    if (interrupt.blocked) {
-      agent.running = false;
-      agent.awaiting = "manual";
-      addAgentMessage("assistant", "A popup is open and I do not have a safe automatic choice. I stopped so I do not keep working in the background.");
-      renderSidebar("agent");
-      return;
-    }
-    let stableMap = rememberPagePlan(buildPageMap());
+    agent.pageMap = rememberPagePlan(buildPageMap());
+    await showAgentThought(
+      document.activeElement || document.body,
+      "Observe",
+      "Backend planner",
+      "Reading the current page and sending it to the backend before taking any checkout action.",
+      450
+    );
+    await waitForPaint(450);
+    const stableMap = rememberPagePlan(buildPageMap());
     agent.pageMap = stableMap;
 
     const userMessage = agent.pendingUserMessage;
@@ -3459,7 +6608,10 @@
   }
 
   function actionableCheckoutErrors(errors = []) {
-    return errors;
+    return (errors || [])
+      .map((error) => String(error || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .filter((error) => !/no seat map available|not possible to reserve seats|requested random seating/i.test(error));
   }
 
   function monthsAfter(dateString, months) {
@@ -3603,31 +6755,90 @@
     `;
   }
 
+  function agentSectionsHtml(map) {
+    const sections = (map.sections || []).filter((section) => section.type !== "continue");
+    if (!sections.length) return "";
+    let currentAssigned = false;
+    return `
+      <ol class="atw-section-progress">
+        ${sections.map((section) => {
+          const state = section.status === "complete" ? "done" : section.status === "blocked" ? "blocked" : "pending";
+          const isCurrent = state === "pending" && !currentAssigned;
+          if (isCurrent) currentAssigned = true;
+          return `<li class="${state}${isCurrent ? " is-current" : ""}"><span class="atw-dot"></span>${escapeHtml(section.label)}</li>`;
+        }).join("")}
+      </ol>
+    `;
+  }
+
+  function agentReasoningHtml() {
+    if (!agent.reasoningLog.length) return "";
+    return `
+      <div class="atw-reasoning-log">
+        ${agent.reasoningLog.slice(-5).reverse().map((entry) => `
+          <div class="atw-reasoning-item ${entry.ok === false ? "is-warn" : ""}">
+            <span class="atw-reasoning-step">${escapeHtml(entry.loopStep)}</span>
+            <span class="atw-reasoning-text">${escapeHtml(entry.action)}</span>
+            ${entry.reason ? `<span class="atw-reasoning-reason">${escapeHtml(entry.reason)}</span>` : ""}
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  // Sidebar is logs-only by design: it starts the agent and shows what it's doing
+  // (section checklist, reasoning log). Anything that needs the user's input is
+  // asked on the page itself, next to the AI cursor — see cursorPromptHtml().
   function agentChatHtml() {
-    const shouldShowThread = Boolean(agent.awaiting) || !agent.running;
-    const visibleMessages = shouldShowThread
-      ? agent.messages
-        .filter((message) => message.role === "user" || /failed|stopped|issue|ready|payment|confirm|debug|question|tell me|skip|continue|review|manually/i.test(message.text))
-        .slice(-3)
-      : [];
-    const messages = visibleMessages.length
-      ? visibleMessages
-      : [{ role: "assistant", text: `I found ${routeSummary()}. Want me to complete checkout for ${traveler()?.first_name || "this traveler"}?` }];
     const map = agent.pageMap || rememberPagePlan(buildPageMap());
     return `
       ${agentStatusHtml(map)}
       <div class="atw-map-line">Reading ${map.site}: ${map.step.replace(/_/g, " ")} · ${map.summary.knownFields}/${map.summary.fields} fields · ${map.summary.paidChoices} paid areas</div>
-      ${shouldShowThread ? `
-        <div class="atw-chat">
-          ${messages.slice(-3).map((message) => `<div class="atw-message ${message.role}">${message.text}</div>`).join("")}
-        </div>
-      ` : `<div class="atw-mini-note">Live steps appear beside the moving AI cursor.</div>`}
+      ${agentSectionsHtml(map)}
+      ${agent.running ? agentReasoningHtml() : ""}
+      ${agent.awaiting ? `<div class="atw-mini-note">Waiting for you — answer next to the AI cursor on the page.</div>` : ""}
+    `;
+  }
+
+  function latestQuestionText() {
+    const last = [...agent.messages].reverse().find((message) => message.role === "assistant");
+    return last?.text || `I found ${routeSummary()}. Want me to complete checkout for ${traveler()?.first_name || "this traveler"}?`;
+  }
+
+  function cursorPromptHtml() {
+    return `
+      <div class="atw-cursor-prompt-message">${escapeHtml(latestQuestionText())}</div>
       ${agentDecisionHtml()}
       <form id="atw-chat-form" class="atw-chat-form">
         <input id="atw-chat-input" placeholder="Type: continue, skip extras, stop..." />
         <button class="atw-primary" type="submit">Send</button>
       </form>
     `;
+  }
+
+  function renderCursorPrompt() {
+    const existing = document.getElementById("atw-cursor-prompt");
+    if (!agent.awaiting) {
+      existing?.remove();
+      return;
+    }
+    const prompt = existing || document.createElement("div");
+    prompt.id = "atw-cursor-prompt";
+    prompt.innerHTML = cursorPromptHtml();
+    if (!prompt.parentElement) document.body.appendChild(prompt);
+    const cursor = document.getElementById("atw-agent-cursor");
+    const anchorRect = cursor?.getBoundingClientRect();
+    if (anchorRect && anchorRect.width) {
+      const left = Math.min(Math.max(8, anchorRect.left), window.innerWidth - 340);
+      const top = Math.min(anchorRect.bottom + 14, window.innerHeight - 40);
+      prompt.style.left = `${Math.max(8, left)}px`;
+      prompt.style.top = `${Math.max(8, top)}px`;
+    } else {
+      prompt.style.left = "50%";
+      prompt.style.top = "auto";
+      prompt.style.bottom = "24px";
+      prompt.style.transform = "translateX(-50%)";
+    }
   }
 
   function agentDecisionHtml() {
@@ -3669,6 +6880,132 @@
     return "";
   }
 
+  function escapeHtml(text) {
+    return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function pct(value) {
+    return `${Math.round((value || 0) * 100)}%`;
+  }
+
+  const OBSERVER_TABS = [
+    ["summary", "Summary"],
+    ["pagemap", "Page Map"],
+    ["fields", "Fields"],
+    ["options", "Options"],
+    ["debug", "Debug JSON"]
+  ];
+
+  function observerTabsHtml() {
+    return `
+      <div class="atw-buttons" style="flex-wrap:wrap;">
+        ${OBSERVER_TABS.map(([key, label]) => `
+          <button class="atw-tab ${agent.observerTab === key ? "atw-primary" : ""}" data-observer-tab="${key}">${label}</button>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function observerSummaryHtml(pu) {
+    const blocker = pu.checkoutState.blockers[0]?.message || "None detected.";
+    const nextAction = pu.proposedNextActions[0]?.label || "None — nothing pending.";
+    return `
+      <div class="atw-box">
+        <strong>Page understood [Observer Mode — no actions taken]</strong>
+        <div class="atw-muted">Current step: ${escapeHtml(pu.pageIdentity.pageType.replace(/_/g, " "))} (confidence ${pct(pu.pageIdentity.confidence)})</div>
+        <div class="atw-muted">Overall status: ${escapeHtml(pu.checkoutState.overallStatus.replace(/_/g, " "))}</div>
+        <div class="atw-muted">Detected sections: ${pu.sections.length}</div>
+      </div>
+      <div class="atw-box">
+        <strong>Main blocker</strong>
+        <div class="atw-muted">${escapeHtml(blocker)}</div>
+      </div>
+      <div class="atw-box">
+        <strong>Recommended next step (not executed)</strong>
+        <div class="atw-muted">${escapeHtml(nextAction)}</div>
+      </div>
+      <div class="atw-box">
+        <strong>Reasoning</strong>
+        <div class="atw-muted">${escapeHtml(pu.reasoningSummary.shortSummary)}</div>
+        ${pu.reasoningSummary.keyEvidence.length ? `<ul class="atw-list">${pu.reasoningSummary.keyEvidence.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul>` : ""}
+        ${pu.reasoningSummary.uncertainty.length ? `<div class="atw-muted" style="margin-top:6px;"><em>Uncertain about:</em><ul class="atw-list">${pu.reasoningSummary.uncertainty.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul></div>` : ""}
+      </div>
+      ${pu.warnings.length ? `
+        <div class="atw-box">
+          <strong>Warnings</strong>
+          <ul class="atw-list">${pu.warnings.map((w) => `<li>[${w.severity}] ${escapeHtml(w.title || w.type)}: ${escapeHtml(w.message)}</li>`).join("")}</ul>
+        </div>
+      ` : ""}
+    `;
+  }
+
+  function observerPageMapHtml(pu) {
+    return `
+      <div class="atw-box">
+        <strong>Sections (${pu.sections.length})</strong>
+        ${pu.sections.map((section, index) => `
+          <div style="margin:10px 0;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);">
+            <div><strong>${index + 1}. [${escapeHtml(section.type)}]</strong> ${escapeHtml(section.label)} — ${escapeHtml(section.status)} (${pct(section.confidence)})</div>
+            <ul class="atw-list">${section.evidence.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul>
+          </div>
+        `).join("") || "<div class='atw-muted'>No sections detected.</div>"}
+      </div>
+    `;
+  }
+
+  function observerFieldsHtml(pu) {
+    const known = pu.fields.filter((f) => f.semanticType !== "unknown");
+    const unknownCount = pu.fields.length - known.length;
+    return `
+      <div class="atw-box">
+        <strong>Recognized fields (${known.length}/${pu.fields.length})</strong>
+        ${known.map((field) => `
+          <div style="margin:8px 0;">
+            <div>${field.filled ? "✓" : "✗"} <strong>${escapeHtml(field.semanticType)}</strong>${field.required ? " (required)" : ""} — ${field.filled ? escapeHtml(field.valuePreview || "filled") : "empty"} (${pct(field.confidence)})</div>
+            <div class="atw-muted" style="font-size:11px;">${escapeHtml(field.label.slice(0, 60))}</div>
+          </div>
+        `).join("") || "<div class='atw-muted'>None recognized.</div>"}
+        ${unknownCount ? `<div class="atw-muted">+${unknownCount} unrecognized field(s) on page (tracked within their section's choices, not shown here).</div>` : ""}
+      </div>
+    `;
+  }
+
+  function observerOptionsHtml(pu) {
+    if (!pu.options.length) return `<div class="atw-box atw-muted">No paid/choice options detected on this page.</div>`;
+    return `
+      <div class="atw-box">
+        <strong>Options (${pu.options.length})</strong>
+        ${pu.options.map((option) => `
+          <div style="margin:8px 0;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);">
+            <div><strong>${escapeHtml(option.label)}</strong> — ${escapeHtml(option.category)} · ${escapeHtml(option.status)}${option.price ? ` · ${option.price.amount} ${option.price.currency}` : ""} (${pct(option.confidence)})</div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function observerDebugHtml(pu) {
+    return `
+      <div class="atw-box">
+        <button id="atw-copy-observer-json">Copy debug JSON</button>
+        <pre style="white-space:pre-wrap;font-size:10px;line-height:1.4;max-height:400px;overflow-y:auto;margin-top:8px;">${escapeHtml(JSON.stringify(pu, null, 2))}</pre>
+      </div>
+    `;
+  }
+
+  function observerPanelHtml() {
+    const pu = agent.pageUnderstanding;
+    if (!pu) return `<div class="atw-box atw-muted">Click "Observe page" to scan.</div>`;
+    const renderers = {
+      summary: observerSummaryHtml,
+      pagemap: observerPageMapHtml,
+      fields: observerFieldsHtml,
+      options: observerOptionsHtml,
+      debug: observerDebugHtml
+    };
+    return (renderers[agent.observerTab] || observerSummaryHtml)(pu);
+  }
+
   function renderSidebar(mode = "ready") {
     const t = traveler();
     const detected = bookingDetected();
@@ -3691,12 +7028,23 @@
             }).join("")}
           </select>
         </label>
+        <label class="atw-label">Anything specific for this booking? (optional)
+          <textarea id="atw-user-goal" placeholder="e.g. book free, nothing extra, no seat" ${agent.running ? "disabled" : ""}>${escapeHtml(agent.userGoal)}</textarea>
+        </label>
         <div class="atw-buttons">
           <button class="atw-primary" id="atw-takeover" ${detected ? "" : "disabled"}>Start agent</button>
+          <button id="atw-observe-only" ${detected ? "" : "disabled"}>Observe page (no actions) [TEMP]</button>
         </div>
-        <div class="atw-agent-card">
-          ${agentChatHtml()}
-        </div>
+        ${mode === "observer" ? `
+          <div class="atw-observer">
+            ${observerTabsHtml()}
+            ${observerPanelHtml()}
+          </div>
+        ` : `
+          <div class="atw-agent-card">
+            ${agentChatHtml()}
+          </div>
+        `}
         <details class="atw-details">
           <summary>Profile and logs</summary>
           <div class="atw-box">
@@ -3722,7 +7070,18 @@
       </div>
     `;
     if (!root.parentElement) document.body.appendChild(root);
+    renderCursorPrompt();
+    document.getElementById("atw-user-goal")?.addEventListener("input", (event) => { agent.userGoal = event.target.value; });
     document.getElementById("atw-takeover").addEventListener("click", () => takeOverCheckout().catch((error) => alert(error.message)));
+    document.getElementById("atw-observe-only")?.addEventListener("click", () => observePageOnly().catch((error) => alert(error.message)));
+    document.querySelectorAll("[data-observer-tab]").forEach((button) => {
+      button.addEventListener("click", () => setObserverTab(button.dataset.observerTab));
+    });
+    document.getElementById("atw-copy-observer-json")?.addEventListener("click", () => {
+      navigator.clipboard.writeText(JSON.stringify(agent.pageUnderstanding, null, 2))
+        .then(() => alert("Debug JSON copied."))
+        .catch((error) => alert(error.message));
+    });
     document.getElementById("atw-copy-debug")?.addEventListener("click", () => copyDebugLog().catch((error) => alert(error.message)));
     document.getElementById("atw-save")?.addEventListener("click", () => saveTrip().catch((error) => alert(error.message)));
     document.getElementById("atw-skip-extras")?.addEventListener("click", () => handleAgentChoice("skip_extras"));
@@ -3756,10 +7115,24 @@
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
+  window.addEventListener("pagehide", () => { saveResumeMarker(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") saveResumeMarker();
+  });
+
   try {
     await fetchData();
     warnings = runRiskChecks();
-    renderSidebar();
+    const resumeMarker = await readResumeMarker();
+    const resumeIsFresh = Boolean(resumeMarker) && (Date.now() - (resumeMarker.savedAt || 0) < RESUME_MAX_AGE_MS);
+    if (resumeIsFresh && resumeMarker.travelerId) {
+      selectedTravelerId = resumeMarker.travelerId;
+      renderSidebar("agent");
+      resumeCheckoutAfterNavigation(resumeMarker);
+    } else {
+      if (resumeMarker) await clearResumeMarker();
+      renderSidebar();
+    }
     watchForCheckoutChanges();
   } catch (error) {
     const root = document.createElement("aside");

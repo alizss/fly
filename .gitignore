@@ -14,6 +14,7 @@ outputs/
 dist/
 .vite/
 coverage/
+test-results/
 
 # Logs
 *.log

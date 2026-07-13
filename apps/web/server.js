@@ -12,7 +12,10 @@ const DB_FILE = path.join(DATA_DIR, "air-travel-wallet-db.json");
 const KEY = crypto.createHash("sha256").update(process.env.ATW_ENCRYPTION_KEY || "local-dev-key-change-me").digest();
 const AGENT_MODEL = process.env.ATW_AGENT_MODEL || "gpt-4.1-mini";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const agentSessions = new Map();
+const agentLoop = require("./agent/loop");
+const agentSessionStore = require("./agent/session-store");
+const agentTraceStore = require("./agent/trace-store");
+const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
 
 function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
@@ -22,77 +25,55 @@ function now() {
   return new Date().toISOString();
 }
 
-function pruneAgentSessions() {
-  const cutoff = Date.now() - 1000 * 60 * 60 * 6;
-  for (const [id, session] of agentSessions.entries()) {
-    if (new Date(session.updated_at).getTime() < cutoff) agentSessions.delete(id);
-  }
-}
-
 function summarizeAgentSession(session) {
   if (!session) return null;
   return {
     id: session.id,
     status: session.status,
     goal: session.goal,
-    currentStage: session.currentStage,
-    travelerName: session.travelerName,
+    currentStage: session.currentStep,
+    travelerName: "",
     approvals: session.approvals,
-    completedFields: [...session.completedFields].slice(-30),
-    completedSections: session.completedSections || {},
-    lockedFields: session.lockedFields || {},
-    retryCounts: session.retryCounts,
-    lastAction: session.lastAction,
-    lastResult: session.lastResult,
-    lastPageSummary: session.lastPageSummary,
-    failures: session.failures.slice(-8),
-    events: session.events.slice(-12).map((event) => ({
-      at: event.at,
-      type: event.type,
-      summary: event.summary || "",
-      ok: event.ok,
-      stage: event.stage
-    }))
-  };
-}
-
-function createAgentSession(body = {}) {
-  pruneAgentSessions();
-  const traveler = body.traveler || {};
-  const session = {
-    id: uid("agt"),
-    created_at: now(),
-    updated_at: now(),
-    status: "running",
-    goal: clampText(body.goal || body.userIntent || "Complete checkout safely.", 500),
-    travelerId: clampText(traveler.id || body.travelerId || "", 120),
-    travelerName: clampText([traveler.first_name, traveler.middle_name, traveler.last_name].filter(Boolean).join(" ") || body.travelerName || "", 160),
-    currentStage: "unknown",
-    approvals: {
-      skipPaidExtrasApproved: false,
-      paymentApproved: false,
-      legalApproved: false
-    },
     completedFields: [],
     completedSections: {},
     lockedFields: {},
     retryCounts: {},
-    lastAction: null,
-    lastResult: null,
-    lastPageSummary: null,
-    failures: [],
+    lastAction: session.lastAction,
+    lastResult: session.lastActionResult || null,
+    lastPageSummary: {
+      site: session.site?.host || "",
+      url: session.site?.url || "",
+      requirements: (session.requirements || []).length,
+      missing: (session.requirements || []).filter((req) => req.required && req.status !== "satisfied").length
+    },
+    failures: session.failures || [],
     events: []
   };
-  agentSessions.set(session.id, session);
-  return session;
+}
+
+function createAgentSession(body = {}) {
+  const traveler = body.traveler || {};
+  const state = agentSessionStore.getOrCreateSession(body.sessionId || "", {
+    goal: clampText(body.goal || body.userIntent || "Complete checkout safely.", 500),
+    travelerId: clampText(traveler.id || body.travelerId || "", 120),
+    site: { host: body.page?.site || "", url: body.page?.url || "" }
+  });
+  const updated = withUpdate(state, {
+    status: "running",
+    currentStep: normalizeStep(body.page?.step || state.currentStep || "unknown"),
+    approvals: {
+      ...state.approvals,
+      skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
+      paymentApproved: false
+    }
+  });
+  agentSessionStore.saveSession(updated);
+  return updated;
 }
 
 function getAgentSession(id) {
   if (!id) return null;
-  const session = agentSessions.get(id);
-  if (!session) return null;
-  session.updated_at = now();
-  return session;
+  return agentSessionStore.getSession(id);
 }
 
 function rememberAgentEvent(session, event) {
@@ -176,61 +157,16 @@ function updateAgentSessionFromPayload(session, payload) {
 }
 
 function reportAgentResult(body = {}) {
-  const session = getAgentSession(body.sessionId);
-  if (!session) return null;
-  if (body.page) {
-    const payload = compactAgentPayload({
-      sessionId: body.sessionId,
-      page: body.page,
-      approvalState: session.approvals || {}
-    });
-    updateAgentSessionFromPayload(session, reconcilePageState(payload, session));
-  }
+  const checkoutState = agentSessionStore.getSession(body.sessionId);
+  if (!checkoutState) return null;
   const result = body.result || {};
-  const action = result.action || result.type || "";
-  const target = result.target || result.fieldType || result.label || "";
-  const ok = Boolean(result.ok);
-  const signature = clampText([action, target, result.stage || session.currentStage].filter(Boolean).join("|"), 220);
-
-  session.lastAction = {
-    action: clampText(action, 80),
-    target: clampText(target, 160),
-    stage: clampText(result.stage || session.currentStage, 80)
-  };
-  session.lastResult = {
-    ok,
-    message: clampText(result.message || result.reason || "", 300),
-    errors: Array.isArray(result.errors) ? result.errors.map((item) => clampText(item, 160)).slice(0, 6) : []
-  };
-  if (ok && result.fieldType) {
-    session.completedFields = [...new Set([...session.completedFields, clampText(result.fieldType, 80)])];
-    session.lockedFields = {
-      ...(session.lockedFields || {}),
-      [clampText(result.fieldType, 80)]: clampText(result.value || result.payload?.value || result.message || "accepted", 180)
-    };
-  }
-  if (!ok) {
-    session.retryCounts[signature] = (session.retryCounts[signature] || 0) + 1;
-    session.failures.push({
-      at: now(),
-      signature,
-      message: session.lastResult.message,
-      errors: session.lastResult.errors
-    });
-    session.failures = session.failures.slice(-20);
-  }
-  rememberAgentEvent(session, {
-    type: "action_result",
-    stage: result.stage || session.currentStage,
-    ok,
-    summary: result.message || `${action || "action"} ${ok ? "worked" : "failed"}`,
-    payload: {
-      action,
-      target,
-      errors: session.lastResult.errors
-    }
+  const updated = withUpdate(checkoutState, {
+    currentStep: normalizeStep(body.page?.step || checkoutState.currentStep || "unknown"),
+    lastActionResult: result,
+    status: result.type === "final_review" ? "awaiting_user" : checkoutState.status
   });
-  return session;
+  agentSessionStore.saveSession(updated);
+  return updated;
 }
 
 function encryptSensitive(value) {
@@ -476,6 +412,186 @@ function lowerText(value) {
   return clampText(value, 4000).toLowerCase();
 }
 
+function compactAccessibilityNode(node = {}) {
+  if (!node || typeof node !== "object") return null;
+  return {
+    id: clampText(node.id, 80),
+    controlId: clampText(node.controlId, 140),
+    role: clampText(node.role, 80),
+    name: clampText(node.name, 220),
+    state: node.state && typeof node.state === "object" ? {
+      disabled: Boolean(node.state.disabled),
+      checked: clampText(node.state.checked, 40),
+      selected: clampText(node.state.selected, 40),
+      expanded: clampText(node.state.expanded, 40),
+      pressed: clampText(node.state.pressed, 40),
+      required: Boolean(node.state.required),
+      invalid: Boolean(node.state.invalid),
+      hasPopup: clampText(node.state.hasPopup, 80),
+      controls: clampText(node.state.controls, 120),
+      describedBy: clampText(node.state.describedBy, 240)
+    } : null,
+    kind: clampText(node.kind, 80),
+    sectionId: clampText(node.sectionId, 80),
+    sectionType: clampText(node.sectionType, 80),
+    sectionLabel: clampText(node.sectionLabel, 160),
+    surfaceId: clampText(node.surfaceId, 80),
+    surfaceType: clampText(node.surfaceType, 80),
+    box: node.box || null
+  };
+}
+
+function compactVisualState(state = {}) {
+  if (!state || typeof state !== "object") return null;
+  return {
+    fingerprint: clampText(state.fingerprint, 120),
+    viewport: state.viewport || null,
+    controlCount: Number(state.controlCount || 0),
+    foreground: state.foreground && typeof state.foreground === "object" ? {
+      active: Boolean(state.foreground.active),
+      id: clampText(state.foreground.id, 80),
+      type: clampText(state.foreground.type, 80),
+      label: clampText(state.foreground.label, 400),
+      blocksBackground: Boolean(state.foreground.blocksBackground),
+      confidence: Number(state.foreground.confidence || 0),
+      reason: clampText(state.foreground.reason, 240),
+      progressMarkers: state.foreground.progressMarkers || {},
+      fingerprint: clampText(state.foreground.fingerprint, 120),
+      optionCount: Number(state.foreground.optionCount || 0),
+      navigationControlCount: Number(state.foreground.navigationControlCount || 0),
+      box: state.foreground.box || null
+    } : null,
+    controls: Array.isArray(state.controls)
+      ? state.controls.map((control) => ({
+          id: clampText(control.id, 80),
+          role: clampText(control.role, 80),
+          name: clampText(control.name, 180),
+          label: clampText(control.label, 180),
+          kind: clampText(control.kind, 80),
+          semantic: clampText(control.semantic, 80),
+          risk: clampText(control.risk, 80),
+          selected: Boolean(control.selected),
+          required: Boolean(control.required),
+          hasValue: Boolean(control.hasValue),
+          state: control.state || null,
+          box: control.box || null
+        })).slice(0, 80)
+      : []
+  };
+}
+
+function compactSurface(surface = {}) {
+  if (!surface || typeof surface !== "object") {
+    return { type: "page", id: "", label: "", role: "", taskHint: "", box: null, options: [], buttons: [] };
+  }
+  return {
+    type: clampText(surface.type || "page", 40),
+    id: clampText(surface.id || "", 80),
+    label: clampText(surface.label || "", 1200),
+    role: clampText(surface.role || "", 80),
+    taskHint: clampText(surface.taskHint || "", 120),
+    blocksBackground: Boolean(surface.blocksBackground),
+    expectedResolution: clampText(surface.expectedResolution || "", 180),
+    foreground: compactVisualState({ foreground: surface.foreground || surface.visualState?.foreground || null })?.foreground || null,
+    visualState: compactVisualState(surface.visualState),
+    accessibility: compactAccessibilityNode(surface.accessibility),
+    box: surface.box || null,
+    taskQueue: Array.isArray(surface.taskQueue)
+      ? surface.taskQueue.map((task) => ({
+          id: clampText(task.id, 80),
+          sectionLabel: clampText(task.sectionLabel, 120),
+          sectionType: clampText(task.sectionType, 80),
+          status: clampText(task.status, 80)
+        })).slice(0, 12)
+      : [],
+    options: Array.isArray(surface.options)
+      ? surface.options.map((option) => ({
+          id: clampText(option.id, 80),
+          controlId: clampText(option.controlId, 140),
+          label: clampText(option.label, 220),
+          semantic: clampText(option.semantic, 80),
+          risk: clampText(option.risk, 80),
+          role: clampText(option.role, 80),
+          selected: Boolean(option.selected),
+          controlState: option.controlState || option.state || null,
+          stateElementId: clampText(option.stateElementId, 80),
+          preferredActivationElementId: clampText(option.preferredActivationElementId, 80),
+          actuators: compactActuators(option.actuators),
+          visualRegion: option.visualRegion || null,
+          accessibility: compactAccessibilityNode(option.accessibility),
+          box: option.box || null
+        })).slice(0, 24)
+      : [],
+    buttons: Array.isArray(surface.buttons)
+      ? surface.buttons.map((button) => ({
+          id: clampText(button.id, 80),
+          controlId: clampText(button.controlId, 140),
+          label: clampText(button.label, 220),
+          semantic: clampText(button.semantic, 80),
+          risk: clampText(button.risk, 80),
+          role: clampText(button.role, 80),
+          selected: Boolean(button.selected),
+          controlState: button.controlState || button.state || null,
+          stateElementId: clampText(button.stateElementId, 80),
+          preferredActivationElementId: clampText(button.preferredActivationElementId, 80),
+          actuators: compactActuators(button.actuators),
+          visualRegion: button.visualRegion || null,
+          accessibility: compactAccessibilityNode(button.accessibility),
+          box: button.box || null
+        })).slice(0, 24)
+      : []
+  };
+}
+
+function compactActuators(actuators = []) {
+  return Array.isArray(actuators)
+    ? actuators.map((item) => ({
+        nodeId: clampText(item.nodeId, 80),
+        relation: clampText(item.relation, 40),
+        role: clampText(item.role, 80),
+        label: clampText(item.label, 180),
+        box: item.box || null
+      })).filter((item) => item.nodeId).slice(0, 10)
+    : [];
+}
+
+function compactControlFields(item = {}) {
+  return {
+    controlId: clampText(item.controlId, 140),
+    controlKind: clampText(item.controlKind || item.kind, 80),
+    controlState: item.controlState || item.state || null,
+    stateElementId: clampText(item.stateElementId, 80),
+    preferredActivationElementId: clampText(item.preferredActivationElementId, 80),
+    actuators: compactActuators(item.actuators),
+    visualRegion: item.visualRegion || null
+  };
+}
+
+function compactLogicalControl(control = {}) {
+  return {
+    controlId: clampText(control.controlId, 140),
+    label: clampText(control.label, 220),
+    accessibleName: clampText(control.accessibleName, 220),
+    kind: clampText(control.kind, 80),
+    role: clampText(control.role, 80),
+    semantic: clampText(control.semantic, 80),
+    risk: clampText(control.risk, 80),
+    state: control.state || null,
+    selected: Boolean(control.selected),
+    required: Boolean(control.required),
+    sectionId: clampText(control.sectionId, 80),
+    sectionType: clampText(control.sectionType, 80),
+    sectionLabel: clampText(control.sectionLabel, 160),
+    surfaceId: clampText(control.surfaceId, 80),
+    surfaceType: clampText(control.surfaceType, 80),
+    surfaceLabel: clampText(control.surfaceLabel, 220),
+    stateElementId: clampText(control.stateElementId, 80),
+    preferredActivationElementId: clampText(control.preferredActivationElementId, 80),
+    actuators: compactActuators(control.actuators),
+    visualRegion: control.visualRegion || null
+  };
+}
+
 function includesAny(value, patterns) {
   const text = lowerText(value);
   return patterns.some((pattern) => pattern.test(text));
@@ -708,10 +824,13 @@ function compactAgentPayload(body) {
         fields: Array.isArray(section.fields)
           ? section.fields.map((field) => ({
               id: clampText(field.id, 80),
+              ...compactControlFields(field),
               label: clampText(field.label, 160),
               field: clampText(field.field, 80),
               kind: clampText(field.kind, 40),
               semantic: clampText(field.semantic || field.field, 80),
+              role: clampText(field.role, 80),
+              accessibility: compactAccessibilityNode(field.accessibility),
               required: Boolean(field.required),
               hasValue: Boolean(field.hasValue),
               box: field.box || null
@@ -720,17 +839,25 @@ function compactAgentPayload(body) {
         choices: Array.isArray(section.choices)
           ? section.choices.map((choice) => ({
               id: clampText(choice.id, 80),
+              ...compactControlFields(choice),
               label: clampText(choice.label, 160),
               selected: Boolean(choice.selected),
               semantic: clampText(choice.semantic, 80),
+              risk: clampText(choice.risk, 80),
+              role: clampText(choice.role, 80),
+              accessibility: compactAccessibilityNode(choice.accessibility),
               box: choice.box || null
             })).slice(0, 20)
           : [],
         buttons: Array.isArray(section.buttons)
           ? section.buttons.map((button) => ({
               id: clampText(button.id, 80),
+              ...compactControlFields(button),
               label: clampText(button.label, 160),
               risk: clampText(button.risk, 80),
+              semantic: clampText(button.semantic, 80),
+              role: clampText(button.role, 80),
+              accessibility: compactAccessibilityNode(button.accessibility),
               box: button.box || null
             })).slice(0, 20)
           : [],
@@ -749,38 +876,16 @@ function compactAgentPayload(body) {
         rule: clampText(task.rule, 260)
       })).slice(0, 30)
     : [];
-  const activeSurface = page.activeSurface && typeof page.activeSurface === "object"
-    ? {
-        type: clampText(page.activeSurface.type || "page", 40),
-        id: clampText(page.activeSurface.id || "", 80),
-        label: clampText(page.activeSurface.label || "", 1200),
-        role: clampText(page.activeSurface.role || "", 80),
-        taskHint: clampText(page.activeSurface.taskHint || "", 120),
-        box: page.activeSurface.box || null,
-        options: Array.isArray(page.activeSurface.options)
-          ? page.activeSurface.options.map((option) => ({
-              id: clampText(option.id, 80),
-              label: clampText(option.label, 220),
-              semantic: clampText(option.semantic, 80),
-              risk: clampText(option.risk, 80),
-              selected: Boolean(option.selected),
-              box: option.box || null
-            })).slice(0, 24)
-          : [],
-        buttons: Array.isArray(page.activeSurface.buttons)
-          ? page.activeSurface.buttons.map((button) => ({
-              id: clampText(button.id, 80),
-              label: clampText(button.label, 220),
-              semantic: clampText(button.semantic, 80),
-              risk: clampText(button.risk, 80),
-              selected: Boolean(button.selected),
-              box: button.box || null
-            })).slice(0, 24)
-          : []
-      }
-    : { type: "page", id: "", label: "", role: "", taskHint: "", box: null, options: [], buttons: [] };
+  const activeSurface = compactSurface(page.activeSurface || {});
+  const currentSurface = compactSurface(page.currentSurface || page.activeSurface || {});
+  const surfaceStack = Array.isArray(page.surfaceStack)
+    ? page.surfaceStack.map(compactSurface).slice(0, 6)
+    : [];
   return {
     sessionId: clampText(body.sessionId || "", 120),
+    clientTurnId: clampText(body.clientTurnId || "", 120),
+    observationId: clampText(body.observationId || "", 120),
+    observationSnapshot: body.observationSnapshot || null,
     userIntent: clampText(body.userIntent || "Complete checkout safely for the selected traveler.", 800),
     userMessage: clampText(body.userMessage || "", 800),
     approvalState: {
@@ -789,10 +894,17 @@ function compactAgentPayload(body) {
     },
     actionHistory: Array.isArray(body.actionHistory)
       ? body.actionHistory.map((item) => ({
-          type: clampText(item.type, 80),
-          payload: item.payload || {}
-        })).slice(-12)
+        type: clampText(item.type, 80),
+        actionId: clampText(item.actionId, 120),
+        observationId: clampText(item.observationId, 120),
+        observationHash: clampText(item.observationHash, 120),
+        intent: clampText(item.intent, 120),
+        requirementId: clampText(item.requirementId, 120),
+        verified: typeof item.verified === "boolean" ? item.verified : undefined,
+        payload: item.payload || {}
+      })).slice(-12)
       : [],
+    lastActionResult: body.lastActionResult && typeof body.lastActionResult === "object" ? body.lastActionResult : null,
     traveler: {
       id: clampText(traveler.id, 120),
       first_name: clampText(traveler.first_name, 80),
@@ -820,7 +932,20 @@ function compactAgentPayload(body) {
       site: clampText(page.site, 80),
       url: clampText(page.url, 500),
       step: clampText(page.step, 80),
+      snapshotHash: clampText(page.snapshotHash, 120),
+      priceText: clampText(page.priceText, 80),
+      price: page.price && typeof page.price === "object" ? page.price : null,
       screenshotDataUrl: screenshotDataUrl.startsWith("data:image/") ? screenshotDataUrl.slice(0, 5_000_000) : "",
+      foreground: compactVisualState({ foreground: page.foreground || page.visualState?.foreground || null })?.foreground || null,
+      visualState: compactVisualState(page.visualState),
+      accessibility: page.accessibility && typeof page.accessibility === "object" ? {
+        foregroundSurfaceId: clampText(page.accessibility.foregroundSurfaceId, 80),
+        foregroundSurfaceType: clampText(page.accessibility.foregroundSurfaceType, 80),
+        landmarkCount: Number(page.accessibility.landmarkCount || 0),
+        controls: Array.isArray(page.accessibility.controls)
+          ? page.accessibility.controls.map(compactAccessibilityNode).filter(Boolean).slice(0, 120)
+          : []
+      } : null,
       coverage: page.coverage || {},
       visibleText: clampText(page.text || page.fullText, 6000),
       errors: Array.isArray(page.errors) ? page.errors.map((item) => clampText(item, 220)).slice(0, 8) : [],
@@ -829,18 +954,28 @@ function compactAgentPayload(body) {
       completedSections: page.completedSections && typeof page.completedSections === "object" ? page.completedSections : {},
       completedFields: page.completedFields && typeof page.completedFields === "object" ? page.completedFields : {},
       sections,
+      controls: Array.isArray(page.controls)
+        ? page.controls.map(compactLogicalControl).filter((control) => control.controlId).slice(0, 180)
+        : [],
       taskQueue,
       stageExit: page.stageExit || {},
       reconciliation: page.reconciliation || {},
       activeSurface,
+      currentSurface,
+      surfaceStack,
+      currentSurfaceTasks: Array.isArray(page.currentSurfaceTasks) ? page.currentSurfaceTasks.slice(0, 20) : [],
+      backgroundTasks: Array.isArray(page.backgroundTasks) ? page.backgroundTasks.slice(0, 20) : [],
       fields: Array.isArray(page.fields)
         ? page.fields.map((field) => ({
             id: clampText(field.id, 80),
+            ...compactControlFields(field),
             label: clampText(field.label, 220),
             box: field.box || null,
             kind: clampText(field.kind, 40),
             field: clampText(field.field, 80),
             semantic: clampText(field.semantic || field.field, 80),
+            role: clampText(field.role, 80),
+            accessibility: compactAccessibilityNode(field.accessibility),
             required: Boolean(field.required),
             hasValue: Boolean(field.value),
             confidence: Number(field.confidence || 0)
@@ -849,9 +984,13 @@ function compactAgentPayload(body) {
       buttons: Array.isArray(page.buttons)
         ? page.buttons.map((button) => ({
             id: clampText(button.id, 80),
+            ...compactControlFields(button),
             label: clampText(button.label, 180),
             box: button.box || null,
-            risk: clampText(button.risk, 80)
+            role: clampText(button.role, 80),
+            semantic: clampText(button.semantic, 80),
+            risk: clampText(button.risk, 80),
+            accessibility: compactAccessibilityNode(button.accessibility)
           })).slice(0, 80)
         : [],
       overlays: Array.isArray(page.overlays)
@@ -865,6 +1004,69 @@ function compactAgentPayload(body) {
       summary: page.summary || {}
     }
   };
+}
+
+// The new decision path: observe -> verify -> plan -> policy -> act, with
+// canonical session state and per-turn traces. Supersedes decideAgentNextAction
+// (kept below, unused by default) which trusted JS-computed section status as
+// ground truth — reconcilePageState/deriveSectionStatus are intentionally NOT
+// called here; that JS-guessed status is exactly what the requirement
+// extractor + verifier replace.
+async function decideAgentNextActionViaLoop(body) {
+  const payload = compactAgentPayload(body);
+  const state = agentSessionStore.getOrCreateSession(payload.sessionId, {
+    goal: payload.userIntent,
+    travelerId: payload.traveler?.id || "",
+    site: { host: payload.page?.site || "", url: payload.page?.url || "" }
+  });
+
+  const observation = {
+    observationId: payload.observationId,
+    observationSnapshot: payload.observationSnapshot,
+    userIntent: payload.userIntent,
+    page: payload.page,
+    lastActionResult: payload.lastActionResult || null
+  };
+
+  logAgent("loop turn start", { clientTurnId: payload.clientTurnId, observationId: payload.observationId, sessionId: state.id, site: payload.page?.site, step: state.currentStep, stallCount: state.stallCount || 0 });
+
+  try {
+    const { state: nextState, clientDecision, debug } = await agentLoop.runLoopTurn({
+      apiKey: OPENAI_API_KEY,
+      model: AGENT_MODEL,
+      dataDir: DATA_DIR,
+      state,
+      observation,
+      traveler: payload.traveler,
+      actionHistory: payload.actionHistory
+    });
+    agentSessionStore.saveSession(nextState);
+    logAgent("loop turn decision", {
+      sessionId: nextState.id,
+      clientTurnId: payload.clientTurnId,
+      observationId: payload.observationId,
+      actionId: clientDecision.actionId || "",
+      intent: clientDecision.intent || "",
+      requirementId: clientDecision.requirementId || "",
+      action: clientDecision.action,
+      target: clientDecision.targetLabel || clientDecision.value || clientDecision.targetId || "",
+      targetKind: clientDecision.targetSnapshot?.kind || "",
+      targetSource: clientDecision.targetSnapshot?.source || "",
+      expectedOutcome: clientDecision.expectedOutcome?.type || "",
+      risk: clientDecision.risk || "",
+      stallCount: nextState.stallCount || 0,
+      requirementsMissing: (nextState.requirements || []).filter((r) => r.required && r.status !== "satisfied").length,
+      missing: (debug?.missing || []).map((item) => item.label).slice(0, 4),
+      nav: (debug?.navigation || []).map((item) => `${item.action}:${item.label}:${item.enabled ? "on" : "off"}:${item.risk}`).slice(0, 5),
+      riskGates: (debug?.riskGates || []).map((item) => `${item.type}:${item.label}:${item.status}:${item.risk}`).slice(0, 4),
+      deterministic: Boolean(debug?.deterministic),
+      reason: debug?.final?.reason || clientDecision.reason || ""
+    });
+    return { ...clientDecision, debug };
+  } catch (error) {
+    logAgent("loop turn ERROR", { message: error.message });
+    return aiUnavailableDecision(error.message);
+  }
 }
 
 function scopedSection(section, isCurrent) {
@@ -881,6 +1083,9 @@ function scopedSection(section, isCurrent) {
 function allowedTargetIdsForSection(section) {
   if (!section) return [];
   return [
+    ...(section.fields || []).map((field) => field.controlId),
+    ...(section.choices || []).map((choice) => choice.controlId),
+    ...(section.buttons || []).map((button) => button.controlId),
     ...(section.fields || []).map((field) => field.id),
     ...(section.choices || []).map((choice) => choice.id),
     ...(section.buttons || []).map((button) => button.id)
@@ -890,6 +1095,8 @@ function allowedTargetIdsForSection(section) {
 function activeSurfaceTargetIds(activeSurface) {
   if (!activeSurface || activeSurface.type === "page") return [];
   return [
+    ...(activeSurface.options || []).map((option) => option.controlId),
+    ...(activeSurface.buttons || []).map((button) => button.controlId),
     ...(activeSurface.options || []).map((option) => option.id),
     ...(activeSurface.buttons || []).map((button) => button.id)
   ].filter(Boolean);
@@ -903,51 +1110,45 @@ function scopePayloadToCurrentTask(payload) {
   const page = payload.page || {};
   const activeSurface = page.activeSurface || defaultActiveSurface();
   const surfaceActive = activeSurface.type && activeSurface.type !== "page";
-  if (surfaceActive) {
-    const allowedTargetIds = new Set(activeSurfaceTargetIds(activeSurface));
-    const surfaceTask = {
-      id: `active_surface:${activeSurface.type}:${activeSurface.id || "visible"}`,
-      sectionId: activeSurface.id || "",
-      sectionLabel: activeSurface.label || activeSurface.taskHint || activeSurface.type,
-      sectionType: "active_surface",
-      order: 0,
-      status: "pending",
-      objective: `Resolve the visible ${activeSurface.type} before touching the background page.`,
-      rule: "Foreground surfaces own the next action. Use visible options/buttons and safety policy."
-    };
-
-    return {
-      ...payload,
-      page: {
-        ...page,
-        currentTask: surfaceTask,
-        allowedTargetIds: [...allowedTargetIds],
-        activeSurface,
-        sections: (page.sections || []).map((section) => scopedSection(section, false)),
-        fields: [],
-        buttons: [],
-        paidChoices: (page.paidChoices || []).slice(0, 4)
-      }
-    };
-  }
-
   const nextTask = page.reconciliation?.nextTask || null;
+  const currentTask = surfaceActive
+    ? {
+        id: `active_surface:${activeSurface.type}:${activeSurface.id || "visible"}`,
+        sectionId: activeSurface.id || "",
+        sectionLabel: activeSurface.label || activeSurface.taskHint || activeSurface.type,
+        sectionType: "active_surface",
+        order: 0,
+        status: "pending",
+        objective: `Resolve the visible ${activeSurface.type} before touching the background page.`,
+        rule: "Foreground surfaces usually own the next action, but the background page is still a valid target if that's what the screenshot actually shows is correct."
+      }
+    : nextTask;
+
+  // Union everything the page/detectors found, current-task or not, surface or not.
+  // classifyStep/section-type guesses only ever narrow this list, which is exactly what
+  // caused the agent to see a control on screen but have no id it was "allowed" to touch.
+  // The only real gate left is: does this id exist anywhere on the page at all, plus the
+  // structural guardrails upstream (payment fields are excluded from candidateInputs()
+  // before they ever reach this payload, see content.js isPaymentField).
   const allowedTargetIds = new Set([
+    ...(page.controls || []).map((control) => control.controlId),
     ...(page.fields || []).map((field) => field.id),
+    ...(page.fields || []).map((field) => field.controlId),
     ...(page.buttons || []).map((button) => button.id),
-    ...(page.sections || []).flatMap((section) => allowedTargetIdsForSection(section))
+    ...(page.buttons || []).map((button) => button.controlId),
+    ...(page.sections || []).flatMap((section) => allowedTargetIdsForSection(section)),
+    ...activeSurfaceTargetIds(activeSurface)
   ].filter(Boolean));
   if (page.stageExit?.continueAllowed && page.stageExit.continueTargetId) allowedTargetIds.add(page.stageExit.continueTargetId);
-  const allowed = [...allowedTargetIds];
 
   return {
     ...payload,
     page: {
       ...page,
-      currentTask: nextTask,
-      allowedTargetIds: allowed,
+      currentTask,
+      allowedTargetIds: [...allowedTargetIds],
       activeSurface,
-      sections: (page.sections || []).map((section) => scopedSection(section, true)),
+      sections: (page.sections || []).map((section) => scopedSection(section, !surfaceActive)),
       fields: page.fields || [],
       buttons: page.buttons || [],
       paidChoices: (page.paidChoices || []).slice(0, 4)
@@ -959,9 +1160,12 @@ function decisionInsideCurrentScope(decision, payload) {
   if (!["click", "type", "select"].includes(decision?.action)) return true;
   const allowed = new Set(payload.page?.allowedTargetIds || []);
   if (!allowed.size) return true;
-  const activeSurface = payload.page?.activeSurface || {};
-  if (activeSurface.type && activeSurface.type !== "page" && !decision.targetId && decision.value) return true;
-  return allowed.has(decision.targetId);
+  if (decision.targetId && allowed.has(decision.targetId)) return true;
+  // targetId missing or stale (e.g. the DOM node it pointed at got replaced by a
+  // React re-render between scans) — as long as there's a visible-text label to go
+  // on, let it through so the client's live-page label match (resolveDecisionTarget)
+  // gets a chance instead of discarding the whole turn.
+  return Boolean(decision.value || decision.coordinate);
 }
 
 function aiUnavailableDecision(reason) {
@@ -1114,16 +1318,18 @@ async function callOpenAiAgent(payload) {
         "If contact or passenger fields are visible and empty, prefer fill_known_fields before asking the user.",
         "If traveler.booking_rules says avoid/no paid extras, no seats, no insurance, no bundles, or no add-ons, treat routine decline/skip/no-thanks choices as safe.",
         "Operate visual-first: decide from the current visible screen using the screenshot plus DOM controls, then let the extension execute precisely.",
-        "page.activeSurface is an authoritative mini-page. If activeSurface.type is dropdown, modal, popover, or confirmation, resolve it before considering background sections.",
-        "When activeSurface is not page, ignore background section tasks except for context and safety. Choose from activeSurface.options/buttons.",
+        "When page.controls is present, prefer returning its controlId as targetId. A controlId represents one logical control across input, label, wrapper, ARIA proxy, and visual region; the executor will choose the safest actuator.",
+        "page.activeSurface, when present, is usually the right thing to resolve first (dropdown, modal, popover, confirmation) — but it is a detector's best guess, not ground truth. If the screenshot clearly shows something else is the correct next action, trust the screenshot over activeSurface.type being 'page'.",
         "For activeSurface dropdown/listbox options, prefer options marked safe_decline when saved traveler rules approve skipping paid extras. Avoid options marked paid unless the user explicitly approves.",
-        "If the visible activeSurface option is obvious but its targetId is missing or stale, put the exact visible label in value so the extension can match it on the live page.",
+        "If a modal/dialog surface's own choice is already selected/registered (e.g. a decline option shows selected, or actionHistory shows you already picked it) but the surface is still open, do not repeat that same choice — look in activeSurface.options for its own dismiss/confirm control (Next, Continue, Close, Done, Confirm) and click that instead to actually leave the dialog.",
+        "targetId is a best-effort DOM id from a heuristic scan and can be missing or stale for things like custom dropdowns, popovers, and canvas/visual widgets (e.g. seat maps) even when you can clearly see them in the screenshot. Whenever you are not fully confident in targetId — or have none — set value to the exact visible text label of the control you mean. The extension will re-resolve that label against the live page at click time, which is more reliable than a guessed id.",
         "Use page.sections as visual decomposition and memory, not as a hard script. Each section has type, status, objective, fields, buttons, selected values, and coordinates.",
         "Use page.taskQueue and page.currentTask as hints for unresolved background work, but choose the best next visible safe action from the whole screen.",
         "Choose targetId only from page.allowedTargetIds unless you are returning wait, stop, ask_user, or final_review. For normal pages this contains all visible actionable controls.",
         "Do not let a stale section/task label block an obvious visible safe action. Active visible UI and latest screenshot are more authoritative than old queue assumptions.",
-        "Click Continue/Next when the visible page appears complete, there are no active surfaces/errors, and stageExit says continueAllowed. Do not require perfect section parsing.",
-        "Continue is represented by page.stageExit, not as a normal task. If page.stageExit.continueAllowed is true, choose page.stageExit.continueTargetId.",
+        "page.stageExit.continueAllowed is a cheap backend guess, not proof — it has been wrong before (e.g. missing a second required radio group bundled into a section that already had one choice made). Before clicking page.stageExit.continueTargetId, look at the ENTIRE screenshot yourself: any required-looking radio group, checkbox, or dropdown that still shows a placeholder/unselected state, or any red/warning icon or asterisk near an empty control, even if page.sections or page.taskQueue call that area 'complete'. If you find one, act on that control instead of clicking Continue, regardless of what continueAllowed says.",
+        "If actionHistory shows you already clicked page.stageExit.continueTargetId and the page did not advance (same fields, same step, still here), do not click it again — that is a strong signal something required is still unanswered somewhere on the visible page; scan the screenshot for it instead of repeating Continue.",
+        "Continue is represented by page.stageExit, not as a normal task. Only choose page.stageExit.continueTargetId after the visual check above finds nothing outstanding.",
         "Do not modify sections whose status is complete unless page.errors explicitly targets that section.",
         "Prefer filling known traveler fields, declining routine paid extras when approvalState.skipPaidExtrasApproved is true, and clicking safe Continue buttons.",
         "When skipPaidExtrasApproved is true and an overlay is a seat, baggage, bundle, cancellation, flexible ticket, insurance, or add-on popup, do not ask the user; choose the safe decline/skip/next action if one is available.",
@@ -1131,8 +1337,7 @@ async function callOpenAiAgent(payload) {
         "Use element boxes to match screenshot-visible controls to targetIds; prefer visible primary/bottom Continue buttons over header/footer or skip links.",
         "If an element appears outside the active checkout content, avoid it unless no safer target exists.",
         "Use the screenshot as visual context when DOM text is incomplete or confusing.",
-        "If page.overlays contains a visible dialog, menu, or listbox, resolve that overlay before assuming the previous page is done.",
-        "If page.overlays is non-empty, the overlay owns the next action. Do not continue working on background page sections until it closes.",
+        "If page.overlays contains a visible dialog, menu, or listbox, resolving it is normally the priority before assuming the previous page is done — unless the screenshot shows it's already effectively resolved or irrelevant to the current goal.",
         "Use actionHistory to avoid repeating actions that already failed verification.",
         "Use adapter hints as guidance, but trust current visible page state over assumptions.",
         "Choose targetId only from the provided fields/buttons. Use empty string when no target is needed.",
@@ -1253,31 +1458,201 @@ function deterministicReconciledDecision(payload) {
   return null;
 }
 
+function logAgent(label, data) {
+  const stamp = new Date().toISOString().slice(11, 23);
+  if (data === undefined) {
+    console.log(`[agent ${stamp}] ${label}`);
+  } else {
+    console.log(`[agent ${stamp}] ${label}`, JSON.stringify(data));
+  }
+}
+
+function safeLogFilePart(value) {
+  return clampText(value || "no-session", 120).replace(/[^a-zA-Z0-9_.-]/g, "_") || "no-session";
+}
+
+function summarizeClientFlowLog(body) {
+  const entry = body.entry || {};
+  const payload = entry.payload || {};
+  const page = payload.page || payload.pageBefore || payload.pageAfterAction || {};
+  const decision = payload.decision || {};
+  const target = payload.target || payload.resolved || {};
+  const point = payload.point || {};
+  return {
+    sessionId: clampText(body.sessionId || "", 80),
+    clientTurnId: clampText(body.clientTurnId || entry.turnId || "", 80),
+    observationId: clampText(payload.observationId || payload.observation?.observationId || "", 80),
+    actionId: clampText(payload.actionId || payload.executionId || "", 80),
+    seq: entry.seq,
+    phase: clampText(entry.phase || "unknown", 80),
+    action: clampText(payload.action || decision.action || "", 80),
+    target: clampText(payload.targetLabel || target.text || target.label || decision.targetLabel || decision.targetId || payload.targetId || "", 140),
+    method: clampText(payload.method || "", 80),
+    point: point.x !== undefined && point.y !== undefined ? `${Math.round(point.x)},${Math.round(point.y)}` : "",
+    site: clampText(page.site || "", 80),
+    step: clampText(page.step || "", 80),
+    controls: Array.isArray(page.visibleControls) ? page.visibleControls.length : undefined,
+    activeSurface: clampText(page.activeSurface?.label || page.activeSurface?.type || "", 140),
+    reason: clampText(payload.reason || decision.reason || "", 180)
+  };
+}
+
+function writeClientFlowLog(body) {
+  const sessionId = safeLogFilePart(body.sessionId || body.entry?.turnId || "no-session");
+  const dir = path.join(DATA_DIR, "agent-client-logs");
+  fs.mkdirSync(dir, { recursive: true });
+  const row = {
+    receivedAt: now(),
+    ...body
+  };
+  fs.appendFileSync(path.join(dir, `${sessionId}.jsonl`), `${JSON.stringify(row)}\n`);
+  return summarizeClientFlowLog(body);
+}
+
+function summarizeActionLedgerRow(body = {}) {
+  const action = body.action || {};
+  const result = body.result || {};
+  const target = body.targetFingerprint || {};
+  return {
+    transactionId: clampText(body.transactionId || "", 80),
+    observationId: clampText(body.observationId || "", 80),
+    turnId: clampText(body.turnId || "", 80),
+    actionId: clampText(body.actionId || "", 80),
+    stage: clampText(body.stage || "", 80),
+    action: clampText(action.action || action.type || "", 80),
+    target: clampText(action.targetLabel || action.value || target.text || target.id || "", 160),
+    result: result.ok === undefined ? "" : result.ok ? "ok" : "failed",
+    code: clampText(result.code || "", 80),
+    reason: clampText(result.reason || result.message || action.reason || "", 180)
+  };
+}
+
+function writeActionLedgerRow(body = {}) {
+  const transactionId = safeLogFilePart(body.transactionId || body.sessionId || body.turnId || "no-session");
+  const dir = path.join(DATA_DIR, "agent-ledger");
+  fs.mkdirSync(dir, { recursive: true });
+  const row = {
+    receivedAt: now(),
+    ...body
+  };
+  fs.appendFileSync(path.join(dir, `${transactionId}.jsonl`), `${JSON.stringify(row)}\n`);
+  return summarizeActionLedgerRow(row);
+}
+
+function findFieldById(scopedPayload, targetId) {
+  if (!targetId) return null;
+  const page = scopedPayload.page || {};
+  const direct = (page.fields || []).find((field) => field.id === targetId);
+  if (direct) return direct;
+  for (const section of page.sections || []) {
+    const match = (section.fields || []).find((field) => field.id === targetId);
+    if (match) return match;
+  }
+  return null;
+}
+
+function correctActionForFieldKind(decision, scopedPayload) {
+  if (decision.action !== "type") return decision;
+  const field = findFieldById(scopedPayload, decision.targetId);
+  if (!field || !["radio", "checkbox"].includes(field.kind)) return decision;
+  logAgent("auto-corrected decision: type -> click on radio/checkbox field", { targetId: decision.targetId, kind: field.kind, originalValue: decision.value });
+  return {
+    ...decision,
+    action: "click",
+    value: "",
+    reason: `${decision.reason} (Auto-corrected: target is a ${field.kind} control, so clicking instead of typing.)`
+  };
+}
+
 async function decideAgentNextAction(body) {
   const payload = compactAgentPayload(body);
   const existingSession = getAgentSession(payload.sessionId);
   const reconciledPayload = reconcilePageState(payload, existingSession);
   const session = updateAgentSessionFromPayload(existingSession, reconciledPayload);
   const scopedPayload = scopePayloadToCurrentTask(reconciledPayload);
+  logAgent("request", {
+    sessionId: payload.sessionId,
+    site: reconciledPayload.page?.site,
+    step: reconciledPayload.page?.step,
+    activeSurface: reconciledPayload.page?.activeSurface?.type || "page",
+    summary: reconciledPayload.page?.summary
+  });
+  logAgent("sections detected", (reconciledPayload.page?.sections || []).map((section) => ({
+    label: section.label,
+    type: section.type,
+    status: section.status,
+    paidChoice: section.paidChoice,
+    fieldCount: (section.fields || []).length,
+    choiceCount: (section.choices || []).length
+  })));
+  logAgent("fields on page", (reconciledPayload.page?.fields || []).map((field) => ({
+    label: field.label?.slice(0, 60),
+    kind: field.kind,
+    detectedAs: field.field,
+    confidence: field.confidence,
+    hasValue: field.hasValue
+  })));
+  logAgent("task queue", (reconciledPayload.page?.taskQueue || []).map((task) => ({
+    section: task.sectionLabel,
+    type: task.sectionType,
+    status: task.status,
+    objective: task.objective
+  })));
+  if (reconciledPayload.page?.activeSurface?.type && reconciledPayload.page.activeSurface.type !== "page") {
+    logAgent("active surface (popup/dropdown open)", {
+      type: reconciledPayload.page.activeSurface.type,
+      label: reconciledPayload.page.activeSurface.label,
+      options: (reconciledPayload.page.activeSurface.options || []).map((option) => option.label)
+    });
+  }
   try {
     if (session) scopedPayload.taskState = summarizeAgentSession(session);
+    logAgent("calling openai", { model: AGENT_MODEL, currentTask: scopedPayload.page?.currentTask?.sectionLabel || "" });
     const aiDecision = await callOpenAiAgent(scopedPayload);
-    if (!aiDecision) return aiUnavailableDecision("OpenAI returned no decision");
-    const normalized = normalizeAgentDecision({ ...aiDecision, source: "openai" });
+    if (!aiDecision) {
+      logAgent("openai returned no decision");
+      return aiUnavailableDecision("OpenAI returned no decision");
+    }
+    logAgent("openai decision", aiDecision);
+    const normalized = correctActionForFieldKind(normalizeAgentDecision({ ...aiDecision, source: "openai" }), scopedPayload);
     if (!decisionInsideCurrentScope(normalized, scopedPayload)) {
+      logAgent("decision rejected: target not found on page and no usable label", { targetId: normalized.targetId, value: normalized.value, currentTask: scopedPayload.page?.currentTask?.sectionLabel || "" });
       return normalizeAgentDecision({
         source: "reconciler",
         action: "wait",
         targetId: "",
         value: "",
-        message: "The AI selected a control outside the current unfinished section, so I rejected it and will rescan.",
+        message: "The control the AI picked isn't on the page anymore (likely replaced by the page re-rendering) and there was no visible label to fall back on, so I'm rescanning.",
         needsApproval: false,
         risk: "safe",
-        reason: `Current task is ${scopedPayload.page?.currentTask?.sectionLabel || "unknown"}; completed sections are locked.`
+        reason: `Current task is ${scopedPayload.page?.currentTask?.sectionLabel || "unknown"}.`
       });
     }
+    if (session) {
+      const sectionSnapshot = (reconciledPayload.page?.sections || []).map((section) => `${section.type}:${section.status}`).join("|");
+      const decisionSignature = `${normalized.action}:${normalized.targetId}:${normalized.value}`;
+      const isRepeat = decisionSignature === session.lastDecisionSignature && sectionSnapshot === session.lastSectionSnapshot;
+      session.stallCount = isRepeat ? (session.stallCount || 0) + 1 : 0;
+      session.lastDecisionSignature = decisionSignature;
+      session.lastSectionSnapshot = sectionSnapshot;
+      if (session.stallCount >= 3) {
+        logAgent("stall detected: same decision repeated with no section progress", { decisionSignature, repeats: session.stallCount });
+        return normalizeAgentDecision({
+          source: "reconciler",
+          action: "ask_user",
+          targetId: "",
+          value: "",
+          message: `I tried the same action ${session.stallCount + 1} times without any visible progress (last attempt: ${normalized.message || normalized.reason || "no message"}). Stopping here so you can take over this step.`,
+          needsApproval: true,
+          risk: "uncertain",
+          reason: "Stalled: identical decision repeated with no detected section progress."
+        });
+      }
+    }
+    logAgent("decision accepted", { action: normalized.action, targetId: normalized.targetId, risk: normalized.risk });
     return normalized;
   } catch (error) {
+    logAgent("ERROR", { message: error.message });
     return aiUnavailableDecision(error.message);
   }
 }
@@ -1362,9 +1737,23 @@ async function handleApi(req, res, pathname) {
     return sendJson(res, 200, extensionBootstrapPayload(db));
   }
 
+  if (req.method === "POST" && pathname === "/api/agent/client-log") {
+    const body = await readBody(req);
+    const summary = writeClientFlowLog(body);
+    logAgent("client flow", summary);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (req.method === "POST" && pathname === "/api/agent/action-ledger") {
+    const body = await readBody(req);
+    const summary = writeActionLedgerRow(body);
+    logAgent("action ledger", summary);
+    return sendJson(res, 200, { ok: true });
+  }
+
   if (req.method === "POST" && pathname === "/api/agent/next-action") {
     const body = await readBody(req);
-    const decision = await decideAgentNextAction(body);
+    const decision = await decideAgentNextActionViaLoop(body);
     return sendJson(res, 200, decision);
   }
 
@@ -1379,6 +1768,18 @@ async function handleApi(req, res, pathname) {
     const session = reportAgentResult(body);
     if (!session) return sendJson(res, 404, { error: "Agent session not found" });
     return sendJson(res, 200, summarizeAgentSession(session));
+  }
+
+  if (req.method === "GET" && pathname.startsWith("/api/agent/session/")) {
+    const sessionId = pathname.slice("/api/agent/session/".length);
+    const state = agentSessionStore.getSession(sessionId);
+    if (!state) return sendJson(res, 404, { error: "Checkout session not found" });
+    return sendJson(res, 200, state);
+  }
+
+  if (req.method === "GET" && pathname.startsWith("/api/agent/traces/")) {
+    const sessionId = pathname.slice("/api/agent/traces/".length);
+    return sendJson(res, 200, { sessionId, traces: agentTraceStore.listTraces(DATA_DIR, sessionId) });
   }
 
   if (req.method === "POST" && pathname === "/api/workspaces") {

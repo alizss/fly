@@ -7,7 +7,8 @@
     "build:web": "vite build --config apps/web/vite.config.ts",
     "dev": "npm run build:web && node apps/web/server.js",
     "start": "npm run build:web && node apps/web/server.js",
-    "check": "npm run build:web && tsc --noEmit && node --check apps/web/server.js && node --check apps/web/public/app.js && node --check apps/extension/src/content/content.js && node --check apps/extension/src/popup/popup.js && node --check apps/extension/src/background/service-worker.js"
+    "check": "npm run build:web && tsc --noEmit && node --check apps/web/server.js && node --check apps/web/public/app.js && node --check apps/extension/src/content/content.js && node --check apps/extension/src/popup/popup.js && node --check apps/extension/src/background/service-worker.js && node --check apps/web/agent/loop.js && node --check apps/web/agent/verify-and-plan.js && node --check apps/web/agent/requirement-extractor.js && node --check apps/web/agent/policy.js && node --check apps/web/agent/session-store.js && node --check apps/web/agent/trace-store.js && node --check apps/web/agent/openai-client.js && node --check apps/web/agent/schemas.js && node --check packages/shared/agent-state/index.js && node --check packages/shared/agent-actions/index.js && node --check packages/shared/requirements/index.js && node --check packages/shared/policy/index.js",
+    "test:agent": "playwright test"
   },
   "engines": {
     "node": ">=20"
@@ -24,6 +25,7 @@
     "vite": "^8.1.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3"
   }
