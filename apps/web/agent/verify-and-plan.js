@@ -61,7 +61,7 @@ const INSTRUCTIONS = [
  */
 async function verifyAndPlan({ apiKey, model, state, observation, currentRequirements, pageState = null, traveler, actionHistory = [], screenshotDataUrl }) {
   const previousPrice = latestPrice(state);
-  const raw = await callStructured({
+  const { data: raw, meta } = await callStructured({
     apiKey,
     model,
     instructions: INSTRUCTIONS,
@@ -83,7 +83,8 @@ async function verifyAndPlan({ apiKey, model, state, observation, currentRequire
     screenshotDataUrl,
     schema: verifyAndPlanSchema,
     schemaName: "checkout_verify_and_plan",
-    maxOutputTokens: 1400
+    maxOutputTokens: 1400,
+    returnMeta: true
   });
 
   const v = raw.verification || {};
@@ -110,7 +111,7 @@ async function verifyAndPlan({ apiKey, model, state, observation, currentRequire
     })).filter((item) => item.requirementId) : []
   };
 
-  return { verification, action: normalizeAction(raw.action || {}) };
+  return { verification, action: normalizeAction(raw.action || {}), meta };
 }
 
 module.exports = { verifyAndPlan };

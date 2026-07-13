@@ -23,7 +23,7 @@ const INSTRUCTIONS = [
 ].join(" ");
 
 async function classifyPageState({ apiKey, model, observation, screenshotDataUrl, traveler }) {
-  const raw = await callStructured({
+  const { data: raw, meta } = await callStructured({
     apiKey,
     model,
     instructions: INSTRUCTIONS,
@@ -36,7 +36,8 @@ async function classifyPageState({ apiKey, model, observation, screenshotDataUrl
     screenshotDataUrl,
     schema: pageStateSchema,
     schemaName: "checkout_page_state",
-    maxOutputTokens: 1800
+    maxOutputTokens: 1800,
+    returnMeta: true
   });
 
   const pageState = normalizePageState(raw);
@@ -45,7 +46,8 @@ async function classifyPageState({ apiKey, model, observation, screenshotDataUrl
     pageStep: pageState.pageStep,
     requirements: requirementsFromPageState(pageState),
     uncertainties: pageState.uncertainties,
-    summary: pageState.summary
+    summary: pageState.summary,
+    meta
   };
 }
 

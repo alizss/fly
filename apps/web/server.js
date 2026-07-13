@@ -1041,6 +1041,8 @@ async function decideAgentNextActionViaLoop(body) {
       actionHistory: payload.actionHistory
     });
     agentSessionStore.saveSession(nextState);
+    const latency = debug?.latency || {};
+    const modelUsage = debug?.modelUsage || {};
     logAgent("loop turn decision", {
       sessionId: nextState.id,
       clientTurnId: payload.clientTurnId,
@@ -1060,6 +1062,12 @@ async function decideAgentNextActionViaLoop(body) {
       nav: (debug?.navigation || []).map((item) => `${item.action}:${item.label}:${item.enabled ? "on" : "off"}:${item.risk}`).slice(0, 5),
       riskGates: (debug?.riskGates || []).map((item) => `${item.type}:${item.label}:${item.status}:${item.risk}`).slice(0, 4),
       deterministic: Boolean(debug?.deterministic),
+      classification_model_ms: latency.classification_model_ms ?? null,
+      verify_plan_model_ms: latency.verify_plan_model_ms ?? null,
+      policy_ms: latency.policy_ms ?? null,
+      input_tokens: modelUsage.input_tokens ?? null,
+      output_tokens: modelUsage.output_tokens ?? null,
+      model: modelUsage.model || AGENT_MODEL,
       reason: debug?.final?.reason || clientDecision.reason || ""
     });
     return { ...clientDecision, debug };

@@ -3221,6 +3221,17 @@
   }
 
   function verifyExpectedOutcome(expected = {}, beforeMap = buildPageMap(), afterMap = buildPageMap(), target = null) {
+    const startedAt = performance.now();
+    const verification = verifyExpectedOutcomeInternal(expected, beforeMap, afterMap, target);
+    logFlow("latency.span", {
+      outcome_verification_ms: Math.round(performance.now() - startedAt),
+      expectedOutcome: expected?.type || "",
+      target: expected?.targetId || expected?.controlId || expected?.targetLabel || ""
+    });
+    return verification;
+  }
+
+  function verifyExpectedOutcomeInternal(expected = {}, beforeMap = buildPageMap(), afterMap = buildPageMap(), target = null) {
     const beforeSignature = expected.beforeSignature || structuralPageSignature(beforeMap);
     const afterSignature = structuralPageSignature(afterMap);
     const changed = beforeSignature !== afterSignature;
@@ -3450,11 +3461,45 @@
       target: elementDescriptor(element),
       pageBefore: pageSnapshot("before-click")
     });
+    watchClickToFirstMutation("click", meta);
     element.dispatchEvent(new PointerEvent("pointerdown", eventInit));
     element.dispatchEvent(new MouseEvent("mousedown", eventInit));
     element.dispatchEvent(new PointerEvent("pointerup", eventInit));
     element.dispatchEvent(new MouseEvent("mouseup", eventInit));
     element.dispatchEvent(new MouseEvent("click", eventInit));
+  }
+
+  function watchClickToFirstMutation(method = "click", meta = {}) {
+    const startedAt = performance.now();
+    let done = false;
+    const finish = (changed) => {
+      if (done) return;
+      done = true;
+      observer.disconnect();
+      logFlow("latency.span", {
+        click_to_first_mutation_ms: changed ? Math.round(performance.now() - startedAt) : null,
+        mutation_observed: Boolean(changed),
+        method,
+        meta
+      });
+    };
+    const observer = new MutationObserver(() => finish(true));
+    try {
+      observer.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true
+      });
+      setTimeout(() => finish(false), 1600);
+    } catch (error) {
+      logFlow("latency.span", {
+        click_to_first_mutation_ms: null,
+        mutation_observed: false,
+        method,
+        error: error.message
+      });
+    }
   }
 
   async function waitForPaint(ms = 300) {
@@ -3486,6 +3531,7 @@
       topElement: elementDescriptor(target),
       pageBefore: pageSnapshot("before-click-xy")
     });
+    watchClickToFirstMutation("click_xy", meta);
     target.dispatchEvent(new PointerEvent("pointerdown", eventInit));
     target.dispatchEvent(new MouseEvent("mousedown", eventInit));
     target.dispatchEvent(new PointerEvent("pointerup", eventInit));
@@ -3498,8 +3544,13 @@
   }
 
   async function waitForUiSettle(ms = 650) {
+    const startedAt = performance.now();
     await showAgentThought(document.activeElement || document.body, "Wait", "Watching page update", "Waiting for popups, dropdowns, validation, price/order changes, or URL changes.", 600);
     await waitForPaint(ms);
+    logFlow("latency.span", {
+      page_settle_ms: Math.round(performance.now() - startedAt),
+      requested_settle_ms: ms
+    });
   }
 
   function activeDemoStepName() {
@@ -5271,7 +5322,7 @@
     }
   }
 
-  async function requestAgentDecision(map, userMessage = "") {
+  async function requestAgentDecision(map, userMessage = "", clientLatency = {}) {
     const turnId = nextFlowId("turn");
     const observationId = nextFlowId("obs");
     agent.activeTurnId = turnId;
@@ -5293,14 +5344,18 @@
 	      observation: observationSnapshot,
 	      page: pageSnapshot("before-backend"),
 	      lastAction: agent.lastActionResult || agent.actionHistory[agent.actionHistory.length - 1] || null
-	    });
+    });
     try {
       const settings = await storageGet(["apiBase"]);
+      const screenshotStartedAt = performance.now();
       const screenshotDataUrl = await captureVisibleScreenshot();
+      const screenshotCaptureMs = Math.round(performance.now() - screenshotStartedAt);
       logFlow("backend.request.send", {
         turnId,
         api: `${settings.apiBase || DEFAULT_API}/agent/next-action`,
         screenshotBytes: screenshotDataUrl.length,
+        observation_build_ms: clientLatency.observation_build_ms ?? null,
+        screenshot_capture_ms: screenshotCaptureMs,
         activeSurface: map.activeSurface ? {
           type: map.activeSurface.type,
           taskHint: map.activeSurface.taskHint,
@@ -5314,6 +5369,7 @@
           })).slice(0, 12)
         } : null
       });
+      const requestStartedAt = performance.now();
       const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/next-action`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -5342,7 +5398,10 @@
       });
       if (!response.ok) throw new Error(`agent returned ${response.status}`);
       const decision = await response.json();
+      const requestUploadMs = Math.round(performance.now() - requestStartedAt);
       agent.lastBackendDebug = decision.debug || null;
+      const backendLatency = decision.debug?.latency || {};
+      const modelUsage = decision.debug?.modelUsage || {};
       logAgentEvent("agent_decision", {
         turnId,
         actionId: decision.actionId || decision.id || "",
@@ -5361,8 +5420,32 @@
         reason: decision.reason,
         debug: decision.debug || null
       });
+      logFlow("latency.spans", {
+        turnId,
+        observationId,
+        observation_build_ms: clientLatency.observation_build_ms ?? null,
+        screenshot_capture_ms: screenshotCaptureMs,
+        request_upload_ms: requestUploadMs,
+        classification_model_ms: backendLatency.classification_model_ms ?? null,
+        verify_plan_model_ms: backendLatency.verify_plan_model_ms ?? null,
+        policy_ms: backendLatency.policy_ms ?? null,
+        input_tokens: modelUsage.input_tokens ?? null,
+        output_tokens: modelUsage.output_tokens ?? null,
+        model: modelUsage.model || "",
+        action: decision.action || "",
+        actionId: decision.actionId || decision.id || ""
+      });
       logFlow("backend.response", {
         turnId,
+        observation_build_ms: clientLatency.observation_build_ms ?? null,
+        screenshot_capture_ms: screenshotCaptureMs,
+        request_upload_ms: requestUploadMs,
+        classification_model_ms: backendLatency.classification_model_ms ?? null,
+        verify_plan_model_ms: backendLatency.verify_plan_model_ms ?? null,
+        policy_ms: backendLatency.policy_ms ?? null,
+        input_tokens: modelUsage.input_tokens ?? null,
+        output_tokens: modelUsage.output_tokens ?? null,
+        model: modelUsage.model || "",
         decision: {
           source: decision.source,
           actionId: decision.actionId || decision.id || "",
@@ -5442,6 +5525,7 @@
   async function continueAfterAction(delay = 800) {
     logFlow("loop.schedule_next", {
       delay,
+      next_loop_delay_ms: delay,
       pageAfterAction: pageSnapshot("after-action-before-next-loop"),
       lastAction: agent.actionHistory[agent.actionHistory.length - 1] || null
     });
@@ -5802,7 +5886,14 @@
     }
 
     if (decision.action === "click_xy") {
+      const targetResolutionStartedAt = performance.now();
       const labelTarget = bestClickableForLabels([decision.targetLabel, decision.value].filter(Boolean), document);
+      logFlow("latency.span", {
+        target_resolution_ms: Math.round(performance.now() - targetResolutionStartedAt),
+        actionId,
+        action: decision.action,
+        method: labelTarget ? "label_to_dom" : "coordinate"
+      });
       if (labelTarget) {
         const validation = validateResolvedTarget(decision, labelTarget, map);
         if (!validation.ok) {
@@ -5919,7 +6010,15 @@
     }
 
     if (decision.action === "click") {
+      const targetResolutionStartedAt = performance.now();
       const target = resolveDecisionTarget(decision, map);
+      logFlow("latency.span", {
+        target_resolution_ms: Math.round(performance.now() - targetResolutionStartedAt),
+        actionId,
+        action: decision.action,
+        method: target ? "resolved" : "not_found",
+        target: decision.controlId || decision.targetId || decision.targetLabel || decision.value || ""
+      });
       if (!target) {
         agent.awaiting = "manual";
         agent.running = false;
@@ -6069,7 +6168,15 @@
     }
 
     if (decision.action === "type" || decision.action === "select") {
+      const targetResolutionStartedAt = performance.now();
       const target = resolveDecisionTarget(decision, map);
+      logFlow("latency.span", {
+        target_resolution_ms: Math.round(performance.now() - targetResolutionStartedAt),
+        actionId,
+        action: decision.action,
+        method: target ? "resolved" : "not_found",
+        target: decision.controlId || decision.targetId || decision.targetLabel || decision.value || ""
+      });
       if (!target || isPaymentField(target)) {
         agent.awaiting = "manual";
         agent.running = false;
@@ -6446,7 +6553,10 @@
   async function processCheckoutAgent() {
     if (!agent.running) return;
     warnings = runRiskChecks();
+    let observationBuildMs = 0;
+    let observationStartedAt = performance.now();
     agent.pageMap = rememberPagePlan(buildPageMap());
+    observationBuildMs += performance.now() - observationStartedAt;
     await showAgentThought(
       document.activeElement || document.body,
       "Observe",
@@ -6455,12 +6565,22 @@
       450
     );
     await waitForPaint(450);
+    observationStartedAt = performance.now();
     const stableMap = rememberPagePlan(buildPageMap());
+    observationBuildMs += performance.now() - observationStartedAt;
     agent.pageMap = stableMap;
+    observationBuildMs = Math.round(observationBuildMs);
+    logFlow("latency.span", {
+      observation_build_ms: observationBuildMs,
+      step: stableMap.step,
+      controls: stableMap.controls?.length || 0,
+      fields: stableMap.fields?.length || 0,
+      buttons: stableMap.buttons?.length || 0
+    });
 
     const userMessage = agent.pendingUserMessage;
     agent.pendingUserMessage = "";
-    const decision = await requestAgentDecision(stableMap, userMessage);
+    const decision = await requestAgentDecision(stableMap, userMessage, { observation_build_ms: observationBuildMs });
     await executeAgentDecision(decision, stableMap);
   }
 

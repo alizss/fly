@@ -23,16 +23,19 @@ function extractResponseText(response) {
  * @param {Object} args.schema JSON schema for the structured output
  * @param {string} args.schemaName
  * @param {number} [args.maxOutputTokens]
+ * @param {boolean} [args.returnMeta] when true, returns { data, meta }
  * @returns {Promise<Object>} parsed structured output
  */
-async function callStructured({ apiKey, model, instructions, payload, screenshotDataUrl = "", schema, schemaName, maxOutputTokens = 900 }) {
+async function callStructured({ apiKey, model, instructions, payload, screenshotDataUrl = "", schema, schemaName, maxOutputTokens = 900, returnMeta = false }) {
   if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
   const promptPayload = payload && payload.page
     ? { ...payload, page: { ...payload.page, screenshotDataUrl: screenshotDataUrl ? "[attached separately]" : "" } }
     : payload;
 
   let lastParseError = null;
+  const startedAt = Date.now();
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    const attemptStartedAt = Date.now();
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
@@ -63,7 +66,18 @@ async function callStructured({ apiKey, model, instructions, payload, screenshot
     const text = extractResponseText(data);
     if (!text) throw new Error(`OpenAI ${schemaName} returned no output text`);
     try {
-      return JSON.parse(text);
+      const parsed = JSON.parse(text);
+      const meta = {
+        schemaName,
+        model: data.model || model,
+        durationMs: Date.now() - startedAt,
+        attemptDurationMs: Date.now() - attemptStartedAt,
+        attempts: attempt + 1,
+        input_tokens: Number(data.usage?.input_tokens || 0),
+        output_tokens: Number(data.usage?.output_tokens || 0),
+        total_tokens: Number(data.usage?.total_tokens || 0)
+      };
+      return returnMeta ? { data: parsed, meta } : parsed;
     } catch (error) {
       lastParseError = error;
       if (attempt === 0) continue;

@@ -659,7 +659,34 @@ function withActionContract(action = {}) {
   });
 }
 
-function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, traceObservation, reason, error = null }) {
+function modelUsageFromMetas(model, metas = []) {
+  const calls = metas.filter(Boolean).map((meta) => ({
+    schemaName: meta.schemaName || "",
+    model: meta.model || model || "",
+    duration_ms: Number(meta.durationMs || 0),
+    attempts: Number(meta.attempts || 0),
+    input_tokens: Number(meta.input_tokens || 0),
+    output_tokens: Number(meta.output_tokens || 0),
+    total_tokens: Number(meta.total_tokens || 0)
+  }));
+  return {
+    model: calls.find((call) => call.model)?.model || model || "",
+    input_tokens: calls.reduce((sum, call) => sum + call.input_tokens, 0),
+    output_tokens: calls.reduce((sum, call) => sum + call.output_tokens, 0),
+    total_tokens: calls.reduce((sum, call) => sum + call.total_tokens, 0),
+    calls
+  };
+}
+
+function withLatencyDebug(debug = {}, latency = {}, modelUsage = {}) {
+  return {
+    ...debug,
+    latency,
+    modelUsage
+  };
+}
+
+function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, traceObservation, reason, error = null, latency = {}, modelUsage = {} }) {
   const failureAction = normalizeAction({
     type: "ask_user",
     reason,
@@ -686,6 +713,7 @@ function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, t
     riskGates: [],
     error: error?.message || (error ? String(error) : "")
   };
+  const debugWithLatency = withLatencyDebug(debug, latency, modelUsage);
   writeTrace(dataDir, state.id, {
     turnId,
     screenshotDataUrl,
@@ -696,12 +724,12 @@ function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, t
     plannedAction: null,
     policyDecision: debug.policy,
     executionResult: { stopped: true, reason, error: debug.error },
-    debug
+    debug: debugWithLatency
   });
   return {
     state: nextState,
     clientDecision: toClientDecision(failureAction),
-    debug
+    debug: debugWithLatency
   };
 }
 
@@ -722,6 +750,13 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
     ? { ...observation, page: { ...(observation?.page || {}), screenshotDataUrl: "[written-to-screenshot-file]" } }
     : observation;
   const turnId = `${Date.now()}`;
+  const latency = {
+    classification_model_ms: 0,
+    verify_plan_model_ms: 0,
+    policy_ms: 0
+  };
+  let classificationMeta = null;
+  let verifyPlanMeta = null;
 
   // 1. Observe + classify typed page state. Requirements are derived from
   // typed buckets, so navigation actions like Continue/Next cannot be
@@ -729,6 +764,8 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
   let extracted;
   try {
     extracted = await classifyPageState({ apiKey, model, observation, screenshotDataUrl, traveler });
+    classificationMeta = extracted.meta || null;
+    latency.classification_model_ms = Number(classificationMeta?.durationMs || 0);
   } catch (error) {
     return safePlannerFailureResult({
       dataDir,
@@ -737,7 +774,9 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
       screenshotDataUrl,
       traceObservation,
       reason: "AI planner unavailable during page classification. I stopped instead of using a deterministic checkout fallback.",
-      error
+      error,
+      latency,
+      modelUsage: modelUsageFromMetas(model, [classificationMeta])
     });
   }
 
@@ -746,10 +785,11 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
   let verification;
   let modelPlannedAction;
   try {
-    ({ verification, action: modelPlannedAction } = await verifyAndPlan({
+    ({ verification, action: modelPlannedAction, meta: verifyPlanMeta } = await verifyAndPlan({
       apiKey, model, state, observation, currentRequirements: extracted.requirements, pageState: extracted.pageState,
       traveler, actionHistory, screenshotDataUrl
     }));
+    latency.verify_plan_model_ms = Number(verifyPlanMeta?.durationMs || 0);
   } catch (error) {
     return safePlannerFailureResult({
       dataDir,
@@ -758,9 +798,12 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
       screenshotDataUrl,
       traceObservation,
       reason: "AI planner unavailable while choosing the next action. I stopped instead of using a deterministic checkout fallback.",
-      error
+      error,
+      latency,
+      modelUsage: modelUsageFromMetas(model, [classificationMeta, verifyPlanMeta])
     });
   }
+  const modelUsage = modelUsageFromMetas(model, [classificationMeta, verifyPlanMeta]);
 
   // Fresh page evidence is the source of truth. The verifier can propose
   // updates, but it may not blindly override current-page unresolved evidence.
@@ -806,7 +849,11 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
     nextState = withUpdate(nextState, { status: "awaiting_user" });
     const reason = "AI planner did not return a next action. I stopped instead of using a deterministic checkout fallback.";
     const clientDecision = askUserDecision(reason);
-    const debug = summarizeTurn({ pageState: extracted.pageState, requirements: mergedRequirements, plannedAction, finalAction: clientDecision, policyDecision: null, deterministicAction });
+    const debug = withLatencyDebug(
+      summarizeTurn({ pageState: extracted.pageState, requirements: mergedRequirements, plannedAction, finalAction: clientDecision, policyDecision: null, deterministicAction }),
+      latency,
+      modelUsage
+    );
     writeTrace(dataDir, state.id, {
       turnId, screenshotDataUrl, observation: traceObservation, pageState: extracted.pageState, requirements: mergedRequirements, verification,
       plannedAction, policyDecision: null,
@@ -830,7 +877,11 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
     const reason = `I tried the same thing ${stallCount} times without progress (blockers: ${verification.blockers.join("; ") || "unclear"}). Stopping so you can take over.`;
     nextState = withUpdate(nextState, { status: "awaiting_user" });
     const clientDecision = askUserDecision(reason);
-    const debug = summarizeTurn({ pageState: extracted.pageState, requirements: mergedRequirements, plannedAction, finalAction: clientDecision, policyDecision: null, deterministicAction: null });
+    const debug = withLatencyDebug(
+      summarizeTurn({ pageState: extracted.pageState, requirements: mergedRequirements, plannedAction, finalAction: clientDecision, policyDecision: null, deterministicAction: null }),
+      latency,
+      modelUsage
+    );
     writeTrace(dataDir, state.id, {
       turnId, screenshotDataUrl, observation: traceObservation, pageState: extracted.pageState, requirements: mergedRequirements, verification,
       plannedAction, policyDecision: null,
@@ -849,7 +900,9 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
     safeIntermediateContinueAction(plannedAction, mergedRequirements),
     observation
   );
+  const policyStartedAt = Date.now();
   const policyDecision = checkPolicy(executablePlannedAction, nextState, traveler, nextState.approvals);
+  latency.policy_ms = Date.now() - policyStartedAt;
 
   let finalAction = executablePlannedAction;
   if (!policyDecision.allow) {
@@ -862,7 +915,11 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
     status: finalAction.type === "ask_user" || finalAction.type === "final_review" ? "awaiting_user" : "running"
   });
 
-  const debug = summarizeTurn({ pageState: extracted.pageState, requirements: mergedRequirements, plannedAction, finalAction, policyDecision, deterministicAction });
+  const debug = withLatencyDebug(
+    summarizeTurn({ pageState: extracted.pageState, requirements: mergedRequirements, plannedAction, finalAction, policyDecision, deterministicAction }),
+    latency,
+    modelUsage
+  );
   writeTrace(dataDir, state.id, {
     turnId, screenshotDataUrl, observation: traceObservation, pageState: extracted.pageState, requirements: mergedRequirements, verification,
     plannedAction, policyDecision,
