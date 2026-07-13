@@ -12,6 +12,8 @@ const INSTRUCTIONS = [
   "riskGates: explicit controls that require user approval: payment/card/final purchase, legal checkbox/I agree/signature, price increase, identity uncertainty. Passive explanatory text is not a risk gate.",
   "activeSurface: the currently active modal/dropdown/popover if one is open; classify its requirements/options/navigation before the background page.",
   "Use page.foreground, page.visualState, and page.accessibility when present. Accessibility role/name/state are direct evidence for whether an item is a radio, checkbox, button, selected option, disabled control, required field, or expanded popup.",
+  "Use page.decisionGroups when present. A decision group is one logical requirement with alternatives. If one member is selected, the group is satisfied; unselected paid alternatives inside that same group are available alternatives, not missing requirements.",
+  "Never create separate missing requirements for unselected paid alternatives when their decision group already has a selected no-cost/decline member.",
   "If foreground.active is true, classify the foreground surface as the current screen, even when the URL/background checkout step did not change. Use foreground.progressMarkers such as Flight 1 of 2 / Flight 2 of 2 to distinguish repeated seat-selection legs.",
   "Hard rule: never put Continue/Next/Proceed/Close/Skip into requiredFields or requiredChoices. Put them only in navigationActions.",
   "Hard rule: passive copy like 'By booking you confirm names match passports' is context only unless there is an explicit checkbox/radio/I agree/final purchase control.",

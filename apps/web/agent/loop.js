@@ -61,16 +61,6 @@ function safeIntermediateContinueAction(action, requirements = []) {
   return action;
 }
 
-function noPaidExtrasRuleActive(state = {}, traveler = {}) {
-  const rules = String(traveler?.booking_rules || traveler?.baggage_preference || "").toLowerCase();
-  return Boolean(state?.approvals?.skipPaidExtrasApproved)
-    || /no paid|no extras|no add-?ons|no add ons|no seat|no insurance|no bundle|avoid paid|personal item only/.test(rules);
-}
-
-function unresolvedStatus(item = {}) {
-  return item && item.status !== "satisfied" && item.status !== "complete" && item.status !== "blocked";
-}
-
 function verifierUpdateForRequirement(verification = {}, requirementId = "") {
   return (verification.requirementUpdates || []).find((update) => update.requirementId === requirementId) || null;
 }
@@ -101,12 +91,53 @@ function sectionMatchesRequirement(section = {}, requirement = {}) {
   return sameNormalizedText(section.label, requirement.label);
 }
 
+function decisionGroupMatchesRequirement(group = {}, requirement = {}) {
+  const targetIds = new Set([requirement.id, ...(requirement.targetIds || [])].filter(Boolean));
+  if (targetIds.has(group.decisionGroupId) || targetIds.has(group.sectionId) || targetIds.has(group.requirementId)) return true;
+  if ((group.alternatives || []).some((choice) => targetIds.has(choice.controlId) || targetIds.has(choice.targetId))) return true;
+  return sameNormalizedText(group.sectionLabel, requirement.label) || sameNormalizedText(group.sectionType, requirement.label) || sameNormalizedText(group.requirementId, requirement.id);
+}
+
+function decisionGroupForRequirement(requirement = {}, page = {}) {
+  return (page.decisionGroups || []).find((group) => decisionGroupMatchesRequirement(group, requirement)) || null;
+}
+
+function controlDecisionGroupId(controlId = "", page = {}) {
+  if (!controlId) return "";
+  const control = (page.controls || []).find((item) => item.controlId === controlId || item.stateElementId === controlId || item.preferredActivationElementId === controlId);
+  if (control?.decisionGroupId) return control.decisionGroupId;
+  const group = (page.decisionGroups || []).find((item) =>
+    (item.alternatives || []).some((choice) => choice.controlId === controlId || choice.targetId === controlId)
+  );
+  return group?.decisionGroupId || "";
+}
+
+function updateEvidenceMatchesRequirement(update = {}, requirement = {}, observation = {}) {
+  const page = observation?.page || {};
+  const requirementGroup = decisionGroupForRequirement(requirement, page);
+  if (!requirementGroup?.decisionGroupId) return true;
+  const evidenceControlId = String(update?.evidence?.controlId || "");
+  const evidenceGroupId = String(update?.evidence?.decisionGroupId || "") || controlDecisionGroupId(evidenceControlId, page);
+  return evidenceGroupId === requirementGroup.decisionGroupId;
+}
+
 function deterministicRequirementEvidence(requirement = {}, observation = {}) {
   const page = observation?.page || {};
   const targetIds = new Set([requirement.id, ...(requirement.targetIds || [])].filter(Boolean));
   const fields = page.fields || [];
   const sections = page.sections || [];
   const tasks = page.taskQueue || [];
+
+  const decisionGroup = decisionGroupForRequirement(requirement, page);
+  if (decisionGroup) {
+    return {
+      source: "deterministic_decision_group",
+      status: decisionGroup.status === "satisfied" ? "satisfied" : "missing",
+      evidence: decisionGroup.selectedLabel
+        ? `Decision ${decisionGroup.sectionLabel || decisionGroup.decisionGroupId} selected ${decisionGroup.selectedLabel}.`
+        : `Decision ${decisionGroup.sectionLabel || decisionGroup.decisionGroupId} has no selected option.`
+    };
+  }
 
   const field = fields.find((item) => targetIds.has(item.id));
   if (field && /field/.test(requirement.type || "")) {
@@ -155,12 +186,13 @@ function deterministicRequirementEvidence(requirement = {}, observation = {}) {
   return null;
 }
 
-function updateHasCurrentEvidence(update = {}, observation = {}) {
+function updateHasCurrentEvidence(update = {}, observation = {}, requirement = {}) {
   if (!update || update.proposedStatus !== "satisfied") return false;
   const currentObservationId = String(observation?.observationId || "");
   const updateObservationId = String(update.observationId || "");
   if (currentObservationId && updateObservationId && currentObservationId !== updateObservationId) return false;
   if (Number(update.confidence || 0) < 0.75) return false;
+  if (!updateEvidenceMatchesRequirement(update, requirement, observation)) return false;
   const evidence = update.evidence || {};
   return Boolean(evidence.controlId || evidence.selectedValue || evidence.visibleText);
 }
@@ -171,7 +203,7 @@ function requirementConflict(requirement = {}, verification = {}, observation = 
   const update = verifierUpdateForRequirement(verification, requirement.id);
   const verifierClaimsSatisfied = satisfiedIds.has(requirement.id) || update?.proposedStatus === "satisfied";
   if (!verifierClaimsSatisfied) return false;
-  return !updateHasCurrentEvidence(update, observation);
+  return !updateHasCurrentEvidence(update, observation, requirement);
 }
 
 function reconcileRequirements(freshRequirements = [], verification = {}, observation = {}) {
@@ -205,7 +237,7 @@ function reconcileRequirements(freshRequirements = [], verification = {}, observ
       };
     }
 
-    if (updateHasCurrentEvidence(update, observation)) {
+    if (updateHasCurrentEvidence(update, observation, requirement)) {
       return {
         ...requirement,
         status: "satisfied",
@@ -217,146 +249,11 @@ function reconcileRequirements(freshRequirements = [], verification = {}, observ
   });
 }
 
-function unresolvedPaidExtraContext(pageState = {}, page = {}) {
-  const paidExtra = (pageState.optionalPaidExtras || []).find((item) =>
-    unresolvedStatus(item) && ["money", "uncertain"].includes(item.risk || "money")
-  );
-  if (paidExtra) {
-    return {
-      id: paidExtra.id || "",
-      label: paidExtra.label || "optional paid extra",
-      targetIds: paidExtra.targetIds || [],
-      source: "optionalPaidExtras"
-    };
-  }
-
-  const requiredPaidChoice = (pageState.requiredChoices || []).find((item) =>
-    unresolvedStatus(item) && (item.kind === "paid_extra" || item.risk === "money")
-  );
-  if (requiredPaidChoice) {
-    return {
-      id: requiredPaidChoice.id || "",
-      label: requiredPaidChoice.label || "paid extra choice",
-      targetIds: requiredPaidChoice.targetIds || [],
-      source: "requiredChoices"
-    };
-  }
-
-  const moneyGate = (pageState.riskGates || []).find((item) =>
-    unresolvedStatus(item) && ["money", "uncertain"].includes(item.risk || "")
-  );
-  if (moneyGate) {
-    return {
-      id: moneyGate.id || "",
-      label: moneyGate.label || "money risk gate",
-      targetIds: moneyGate.targetIds || [],
-      source: "riskGates"
-    };
-  }
-
-  const pageTask = (page.taskQueue || []).find((task) =>
-    task?.status === "pending" && /baggage|bundle|flexible|ticket|cancellation|insurance|seat|sms|support|extra/i.test(`${task.sectionType || ""} ${task.sectionLabel || ""} ${task.objective || ""}`)
-  );
-  if (pageTask) {
-    return {
-      id: pageTask.id || pageTask.sectionId || "",
-      label: pageTask.sectionLabel || pageTask.sectionType || "pending optional section",
-      sectionId: pageTask.sectionId || "",
-      sectionType: pageTask.sectionType || "",
-      source: "taskQueue"
-    };
-  }
-
-  return null;
-}
-
 function safeDeclineLabel(value = "") {
   const text = normalizeText(value);
   if (!text) return false;
   if (/\b(add|cart|buy|premium|upgrade|select seat|choose seat|aisle|window)\b/.test(text) && !/\b0\s*(eur|€|usd|\$)|free\b/.test(text)) return false;
   return /\b(no thanks|no, thanks|none|none of the passengers|go without|without|decline|skip|not now|random seating|0\s*(eur|€|usd|\$)|free)\b/.test(text);
-}
-
-function paidLookingLabel(value = "") {
-  const text = normalizeText(value);
-  return /([1-9][0-9]*(?:[.,][0-9]{1,2})?)\s*(eur|€|usd|\$)/.test(text)
-    && !/\b0\s*(eur|€|usd|\$)\b/.test(text);
-}
-
-function contextWords(context = {}) {
-  return normalizeText(`${context.label || ""} ${context.sectionType || ""} ${context.source || ""}`)
-    .split(/[^a-z0-9]+/)
-    .filter((word) => word.length >= 4 && !["paid", "extra", "choice", "section", "optional", "pending"].includes(word));
-}
-
-function scoreSafeDeclineCandidate(candidate = {}, context = {}) {
-  const labelText = `${candidate.label || ""} ${candidate.accessibleName || ""} ${candidate.semantic || ""} ${candidate.risk || ""}`;
-  if (!safeDeclineLabel(labelText) && candidate.risk !== "safe_decline" && !/decline/i.test(candidate.semantic || "")) return 0;
-  if (candidate.selected) return 0;
-  if (paidLookingLabel(labelText) && !/\b0\s*(eur|€|usd|\$)|free\b/i.test(labelText)) return 0;
-
-  let score = 20;
-  if (candidate.risk === "safe_decline") score += 40;
-  if (/decline/i.test(candidate.semantic || "")) score += 35;
-  if (candidate.kind === "choice" || /radio|checkbox|option/.test(candidate.kind || candidate.role || "")) score += 20;
-  if (candidate.box) score += 8;
-  if (context.sectionId && candidate.sectionId === context.sectionId) score += 45;
-  if (context.id && (candidate.sectionId === context.id || candidate.id === context.id)) score += 25;
-  if (context.targetIds?.includes(candidate.id)) score += 20;
-
-  const candidateText = normalizeText(`${candidate.label || ""} ${candidate.sectionLabel || ""} ${candidate.sectionType || ""}`);
-  for (const word of contextWords(context)) {
-    if (candidateText.includes(word)) score += 10;
-  }
-
-  return score;
-}
-
-function bestSafeDeclineCandidate(page = {}, context = {}) {
-  const candidates = pageTargetCandidates(page)
-    .map((candidate) => ({ candidate, score: scoreSafeDeclineCandidate(candidate, context) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-  return candidates[0]?.candidate || null;
-}
-
-function recoverPendingPaidExtraBeforeNavigation(action = {}, pageState = {}, observation = {}, state = {}, traveler = {}) {
-  if (!isContinueAction(action)) return null;
-  if (!noPaidExtrasRuleActive(state, traveler)) return null;
-
-  const page = observation.page || {};
-  const context = unresolvedPaidExtraContext(pageState, page);
-  if (!context) return null;
-
-  const declineTarget = bestSafeDeclineCandidate(page, context);
-  if (!declineTarget) return null;
-
-  return normalizeAction({
-    observationId: observation.observationId || "",
-    observationHash: observation.observationSnapshot?.snapshotHash || "",
-    type: "click",
-    targetId: declineTarget.id || "",
-    targetLabel: declineTarget.label || declineTarget.accessibleName || "",
-    value: declineTarget.label || declineTarget.accessibleName || "",
-    reason: `Resolve pending ${context.label || "paid extra"} by choosing the visible no-cost decline option before navigation.`,
-    risk: "safe",
-    requiresApproval: false,
-    intent: "decline_optional_extra",
-    requirementId: context.id || declineTarget.sectionType || declineTarget.sectionLabel || "",
-    targetSnapshot: declineTarget,
-    expectedOutcome: {
-      type: "requirement_status",
-      requirementId: context.id || declineTarget.sectionType || declineTarget.sectionLabel || "",
-      status: "satisfied",
-      targetId: declineTarget.id || "",
-      sectionId: declineTarget.sectionId || context.sectionId || "",
-      sectionType: declineTarget.sectionType || context.sectionType || "",
-      sectionLabel: declineTarget.sectionLabel || context.label || "",
-      surfaceId: declineTarget.surfaceId || "",
-      intent: "decline_optional_extra",
-      mustNotIncreasePrice: true
-    }
-  });
 }
 
 function policyBlockedAction(policyDecision, action) {
@@ -436,6 +333,7 @@ function toClientDecision(action) {
     targetId: action.targetId || "",
     targetLabel: action.targetLabel || "",
     targetSnapshot: action.targetSnapshot || null,
+    decisionGroupId: action.decisionGroupId || action.targetSnapshot?.decisionGroupId || "",
     expectedOutcome: action.expectedOutcome || null,
     value: action.value || action.targetLabel || "",
     x: action.x,
@@ -478,6 +376,7 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
   return {
     id: String(candidate.id || ""),
     controlId: String(candidate.controlId || ""),
+    decisionGroupId: String(candidate.decisionGroupId || ""),
     label: String(candidate.label || ""),
     normalizedLabel: normalizeText(candidate.label || ""),
     role: String(candidate.role || ""),
@@ -581,6 +480,7 @@ function bindTargetSnapshot(action = {}, observation = {}) {
     ...action,
     observationId: action.observationId || observation.observationId || "",
     observationHash: action.observationHash || observation.observationSnapshot?.snapshotHash || "",
+    decisionGroupId: action.decisionGroupId || action.targetSnapshot?.decisionGroupId || targetSnapshot?.decisionGroupId || "",
     targetSnapshot: action.targetSnapshot || targetSnapshot || null
   });
   return withActionContract(bound);
@@ -614,6 +514,7 @@ function expectedOutcomeForAction(action = {}) {
       requirementId: action.requirementId || target.sectionType || target.sectionLabel || "",
       status: "satisfied",
       targetId: action.targetId || target.id || "",
+      decisionGroupId: action.decisionGroupId || target.decisionGroupId || "",
       sectionId: target.sectionId || "",
       sectionType: target.sectionType || "",
       sectionLabel: target.sectionLabel || "",
@@ -626,6 +527,7 @@ function expectedOutcomeForAction(action = {}) {
     return {
       type: "active_surface_change",
       targetId: action.targetId || target.id || "",
+      decisionGroupId: action.decisionGroupId || target.decisionGroupId || "",
       sectionId: target.sectionId || "",
       sectionType: target.sectionType || "",
       sectionLabel: target.sectionLabel || "",
@@ -640,6 +542,7 @@ function expectedOutcomeForAction(action = {}) {
       requirementId: action.requirementId,
       status: "satisfied",
       targetId: action.targetId || target.id || "",
+      decisionGroupId: action.decisionGroupId || target.decisionGroupId || "",
       sectionId: target.sectionId || "",
       sectionType: target.sectionType || "",
       sectionLabel: target.sectionLabel || "",
@@ -836,14 +739,8 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
   const hadPreviousCount = typeof state.lastMissingCount === "number";
   const noCountImprovement = hadPreviousCount && missingCount >= state.lastMissingCount;
   const verifierSaysNoProgress = !verification.changed && !verification.lastActionWorked;
-  const deterministicAction = recoverPendingPaidExtraBeforeNavigation(
-    modelPlannedAction,
-    extracted.pageState,
-    observation,
-    nextState,
-    traveler
-  );
-  const plannedAction = deterministicAction || modelPlannedAction;
+  const deterministicAction = null;
+  const plannedAction = modelPlannedAction;
 
   if (!plannedAction || !plannedAction.type) {
     nextState = withUpdate(nextState, { status: "awaiting_user" });

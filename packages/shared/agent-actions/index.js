@@ -8,6 +8,7 @@
  * @property {string} [observationHash]
  * @property {string} [intent]
  * @property {string} [controlId]
+ * @property {string} [decisionGroupId]
  * @property {string} [targetId]
  * @property {string} [targetLabel]
  * @property {Object} [targetSnapshot]
@@ -56,6 +57,7 @@ function normalizeAction(raw = {}) {
     observationHash: raw.observationHash ? String(raw.observationHash).slice(0, 120) : "",
     intent: raw.intent ? String(raw.intent).slice(0, 120) : "",
     controlId: raw.controlId ? String(raw.controlId).slice(0, 140) : (raw.targetSnapshot?.controlId ? String(raw.targetSnapshot.controlId).slice(0, 140) : ""),
+    decisionGroupId: raw.decisionGroupId ? String(raw.decisionGroupId).slice(0, 140) : (raw.targetSnapshot?.decisionGroupId ? String(raw.targetSnapshot.decisionGroupId).slice(0, 140) : ""),
     targetId: normalizeTargetId(raw.targetId),
     targetLabel: raw.targetLabel ? String(raw.targetLabel).slice(0, 300) : "",
     targetSnapshot: raw.targetSnapshot && typeof raw.targetSnapshot === "object" ? raw.targetSnapshot : null,

@@ -27,6 +27,8 @@ const INSTRUCTIONS = [
   "PART 2 — action, informed by part 1:",
   "You are also given `pageState`, a typed classifier output. Treat it as the primary map of the page: requiredFields/requiredChoices are prerequisites, optionalPaidExtras are decline/skip candidates, navigationActions are buttons like Continue/Next/Close/Skip, and riskGates require approval.",
   "The page payload may include `foreground`, `visualState`, and `accessibility`. Use accessibility role/name/state plus visible boxes to identify controls. If foreground.active is true, that foreground surface owns the next action until its fingerprint/progress marker changes or closes.",
+  "The page payload may include `decisionGroups`. Treat each decision group as one logical requirement. If a group has status='satisfied' with selectedControlId/selectedLabel, do not try to choose another unselected alternative in that same group. Unselected paid alternatives are not blockers by themselves.",
+  "When resolving a missing choice, choose a control from the same unresolved decisionGroupId. Do not use evidence or controls from one group (for example flexible ticket) to satisfy another group (for example baggage).",
   "If the same modal remains open but `foreground.progressMarkers` changes (for example Flight 1 of 2 becomes Flight 2 of 2), treat that as progress from the previous action, not as a no-op.",
   "Never treat navigationActions as missing requirements. If all requiredFields and requiredChoices are satisfied and no blocking riskGate is present, choose the best enabled navigationAction.",
   "If a Continue/Next navigationAction is visible and enabled, and the only remaining issue is passive disclaimer text with no checkbox/control, click the navigationAction with risk='safe'.",

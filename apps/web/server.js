@@ -417,6 +417,7 @@ function compactAccessibilityNode(node = {}) {
   return {
     id: clampText(node.id, 80),
     controlId: clampText(node.controlId, 140),
+    decisionGroupId: clampText(node.decisionGroupId, 140),
     role: clampText(node.role, 80),
     name: clampText(node.name, 220),
     state: node.state && typeof node.state === "object" ? {
@@ -558,6 +559,7 @@ function compactActuators(actuators = []) {
 function compactControlFields(item = {}) {
   return {
     controlId: clampText(item.controlId, 140),
+    decisionGroupId: clampText(item.decisionGroupId, 140),
     controlKind: clampText(item.controlKind || item.kind, 80),
     controlState: item.controlState || item.state || null,
     stateElementId: clampText(item.stateElementId, 80),
@@ -570,6 +572,7 @@ function compactControlFields(item = {}) {
 function compactLogicalControl(control = {}) {
   return {
     controlId: clampText(control.controlId, 140),
+    decisionGroupId: clampText(control.decisionGroupId, 140),
     label: clampText(control.label, 220),
     accessibleName: clampText(control.accessibleName, 220),
     kind: clampText(control.kind, 80),
@@ -589,6 +592,33 @@ function compactLogicalControl(control = {}) {
     preferredActivationElementId: clampText(control.preferredActivationElementId, 80),
     actuators: compactActuators(control.actuators),
     visualRegion: control.visualRegion || null
+  };
+}
+
+function compactDecisionGroup(group = {}) {
+  return {
+    decisionGroupId: clampText(group.decisionGroupId, 140),
+    sectionId: clampText(group.sectionId, 80),
+    sectionType: clampText(group.sectionType, 80),
+    sectionLabel: clampText(group.sectionLabel, 160),
+    requirementId: clampText(group.requirementId, 120),
+    required: Boolean(group.required),
+    status: clampText(group.status, 40),
+    selectedControlId: clampText(group.selectedControlId, 140),
+    selectedLabel: clampText(group.selectedLabel, 220),
+    selectedSemantic: clampText(group.selectedSemantic, 80),
+    alternatives: Array.isArray(group.alternatives)
+      ? group.alternatives.map((choice) => ({
+          controlId: clampText(choice.controlId, 140),
+          targetId: clampText(choice.targetId, 80),
+          label: clampText(choice.label, 220),
+          semantic: clampText(choice.semantic, 80),
+          risk: clampText(choice.risk, 80),
+          selected: Boolean(choice.selected),
+          priceText: clampText(choice.priceText, 80)
+        })).slice(0, 16)
+      : [],
+    evidence: Array.isArray(group.evidence) ? group.evidence.map((item) => clampText(item, 180)).slice(0, 5) : []
   };
 }
 
@@ -957,6 +987,9 @@ function compactAgentPayload(body) {
       controls: Array.isArray(page.controls)
         ? page.controls.map(compactLogicalControl).filter((control) => control.controlId).slice(0, 180)
         : [],
+      decisionGroups: Array.isArray(page.decisionGroups)
+        ? page.decisionGroups.map(compactDecisionGroup).filter((group) => group.decisionGroupId).slice(0, 80)
+        : [],
       taskQueue,
       stageExit: page.stageExit || {},
       reconciliation: page.reconciliation || {},
@@ -1050,6 +1083,7 @@ async function decideAgentNextActionViaLoop(body) {
       actionId: clientDecision.actionId || "",
       intent: clientDecision.intent || "",
       requirementId: clientDecision.requirementId || "",
+      decisionGroupId: clientDecision.decisionGroupId || clientDecision.targetSnapshot?.decisionGroupId || "",
       action: clientDecision.action,
       target: clientDecision.targetLabel || clientDecision.value || clientDecision.targetId || "",
       targetKind: clientDecision.targetSnapshot?.kind || "",

@@ -1148,6 +1148,7 @@
       sectionType: section?.type || "",
       sectionLabel: section?.label || "",
       controlId: control?.controlId || element.dataset?.atwControlId || "",
+      decisionGroupId: control?.decisionGroupId || "",
       controlKind: control?.kind || "",
       state: control?.state || null,
       actuators: control?.actuators || [],
@@ -1202,6 +1203,10 @@
     const strictSurface = isStrictActionSurfaceType(expected.surfaceType);
     const expectedControlId = expected.controlId || decision.controlId || "";
     const liveControlId = live.controlId || element?.dataset?.atwControlId || "";
+    const expectedDecisionGroupId = expected.decisionGroupId || decision.decisionGroupId || "";
+    if (expectedDecisionGroupId && live.decisionGroupId && expectedDecisionGroupId !== live.decisionGroupId) {
+      return { ok: false, code: "TARGET_DECISION_GROUP_MISMATCH", expected, live };
+    }
     const expectedActuatorIds = new Set([
       expected.stateElementId,
       expected.preferredActivationElementId,
@@ -2793,6 +2798,10 @@
     const sectionLabel = context.sectionLabel || context.section?.label || "";
     const sectionId = context.sectionId || context.section?.id || "";
     const surface = context.surface || {};
+    const surfaceDecisionGroupId = surface?.type && surface.type !== "page"
+      ? decisionGroupIdForContext({ sectionId: surface.id || "", sectionType: surface.type || "", sectionLabel: surface.label || surface.taskHint || "" })
+      : "";
+    const decisionGroupId = context.decisionGroupId || decisionGroupIdForContext({ sectionId, sectionType, sectionLabel }) || surfaceDecisionGroupId;
     const members = [
       { element: stateElement, relation: "state" },
       { element: labelElement, relation: "label" },
@@ -2834,6 +2843,7 @@
       state,
       selected: Boolean(state.checked || state.selected),
       required: Boolean(state.required || context.required),
+      decisionGroupId,
       sectionId,
       sectionType,
       sectionLabel,
@@ -2850,6 +2860,7 @@
   function applyControlToModel(model, control) {
     if (!model || !control) return model;
     model.controlId = control.controlId;
+    model.decisionGroupId = control.decisionGroupId || model.decisionGroupId || "";
     model.controlKind = control.kind;
     model.controlState = control.state;
     model.stateElementId = control.stateElementId;
@@ -2857,6 +2868,92 @@
     model.actuators = control.actuators;
     model.visualRegion = control.visualRegion;
     return model;
+  }
+
+  function decisionGroupIdForContext({ sectionId = "", sectionType = "", sectionLabel = "" } = {}) {
+    if (!sectionId && !sectionType && !sectionLabel) return "";
+    const key = [sectionType || "decision", sectionId || sectionLabel || "group"].map(slugControlPart).filter(Boolean).join("_");
+    return key ? `dg_${key}`.slice(0, 118) : "";
+  }
+
+  function buildCanonicalDecisionGroups(sections = [], controls = [], activeSurface = {}) {
+    const byControlId = new Map((controls || []).map((control) => [control.controlId, control]));
+    const sectionGroups = (sections || [])
+      .filter((section) => Array.isArray(section.choices) && section.choices.length)
+      .map((section) => {
+        const decisionGroupId = decisionGroupIdForContext({ sectionId: section.id, sectionType: section.type, sectionLabel: section.label });
+        const choices = (section.choices || []).map((choice) => {
+          const control = byControlId.get(choice.controlId) || {};
+          return {
+            controlId: choice.controlId || control.controlId || "",
+            targetId: choice.id || control.preferredActivationElementId || control.stateElementId || "",
+            label: choice.label || control.label || "",
+            semantic: choice.semantic || control.semantic || "",
+            risk: choice.risk || control.risk || "",
+            selected: Boolean(choice.selected || control.selected || control.state?.checked || control.state?.selected),
+            state: choice.controlState || control.state || null,
+            priceText: (choice.label || "").match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
+          };
+        }).filter((choice) => choice.controlId || choice.targetId || choice.label);
+        const selected = choices.find((choice) => choice.selected) || null;
+        return {
+          decisionGroupId,
+          sectionId: section.id || "",
+          sectionType: section.type || "",
+          sectionLabel: section.label || "",
+          requirementId: section.type || section.id || "",
+          required: Boolean(section.required || section.paidChoice || section.status === "incomplete"),
+          status: selected ? "satisfied" : (section.status === "complete" ? "satisfied" : "missing"),
+          selectedControlId: selected?.controlId || "",
+          selectedLabel: selected?.label || "",
+          selectedSemantic: selected?.semantic || "",
+          alternatives: choices.map((choice) => ({
+            controlId: choice.controlId,
+            targetId: choice.targetId,
+            label: choice.label,
+            semantic: choice.semantic,
+            risk: choice.risk,
+            selected: choice.selected,
+            priceText: choice.priceText
+          })),
+          evidence: selected ? [`Selected: ${selected.label}`] : [`No selected option for ${section.label || section.type || "decision"}`]
+        };
+      })
+      .slice(0, 80);
+    const surfaceGroups = activeSurface?.type && activeSurface.type !== "page" && Array.isArray(activeSurface.options) && activeSurface.options.length
+      ? [(() => {
+          const decisionGroupId = decisionGroupIdForContext({ sectionId: activeSurface.id || "", sectionType: activeSurface.type || "", sectionLabel: activeSurface.label || activeSurface.taskHint || "" });
+          const alternatives = (activeSurface.options || []).map((option) => {
+            const control = byControlId.get(option.controlId) || {};
+            const selected = Boolean(option.selected || control.selected || control.state?.checked || control.state?.selected);
+            return {
+              controlId: option.controlId || control.controlId || "",
+              targetId: option.id || control.preferredActivationElementId || control.stateElementId || "",
+              label: option.label || control.label || "",
+              semantic: option.semantic || control.semantic || "",
+              risk: option.risk || control.risk || "",
+              selected,
+              priceText: (option.label || "").match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
+            };
+          }).filter((choice) => choice.controlId || choice.targetId || choice.label);
+          const selected = alternatives.find((choice) => choice.selected) || null;
+          return {
+            decisionGroupId,
+            sectionId: activeSurface.id || "",
+            sectionType: activeSurface.type || "",
+            sectionLabel: activeSurface.label || activeSurface.taskHint || "",
+            requirementId: activeSurface.type || activeSurface.id || "",
+            required: true,
+            status: selected ? "satisfied" : "missing",
+            selectedControlId: selected?.controlId || "",
+            selectedLabel: selected?.label || "",
+            selectedSemantic: selected?.semantic || "",
+            alternatives,
+            evidence: selected ? [`Selected: ${selected.label}`] : [`No selected option for ${activeSurface.label || activeSurface.type || "active surface"}`]
+          };
+        })()]
+      : [];
+    return [...surfaceGroups, ...sectionGroups].slice(0, 80);
   }
 
   function buildCanonicalControlGraph(sections = [], fields = [], buttons = [], activeSurface = {}) {
@@ -3261,10 +3358,15 @@
       blockers: stageExitBlockers(afterMap, expected)
     };
     const expectedControlId = expected.controlId || expected.targetSnapshot?.controlId || "";
+    const expectedDecisionGroupId = expected.decisionGroupId || expected.targetSnapshot?.decisionGroupId || "";
     const afterControl = expectedControlId
       ? (afterMap.controls || []).find((control) => control.controlId === expectedControlId)
       : null;
+    const afterDecisionGroup = expectedDecisionGroupId
+      ? (afterMap.decisionGroups || []).find((group) => group.decisionGroupId === expectedDecisionGroupId)
+      : null;
     const afterControlState = afterControl?.state || null;
+    const logicalDecisionSatisfied = Boolean(afterDecisionGroup && afterDecisionGroup.status === "satisfied");
     const logicalControlSatisfied = Boolean(
       afterControl
       && (
@@ -3312,7 +3414,7 @@
           .some((item) => (item.id === expected.targetId || item.controlId === expected.targetId || item.controlId === expectedControlId) && (item.selected || item.hasValue || item.controlState?.checked || item.controlState?.selected || item.controlState?.valuePresent))
         : false;
       const activeSurfaceProgress = beforeMap.activeSurface?.label && beforeMap.activeSurface?.label !== afterMap.activeSurface?.label;
-      const ok = logicalControlSatisfied || targetSelected || matchedSection?.status === "complete" || (activeSurfaceProgress && !evidence.errors.length);
+      const ok = logicalDecisionSatisfied || logicalControlSatisfied || targetSelected || matchedSection?.status === "complete" || (activeSurfaceProgress && !evidence.errors.length);
       return {
         ok,
         code: ok ? "REQUIREMENT_EVIDENCE_VERIFIED" : "REQUIREMENT_NOT_VERIFIED",
@@ -3321,6 +3423,8 @@
           : `${expected.requirementId || expected.sectionLabel || "Requirement"} is still missing evidence after the action.`,
         evidence: {
           ...evidence,
+          decisionGroup: afterDecisionGroup || null,
+          logicalDecisionSatisfied,
           control: afterControl || null,
           logicalControlSatisfied,
           targetSelected,
@@ -4698,6 +4802,7 @@
     const activeSurface = buildActiveSurface(activeOverlayElements());
     const sections = buildSectionModels(detectCheckoutSections(), fields, buttons);
     const controls = buildCanonicalControlGraph(sections, fields, buttons, activeSurface);
+    const decisionGroups = buildCanonicalDecisionGroups(sections, controls, activeSurface);
     const taskQueue = buildTaskQueue(sections);
     const surfaceModel = buildSurfaceStack(activeSurface, sections, taskQueue, overlays, step);
     const stageExit = buildStageExit(taskQueue, buttons, overlays, errors, step);
@@ -4720,6 +4825,7 @@
       price,
       priceText: price ? `${price.amount} ${price.currency}` : "",
       controls,
+      decisionGroups,
       sections,
       taskQueue,
       stageExit,
@@ -4728,6 +4834,7 @@
         knownFields: fields.filter((field) => field.field !== "unknown").length,
         buttons: buttons.length,
         controls: controls.length,
+        decisionGroups: decisionGroups.length,
         overlays: overlays.length,
         errors: errors.length,
         paidChoices: paidChoices.length,
@@ -5126,6 +5233,7 @@
           id: node.id,
           role: node.role,
           controlId: node.controlId || "",
+          decisionGroupId: node.decisionGroupId || "",
           name: node.name,
           state: node.state,
           kind: node.kind,
@@ -5139,6 +5247,7 @@
       } : null,
       controls: (map.controls || []).map((control) => ({
         controlId: control.controlId,
+        decisionGroupId: control.decisionGroupId || "",
         label: control.label,
         accessibleName: control.accessibleName,
         kind: control.kind,
@@ -5165,6 +5274,28 @@
         })).slice(0, 8),
         visualRegion: control.visualRegion
       })).slice(0, 180),
+      decisionGroups: (map.decisionGroups || []).map((group) => ({
+        decisionGroupId: group.decisionGroupId,
+        sectionId: group.sectionId,
+        sectionType: group.sectionType,
+        sectionLabel: group.sectionLabel,
+        requirementId: group.requirementId,
+        required: Boolean(group.required),
+        status: group.status,
+        selectedControlId: group.selectedControlId,
+        selectedLabel: group.selectedLabel,
+        selectedSemantic: group.selectedSemantic,
+        alternatives: (group.alternatives || []).map((choice) => ({
+          controlId: choice.controlId,
+          targetId: choice.targetId,
+          label: choice.label,
+          semantic: choice.semantic,
+          risk: choice.risk,
+          selected: Boolean(choice.selected),
+          priceText: choice.priceText || ""
+        })).slice(0, 16),
+        evidence: (group.evidence || []).slice(0, 5)
+      })).slice(0, 80),
       errors: actionableCheckoutErrors(map.errors),
       paidChoices: map.paidChoices,
       sectionProgress: agent.sectionProgress || {},
@@ -5183,6 +5314,7 @@
         choices: (section.choices || []).map((choice) => ({
           id: choice.id,
           controlId: choice.controlId || "",
+          decisionGroupId: choice.decisionGroupId || "",
           label: choice.label,
           selected: Boolean(choice.selected),
           semantic: choice.semantic,
@@ -5200,6 +5332,7 @@
         fields: (section.fields || []).map((field) => ({
           id: field.id,
           controlId: field.controlId || "",
+          decisionGroupId: field.decisionGroupId || "",
           label: field.label,
           field: field.field,
           kind: field.kind,
@@ -5218,6 +5351,7 @@
         buttons: (section.buttons || []).map((button) => ({
           id: button.id,
           controlId: button.controlId || "",
+          decisionGroupId: button.decisionGroupId || "",
           label: button.label,
           risk: button.risk,
           semantic: button.semantic,
@@ -5410,6 +5544,7 @@
         action: decision.action,
         intent: decision.intent || "",
         requirementId: decision.requirementId || "",
+        decisionGroupId: decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "",
         targetId: decision.targetId,
         targetLabel: decision.targetLabel,
         targetSnapshot: decision.targetSnapshot || null,
@@ -5453,6 +5588,7 @@
           action: decision.action,
           intent: decision.intent || "",
           requirementId: decision.requirementId || "",
+          decisionGroupId: decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "",
           targetId: decision.targetId,
           targetLabel: decision.targetLabel,
           targetSnapshot: decision.targetSnapshot || null,
@@ -5491,6 +5627,7 @@
         action: decision.action,
         intent: decision.intent || "",
         requirementId: decision.requirementId || "",
+        decisionGroupId: decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "",
         targetId: decision.targetId,
         targetSnapshot: decision.targetSnapshot || null,
         expectedOutcome: decision.expectedOutcome || null,
