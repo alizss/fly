@@ -12,6 +12,7 @@
  *
  * @typedef {Object} CheckoutRequirement
  * @property {string} id
+ * @property {string} [decisionGroupId]
  * @property {RequirementType} type
  * @property {string} label
  * @property {RequirementStatus} status
@@ -39,6 +40,7 @@ function clampConfidence(value) {
 function normalizeRequirement(raw = {}, index = 0) {
   return {
     id: String(raw.id || `req_${index}_${Math.random().toString(36).slice(2, 8)}`),
+    decisionGroupId: raw.decisionGroupId ? String(raw.decisionGroupId).slice(0, 140) : "",
     type: REQUIREMENT_TYPES.has(raw.type) ? raw.type : "unknown",
     label: String(raw.label || "").slice(0, 200),
     status: REQUIREMENT_STATUSES.has(raw.status) ? raw.status : "unknown",

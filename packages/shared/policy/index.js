@@ -74,7 +74,7 @@ function blocksContinue(req, profile = {}) {
     return false;
   }
   if (req.required) return true;
-  return req.type === "paid_extra_decision" && profileWantsNoExtras(profile);
+  return false;
 }
 
 function looksLikeCardField(action) {

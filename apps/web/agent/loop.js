@@ -22,7 +22,7 @@ const { checkPolicy } = require("./policy");
 const { writeTrace } = require("./trace-store");
 const { normalizeAction, actionSignature } = require("../../../packages/shared/agent-actions");
 const { withUpdate, normalizeStep } = require("../../../packages/shared/agent-state");
-const { missingRequired } = require("../../../packages/shared/requirements");
+const { missingRequired, normalizeRequirement } = require("../../../packages/shared/requirements");
 
 const STALL_THRESHOLD = 3;
 
@@ -100,6 +100,88 @@ function decisionGroupMatchesRequirement(group = {}, requirement = {}) {
 
 function decisionGroupForRequirement(requirement = {}, page = {}) {
   return (page.decisionGroups || []).find((group) => decisionGroupMatchesRequirement(group, requirement)) || null;
+}
+
+function decisionGroupRequirementType(group = {}) {
+  const text = normalizeText(`${group.requirementId || ""} ${group.sectionType || ""} ${group.sectionLabel || ""}`);
+  if (/bag|baggage|luggage/.test(text)) return "baggage_decision";
+  if (/seat/.test(text)) return "seat_decision";
+  if (/legal|terms|condition|agree/.test(text)) return "legal_acceptance";
+  if (/payment|pay|card/.test(text)) return "payment";
+  if (/bundle|flexible|ticket|sms|support|insurance|cancellation|protection|extra/.test(text)) return "paid_extra_decision";
+  return "unknown";
+}
+
+function decisionGroupRisk(group = {}) {
+  if (group.status === "satisfied") return "safe";
+  const alternatives = group.alternatives || [];
+  if (alternatives.some((choice) => choice.risk === "payment")) return "payment";
+  if (alternatives.some((choice) => choice.risk === "legal")) return "legal";
+  if (alternatives.some((choice) => choice.risk === "money" || choice.priceText)) return "money";
+  if (alternatives.some((choice) => choice.risk === "uncertain")) return "uncertain";
+  return "safe";
+}
+
+function requirementFromDecisionGroup(group = {}, index = 0) {
+  return normalizeRequirement({
+    id: group.decisionGroupId || `decision_group_${index}`,
+    decisionGroupId: group.decisionGroupId || "",
+    type: decisionGroupRequirementType(group),
+    label: group.sectionLabel || group.sectionType || group.requirementId || group.decisionGroupId || `Decision ${index + 1}`,
+    status: group.status === "satisfied" ? "satisfied" : (group.status || "missing"),
+    required: Boolean(group.required),
+    risk: decisionGroupRisk(group),
+    evidence: [
+      ...(group.evidence || []),
+      group.selectedLabel ? `Selected option: ${group.selectedLabel}` : ""
+    ].filter(Boolean).slice(0, 5),
+    confidence: group.status === "satisfied" ? 0.95 : 0.9,
+    targetIds: [
+      group.decisionGroupId,
+      group.sectionId,
+      group.requirementId,
+      ...(group.alternatives || []).flatMap((choice) => [choice.controlId, choice.targetId])
+    ].filter(Boolean).slice(0, 10)
+  }, index);
+}
+
+function withDecisionGroupFields(requirement = {}, group = {}) {
+  return {
+    ...requirement,
+    decisionGroupId: group.decisionGroupId || "",
+    selectedControlId: group.selectedControlId || "",
+    selectedLabel: group.selectedLabel || "",
+    alternatives: (group.alternatives || []).map((choice) => ({
+      controlId: choice.controlId || "",
+      targetId: choice.targetId || "",
+      label: choice.label || "",
+      semantic: choice.semantic || "",
+      risk: choice.risk || "",
+      selected: Boolean(choice.selected),
+      priceText: choice.priceText || ""
+    })).slice(0, 16)
+  };
+}
+
+function requirementsWithDecisionGroups(classifiedRequirements = [], observation = {}) {
+  const page = observation?.page || {};
+  const groups = page.decisionGroups || [];
+  if (!groups.length) return classifiedRequirements;
+
+  const groupRequirements = groups.map((group, index) =>
+    withDecisionGroupFields(requirementFromDecisionGroup(group, index), group)
+  );
+  const groupedIds = new Set(groupRequirements.map((req) => req.id).filter(Boolean));
+  const filteredClassified = (classifiedRequirements || []).filter((requirement) => {
+    const group = decisionGroupForRequirement(requirement, page);
+    if (!group?.decisionGroupId) return true;
+    // Choice-like requirements are represented by the canonical group. Field,
+    // payment, and unrelated requirements remain separate.
+    if (/decision|legal_acceptance|unknown/.test(requirement.type || "")) return false;
+    return !groupedIds.has(requirement.id);
+  });
+
+  return [...filteredClassified, ...groupRequirements];
 }
 
 function controlDecisionGroupId(controlId = "", page = {}) {
@@ -669,6 +751,10 @@ async function runLoopTurn({ apiKey, model, dataDir, state, observation, travele
     extracted = await classifyPageState({ apiKey, model, observation, screenshotDataUrl, traveler });
     classificationMeta = extracted.meta || null;
     latency.classification_model_ms = Number(classificationMeta?.durationMs || 0);
+    extracted = {
+      ...extracted,
+      requirements: requirementsWithDecisionGroups(extracted.requirements || [], observation)
+    };
   } catch (error) {
     return safePlannerFailureResult({
       dataDir,
