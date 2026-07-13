@@ -2720,6 +2720,16 @@
     return role || tag || "control";
   }
 
+  function isDropdownLikeElement(element) {
+    const tag = (element?.tagName || "").toLowerCase();
+    const role = implicitRole(element);
+    return tag === "select" || role === "combobox" || role === "listbox" || element?.getAttribute?.("aria-haspopup") === "listbox";
+  }
+
+  function isPlaceholderChoiceValue(value = "") {
+    return /^(choose|select|please select|select one|select one option|please choose)$/i.test(String(value || "").replace(/\s+/g, " ").trim());
+  }
+
   function stateElementForControl(element) {
     if (!element) return null;
     if (element.matches?.("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], [role='button'], button")) return element;
@@ -2733,11 +2743,16 @@
 
   function controlStateForElement(element) {
     const value = currentElementValue(element);
+    const exposesChoiceValue = isDropdownLikeElement(element) || implicitRole(element) === "option";
+    const valueText = exposesChoiceValue && value && !isPlaceholderChoiceValue(value)
+      ? compactText(value, 180)
+      : "";
     return {
       checked: Boolean(element?.checked === true || element?.getAttribute?.("aria-checked") === "true"),
       selected: Boolean(element?.selected === true || element?.getAttribute?.("aria-selected") === "true" || isChoiceSelected(element)),
       valuePresent: Boolean(value && String(value).trim()),
       value: value ? "[filled]" : "",
+      valueText,
       disabled: isDisabledLike(element),
       required: Boolean(element?.required === true || element?.getAttribute?.("aria-required") === "true"),
       expanded: element?.getAttribute?.("aria-expanded") || "",
@@ -2799,9 +2814,9 @@
     const sectionId = context.sectionId || context.section?.id || "";
     const surface = context.surface || {};
     const surfaceDecisionGroupId = surface?.type && surface.type !== "page"
-      ? decisionGroupIdForContext({ sectionId: surface.id || "", sectionType: surface.type || "", sectionLabel: surface.label || surface.taskHint || "" })
+      ? (surface.decisionGroupId || decisionGroupIdForContext({ sectionType: surface.taskHint || surface.type || "", sectionLabel: surface.parentSectionLabel || surface.label || surface.taskHint || "" }))
       : "";
-    const decisionGroupId = context.decisionGroupId || decisionGroupIdForContext({ sectionId, sectionType, sectionLabel }) || surfaceDecisionGroupId;
+    const decisionGroupId = context.decisionGroupId || decisionGroupIdForContext({ sectionType, sectionLabel, field: context.field || "" }) || surfaceDecisionGroupId;
     const members = [
       { element: stateElement, relation: "state" },
       { element: labelElement, relation: "label" },
@@ -2812,12 +2827,11 @@
     const boxes = members.map((item) => isVisible(item.element) ? elementBox(item.element) : null).filter(Boolean);
     const state = controlStateForElement(stateElement);
     const base = [
-      surface.id || surface.type || "page",
-      sectionId || sectionType || sectionLabel || "section",
+      decisionGroupId || surface.type || "page",
+      sectionType || sectionLabel || "section",
       kind,
       semantic,
-      label,
-      elementId(stateElement)
+      label
     ].map(slugControlPart).join("_");
     const controlId = `ctrl_${base}`.slice(0, 118);
     members.forEach((item) => {
@@ -2870,19 +2884,47 @@
     return model;
   }
 
-  function decisionGroupIdForContext({ sectionId = "", sectionType = "", sectionLabel = "" } = {}) {
-    if (!sectionId && !sectionType && !sectionLabel) return "";
-    const key = [sectionType || "decision", sectionId || sectionLabel || "group"].map(slugControlPart).filter(Boolean).join("_");
+  function decisionGroupIdForContext({ sectionType = "", sectionLabel = "", field = "" } = {}) {
+    if (!sectionType && !sectionLabel && !field) return "";
+    const logicalType = sectionType && sectionType !== "unknown" ? sectionType : (field || "decision");
+    const logicalLabel = sectionLabel && !/^additional section$/i.test(sectionLabel) ? sectionLabel : field;
+    const key = [logicalType || "decision", logicalLabel || "group"].map(slugControlPart).filter(Boolean).join("_");
     return key ? `dg_${key}`.slice(0, 118) : "";
+  }
+
+  function sectionDecisionFields(section = {}) {
+    return (section.fields || [])
+      .filter((field) => {
+        const kind = `${field.kind || ""} ${field.controlKind || ""} ${field.role || ""}`.toLowerCase();
+        const semantic = `${field.semantic || ""} ${field.field || ""}`.toLowerCase();
+        const value = field.controlState?.valueText || "";
+        return /select|combobox|listbox/.test(kind)
+          || /required_dropdown_choice/.test(semantic)
+          || Boolean(value && field.required);
+      });
+  }
+
+  function choiceLikeModelFromDecisionField(field = {}, control = {}) {
+    const selectedLabel = field.controlState?.valueText || control.state?.valueText || "";
+    return {
+      controlId: field.controlId || control.controlId || "",
+      targetId: field.id || field.preferredActivationElementId || control.preferredActivationElementId || control.stateElementId || "",
+      label: selectedLabel || field.label || control.label || "",
+      semantic: selectedLabel ? semanticChoiceType(selectedLabel) : (field.semantic || control.semantic || "required_dropdown_choice"),
+      risk: selectedLabel ? choiceRisk(selectedLabel) : (field.risk || control.risk || "uncertain"),
+      selected: Boolean(selectedLabel),
+      state: field.controlState || control.state || null,
+      priceText: selectedLabel.match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
+    };
   }
 
   function buildCanonicalDecisionGroups(sections = [], controls = [], activeSurface = {}) {
     const byControlId = new Map((controls || []).map((control) => [control.controlId, control]));
     const sectionGroups = (sections || [])
-      .filter((section) => Array.isArray(section.choices) && section.choices.length)
+      .filter((section) => Array.isArray(section.choices) && section.choices.length || sectionDecisionFields(section).length)
       .map((section) => {
-        const decisionGroupId = decisionGroupIdForContext({ sectionId: section.id, sectionType: section.type, sectionLabel: section.label });
-        const choices = (section.choices || []).map((choice) => {
+        const decisionGroupId = decisionGroupIdForContext({ sectionType: section.type, sectionLabel: section.label });
+        const choiceModels = (section.choices || []).map((choice) => {
           const control = byControlId.get(choice.controlId) || {};
           return {
             controlId: choice.controlId || control.controlId || "",
@@ -2894,7 +2936,14 @@
             state: choice.controlState || control.state || null,
             priceText: (choice.label || "").match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
           };
-        }).filter((choice) => choice.controlId || choice.targetId || choice.label);
+        });
+        const fieldModels = sectionDecisionFields(section).map((field) => choiceLikeModelFromDecisionField(field, byControlId.get(field.controlId) || {}));
+        const choices = [...choiceModels, ...fieldModels]
+          .filter((choice) => choice.controlId || choice.targetId || choice.label)
+          .filter((choice, index, list) => {
+            const key = `${choice.controlId || choice.targetId}:${normalizeMatchText(choice.label)}`;
+            return list.findIndex((other) => `${other.controlId || other.targetId}:${normalizeMatchText(other.label)}` === key) === index;
+          });
         const selected = choices.find((choice) => choice.selected) || null;
         return {
           decisionGroupId,
@@ -2922,7 +2971,7 @@
       .slice(0, 80);
     const surfaceGroups = activeSurface?.type && activeSurface.type !== "page" && Array.isArray(activeSurface.options) && activeSurface.options.length
       ? [(() => {
-          const decisionGroupId = decisionGroupIdForContext({ sectionId: activeSurface.id || "", sectionType: activeSurface.type || "", sectionLabel: activeSurface.label || activeSurface.taskHint || "" });
+          const decisionGroupId = activeSurface.decisionGroupId || decisionGroupIdForContext({ sectionType: activeSurface.taskHint || activeSurface.type || "", sectionLabel: activeSurface.parentSectionLabel || activeSurface.label || activeSurface.taskHint || "" });
           const alternatives = (activeSurface.options || []).map((option) => {
             const control = byControlId.get(option.controlId) || {};
             const selected = Boolean(option.selected || control.selected || control.state?.checked || control.state?.selected);
@@ -2940,9 +2989,9 @@
           return {
             decisionGroupId,
             sectionId: activeSurface.id || "",
-            sectionType: activeSurface.type || "",
-            sectionLabel: activeSurface.label || activeSurface.taskHint || "",
-            requirementId: activeSurface.type || activeSurface.id || "",
+            sectionType: activeSurface.parentSectionType || activeSurface.taskHint || activeSurface.type || "",
+            sectionLabel: activeSurface.parentSectionLabel || activeSurface.label || activeSurface.taskHint || "",
+            requirementId: activeSurface.taskHint || activeSurface.parentSectionType || activeSurface.type || activeSurface.id || "",
             required: true,
             status: selected ? "satisfied" : "missing",
             selectedControlId: selected?.controlId || "",
@@ -3699,7 +3748,7 @@
       if (text.length > 40) return text;
     }
     const candidates = queryAllDeep("main, [role='main'], form, section, article")
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar, #atw-agent-cursor, .atw-section-outline"))
       .map((element) => {
         const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
         const headingScore = /traveller information|traveler information|configure your trip|select baggage|seat selection|payment|confirmation/i.test(text) ? 1200 : 0;
@@ -3961,7 +4010,7 @@
     const explicit = queryAllDeep(selectors);
     const floating = queryAllDeep("body *")
       .filter((element) => {
-        if (!isVisible(element) || element.closest("#atw-sidebar")) return false;
+        if (!isVisible(element) || element.closest("#atw-sidebar, #atw-agent-cursor, .atw-section-outline")) return false;
         const style = getComputedStyle(element);
         const rect = element.getBoundingClientRect();
         const text = overlayText(element);
@@ -3973,7 +4022,7 @@
         return Number.isNaN(z) || z >= 1;
       });
     const candidates = [...new Set([...explicit, ...floating])]
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar, #atw-agent-cursor, .atw-section-outline"))
       .filter((element) => {
         const rect = element.getBoundingClientRect();
         if (rect.width < 12 || rect.height < 12) return false;
@@ -4627,7 +4676,63 @@
     return true;
   }
 
-  function buildActiveSurface(overlays = activeOverlayElements()) {
+  function inferSurfaceParentDecisionContext(overlay, sections = [], taskQueue = []) {
+    const expandedControls = queryAllDeep("select, [role='combobox'], button, [role='button'], [aria-haspopup], [aria-controls], [aria-owns]")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar, #atw-agent-cursor, .atw-section-outline"))
+      .map((element) => {
+        const owns = [element.getAttribute("aria-controls"), element.getAttribute("aria-owns")]
+          .filter(Boolean)
+          .flatMap((value) => String(value).split(/\s+/).filter(Boolean));
+        const active = document.activeElement === element || element.contains(document.activeElement);
+        const expanded = element.getAttribute("aria-expanded") === "true";
+        const linkedToOverlay = owns.some((id) => {
+          const owned = document.getElementById(id);
+          return owned && (owned === overlay || overlay.contains(owned) || owned.contains(overlay));
+        });
+        const box = elementBox(element);
+        const overlayBox = elementBox(overlay);
+        const nearOverlay = Math.abs((box.centerX || 0) - (overlayBox.centerX || 0)) < Math.max(260, overlayBox.width || 0)
+          && Math.abs((box.centerY || 0) - (overlayBox.centerY || 0)) < 420;
+        let score = 0;
+        if (linkedToOverlay) score += 100;
+        if (active) score += 50;
+        if (expanded) score += 35;
+        if (nearOverlay) score += 15;
+        return { element, score };
+      })
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score);
+    const parent = expandedControls[0]?.element || null;
+    const section = parent
+      ? (sections || []).find((item) => {
+          const sectionElement = elementById(item.id) || item.element;
+          return sectionElement && (sectionElement.contains(parent) || elementBelongsToSectionBand(parent, item, liveSectionModels(sections || [])));
+        })
+      : null;
+    const task = (taskQueue || []).find((item) => {
+      if (section && item.sectionId === section.id) return true;
+      const source = `${item.sectionType || ""} ${item.sectionLabel || ""} ${overlayText(overlay)}`.toLowerCase();
+      if (/flexible_ticket/.test(item.sectionType || "") && /flexible ticket|none of the passengers/.test(source)) return true;
+      if (/bundle/.test(item.sectionType || "") && /bundle|premium support|airhelp|sms/.test(source)) return true;
+      if (/cancellation_insurance/.test(item.sectionType || "") && /cancellation|insurance|refund/.test(source)) return true;
+      if (/baggage/.test(item.sectionType || "") && /baggage|bag|kg/.test(source)) return true;
+      if (/seat/.test(item.sectionType || "") && /seat|seating/.test(source)) return true;
+      return false;
+    }) || null;
+    const sectionType = section?.type || task?.sectionType || "";
+    const sectionLabel = section?.label || task?.sectionLabel || "";
+    const decisionGroupId = decisionGroupIdForContext({ sectionType, sectionLabel });
+    return {
+      parentControlId: parent?.dataset?.atwControlId || "",
+      parentElementId: parent ? elementId(parent) : "",
+      parentSectionId: section?.id || task?.sectionId || "",
+      parentSectionType: sectionType,
+      parentSectionLabel: sectionLabel,
+      decisionGroupId
+    };
+  }
+
+  function buildActiveSurface(overlays = activeOverlayElements(), sections = [], taskQueue = []) {
     const overlay = overlays[0];
     if (!overlay) {
       return {
@@ -4647,7 +4752,9 @@
     const text = overlayText(overlay);
     const type = isTransientChoiceOverlay(overlay) ? "dropdown" : /dialog|modal/i.test(role) || overlay.getAttribute("aria-modal") === "true" ? "modal" : "popover";
     const map = agent.pageMap || null;
-    const task = map ? nextPendingTask(map, ["baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"]) : null;
+    const parentContext = inferSurfaceParentDecisionContext(overlay, sections, taskQueue);
+    const task = (taskQueue || []).find((item) => item.sectionId && item.sectionId === parentContext.parentSectionId)
+      || (map ? nextPendingTask(map, ["baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"]) : null);
     const options = overlayButtons(overlay).map((option) => {
       const label = overlayChoiceText(option);
       return {
@@ -4656,6 +4763,7 @@
         semantic: overlayOptionSemantic(label),
         risk: overlayOptionRisk(label),
         selected: isChoiceSelected(option) || option.getAttribute?.("aria-selected") === "true",
+        decisionGroupId: parentContext.decisionGroupId || "",
         box: elementBox(option),
         accessibility: accessibilityNode(option, map)
       };
@@ -4675,9 +4783,15 @@
     const surface = {
       type,
       id: elementId(overlay),
+      decisionGroupId: parentContext.decisionGroupId || "",
+      parentControlId: parentContext.parentControlId || "",
+      parentElementId: parentContext.parentElementId || "",
+      parentSectionId: parentContext.parentSectionId || "",
+      parentSectionType: parentContext.parentSectionType || task?.sectionType || "",
+      parentSectionLabel: parentContext.parentSectionLabel || task?.sectionLabel || "",
       label: text.slice(0, 800),
       role,
-      taskHint: task?.sectionType || routineExtraOverlayKind(text, task) || "",
+      taskHint: parentContext.parentSectionType || task?.sectionType || routineExtraOverlayKind(text, task) || "",
       options: prioritized.slice(0, 20),
       buttons: prioritized.slice(0, 20),
       box: elementBox(overlay),
@@ -4799,11 +4913,11 @@
     const paidChoices = collectPaidChoices(fullText);
     const price = priceFromText(fullText);
     const overlays = visibleOverlays();
-    const activeSurface = buildActiveSurface(activeOverlayElements());
     const sections = buildSectionModels(detectCheckoutSections(), fields, buttons);
+    const taskQueue = buildTaskQueue(sections);
+    const activeSurface = buildActiveSurface(activeOverlayElements(), sections, taskQueue);
     const controls = buildCanonicalControlGraph(sections, fields, buttons, activeSurface);
     const decisionGroups = buildCanonicalDecisionGroups(sections, controls, activeSurface);
-    const taskQueue = buildTaskQueue(sections);
     const surfaceModel = buildSurfaceStack(activeSurface, sections, taskQueue, overlays, step);
     const stageExit = buildStageExit(taskQueue, buttons, overlays, errors, step);
     const map = {

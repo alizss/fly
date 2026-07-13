@@ -226,3 +226,65 @@ test("P0.9 preserves decision-group identity when binding a logical control targ
   assert.equal(bound.targetSnapshot.stateElementId, "atw-bag-input");
   assert.equal(bound.targetSnapshot.preferredActivationElementId, "atw-bag-label");
 });
+
+test("P0.10 live selected dropdown group state survives stale missing model claims", () => {
+  const observation = observationWithGroups();
+  observation.page.decisionGroups = observation.page.decisionGroups.map((group) =>
+    group.decisionGroupId === "dg_flexible_ticket"
+      ? {
+          ...group,
+          status: "satisfied",
+          selectedControlId: "ctrl_flex_none",
+          selectedLabel: "None of the passengers",
+          alternatives: group.alternatives.map((choice) =>
+            choice.controlId === "ctrl_flex_none" ? { ...choice, selected: true } : choice
+          ),
+          evidence: ["Selected: None of the passengers"]
+        }
+      : group
+  );
+
+  const classified = [
+    {
+      id: "model_flex_missing",
+      decisionGroupId: "dg_flexible_ticket",
+      type: "paid_extra_decision",
+      label: "Flexible Ticket",
+      status: "missing",
+      required: true,
+      risk: "money",
+      evidence: ["Model did not see the collapsed selected value"],
+      confidence: 0.8,
+      targetIds: ["atw-el-324"]
+    }
+  ];
+
+  const requirements = __private.requirementsWithDecisionGroups(classified, observation);
+  const flex = requirements.find((req) => req.id === "dg_flexible_ticket");
+
+  assert.equal(requirements.some((req) => req.id === "model_flex_missing"), false);
+  assert.equal(flex.status, "satisfied");
+  assert.equal(flex.selectedLabel, "None of the passengers");
+});
+
+test("P0.10 stable logical decision group is independent of changing DOM element ids", () => {
+  const first = {
+    decisionGroupId: "dg_flexible_ticket_flexible-ticket",
+    sectionId: "atw-el-316",
+    sectionType: "flexible_ticket",
+    sectionLabel: "Flexible Ticket",
+    requirementId: "flexible_ticket",
+    required: true,
+    status: "satisfied",
+    selectedControlId: "ctrl_flex_none",
+    selectedLabel: "None of the passengers",
+    alternatives: []
+  };
+  const reopened = {
+    ...first,
+    sectionId: "atw-el-324"
+  };
+
+  assert.equal(first.decisionGroupId, reopened.decisionGroupId);
+  assert.notEqual(first.sectionId, reopened.sectionId);
+});
