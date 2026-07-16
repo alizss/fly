@@ -167,7 +167,7 @@ const pageStateSchema = {
 const verifierSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["ok", "changed", "lastActionWorked", "blockers", "priceChanged", "riskChanged", "evidence", "confidence", "satisfiedRequirementIds", "requirementUpdates"],
+  required: ["ok", "changed", "lastActionWorked", "blockers", "priceChanged", "riskChanged", "evidence", "confidence", "requirementUpdates"],
   properties: {
     ok: { type: "boolean" },
     changed: { type: "boolean" },
@@ -177,7 +177,6 @@ const verifierSchema = {
     riskChanged: { type: "boolean" },
     evidence: { type: "array", items: { type: "string" } },
     confidence: { type: "number" },
-    satisfiedRequirementIds: { type: "array", items: { type: "string" } },
     requirementUpdates: {
       type: "array",
       items: {
@@ -208,7 +207,7 @@ const verifierSchema = {
 const plannerSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["type", "targetId", "targetLabel", "value", "x", "y", "scrollY", "keys", "reason", "requirementId", "risk", "requiresApproval"],
+  required: ["type", "targetId", "targetLabel", "value", "x", "y", "visualRegion", "scrollY", "keys", "reason", "requirementId", "risk", "requiresApproval"],
   properties: {
     type: {
       type: "string",
@@ -224,9 +223,7 @@ const plannerSchema = {
         "final_review",
         "stop",
         "fill_known_fields",
-        "fill_visible_profile_fields",
-        "skip_optional_extra",
-        "close_modal"
+        "fill_visible_profile_fields"
       ]
     },
     targetId: { type: "string" },
@@ -234,6 +231,20 @@ const plannerSchema = {
     value: { type: "string" },
     x: { type: "number" },
     y: { type: "number" },
+    visualRegion: {
+      type: "object",
+      additionalProperties: false,
+      required: ["x", "y", "width", "height", "viewportWidth", "viewportHeight", "surfaceId"],
+      properties: {
+        x: { type: "number" },
+        y: { type: "number" },
+        width: { type: "number" },
+        height: { type: "number" },
+        viewportWidth: { type: "number" },
+        viewportHeight: { type: "number" },
+        surfaceId: { type: "string" }
+      }
+    },
     scrollY: { type: "number" },
     keys: { type: "string" },
     reason: { type: "string" },

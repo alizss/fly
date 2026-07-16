@@ -11,6 +11,7 @@ const DATA_DIR = path.join(ROOT, "work");
 const DB_FILE = path.join(DATA_DIR, "air-travel-wallet-db.json");
 const KEY = crypto.createHash("sha256").update(process.env.ATW_ENCRYPTION_KEY || "local-dev-key-change-me").digest();
 const AGENT_MODEL = process.env.ATW_AGENT_MODEL || "gpt-4.1-mini";
+const AGENT_RECOVERY_MODEL = process.env.ATW_AGENT_RECOVERY_MODEL || AGENT_MODEL;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const agentLoop = require("./agent/loop");
 const agentSessionStore = require("./agent/session-store");
@@ -35,7 +36,6 @@ function summarizeAgentSession(session) {
     travelerName: "",
     approvals: session.approvals,
     completedFields: [],
-    completedSections: {},
     lockedFields: {},
     retryCounts: {},
     lastAction: session.lastAction,
@@ -53,120 +53,53 @@ function summarizeAgentSession(session) {
 
 function createAgentSession(body = {}) {
   const traveler = body.traveler || {};
-  const state = agentSessionStore.getOrCreateSession(body.sessionId || "", {
+  const requestedSessionId = clampText(body.sessionId || "", 120);
+  if (body.resumeOnly && (!requestedSessionId || !agentSessionStore.getSession(requestedSessionId))) {
+    return null;
+  }
+  const state = agentSessionStore.getOrCreateSession(requestedSessionId, {
     goal: clampText(body.goal || body.userIntent || "Complete checkout safely.", 500),
     travelerId: clampText(traveler.id || body.travelerId || "", 120),
     site: { host: body.page?.site || "", url: body.page?.url || "" }
   });
   const updated = withUpdate(state, {
     status: "running",
+    userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
+    travelerIds: [traveler.id || body.travelerId || state.travelerId].filter(Boolean),
+    policySnapshot: {
+      bookingRules: clampText(traveler.booking_rules, 800),
+      baggagePreference: clampText(traveler.baggage_preference, 120),
+      preferredSeat: clampText(traveler.preferred_seat, 120),
+      paymentPreference: clampText(traveler.payment_preference, 120)
+    },
     currentStep: normalizeStep(body.page?.step || state.currentStep || "unknown"),
     approvals: {
       ...state.approvals,
       skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
-      paymentApproved: false
+      paymentApproved: false,
+      paymentAuthorization: body.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
+      priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
     }
   });
   agentSessionStore.saveSession(updated);
   return updated;
 }
 
-function getAgentSession(id) {
-  if (!id) return null;
-  return agentSessionStore.getSession(id);
-}
-
-function rememberAgentEvent(session, event) {
-  if (!session) return;
-  const safeEvent = {
-    at: now(),
-    type: clampText(event.type || "event", 80),
-    ok: typeof event.ok === "boolean" ? event.ok : undefined,
-    stage: clampText(event.stage || session.currentStage || "unknown", 80),
-    summary: clampText(event.summary || event.message || "", 280),
-    payload: event.payload || {}
-  };
-  session.events.push(safeEvent);
-  session.events = session.events.slice(-80);
-  session.updated_at = safeEvent.at;
-}
-
-function updateAgentSessionFromPayload(session, payload) {
-  if (!session) return null;
-  session.currentStage = payload.page?.step || session.currentStage || "unknown";
-  session.approvals = {
-    ...session.approvals,
-    ...(payload.approvalState || {})
-  };
-  if (payload.page?.completedFields && typeof payload.page.completedFields === "object") {
-    session.completedFields = [
-      ...new Set([
-        ...session.completedFields,
-        ...Object.keys(payload.page.completedFields).map((field) => clampText(field, 80))
-      ])
-    ].slice(-60);
-    session.lockedFields = {
-      ...(session.lockedFields || {}),
-      ...Object.fromEntries(Object.entries(payload.page.completedFields).map(([field, value]) => [
-        clampText(field, 80),
-        clampText(value?.actual || value?.selector || "accepted", 180)
-      ]))
-    };
-  }
-  if (payload.page?.completedSections && typeof payload.page.completedSections === "object") {
-    session.completedSections = {
-      ...(session.completedSections || {}),
-      ...payload.page.completedSections
-    };
-  }
-  session.lastPageSummary = {
-    site: payload.page?.site,
-    step: payload.page?.step,
-    errors: payload.page?.errors || [],
-    paidChoices: payload.page?.paidChoices || [],
-    overlays: payload.page?.overlays || [],
-    sectionProgress: payload.page?.sectionProgress || {},
-    completedSections: payload.page?.completedSections || {},
-    completedFields: payload.page?.completedFields || {},
-    stageExit: payload.page?.stageExit || {},
-    reconciliation: payload.page?.reconciliation || {},
-    sections: (payload.page?.sections || []).map((section) => ({
-      label: section.label,
-      type: section.type,
-      status: section.status,
-      objective: section.objective,
-      selected: section.selected || []
-    })).slice(0, 20),
-    taskQueue: (payload.page?.taskQueue || []).map((task) => ({
-      sectionLabel: task.sectionLabel,
-      sectionType: task.sectionType,
-      status: task.status,
-      objective: task.objective
-    })).slice(0, 30),
-    coverage: payload.page?.coverage || {},
-    fields: payload.page?.fields?.length || 0,
-    buttons: payload.page?.buttons?.length || 0
-  };
-  rememberAgentEvent(session, {
-    type: "observe_page",
-    stage: session.currentStage,
-    ok: !(payload.page?.errors || []).length,
-    summary: `${payload.page?.site || "site"} ${payload.page?.step || "unknown"}: ${(payload.page?.fields || []).length} fields, ${(payload.page?.buttons || []).length} actions, ${(payload.page?.sections || []).length} sections`
-  });
-  return session;
-}
-
 function reportAgentResult(body = {}) {
   const checkoutState = agentSessionStore.getSession(body.sessionId);
   if (!checkoutState) return null;
   const result = body.result || {};
-  const updated = withUpdate(checkoutState, {
+  const status = result.type === "final_review"
+    ? "ready_for_payment"
+    : result.type === "save_trip"
+      ? "complete"
+      : ["ask_user", "stop"].includes(result.type)
+        ? "awaiting_user"
+        : checkoutState.status;
+  return agentSessionStore.recordActionResult(checkoutState.id, result, {
     currentStep: normalizeStep(body.page?.step || checkoutState.currentStep || "unknown"),
-    lastActionResult: result,
-    status: result.type === "final_review" ? "awaiting_user" : checkoutState.status
+    status
   });
-  agentSessionStore.saveSession(updated);
-  return updated;
 }
 
 function encryptSensitive(value) {
@@ -417,6 +350,7 @@ function compactAccessibilityNode(node = {}) {
   return {
     id: clampText(node.id, 80),
     controlId: clampText(node.controlId, 140),
+    visualRef: clampText(node.visualRef, 40),
     decisionGroupId: clampText(node.decisionGroupId, 140),
     role: clampText(node.role, 80),
     name: clampText(node.name, 220),
@@ -465,6 +399,7 @@ function compactVisualState(state = {}) {
     controls: Array.isArray(state.controls)
       ? state.controls.map((control) => ({
           id: clampText(control.id, 80),
+          visualRef: clampText(control.visualRef, 40),
           role: clampText(control.role, 80),
           name: clampText(control.name, 180),
           label: clampText(control.label, 180),
@@ -497,18 +432,11 @@ function compactSurface(surface = {}) {
     visualState: compactVisualState(surface.visualState),
     accessibility: compactAccessibilityNode(surface.accessibility),
     box: surface.box || null,
-    taskQueue: Array.isArray(surface.taskQueue)
-      ? surface.taskQueue.map((task) => ({
-          id: clampText(task.id, 80),
-          sectionLabel: clampText(task.sectionLabel, 120),
-          sectionType: clampText(task.sectionType, 80),
-          status: clampText(task.status, 80)
-        })).slice(0, 12)
-      : [],
     options: Array.isArray(surface.options)
       ? surface.options.map((option) => ({
           id: clampText(option.id, 80),
           controlId: clampText(option.controlId, 140),
+          visualRef: clampText(option.visualRef, 40),
           label: clampText(option.label, 220),
           semantic: clampText(option.semantic, 80),
           risk: clampText(option.risk, 80),
@@ -518,6 +446,7 @@ function compactSurface(surface = {}) {
           stateElementId: clampText(option.stateElementId, 80),
           preferredActivationElementId: clampText(option.preferredActivationElementId, 80),
           actuators: compactActuators(option.actuators),
+          operations: compactControlOperations(option.operations),
           visualRegion: option.visualRegion || null,
           accessibility: compactAccessibilityNode(option.accessibility),
           box: option.box || null
@@ -527,6 +456,7 @@ function compactSurface(surface = {}) {
       ? surface.buttons.map((button) => ({
           id: clampText(button.id, 80),
           controlId: clampText(button.controlId, 140),
+          visualRef: clampText(button.visualRef, 40),
           label: clampText(button.label, 220),
           semantic: clampText(button.semantic, 80),
           risk: clampText(button.risk, 80),
@@ -536,6 +466,7 @@ function compactSurface(surface = {}) {
           stateElementId: clampText(button.stateElementId, 80),
           preferredActivationElementId: clampText(button.preferredActivationElementId, 80),
           actuators: compactActuators(button.actuators),
+          operations: compactControlOperations(button.operations),
           visualRegion: button.visualRegion || null,
           accessibility: compactAccessibilityNode(button.accessibility),
           box: button.box || null
@@ -559,19 +490,65 @@ function compactActuators(actuators = []) {
 function compactControlFields(item = {}) {
   return {
     controlId: clampText(item.controlId, 140),
+    visualRef: clampText(item.visualRef, 40),
     decisionGroupId: clampText(item.decisionGroupId, 140),
     controlKind: clampText(item.controlKind || item.kind, 80),
     controlState: item.controlState || item.state || null,
     stateElementId: clampText(item.stateElementId, 80),
     preferredActivationElementId: clampText(item.preferredActivationElementId, 80),
+    operations: compactControlOperations(item.operations),
+    recovery: compactControlRecovery(item.recovery),
     actuators: compactActuators(item.actuators),
     visualRegion: item.visualRegion || null
   };
 }
 
+function compactControlOperations(operations = {}) {
+  return Object.fromEntries(Object.entries(operations || {}).map(([name, capability]) => [
+    clampText(name, 40),
+    capability ? {
+      operation: clampText(capability.operation || name, 40),
+      actuatorId: clampText(capability.actuatorId, 80),
+      actuatorIds: Array.isArray(capability.actuatorIds) ? capability.actuatorIds.map((id) => clampText(id, 80)).filter(Boolean).slice(0, 8) : [],
+      precondition: capability.precondition || null,
+      expectedOutcome: clampText(capability.expectedOutcome, 80)
+    } : null
+  ]));
+}
+
+function compactControlRecovery(recovery = {}) {
+  return Object.fromEntries(Object.entries(recovery || {}).map(([name, capability]) => [
+    clampText(name, 40),
+    capability ? {
+      operation: clampText(capability.operation || name, 40),
+      status: clampText(capability.status, 40),
+      strategy: clampText(capability.strategy, 120),
+      requiresFreshObservation: Boolean(capability.requiresFreshObservation),
+      requiresVisualConfirmation: Boolean(capability.requiresVisualConfirmation),
+      regions: Array.isArray(capability.regions)
+        ? capability.regions.map((region) => ({
+            x: Number(region.x || 0),
+            y: Number(region.y || 0),
+            width: Number(region.width || 0),
+            height: Number(region.height || 0),
+            centerX: Number(region.centerX || 0),
+            centerY: Number(region.centerY || 0),
+            viewportWidth: Number(region.viewportWidth || 0),
+            viewportHeight: Number(region.viewportHeight || 0),
+            surfaceId: clampText(region.surfaceId, 80),
+            inViewport: region.inViewport !== false,
+            evidence: clampText(region.evidence, 120),
+            confidence: Number(region.confidence || 0)
+          })).slice(0, 4)
+        : []
+    } : null
+  ]));
+}
+
 function compactLogicalControl(control = {}) {
   return {
     controlId: clampText(control.controlId, 140),
+    visualRef: clampText(control.visualRef, 40),
     decisionGroupId: clampText(control.decisionGroupId, 140),
     label: clampText(control.label, 220),
     accessibleName: clampText(control.accessibleName, 220),
@@ -590,6 +567,8 @@ function compactLogicalControl(control = {}) {
     surfaceLabel: clampText(control.surfaceLabel, 220),
     stateElementId: clampText(control.stateElementId, 80),
     preferredActivationElementId: clampText(control.preferredActivationElementId, 80),
+    operations: compactControlOperations(control.operations),
+    recovery: compactControlRecovery(control.recovery),
     actuators: compactActuators(control.actuators),
     visualRegion: control.visualRegion || null
   };
@@ -608,9 +587,10 @@ function compactDecisionGroup(group = {}) {
     selectedLabel: clampText(group.selectedLabel, 220),
     selectedSemantic: clampText(group.selectedSemantic, 80),
     alternatives: Array.isArray(group.alternatives)
-      ? group.alternatives.map((choice) => ({
+        ? group.alternatives.map((choice) => ({
           controlId: clampText(choice.controlId, 140),
           targetId: clampText(choice.targetId, 80),
+          visualRef: clampText(choice.visualRef, 40),
           label: clampText(choice.label, 220),
           semantic: clampText(choice.semantic, 80),
           risk: clampText(choice.risk, 80),
@@ -620,219 +600,6 @@ function compactDecisionGroup(group = {}) {
       : [],
     evidence: Array.isArray(group.evidence) ? group.evidence.map((item) => clampText(item, 180)).slice(0, 5) : []
   };
-}
-
-function includesAny(value, patterns) {
-  const text = lowerText(value);
-  return patterns.some((pattern) => pattern.test(text));
-}
-
-function selectedChoiceLabels(section) {
-  return Array.isArray(section.choices)
-    ? section.choices.filter((choice) => choice.selected).map((choice) => choice.label || "")
-    : [];
-}
-
-function sectionHasChoice(section, matcher) {
-  return Array.isArray(section.choices) && section.choices.some((choice) => matcher(choice));
-}
-
-function sectionHasSelectedChoice(section, matcher) {
-  return Array.isArray(section.choices) && section.choices.some((choice) => choice.selected && matcher(choice));
-}
-
-function meaningfulActionBox(box = {}) {
-  return Boolean(
-    box &&
-    Number(box.width || 0) >= 24 &&
-    Number(box.height || 0) >= 16 &&
-    Number(box.centerX ?? box.x ?? 0) > -200
-  );
-}
-
-function fieldBySemantic(section, names) {
-  const wanted = new Set(names);
-  return (section.fields || []).filter((field) => wanted.has(field.semantic || field.field));
-}
-
-function fieldsComplete(section, names) {
-  const fields = fieldBySemantic(section, names);
-  if (!fields.length) return false;
-  return fields.every((field) => field.hasValue);
-}
-
-function checkedFieldLabels(section) {
-  return (section.fields || [])
-    .filter((field) => /radio|checkbox/i.test(field.kind || "") && field.hasValue)
-    .map((field) => field.label || "")
-    .filter(Boolean)
-    .map((text) => clampText(text, 240));
-}
-
-function hasBlockingErrorsForSection(page, section) {
-  const text = lowerText([section.label, section.type, section.text].join(" "));
-  return (page.errors || []).some((error) => {
-    const err = lowerText(error);
-    if (/select one option|select an option|choose one option|please select/.test(err)) return false;
-    if (section.type === "contact" && /email|phone|mobile|contact/.test(err)) return true;
-    if (section.type === "passenger" && /title|gender|first|surname|last|passenger|traveller|traveler/.test(err)) return true;
-    return text && err.includes(text.slice(0, 30));
-  });
-}
-
-function deriveSectionStatus(section, page) {
-  const type = section.type || "unknown";
-  const text = lowerText(`${section.label} ${section.text}`);
-  const selectedLabels = selectedChoiceLabels(section).join(" ");
-  const selectedText = lowerText(`${selectedLabels} ${(section.selected || []).join(" ")}`);
-  const hasRequiredChoice = sectionHasChoice(section, (choice) => (
-    /required_dropdown_choice|decline_baggage|decline_paid_extra|add_paid_extra|traveler_title/.test(choice.semantic || "")
-    || /select one|select an option|choose|no checked baggage|no,?\s*thanks|add to cart|premium|standard|mrs|mr\b/i.test(choice.label || "")
-  ));
-  const hasSelectedChoice = sectionHasSelectedChoice(section, () => true);
-  const hasBlockingError = hasBlockingErrorsForSection(page, section);
-
-  if (type === "continue") return "gate";
-  if (type === "payment") return "blocked";
-
-  if (type === "contact") {
-    const hasContactFields = fieldBySemantic(section, ["email", "confirm_email", "phone", "phone_country_code"]).length > 0;
-    const missingRequired = (section.fields || []).some((field) => field.required && !field.hasValue);
-    return hasContactFields && !missingRequired && !hasBlockingError ? "complete" : "incomplete";
-  }
-
-  if (type === "passenger") {
-    const namesDone = fieldsComplete(section, ["first_name", "last_name"]);
-    const titleDone = sectionHasSelectedChoice(section, (choice) => choice.semantic === "traveler_title" || /\bmr\b|mrs|ms/i.test(choice.label || ""))
-      || sectionHasSelectedChoice(section, () => /title|gender/i.test(text));
-    return namesDone && titleDone && !hasBlockingError ? "complete" : "incomplete";
-  }
-
-  if (type === "baggage") {
-    const selectedNoBaggage = /no checked baggage|no baggage|without baggage|go without/.test(selectedText)
-      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_baggage")
-      || checkedFieldLabels(section).some((label) => /no checked baggage|no baggage|without baggage|go without/.test(lowerText(label)));
-    const summarySaysNoBaggage = /checked baggage\s+no baggage selected/.test(lowerText(page.visibleText));
-    const hasBaggageDecision = hasRequiredChoice
-      || sectionHasChoice(section, (choice) => /decline_baggage|add_paid_extra/.test(choice.semantic || "") || /checked baggage|no checked baggage|\d+\s*x\s*\d+\s*kg|eur|€|\$/.test(choice.label || ""))
-      || /checked baggage|no checked baggage|\d+\s*x\s*\d+\s*kg/.test(text);
-    if (hasBaggageDecision) return selectedNoBaggage && !hasBlockingError ? "complete" : "incomplete";
-    return summarySaysNoBaggage ? "complete" : "unknown";
-  }
-
-  if (type === "bundle") {
-    const selectedDecline = /no,?\s*thanks|none/.test(selectedText)
-      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_paid_extra")
-      || checkedFieldLabels(section).some((label) => /no,?\s*thanks|none|without bundle/.test(lowerText(label)));
-    return selectedDecline && !hasBlockingError ? "complete" : "incomplete";
-  }
-
-  if (type === "flexible_ticket") {
-    const dropdowns = fieldBySemantic(section, ["required_dropdown_choice", "unknown"]).filter((field) => /choose|select|option|dropdown|combobox/i.test(`${field.label} ${field.kind}`));
-    const dropdownDone = dropdowns.length ? dropdowns.every((field) => field.hasValue) : false;
-    const selectedDecline = /none of the passengers|none|no,?\s*thanks|without/.test(selectedText)
-      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_paid_extra");
-    return (dropdownDone || selectedDecline) && !hasBlockingError ? "complete" : "incomplete";
-  }
-
-  if (type === "cancellation_insurance" || /cancellation|insurance|refund/.test(text)) {
-    const selectedDecline = /no,?\s*thanks|none|without/.test(selectedText)
-      || sectionHasSelectedChoice(section, (choice) => choice.semantic === "decline_paid_extra")
-      || checkedFieldLabels(section).some((label) => /no,?\s*thanks|none|without/.test(lowerText(label)));
-    return selectedDecline && !hasBlockingError ? "complete" : "incomplete";
-  }
-
-  if (hasRequiredChoice) return hasSelectedChoice ? "complete" : "incomplete";
-  if ((section.fields || []).some((field) => field.required && !field.hasValue)) return "incomplete";
-  if (hasBlockingError) return "incomplete";
-  return section.status || "unknown";
-}
-
-function objectiveForSection(section, status) {
-  if (status === "complete") return "Verified from current page state; do not touch unless a targeted error appears.";
-  const objectives = {
-    contact: "Fill contact fields from saved traveler profile.",
-    passenger: "Fill passenger title, first name, and surname from saved traveler profile.",
-    baggage: "Choose no checked baggage unless user explicitly approved paid bags.",
-    bundle: "Choose No thanks for paid bundle/support/SMS extras.",
-    flexible_ticket: "Choose None/no-passenger/zero-cost option for flexible ticket.",
-    cancellation_insurance: "Choose No thanks for cancellation/refund insurance.",
-    seat: "Skip paid seat selection unless included or explicitly approved.",
-    continue: "Stage exit gate; click only when no required tasks remain.",
-    payment: "Stop before real payment or final booking."
-  };
-  return objectives[section.type] || section.objective || "Resolve required visible controls safely.";
-}
-
-function reconcilePageState(payload, session) {
-  const page = payload.page || {};
-  const sections = (page.sections || []).map((section) => {
-    const status = deriveSectionStatus(section, page);
-    return {
-      ...section,
-      status,
-      objective: objectiveForSection(section, status)
-    };
-  });
-  const pendingTasks = sections
-    .filter((section) => !["continue", "payment"].includes(section.type))
-    .filter((section) => section.status !== "complete" && section.status !== "blocked")
-    .filter((section) => section.required || section.paidChoice || ["contact", "passenger", "baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"].includes(section.type))
-    .map((section) => ({
-      id: `task-${section.id}`,
-      sectionId: section.id,
-      sectionLabel: section.label,
-      sectionType: section.type,
-      order: section.order,
-      status: "pending",
-      objective: section.objective,
-      rule: section.paidChoice ? "Saved traveler rules decide routine paid extras before asking." : "Use saved traveler profile and verify current page state."
-    }));
-  const continueButton = (page.buttons || []).find((button) => (
-    button.risk === "safe_continue" &&
-    !/skip to/i.test(button.label || "") &&
-    meaningfulActionBox(button.box)
-  ));
-  const blockers = [];
-  if (pendingTasks.length) blockers.push(`pending: ${pendingTasks[0].sectionLabel}`);
-  if ((page.overlays || []).length) blockers.push("visible overlay/menu/modal");
-  if ((page.errors || []).length) blockers.push(`visible errors: ${page.errors.slice(0, 2).join("; ")}`);
-  if (!continueButton) blockers.push("no safe Continue button");
-  const stageExit = {
-    continueAllowed: Boolean(!pendingTasks.length && !(page.overlays || []).length && !(page.errors || []).length && continueButton && !["payment", "confirmation"].includes(page.step)),
-    continueTargetId: continueButton?.id || "",
-    blockers
-  };
-
-  if (session) {
-    session.completedSections = session.completedSections || {};
-    for (const section of sections) {
-      if (section.status === "complete") {
-        session.completedSections[section.type] = {
-          label: section.label,
-          at: now()
-        };
-      }
-    }
-  }
-
-  payload.page = {
-    ...page,
-    sections,
-    taskQueue: pendingTasks,
-    stageExit,
-    reconciliation: {
-      completedSections: sections.filter((section) => section.status === "complete").map((section) => section.type),
-      pendingSections: pendingTasks.map((task) => task.sectionType),
-      nextTask: pendingTasks[0] || null
-    },
-    summary: {
-      ...(page.summary || {}),
-      pendingTasks: pendingTasks.length,
-      completedSections: sections.filter((section) => section.status === "complete").length
-    }
-  };
-  return payload;
 }
 
 function compactAgentPayload(body) {
@@ -845,10 +612,8 @@ function compactAgentPayload(body) {
         label: clampText(section.label, 120),
         type: clampText(section.type, 80),
         order: Number(section.order || 0),
-        status: clampText(section.status, 80),
         required: Boolean(section.required),
         paidChoice: Boolean(section.paidChoice),
-        objective: clampText(section.objective, 260),
         selected: Array.isArray(section.selected) ? section.selected.map((item) => clampText(item, 120)).slice(0, 8) : [],
         box: section.box || null,
         fields: Array.isArray(section.fields)
@@ -894,18 +659,6 @@ function compactAgentPayload(body) {
         text: clampText(section.text, 900)
       })).slice(0, 20)
     : [];
-  const taskQueue = Array.isArray(page.taskQueue)
-    ? page.taskQueue.map((task) => ({
-        id: clampText(task.id, 80),
-        sectionId: clampText(task.sectionId, 80),
-        sectionLabel: clampText(task.sectionLabel, 120),
-        sectionType: clampText(task.sectionType, 80),
-        order: Number(task.order || 0),
-        status: clampText(task.status, 80),
-        objective: clampText(task.objective, 260),
-        rule: clampText(task.rule, 260)
-      })).slice(0, 30)
-    : [];
   const activeSurface = compactSurface(page.activeSurface || {});
   const currentSurface = compactSurface(page.currentSurface || page.activeSurface || {});
   const surfaceStack = Array.isArray(page.surfaceStack)
@@ -920,7 +673,13 @@ function compactAgentPayload(body) {
     userMessage: clampText(body.userMessage || "", 800),
     approvalState: {
       skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved),
-      paymentApproved: Boolean(body.approvalState?.paymentApproved)
+      paymentApproved: Boolean(body.approvalState?.paymentApproved),
+      paymentAuthorization: body.approvalState?.paymentAuthorization && typeof body.approvalState.paymentAuthorization === "object"
+        ? body.approvalState.paymentAuthorization
+        : null,
+      priceAuthorization: body.approvalState?.priceAuthorization && typeof body.approvalState.priceAuthorization === "object"
+        ? body.approvalState.priceAuthorization
+        : null
     },
     actionHistory: Array.isArray(body.actionHistory)
       ? body.actionHistory.map((item) => ({
@@ -962,10 +721,38 @@ function compactAgentPayload(body) {
       site: clampText(page.site, 80),
       url: clampText(page.url, 500),
       step: clampText(page.step, 80),
+      viewport: page.viewport && typeof page.viewport === "object" ? page.viewport : null,
       snapshotHash: clampText(page.snapshotHash, 120),
+      graphIntegrity: page.graphIntegrity && typeof page.graphIntegrity === "object" ? {
+        ok: page.graphIntegrity.ok !== false,
+        conflicts: Array.isArray(page.graphIntegrity.conflicts) ? page.graphIntegrity.conflicts.slice(0, 20) : [],
+        resolvedConflictCount: Number(page.graphIntegrity.resolvedConflictCount || 0),
+        duplicateElementRekeyCount: Number(page.graphIntegrity.duplicateElementRekeyCount || 0),
+        aliasConflictCount: Number(page.graphIntegrity.aliasConflictCount || 0),
+        aliasConflicts: Array.isArray(page.graphIntegrity.aliasConflicts) ? page.graphIntegrity.aliasConflicts.slice(0, 20) : []
+      } : null,
+      itineraryFingerprint: clampText(page.itineraryFingerprint || page.summary?.itineraryFingerprint, 160),
+      offerFingerprint: clampText(page.offerFingerprint || page.summary?.offerFingerprint, 160),
       priceText: clampText(page.priceText, 80),
       price: page.price && typeof page.price === "object" ? page.price : null,
       screenshotDataUrl: screenshotDataUrl.startsWith("data:image/") ? screenshotDataUrl.slice(0, 5_000_000) : "",
+      screenshotAnnotations: Array.isArray(page.screenshotAnnotations)
+        ? page.screenshotAnnotations.map((item) => ({
+            visualRef: clampText(item.visualRef, 40),
+            targetId: clampText(item.targetId, 80),
+            controlId: clampText(item.controlId, 140),
+            decisionGroupId: clampText(item.decisionGroupId, 140),
+            label: clampText(item.label, 220),
+            kind: clampText(item.kind, 80),
+            role: clampText(item.role, 80),
+            semantic: clampText(item.semantic, 80),
+            risk: clampText(item.risk, 80),
+            selected: Boolean(item.selected),
+            required: Boolean(item.required),
+            source: clampText(item.source, 80),
+            box: item.box || null
+          })).filter((item) => item.visualRef).slice(0, 80)
+        : [],
       foreground: compactVisualState({ foreground: page.foreground || page.visualState?.foreground || null })?.foreground || null,
       visualState: compactVisualState(page.visualState),
       accessibility: page.accessibility && typeof page.accessibility === "object" ? {
@@ -979,25 +766,39 @@ function compactAgentPayload(body) {
       coverage: page.coverage || {},
       visibleText: clampText(page.text || page.fullText, 6000),
       errors: Array.isArray(page.errors) ? page.errors.map((item) => clampText(item, 220)).slice(0, 8) : [],
+      validationIssues: Array.isArray(page.validationIssues)
+        ? page.validationIssues.map((issue) => ({
+            issueId: clampText(issue.issueId, 140),
+            message: clampText(issue.message, 220),
+            controlId: clampText(issue.controlId, 140),
+            semanticType: clampText(issue.semanticType, 80),
+            sectionId: clampText(issue.sectionId, 80),
+            sectionType: clampText(issue.sectionType, 80),
+            surfaceId: clampText(issue.surfaceId, 80),
+            stageWide: Boolean(issue.stageWide)
+          })).filter((issue) => issue.message).slice(0, 12)
+        : [],
       paidChoices: Array.isArray(page.paidChoices) ? page.paidChoices.map((item) => clampText(item, 160)).slice(0, 8) : [],
-      sectionProgress: page.sectionProgress && typeof page.sectionProgress === "object" ? page.sectionProgress : {},
-      completedSections: page.completedSections && typeof page.completedSections === "object" ? page.completedSections : {},
       completedFields: page.completedFields && typeof page.completedFields === "object" ? page.completedFields : {},
       sections,
       controls: Array.isArray(page.controls)
         ? page.controls.map(compactLogicalControl).filter((control) => control.controlId).slice(0, 180)
         : [],
+      controlAliases: Array.isArray(page.controlAliases)
+        ? page.controlAliases.map((entry) => ({
+            aliasId: clampText(entry.aliasId, 140),
+            controlId: clampText(entry.controlId, 140),
+            kind: clampText(entry.kind, 40)
+          })).filter((entry) => entry.aliasId && entry.controlId).slice(0, 1200)
+        : [],
       decisionGroups: Array.isArray(page.decisionGroups)
         ? page.decisionGroups.map(compactDecisionGroup).filter((group) => group.decisionGroupId).slice(0, 80)
         : [],
-      taskQueue,
       stageExit: page.stageExit || {},
       reconciliation: page.reconciliation || {},
       activeSurface,
       currentSurface,
       surfaceStack,
-      currentSurfaceTasks: Array.isArray(page.currentSurfaceTasks) ? page.currentSurfaceTasks.slice(0, 20) : [],
-      backgroundTasks: Array.isArray(page.backgroundTasks) ? page.backgroundTasks.slice(0, 20) : [],
       fields: Array.isArray(page.fields)
         ? page.fields.map((field) => ({
             id: clampText(field.id, 80),
@@ -1039,19 +840,13 @@ function compactAgentPayload(body) {
   };
 }
 
-// The new decision path: observe -> verify -> plan -> policy -> act, with
-// canonical session state and per-turn traces. Supersedes decideAgentNextAction
-// (kept below, unused by default) which trusted JS-computed section status as
-// ground truth — reconcilePageState/deriveSectionStatus are intentionally NOT
-// called here; that JS-guessed status is exactly what the requirement
-// extractor + verifier replace.
+// The decision path: observe -> verify -> plan -> policy -> act, with canonical
+// session state and per-turn traces.
 async function decideAgentNextActionViaLoop(body) {
   const payload = compactAgentPayload(body);
-  const state = agentSessionStore.getOrCreateSession(payload.sessionId, {
-    goal: payload.userIntent,
-    travelerId: payload.traveler?.id || "",
-    site: { host: payload.page?.site || "", url: payload.page?.url || "" }
-  });
+  if (!payload.sessionId) throw new Error("DURABLE_SESSION_REQUIRED");
+  let state = agentSessionStore.getSession(payload.sessionId);
+  if (!state) throw new Error("DURABLE_SESSION_NOT_FOUND");
 
   const observation = {
     observationId: payload.observationId,
@@ -1061,17 +856,39 @@ async function decideAgentNextActionViaLoop(body) {
     lastActionResult: payload.lastActionResult || null
   };
 
+  agentSessionStore.recordObservation(state.id, observation);
+  state = agentSessionStore.getSession(state.id) || state;
+  state = agentSessionStore.saveSession(withUpdate(state, {
+    userIntent: payload.userIntent || state.userIntent || state.goal,
+    travelerIds: [payload.traveler?.id || state.travelerId].filter(Boolean),
+    policySnapshot: {
+      bookingRules: payload.traveler?.booking_rules || state.policySnapshot?.bookingRules || "",
+      baggagePreference: payload.traveler?.baggage_preference || state.policySnapshot?.baggagePreference || "",
+      preferredSeat: payload.traveler?.preferred_seat || state.policySnapshot?.preferredSeat || "",
+      paymentPreference: payload.traveler?.payment_preference || state.policySnapshot?.paymentPreference || ""
+    },
+    approvals: {
+      ...(state.approvals || {}),
+      skipPaidExtrasApproved: Boolean(payload.approvalState?.skipPaidExtrasApproved || state.approvals?.skipPaidExtrasApproved),
+      paymentAuthorization: payload.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
+      priceAuthorization: payload.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
+    }
+  }));
+
   logAgent("loop turn start", { clientTurnId: payload.clientTurnId, observationId: payload.observationId, sessionId: state.id, site: payload.page?.site, step: state.currentStep, stallCount: state.stallCount || 0 });
 
   try {
     const { state: nextState, clientDecision, debug } = await agentLoop.runLoopTurn({
       apiKey: OPENAI_API_KEY,
       model: AGENT_MODEL,
+      recoveryModel: AGENT_RECOVERY_MODEL,
       dataDir: DATA_DIR,
       state,
       observation,
       traveler: payload.traveler,
-      actionHistory: payload.actionHistory
+      actionHistory: payload.actionHistory,
+      transactionStore: agentSessionStore,
+      clientTurnId: payload.clientTurnId
     });
     agentSessionStore.saveSession(nextState);
     const latency = debug?.latency || {};
@@ -1104,110 +921,11 @@ async function decideAgentNextActionViaLoop(body) {
       model: modelUsage.model || AGENT_MODEL,
       reason: debug?.final?.reason || clientDecision.reason || ""
     });
-    return { ...clientDecision, debug };
+    return { ...clientDecision, sessionId: nextState.id, debug };
   } catch (error) {
     logAgent("loop turn ERROR", { message: error.message });
     return aiUnavailableDecision(error.message);
   }
-}
-
-function scopedSection(section, isCurrent) {
-  if (isCurrent) return section;
-  return {
-    ...section,
-    fields: [],
-    choices: [],
-    buttons: [],
-    text: clampText(section.text, 260)
-  };
-}
-
-function allowedTargetIdsForSection(section) {
-  if (!section) return [];
-  return [
-    ...(section.fields || []).map((field) => field.controlId),
-    ...(section.choices || []).map((choice) => choice.controlId),
-    ...(section.buttons || []).map((button) => button.controlId),
-    ...(section.fields || []).map((field) => field.id),
-    ...(section.choices || []).map((choice) => choice.id),
-    ...(section.buttons || []).map((button) => button.id)
-  ].filter(Boolean);
-}
-
-function activeSurfaceTargetIds(activeSurface) {
-  if (!activeSurface || activeSurface.type === "page") return [];
-  return [
-    ...(activeSurface.options || []).map((option) => option.controlId),
-    ...(activeSurface.buttons || []).map((button) => button.controlId),
-    ...(activeSurface.options || []).map((option) => option.id),
-    ...(activeSurface.buttons || []).map((button) => button.id)
-  ].filter(Boolean);
-}
-
-function defaultActiveSurface() {
-  return { type: "page", id: "", label: "", role: "", taskHint: "", options: [], buttons: [] };
-}
-
-function scopePayloadToCurrentTask(payload) {
-  const page = payload.page || {};
-  const activeSurface = page.activeSurface || defaultActiveSurface();
-  const surfaceActive = activeSurface.type && activeSurface.type !== "page";
-  const nextTask = page.reconciliation?.nextTask || null;
-  const currentTask = surfaceActive
-    ? {
-        id: `active_surface:${activeSurface.type}:${activeSurface.id || "visible"}`,
-        sectionId: activeSurface.id || "",
-        sectionLabel: activeSurface.label || activeSurface.taskHint || activeSurface.type,
-        sectionType: "active_surface",
-        order: 0,
-        status: "pending",
-        objective: `Resolve the visible ${activeSurface.type} before touching the background page.`,
-        rule: "Foreground surfaces usually own the next action, but the background page is still a valid target if that's what the screenshot actually shows is correct."
-      }
-    : nextTask;
-
-  // Union everything the page/detectors found, current-task or not, surface or not.
-  // classifyStep/section-type guesses only ever narrow this list, which is exactly what
-  // caused the agent to see a control on screen but have no id it was "allowed" to touch.
-  // The only real gate left is: does this id exist anywhere on the page at all, plus the
-  // structural guardrails upstream (payment fields are excluded from candidateInputs()
-  // before they ever reach this payload, see content.js isPaymentField).
-  const allowedTargetIds = new Set([
-    ...(page.controls || []).map((control) => control.controlId),
-    ...(page.fields || []).map((field) => field.id),
-    ...(page.fields || []).map((field) => field.controlId),
-    ...(page.buttons || []).map((button) => button.id),
-    ...(page.buttons || []).map((button) => button.controlId),
-    ...(page.sections || []).flatMap((section) => allowedTargetIdsForSection(section)),
-    ...activeSurfaceTargetIds(activeSurface)
-  ].filter(Boolean));
-  if (page.stageExit?.continueAllowed && page.stageExit.continueTargetId) allowedTargetIds.add(page.stageExit.continueTargetId);
-
-  return {
-    ...payload,
-    page: {
-      ...page,
-      currentTask,
-      allowedTargetIds: [...allowedTargetIds],
-      activeSurface,
-      sections: (page.sections || []).map((section) => scopedSection(section, !surfaceActive)),
-      fields: page.fields || [],
-      buttons: page.buttons || [],
-      paidChoices: (page.paidChoices || []).slice(0, 4)
-    }
-  };
-}
-
-function decisionInsideCurrentScope(decision, payload) {
-  if (!["click", "type", "select"].includes(decision?.action)) return true;
-  const allowed = new Set(payload.page?.allowedTargetIds || []);
-  if (!allowed.size) return true;
-  if (decision.targetId && allowed.has(decision.targetId)) return true;
-  // targetId missing or stale (e.g. the DOM node it pointed at got replaced by a
-  // React re-render between scans) — as long as there's a visible-text label to go
-  // on, let it through so the client's live-page label match (resolveDecisionTarget)
-  // gets a chance instead of discarding the whole turn.
-  return Boolean(decision.value || decision.coordinate);
 }
 
 function aiUnavailableDecision(reason) {
@@ -1223,34 +941,6 @@ function aiUnavailableDecision(reason) {
   };
 }
 
-function noExtrasApprovedForPayload(payload) {
-  return payload.approvalState?.skipPaidExtrasApproved
-    || includesAny(payload.traveler?.booking_rules, [/no paid/i, /no extras/i, /no add-?ons/i, /no seat/i, /no insurance/i, /no bundle/i]);
-}
-
-function safeDeclineSurfaceOption(activeSurface) {
-  const options = [...(activeSurface?.options || []), ...(activeSurface?.buttons || [])]
-    .filter((option, index, list) => option?.id && !option.selected && list.findIndex((item) => item?.id === option.id) === index);
-  const surfaceText = `${activeSurface?.taskHint || ""} ${activeSurface?.label || ""}`.toLowerCase();
-  const isSeatSurface = /seat|reserve seating|seat map/.test(surfaceText);
-  const scoreOption = (option) => {
-    const label = String(option.label || "").toLowerCase();
-    if (!label) return -1000;
-    if (/add|buy|upgrade|premium|cart|add to my trip/.test(label) && !/no|none|without|0\s*(eur|€|usd|\$)/.test(label)) return -100;
-    if (/safe_decline/i.test(option.risk || "") || /decline_paid_extra/i.test(option.semantic || "")) return 120;
-    if (/none of the passengers|none of the travellers|none of the travelers/.test(label)) return 115;
-    if (/0\s*(eur|€|usd|\$)|free/.test(label)) return 105;
-    if (/i.ll go without|go without|continue without/.test(label)) return 95;
-    if (/no,?\s*thanks|not now|skip|decline|no checked baggage|no baggage/.test(label)) return 90;
-    if (isSeatSurface && /\bnext\b|skip seat selection|random seat|no seat/.test(label)) return 70;
-    return -10;
-  };
-  return options
-    .map((option) => ({ option, score: scoreOption(option) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score)[0]?.option || null;
-}
-
 function sanitizeAgentError(reason) {
   const text = clampText(reason, 220)
     .replace(/sk-[A-Za-z0-9_-]+/g, "[redacted-key]")
@@ -1258,246 +948,6 @@ function sanitizeAgentError(reason) {
   if (/incorrect api key/i.test(text)) return "OpenAI rejected the configured API key";
   if (/OPENAI_API_KEY is not set/i.test(text)) return "OPENAI_API_KEY is not set";
   return text;
-}
-
-function normalizeAgentDecision(decision) {
-  const allowedActions = new Set(["click", "type", "select", "fill_known_fields", "ask_user", "final_review", "save_trip", "wait", "stop"]);
-  const allowedRisks = new Set(["safe", "money", "payment", "legal", "uncertain"]);
-  const action = allowedActions.has(decision?.action) ? decision.action : "stop";
-  const risk = allowedRisks.has(decision?.risk) ? decision.risk : "uncertain";
-  return {
-    source: clampText(decision?.source || "openai", 40),
-    action,
-    targetId: clampText(decision?.targetId || "", 120),
-    value: clampText(decision?.value || "", 600),
-    message: clampText(decision?.message || "The AI returned an incomplete action, so I stopped.", 600),
-    needsApproval: Boolean(decision?.needsApproval),
-    risk,
-    reason: clampText(decision?.reason || "Validated OpenAI structured action.", 400)
-  };
-}
-
-function extractResponseText(response) {
-  if (typeof response.output_text === "string") return response.output_text;
-  for (const item of response.output || []) {
-    for (const content of item.content || []) {
-      if (content.type === "output_text" && content.text) return content.text;
-    }
-  }
-  return "";
-}
-
-function adapterHints(site) {
-  const hints = {
-    gotogate: [
-      "GoToGate commonly shows paid bundles, baggage, SMS updates, AirHelp, and cancellation guarantee upsells.",
-      "Treat Configure your trip, Select baggage, bundle, voucher refund, and cancellation guarantee as extras, not payment.",
-      "Prefer No thanks / no checked baggage / no add-on when approvalState.skipPaidExtrasApproved is true; that approval may come from the saved traveler profile rules.",
-      "Do not infer payment step from an order summary mentioning payment options."
-    ],
-    "croatia-airlines": [
-      "Croatia Airlines checkout may use custom controls and step progress labels.",
-      "Use active page content and visible required-field errors over inactive stepper labels.",
-      "Stop before any final purchase or payment submission."
-    ],
-    skyscanner: [
-      "Skyscanner is usually flight search/redirect, not final checkout.",
-      "Summarize selected itinerary and expect redirect to airline or OTA checkout.",
-      "After redirect, reclassify the new seller page from scratch."
-    ],
-    demo: [
-      "Local demo pages use data attributes for safe test actions.",
-      "Demo payment may be clicked only when the demo payment action is explicitly selected."
-    ],
-    generic: [
-      "Prefer visible labels, ARIA labels, and nearby text to infer fields and safe actions.",
-      "If page structure is unclear, ask the user instead of guessing."
-    ]
-  };
-  return hints[site] || hints.generic;
-}
-
-async function callOpenAiAgent(payload) {
-  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set");
-  const screenshotDataUrl = payload.page?.screenshotDataUrl || "";
-  const promptPayload = {
-    ...payload,
-    page: {
-      ...payload.page,
-      screenshotDataUrl: screenshotDataUrl ? "[attached separately]" : ""
-    },
-    adapterHints: adapterHints(payload.page?.site)
-  };
-  const schema = {
-    type: "object",
-    additionalProperties: false,
-    required: ["action", "targetId", "value", "message", "needsApproval", "risk", "reason"],
-    properties: {
-      action: { type: "string", enum: ["click", "type", "select", "fill_known_fields", "ask_user", "final_review", "save_trip", "wait", "stop"] },
-      targetId: { type: "string" },
-      value: { type: "string" },
-      message: { type: "string" },
-      needsApproval: { type: "boolean" },
-      risk: { type: "string", enum: ["safe", "money", "payment", "legal", "uncertain"] },
-      reason: { type: "string" }
-    }
-  };
-  const response = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${OPENAI_API_KEY}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: AGENT_MODEL,
-      instructions: [
-        "You are the planning brain for Air Travel Wallet, a browser checkout copilot.",
-        "Return one structured action only. The Chrome extension will validate and execute it.",
-        "Never approve payment, final booking, legal terms, or price increases without asking the user.",
-        "Routine declines of paid extras are safe when approvalState.skipPaidExtrasApproved is true because that reflects saved traveler profile rules.",
-        "Follow traveler.booking_rules as durable user preference context unless the user says otherwise in the current chat.",
-        "Do not ask the user for saved traveler/profile details that are present in traveler or can be filled by fill_known_fields.",
-        "If contact or passenger fields are visible and empty, prefer fill_known_fields before asking the user.",
-        "If traveler.booking_rules says avoid/no paid extras, no seats, no insurance, no bundles, or no add-ons, treat routine decline/skip/no-thanks choices as safe.",
-        "Operate visual-first: decide from the current visible screen using the screenshot plus DOM controls, then let the extension execute precisely.",
-        "When page.controls is present, prefer returning its controlId as targetId. A controlId represents one logical control across input, label, wrapper, ARIA proxy, and visual region; the executor will choose the safest actuator.",
-        "page.activeSurface, when present, is usually the right thing to resolve first (dropdown, modal, popover, confirmation) — but it is a detector's best guess, not ground truth. If the screenshot clearly shows something else is the correct next action, trust the screenshot over activeSurface.type being 'page'.",
-        "For activeSurface dropdown/listbox options, prefer options marked safe_decline when saved traveler rules approve skipping paid extras. Avoid options marked paid unless the user explicitly approves.",
-        "If a modal/dialog surface's own choice is already selected/registered (e.g. a decline option shows selected, or actionHistory shows you already picked it) but the surface is still open, do not repeat that same choice — look in activeSurface.options for its own dismiss/confirm control (Next, Continue, Close, Done, Confirm) and click that instead to actually leave the dialog.",
-        "targetId is a best-effort DOM id from a heuristic scan and can be missing or stale for things like custom dropdowns, popovers, and canvas/visual widgets (e.g. seat maps) even when you can clearly see them in the screenshot. Whenever you are not fully confident in targetId — or have none — set value to the exact visible text label of the control you mean. The extension will re-resolve that label against the live page at click time, which is more reliable than a guessed id.",
-        "Use page.sections as visual decomposition and memory, not as a hard script. Each section has type, status, objective, fields, buttons, selected values, and coordinates.",
-        "Use page.taskQueue and page.currentTask as hints for unresolved background work, but choose the best next visible safe action from the whole screen.",
-        "Choose targetId only from page.allowedTargetIds unless you are returning wait, stop, ask_user, or final_review. For normal pages this contains all visible actionable controls.",
-        "Do not let a stale section/task label block an obvious visible safe action. Active visible UI and latest screenshot are more authoritative than old queue assumptions.",
-        "page.stageExit.continueAllowed is a cheap backend guess, not proof — it has been wrong before (e.g. missing a second required radio group bundled into a section that already had one choice made). Before clicking page.stageExit.continueTargetId, look at the ENTIRE screenshot yourself: any required-looking radio group, checkbox, or dropdown that still shows a placeholder/unselected state, or any red/warning icon or asterisk near an empty control, even if page.sections or page.taskQueue call that area 'complete'. If you find one, act on that control instead of clicking Continue, regardless of what continueAllowed says.",
-        "If actionHistory shows you already clicked page.stageExit.continueTargetId and the page did not advance (same fields, same step, still here), do not click it again — that is a strong signal something required is still unanswered somewhere on the visible page; scan the screenshot for it instead of repeating Continue.",
-        "Continue is represented by page.stageExit, not as a normal task. Only choose page.stageExit.continueTargetId after the visual check above finds nothing outstanding.",
-        "Do not modify sections whose status is complete unless page.errors explicitly targets that section.",
-        "Prefer filling known traveler fields, declining routine paid extras when approvalState.skipPaidExtrasApproved is true, and clicking safe Continue buttons.",
-        "When skipPaidExtrasApproved is true and an overlay is a seat, baggage, bundle, cancellation, flexible ticket, insurance, or add-on popup, do not ask the user; choose the safe decline/skip/next action if one is available.",
-        "Do not select controls that are already selected; if skip choices are already selected, proceed with a safe Continue action.",
-        "Use element boxes to match screenshot-visible controls to targetIds; prefer visible primary/bottom Continue buttons over header/footer or skip links.",
-        "If an element appears outside the active checkout content, avoid it unless no safer target exists.",
-        "Use the screenshot as visual context when DOM text is incomplete or confusing.",
-        "If page.overlays contains a visible dialog, menu, or listbox, resolving it is normally the priority before assuming the previous page is done — unless the screenshot shows it's already effectively resolved or irrelevant to the current goal.",
-        "Use actionHistory to avoid repeating actions that already failed verification.",
-        "Use adapter hints as guidance, but trust current visible page state over assumptions.",
-        "Choose targetId only from the provided fields/buttons. Use empty string when no target is needed.",
-        "If unsure, ask_user with a short clear question.",
-        "The reason field is a concise user-visible rationale, not hidden chain-of-thought."
-      ].join(" "),
-      input: [
-        {
-          role: "user",
-          content: [
-            { type: "input_text", text: JSON.stringify(promptPayload) },
-            ...(screenshotDataUrl ? [{ type: "input_image", image_url: screenshotDataUrl }] : [])
-          ]
-        }
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "checkout_agent_action",
-          strict: true,
-          schema
-        }
-      },
-      max_output_tokens: 700
-    })
-  });
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenAI agent request failed: ${response.status} ${errorText.slice(0, 200)}`);
-  }
-  const data = await response.json();
-  return JSON.parse(extractResponseText(data));
-}
-
-function deterministicReconciledDecision(payload) {
-  const page = payload.page || {};
-  const nextTask = page.reconciliation?.nextTask;
-  const activeSurface = page.activeSurface || {};
-  const noExtrasApproved = noExtrasApprovedForPayload(payload);
-  if (activeSurface.type && activeSurface.type !== "page" && noExtrasApproved) {
-    const decline = safeDeclineSurfaceOption(activeSurface);
-    if (decline?.id) {
-      return normalizeAgentDecision({
-        source: "reconciler",
-        action: "click",
-        targetId: decline.id,
-        value: "",
-        message: `Resolving the open ${activeSurface.type}: ${decline.label}.`,
-        needsApproval: false,
-        risk: "safe",
-        reason: "Active surface resolver found a visible safe decline / zero-cost option and saved traveler rules approve skipping paid extras."
-      });
-    }
-  }
-  if (page.stageExit?.continueAllowed && page.stageExit.continueTargetId) {
-    return normalizeAgentDecision({
-      source: "reconciler",
-      action: "click",
-      targetId: page.stageExit.continueTargetId,
-      value: "",
-      message: "All required sections are verified. Continuing to the next checkout step.",
-      needsApproval: false,
-      risk: "safe",
-      reason: "Backend reconciler found no pending tasks, no overlays, no errors, and a safe Continue button."
-    });
-  }
-
-  if (nextTask && ["contact", "passenger"].includes(nextTask.sectionType)) {
-    return normalizeAgentDecision({
-      source: "reconciler",
-      action: "fill_known_fields",
-      targetId: nextTask.sectionId,
-      value: "",
-      message: `Filling ${nextTask.sectionLabel} from the saved traveler profile.`,
-      needsApproval: false,
-      risk: "safe",
-      reason: "Backend reconciler found a pending profile section."
-    });
-  }
-
-  if (nextTask && noExtrasApproved && /baggage|bundle|flexible_ticket|cancellation_insurance|seat/.test(nextTask.sectionType)) {
-    const section = (page.sections || []).find((item) => item.id === nextTask.sectionId);
-    const decline = (section?.choices || []).find((choice) => (
-      /decline_baggage|decline_paid_extra/.test(choice.semantic || "")
-      || /no checked baggage|no,?\s*thanks|none of the passengers|go without|random seat/i.test(choice.label || "")
-    ));
-    if (decline?.id) {
-      return normalizeAgentDecision({
-        source: "reconciler",
-        action: "click",
-        targetId: decline.id,
-        value: "",
-        message: `Applying saved no-extras rule: ${decline.label}.`,
-        needsApproval: false,
-        risk: "safe",
-        reason: `Backend reconciler selected the safe decline choice for ${nextTask.sectionLabel}.`
-      });
-    }
-    const dropdown = (section?.fields || []).find((field) => (
-      /required_dropdown_choice|unknown/.test(field.semantic || field.field || "")
-      && /choose|select|option|dropdown|combobox/i.test(`${field.label || ""} ${field.kind || ""}`)
-      && !field.hasValue
-    ));
-    if (dropdown?.id) {
-      return normalizeAgentDecision({
-        source: "reconciler",
-        action: "select",
-        targetId: dropdown.id,
-        value: "None of the passengers",
-        message: `Applying saved no-extras rule for ${nextTask.sectionLabel}: selecting the zero-cost/no-passenger option.`,
-        needsApproval: false,
-        risk: "safe",
-        reason: "Backend reconciler found a pending no-extras dropdown and selected the safe decline value."
-      });
-    }
-  }
-
-  return null;
 }
 
 function logAgent(label, data) {
@@ -1578,125 +1028,11 @@ function writeActionLedgerRow(body = {}) {
     ...body
   };
   fs.appendFileSync(path.join(dir, `${transactionId}.jsonl`), `${JSON.stringify(row)}\n`);
+  const realTransactionId = clampText(body.transactionId || body.sessionId || "", 120);
+  if (realTransactionId && agentSessionStore.getSession(realTransactionId)) {
+    agentSessionStore.recordActionEvent(realTransactionId, row);
+  }
   return summarizeActionLedgerRow(row);
-}
-
-function findFieldById(scopedPayload, targetId) {
-  if (!targetId) return null;
-  const page = scopedPayload.page || {};
-  const direct = (page.fields || []).find((field) => field.id === targetId);
-  if (direct) return direct;
-  for (const section of page.sections || []) {
-    const match = (section.fields || []).find((field) => field.id === targetId);
-    if (match) return match;
-  }
-  return null;
-}
-
-function correctActionForFieldKind(decision, scopedPayload) {
-  if (decision.action !== "type") return decision;
-  const field = findFieldById(scopedPayload, decision.targetId);
-  if (!field || !["radio", "checkbox"].includes(field.kind)) return decision;
-  logAgent("auto-corrected decision: type -> click on radio/checkbox field", { targetId: decision.targetId, kind: field.kind, originalValue: decision.value });
-  return {
-    ...decision,
-    action: "click",
-    value: "",
-    reason: `${decision.reason} (Auto-corrected: target is a ${field.kind} control, so clicking instead of typing.)`
-  };
-}
-
-async function decideAgentNextAction(body) {
-  const payload = compactAgentPayload(body);
-  const existingSession = getAgentSession(payload.sessionId);
-  const reconciledPayload = reconcilePageState(payload, existingSession);
-  const session = updateAgentSessionFromPayload(existingSession, reconciledPayload);
-  const scopedPayload = scopePayloadToCurrentTask(reconciledPayload);
-  logAgent("request", {
-    sessionId: payload.sessionId,
-    site: reconciledPayload.page?.site,
-    step: reconciledPayload.page?.step,
-    activeSurface: reconciledPayload.page?.activeSurface?.type || "page",
-    summary: reconciledPayload.page?.summary
-  });
-  logAgent("sections detected", (reconciledPayload.page?.sections || []).map((section) => ({
-    label: section.label,
-    type: section.type,
-    status: section.status,
-    paidChoice: section.paidChoice,
-    fieldCount: (section.fields || []).length,
-    choiceCount: (section.choices || []).length
-  })));
-  logAgent("fields on page", (reconciledPayload.page?.fields || []).map((field) => ({
-    label: field.label?.slice(0, 60),
-    kind: field.kind,
-    detectedAs: field.field,
-    confidence: field.confidence,
-    hasValue: field.hasValue
-  })));
-  logAgent("task queue", (reconciledPayload.page?.taskQueue || []).map((task) => ({
-    section: task.sectionLabel,
-    type: task.sectionType,
-    status: task.status,
-    objective: task.objective
-  })));
-  if (reconciledPayload.page?.activeSurface?.type && reconciledPayload.page.activeSurface.type !== "page") {
-    logAgent("active surface (popup/dropdown open)", {
-      type: reconciledPayload.page.activeSurface.type,
-      label: reconciledPayload.page.activeSurface.label,
-      options: (reconciledPayload.page.activeSurface.options || []).map((option) => option.label)
-    });
-  }
-  try {
-    if (session) scopedPayload.taskState = summarizeAgentSession(session);
-    logAgent("calling openai", { model: AGENT_MODEL, currentTask: scopedPayload.page?.currentTask?.sectionLabel || "" });
-    const aiDecision = await callOpenAiAgent(scopedPayload);
-    if (!aiDecision) {
-      logAgent("openai returned no decision");
-      return aiUnavailableDecision("OpenAI returned no decision");
-    }
-    logAgent("openai decision", aiDecision);
-    const normalized = correctActionForFieldKind(normalizeAgentDecision({ ...aiDecision, source: "openai" }), scopedPayload);
-    if (!decisionInsideCurrentScope(normalized, scopedPayload)) {
-      logAgent("decision rejected: target not found on page and no usable label", { targetId: normalized.targetId, value: normalized.value, currentTask: scopedPayload.page?.currentTask?.sectionLabel || "" });
-      return normalizeAgentDecision({
-        source: "reconciler",
-        action: "wait",
-        targetId: "",
-        value: "",
-        message: "The control the AI picked isn't on the page anymore (likely replaced by the page re-rendering) and there was no visible label to fall back on, so I'm rescanning.",
-        needsApproval: false,
-        risk: "safe",
-        reason: `Current task is ${scopedPayload.page?.currentTask?.sectionLabel || "unknown"}.`
-      });
-    }
-    if (session) {
-      const sectionSnapshot = (reconciledPayload.page?.sections || []).map((section) => `${section.type}:${section.status}`).join("|");
-      const decisionSignature = `${normalized.action}:${normalized.targetId}:${normalized.value}`;
-      const isRepeat = decisionSignature === session.lastDecisionSignature && sectionSnapshot === session.lastSectionSnapshot;
-      session.stallCount = isRepeat ? (session.stallCount || 0) + 1 : 0;
-      session.lastDecisionSignature = decisionSignature;
-      session.lastSectionSnapshot = sectionSnapshot;
-      if (session.stallCount >= 3) {
-        logAgent("stall detected: same decision repeated with no section progress", { decisionSignature, repeats: session.stallCount });
-        return normalizeAgentDecision({
-          source: "reconciler",
-          action: "ask_user",
-          targetId: "",
-          value: "",
-          message: `I tried the same action ${session.stallCount + 1} times without any visible progress (last attempt: ${normalized.message || normalized.reason || "no message"}). Stopping here so you can take over this step.`,
-          needsApproval: true,
-          risk: "uncertain",
-          reason: "Stalled: identical decision repeated with no detected section progress."
-        });
-      }
-    }
-    logAgent("decision accepted", { action: normalized.action, targetId: normalized.targetId, risk: normalized.risk });
-    return normalized;
-  } catch (error) {
-    logAgent("ERROR", { message: error.message });
-    return aiUnavailableDecision(error.message);
-  }
 }
 
 function bootstrapPayload(db) {
@@ -1795,13 +1131,31 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === "POST" && pathname === "/api/agent/next-action") {
     const body = await readBody(req);
-    const decision = await decideAgentNextActionViaLoop(body);
-    return sendJson(res, 200, decision);
+    const sessionId = clampText(body.sessionId || "", 120);
+    if (!sessionId) return sendJson(res, 409, { error: "A durable checkout session is required before planning.", code: "DURABLE_SESSION_REQUIRED" });
+    if (!agentSessionStore.getSession(sessionId)) {
+      return sendJson(res, 409, { error: "The checkout session no longer exists; refusing to create a replacement transaction.", code: "DURABLE_SESSION_NOT_FOUND" });
+    }
+    try {
+      const decision = await decideAgentNextActionViaLoop(body);
+      return sendJson(res, 200, decision);
+    } catch (error) {
+      if (/^DURABLE_SESSION_/.test(error.message || "")) {
+        return sendJson(res, 409, { error: error.message, code: error.message });
+      }
+      throw error;
+    }
   }
 
   if (req.method === "POST" && pathname === "/api/agent/session") {
     const body = await readBody(req);
     const session = createAgentSession(body);
+    if (!session) {
+      return sendJson(res, 409, {
+        error: "The saved checkout session could not be resumed; refusing to create a replacement transaction.",
+        code: "DURABLE_SESSION_NOT_FOUND"
+      });
+    }
     return sendJson(res, 201, summarizeAgentSession(session));
   }
 
@@ -1817,6 +1171,13 @@ async function handleApi(req, res, pathname) {
     const state = agentSessionStore.getSession(sessionId);
     if (!state) return sendJson(res, 404, { error: "Checkout session not found" });
     return sendJson(res, 200, state);
+  }
+
+  if (req.method === "GET" && pathname.startsWith("/api/agent/transaction/")) {
+    const sessionId = pathname.slice("/api/agent/transaction/".length);
+    const transaction = agentSessionStore.reconstructTransaction(sessionId);
+    if (!transaction) return sendJson(res, 404, { error: "Checkout transaction not found" });
+    return sendJson(res, 200, transaction);
   }
 
   if (req.method === "GET" && pathname.startsWith("/api/agent/traces/")) {

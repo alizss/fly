@@ -19,6 +19,13 @@
  * @typedef {Object} AgentFailure
  * @property {string} at
  * @property {string} actionSignature
+ * @property {string} actuatorSignature
+ * @property {string} actionId
+ * @property {string} observationId
+ * @property {string} controlId
+ * @property {string} targetId
+ * @property {string} operation
+ * @property {string} code
  * @property {string} message
  *
  * @typedef {"flight_selection"|"traveler_information"|"extras"|"seats"|"payment"|"confirmation"|"unknown"} CheckoutStep
@@ -29,6 +36,7 @@
  * @property {SessionStatus} status
  * @property {string} goal
  * @property {string} travelerId
+ * @property {string[]} travelerIds
  * @property {{host: string, url: string, sellerName?: string}} site
  * @property {CheckoutStep} currentStep
  * @property {import("../requirements").CheckoutRequirement[]} requirements
@@ -39,6 +47,16 @@
  * @property {Object|null} lastVerification
  * @property {AgentFailure[]} failures
  * @property {string[]} traceIds
+ * @property {string} currentObservationId
+ * @property {string} currentObservationHash
+ * @property {Object[]} requirementLifecycle
+ * @property {Object[]} activeRequirements
+ * @property {Object|null} activeSkillPlan
+ * @property {Object|null} blockedObligation
+ * @property {Object|null} pendingRecoveryAction
+ * @property {Object|null} invariantBaseline
+ * @property {Object} paymentState
+ * @property {Object} confirmationState
  * @property {string} createdAt
  * @property {string} updatedAt
  */
@@ -64,9 +82,16 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     status: "running",
     goal: String(goal || "Complete checkout safely."),
     travelerId: String(travelerId || ""),
+    travelerIds: travelerId ? [String(travelerId)] : [],
+    policySnapshot: {},
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
     currentStep: "unknown",
     requirements: [],
+    requirementLifecycle: [],
+    activeRequirements: [],
+    activeSkillPlan: null,
+    blockedObligation: null,
+    pendingRecoveryAction: null,
     approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalApproved: false, priceIncreaseApproved: false },
     priceHistory: [],
     selectedOptions: [],
@@ -74,6 +99,13 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     lastVerification: null,
     failures: [],
     traceIds: [],
+    currentObservationId: "",
+    currentObservationHash: "",
+    itineraryFingerprint: "",
+    offerFingerprint: "",
+    invariantBaseline: null,
+    paymentState: { status: "not_authorized", authorizationId: "", attempts: 0, lastAttemptAt: "" },
+    confirmationState: { status: "not_confirmed", reference: "", confirmedAt: "" },
     createdAt: at,
     updatedAt: at
   };

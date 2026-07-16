@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Traveler profile fixture</title>
+  <style>
+    body { font-family: sans-serif; margin: 40px; }
+    form { display: grid; gap: 16px; width: 560px; }
+    label, fieldset { display: grid; gap: 6px; }
+    input, button { min-height: 38px; }
+    .phone { display: grid; grid-template-columns: 170px 1fr; gap: 12px; }
+    .country-picker { display: grid; gap: 6px; }
+    .country-control { display: grid; grid-template-columns: 1fr 38px; }
+    [role="listbox"] { position: fixed; left: 40px; top: 245px; width: 220px; padding: 8px; background: white; border: 1px solid #222; z-index: 20; }
+    [role="option"] { display: block; width: 100%; margin: 4px 0; text-align: left; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Traveller information</h1>
+    <form id="traveler-form">
+      <label for="email">E-mail *<input id="email" name="email" type="email" required></label>
+      <label for="confirm-email">Confirm e-mail address *<input id="confirm-email" name="confirm_email" type="email" required></label>
+      <div class="phone">
+        <div class="country-picker">
+          <label for="country-code">Country code</label>
+          <div class="country-control">
+            <input id="country-code" name="phone_country_code" role="combobox" aria-haspopup="listbox" aria-controls="country-options" aria-expanded="false" value="+44-1481">
+            <button id="country-code-arrow" type="button" aria-label="Open country codes" aria-haspopup="listbox" aria-controls="country-options" aria-expanded="false">v</button>
+          </div>
+        </div>
+        <label for="phone">Mobile number *<input id="phone" name="phone" type="tel" required></label>
+      </div>
+      <fieldset>
+        <legend>Title *</legend>
+        <label for="title-mr"><input id="title-mr" name="title" type="radio" value="male"> Mr</label>
+        <label for="title-ms"><input id="title-ms" name="title" type="radio" value="female"> Mrs/Ms</label>
+      </fieldset>
+      <label for="first-name">First name(s) *<input id="first-name" name="first_name" required></label>
+      <label for="surname">Surname *<input id="surname" name="last_name" required></label>
+      <label for="dob">Date of birth *<input id="dob" name="date_of_birth" placeholder="DD-MM-YYYY" required></label>
+    </form>
+    <div id="country-options" role="listbox" aria-label="Country code" hidden>
+      <button id="country-guernsey" type="button" role="option" data-value="+44-1481">Guernsey +44-1481</button>
+      <button id="country-slovenia" type="button" role="option" data-value="+386">Slovenia +386</button>
+    </div>
+  </main>
+  <script>
+    const country = document.getElementById("country-code");
+    const countryArrow = document.getElementById("country-code-arrow");
+    const options = document.getElementById("country-options");
+    countryArrow.addEventListener("click", () => {
+      options.hidden = false;
+      country.setAttribute("aria-expanded", "true");
+      countryArrow.setAttribute("aria-expanded", "true");
+    });
+    options.addEventListener("click", (event) => {
+      const option = event.target.closest("[role='option']");
+      if (!option) return;
+      country.value = option.dataset.value;
+      country.dispatchEvent(new Event("input", { bubbles: true }));
+      country.dispatchEvent(new Event("change", { bubbles: true }));
+      country.setAttribute("aria-expanded", "false");
+      countryArrow.setAttribute("aria-expanded", "false");
+      options.hidden = true;
+    });
+    for (const input of document.querySelectorAll("input:not([role='combobox']):not([type='radio'])")) {
+      input.addEventListener("blur", () => {
+        const replacement = input.cloneNode(true);
+        replacement.value = input.value;
+        input.replaceWith(replacement);
+      });
+    }
+  </script>
+</body>
+</html>

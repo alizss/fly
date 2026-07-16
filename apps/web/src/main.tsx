@@ -1,22 +1,19 @@
 import React, { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { AnimatePresence, motion } from "framer-motion";
-import {
-  BadgeCheck,
-  BriefcaseBusiness,
-  CalendarDays,
-  CircleAlert,
-  Clock3,
-  Luggage,
-  MapPinned,
-  Plane,
-  Radar,
-  ReceiptText,
-  Settings,
-  Sparkles,
-  UserRound,
-  UsersRound
-} from "lucide-react";
+import BadgeCheck from "lucide-react/dist/esm/icons/badge-check.mjs";
+import BriefcaseBusiness from "lucide-react/dist/esm/icons/briefcase-business.mjs";
+import CalendarDays from "lucide-react/dist/esm/icons/calendar-days.mjs";
+import CircleAlert from "lucide-react/dist/esm/icons/circle-alert.mjs";
+import Clock3 from "lucide-react/dist/esm/icons/clock-3.mjs";
+import Luggage from "lucide-react/dist/esm/icons/luggage.mjs";
+import MapPinned from "lucide-react/dist/esm/icons/map-pinned.mjs";
+import Plane from "lucide-react/dist/esm/icons/plane.mjs";
+import Radar from "lucide-react/dist/esm/icons/radar.mjs";
+import ReceiptText from "lucide-react/dist/esm/icons/receipt-text.mjs";
+import Settings from "lucide-react/dist/esm/icons/settings.mjs";
+import Sparkles from "lucide-react/dist/esm/icons/sparkles.mjs";
+import UserRound from "lucide-react/dist/esm/icons/user-round.mjs";
+import UsersRound from "lucide-react/dist/esm/icons/users-round.mjs";
 import "./styles.css";
 
 const API = "/api";
@@ -168,17 +165,9 @@ function App() {
         <main className="min-w-0">
           <Topbar title={title} workspace={data.workspaces[0]?.name || "Workspace"} />
           <section className="grid gap-6 px-5 py-6 md:px-8">
-            <AnimatePresence mode="wait">
-              <motion.div
-                key={route}
-                initial={{ opacity: 0, y: 12 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.22 }}
-              >
-                <RouteView route={route} data={data} selectedTraveler={selectedTraveler} setData={setData} refresh={refresh} />
-              </motion.div>
-            </AnimatePresence>
+            <div key={route} className="route-enter">
+              <RouteView route={route} data={data} selectedTraveler={selectedTraveler} setData={setData} refresh={refresh} />
+            </div>
           </section>
         </main>
       </div>
