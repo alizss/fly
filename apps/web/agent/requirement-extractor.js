@@ -6,13 +6,15 @@
 const { callStructured } = require("./openai-client");
 const { requirementExtractorSchema } = require("./schemas");
 const { normalizeRequirement } = require("../../../packages/shared/requirements");
+const { modelObservationContext, semanticActionContext } = require("./model-context");
 
 const INSTRUCTIONS = [
   "You extract checkout REQUIREMENTS from a flight booking page, not section summaries.",
+  "Use pageMarkdown for compact whole-page state and observationDiffMarkdown for the exact fresh transition. Seat cells may be aggregated; do not expand them into individual requirements.",
   "Treat any DOM-derived section labels/status you're given as hints only — they have been wrong before (e.g. one radio group in a bundled section gets resolved and the whole section is reported 'complete' while a second, separate required radio group in the same visual section is still empty).",
   "Look at the screenshot yourself. Identify every distinct thing still required before this step of checkout can be considered done: passenger/contact fields, document fields, baggage decisions (cabin AND checked are separate requirements if both exist), seat decisions, paid extras, legal/terms acceptance, and the final Continue/payment action.",
-  "If an activeSurface modal/dropdown/popover is present, treat that as the current screen. Extract requirements for that surface first, especially whether it is an optional seat/baggage/extra selection that can be skipped.",
-  "Use page.foreground, page.visualState, and page.accessibility when present. Accessibility role/name/state are evidence for which visible controls are actual radios, checkboxes, listbox options, buttons, required fields, selected values, disabled options, or expanded popups.",
+  "If currentSurface is a modal/dropdown/popover, treat it as the current screen. Extract requirements for that surface first, especially whether it is an optional seat/baggage/extra selection that can be skipped.",
+  "Stable references and typed states in pageMarkdown are evidence for radios, checkboxes, listbox options, buttons, required fields, selected values, disabled options, and expanded popups.",
   "If the visible foreground surface has progress markers such as Flight 1 of 2 / Flight 2 of 2, treat each marker as a distinct current surface state, not the same stale modal.",
   "A required radio/checkbox group counts as satisfied only if one of its own options is visibly selected — not because a differently-labeled nearby control was resolved.",
   "Mark clearly-optional paid upsells (insurance, bundles, seat upgrades) as required=false, risk='money'.",
@@ -34,15 +36,16 @@ const INSTRUCTIONS = [
  * @returns {Promise<{pageStep: string, requirements: Array, uncertainties: string[], summary: string}>}
  */
 async function extractRequirements({ apiKey, model, observation, screenshotDataUrl, traveler }) {
+  const observationContext = modelObservationContext(observation, traveler);
   const raw = await callStructured({
     apiKey,
     model,
     instructions: INSTRUCTIONS,
     payload: {
-      page: observation?.page || {},
+      ...observationContext,
       traveler: traveler || {},
       userIntent: observation?.userIntent || "",
-      lastActionResult: observation?.lastActionResult || null
+      lastActionResult: semanticActionContext({}, observation?.lastActionResult || {})
     },
     screenshotDataUrl,
     schema: requirementExtractorSchema,

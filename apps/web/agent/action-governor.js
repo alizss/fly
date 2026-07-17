@@ -1,11 +1,42 @@
 const { evaluateActionPolicy, isNonMutatingAction } = require("../../../packages/shared/policy");
-const { normalizeAction, actuatorSignature } = require("../../../packages/shared/agent-actions");
-const { withUpdate } = require("../../../packages/shared/agent-state");
-const { resolveActionControl } = require("./control-alias-index");
-const { currentProfileSkillAtom, profileStageReadiness } = require("./skill-expander");
+const { isDeepStrictEqual } = require("node:util");
+const {
+  normalizeAction,
+  normalizeVisualRegion,
+  visualRegionsMatch,
+  actuatorSignature
+} = require("../../../packages/shared/agent-actions");
+const { classifyGraphConflicts, resolveActionControl, selectedActionGraphConflicts } = require("./control-alias-index");
+const { profileStageReadiness } = require("./skill-expander");
+const { invariantDecision, prepareTransactionInvariants } = require("./invariants");
+const { PAGE_SURFACE_ID, controlBelongsToCurrentSurface, currentSurface, currentSurfaceId } = require("./surface-contract");
+const { approveActionLifecycle, proposeActionLifecycle, rejectActionLifecycle } = require("./action-lifecycle");
 
-const DOM_MUTATIONS = new Set(["click", "type", "select"]);
+const DOM_MUTATIONS = new Set(["click", "type", "select", "keypress"]);
 const COMPOUND_MUTATIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
+const RECOVERABLE_GROUNDING_CODES = new Set([
+  "CANDIDATE_SET_OBSERVATION_MISMATCH",
+  "CURRENT_GOAL_CANDIDATE_MISMATCH",
+  "CANONICAL_ALIAS_REQUIRED",
+  "CANONICAL_ALIAS_UNRESOLVED",
+  "CANONICAL_ALIAS_CONFLICT",
+  "CANONICAL_TARGET_REQUIRED",
+  "CONTROL_ID_MISMATCH",
+  "DECISION_GROUP_MISMATCH",
+  "TARGET_DECISION_GROUP_MISMATCH",
+  "TARGET_ID_MISMATCH",
+  "TARGET_SURFACE_MISMATCH",
+  "TARGET_SEMANTIC_MISMATCH",
+  "TARGET_RISK_MISMATCH",
+  "ACTION_OPERATION_ACTUATOR_MISMATCH",
+  "ACTION_ACTUATOR_KIND_MISMATCH",
+  "CANONICAL_OPERATION_UNAVAILABLE",
+  "CANONICAL_ACTUATOR_UNAVAILABLE",
+  "OPERATION_PRECONDITION_FAILED",
+  "TARGET_DISAPPEARED",
+  "TARGET_OUTSIDE_CURRENT_SURFACE",
+  "CONTROL_GRAPH_SELECTED_ACTION_AMBIGUOUS"
+]);
 
 function fail(code, reason, checks = [], decision = "blocked_by_safety") {
   return { allow: false, decision, code, reason, checks: [...checks, { code, ok: false }] };
@@ -19,160 +50,87 @@ function pass(checks, code, detail = "") {
   checks.push({ code, ok: true, detail });
 }
 
-function text(value) {
-  return String(value || "").trim();
-}
-
 function number(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
-}
-
-function priceSnapshot(page = {}) {
-  const structured = page.price && typeof page.price === "object" ? page.price : {};
-  let amount = number(structured.amount ?? structured.total ?? structured.value);
-  if (amount == null) {
-    const match = text(page.priceText).match(/([0-9]+(?:[.,][0-9]{1,2})?)/);
-    amount = match ? Number(match[1].replace(",", ".")) : null;
-  }
-  const currency = text(structured.currency || (text(page.priceText).match(/\b(EUR|USD|GBP|CHF|CAD|AUD)\b|[€$£]/i)?.[0] || "")).toUpperCase();
-  return { amount, currency };
-}
-
-function transactionFacts(state = {}, observation = {}, traveler = {}) {
-  const page = observation.page || {};
-  const summary = page.summary && typeof page.summary === "object" ? page.summary : {};
-  const price = priceSnapshot(page);
-  return {
-    travelerIds: [traveler.id || state.travelerId].filter(Boolean).map(String).sort(),
-    itineraryFingerprint: text(page.itineraryFingerprint || summary.itineraryFingerprint || state.itineraryFingerprint),
-    offerFingerprint: text(page.offerFingerprint || summary.offerFingerprint || state.offerFingerprint),
-    priceAmount: price.amount,
-    currency: price.currency
-  };
-}
-
-function establishInvariantBaseline(state, observation, traveler) {
-  const current = transactionFacts(state, observation, traveler);
-  if (!state.invariantBaseline) return withUpdate(state, { invariantBaseline: current });
-  const baseline = { ...state.invariantBaseline };
-  let changed = false;
-  for (const field of ["travelerIds", "itineraryFingerprint", "offerFingerprint", "priceAmount", "currency"]) {
-    const missing = field === "travelerIds"
-      ? !Array.isArray(baseline[field]) || baseline[field].length === 0
-      : baseline[field] == null || baseline[field] === "";
-    const available = field === "travelerIds"
-      ? Array.isArray(current[field]) && current[field].length > 0
-      : current[field] != null && current[field] !== "";
-    if (missing && available) {
-      baseline[field] = current[field];
-      changed = true;
-    }
-  }
-  return changed ? withUpdate(state, { invariantBaseline: baseline }) : state;
-}
-
-function compareInvariantBaseline(state, observation, traveler, action, checks) {
-  const baseline = state.invariantBaseline || {};
-  const current = transactionFacts(state, observation, traveler);
-  const baselineTravelers = JSON.stringify(baseline.travelerIds || []);
-  const currentTravelers = JSON.stringify(current.travelerIds || []);
-  if (baselineTravelers !== currentTravelers) return fail("TRAVELER_SET_CHANGED", "The traveler set changed after this checkout transaction began.", checks);
-  pass(checks, "TRAVELER_SET_STABLE");
-
-  for (const [field, code] of [["itineraryFingerprint", "ITINERARY_CHANGED"], ["offerFingerprint", "OFFER_CHANGED"], ["currency", "CURRENCY_CHANGED"]]) {
-    if (baseline[field] && current[field] && baseline[field] !== current[field]) {
-      return fail(code, `${field} no longer matches the approved transaction baseline.`, checks);
-    }
-    pass(checks, `${field.toUpperCase()}_STABLE`, baseline[field] && current[field] ? current[field] : "not-yet-observed");
-  }
-
-  if (baseline.priceAmount != null && current.priceAmount != null && current.priceAmount > baseline.priceAmount) {
-    const authorization = state.approvals?.priceAuthorization;
-    const approvedMaximum = number(authorization?.maximumAmount);
-    if (!authorization?.authorizationId || approvedMaximum == null || current.priceAmount > approvedMaximum) {
-      return fail("UNAPPROVED_PRICE_CHANGE", `Price increased from ${baseline.priceAmount} to ${current.priceAmount} without a bound price authorization.`, checks);
-    }
-  }
-  pass(checks, "PRICE_WITHIN_AUTHORIZATION");
-
-  const paymentLike = action.risk === "payment" || action.type === "final_review" || /payment|purchase|book_now/.test(`${action.intent || ""} ${action.targetSnapshot?.semantic || ""}`);
-  if (paymentLike) {
-    const authorization = state.approvals?.paymentAuthorization;
-    if (!authorization?.authorizationId || authorization.transactionId !== state.id || authorization.singleUse !== true) {
-      return fail("PAYMENT_AUTHORIZATION_MISSING", "Payment requires a one-time authorization bound to this exact transaction and offer.", checks);
-    }
-    if (authorization.offerFingerprint && current.offerFingerprint && authorization.offerFingerprint !== current.offerFingerprint) {
-      return fail("PAYMENT_OFFER_CHANGED", "The payment authorization does not match the current offer.", checks);
-    }
-    if (state.paymentState?.attempts > 0 || state.paymentState?.status === "submitted") {
-      return fail("DUPLICATE_PAYMENT_ATTEMPT", "A payment attempt has already been recorded for this transaction.", checks);
-    }
-  }
-  pass(checks, "PAYMENT_GUARD");
-  return null;
 }
 
 function canonicalControlForAction(action, page = {}) {
   return resolveActionControl(action, page).control || null;
 }
 
-function incompleteProfileSkillBlocks(action = {}, state = {}, page = {}) {
-  const plan = state.activeSkillPlan;
-  if (!plan || !COMPOUND_MUTATIONS.has(plan.skillType) || plan.status === "complete") return false;
-  if (["satisfy_field", "open_profile_choice"].includes(action.intent)) return false;
-  if (!DOM_MUTATIONS.has(action.type)) return false;
-  const control = canonicalControlForAction(action, page) || {};
-  const section = String(control.sectionType || "").toLowerCase();
-  const semantic = String(control.semantic || action.intent || "").toLowerCase();
-  return /baggage|bundle|extra|seat|cancellation|insurance|flexible|continue|navigation/.test(`${section} ${semantic}`)
-    || action.intent === "navigate_stage";
+function currentObservationSurfaceId(observation = {}) {
+  return currentSurfaceId(observation.page || {});
 }
 
-function profileSkillDependencyFailure(action = {}, state = {}, page = {}, checks = []) {
-  const plan = state.activeSkillPlan;
-  if (!plan || !COMPOUND_MUTATIONS.has(plan.skillType) || plan.status === "complete" || !DOM_MUTATIONS.has(action.type) && action.type !== "click_xy") {
-    return null;
+function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = []) {
+  const goal = state.currentGoal;
+  if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
+  // An action with no candidate claim is an ownership violation. Let the
+  // ownership check below report that precise prerequisite error; candidate
+  // exactness applies once a candidateId is actually presented.
+  if (!action.candidateId) return null;
+  const candidateSet = goal.candidateSet || null;
+  if (candidateSet) {
+    const currentObservationId = observation.observationId || "";
+    const currentObservationHash = observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "";
+    const currentSurfaceId = currentObservationSurfaceId(observation);
+    if (candidateSet.observationId !== currentObservationId
+      || candidateSet.observationHash !== currentObservationHash
+      || candidateSet.surfaceId !== currentSurfaceId) {
+      return recoverable(
+        "CANDIDATE_SET_OBSERVATION_MISMATCH",
+        "The selected candidate set is not bound to the current observation, hash, and surface.",
+        checks
+      );
+    }
   }
-  const atom = currentProfileSkillAtom(plan);
-  if (!atom) {
-    return incompleteProfileSkillBlocks(action, state, page)
-      ? fail("PROFILE_SKILL_INCOMPLETE", "Traveler profile work remains incomplete and later checkout work cannot bypass it.", checks)
-      : null;
-  }
-  const exactOwner = action.skillPlanId === plan.planId && action.skillAtomId === atom.atomId;
-  if (exactOwner) {
-    pass(checks, "PROFILE_ATOM_OWNS_ACTION", atom.atomId);
-    return null;
-  }
-  const control = canonicalControlForAction(action, page) || {};
-  return fail(
-    "PROFILE_ATOM_DEPENDENCY",
-    `The unresolved ${atom.label || atom.semanticType} prerequisite owns the next profile action; ${control.label || action.targetLabel || action.intent || action.type} cannot bypass it.`,
-    checks
-  );
-}
-
-function blockedObligationFailure(action = {}, state = {}, checks = []) {
-  const obligation = state.blockedObligation;
-  if (!obligation || !["blocked", "recovering"].includes(obligation.status)) return null;
-  if (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy") return null;
-  const expected = obligation.recoveryExpectedOutcome || {};
-  const exact = action.skillPlanId === obligation.owner?.skillPlanId
-    && action.skillAtomId === obligation.owner?.atomId
-    && action.controlId === obligation.control?.controlId
-    && action.operation === obligation.operation
-    && action.expectedOutcome?.type === expected.type
-    && String(action.expectedOutcome?.controlId || "") === String(expected.controlId || "");
+  const candidates = candidateSet?.candidates || goal.candidates || [];
+  const candidate = candidates.find((item) => item.candidateId === action.candidateId);
+  const candidateAffordance = candidate?.affordance || {};
+  const actionAffordance = action.affordance || {};
+  const affordanceExact = !candidateAffordance.stableKey && !actionAffordance.stableKey
+    ? true
+    : Boolean(candidateAffordance.stableKey)
+      && candidateAffordance.actuator?.proven === true
+      && actionAffordance.actuator?.proven === true
+      && isDeepStrictEqual(candidateAffordance, actionAffordance);
+  const exact = Boolean(candidate)
+    && action.goalId === goal.goalId
+    && candidate.type === action.type
+    && candidate.operation === action.operation
+    && candidate.controlId === action.controlId
+    && String(candidate.targetId || "") === String(action.targetId || "")
+    && (!["type", "select"].includes(action.type) || String(candidate.value || "") === String(action.value || ""))
+    && (action.type !== "keypress" || String(candidate.keys || "") === String(action.keys || ""))
+    && (action.type !== "click_xy" || visualRegionsMatch(candidate.visualRegion || {}, action.visualRegion || {}))
+    && action.interactionRole === candidate.interactionRole
+    && action.semanticEffect === candidate.semanticEffect
+    && action.expectedEvidence === candidate.expectedEvidence
+    && affordanceExact
+    && action.expectedOutcome?.type === candidate.expectedOutcome?.type
+    && String(action.expectedOutcome?.controlId || "") === String(candidate.expectedOutcome?.controlId || "");
   if (!exact) {
-    return fail(
-      "BLOCKED_OBLIGATION_MISMATCH",
-      "The executable action does not exactly match the persisted blocked obligation owner, control, operation, and expected outcome.",
+    return recoverable(
+      "CURRENT_GOAL_CANDIDATE_MISMATCH",
+      "The executable action is not the server-grounded candidate selected for the current semantic goal.",
       checks
     );
   }
-  pass(checks, "BLOCKED_OBLIGATION_EXACT", obligation.obligationId || "");
+  pass(checks, "CURRENT_GOAL_CANDIDATE_EXACT", candidate.candidateId);
   return null;
+}
+
+function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
+  const goal = state.currentGoal;
+  if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
+  if (action.candidateId && action.goalId === goal.goalId) return null;
+  const control = canonicalControlForAction(action, page) || {};
+  return fail(
+    "CURRENT_GOAL_UNRESOLVED",
+    `The current semantic goal ${goal.label || goal.semanticType}=${goal.desiredValue} must complete or exhaust its finite recovery budget before ${control.label || action.targetLabel || action.intent || action.type}.`,
+    checks
+  );
 }
 
 function actionTargetsLaterCheckoutWork(action = {}, page = {}) {
@@ -207,6 +165,9 @@ function validateCanonicalTarget(action, observation, checks) {
   if (target.decisionGroupId && control.decisionGroupId && target.decisionGroupId !== control.decisionGroupId) {
     return fail("DECISION_GROUP_MISMATCH", "The target moved to a different checkout decision group.", checks);
   }
+  if (target.surfaceId && control.surfaceId && target.surfaceId !== control.surfaceId) {
+    return fail("TARGET_SURFACE_MISMATCH", "The governed target no longer belongs to the canonical control's surface.", checks);
+  }
   if (target.semantic && control.semantic && target.semantic !== control.semantic) {
     return fail("TARGET_SEMANTIC_MISMATCH", "The target semantic intent changed after observation.", checks);
   }
@@ -237,11 +198,11 @@ function validateCanonicalTarget(action, observation, checks) {
       );
     }
     const controlKind = String(control.kind || control.controlKind || "").toLowerCase();
-    const controlRole = String(control.role || "").toLowerCase();
+    const controlRole = String(control.role || control.domRole || "").toLowerCase();
     const typeCompatible = controlKind === "field"
       || ["text", "email", "tel", "number", "password", "search", "url", "textarea"].includes(controlKind)
-      || ["textbox", "searchbox", "spinbutton"].includes(controlRole);
-    const selectCompatible = controlKind === "select" || ["combobox", "listbox"].includes(controlRole);
+      || ["textbox", "searchbox", "spinbutton", "editable_combobox"].includes(controlRole);
+    const selectCompatible = controlKind === "select" || ["combobox", "listbox", "select"].includes(controlRole);
     if (action.type === "type" && !typeCompatible) {
       return fail("ACTION_ACTUATOR_KIND_MISMATCH", "Type actions require an editable canonical field.", checks);
     }
@@ -253,9 +214,8 @@ function validateCanonicalTarget(action, observation, checks) {
   if (state.disabled === true || control.disabled === true) return fail("TARGET_DISABLED", "The canonical target was observed as disabled.", checks);
   const region = control.visualRegion || target.visualRegion || target.box;
   if (region?.inViewport === false) return recoverable("TARGET_OUT_OF_VIEW", "The canonical target is outside the observed viewport and can be recovered by governed scrolling.", checks);
-  const foreground = observation.page?.foreground || {};
-  if (foreground.active && foreground.blocksBackground !== false && control.surfaceId && foreground.id && control.surfaceId !== foreground.id) {
-    return fail("TARGET_OUTSIDE_FOREGROUND", "A blocking foreground surface owns the next action.", checks);
+  if (!controlBelongsToCurrentSurface(control, observation.page || {})) {
+    return recoverable("TARGET_OUTSIDE_CURRENT_SURFACE", "The selected control does not belong to the authoritative current surface.", checks);
   }
   pass(checks, "CANONICAL_TARGET_CURRENT", control.controlId);
   return null;
@@ -276,14 +236,19 @@ function validateVisualFallback(action, observation, checks) {
     const resolution = resolveActionControl(action, observation.page || {});
     const control = resolution.control;
     const recovery = control?.recovery?.[action.operation || target.recoveryOperation || ""];
-    const regionMatches = (recovery?.regions || []).some((candidate) => (
-      Math.abs(Number(candidate.x) - Number(region.x)) <= 2
-      && Math.abs(Number(candidate.y) - Number(region.y)) <= 2
-      && Math.abs(Number(candidate.width) - Number(region.width)) <= 2
-      && Math.abs(Number(candidate.height) - Number(region.height)) <= 2
-    ));
+    const regionMatches = (recovery?.regions || []).some((candidate) => visualRegionsMatch(candidate, region));
     if (!resolution.ok || !recovery || !regionMatches || recovery.requiresVisualConfirmation !== true) {
       return fail("VISUAL_CONTROL_RECOVERY_UNPROVEN", "The coordinate is not one of the current canonical control's bounded visual recovery regions.", checks);
+    }
+    const canonicalRegion = normalizeVisualRegion(region);
+    if (canonicalRegion.observationId && canonicalRegion.observationId !== action.observationId) {
+      return fail("VISUAL_OBSERVATION_MISMATCH", "The bounded visual region belongs to a different observation.", checks);
+    }
+    if (canonicalRegion.controlId && canonicalRegion.controlId !== control.controlId) {
+      return fail("VISUAL_CONTROL_MISMATCH", "The bounded visual region belongs to a different logical control.", checks);
+    }
+    if (canonicalRegion.operation && canonicalRegion.operation !== action.operation) {
+      return fail("VISUAL_OPERATION_MISMATCH", "The bounded visual region belongs to a different control operation.", checks);
     }
     pass(checks, "VISUAL_CONTROL_RECOVERY_BOUND", `${control.controlId}:${action.operation}`);
   }
@@ -311,9 +276,9 @@ function validateVisualFallback(action, observation, checks) {
   if (region.viewportHeight && viewport.height && Number(region.viewportHeight) !== Number(viewport.height)) {
     return fail("VISUAL_VIEWPORT_CHANGED", "Viewport height changed after the visual action was planned.", checks);
   }
-  const foreground = observation.page?.foreground || {};
-  const expectedSurface = foreground.active ? foreground.id : "";
-  if (expectedSurface && region.surfaceId !== expectedSurface) {
+  const expectedSurface = currentSurfaceId(observation.page || {});
+  const regionSurface = region.surfaceId || (currentSurface(observation.page || {}).type === "page" ? PAGE_SURFACE_ID : "");
+  if (expectedSurface && regionSurface !== expectedSurface) {
     return fail("VISUAL_SURFACE_MISMATCH", "The visual region does not belong to the current foreground surface.", checks);
   }
   if (action.risk !== "safe") return fail("VISUAL_RISK_UNAPPROVED", "Coordinate actions must be explicitly classified safe before execution.", checks);
@@ -324,7 +289,8 @@ function validateVisualFallback(action, observation, checks) {
 function governAction({ action: rawAction, state: rawState, observation, traveler = {}, approvals = {}, store, turnId = "" }) {
   const checks = [];
   const action = normalizeAction(rawAction || {});
-  let state = establishInvariantBaseline(rawState, observation, traveler);
+  const invariantContext = prepareTransactionInvariants(rawState, observation, traveler);
+  let state = invariantContext.state;
   const record = (stage, payload = {}) => store?.recordActionEvent?.(state.id, {
     actionId: action.id || "",
     observationId: action.observationId || observation?.observationId || "",
@@ -334,10 +300,12 @@ function governAction({ action: rawAction, state: rawState, observation, travele
     ...payload
   });
   const denied = (result) => {
+    state = { ...state, actionLifecycle: rejectActionLifecycle(state.actionLifecycle, result) };
     record("blocked", { result: { ok: false, code: result.code, reason: result.reason, checks: result.checks || checks } });
-    return result;
+    return { ...result, state };
   };
   record("proposed", { result: { ok: null } });
+  state = { ...state, actionLifecycle: proposeActionLifecycle(action, observation) };
   if (!action.id || !action.observationId || !action.observationHash) {
     return denied({ ...fail("ACTION_IDENTITY_MISSING", "Action id, observation id, and observation hash are required.", checks), action, state });
   }
@@ -348,30 +316,43 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   }
   pass(checks, "OBSERVATION_CURRENT");
 
-  const graphIntegrity = observation.page?.graphIntegrity;
-  if (graphIntegrity && graphIntegrity.ok === false) {
-    return denied({ ...fail("CONTROL_GRAPH_INVALID", "The current observation has unresolved actionable control ownership conflicts.", checks), action, state });
-  }
-  pass(checks, "CONTROL_GRAPH_VALID");
-
-  const obligationFailure = blockedObligationFailure(action, state, checks);
-  if (obligationFailure) {
+  const graphConflicts = classifyGraphConflicts(observation.page || {});
+  const selectedConflicts = selectedActionGraphConflicts(action, observation.page || {});
+  if (selectedConflicts.length) {
     return denied({
-      ...obligationFailure,
+      ...recoverable(
+        "CONTROL_GRAPH_SELECTED_ACTION_AMBIGUOUS",
+        "The selected candidate's canonical control or actuator has ambiguous ownership in the current observation.",
+        checks
+      ),
+      action,
+      state,
+      conflicts: selectedConflicts.slice(0, 8)
+    });
+  }
+  pass(
+    checks,
+    "SELECTED_CONTROL_GRAPH_VALID",
+    `${graphConflicts.actionable.length} unrelated actionable conflict(s); ${graphConflicts.diagnostic.length} diagnostic conflict(s) preserved`
+  );
+
+  const goalCandidateFailure = currentGoalCandidateFailure(action, state, observation, checks);
+  if (goalCandidateFailure) {
+    return denied({
+      ...goalCandidateFailure,
       action,
       state
     });
   }
-
-  const profileDependencyFailure = profileSkillDependencyFailure(action, state, observation.page || {}, checks);
-  if (profileDependencyFailure) {
+  const goalOwnershipFailure = currentGoalOwnershipFailure(action, state, observation.page || {}, checks);
+  if (goalOwnershipFailure) {
     return denied({
-      ...profileDependencyFailure,
+      ...goalOwnershipFailure,
       action,
       state
     });
   }
-  pass(checks, "PROFILE_SKILL_SEQUENCE_VALID");
+  pass(checks, "SEMANTIC_GOAL_SEQUENCE_VALID");
 
   const profileReadiness = incompleteProfileStageBlocks(action, observation, traveler);
   if (profileReadiness) {
@@ -394,7 +375,12 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   pass(checks, "PROFILE_STAGE_READY_OR_ACTION_SCOPED");
 
   const targetFailure = validateCanonicalTarget(action, observation, checks) || validateVisualFallback(action, observation, checks);
-  if (targetFailure) return denied({ ...targetFailure, action, state });
+  if (targetFailure) {
+    const routedFailure = RECOVERABLE_GROUNDING_CODES.has(targetFailure.code)
+      ? { ...targetFailure, decision: "recoverable" }
+      : targetFailure;
+    return denied({ ...routedFailure, action, state });
+  }
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
     const signature = actuatorSignature(action);
     const previousFailure = (state.failures || []).find((failure) => failure.actuatorSignature === signature);
@@ -419,10 +405,20 @@ function governAction({ action: rawAction, state: rawState, observation, travele
     && (!action.expectedOutcome || !action.expectedOutcome.type)) {
     return denied({ ...fail("EXPECTED_OUTCOME_REQUIRED", "Every executable action must carry its governed postcondition before dispatch.", checks), action, state });
   }
-  const foreground = observation.page?.foreground || {};
-  if (action.intent === "decline_optional_extra" && foreground.active
-    && action.expectedOutcome?.type !== "active_surface_dismissed") {
-    return denied({ ...fail("FOREGROUND_POSTCONDITION_REQUIRED", "A foreground decline must prove that the exact active surface was dismissed.", checks), action, state });
+  const foreground = currentSurface(observation.page || {});
+  const exactForegroundChoice = action.expectedOutcome?.type === "exact_free_option_selected"
+    && Boolean(action.expectedOutcome?.expectedSelectedControlId || action.expectedOutcome?.controlId)
+    && Boolean(action.expectedOutcome?.decisionGroupId || action.decisionGroupId);
+  const typedWaiverCommand = action.interactionRole === "command"
+    && action.semanticEffect === "waive"
+    && action.expectedEvidence === "dismissed"
+    && action.expectedOutcome?.type === "command_acknowledged"
+    && Boolean(action.expectedOutcome?.decisionGroupId || action.decisionGroupId);
+  if (action.intent === "decline_optional_extra" && foreground.type !== "page"
+    && action.expectedOutcome?.type !== "active_surface_dismissed"
+    && !exactForegroundChoice
+    && !typedWaiverCommand) {
+    return denied({ ...fail("FOREGROUND_POSTCONDITION_REQUIRED", "A foreground decline must prove the exact free choice or carry a typed waiver command contract with fresh acknowledgement evidence.", checks), action, state });
   }
   pass(checks, "EXPECTED_OUTCOME_BOUND", action.expectedOutcome?.type || "control-flow");
 
@@ -433,8 +429,9 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   }
   pass(checks, "POLICY_ALLOWED", policy.reason);
 
-  const invariantFailure = compareInvariantBaseline(state, observation, traveler, action, checks);
-  if (invariantFailure) return denied({ ...invariantFailure, action, state, policy });
+  const invariants = invariantDecision(invariantContext, action, state);
+  checks.push(...(invariants.checks || []));
+  if (!invariants.allow) return denied({ ...invariants, checks, action, state, policy });
 
   if (!isNonMutatingAction(action)) {
     const reservation = store.reserveGovernedAction({
@@ -448,6 +445,7 @@ function governAction({ action: rawAction, state: rawState, observation, travele
     pass(checks, "DUPLICATE_ACTION_GUARD", reservation.signature);
   }
 
+  state = { ...state, actionLifecycle: approveActionLifecycle(state.actionLifecycle) };
   record("governed", { result: { ok: true, code: "ALLOWED", checks } });
   return { allow: true, decision: "allowed", code: "ALLOWED", reason: policy.reason, checks, action, state, policy };
 }
@@ -456,16 +454,13 @@ module.exports = {
   governAction,
   __private: {
     canonicalControlForAction,
-    compareInvariantBaseline,
-    establishInvariantBaseline,
-    incompleteProfileSkillBlocks,
-    blockedObligationFailure,
-    profileSkillDependencyFailure,
+    currentGoalCandidateFailure,
+    currentObservationSurfaceId,
+    currentGoalOwnershipFailure,
     incompleteProfileStageBlocks,
     actionTargetsLaterCheckoutWork,
-    priceSnapshot,
-    transactionFacts,
     validateCanonicalTarget,
     validateVisualFallback
-  }
+  },
+  RECOVERABLE_GROUNDING_CODES
 };

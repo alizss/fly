@@ -14,6 +14,10 @@ const {
   expandSkillAction,
   normalizedPhoneParts,
   profileStageReadiness,
+  deriveProfileGoal,
+  profileGoalSatisfied,
+  candidatesForProfileGoal,
+  actionForProfileCandidate,
   resumeSuspendedSkillPlan,
   skillRecoveryContext,
   blockedObligationForPlan,
@@ -80,7 +84,7 @@ function tempDb() {
 test("P0.2/P0.3 reconstructs the transaction, observation, action, and result after restart", () => {
   const { dir, dbPath } = tempDb();
   const { state, observation } = fixture();
-  state.policySnapshot = {
+  state.userPolicy = {
     bookingRules: "No paid extras",
     baggagePreference: "personal item",
     preferredSeat: "no preference",
@@ -119,13 +123,18 @@ test("P0.2/P0.3 reconstructs the transaction, observation, action, and result af
     reason: "Decline the optional paid baggage."
   };
   assert.equal(store.reserveGovernedAction({ transactionId: state.id, turnId: "turn_1", action, observationId: "obs_1", observationHash: "hash_1" }).ok, true);
-  store.updateGovernedAction("act_1", "verified", { actionId: "act_1", verified: true });
+  assert.equal(store.getGovernedAction("act_1").status, "approved");
+  store.recordActionEvent(state.id, { actionId: "act_1", stage: "diagnostic_only" });
+  assert.equal(store.getGovernedAction("act_1").status, "approved");
+  assert.equal(store.advanceGovernedAction("act_1", ["approved"], "dispatched", { actionId: "act_1", dispatched: true }), true);
+  assert.equal(store.advanceGovernedAction("act_1", ["dispatched"], "observed", { actionId: "act_1", observed: true }), true);
+  assert.equal(store.advanceGovernedAction("act_1", ["observed"], "verified", { actionId: "act_1", verified: true }), true);
   store.close();
 
   store = createStore({ dbPath });
   const reconstructed = store.reconstructTransaction(state.id);
   assert.equal(reconstructed.state.id, state.id);
-  assert.equal(reconstructed.state.policySnapshot.bookingRules, "No paid extras");
+  assert.equal(reconstructed.state.userPolicy.bookingRules, "No paid extras");
   assert.equal(reconstructed.currentObservation.observationId, "obs_1");
   assert.equal(reconstructed.observations.length, 1);
   assert.equal(reconstructed.actions[0].action_id, "act_1");
@@ -185,11 +194,98 @@ test("P0.6 governor allows one current canonical safe action and rejects its dup
   };
   const allowed = governAction({ action, state, observation, traveler: { id: "trav_1", booking_rules: "no extras" }, store, turnId: "turn_1" });
   assert.equal(allowed.allow, true);
+  assert.equal(allowed.state.actionLifecycle.status, "approved");
+  assert.equal(allowed.state.actionLifecycle.approved, true);
+  assert.equal(allowed.state.actionLifecycle.dispatched, false);
   const duplicate = governAction({ action: { ...action, id: "act_safe_2" }, state: allowed.state, observation, traveler: { id: "trav_1", booking_rules: "no extras" }, store, turnId: "turn_2" });
   assert.equal(duplicate.allow, false);
   assert.equal(duplicate.code, "DUPLICATE_ACTION_ATTEMPT");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("risk-scoped governor preserves unrelated conflicts but blocks selected ownership ambiguity", () => {
+  const governedAction = {
+    id: "act_risk_scoped",
+    type: "click",
+    operation: "activate",
+    observationId: "obs_1",
+    observationHash: "hash_1",
+    intent: "decline_optional_extra",
+    controlId: "ctrl_decline",
+    decisionGroupId: "dg_baggage_confirm",
+    targetId: "el_decline",
+    targetLabel: "I'll go without",
+    targetSnapshot: {
+      id: "el_decline",
+      controlId: "ctrl_decline",
+      decisionGroupId: "dg_baggage_confirm",
+      semantic: "decline_paid_extra",
+      risk: "safe_decline",
+      surfaceId: "surface_1",
+      surfaceType: "modal"
+    },
+    expectedOutcome: { type: "active_surface_dismissed", surfaceId: "surface_1", mustNotIncreasePrice: true },
+    risk: "safe",
+    reason: "Decline the current optional extra."
+  };
+
+  const diagnosticFixture = fixture();
+  diagnosticFixture.observation.page.controls[0].operations = {
+    activate: { actuatorId: "el_decline", actuatorIds: ["el_decline"], precondition: { disabled: false } }
+  };
+  diagnosticFixture.observation.page.graphIntegrity = {
+    ok: false,
+    conflicts: [],
+    aliasConflicts: [{ code: "UNKNOWN_CONTROL_ID", aliasId: "el_unavailable", controlIds: ["ctrl_removed_unavailable"], source: "screenshot_annotation" }]
+  };
+  const diagnosticDb = tempDb();
+  const diagnosticStore = createStore({ dbPath: diagnosticDb.dbPath });
+  diagnosticStore.saveSession(diagnosticFixture.state);
+  diagnosticStore.recordObservation(diagnosticFixture.state.id, diagnosticFixture.observation);
+  const allowed = governAction({
+    action: governedAction,
+    state: diagnosticFixture.state,
+    observation: diagnosticFixture.observation,
+    traveler: { id: "trav_1", booking_rules: "no extras" },
+    store: diagnosticStore,
+    turnId: "turn_diagnostic_conflict"
+  });
+  assert.equal(allowed.allow, true);
+  assert.ok(allowed.checks.some((check) => check.code === "SELECTED_CONTROL_GRAPH_VALID" && /diagnostic conflict/.test(check.detail)));
+  diagnosticStore.close();
+  fs.rmSync(diagnosticDb.dir, { recursive: true, force: true });
+
+  const selectedFixture = fixture();
+  selectedFixture.observation.page.controls[0].operations = {
+    activate: { actuatorId: "el_decline", actuatorIds: ["el_decline"], precondition: { disabled: false } }
+  };
+  selectedFixture.observation.page.graphIntegrity = {
+    ok: false,
+    conflicts: [{
+      nodeIds: ["el_decline"],
+      existing: { controlId: "ctrl_decline" },
+      incoming: { controlId: "ctrl_conflicting_decline" },
+      resolved: false
+    }]
+  };
+  const selectedDb = tempDb();
+  const selectedStore = createStore({ dbPath: selectedDb.dbPath });
+  selectedStore.saveSession(selectedFixture.state);
+  selectedStore.recordObservation(selectedFixture.state.id, selectedFixture.observation);
+  const blocked = governAction({
+    action: { ...governedAction, id: "act_selected_conflict" },
+    state: selectedFixture.state,
+    observation: selectedFixture.observation,
+    traveler: { id: "trav_1", booking_rules: "no extras" },
+    store: selectedStore,
+    turnId: "turn_selected_conflict"
+  });
+  assert.equal(blocked.allow, false);
+  assert.equal(blocked.decision, "recoverable");
+  assert.equal(blocked.code, "CONTROL_GRAPH_SELECTED_ACTION_AMBIGUOUS");
+  selectedStore.close();
+  fs.rmSync(selectedDb.dir, { recursive: true, force: true });
 });
 
 test("P0.2/P0.6 persists a failed actuator and forbids the identical retry across observations", () => {
@@ -825,7 +921,7 @@ test("P0.4 persists a custom country-code choice as governed open and choose ato
   const open = advanceSkillPlan(plan, closedObservation, traveler, {});
   assert.equal(open.status, "action");
   assert.equal(open.action.type, "click");
-  assert.equal(open.action.intent, "open_profile_choice");
+  assert.equal(open.action.intent, "satisfy_semantic_goal");
   assert.equal(open.action.operation, "open");
   assert.equal(open.action.targetId, "el_country_arrow");
   assert.equal(open.action.expectedOutcome.type, "options_surface_appeared");
@@ -901,186 +997,6 @@ test("P0.4 persists a custom country-code choice as governed open and choose ato
   assert.equal(choose.action.expectedOutcome.expectedNormalizedValue, "+386");
 });
 
-test("P0.4 suspended country ownership resumes at choose after verified visual opener recovery", () => {
-  const traveler = { phone: "+38670328922", nationality: "Slovenia" };
-  const closedObservation = {
-    observationId: "obs_country_visual_closed",
-    observationSnapshot: { snapshotHash: "hash_country_visual_closed" },
-    page: {
-      step: "traveler_information",
-      snapshotHash: "hash_country_visual_closed",
-      activeSurface: { id: "", type: "page", label: "" },
-      currentSurface: { id: "", type: "page", label: "" },
-      errors: [],
-      fields: [{
-        id: "el_country_visual_input",
-        controlId: "ctrl_country_visual",
-        field: "phone_country_code",
-        label: "Country code",
-        kind: "text",
-        role: "combobox",
-        hasValue: true,
-        controlState: { valuePresent: true, normalizedValue: "+44", expanded: false }
-      }],
-      controls: [{
-        controlId: "ctrl_country_visual",
-        label: "Country code",
-        kind: "select",
-        role: "combobox",
-        semantic: "phone_country_code",
-        risk: "safe",
-        surfaceId: "",
-        state: { disabled: false, valuePresent: true, normalizedValue: "+44", expanded: false },
-        stateElementId: "el_country_visual_input",
-        preferredActivationElementId: "el_country_visual_input",
-        actuators: [{ nodeId: "el_country_visual_input", relation: "state" }],
-        operations: { activate: null, open: null, choose: null, type: null, select: null },
-        recovery: {
-          open: {
-            operation: "open",
-            status: "unproven",
-            requiresVisualConfirmation: true,
-            regions: [{ x: 180, y: 100, width: 40, height: 40, viewportWidth: 1200, viewportHeight: 800, surfaceId: "" }]
-          }
-        }
-      }]
-    }
-  };
-  const plan = createSkillPlan({ id: "act_country_visual_parent", type: "fill_visible_profile_fields" }, closedObservation, traveler);
-  const ambiguous = advanceSkillPlan(plan, closedObservation, traveler, {});
-  assert.equal(ambiguous.status, "ambiguous");
-  assert.equal(ambiguous.plan.status, "suspended");
-  const context = skillRecoveryContext(ambiguous.plan, closedObservation, traveler);
-  const obligation = blockedObligationForPlan(ambiguous.plan, closedObservation, traveler);
-  assert.equal(context.semanticType, "phone_country_code");
-  assert.equal(context.operation, "open");
-  assert.equal(context.recovery.regions.length, 1);
-
-  const openedObservation = {
-    ...closedObservation,
-    observationId: "obs_country_visual_opened",
-    observationSnapshot: { snapshotHash: "hash_country_visual_opened" },
-    page: {
-      ...closedObservation.page,
-      snapshotHash: "hash_country_visual_opened",
-      activeSurface: { id: "surface_country_visual", type: "dropdown", label: "Country code" },
-      currentSurface: { id: "surface_country_visual", type: "dropdown", label: "Country code" }
-    }
-  };
-  const recoveryResult = {
-    actionId: "act_visual_recovery",
-    skillPlanId: ambiguous.plan.planId,
-    skillAtomId: context.atomId,
-    controlId: context.controlId,
-    operation: "open",
-    executed: true,
-    verified: true,
-    expectedOutcome: obligation.recoveryExpectedOutcome,
-    outcome: { code: "OPTIONS_SURFACE_APPEARED" }
-  };
-  assert.equal(exactRecoveryProof(obligation, recoveryResult), true);
-  const resumed = resumeSuspendedSkillPlan(ambiguous.plan, openedObservation, traveler, recoveryResult, obligation);
-  assert.equal(resumed.resumable, true);
-  assert.equal(resumed.plan.status, "running");
-  assert.equal(currentProfileSkillAtom(resumed.plan).phase, "choose");
-});
-
-test("P0 root gate persists one exact blocked obligation and ignores wait as a recovery attempt", () => {
-  const traveler = { phone: "+38670328922", nationality: "Slovenia" };
-  const observation = {
-    observationId: "obs_blocked_obligation",
-    observationSnapshot: { snapshotHash: "hash_blocked_obligation" },
-    page: {
-      step: "traveler_information",
-      snapshotHash: "hash_blocked_obligation",
-      activeSurface: { id: "", type: "page", label: "" },
-      currentSurface: { id: "", type: "page", label: "" },
-      errors: [],
-      fields: [{
-        id: "el_blocked_country",
-        controlId: "ctrl_blocked_country",
-        field: "phone_country_code",
-        label: "Country code",
-        kind: "text",
-        role: "combobox",
-        hasValue: true,
-        controlState: { valuePresent: true, normalizedValue: "+44", expanded: false }
-      }],
-      controls: [{
-        controlId: "ctrl_blocked_country",
-        label: "Country code",
-        kind: "select",
-        role: "combobox",
-        semantic: "phone_country_code",
-        risk: "safe",
-        state: { disabled: false, valuePresent: true, normalizedValue: "+44", expanded: false },
-        stateElementId: "el_blocked_country",
-        preferredActivationElementId: "el_blocked_country",
-        actuators: [{ nodeId: "el_blocked_country", relation: "state" }],
-        operations: { activate: null, open: null, choose: null, type: null, select: null },
-        recovery: {
-          open: {
-            operation: "open",
-            status: "unproven",
-            requiresVisualConfirmation: true,
-            regions: [{ x: 180, y: 100, width: 40, height: 40 }]
-          }
-        }
-      }],
-      screenshotAnnotations: [{
-        visualRef: "R1",
-        targetId: "",
-        controlId: "ctrl_blocked_country",
-        source: "control.recovery.open",
-        box: { x: 180, y: 100, width: 40, height: 40 }
-      }]
-    }
-  };
-  const plan = createSkillPlan({ id: "act_blocked_parent", type: "fill_visible_profile_fields" }, observation, traveler);
-  const suspended = advanceSkillPlan(plan, observation, traveler, {});
-  const obligation = blockedObligationForPlan(suspended.plan, observation, traveler);
-  assert.deepEqual(obligation.owner, {
-    skillPlanId: suspended.plan.planId,
-    atomId: currentProfileSkillAtom(suspended.plan).atomId,
-    skillType: "fill_visible_profile_fields",
-    semanticType: "phone_country_code",
-    ordinal: 0
-  });
-  assert.equal(obligation.control.controlId, "ctrl_blocked_country");
-  assert.equal(obligation.operation, "open");
-  assert.equal(obligation.expectedResult.expectedNormalizedValue, "+386");
-  assert.equal(recordBlockedObligationAttempt(obligation, { type: "wait" }).attempts.length, 0);
-
-  const action = loopPrivate.canonicalBlockedRecoveryAction(obligation, observation);
-  assert.equal(action.type, "click_xy");
-  assert.equal(action.controlId, obligation.control.controlId);
-  assert.equal(action.operation, "open");
-  assert.deepEqual(action.expectedOutcome, obligation.recoveryExpectedOutcome);
-  const attempted = recordBlockedObligationAttempt(obligation, action);
-  assert.equal(attempted.attempts.length, 1);
-  assert.equal(attempted.attempts[0].status, "dispatched");
-
-  const wrongProof = {
-    actionId: action.id,
-    skillPlanId: obligation.owner.skillPlanId,
-    skillAtomId: obligation.owner.atomId,
-    controlId: obligation.control.controlId,
-    operation: "choose",
-    executed: true,
-    verified: true,
-    expectedOutcome: obligation.recoveryExpectedOutcome,
-    outcome: { code: "OPTIONS_SURFACE_APPEARED" }
-  };
-  assert.equal(exactRecoveryProof(attempted, wrongProof), false);
-
-  const exactProof = { ...wrongProof, operation: "open" };
-  const reconciled = reconcileBlockedObligationResult(attempted, exactProof);
-  assert.equal(reconciled.exact, true);
-  assert.equal(reconciled.obligation.status, "recovered");
-  assert.equal(reconciled.obligation.attempts[0].status, "verified");
-  assert.equal(reconciled.obligation.proofs[0].controlId, obligation.control.controlId);
-});
-
 test("P0.4 does not complete while visible validation errors remain", () => {
   const traveler = {
     email: "ali@example.test",
@@ -1117,7 +1033,7 @@ test("P0.4 does not complete while visible validation errors remain", () => {
   }
   assert.equal(result.status, "ambiguous");
   assert.equal(result.plan.status, "suspended");
-  assert.match(result.reason, /validation errors remain/i);
+  assert.match(result.reason, /no untried grounded strategy|validation errors remain/i);
 });
 
 test("P0 scoped validation blocks only its canonical profile owner or an explicit stage-wide issue", () => {
@@ -1164,10 +1080,158 @@ test("P0 scoped validation blocks only its canonical profile owner or an explici
   assert.equal(profileStageReadiness(observation, traveler).ready, false);
 });
 
+test("Control-owned confirm-email validation does not invalidate primary email", () => {
+  const traveler = {
+    email: "ali@example.test",
+    phone: "+38670328922",
+    nationality: "Slovenia",
+    gender: "male",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    date_of_birth: "2003-05-31"
+  };
+  const blank = completeProfileObservation({ observationId: "obs_email_blank", filled: new Set() });
+  const emailGoal = deriveProfileGoal(blank, traveler);
+  assert.equal(emailGoal.semanticType, "email");
+
+  const filled = new Set(["email", "confirm_email"]);
+  const observation = completeProfileObservation({ observationId: "obs_confirm_error", filled });
+  const confirmControl = observation.page.controls.find((control) => control.semantic === "confirm_email");
+  observation.page.validationIssues = [{
+    issueId: "validation_confirm_email",
+    message: "Email confirmation does not match",
+    controlId: confirmControl.controlId,
+    sectionType: "contact",
+    stageWide: false
+  }];
+
+  assert.equal(profileGoalSatisfied(emailGoal, observation, traveler), true);
+  const next = deriveProfileGoal(observation, traveler, emailGoal);
+  assert.equal(next.semanticType, "confirm_email");
+  const candidates = candidatesForProfileGoal(next, observation, traveler);
+  assert.equal(candidates.some((candidate) => candidate.type === "type" && candidate.value === traveler.email), true);
+});
+
+test("Unified blank-profile goals advance in order and known values always produce candidates", () => {
+  const traveler = {
+    id: "trav_unified_profile",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    nationality: "Slovenia",
+    gender: "male",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    date_of_birth: "2003-05-31"
+  };
+  const expectedOrder = ["email", "confirm_email", "phone_country_code", "phone", "title", "first_name", "last_name", "date_of_birth"];
+  const filled = new Set();
+  let currentGoal = null;
+
+  for (let index = 0; index < expectedOrder.length; index += 1) {
+    const observation = completeProfileObservation({ observationId: `obs_unified_progress_${index}`, filled });
+    currentGoal = deriveProfileGoal(observation, traveler, currentGoal);
+    assert.equal(currentGoal.semanticType, expectedOrder[index]);
+    const candidates = candidatesForProfileGoal(currentGoal, observation, traveler);
+    assert.ok(candidates.length > 0, `${currentGoal.semanticType} should have a deterministic or grounded candidate`);
+    if (currentGoal.semanticType === "confirm_email") {
+      assert.equal(candidates.some((candidate) => candidate.value === traveler.email), true);
+    }
+    filled.add(currentGoal.semanticType);
+  }
+
+  const completeObservation = completeProfileObservation({ observationId: "obs_unified_progress_complete", filled });
+  assert.equal(deriveProfileGoal(completeObservation, traveler, currentGoal), null);
+  assert.equal(profileStageReadiness(completeObservation, traveler).ready, true);
+});
+
+test("Unified profile loop asks only when required user data is genuinely missing", async () => {
+  const { dir, dbPath } = tempDb();
+  const traveler = { id: "trav_missing_passport", email: "ali@example.test" };
+  const observation = {
+    observationId: "obs_missing_passport",
+    observationSnapshot: { snapshotHash: "hash_missing_passport" },
+    page: {
+      site: "example.test",
+      url: "https://example.test/traveler",
+      step: "traveler_information",
+      snapshotHash: "hash_missing_passport",
+      graphIntegrity: { ok: true, conflicts: [] },
+      activeSurface: { id: "", type: "page", label: "" },
+      currentSurface: { id: "", type: "page", label: "" },
+      errors: [],
+      fields: [{
+        id: "el_passport",
+        controlId: "ctrl_passport",
+        field: "passport_number",
+        label: "Passport number",
+        kind: "text",
+        role: "textbox",
+        required: true,
+        hasValue: false,
+        controlState: { valuePresent: false, normalizedValue: "" },
+        sectionType: "document"
+      }],
+      controls: [{
+        controlId: "ctrl_passport",
+        label: "Passport number",
+        kind: "text",
+        role: "textbox",
+        semantic: "passport_number",
+        risk: "safe",
+        sectionType: "document",
+        state: { disabled: false, valuePresent: false, normalizedValue: "" },
+        stateElementId: "el_passport",
+        preferredActivationElementId: "el_passport",
+        actuators: [{ nodeId: "el_passport", relation: "state" }],
+        operations: {
+          activate: null,
+          open: null,
+          choose: null,
+          type: { operation: "type", actuatorId: "el_passport", actuatorIds: ["el_passport"] },
+          select: null
+        }
+      }]
+    }
+  };
+  const state = createCheckoutSessionState({
+    goal: "Complete traveler information",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: observation.page.url }
+  });
+  state.id = "txn_missing_passport";
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_missing_passport"
+  });
+
+  assert.equal(result.clientDecision.action, "ask_user");
+  assert.match(result.clientDecision.reason, /Passport number/);
+  assert.match(result.clientDecision.reason, /not available/i);
+  assert.equal(result.debug.modelUsage.calls.length, 0);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("P0.4 governor blocks baggage and extras while the profile skill is incomplete", () => {
   const { dir, dbPath } = tempDb();
   const { state, observation } = fixture();
-  state.activeSkillPlan = { planId: "skill_profile", skillType: "fill_visible_profile_fields", status: "running", atoms: [] };
+  state.currentGoal = {
+    goalId: "profile:email:0",
+    semanticType: "email",
+    desiredValue: "ali@example.test",
+    label: "Email",
+    candidates: []
+  };
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -1200,7 +1264,7 @@ test("P0.4 governor blocks baggage and extras while the profile skill is incompl
     }
   });
   assert.equal(result.allow, false);
-  assert.equal(result.code, "PROFILE_SKILL_INCOMPLETE");
+  assert.equal(result.code, "CURRENT_GOAL_UNRESOLVED");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1227,13 +1291,8 @@ test("P0.5/P0.6 governor blocks phone while country-code prerequisite owns the p
     site: { host: "example.test", url: "https://example.test/traveler" }
   });
   state.id = "txn_country_dependency";
-  const plan = createSkillPlan({ id: "act_country_dependency_parent", type: "fill_visible_profile_fields" }, observation, traveler);
-  plan.status = "suspended";
-  plan.suspendedReason = "Country opener is ambiguous.";
-  state.activeSkillPlan = plan;
-  const countryAtom = currentProfileSkillAtom(plan);
-  assert.equal(countryAtom.semanticType, "phone_country_code");
-  const phoneAtom = plan.atoms.find((atom) => atom.semanticType === "phone");
+  state.currentGoal = deriveProfileGoal(observation, traveler);
+  assert.equal(state.currentGoal.semanticType, "phone_country_code");
   const phoneControl = observation.page.controls.find((control) => control.semantic === "phone");
 
   const store = createStore({ dbPath });
@@ -1252,8 +1311,6 @@ test("P0.5/P0.6 governor blocks phone while country-code prerequisite owns the p
       observationHash: observation.observationSnapshot.snapshotHash,
       intent: "satisfy_field",
       operation: "type",
-      skillPlanId: plan.planId,
-      skillAtomId: phoneAtom.atomId,
       controlId: phoneControl.controlId,
       targetId: phoneControl.stateElementId,
       targetLabel: phoneControl.label,
@@ -1274,7 +1331,7 @@ test("P0.5/P0.6 governor blocks phone while country-code prerequisite owns the p
     }
   });
   assert.equal(result.allow, false);
-  assert.equal(result.code, "PROFILE_ATOM_DEPENDENCY");
+  assert.equal(result.code, "CURRENT_GOAL_UNRESOLVED");
   assert.match(result.reason, /country code/i);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1334,12 +1391,10 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
     site: { host: "example.test", url: observation.page.url }
   });
   state.id = "txn_visual_country";
-  const plan = createSkillPlan({ id: "act_visual_country_parent", type: "fill_visible_profile_fields" }, observation, traveler);
-  plan.status = "suspended";
-  plan.suspendedReason = "No proven DOM opener.";
-  state.activeSkillPlan = plan;
-  const atom = currentProfileSkillAtom(plan);
-  state.blockedObligation = blockedObligationForPlan(plan, observation, traveler);
+  state.currentGoal = deriveProfileGoal(observation, traveler);
+  state.currentGoal.candidates = candidatesForProfileGoal(state.currentGoal, observation, traveler);
+  const candidate = state.currentGoal.candidates.find((item) => item.type === "click_xy");
+  assert.ok(candidate);
 
   const store = createStore({ dbPath });
   store.saveSession(state);
@@ -1351,24 +1406,15 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
     store,
     turnId: "turn_visual_country_mismatch",
     action: {
-      id: "act_visual_country_wrong_operation",
-      type: "click_xy",
-      observationId: observation.observationId,
-      observationHash: observation.observationSnapshot.snapshotHash,
-      intent: "recover_skill_atom",
-      operation: "choose",
-      skillPlanId: plan.planId,
-      skillAtomId: atom.atomId,
-      controlId: "ctrl_visual_country",
-      x: 200,
-      y: 120,
-      visualRegion: { x: 180, y: 100, width: 40, height: 40, viewportWidth: 1200, viewportHeight: 800, surfaceId: "" },
-      expectedOutcome: { type: "options_surface_appeared", controlId: "ctrl_visual_country" },
-      risk: "safe"
+      ...loopPrivate.bindTargetSnapshot(
+        actionForProfileCandidate(state.currentGoal, candidate, observation),
+        observation
+      ),
+      operation: "choose"
     }
   });
   assert.equal(mismatched.allow, false);
-  assert.equal(mismatched.code, "BLOCKED_OBLIGATION_MISMATCH");
+  assert.equal(mismatched.code, "CURRENT_GOAL_CANDIDATE_MISMATCH");
 
   const result = governAction({
     state,
@@ -1376,36 +1422,12 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
     traveler,
     store,
     turnId: "turn_visual_country",
-    action: {
-      id: "act_visual_country_recovery",
-      type: "click_xy",
-      observationId: observation.observationId,
-      observationHash: observation.observationSnapshot.snapshotHash,
-      intent: "recover_skill_atom",
-      operation: "open",
-      skillPlanId: plan.planId,
-      skillAtomId: atom.atomId,
-      controlId: "ctrl_visual_country",
-      targetId: "",
-      targetLabel: "Country code open region",
-      x: 200,
-      y: 120,
-      visualRegion: { x: 180, y: 100, width: 40, height: 40, viewportWidth: 1200, viewportHeight: 800, surfaceId: "" },
-      targetSnapshot: {
-        id: "",
-        controlId: "ctrl_visual_country",
-        semantic: "phone_country_code",
-        risk: "safe",
-        source: "visual_control_recovery",
-        recoveryOperation: "open",
-        visualRegion: { x: 180, y: 100, width: 40, height: 40, viewportWidth: 1200, viewportHeight: 800, surfaceId: "" }
-      },
-      expectedOutcome: { type: "options_surface_appeared", controlId: "ctrl_visual_country" },
-      risk: "safe",
-      reason: "Use the bounded right-edge recovery region."
-    }
+    action: loopPrivate.bindTargetSnapshot(
+      actionForProfileCandidate(state.currentGoal, candidate, observation),
+      observation
+    )
   });
-  assert.equal(result.allow, true);
+  assert.equal(result.allow, true, JSON.stringify(result));
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1429,7 +1451,7 @@ test("P0.4 persists a multi-atom skill and rebinds each atom to the fresh observ
   assert.equal(second.status, "action");
   assert.equal(second.action.controlId, "ctrl_phone_obs_form_2");
   assert.notEqual(second.action.controlId, "ctrl_phone_obs_form_1");
-  assert.equal(second.plan.atoms.find((atom) => atom.semanticType === "email").status, "complete");
+  assert.equal(second.plan.atoms.find((atom) => atom.semanticType === "email").status, "satisfied");
 
   const finalObservation = profileFormObservation({ observationId: "obs_form_3", emailFilled: true, phoneFilled: true });
   const complete = advanceSkillPlan(second.plan, finalObservation, traveler, {
@@ -1442,7 +1464,7 @@ test("P0.4 persists a multi-atom skill and rebinds each atom to the fresh observ
   assert.equal(complete.plan.atoms.every((atom) => ["complete", "satisfied"].includes(atom.status)), true);
 });
 
-test("P0.4 suspends a skill when the exact atomic result fails", () => {
+test("P0.4 changes strategy or suspends when an exact atomic result fails", () => {
   const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222" };
   const firstObservation = profileFormObservation();
   const first = advanceSkillPlan(
@@ -1458,7 +1480,7 @@ test("P0.4 suspends a skill when the exact atomic result fails", () => {
   });
   assert.equal(failed.status, "ambiguous");
   assert.equal(failed.plan.status, "suspended");
-  assert.match(failed.reason, /FIELD_VALUE_NOT_VERIFIED/);
+  assert.match(failed.reason, /no untried grounded strategy/i);
 });
 
 test("P0.3 reissues an unexecuted stale skill atom against the fresh observation", () => {
@@ -1489,51 +1511,132 @@ test("P0.3 reissues an unexecuted stale skill atom against the fresh observation
   assert.equal(reissued.atom.lastRejectionCode, "OBSERVATION_HASH_MISMATCH");
 });
 
-test("P0.4 active skill plans survive a SQLite restart", () => {
+test("Unified semantic goal state survives a SQLite restart", () => {
   const { dir, dbPath } = tempDb();
   const { state } = fixture();
   const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222" };
   const observation = profileFormObservation();
-  const first = advanceSkillPlan(
-    createSkillPlan({ id: "act_parent", type: "fill_visible_profile_fields" }, observation, traveler),
-    observation,
-    traveler,
-    {}
-  );
-  state.activeSkillPlan = first.plan;
+  state.currentGoal = deriveProfileGoal(observation, traveler);
+  state.currentGoal.candidates = candidatesForProfileGoal(state.currentGoal, observation, traveler);
+  state.pendingAction = {
+    status: "governed",
+    actionId: "act_email",
+    goalId: state.currentGoal.goalId,
+    candidateId: state.currentGoal.candidates[0].candidateId
+  };
+  state.attemptedCandidateIds = ["candidate_previous"];
+  state.verifiedResults = [{ goalId: "profile:prior:0", browserVerified: true }];
   let store = createStore({ dbPath });
   store.saveSession(state);
   store.close();
   store = createStore({ dbPath });
   const restored = store.getSession(state.id);
-  assert.equal(restored.activeSkillPlan.planId, first.plan.planId);
-  assert.equal(restored.activeSkillPlan.atoms.find((atom) => atom.status === "dispatched").lastActionId, first.action.id);
+  assert.equal(restored.currentGoal.goalId, "profile:email:0");
+  assert.equal(restored.pendingAction.candidateId, state.currentGoal.candidates[0].candidateId);
+  assert.deepEqual(restored.attemptedCandidateIds, ["candidate_previous"]);
+  assert.equal(restored.verifiedResults[0].browserVerified, true);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.4 resumes the next governed atom without another model call", async () => {
+test("Unified loop fills email then immediately advances to confirmation email", async () => {
+  const { dir, dbPath } = tempDb();
+  const traveler = {
+    id: "trav_email_confirmation",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    nationality: "Slovenia",
+    gender: "male",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    date_of_birth: "2003-05-31"
+  };
+  const state = createCheckoutSessionState({
+    goal: "Complete traveler profile",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: "https://example.test/traveler" }
+  });
+  state.id = "txn_email_confirmation";
+  const store = createStore({ dbPath });
+  const firstObservation = completeProfileObservation({ observationId: "obs_email_first", filled: new Set() });
+  store.saveSession(state);
+  store.recordObservation(state.id, firstObservation);
+  const email = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation: firstObservation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_email_first"
+  });
+  assert.equal(email.clientDecision.action, "type");
+  assert.equal(email.state.currentGoal.semanticType, "email");
+  assert.equal(email.clientDecision.value, traveler.email);
+
+  const confirmationObservation = completeProfileObservation({
+    observationId: "obs_email_confirmation_next",
+    filled: new Set(["email"])
+  });
+  confirmationObservation.lastActionResult = {
+    actionId: email.clientDecision.actionId,
+    candidateId: email.clientDecision.candidateId,
+    dispatched: true,
+    executed: true,
+    verified: true,
+    postconditionSatisfied: true,
+    outcome: { code: "NORMALIZED_VALUE_VERIFIED" }
+  };
+  store.recordObservation(state.id, confirmationObservation);
+  const confirmation = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation: confirmationObservation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_email_confirmation"
+  });
+  assert.equal(confirmation.clientDecision.action, "type");
+  assert.equal(confirmation.state.currentGoal.semanticType, "confirm_email");
+  assert.equal(confirmation.clientDecision.value, traveler.email);
+  assert.equal(confirmation.debug.modelUsage.calls.length, 0);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("Unified semantic loop advances to the next profile goal without another model call", async () => {
   const { dir, dbPath } = tempDb();
   const { state } = fixture();
   const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222", booking_rules: "no extras" };
   const firstObservation = profileFormObservation();
-  const first = advanceSkillPlan(
-    createSkillPlan({ id: "act_parent", type: "fill_visible_profile_fields" }, firstObservation, traveler),
-    firstObservation,
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, firstObservation);
+  const first = await runLoopTurn({
+    apiKey: "",
+    model: "should-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation: firstObservation,
     traveler,
-    {}
-  );
-  state.activeSkillPlan = first.plan;
+    transactionStore: store,
+    clientTurnId: "turn_goal_email"
+  });
   const nextObservation = {
     ...profileFormObservation({ observationId: "obs_form_resume", emailFilled: true }),
     lastActionResult: {
-      actionId: first.action.id,
+      actionId: first.clientDecision.actionId,
+      candidateId: first.clientDecision.candidateId,
+      dispatched: true,
+      executed: true,
       verified: true,
+      postconditionSatisfied: true,
       outcome: { code: "FIELD_VALUE_VERIFIED" }
     }
   };
-  const store = createStore({ dbPath });
-  store.saveSession(state);
   store.recordObservation(state.id, nextObservation);
   const result = await runLoopTurn({
     apiKey: "",
@@ -1547,40 +1650,47 @@ test("P0.4 resumes the next governed atom without another model call", async () 
   });
   assert.equal(result.clientDecision.action, "type");
   assert.equal(result.clientDecision.controlId, "ctrl_phone_obs_form_resume");
-  assert.equal(result.clientDecision.skillPlanId, first.plan.planId);
+  assert.equal(result.clientDecision.goalId, "profile:phone:0");
   assert.equal(result.clientDecision.observationId, "obs_form_resume");
-  assert.match(result.clientDecision.actionId, /^act_skill_/);
-  assert.equal(result.clientDecision.expectedOutcome.type, "field_value_changed");
-  assert.equal(result.clientDecision.expectedOutcome.expectedValue, "40111222");
+  assert.match(result.clientDecision.actionId, /^act_goal_/);
+  assert.equal(result.clientDecision.expectedOutcome.type, "normalized_value_changed");
+  assert.equal(result.clientDecision.expectedOutcome.expectedNormalizedValue, "40111222");
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.equal(result.state.activeSkillPlan.atoms.find((atom) => atom.semanticType === "email").status, "complete");
+  assert.equal(result.state.currentGoal.semanticType, "phone");
+  assert.equal(result.state.verifiedResults.some((item) => item.goalId === "profile:email:0" && item.semanticPostconditionSatisfied), true);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.3 loop preserves and reissues a stale unexecuted atom through the governor", async () => {
+test("Unified semantic loop reissues a candidate after stale pre-dispatch rejection", async () => {
   const { dir, dbPath } = tempDb();
   const { state } = fixture();
   const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222", booking_rules: "no extras" };
   const firstObservation = profileFormObservation({ observationId: "obs_stale_loop_before" });
-  const first = advanceSkillPlan(
-    createSkillPlan({ id: "act_parent", type: "fill_visible_profile_fields" }, firstObservation, traveler),
-    firstObservation,
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, firstObservation);
+  const first = await runLoopTurn({
+    apiKey: "",
+    model: "should-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation: firstObservation,
     traveler,
-    {}
-  );
-  state.activeSkillPlan = first.plan;
+    transactionStore: store,
+    clientTurnId: "turn_stale_initial"
+  });
   const freshObservation = {
     ...profileFormObservation({ observationId: "obs_stale_loop_after" }),
     lastActionResult: {
-      actionId: first.action.id,
+      actionId: first.clientDecision.actionId,
+      candidateId: first.clientDecision.candidateId,
+      dispatched: false,
       executed: false,
       verified: false,
       outcome: { code: "OBSERVATION_HASH_MISMATCH" }
     }
   };
-  const store = createStore({ dbPath });
-  store.saveSession(state);
   store.recordObservation(state.id, freshObservation);
 
   const result = await runLoopTurn({
@@ -1595,12 +1705,14 @@ test("P0.3 loop preserves and reissues a stale unexecuted atom through the gover
   });
 
   assert.equal(result.clientDecision.action, "type");
-  assert.equal(result.clientDecision.skillAtomId, first.action.skillAtomId);
+  assert.equal(result.clientDecision.goalId, "profile:email:0");
+  assert.notEqual(result.clientDecision.candidateId, first.clientDecision.candidateId);
+  assert.equal(result.clientDecision.candidateId, "obs_stale_loop_after:candidate_1");
   assert.equal(result.clientDecision.observationId, "obs_stale_loop_after");
   assert.equal(result.clientDecision.controlId, "ctrl_email_obs_stale_loop_after");
-  assert.notEqual(result.clientDecision.actionId, first.action.id);
+  assert.notEqual(result.clientDecision.actionId, first.clientDecision.actionId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.equal(result.state.activeSkillPlan.atoms.find((atom) => atom.semanticType === "email").reissueCount, 1);
+  assert.deepEqual(result.state.attemptedCandidateIds, []);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1627,10 +1739,12 @@ test("P0.4 blank traveler stage deterministically starts profile ownership befor
 
   assert.equal(result.clientDecision.action, "type");
   assert.equal(result.clientDecision.controlId, "ctrl_email_obs_profile_owner");
-  assert.equal(result.clientDecision.intent, "satisfy_field");
+  assert.equal(result.clientDecision.intent, "satisfy_semantic_goal");
+  assert.equal(result.clientDecision.goalId, "profile:email:0");
+  assert.ok(result.clientDecision.candidateId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.equal(result.state.activeSkillPlan.status, "running");
-  assert.equal(result.state.activeSkillPlan.atoms.find((atom) => atom.semanticType === "email").status, "dispatched");
+  assert.equal(result.state.currentGoal.semanticType, "email");
+  assert.equal(result.state.pendingAction.candidateId, result.clientDecision.candidateId);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1674,7 +1788,7 @@ test("P0.4 canonical profile readiness blocks baggage even without an active ski
     }
   });
 
-  assert.equal(state.activeSkillPlan, null);
+  assert.equal(state.currentGoal, null);
   assert.equal(result.allow, false);
   assert.equal(result.code, "PROFILE_STAGE_NOT_READY");
   assert.match(result.reason, /Mobile number is invalid/);
@@ -1708,9 +1822,8 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(recovery.clientDecision.intent, "recover_target_viewport");
   assert.equal(recovery.clientDecision.needsApproval, false);
   assert.equal(recovery.debug.modelUsage.calls.length, 0);
-  const pendingAtom = recovery.state.activeSkillPlan.atoms.find((atom) => atom.semanticType === "email");
-  assert.equal(pendingAtom.status, "pending");
-  assert.equal(pendingAtom.viewportRecoveryCount, 1);
+  assert.equal(recovery.state.currentGoal.semanticType, "email");
+  assert.equal(recovery.state.pendingAction.status, "viewport_recovery");
 
   const fresh = profileFormObservation({ observationId: "obs_profile_scrolled" });
   fresh.page.viewport = { width: 1200, height: 800 };
@@ -1738,7 +1851,7 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(rebound.clientDecision.controlId, "ctrl_email_obs_profile_scrolled");
   assert.equal(rebound.clientDecision.observationId, "obs_profile_scrolled");
   assert.equal(rebound.debug.modelUsage.calls.length, 0);
-  assert.notEqual(rebound.clientDecision.actionId, pendingAtom.lastViewportRejectedActionId);
+  assert.notEqual(rebound.clientDecision.actionId, recovery.state.pendingAction.recoveryOfAction.id);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1765,7 +1878,7 @@ test("P0.4 profile readiness becomes eligible only after canonical fields and er
 test("P0.7 a pending ordinary action rebinds after viewport recovery without a model call", async () => {
   const { dir, dbPath } = tempDb();
   const { state, observation } = fixture();
-  state.pendingRecoveryAction = {
+  state.pendingAction = {
     type: "viewport_rebind",
     recoveryCount: 1,
     blockedActionId: "act_decline_offscreen",
@@ -1802,7 +1915,7 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
   assert.equal(result.clientDecision.controlId, "ctrl_decline");
   assert.equal(result.clientDecision.targetId, "el_decline");
   assert.equal(result.clientDecision.expectedOutcome.type, "active_surface_dismissed");
-  assert.equal(result.state.pendingRecoveryAction, null);
+  assert.equal(result.state.pendingAction, null);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1818,7 +1931,7 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
     height: 40,
     inViewport: false
   };
-  state.pendingRecoveryAction = {
+  state.pendingAction = {
     type: "viewport_rebind",
     recoveryCount: 1,
     blockedActionId: "act_decline_offscreen",
@@ -1853,8 +1966,111 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
 
   assert.equal(result.clientDecision.action, "scroll");
   assert.equal(result.clientDecision.intent, "recover_target_viewport");
-  assert.equal(result.state.pendingRecoveryAction.recoveryCount, 2);
+  assert.equal(result.state.pendingAction.recoveryCount, 2);
   assert.equal(result.debug.modelUsage.calls.length, 0);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("P0.7 measurable viewport progress resets the genuine-failure budget", async () => {
+  const { dir, dbPath } = tempDb();
+  const { state, observation } = fixture();
+  observation.page.viewport = { width: 1200, height: 800 };
+  observation.page.controls[0].visualRegion = { x: 100, y: 1200, width: 180, height: 40, inViewport: false };
+  state.pendingAction = {
+    type: "viewport_rebind",
+    recoveryCount: 4,
+    noProgressFailureCount: 2,
+    viewportProgress: [{
+      observationId: "obs_previous_scroll",
+      exists: true,
+      inViewport: false,
+      distanceToViewport: 900,
+      measurableProgress: false
+    }],
+    blockedActionId: "act_decline_progress",
+    action: {
+      id: "act_decline_progress",
+      type: "click",
+      observationId: "obs_before_scroll",
+      intent: "decline_optional_extra",
+      controlId: "ctrl_decline",
+      decisionGroupId: "dg_baggage_confirm",
+      targetId: "ctrl_decline",
+      risk: "safe",
+      reason: "Resume the optional-extra decline after viewport recovery."
+    }
+  };
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler: { id: "trav_1", booking_rules: "no extras" },
+    transactionStore: store,
+    clientTurnId: "turn_viewport_progress"
+  });
+
+  assert.equal(result.clientDecision.action, "scroll");
+  assert.equal(result.clientDecision.expectedOutcome.attempt, 5);
+  assert.equal(result.state.pendingAction.noProgressFailureCount, 0);
+  assert.equal(result.state.pendingAction.viewportProgress.at(-1).measurableProgress, true);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("P0.7 user handoff occurs only after bounded genuine viewport failures", async () => {
+  const { dir, dbPath } = tempDb();
+  const { state, observation } = fixture();
+  observation.page.viewport = { width: 1200, height: 800 };
+  observation.page.controls[0].visualRegion = { x: 100, y: 1280, width: 180, height: 40, inViewport: false };
+  state.pendingAction = {
+    type: "viewport_rebind",
+    recoveryCount: 3,
+    noProgressFailureCount: 2,
+    viewportProgress: [{
+      observationId: "obs_previous_unchanged_scroll",
+      exists: true,
+      inViewport: false,
+      distanceToViewport: 500,
+      measurableProgress: false
+    }],
+    blockedActionId: "act_decline_stuck",
+    action: {
+      id: "act_decline_stuck",
+      type: "click",
+      observationId: "obs_before_scroll",
+      intent: "decline_optional_extra",
+      controlId: "ctrl_decline",
+      decisionGroupId: "dg_baggage_confirm",
+      targetId: "ctrl_decline",
+      risk: "safe",
+      reason: "Resume the optional-extra decline after viewport recovery."
+    }
+  };
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler: { id: "trav_1", booking_rules: "no extras" },
+    transactionStore: store,
+    clientTurnId: "turn_viewport_genuine_failure"
+  });
+
+  assert.equal(result.clientDecision.action, "ask_user");
+  assert.equal(result.state.pendingAction, null);
+  assert.equal(result.state.status, "awaiting_user");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

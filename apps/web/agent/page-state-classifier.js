@@ -1,18 +1,20 @@
 const { callStructured } = require("./openai-client");
 const { pageStateSchema } = require("./schemas");
 const { normalizePageState, requirementsFromPageState } = require("../../../packages/shared/page-state");
+const { modelObservationContext, semanticActionContext } = require("./model-context");
 
 const INSTRUCTIONS = [
   "You classify a flight checkout page into a typed PageState. This is NOT a free-form requirements list.",
+  "Use pageMarkdown as the compact whole-page source of truth and observationDiffMarkdown for the exact transition since the previous observation. Do not assume the screenshot viewport is the whole page.",
   "Use these buckets exactly:",
   "requiredFields: fields the user must fill before the current step can proceed.",
   "requiredChoices: required radio/checkbox/select decisions such as baggage choice, seat decision, required legal checkbox.",
   "optionalPaidExtras: paid upsells/add-ons/seat upgrades/insurance/bundles that should usually be declined or skipped.",
   "navigationActions: visible buttons/links that move the flow, e.g. Continue, Next, Close, Skip. Navigation actions are actions, never missing requirements.",
   "riskGates: explicit controls that require user approval: payment/card/final purchase, legal checkbox/I agree/signature, price increase, identity uncertainty. Passive explanatory text is not a risk gate.",
-  "activeSurface: the currently active modal/dropdown/popover if one is open; classify its requirements/options/navigation before the background page.",
-  "Use page.foreground, page.visualState, and page.accessibility when present. Accessibility role/name/state are direct evidence for whether an item is a radio, checkbox, button, selected option, disabled control, required field, or expanded popup.",
-  "Use page.decisionGroups when present. A decision group is one logical requirement with alternatives. If one member is selected, the group is satisfied; unselected paid alternatives inside that same group are available alternatives, not missing requirements.",
+  "currentSurface: the authoritative current modal/dropdown/popover/page; classify its requirements/options/navigation before background evidence.",
+  "Stable references in pageMarkdown identify the current canonical controls. Aggregated seat-cell counts are context, not hundreds of separate requirements.",
+  "Use the typed decision and control state preserved in pageMarkdown. A decision group is one logical requirement with alternatives. If one member is selected, the group is satisfied; unselected paid alternatives inside that same group are available alternatives, not missing requirements.",
   "Never create separate missing requirements for unselected paid alternatives when their decision group already has a selected no-cost/decline member.",
   "If foreground.active is true, classify the foreground surface as the current screen, even when the URL/background checkout step did not change. Use foreground.progressMarkers such as Flight 1 of 2 / Flight 2 of 2 to distinguish repeated seat-selection legs.",
   "Hard rule: never put Continue/Next/Proceed/Close/Skip into requiredFields or requiredChoices. Put them only in navigationActions.",
@@ -25,15 +27,16 @@ const INSTRUCTIONS = [
 ].join(" ");
 
 async function classifyPageState({ apiKey, model, observation, screenshotDataUrl, traveler }) {
+  const observationContext = modelObservationContext(observation, traveler);
   const { data: raw, meta } = await callStructured({
     apiKey,
     model,
     instructions: INSTRUCTIONS,
     payload: {
-      page: observation?.page || {},
+      ...observationContext,
       traveler: traveler || {},
       userIntent: observation?.userIntent || "",
-      lastActionResult: observation?.lastActionResult || null
+      lastActionResult: semanticActionContext({}, observation?.lastActionResult || {})
     },
     screenshotDataUrl,
     schema: pageStateSchema,

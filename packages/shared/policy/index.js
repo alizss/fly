@@ -152,7 +152,8 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
 
   // Continue/advance: only once every required requirement is actually satisfied.
   if (looksLikeContinueAction(action)) {
-    const missing = (state?.requirements || []).filter((req) => req.status !== "satisfied" && blocksContinue(req, profile));
+    const { requirementFulfilled } = require("../requirements");
+    const missing = (state?.requirements || []).filter((req) => !requirementFulfilled(req) && blocksContinue(req, profile));
     if (missing.length) {
       return { allow: false, decision: "deny", reason: `${missing.length} required item(s) not yet satisfied: ${missing.map((r) => r.label).join(", ")}.` };
     }

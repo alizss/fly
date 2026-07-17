@@ -7,7 +7,7 @@
 /**
  * @typedef {"traveler_field"|"contact_field"|"document_field"|"baggage_decision"|
  *   "seat_decision"|"paid_extra_decision"|"legal_acceptance"|"payment"|"continue"|"unknown"} RequirementType
- * @typedef {"missing"|"satisfied"|"blocked"|"needs_user"|"unknown"|"conflicted"} RequirementStatus
+ * @typedef {"missing"|"satisfied"|"waived_by_policy"|"blocked"|"needs_user"|"unknown"|"conflicted"} RequirementStatus
  * @typedef {"safe"|"money"|"payment"|"legal"|"uncertain"} RiskLevel
  *
  * @typedef {Object} CheckoutRequirement
@@ -27,7 +27,7 @@ const REQUIREMENT_TYPES = new Set([
   "traveler_field", "contact_field", "document_field", "baggage_decision",
   "seat_decision", "paid_extra_decision", "legal_acceptance", "payment", "continue", "unknown"
 ]);
-const REQUIREMENT_STATUSES = new Set(["missing", "satisfied", "blocked", "needs_user", "unknown", "conflicted"]);
+const REQUIREMENT_STATUSES = new Set(["missing", "satisfied", "waived_by_policy", "blocked", "needs_user", "unknown", "conflicted"]);
 const RISK_LEVELS = new Set(["safe", "money", "payment", "legal", "uncertain"]);
 
 function clampConfidence(value) {
@@ -56,11 +56,15 @@ function normalizeRequirement(raw = {}, index = 0) {
 function allRequiredSatisfied(requirements = [], minConfidence = 0.75) {
   return requirements
     .filter((req) => req.required)
-    .every((req) => req.status === "satisfied" && req.confidence >= minConfidence);
+    .every((req) => requirementFulfilled(req) && req.confidence >= minConfidence);
 }
 
 function missingRequired(requirements = []) {
-  return requirements.filter((req) => req.required && req.status !== "satisfied");
+  return requirements.filter((req) => req.required && !requirementFulfilled(req));
 }
 
-module.exports = { normalizeRequirement, allRequiredSatisfied, missingRequired, REQUIREMENT_TYPES, REQUIREMENT_STATUSES, RISK_LEVELS };
+function requirementFulfilled(requirement = {}) {
+  return ["satisfied", "waived_by_policy"].includes(requirement.status);
+}
+
+module.exports = { normalizeRequirement, allRequiredSatisfied, missingRequired, requirementFulfilled, REQUIREMENT_TYPES, REQUIREMENT_STATUSES, RISK_LEVELS };

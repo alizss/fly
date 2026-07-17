@@ -10,47 +10,92 @@
 
 const { callStructured } = require("./openai-client");
 const { verifyAndPlanSchema } = require("./schemas");
-const { normalizeAction } = require("../../../packages/shared/agent-actions");
 const { latestPrice } = require("../../../packages/shared/agent-state");
+const {
+  semanticActionContext,
+  modelObservationContext,
+  sanitizedActionHistory,
+  sanitizedFailureHistory
+} = require("./model-context");
 
 const INSTRUCTIONS = [
-  "You are the verification + planning brain for a flight checkout copilot, working on a page you may never have seen the exact layout of before. Do not assume anything about this being any particular airline or booking site — reason only from what is actually visible right now.",
-  "Return two things in one response: `verification` (did the last action actually work, what changed) and `action` (exactly one next step).",
+  "You verify semantic checkout progress and select one server-grounded candidate for the next goal.",
+  "Return `verification` plus `action={candidateId}`. candidateId is the complete planner action contract.",
+  "Use pageMarkdown for current whole-page state and observationDiffMarkdown for what changed. Treat an appeared popup, changed progress marker, committed selection, or validation response as meaningful current-state evidence and replan from it.",
+  "Historical actions are semantic context only. They intentionally contain no DOM identity and must never be treated as executable targets.",
+  "The candidate list is generated exclusively from the current observation's canonical registry. Select exactly one listed candidateId. Do not return a semantic goal or restate the server's goal wording.",
+  "Never invent or return targetId, controlId, coordinates, snapshots, geometry, actuators, operations, values, keys, or another action.",
   "PART 1 — verification:",
-  "You are given the previous requirements list, the action just taken, and the freshly re-extracted current requirements/screenshot.",
+  "You are given semantic information about the previous action and freshly extracted current requirements/screenshot.",
   "changed=true only if something observably changed (a field now has a value it didn't before, a requirement's status flipped, the URL/step changed, a dropdown opened or closed). Do not assume an action worked just because it was dispatched without error.",
-  "lastActionWorked judges whether the last action achieved what its own stated reason claimed it would.",
-  "If the last action was a repeat of 'click Continue' (or similar) and the step/URL/fields did not change, that is NOT ok — list it as a blocker.",
+  "lastActionWorked judges whether the semantic outcome was achieved.",
   "priceChanged=true only if a total/price figure differs from the previous one given to you. riskChanged=true if something newly visible is money/payment/legal risk that wasn't flagged before.",
-  "Only requirementUpdates can propose a requirement state change. A requirement update must reference the current observationId when available, identify concrete visible/current evidence, and only propose satisfied when the current page no longer shows that requirement as unresolved.",
-  "If currentRequirements says a requirement is missing/needs_user/unknown, do not also mark it satisfied unless the screenshot/current page clearly proves the extracted requirement is stale. When unsure, leave it unresolved.",
-  "PART 2 — action, informed by part 1:",
-  "You are also given `pageState`, a typed classifier output. Treat it as the primary map of the page: requiredFields/requiredChoices are prerequisites, optionalPaidExtras are decline/skip candidates, navigationActions are buttons like Continue/Next/Close/Skip, and riskGates require approval.",
-  "The page payload may include `foreground`, `visualState`, and `accessibility`. Use accessibility role/name/state plus visible boxes to identify controls. If foreground.active is true, that foreground surface owns the next action until its fingerprint/progress marker changes or closes.",
-  "The page payload may include `decisionGroups`. Treat each decision group as one logical requirement. If a group has status='satisfied' with selectedControlId/selectedLabel, do not try to choose another unselected alternative in that same group. Unselected paid alternatives are not blockers by themselves.",
-  "When resolving a missing choice, choose a control from the same unresolved decisionGroupId. Do not use evidence or controls from one group (for example flexible ticket) to satisfy another group (for example baggage).",
-  "If the same modal remains open but `foreground.progressMarkers` changes (for example Flight 1 of 2 becomes Flight 2 of 2), treat that as progress from the previous action, not as a no-op.",
-  "Never treat navigationActions as missing requirements. If all requiredFields and requiredChoices are satisfied and no blocking riskGate is present, choose the best enabled navigationAction.",
-  "If a Continue/Next navigationAction is visible and enabled, and the only remaining issue is passive disclaimer text with no checkbox/control, click the navigationAction with risk='safe'.",
-  "Prefer satisfying missing required=true requirements with confidence>=0.7 that are risk='safe' first. If several plain traveler/contact text fields are empty at once, use type='fill_visible_profile_fields' to fill all visible profile-mappable fields in one browser-side pass instead of one at a time.",
-  "If the current page has an activeSurface whose type is modal/dropdown/popover, plan only within that active surface until it closes or changes. Choose a canonical controlId/targetId or screenshot visualRef from the current observation. Use click_xy only for a genuinely visual canvas/SVG control with current coordinates.",
-  "If an active modal says seats were not selected / you have not selected a seat and offers Continue versus Choose seat, and the profile/intent says no specific seats or no extras, choose Continue with risk='safe'. That is declining optional seat selection; Choose seat is the upsell path.",
-  "For seat maps, seat-selection popups, baggage popups, bundles, insurance, or other paid extras where the profile/intent says no extras/no specific seats, click the observed canonical safe option such as Next/Continue/Close/No thanks/Without/Skip. Do not choose a paid seat or paid add-on.",
-  "For weird visual controls/canvas/SVG seat maps, do not invent a DOM target. Use click_xy only for a visible safe navigation/decline/close control, never for selecting a paid seat.",
-  "Use type='scroll' when the next safe required control is likely offscreen. Use type='keypress' with keys='Escape' only to close a harmless dropdown/popover, not to bypass payment/legal/final review.",
-  "Prefer declining paid extras (baggage/seat/insurance/bundle/flexible-ticket) when the traveler profile or approval state says no paid extras.",
-  "Do not propose clicking Continue/Next while any required requirement's status is not 'satisfied' in the CURRENT requirements list — check it yourself, do not assume.",
-  "If verification.changed is false and the previous action already looked like this same one, do not simply repeat it — try a different visible control for the same requirement, or ask_user.",
-  "When activeSkillRecovery is present, that exact skill atom owns the next step even though its deterministic actuator is ambiguous. Recover only that atom; do not fill a later traveler field such as phone/name and do not navigate onward.",
-  "For activeSkillRecovery, use evidence in this order: a canonical operation actuator, accessibility relationships, bounded geometry recovery regions, screenshot grounding, then click_xy inside one supplied recovery region. If none is defensible, use wait/scroll for one fresh observation or ask_user. Never invent coordinates outside a supplied region.",
-  "The payload includes failedActuatorAttempts from this durable checkout session. Never propose the same type+operation+controlId+targetId+value signature again. Use another current actuator for the same control, reobserve, or ask_user.",
-  "Never propose typing into or clicking a card number/CVC-looking field. Never propose a final payment/purchase action — use type='final_review' or type='ask_user' once nothing else is missing.",
-  "For click/type/select, targetId must be a canonical controlId, screenshot visualRef, or exact registered element ID from the CURRENT observation. targetLabel is descriptive only and is never a fallback identity. If no current canonical target exists, return wait or ask_user instead of a label-only mutation.",
-  "Use click_xy only when the target is genuinely visual canvas/SVG content with no canonical DOM control. Bind it to the current observation by setting x/y plus visualRegion={x,y,width,height,viewportWidth,viewportHeight,surfaceId}. The point must lie inside that region and the region must belong to the foreground surface. Never use click_xy to recover a DOM control by text.",
-  "The action JSON schema requires x, y, visualRegion, scrollY, and keys on every action. For non-coordinate actions use x=0, y=0 and visualRegion={x:0,y:0,width:0,height:0,viewportWidth:0,viewportHeight:0,surfaceId:''}; use 0 for scrollY and empty string for keys when they do not apply.",
-  "requirementId should reference the id of the requirement this action is trying to satisfy, when applicable; empty string if none. requiresApproval should be true whenever risk is 'money', 'payment', or 'legal'.",
-  "Both `verification.evidence`/`blockers` and `action.reason` are short, concrete, user-visible text — not internal chain-of-thought."
+  "Verification is diagnostic only. Browser observations and browser-confirmed postconditions are the sole authority for requirement and action success. Do not use requirementUpdates to override currentRequirements.",
+  "PART 2 — candidate selection:",
+  "Prefer a visible safe decline/no-extra candidate for baggage, bundles, seats, flexible tickets, cancellation, and insurance when policy says no extras.",
+  "For a closed required dropdown, select its current `open` candidate. On the next fresh observation, select a free/no-extra observed option; never reuse an old modal candidate.",
+  "Do not select Continue while a current required decision is unresolved.",
+  "If the browser rejected a stale identity, select a newly listed current candidate for the same semantic goal. If none exists, select the grounded handoff candidate.",
+  "Both verification evidence and blockers must be short, concrete, user-visible text."
 ].join(" ");
+
+class PlannerContractError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = "PlannerContractError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
+function resolvePlannerSelection(rawAction = {}, candidateSet = {}) {
+  const candidateId = String(rawAction?.candidateId || "");
+  const candidates = Array.isArray(candidateSet?.candidates) ? candidateSet.candidates : [];
+  const candidate = candidates.find((item) => item.candidateId === candidateId) || null;
+  if (!candidate) {
+    throw new PlannerContractError(
+      "PLANNER_CANDIDATE_NOT_CURRENT",
+      "Planner returned a candidateId outside the current observation-bound candidate set.",
+      { candidateId, observationId: candidateSet?.observationId || "" }
+    );
+  }
+  return {
+    candidateId,
+    candidate
+  };
+}
+
+async function selectFromImmutableCandidateSet({ candidateSet = {}, maxAttempts = 3, requestSelection }) {
+  let lastError = null;
+  const metas = [];
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const response = await requestSelection(attempt);
+    if (response?.meta) metas.push(response.meta);
+    try {
+      return {
+        raw: response?.data || {},
+        meta: response?.meta || null,
+        metas,
+        attempt,
+        selection: resolvePlannerSelection(response?.data?.action || response?.data || {}, candidateSet)
+      };
+    } catch (error) {
+      if (!(error instanceof PlannerContractError)) throw error;
+      lastError = error;
+    }
+  }
+  throw new PlannerContractError(
+    lastError?.code || "PLANNER_CANDIDATE_NOT_CURRENT",
+    "Planner exhausted bounded reselection against the unchanged immutable candidate set.",
+    {
+      ...(lastError?.details || {}),
+      selectionAttempts: maxAttempts,
+      observationId: candidateSet.observationId || "",
+      observationHash: candidateSet.observationHash || "",
+      surfaceId: candidateSet.surfaceId || ""
+    }
+  );
+}
 
 /**
  * @param {Object} args
@@ -65,44 +110,75 @@ const INSTRUCTIONS = [
  * @param {string} [args.screenshotDataUrl]
  * @returns {Promise<{ verification: Object, action: import("../../../packages/shared/agent-actions").AgentAction }>}
  */
-async function verifyAndPlan({ apiKey, model, state, observation, currentRequirements, pageState = null, traveler, actionHistory = [], screenshotDataUrl, skillRecovery = null }) {
+async function verifyAndPlan({ apiKey, model, state, observation, currentRequirements, pageState = null, traveler, actionHistory = [], screenshotDataUrl, candidateSet = null, semanticGoal = null }) {
   const previousPrice = latestPrice(state);
-  const { data: raw, meta } = await callStructured({
+  const observationContext = modelObservationContext(observation, traveler);
+  const boundCandidateSet = candidateSet || {
+    observationId: observation?.observationId || "",
+    observationHash: observation?.observationSnapshot?.snapshotHash || observation?.page?.snapshotHash || "",
+    surfaceId: "",
+    candidates: []
+  };
+  const candidates = Array.isArray(boundCandidateSet.candidates) ? boundCandidateSet.candidates : [];
+  const plannerPayload = {
+    previousRequirements: (state?.requirements || []).map((req) => ({ id: req.id, label: req.label, status: req.status, required: req.required })),
+    lastAction: semanticActionContext(state?.lastAction || {}, observation?.lastActionResult || {}),
+    currentStep: state?.currentStep || "unknown",
+    currentRequirements,
+    pageState,
+    previousPrice,
+    currentPriceText: observation?.page?.priceText || "",
+    lastActionResultFromClient: semanticActionContext(state?.lastAction || {}, observation?.lastActionResult || {}),
+    ...observationContext,
+    traveler: traveler || {},
+    approvalState: state?.approvals || {},
+    semanticGoal,
+    candidateSet: {
+      observationId: boundCandidateSet.observationId || "",
+      observationHash: boundCandidateSet.observationHash || "",
+      surfaceId: boundCandidateSet.surfaceId || "",
+      candidates: candidates.map((candidate) => ({
+        candidateId: candidate.candidateId,
+        controlId: candidate.controlId || "",
+        semantic: candidate.semantic || "",
+        operation: candidate.operation || "",
+        interactionRole: candidate.interactionRole || "",
+        semanticEffect: candidate.semanticEffect || "",
+        expectedEvidence: candidate.expectedEvidence || "",
+        affordance: candidate.affordance || null,
+        risk: candidate.risk || "uncertain",
+        visible: candidate.visible === true,
+        summary: candidate.summary || ""
+      }))
+    },
+    failedActionOutcomes: sanitizedFailureHistory(state?.failures || []),
+    actionHistory: sanitizedActionHistory(actionHistory),
+    userIntent: observation?.userIntent || ""
+  };
+  const selected = await selectFromImmutableCandidateSet({
+    candidateSet: boundCandidateSet,
+    maxAttempts: 3,
+    requestSelection: (attempt) => callStructured({
     apiKey,
     model,
     instructions: INSTRUCTIONS,
     payload: {
-      previousRequirements: (state?.requirements || []).map((req) => ({ id: req.id, label: req.label, status: req.status, required: req.required })),
-      lastAction: state?.lastAction || null,
-      currentStep: state?.currentStep || "unknown",
-      currentRequirements,
-      pageState,
-      previousPrice,
-      currentPriceText: observation?.page?.priceText || "",
-      lastActionResultFromClient: observation?.lastActionResult || null,
-      page: observation?.page || {},
-      traveler: traveler || {},
-      approvalState: state?.approvals || {},
-      activeSkillRecovery: skillRecovery,
-      failedActuatorAttempts: (state?.failures || []).map((failure) => ({
-        actuatorSignature: failure.actuatorSignature || failure.actionSignature || "",
-        actionId: failure.actionId || "",
-        observationId: failure.observationId || "",
-        controlId: failure.controlId || "",
-        targetId: failure.targetId || "",
-        operation: failure.operation || "",
-        code: failure.code || "",
-        message: failure.message || ""
-      })).slice(-30),
-      actionHistory: actionHistory.slice(-12),
-      userIntent: observation?.userIntent || ""
+      ...plannerPayload,
+      candidateSelectionAttempt: attempt
     },
     screenshotDataUrl,
     schema: verifyAndPlanSchema,
     schemaName: "checkout_verify_and_plan",
     maxOutputTokens: 1400,
     returnMeta: true
+    })
   });
+  const raw = selected.raw;
+  const meta = {
+    ...(selected.meta || {}),
+    candidateSelectionAttempts: selected.attempt,
+    retryMetas: selected.metas
+  };
 
   const v = raw.verification || {};
   const verification = {
@@ -127,7 +203,8 @@ async function verifyAndPlan({ apiKey, model, state, observation, currentRequire
     })).filter((item) => item.requirementId) : []
   };
 
-  return { verification, action: normalizeAction(raw.action || {}), meta };
+  const selection = selected.selection;
+  return { verification, selection, meta };
 }
 
-module.exports = { verifyAndPlan };
+module.exports = { PlannerContractError, resolvePlannerSelection, selectFromImmutableCandidateSet, verifyAndPlan };

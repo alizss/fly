@@ -39,7 +39,7 @@ This is the most important phase.
 
 ## P0.1 Remove extension-side autonomous actions
 
-The original split-brain implementation included these direct actors:
+These functions must stop directly clicking:
 
 * `settleAndHandleInterrupts()`
 * `handleRoutineExtraOverlay()`
@@ -48,7 +48,7 @@ The original split-brain implementation included these direct actors:
 * `autoResolveNoExtrasSection()`
 * `clickContinueGate()`
 
-Those actor paths have now been removed from the live extension. Future helpers may exist only as detectors, mechanical skill steps, or action proposers; they must never authorize or discover a mutating target outside the canonical governed action.
+They can remain as detectors or action proposers, but they must return a normalized action.
 
 Wrong:
 
@@ -138,6 +138,12 @@ SQLite is enough initially. Do not depend on memory.
 
 ## P0.3 Introduce immutable observations
 
+- [x] Stale canonical proposals are rejected, discarded, and automatically replanned from a newly observed candidate set with a finite recovery budget.
+- [x] Candidate sets are immutable envelopes bound to the exact observation ID, observation hash, and active surface; the governor rejects any binding drift.
+- [x] The planner executable contract contains only `candidateId`; model-generated semantic goal text is excluded. The server-owned candidate supplies the canonical goal, control, operation, actuator, and expected outcome.
+- [x] Grounding/replan attempts and browser-dispatched execution failures use separate finite budgets.
+- Process note: the explicit baggage-history → flexible-ticket recovery regression was added after the implementation work. The requested test-first chronology was missed and cannot be retroactively corrected; the regression now permanently covers the failure.
+
 Every page observation gets an ID and hash.
 
 ```js
@@ -169,33 +175,6 @@ Reject action
 
 This prevents stale clicks after rerenders and surprise popups.
 
-The authority hash is intentionally narrower than the diagnostic page diff. It
-contains the route/stage, foreground ownership, canonical control state,
-control-scoped validation status, decision-group state, graph integrity,
-transaction fingerprints, and price. Raw validation prose, raw page text,
-bounding boxes, scrolling, and layout are diagnostic evidence rather than
-execution identity. Changing error wording alone is not material; a canonical
-control entering or leaving an invalid state is material.
-
-When a material change makes a governed skill atom stale before execution:
-
-```text
-Reject the old action without executing it
-→ persist the unexecuted stale result
-→ capture a fresh immutable observation
-→ preserve the logical skill atom
-→ bind it to the fresh canonical control
-→ govern and issue a new action ID
-```
-
-Fresh rebinding succeeds only when the same logical obligation resolves to one
-unambiguous current canonical control and executable operation. A missing
-control or actuator is a typed recovery failure; absence never counts as
-recovered, visible, or complete.
-
-An executed action that fails its exact postcondition is not automatically
-retried by this rule; it remains an ambiguity/failure for the planner.
-
 ---
 
 ## P0.4 Separate skills from atomic actions
@@ -224,66 +203,6 @@ complete_contact_section
 
 A skill must expand into observable atomic actions.
 
-The expansion is a persisted plan, not a one-shot conversion:
-
-```text
-Create skill plan
-→ persist logical atoms
-→ bind one atom to the fresh canonical observation
-→ govern and execute it
-→ verify its exact postcondition
-→ mark that atom complete
-→ bind the next atom from the next observation
-→ return to AI after completion or ambiguity
-```
-
-The skill owns the semantic obligation and postcondition, not the website's
-interaction method.
-
-Example:
-
-```js
-{
-  skill: "select_profile_value",
-  semanticType: "phone_country_code",
-  desiredValue: "+386",
-  postcondition: {
-    type: "normalized_value_changed",
-    expectedValue: "+386"
-  }
-}
-```
-
-The skill may use a native select, combobox typing, a sibling arrow, keyboard
-interaction, an accessibility target, or a screenshot-grounded click. Those
-are observation-time execution strategies, not separate country-code or
-airline skills.
-
-Skill atoms retain semantic field/decision identity, but never retain a stale
-DOM target as execution authority. Every atom receives its own observation ID,
-action ID, canonical control binding, expected outcome, governor decision,
-ledger events, and verification result. A failed or missing exact result
-suspends the current atom without releasing ownership of its unresolved
-prerequisite. That prerequisite remains authoritative until fresh canonical
-evidence proves it satisfied, a bounded typed recovery reissues it, or the
-transaction truthfully hands control to the user. General model planning may
-interpret or recover the suspended atom, but dependent atoms and later checkout
-stages may not bypass it.
-
-Skill ownership is deterministic. When the current observation contains
-unresolved profile-mappable controls and the selected traveler has the required
-values, the transaction orchestrator must create or resume the required profile
-skill, including a persisted suspended skill whose prerequisite remains
-unresolved, before general model planning. The model may help classify an
-unknown field, but it must not be responsible for opting into the skill one
-field at a time.
-
-The skill must consume the canonical control's normalized current value and
-state. It must not maintain a second field-satisfaction implementation. A field
-that the current observation already proves equal to the desired profile value
-is satisfied; it is not retyped merely because the skill cannot interpret the
-raw DOM value itself.
-
 Do not let `fill_visible_profile_fields` silently change twelve controls and return one vague result.
 
 Each atomic action needs:
@@ -296,6 +215,11 @@ Each atomic action needs:
 ---
 
 ## P0.5 Add transaction invariants
+
+- [x] Browser observations publish structured itinerary segments, travelers, currency, base/total price, fare brand, selected extras, and provenance; visible route/date/time hashes are no longer transaction truth.
+- [x] `invariants.js` owns the immutable approved baseline, append-only observation evidence, and explicit contradiction decisions. Missing or matching partial evidence remains stable and never silently replaces the baseline.
+- [x] Only explicit route/date/time/flight/traveler/currency conflicts block ordinary progress; price and payment remain separately authorization-bound.
+- [x] The governor consumes the invariant decision and no longer constructs or mutates transaction truth itself.
 
 Create:
 
@@ -318,13 +242,11 @@ Check continuously:
 
 The model may explain changes. It cannot override invariants.
 
-A visible validation error keeps the transaction in the control's current
-stage. Baggage, extras, seats, and navigation cannot begin merely because no
-profile skill happened to be active in memory.
-
 ---
 
 ## P0.6 Add a central action governor
+
+- [x] The strict central governor remains authoritative: model-selected candidate IDs are bound and exact-matched server-side; stale targets are never recovered by label similarity or site-specific exceptions.
 
 Create:
 
@@ -350,6 +272,9 @@ No code path may bypass this component.
 ---
 
 ## P0.7 Strengthen target validation
+
+- [x] Current-observation target recovery is complete for the modal-disappeared → flexible-ticket-control transition, including strict rejection of the old modal identity.
+- [x] Control-graph validation is risk-scoped: screenshot annotations come only from the finalized registry, conflicted controls are excluded from candidates, unrelated conflicts remain diagnostic, and the governor blocks only ambiguity touching the selected control, actuator, target, or surface.
 
 Every target needs a fingerprint:
 
@@ -377,22 +302,6 @@ Before clicking, confirm:
 * Bounding box has not materially moved
 
 If confidence is low, reobserve. Do not fuzzy-click another “Continue.”
-
-A known canonical target that is outside the current viewport is recoverable,
-not automatically a user handoff. Preserve the logical pending action, issue a
-governed non-mutating scroll/reobserve step, and bind the action again to the
-fresh observation. Ask the user only when the target cannot be brought into a
-valid actionable viewport or the refreshed identity becomes ambiguous.
-
-Viewport recovery must scroll the canonical target's nearest effective
-scrollable ancestor, using the document viewport only when no inner scroll
-owner exists. Each attempt is bounded and followed by a fresh observation.
-Recovery succeeds only when the fresh registry contains the same unambiguous
-logical control and operation actuator, and that actuator is visible,
-intersecting the actionable viewport, unobscured, and hit-testable. If the
-control disappears, the scroll owner cannot move farther, or the refreshed
-binding is ambiguous, return a typed recovery failure. Never default a missing
-target to in-view.
 
 ---
 
@@ -433,275 +342,6 @@ Never automatically retry from `SUBMISSION_RESULT_UNKNOWN`.
 
 ---
 
-## P0.9 Create one canonical logical control graph
-
-Each observation must create exactly one control registry. Every semantic model,
-screenshot annotation, accessibility node, planner target, executor target, and
-verification result must reference records from that registry rather than
-reconstructing identity independently.
-
-A logical control owns:
-
-```js
-{
-  controlId,
-  decisionGroupId,
-  stateElementId,
-  operations: {
-    open: { actuatorId, precondition, expectedOutcome },
-    choose: { actuatorIds, precondition, expectedOutcome },
-    type: { actuatorId, precondition, expectedOutcome },
-    select: { actuatorId, precondition, expectedOutcome }
-  },
-  actuators,
-  semantic,
-  risk,
-  state: {
-    checked,
-    selected,
-    disabled,
-    expanded,
-    valuePresent,
-    normalizedValue
-  },
-  validation: {
-    status: "valid | invalid | unknown",
-    issueIds: []
-  },
-  scrollContext: {
-    ownerId,
-    axis,
-    canScrollBackward,
-    canScrollForward
-  },
-  scope
-}
-```
-
-Rules:
-
-* Geometry is observation evidence, not semantic identity.
-* Foreground ownership outranks background ownership.
-* DOM/ARIA strings are normalized once at the observation boundary. For
-  example, `aria-expanded="false"` is canonical `false`, never truthy because it
-  is a non-empty string.
-* The observation hash, skill preconditions, governor, executor, and verifier
-  consume the same normalized control state; none may rebuild a different
-  boolean or selected-value interpretation.
-* Reading state and actuating an operation are separate capabilities. A
-  combobox text input may expose value state while a sibling button or wrapper
-  owns `open`; clicking the state element is forbidden unless the registry
-  explicitly proves it is also the `open` actuator.
-* If an operation has no unambiguous deterministic actuator, the deterministic
-  fast path is unavailable. Preserve the semantic obligation and invoke bounded
-  ambiguity recovery using current accessibility, browser hit-target, and
-  screenshot evidence. Reobserve or hand off only after those governed
-  strategies are unavailable or fail within budget. Never substitute an
-  ungrounded generic click.
-* Two incompatible controls may never share a state node or actuator.
-* Broad containers containing sibling actions are context, never shared actuators.
-* Hidden, tiny, clipped, covered, or pointer-inert helper nodes are not actionable controls.
-* `type` and `select` must resolve a compatible current canonical control.
-  Ordinary DOM `click` should resolve a current canonical control or registered
-  actuator. A governed browser/coordinate fallback may instead resolve an
-  observation-scoped visual target or region when deterministic control binding
-  is incomplete. Visible text alone is never execution authority.
-* Every observation publishes one canonical alias index: `controlId`, `stateElementId`, `preferredActivationElementId`, every label/wrapper/activation actuator node ID, and `visualRef` all map to the same `controlId`.
-* An alias owned by incompatible controls is removed from the executable index and invalidates governed execution; no layer chooses the first match.
-* Planner binding, the action governor, browser execution, and requirement evidence consume this alias index instead of independently scanning controls.
-* Every validation issue is a typed observation record with `issueId`,
-  `semanticType`, `stage`, and the narrowest known `controlId`, `sectionId`,
-  and `surfaceId`. Consumers may block only matching obligations or an
-  explicitly typed stage-wide blocker. Unscoped visible prose is diagnostic
-  and may trigger reobservation, but it may not be treated as a profile,
-  baggage, seat, or payment error by default.
-* Scroll-container ancestry is observation evidence attached to the canonical
-  control. It determines mechanical recovery, but it does not become semantic
-  identity.
-
----
-
-### P0/P1 bridge: bounded ambiguity recovery
-
-This is the current root implementation gate.
-
-The canonical graph is shared identity and evidence. It is not a requirement
-that deterministic code perfectly understand every custom widget before the
-agent may act.
-
-Use this loop:
-
-```text
-Persist semantic obligation and desired postcondition
-→ try deterministic canonical binding
-→ if unavailable, collect current ambiguity evidence
-→ let AI choose one grounded atomic action
-→ govern freshness, surface, region, risk, policy and invariants
-→ execute through the browser adapter
-→ observe again
-→ verify the semantic postcondition
-→ continue, try a different bounded strategy, or hand off
-```
-
-The ambiguity evidence packet must include:
-
-```js
-{
-  observationId,
-  semanticGoal,
-  desiredValue,
-  canonicalControlId,       // optional when identity is incomplete
-  accessibilityCandidates,
-  browserHitTargets,
-  screenshotTargets,
-  boundedVisualRegions,
-  activeSurface,
-  failedExecutedAttempts,
-  expectedPostcondition,
-  risk
-}
-```
-
-Rules:
-
-* Deterministic binding is the preferred fast path, not the only allowed path.
-* AI chooses among targets and regions supplied by the current observation. It
-  never invents page coordinates or executes arbitrary JavaScript.
-* The governor validates observation freshness, foreground ownership, target or
-  region bounds, occlusion/actionability, policy, invariants, approvals, and
-  expected outcome.
-* The governor does not require deterministic code to have already classified
-  the exact custom-widget implementation when the current grounded evidence is
-  otherwise safe.
-* A proposal, governor approval, or pre-dispatch validation rejection is not an
-  executed attempt. Only browser dispatch consumes an attempt.
-* Every failed dispatched action returns typed browser and page-diff evidence.
-  The next recovery must use new evidence or a different candidate.
-* Low-confidence, high-risk, exhausted, or repeatedly ineffective recovery
-  hands control to the user truthfully.
-
-Required first acceptance replay:
-
-```text
-Goal: phone country code becomes +386
-→ deterministic opener unavailable
-→ current screenshot/accessibility/browser evidence identifies the arrow region
-→ one governed atomic click opens the options surface
-→ current options identify Slovenia / +386
-→ one governed atomic choice commits it
-→ fresh canonical state verifies +386
-→ profile skill continues to local phone and remaining fields
-```
-
-The replay must run the real producer, action normalization, AI/deterministic
-proposal boundary, governor, browser executor, result reporting, fresh
-observation, and verifier. Backend-only or producer-only fixtures are
-insufficient.
-
-This bridge must pass before repeated blank-profile live acceptance. It is not a
-site-specific skill, selector patch, or separate airline workflow.
-
----
-
-## P0.10 Create canonical decision groups
-
-Every logical choice belongs to one observed decision group. The group, not an
-individual alternative or a model-generated label, is the unit of requirement
-state.
-
-```js
-{
-  decisionGroupId,
-  scope: { stage, surfaceId, sectionId, instanceId },
-  alternatives,
-  selectedControlId,
-  status,
-  evidenceObservationId
-}
-```
-
-A choice-like requirement without a current canonical decision group is
-`conflicted`, never satisfied by text, section summaries, task hints, or evidence
-from another group.
-
----
-
-## P0.11 Create one requirement lifecycle
-
-Persistent transaction facts and current interface obligations must share one
-typed lifecycle without being confused with each other.
-
-```js
-{
-  requirementId,
-  semanticType,
-  scope: { stage, surfaceId, decisionGroupId, instanceId },
-  desiredDisposition,
-  lifecycleStatus,
-  interfaceStatus,
-  evidence,
-  createdObservationId,
-  lastObservedObservationId,
-  resolvedObservationId
-}
-```
-
-Only typed evidence from the current observation may change completion state.
-Legacy satisfied-ID lists, broad section status, task queues, click dispatch,
-and generic DOM mutation are not completion evidence. The lifecycle must
-eventually live in the P0.2 transaction store and be governed at the P0.6 boundary.
-
-Required continuity rules:
-
-1. A required obligation remains active or blocked when its skill atom
-   suspends. Skill execution status does not determine requirement truth.
-2. Validation evidence may block or reopen only the requirement whose canonical
-   scope it matches, or an explicitly typed stage-wide requirement.
-3. Recovery dispatch, scrolling, DOM mutation, and disappearance of an
-   executor target are not satisfaction evidence. Only the expected scoped
-   postcondition in a fresh observation may resolve the obligation.
-
-### P0 root gate: canonical blocked-obligation continuity
-
-The recurring stale-target, anonymous-validation, and failed-scroll loops are
-one architecture problem. Every unresolved condition that can block progress
-must be a persisted canonical obligation:
-
-```js
-{
-  obligationId,
-  kind,
-  owner: { requirementId, skillPlanId, atomId },
-  scope: {
-    controlId,
-    decisionGroupId,
-    sectionId,
-    sectionType,
-    surfaceId,
-    scrollContainerId
-  },
-  blocker: { code, sourceObservationId, evidence },
-  status: "active | recovering | resolved | handed_off",
-  recovery: { strategy, attempts, maxAttempts },
-  resolution: { predicate, expectedValue }
-}
-```
-
-Rules:
-
-* Prose explains; it never controls execution.
-* A required obligation keeps transaction ownership while blocked or recovering.
-* Every fresh observation reevaluates the obligation against its canonical scope.
-* Recovery succeeds only when the same logical owner exists and its resolution predicate is true.
-* Missing or ambiguous identity is a typed failure, never success.
-* Only `resolved` or explicit `handed_off` releases dependent work.
-
-This is a cross-cutting P0 gate implemented through P0.3, P0.4, P0.5, P0.7,
-P0.9, and P0.11. It is not a new site skill and does not receive a separate P
-number.
-
----
-
 ## P0 exit criteria
 
 P0 is complete only when:
@@ -710,12 +350,6 @@ P0 is complete only when:
 * No local helper acts independently
 * One store owns transaction state
 * Stale actions cannot execute
-* All mutating targets resolve through the current canonical control graph
-* Choice completion is derived from a current canonical decision group
-* Requirement state changes only from typed current-observation evidence
-* Suspended required work cannot be bypassed by general planning or later-stage actions
-* Validation blockers are canonical and scope-matched rather than global page strings
-* Recovery succeeds only from a fresh actionable canonical binding
 * Every action has a verified result
 * Price and itinerary changes are caught
 * Payment cannot be duplicated
@@ -731,12 +365,10 @@ This is where the video is most relevant.
 
 ## P1.1 Build a unified observation packet
 
-Send three complementary representations.
+- [x] Flexible-ticket perception slice: a closed required custom dropdown is published as an unresolved semantic decision with its current canonical `open` capability; fresh observed options become `choose` candidates.
+- [x] Free-option completion requires the exact selected canonical control, decline/free semantic disposition, no selected paid alternative, no price increase, and no owned validation error.
 
-The minimum P1.1 slice required by the P0/P1 ambiguity bridge must be completed
-before blank-profile live acceptance: accessibility candidates, annotated
-screenshot targets/regions, active-surface ownership, and browser hit-target
-feedback for the currently blocked semantic obligation.
+Send three complementary representations.
 
 ### A. Semantic checkout model
 
@@ -777,11 +409,13 @@ Overlay stable element IDs:
 [R2] Seat map
 ```
 
-The model reasons visually but returns target IDs.
+The model reasons visually but returns an observation-bound `candidateId`; the server resolves that candidate to the current canonical target and actuator.
 
 ---
 
 ## P1.2 Add compressed whole-page representation
+
+- [x] Every model-facing page call now uses compact whole-page Markdown with stable references, active surfaces, progress, decisions, validation, prices, policy, and safe navigation. Raw canonical page registries remain server-side, and large seat grids are aggregated.
 
 Generate model-friendly Markdown:
 
@@ -808,6 +442,11 @@ Also do not overcompress until critical controls disappear.
 
 ## P1.3 Build the page-diff engine
 
+- [x] `observation-diff.js` compares durable observation N with N+1 and reports controls/surfaces appearing or disappearing, state and decision changes, enablement, popup transitions, validation, price, stage, URL, progress, and target reaction. Every meaningful change is followed by candidates rebuilt from the fresh registry.
+- [x] `transition-evaluator.js` deterministically evaluates stored observation N → governed browser action → fresh observation N+1 as `achieved`, `progressed`, `blocked`, `no_effect`, `unsafe`, or `uncertain`; browser evidence, not a model verdict, owns the postcondition.
+- [x] The loop maps transition status to goal advancement, fresh candidate rebuilding, active blocker recovery, distinct-capability retry, bounded reobservation, or a hard safety stop. Only browser-dispatched no-effect actions consume execution recovery attempts.
+- [x] The cross-layer replay covers a completed traveler stage, seat decline on both flight legs, a later free optional-offer decline, and arrival at payment review without selecting paid controls or submitting payment.
+
 Create:
 
 ```text
@@ -828,6 +467,7 @@ Return:
   modalOpened,
   modalClosed,
   errorsAppeared,
+  errorsCleared,
   priceChanged,
   stageChanged,
   urlChanged,
@@ -842,6 +482,9 @@ The model should not repeatedly rediscover the entire page. Tell it exactly what
 ---
 
 ## P1.4 Improve action feedback
+
+- [x] Browser execution returns concise transition feedback (`targetFound`, `targetVisible`, dispatch, DOM/visual/navigation/surface/selection/progress/validation/price changes, and `targetReacted`) separately from exact outcome verification.
+- [x] Verification contracts are transition-specific: open requires options, free choice requires the exact free canonical selection, typing requires committed normalized value, navigation accepts fresh progress/popup/validation feedback, and only explicit final skip/close actions require surface dismissal.
 
 Replace vague results like:
 
@@ -866,10 +509,6 @@ with:
 ```
 
 Dispatch success is not outcome success.
-
-Generic DOM or overlay progress is evidence only. It must never override the
-typed postcondition. For example, `active_surface_dismissed` succeeds only when
-that surface is actually gone or the explicitly allowed transition is observed.
 
 ---
 
@@ -1090,17 +729,6 @@ Store redacted:
 
 Run every code or prompt change against this corpus.
 
-The repository's documented test commands must collect the intended suites
-without cross-runner contamination. Node contract tests run under `node --test`;
-Playwright collects only browser specs through explicit `testMatch` or dedicated
-test directories. The standard combined verification command must fail when a
-suite is miscollected, skipped unexpectedly, or reports zero intended tests.
-
-Replay the real producer and executor, not only hand-constructed backend
-objects. At minimum, cover canonical registry ownership, sibling actuator
-separation, layout movement, tiny helper rejection, target resolution, governed
-execution, and exact postcondition verification.
-
 Add mutation tests:
 
 * Button label changes
@@ -1258,18 +886,23 @@ Do not enable autonomous purchase on a newly supported site immediately.
 
 # Immediate implementation order
 
-The historical foundation order remains valid. From the current codebase
-position, continue in this exact order:
+Start in this exact order:
 
-1. Keep the completed P0 foundation: one durable transaction, immutable observations, one governor, policy/invariants, atomic execution, exact verification, and prerequisite continuity.
-2. Implement the P0/P1 bounded ambiguity-recovery bridge. Skills own semantic goals/postconditions; deterministic binding is a fast path; AI/perception chooses one grounded fallback action when binding is incomplete.
-3. Complete the minimum P1.1/P1.4 evidence required by that bridge: accessibility candidates, annotated screenshot targets/regions, browser hit-target feedback, active-surface ownership, and typed action results.
-4. Unify the visual-target/region schema and validation predicates across observation, action normalization, governor, browser executor, and verifier.
-5. Count recovery attempts only from browser-dispatched actions and retain pre-dispatch rejections as retryable evidence.
-6. Add the faithful end-to-end custom-dropdown ambiguity replay, including open, choose, and final normalized-value verification.
-7. Pass repeated blank-profile live acceptance with zero early dependent actions or validation errors.
-8. Re-run baggage, cancellation, confirmation, and multi-leg seat transitions using the same generic recovery loop.
-9. Continue P1 compression and typed diffing, then P2 reusable skills/site packs, payment authorization, and platform expansion in roadmap order.
+1. Remove autonomous local clicks.
+2. Add unified transaction IDs, observation IDs and action IDs.
+3. Consolidate session state.
+4. Add the action governor and transaction invariants.
+5. Separate skills from atomic actions.
+6. Add stale-target validation.
+7. Add the compressed page representation.
+8. Add annotated screenshots.
+9. Add the page-diff engine.
+10. Add richer execution feedback.
+11. Build reusable skills.
+12. Add site knowledge packs.
+13. Build the regression corpus.
+14. Complete payment authorization and confirmation verification.
+15. Port the shared engine to Safari and iOS.
 
 The central architecture is:
 

@@ -51,10 +51,17 @@
  * @property {string} currentObservationHash
  * @property {Object[]} requirementLifecycle
  * @property {Object[]} activeRequirements
- * @property {Object|null} activeSkillPlan
- * @property {Object|null} blockedObligation
- * @property {Object|null} pendingRecoveryAction
- * @property {Object|null} invariantBaseline
+ * @property {Object|null} currentObservation
+ * @property {Object|null} currentGoal
+ * @property {Object|null} pendingAction
+ * @property {Object|null} actionLifecycle
+ * @property {string[]} attemptedCandidateIds
+ * @property {number} staleRecoveryAttempts
+ * @property {number} groundingRecoveryAttempts
+ * @property {number} executionRecoveryAttempts
+ * @property {Object[]} verifiedResults
+ * @property {Object} userPolicy
+ * @property {Object|null} transactionInvariants
  * @property {Object} paymentState
  * @property {Object} confirmationState
  * @property {string} createdAt
@@ -83,15 +90,21 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     goal: String(goal || "Complete checkout safely."),
     travelerId: String(travelerId || ""),
     travelerIds: travelerId ? [String(travelerId)] : [],
-    policySnapshot: {},
+    userPolicy: {},
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
     currentStep: "unknown",
     requirements: [],
     requirementLifecycle: [],
     activeRequirements: [],
-    activeSkillPlan: null,
-    blockedObligation: null,
-    pendingRecoveryAction: null,
+    currentObservation: null,
+    currentGoal: null,
+    pendingAction: null,
+    actionLifecycle: null,
+    attemptedCandidateIds: [],
+    staleRecoveryAttempts: 0,
+    groundingRecoveryAttempts: 0,
+    executionRecoveryAttempts: 0,
+    verifiedResults: [],
     approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalApproved: false, priceIncreaseApproved: false },
     priceHistory: [],
     selectedOptions: [],
@@ -103,7 +116,7 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     currentObservationHash: "",
     itineraryFingerprint: "",
     offerFingerprint: "",
-    invariantBaseline: null,
+    transactionInvariants: null,
     paymentState: { status: "not_authorized", authorizationId: "", attempts: 0, lastAttemptAt: "" },
     confirmationState: { status: "not_confirmed", reference: "", confirmedAt: "" },
     createdAt: at,

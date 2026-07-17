@@ -2,6 +2,7 @@
   if (document.getElementById("atw-sidebar")) return;
 
   const DEFAULT_API = "http://localhost:4173/api";
+  const MAX_OBSERVATION_TRANSPORT_BYTES = 5_250_000;
   const AGENT_SINGLE_BRAIN = true;
   const BAGGAGE_TERMS = ["no cabin bag", "baggage not included", "personal item only", "without baggage", "checked baggage not included"];
   const MULTI_AIRPORT_CODES = new Set(["LHR", "LGW", "LTN", "STN", "LCY", "CDG", "ORY", "BVA", "IST", "SAW"]);
@@ -47,6 +48,28 @@
   let warnings = [];
   let renderTimer = null;
   let elementIdCounter = 0;
+  const canonicalSelectionCommitments = new Map();
+  function rememberCanonicalSelectionCommitment(option, decision = {}) {
+    if (!option?.matches?.("[role='option'], option, [role='menuitem']")) return null;
+    const surface = option.closest?.("[role='listbox'], [role='menu']") || option.parentElement?.closest?.("[id]");
+    const surfaceId = surface?.id || "";
+    const controlId = decision.controlId || option.dataset?.atwControlId || "";
+    if (!surfaceId || !controlId) return null;
+    const label = (decision.targetLabel || controlText(option) || option.textContent || "").replace(/\s+/g, " ").trim();
+    const commitment = {
+      controlId,
+      targetId: decision.targetId || elementId(option),
+      label,
+      semantic: decision.targetSnapshot?.semantic || semanticChoiceType(label),
+      risk: decision.targetSnapshot?.risk || choiceRisk(label)
+    };
+    canonicalSelectionCommitments.set(surfaceId, commitment);
+    return commitment;
+  }
+  document.addEventListener("click", (event) => {
+    const option = event.target?.closest?.("[role='option'], option, [role='menuitem']");
+    if (option) rememberCanonicalSelectionCommitment(option);
+  }, true);
   let agent = {
     running: false,
     sessionId: "",
@@ -143,7 +166,8 @@
   }
 
   function traveler() {
-    return appData.travelers.find((item) => item.id === selectedTravelerId) || appData.travelers[0];
+    const travelers = Array.isArray(appData?.travelers) ? appData.travelers : [];
+    return travelers.find((item) => item.id === selectedTravelerId) || travelers[0] || null;
   }
 
   function travelerRules() {
@@ -811,7 +835,7 @@
     showAgentCursor(element, `type ${String(value).slice(0, 12)}`);
     userLikeClick(element);
     await sleep(80);
-    element.focus();
+    element.focus({ preventScroll: true });
     if (typeof element.select === "function") element.select();
     setNativeElementValue(element, "");
     dispatchFieldEvents(element);
@@ -860,8 +884,6 @@
       return result;
     }
 
-    scrollElementWithinNearestContainer(element, { behavior: "smooth" });
-    await sleep(360);
     await showAgentThought(element, "Field", `Filling ${fieldLabel}`, "Using saved traveler profile, then verifying the value sticks.", 900);
     flashElement(element);
 
@@ -883,7 +905,7 @@
     }
 
     try {
-      element.focus();
+      element.focus({ preventScroll: true });
       setNativeElementValue(element, expected);
       dispatchFieldEvents(element);
       element.blur?.();
@@ -1067,7 +1089,7 @@
         value: decision.value || ""
       },
       nearbyText: parent,
-      surface: compactText(agent.pageMap?.activeSurface?.label || "", 220)
+      surface: compactText(agent.pageMap?.currentSurface?.label || "", 220)
     };
   }
 
@@ -1086,18 +1108,11 @@
   function liveTargetSnapshot(element, map = agent.pageMap || buildPageMap()) {
     if (!element) return null;
     const descriptor = elementDescriptor(element);
-    const activeSurface = map?.activeSurface || {};
-    let surfaceId = "";
-    let surfaceType = "page";
-    let surfaceLabel = "";
-    if (activeSurface?.type && activeSurface.type !== "page") {
-      const surfaceElement = elementById(activeSurface.id);
-      if (surfaceElement && (surfaceElement === element || surfaceElement.contains(element))) {
-        surfaceId = activeSurface.id || "";
-        surfaceType = activeSurface.type || "modal";
-        surfaceLabel = activeSurface.label || "";
-      }
-    }
+    const authoritativeSurface = map?.currentSurface || { id: "surface-page", type: "page", label: "Page" };
+    const membership = surfaceMembershipForElement(element, authoritativeSurface);
+    const surfaceId = membership.surfaceId;
+    const surfaceType = surfaceId === authoritativeSurface.id ? authoritativeSurface.type : "page";
+    const surfaceLabel = surfaceId === authoritativeSurface.id ? authoritativeSurface.label : "Page";
     const section = liveSectionForElement(map, element);
     const label = buttonText(element) || labelText(element) || element.innerText || element.textContent || "";
     const control = lookupControlForElement(map, element);
@@ -1115,6 +1130,7 @@
       surfaceId,
       surfaceType,
       surfaceLabel,
+      surfaceMembershipEvidence: membership.evidence,
       surfaceNormalizedLabel: normalizeMatchText(surfaceLabel),
       sectionId: section?.id || "",
       sectionType: section?.type || "",
@@ -1148,11 +1164,8 @@
   }
 
   function targetBelongsToCurrentSurface(map = agent.pageMap || buildPageMap(), element) {
-    const surface = map.currentSurface || map.activeSurface || {};
-    if (!surface?.type || surface.type === "page") return true;
-    const surfaceElement = elementById(surface.id);
-    if (!surfaceElement) return false;
-    return surfaceElement === element || surfaceElement.contains(element);
+    const surface = map.currentSurface || { id: "surface-page", type: "page" };
+    return surfaceMembershipForElement(element, surface).surfaceId === (surface.id || "surface-page");
   }
 
   function validateResolvedTarget(decision = {}, element, map = agent.pageMap || buildPageMap()) {
@@ -1163,15 +1176,18 @@
         ok: false,
         code: "TARGET_OUTSIDE_CURRENT_SURFACE",
         expected: expected || {
-          surfaceId: map.currentSurface?.id || map.activeSurface?.id || "",
-          surfaceType: map.currentSurface?.type || map.activeSurface?.type || "page",
-          surfaceLabel: map.currentSurface?.label || map.activeSurface?.label || ""
+          surfaceId: map.currentSurface?.id || "surface-page",
+          surfaceType: map.currentSurface?.type || "page",
+          surfaceLabel: map.currentSurface?.label || "Page"
         },
         live
       };
     }
-    if (!expected) return { ok: true, live, expected: null };
     if (!live) return { ok: false, code: "TARGET_MISSING", expected, live: null };
+    if (live.box?.inViewport !== true) {
+      return { ok: false, code: "TARGET_OUT_OF_VIEW", expected: expected || null, live };
+    }
+    if (!expected) return { ok: true, live, expected: null };
     const warnings = [];
     const strictSurface = isStrictActionSurfaceType(expected.surfaceType);
     const expectedControlId = expected.controlId || decision.controlId || "";
@@ -1240,10 +1256,14 @@
     if (strictSurface) {
       if (validTargetId(expected.surfaceId)) {
         const expectedSurface = elementById(expected.surfaceId);
-        if (!expectedSurface || (expectedSurface !== element && !expectedSurface.contains(element))) {
+        const authoritativeSurface = map.currentSurface || { id: "surface-page", type: "page" };
+        const liveMembership = surfaceMembershipForElement(element, authoritativeSurface);
+        const registeredOrRelated = authoritativeSurface.id === expected.surfaceId
+          && liveMembership.surfaceId === expected.surfaceId;
+        if (!expectedSurface || (!registeredOrRelated && expectedSurface !== element && !expectedSurface.contains(element))) {
           return { ok: false, code: "TARGET_SURFACE_MISMATCH", expected, live };
         }
-      } else if (!live.surfaceId && map?.activeSurface?.type && map.activeSurface.type !== "page") {
+      } else if (!live.surfaceId && map?.currentSurface?.type && map.currentSurface.type !== "page") {
         return { ok: false, code: "TARGET_NOT_IN_ACTIVE_SURFACE", expected, live };
       }
     }
@@ -1278,9 +1298,18 @@
     if (controlledRecovery) {
       const control = (map.controls || []).find((item) => item.controlId === (decision.controlId || expected.controlId));
       const recovery = control?.recovery?.[decision.operation || expected.recoveryOperation || ""];
-      const regionMatches = (recovery?.regions || []).some((candidate) => boxesCloseEnough(candidate, region));
+      const regionMatches = (recovery?.regions || []).some((candidate) => visualRegionContractsMatch(candidate, region));
       if (!control || !recovery || recovery.requiresVisualConfirmation !== true || !regionMatches) {
         return { ok: false, code: "VISUAL_CONTROL_RECOVERY_UNPROVEN", expected, live: liveTargetSnapshot(hit, map) };
+      }
+      if (region.observationId && region.observationId !== decision.observationId) {
+        return { ok: false, code: "VISUAL_OBSERVATION_MISMATCH", expected, live: liveTargetSnapshot(hit, map) };
+      }
+      if (region.controlId && region.controlId !== control.controlId) {
+        return { ok: false, code: "VISUAL_CONTROL_MISMATCH", expected, live: liveTargetSnapshot(hit, map) };
+      }
+      if (region.operation && region.operation !== decision.operation) {
+        return { ok: false, code: "VISUAL_OPERATION_MISMATCH", expected, live: liveTargetSnapshot(hit, map) };
       }
     }
     if (region.width < 4 || region.height < 4 || x < region.x || x > region.x + region.width || y < region.y || y > region.y + region.height) {
@@ -1295,7 +1324,7 @@
     if (!hit || hit.closest?.("#atw-sidebar") || isPaymentField(hit) || !targetBelongsToCurrentSurface(map, hit)) {
       return { ok: false, code: "VISUAL_TARGET_OUTSIDE_FOREGROUND", expected, live: liveTargetSnapshot(hit, map) };
     }
-    const currentSurface = map.currentSurface || map.activeSurface || {};
+    const currentSurface = map.currentSurface || { id: "surface-page", type: "page" };
     if (currentSurface.type && currentSurface.type !== "page" && region.surfaceId !== currentSurface.id) {
       return { ok: false, code: "VISUAL_SURFACE_MISMATCH", expected, live: liveTargetSnapshot(hit, map) };
     }
@@ -1324,28 +1353,12 @@
       signature: pageSignature(map).slice(0, 900),
       snapshotHash: observationHashForMap(map),
       graphIntegrity: map.graphIntegrity || null,
-      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || map.activeSurface || {}),
+      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || {}),
       visualState: map.visualState || visualPageState(map),
       accessibility: map.accessibility ? {
         foregroundSurfaceId: map.accessibility.foregroundSurfaceId,
         foregroundSurfaceType: map.accessibility.foregroundSurfaceType,
         controls: (map.accessibility.controls || []).slice(0, 40)
-      } : null,
-      activeSurface: map.activeSurface ? {
-        type: map.activeSurface.type,
-        taskHint: map.activeSurface.taskHint,
-        label: compactText(map.activeSurface.label, 220),
-        visualState: map.activeSurface.visualState || null,
-        accessibility: map.activeSurface.accessibility || null,
-        options: (map.activeSurface.options || []).slice(0, 8).map((option) => ({
-          id: option.id,
-          label: compactText(option.label, 120),
-          risk: option.risk,
-          semantic: option.semantic,
-          selected: Boolean(option.selected),
-          accessibility: option.accessibility || null,
-          box: option.box
-        }))
       } : null,
       currentSurface: map.currentSurface ? {
         id: map.currentSurface.id || "",
@@ -1551,12 +1564,10 @@
       url: location.href,
       site: map.site,
       step: map.step,
-        activeSurfaceLabel: map.activeSurface?.label || "",
-        activeSurfaceType: map.activeSurface?.type || "page",
-      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || map.activeSurface || {}),
+      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || {}),
       visualState: map.visualState || visualPageState(map),
-      currentSurfaceLabel: map.currentSurface?.label || map.activeSurface?.label || "",
-      currentSurfaceType: map.currentSurface?.type || map.activeSurface?.type || "page",
+      currentSurfaceLabel: map.currentSurface?.label || "",
+      currentSurfaceType: map.currentSurface?.type || "page",
       currentSurfaceTasks: (map.currentSurfaceTasks || map.currentSurface?.taskQueue || []).map((task) => task.sectionType || task.sectionLabel).filter(Boolean).slice(0, 8),
       backgroundTasks: (map.backgroundTasks || []).map((task) => task.sectionType || task.sectionLabel).filter(Boolean).slice(0, 8),
       controls: [...(map.buttons || []), ...(map.fields || [])].length
@@ -1577,6 +1588,32 @@
   }
 
   function rememberActionExecutionResult(actionId, observationId, decision = {}, expectedOutcome = {}, verification = {}) {
+    const feedback = verification.feedback && typeof verification.feedback === "object"
+      ? verification.feedback
+      : {
+          dispatched: true,
+          targetReacted: Boolean(verification.ok),
+          selectionChanged: false,
+          surfaceChanged: Boolean(verification.evidence?.visual?.foregroundChanged),
+          progressChanged: Boolean(verification.evidence?.visual?.progressMarkerChanged),
+          priceChanged: false
+        };
+    const pageChanged = Boolean(
+      feedback.domChanged
+      || feedback.visualChanged
+      || verification.evidence?.visual?.visualChanged
+      || verification.evidence?.visual?.foregroundChanged
+      || verification.code === "PAGE_CHANGED"
+      || verification.code === "STAGE_CHANGED"
+      || verification.code === "OBSERVABLE_CHANGE"
+    );
+    const postconditionSatisfied = Boolean(
+      verification.ok
+      && (
+        ["normalized_value_changed", "field_value_changed", "control_selected"].includes(expectedOutcome.type)
+        || verification.evidence?.goalSatisfied === true
+      )
+    );
     const result = {
       at: new Date().toISOString(),
       actionId,
@@ -1586,9 +1623,21 @@
       requirementId: decision.requirementId || "",
       intent: decision.intent || "",
       operation: decision.operation || "",
+      goalId: decision.goalId || "",
+      candidateId: decision.candidateId || "",
       controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
       skillPlanId: decision.skillPlanId || "",
       skillAtomId: decision.skillAtomId || "",
+      dispatched: true,
+      targetResolved: feedback.targetFound !== false,
+      clickReachedPage: ["click", "click_xy"].includes(decision.action || ""),
+      pageChanged,
+      activeSurfaceChanged: Boolean(feedback.surfaceChanged),
+      feedback,
+      expectedOutcomeObserved: Boolean(verification.ok),
+      postconditionSatisfied,
+      failureCode: verification.ok ? "" : String(verification.code || "OUTCOME_NOT_VERIFIED"),
+      resultObservationHash: String(verification.evidence?.afterObservationHash || ""),
       executed: true,
       verified: Boolean(verification.ok),
       action: {
@@ -1624,7 +1673,7 @@
   }
 
   function rememberUnexecutedActionResult(actionId, observationId, decision = {}, outcome = {}) {
-    const mechanicallyAttempted = outcome.executed === true || outcome.code === "FIELD_VALUE_NOT_VERIFIED";
+    const mechanicallyAttempted = outcome.dispatched === true || outcome.executed === true;
     const result = {
       at: new Date().toISOString(),
       actionId,
@@ -1634,9 +1683,20 @@
       requirementId: decision.requirementId || "",
       intent: decision.intent || "",
       operation: decision.operation || "",
+      goalId: decision.goalId || "",
+      candidateId: decision.candidateId || "",
       controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
       skillPlanId: decision.skillPlanId || "",
       skillAtomId: decision.skillAtomId || "",
+      dispatched: mechanicallyAttempted,
+      targetResolved: Boolean(outcome.targetResolved),
+      clickReachedPage: Boolean(outcome.clickReachedPage),
+      pageChanged: Boolean(outcome.pageChanged),
+      activeSurfaceChanged: Boolean(outcome.activeSurfaceChanged),
+      expectedOutcomeObserved: false,
+      postconditionSatisfied: false,
+      failureCode: String(outcome.code || "ACTION_NOT_DISPATCHED"),
+      resultObservationHash: String(outcome.resultObservationHash || ""),
       executed: mechanicallyAttempted,
       verified: false,
       action: {
@@ -2005,31 +2065,93 @@
     return `h${(hash >>> 0).toString(36)}`;
   }
 
-  function transactionFingerprintEvidence() {
+  function transactionFactsEvidence({ step = "unknown", price = null, decisionGroups = [], activeSurface = {} } = {}) {
     const text = String(primaryPageText() || visiblePageText() || "")
       .replace(/[\u200e\u200f\u202a-\u202e]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-    const collect = (pattern) => [...text.matchAll(pattern)]
-      .map((match) => normalizeMatchText(match[0]))
-      .filter(Boolean);
-    const routes = collect(/\b[A-Z]{3}(?:\s+[\p{L}.'-]+){0,3}\s*(?:-|–|—|→|\bto\b)\s*[A-Z]{3}(?:\s+[\p{L}.'-]+){0,3}\b/gu);
-    const dates = collect(/\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\s+\d{1,2}\s+[\p{L}]+\s+20\d{2}\b/giu);
-    const times = collect(/\b\d{1,2}:\d{2}\s*(?:-|–|—|to)\s*\d{1,2}:\d{2}\b/gi);
-    const baseFares = collect(/\b(?:price per (?:adult|passenger)|flight ticket|base fare)\s*\d+(?:[.,]\d{1,2})?\s*(?:EUR|USD|GBP|CHF|CAD|AUD|€|\$|£)\b/gi);
-    const unique = (values) => [...new Set(values)].sort();
-    const itineraryParts = unique([...routes, ...dates, ...times]).slice(0, 24);
-    const offerParts = unique(baseFares).slice(0, 8);
+    const normalizeCurrency = (value = "") => ({ "€": "EUR", "$": "USD", "£": "GBP" }[String(value).toUpperCase()] || String(value).toUpperCase());
+    const attributeSegments = queryAllDeep("[data-origin][data-destination], [data-departure-airport][data-arrival-airport]")
+      .map((element, index) => ({
+        segmentId: element.getAttribute("data-segment-id") || `structured_${index + 1}`,
+        origin: (element.getAttribute("data-origin") || element.getAttribute("data-departure-airport") || "").toUpperCase(),
+        destination: (element.getAttribute("data-destination") || element.getAttribute("data-arrival-airport") || "").toUpperCase(),
+        departureDate: element.getAttribute("data-departure-date") || "",
+        departureTime: element.getAttribute("data-departure-time") || "",
+        arrivalTime: element.getAttribute("data-arrival-time") || "",
+        flightNumber: (element.getAttribute("data-flight-number") || "").toUpperCase(),
+        confidence: 0.95
+      }))
+      .filter((segment) => segment.origin || segment.destination);
+    const routeMatches = [...text.matchAll(/\b([A-Z]{3})\b(?:\s+[\p{L}.'-]+){0,3}\s*(?:-|–|—|→|\bto\b)\s*\b([A-Z]{3})\b/gu)];
+    const dates = [
+      ...[...text.matchAll(/\b20\d{2}-\d{2}-\d{2}\b/g)].map((match) => match[0]),
+      ...[...text.matchAll(/\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\s+\d{1,2}\s+[\p{L}]+\s+20\d{2}\b/giu)].map((match) => match[0])
+    ];
+    const timePairs = [...text.matchAll(/\b(\d{1,2}:\d{2})\s*(?:-|–|—|to)\s*(\d{1,2}:\d{2})\b/gi)];
+    const flights = [...text.matchAll(/\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\s*([0-9]{2,4})\b/g)]
+      .map((match) => `${match[1]}${match[2]}`)
+      .filter((value) => !/^20\d{2}$/.test(value));
+    const textSegments = routeMatches.map((match, index) => ({
+      segmentId: `observed_${index + 1}_${stableHash(`${match[1]}:${match[2]}:${dates[index] || ""}:${flights[index] || ""}`)}`,
+      origin: match[1].toUpperCase(),
+      destination: match[2].toUpperCase(),
+      departureDate: dates[index] || (dates.length === 1 ? dates[0] : ""),
+      departureTime: timePairs[index]?.[1] || (timePairs.length === 1 ? timePairs[0][1] : ""),
+      arrivalTime: timePairs[index]?.[2] || (timePairs.length === 1 ? timePairs[0][2] : ""),
+      flightNumber: flights[index] || (flights.length === 1 ? flights[0] : ""),
+      confidence: 0.68
+    }));
+    const segments = (attributeSegments.length ? attributeSegments : textSegments).map(({ confidence, ...segment }) => segment).slice(0, 12);
+    const completeness = !segments.length
+      ? "unknown"
+      : segments.every((segment) => segment.origin && segment.destination && segment.departureDate)
+        ? "complete"
+        : "partial";
+    const baseFareMatch = text.match(/\b(?:price per (?:adult|passenger)|flight ticket|base fare)\s*[:\-]?\s*(\d+(?:[.,]\d{1,2})?)\s*(EUR|USD|GBP|CHF|CAD|AUD|€|\$|£)\b/i);
+    const fareBrandMatch = text.match(/\b(?:fare|ticket)\s*(?:brand|type|class)?\s*[:\-]\s*([\p{L}][\p{L}0-9 +_-]{1,40})/iu);
+    const currentTraveler = traveler() || {};
+    const source = step === "payment"
+      ? "payment_summary"
+      : activeSurface?.type && activeSurface.type !== "page"
+        ? "popup"
+        : segments.length
+          ? "travel_details"
+          : "order_summary";
+    const selectedExtras = decisionGroups
+      .filter((group) => group.status === "satisfied" && group.selectedLabel)
+      .map((group) => ({
+        decisionGroupId: group.decisionGroupId || "",
+        label: group.selectedLabel || "",
+        disposition: group.selectedSemantic || "",
+        priceAmount: null,
+        currency: price?.currency || ""
+      }))
+      .slice(0, 40);
     return {
-      itineraryFingerprint: itineraryParts.length ? stableHash(itineraryParts.join("|")) : "",
-      offerFingerprint: itineraryParts.length && offerParts.length
-        ? stableHash([...itineraryParts, ...offerParts].join("|"))
-        : ""
+      itinerary: { completeness, segments },
+      travelers: currentTraveler.id ? [{
+        travelerId: currentTraveler.id,
+        name: [currentTraveler.first_name, currentTraveler.middle_name, currentTraveler.last_name].filter(Boolean).join(" ")
+      }] : [],
+      currency: normalizeCurrency(price?.currency || baseFareMatch?.[2] || ""),
+      basePrice: baseFareMatch ? {
+        amount: Number(baseFareMatch[1].replace(",", ".")),
+        currency: normalizeCurrency(baseFareMatch[2])
+      } : { amount: null, currency: normalizeCurrency(price?.currency || "") },
+      totalPrice: price ? { amount: Number(price.amount), currency: normalizeCurrency(price.currency) } : { amount: null, currency: "" },
+      fareBrand: fareBrandMatch?.[1]?.trim() || "",
+      selectedExtras,
+      provenance: [{
+        source,
+        observationId: agent.activeObservationId || "",
+        confidence: attributeSegments.length ? 0.95 : segments.length ? 0.68 : price ? 0.75 : 0.35
+      }]
     };
   }
 
   function structuralPageSignature(map = buildPageMap()) {
-    const activeSurface = map.activeSurface || {};
+    const activeSurface = map.currentSurface || {};
     const stableSection = (section) => [
       section.type || "",
       normalizeMatchText(section.label || ""),
@@ -2068,7 +2190,7 @@
     })();
     const foreground = map.currentSurface?.type && map.currentSurface.type !== "page"
       ? map.currentSurface
-      : map.activeSurface || {};
+      : {};
     const stableState = (state = {}) => ({
       checked: Boolean(state.checked),
       selected: Boolean(state.selected),
@@ -2131,8 +2253,15 @@
         ok: map.graphIntegrity?.ok !== false,
         unresolvedConflictCount: Number(map.graphIntegrity?.unresolvedConflictCount || 0)
       },
-      itineraryFingerprint: map.itineraryFingerprint || "",
-      offerFingerprint: map.offerFingerprint || "",
+      transactionFacts: map.transactionFacts ? {
+        itinerary: map.transactionFacts.itinerary,
+        travelers: map.transactionFacts.travelers,
+        currency: map.transactionFacts.currency,
+        basePrice: map.transactionFacts.basePrice,
+        totalPrice: map.transactionFacts.totalPrice,
+        fareBrand: map.transactionFacts.fareBrand,
+        selectedExtras: map.transactionFacts.selectedExtras
+      } : null,
       price: map.price || null,
       controls,
       decisionGroups,
@@ -2333,7 +2462,7 @@
   function accessibilityNode(element, map = agent.pageMap || null) {
     if (!element || !isVisible(element) || element.closest?.("#atw-sidebar")) return null;
     const section = map ? liveSectionForElement(map, element) : null;
-    const surface = map?.currentSurface || map?.activeSurface || {};
+    const surface = map?.currentSurface || {};
     const control = map ? lookupControlForElement(map, element) : null;
     const box = elementBox(element);
     return {
@@ -2355,7 +2484,7 @@
   }
 
   function accessibilitySnapshot(map = agent.pageMap || buildPageMap()) {
-    const surface = map.currentSurface || map.activeSurface || {};
+    const surface = map.currentSurface || {};
     const controls = [
       ...(map.fields || []).map((item) => item.element),
       ...(map.buttons || []).map((item) => item.element),
@@ -2376,10 +2505,10 @@
     };
   }
 
-  function activeSurfaceEntryForElement(map, element) {
+  function currentSurfaceEntryForElement(map, element) {
     if (!element) return null;
     const id = elementId(element);
-    return activeSurfaceEntries(map).find((entry) => entry.id === id) || null;
+    return currentSurfaceEntries(map).find((entry) => entry.id === id) || null;
   }
 
   function isActionableClickTarget(element) {
@@ -2502,7 +2631,7 @@
   }
 
   function resolveDecisionTarget(decision, map) {
-    const mutatingTargetAction = ["click", "type", "select"].includes(decision.action);
+    const mutatingTargetAction = ["click", "type", "select", "keypress"].includes(decision.action);
     if (!mutatingTargetAction) return null;
 
     const requestedVisualRef = decision.visualRef || decision.targetSnapshot?.visualRef || "";
@@ -2588,6 +2717,11 @@
           || (tag === "input" && !["button", "submit", "reset", "radio", "checkbox", "file", "hidden"].includes(type));
       }
       if (decision.action === "select") return element.tagName === "SELECT";
+      if (decision.action === "keypress") {
+        return typeof element.focus === "function"
+          && (element.matches?.("input, textarea, select, button, [tabindex], [contenteditable], [role='combobox'], [role='listbox'], [role='option']")
+            || element.isContentEditable);
+      }
       return true;
     };
     const controlTarget = candidateIds
@@ -3108,17 +3242,34 @@
       .map((text) => text.replace(/\s+/g, " ").trim());
   }
 
+  function structuredPriceFromText(value = "") {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    const after = text.match(/(-?\d+(?:[.,]\d{1,2})?)\s*(EUR|USD|GBP|CHF|€|\$|£)/i);
+    const before = text.match(/(EUR|USD|GBP|CHF|€|\$|£)\s*(-?\d+(?:[.,]\d{1,2})?)/i);
+    const amountText = after?.[1] || before?.[2] || "";
+    const currencyText = String(after?.[2] || before?.[1] || "").toUpperCase();
+    if (!amountText || !currencyText) return null;
+    const currency = currencyText === "€" ? "EUR" : currencyText === "$" ? "USD" : currencyText === "£" ? "GBP" : currencyText;
+    const amount = Number(amountText.replace(",", "."));
+    return Number.isFinite(amount) ? { amount, currency } : null;
+  }
+
   function semanticChoiceType(label = "") {
     const text = label.toLowerCase();
+    const structuredPrice = structuredPriceFromText(label);
     if (/no checked baggage|no baggage|without baggage|i.ll go without|go without/.test(text)) return "decline_baggage";
     if (/no,?\s*thanks|none of the passengers|none\b|without/.test(text)) return "decline_paid_extra";
-    if (/add to cart|add to my trip|premium|bundle|checked baggage|\b\d+\s*x\s*\d+\s*kg|eur|€|\$/.test(text)) return "add_paid_extra";
+    if ((structuredPrice && structuredPrice.amount > 0)
+      || /add to cart|add to my trip|premium|bundle|checked baggage|\b\d+\s*x\s*\d+\s*kg/.test(text)) return "add_paid_extra";
     if (/continue|next|proceed/.test(text)) return "continue";
     if (/mr|mrs|ms|title/.test(text)) return "traveler_title";
     return "choice";
   }
 
   function choiceRisk(label = "") {
+    const structuredPrice = structuredPriceFromText(label);
+    if (structuredPrice?.amount === 0) return "safe";
+    if (structuredPrice && structuredPrice.amount > 0) return "money";
     const semantic = semanticChoiceType(label);
     if (/decline_/.test(semantic)) return "safe_decline";
     if (semantic === "add_paid_extra") return "money";
@@ -3336,20 +3487,53 @@
 
   function recoveryRegion(box = {}, surfaceId = "", evidence = "", confidence = 0.5) {
     if (!box || box.width < 4 || box.height < 4) return null;
-    return {
-      x: Math.round(box.x),
-      y: Math.round(box.y),
-      width: Math.round(box.width),
-      height: Math.round(box.height),
-      centerX: Math.round(box.x + box.width / 2),
-      centerY: Math.round(box.y + box.height / 2),
+    return normalizeVisualRegionContract({
+      ...box,
       viewportWidth: window.innerWidth,
       viewportHeight: window.innerHeight,
       surfaceId,
       inViewport: box.inViewport !== false,
       evidence,
       confidence
+    });
+  }
+
+  function normalizeVisualRegionContract(raw = {}, context = {}) {
+    if (!raw || typeof raw !== "object") return null;
+    const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
+    const x = Math.round(finite(raw.x));
+    const y = Math.round(finite(raw.y));
+    const width = Math.max(0, Math.round(finite(raw.width)));
+    const height = Math.max(0, Math.round(finite(raw.height)));
+    return {
+      x,
+      y,
+      width,
+      height,
+      centerX: Math.round(finite(raw.centerX, x + width / 2)),
+      centerY: Math.round(finite(raw.centerY, y + height / 2)),
+      viewportWidth: Math.max(0, Math.round(finite(raw.viewportWidth, context.viewportWidth || window.innerWidth))),
+      viewportHeight: Math.max(0, Math.round(finite(raw.viewportHeight, context.viewportHeight || window.innerHeight))),
+      surfaceId: String(raw.surfaceId || context.surfaceId || "").slice(0, 120),
+      observationId: String(raw.observationId || context.observationId || "").slice(0, 120),
+      controlId: String(raw.controlId || context.controlId || "").slice(0, 140),
+      operation: String(raw.operation || context.operation || "").slice(0, 40),
+      source: String(raw.source || context.source || "").slice(0, 120),
+      confidence: Math.max(0, Math.min(1, finite(raw.confidence, context.confidence))),
+      evidence: String(raw.evidence || context.evidence || "").slice(0, 240),
+      inViewport: raw.inViewport !== false
     };
+  }
+
+  function visualRegionContractsMatch(left = {}, right = {}, tolerance = 2) {
+    const a = normalizeVisualRegionContract(left);
+    const b = normalizeVisualRegionContract(right);
+    if (!a || !b) return false;
+    if (!["x", "y", "width", "height", "centerX", "centerY"].every((key) => Math.abs(a[key] - b[key]) <= tolerance)) {
+      return false;
+    }
+    return ["viewportWidth", "viewportHeight", "surfaceId", "observationId", "controlId", "operation", "source"]
+      .every((key) => !a[key] || !b[key] || a[key] === b[key]);
   }
 
   function visualRecoveryForOpenOperation(stateElement, wrapper, surfaceId = "") {
@@ -3400,7 +3584,7 @@
   }
 
   function controlOperationsForElement({ element, stateElement, activationElement, kind, role, state }) {
-    const operations = { activate: null, open: null, choose: null, type: null, select: null };
+    const operations = { activate: null, open: null, choose: null, type: null, select: null, keyboard: null };
     const make = (name, actuatorCandidates, expectedOutcome, precondition = {}) => {
       const candidates = (actuatorCandidates || []).map((candidate) => typeof candidate === "string"
         ? { nodeId: candidate }
@@ -3431,11 +3615,19 @@
     const editable = stateElement?.isContentEditable
       || tag === "textarea"
       || (tag === "input" && !["button", "submit", "reset", "radio", "checkbox", "file", "hidden"].includes(inputType));
-    if (editable && !dropdownLike) operations.type = make("type", [stateId], "normalized_value_changed", { disabled: false });
+    if (editable) {
+      operations.type = make(
+        "type",
+        [stateId],
+        dropdownLike ? "semantic_progress" : "normalized_value_changed",
+        { disabled: false }
+      );
+    }
     if (tag === "select") operations.select = make("select", [stateId], "normalized_value_changed", { disabled: false });
     if (dropdownLike && tag !== "select") {
       const openCandidates = operationActuatorCandidates(stateElement, element, activationElement);
       operations.open = make("open", openCandidates, "options_surface_appeared", { expanded: false });
+      operations.keyboard = make("keyboard", [stateId], "semantic_progress", { disabled: false });
     }
     if (["option", "radio", "checkbox"].includes(kind) || ["option", "radio", "checkbox"].includes(role)) {
       operations.choose = make("choose", [activationId, stateId], "control_selected", { disabled: false });
@@ -3443,6 +3635,28 @@
       operations.activate = make("activate", [activationId, stateId], "observable_change", { disabled: false });
     }
     return operations;
+  }
+
+  function perceptionRoleForControl(stateElement, kind, domRole, operations = {}) {
+    const tag = String(stateElement?.tagName || "").toLowerCase();
+    const editable = Boolean(operations.type);
+    const dropdownLike = tag === "select"
+      || ["combobox", "listbox"].includes(String(domRole || "").toLowerCase())
+      || stateElement?.getAttribute?.("aria-haspopup") === "listbox";
+    if (editable && dropdownLike && tag !== "select") return "editable_combobox";
+    if (tag === "select") return "select";
+    return domRole || kind || "control";
+  }
+
+  function observedCapabilities(operations = {}, perceptionRole = "") {
+    const capabilities = [];
+    if (operations.type) capabilities.push(perceptionRole === "editable_combobox" ? "type_query" : "type");
+    if (operations.select) capabilities.push("select");
+    if (operations.open) capabilities.push("open");
+    if (operations.choose) capabilities.push("choose");
+    if (operations.keyboard) capabilities.push("keyboard");
+    if (operations.activate) capabilities.push("activate");
+    return capabilities;
   }
 
   function unionBoxes(boxes = []) {
@@ -3498,13 +3712,50 @@
     ].join("|"));
   }
 
+  function stableControlKeyForElement(element, stateElement, kind = "control") {
+    const target = stateElement || element;
+    if (!target) return "";
+    const associatedLabel = labelElementForInput(target);
+    const associatedLabelText = associatedLabel && associatedLabel !== target
+      ? (associatedLabel.innerText || associatedLabel.textContent || "")
+      : "";
+    const localMeaning = normalizeMatchText(
+      associatedLabelText
+      || buttonText(target)
+      || target.getAttribute?.("aria-label")
+      || target.getAttribute?.("title")
+      || target.getAttribute?.("placeholder")
+      || ""
+    ).slice(0, 140);
+    const stableAttributes = [
+      target.getAttribute?.("name") ? `name:${target.getAttribute("name")}` : "",
+      target.getAttribute?.("type") ? `type:${target.getAttribute("type")}` : "",
+      target.getAttribute?.("value") ? `value:${target.getAttribute("value")}` : "",
+      target.getAttribute?.("autocomplete") ? `autocomplete:${target.getAttribute("autocomplete")}` : "",
+      target.getAttribute?.("data-testid") ? `testid:${target.getAttribute("data-testid")}` : "",
+      localMeaning ? `meaning:${localMeaning}` : ""
+    ].filter(Boolean);
+    const path = [];
+    let current = target;
+    for (let depth = 0; current && depth < 5; depth += 1, current = current.parentElement) {
+      const tag = String(current.tagName || "node").toLowerCase();
+      const role = implicitRole(current) || "";
+      const siblings = current.parentElement
+        ? [...current.parentElement.children].filter((item) => String(item.tagName || "").toLowerCase() === tag && implicitRole(item) === role)
+        : [current];
+      const ordinal = Math.max(0, siblings.indexOf(current));
+      path.push(`${tag}:${role || "none"}:${ordinal}`);
+    }
+    return [kind, ...stableAttributes, `path:${path.join("/")}`].join("|");
+  }
+
   function canonicalControlForElement(element, context = {}) {
     if (!element || element.closest?.("#atw-sidebar")) return null;
     const stateElement = stateElementForControl(element);
     if (!stateElement || stateElement.closest?.("#atw-sidebar")) return null;
     const labelElement = labelElementForInput(stateElement);
     const wrapper = controlWrapperForElement(element, stateElement);
-    const activationElement = labelElement || clickableAncestor(element) || clickableAncestor(wrapper) || wrapper || stateElement;
+    const activationElement = labelElement || clickableAncestor(element) || clickableAncestor(wrapper) || stateElement;
     const kind = controlKindForElement(stateElement);
     const directName = directControlName(stateElement) || directControlName(element);
     const label = compactText(
@@ -3537,21 +3788,24 @@
     ].filter((item) => item.element);
     const boxes = members.map((item) => isVisible(item.element) ? elementBox(item.element) : null).filter(Boolean);
     const state = controlStateForElement(stateElement, semantic);
-    const operations = controlOperationsForElement({ element, stateElement, activationElement, kind, role: implicitRole(stateElement) || implicitRole(element), state });
+    const domRole = implicitRole(stateElement) || implicitRole(element);
+    const operations = controlOperationsForElement({ element, stateElement, activationElement, kind, role: domRole, state });
     const recovery = {
       open: isDropdownLikeElement(stateElement) && !operations.open
         ? visualRecoveryForOpenOperation(stateElement, wrapper, surface.id || "")
         : null
     };
-    const identityHash = controlDomFingerprint(element, stateElement, label);
-    const base = [
-      decisionGroupId || surface.type || "page",
-      sectionType || sectionLabel || "section",
-      kind,
-      semantic,
-      label
-    ].map(slugControlPart).join("_");
-    const controlId = `ctrl_${base}`.slice(0, 98) + `_${identityHash}`.slice(0, 20);
+    const stableKey = stableControlKeyForElement(element, stateElement, kind);
+    const identityHash = stableHash(stableKey);
+    const controlId = `ctrl_${slugControlPart(kind).slice(0, 24)}_${identityHash}`.slice(0, 140);
+    if (recovery.open?.regions?.length) {
+      recovery.open.regions = recovery.open.regions.map((region) => normalizeVisualRegionContract(region, {
+        controlId,
+        operation: "open",
+        source: "control.recovery.open",
+        surfaceId: surface.id || ""
+      }));
+    }
     members.forEach((item) => {
       try {
         item.element.dataset.atwControlId = controlId;
@@ -3569,19 +3823,43 @@
       .map((item) => actuatorEntry(item.element, item.relation))
       .filter(Boolean)
       .filter((entry, index, list) => list.findIndex((other) => other.nodeId === entry.nodeId && other.relation === entry.relation) === index);
+    const perceptionRole = perceptionRoleForControl(stateElement, kind, domRole, operations);
+    const visualRegion = unionBoxes(boxes) || elementBox(stateElement);
+    const visualRegions = [
+      visualRegion ? normalizeVisualRegionContract(visualRegion, {
+        controlId,
+        source: "control.visual_region",
+        surfaceId: surface.id || ""
+      }) : null,
+      ...Object.entries(recovery).flatMap(([operation, strategy]) => (strategy?.regions || []).map((region) => (
+        normalizeVisualRegionContract(region, {
+          controlId,
+          operation,
+          source: `control.recovery.${operation}`,
+          surfaceId: surface.id || ""
+        })
+      )))
+    ].filter(Boolean);
     return {
       controlId,
       id: controlId,
+      stableKey,
+      meaning: semantic || label,
       label,
       accessibleName: accessibleName(stateElement) || accessibleName(element),
       kind,
-      role: implicitRole(stateElement) || implicitRole(element),
+      role: perceptionRole,
+      domRole,
       semantic,
       semanticIntent: semantic,
       risk: choiceRisk(label),
+      structuredPrice: structuredPriceFromText(label),
       state,
+      currentValue: state.normalizedValue || state.valueText || "",
+      capabilities: observedCapabilities(operations, perceptionRole),
       operations,
       recovery,
+      visualRegions,
       selected: Boolean(state.checked || state.selected),
       required: Boolean(state.required || context.required),
       decisionGroupId,
@@ -3594,16 +3872,21 @@
       stateElementId: elementId(stateElement),
       preferredActivationElementId: elementId(activationElement || stateElement),
       actuators,
-      visualRegion: unionBoxes(boxes) || elementBox(stateElement)
+      visualRegion
     };
   }
 
   function applyControlToModel(model, control) {
     if (!model || !control) return model;
     model.controlId = control.controlId;
+    model.stableKey = control.stableKey || model.stableKey || "";
+    model.meaning = control.meaning || model.meaning || control.semantic || "";
+    model.structuredPrice = control.structuredPrice || model.structuredPrice || null;
     model.decisionGroupId = control.decisionGroupId || model.decisionGroupId || "";
     model.controlKind = control.kind;
     model.controlState = control.state;
+    model.currentValue = control.currentValue || "";
+    model.capabilities = control.capabilities || [];
     model.operations = control.operations;
     model.recovery = control.recovery || {};
     model.stateElementId = control.stateElementId;
@@ -3611,10 +3894,12 @@
     model.actuators = control.actuators;
     model.operations = control.operations;
     model.visualRegion = control.visualRegion;
+    model.visualRegions = control.visualRegions || [];
     model.semantic = model.semantic || control.semantic;
     model.semanticIntent = model.semanticIntent || control.semanticIntent || control.semantic;
-    model.risk = model.risk || control.risk;
-    model.role = model.role || control.role;
+    model.risk = control.risk || model.risk;
+    model.role = control.role || model.role;
+    model.domRole = control.domRole || model.domRole || "";
     if (model.field || Object.prototype.hasOwnProperty.call(model, "value")) {
       model.hasValue = Boolean(
         model.value
@@ -3667,12 +3952,65 @@
     };
   }
 
+  function choiceLikeModelFromDecisionControl(control = {}) {
+    const observedValue = String(
+      control.currentValue
+      || control.state?.valueText
+      || control.state?.selectedLabel
+      || ""
+    ).replace(/\s+/g, " ").trim();
+    const selectedLabel = observedValue && !isPlaceholderChoiceValue(observedValue)
+      ? observedValue
+      : "";
+    const stateElement = elementById(control.stateElementId || control.preferredActivationElementId || "");
+    const optionsSurfaceId = stateElement?.getAttribute?.("aria-controls") || "";
+    const optionsSurface = optionsSurfaceId ? document.getElementById(optionsSurfaceId) : null;
+    const committedEvidence = optionsSurfaceId ? canonicalSelectionCommitments.get(optionsSurfaceId) : null;
+    const committedOption = selectedLabel && optionsSurface
+      ? queryAllDeep("[role='option'], option, button, [role='menuitem']", optionsSurface).find((option) => (
+          normalizeMatchText(controlText(option) || option.textContent || "") === normalizeMatchText(selectedLabel)
+        ))
+      : null;
+    const matchingCommitment = committedEvidence
+      && normalizeMatchText(committedEvidence.label || "") === normalizeMatchText(selectedLabel)
+      ? committedEvidence
+      : null;
+    const committedControlId = matchingCommitment?.controlId || committedOption?.dataset?.atwControlId || "";
+    return {
+      controlId: committedControlId || control.controlId || "",
+      targetId: matchingCommitment?.targetId || (committedOption ? elementId(committedOption) : (control.preferredActivationElementId || control.stateElementId || "")),
+      label: selectedLabel || control.label || "",
+      semantic: matchingCommitment?.semantic || (selectedLabel ? semanticChoiceType(selectedLabel) : (control.semantic || "required_dropdown_choice")),
+      risk: matchingCommitment?.risk || (selectedLabel ? choiceRisk(selectedLabel) : (control.risk || "uncertain")),
+      selected: Boolean(selectedLabel),
+      state: control.state || null,
+      priceText: selectedLabel.match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
+    };
+  }
+
+  function sectionDecisionControls(section = {}, controls = []) {
+    return (controls || []).filter((control) => {
+      if (!control?.controlId || control.sectionId !== section.id) return false;
+      const role = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
+      const semantic = String(control.semantic || "").toLowerCase();
+      return /combobox|listbox|select/.test(role)
+        || /required_dropdown_choice/.test(semantic)
+        || Boolean(control.operations?.open);
+    });
+  }
+
   function buildCanonicalDecisionGroups(sections = [], controls = [], activeSurface = {}) {
     const byControlId = new Map((controls || []).map((control) => [control.controlId, control]));
     const sectionGroups = (sections || [])
-      .filter((section) => Array.isArray(section.choices) && section.choices.length || sectionDecisionFields(section).length)
+      .filter((section) => (
+        Array.isArray(section.choices) && section.choices.length
+        || sectionDecisionFields(section).length
+        || sectionDecisionControls(section, controls).length
+      ))
       .map((section) => {
-        const decisionGroupId = decisionGroupIdForContext({ sectionType: section.type, sectionLabel: section.label });
+        const decisionControls = sectionDecisionControls(section, controls);
+        const decisionGroupId = decisionControls[0]?.decisionGroupId
+          || decisionGroupIdForContext({ sectionType: section.type, sectionLabel: section.label });
         const choiceModels = (section.choices || []).map((choice) => {
           const control = byControlId.get(choice.controlId) || {};
           return {
@@ -3687,7 +4025,8 @@
           };
         });
         const fieldModels = sectionDecisionFields(section).map((field) => choiceLikeModelFromDecisionField(field, byControlId.get(field.controlId) || {}));
-        const choices = [...choiceModels, ...fieldModels]
+        const controlModels = decisionControls.map(choiceLikeModelFromDecisionControl);
+        const choices = [...choiceModels, ...fieldModels, ...controlModels]
           .filter((choice) => choice.controlId || choice.targetId || choice.label)
           .filter((choice, index, list) => {
             const key = `${choice.controlId || choice.targetId}:${normalizeMatchText(choice.label)}`;
@@ -3696,6 +4035,7 @@
         const selected = choices.find((choice) => choice.selected) || null;
         return {
           decisionGroupId,
+          surfaceId: decisionControls[0]?.surfaceId || "surface-page",
           sectionId: section.id || "",
           sectionType: section.type || "",
           sectionLabel: section.label || "",
@@ -3737,6 +4077,7 @@
           const selected = alternatives.find((choice) => choice.selected) || null;
           return {
             decisionGroupId,
+            surfaceId: activeSurface.id || "",
             sectionId: activeSurface.id || "",
             sectionType: activeSurface.parentSectionType || activeSurface.taskHint || activeSurface.type || "",
             sectionLabel: activeSurface.parentSectionLabel || activeSurface.label || activeSurface.taskHint || "",
@@ -4078,7 +4419,32 @@
       }
     }
 
-    const sanitized = sanitizeCanonicalControlGraph(registry.controls());
+    const sanitized = sanitizeCanonicalControlGraph(registry.controls()).map((control) => {
+      const membership = controlMemberNodeIds(control)
+        .map(elementById)
+        .filter(Boolean)
+        .map((element) => surfaceMembershipForElement(element, surface || { type: "page" }))
+        .find((result) => result.surfaceId === surface?.id)
+        || { surfaceId: "surface-page", evidence: "background_page" };
+      const belongsToForeground = Boolean(surface?.type && surface.type !== "page" && membership.surfaceId === surface.id);
+      const owner = belongsToForeground ? surface : { id: "surface-page", type: "page", label: "Page" };
+      return {
+        ...control,
+        surfaceId: owner.id,
+        surfaceType: owner.type,
+        surfaceLabel: owner.label,
+        surfaceMembershipEvidence: membership.evidence
+      };
+    });
+    if (surface) {
+      surface.memberControlIds = sanitized
+        .filter((control) => control.surfaceId === surface.id)
+        .map((control) => control.controlId);
+      surface.memberActuatorIds = sanitized
+        .filter((control) => control.surfaceId === surface.id)
+        .flatMap((control) => controlMemberNodeIds(control))
+        .filter((id, index, list) => id && list.indexOf(id) === index);
+    }
     applyControlsToObservationModels(sections, fields, buttons, activeSurface, sanitized);
     if (registry.conflicts.length) {
       const unresolved = registry.conflicts.filter((conflict) => !conflict.resolved);
@@ -4089,7 +4455,7 @@
         samples: registry.conflicts.slice(0, 8)
       });
     }
-    return sanitized.slice(0, 180);
+    return sanitized;
   }
 
   function sectionChoiceModels(section, allSections = []) {
@@ -4253,7 +4619,7 @@
       meaningfulActionBox(button.box)
     ));
     const blockers = [];
-    const unresolvedGroup = (decisionGroups || []).find((group) => group.required && !["satisfied", "waived"].includes(group.status));
+    const unresolvedGroup = (decisionGroups || []).find((group) => group.required && !["satisfied", "waived", "waived_by_policy"].includes(group.status));
     const unresolvedField = unfilledRequiredFields(fields)[0];
     if (unresolvedGroup) blockers.push(`unresolved decision: ${unresolvedGroup.sectionLabel || unresolvedGroup.requirementId || unresolvedGroup.decisionGroupId}`);
     if (unresolvedField) blockers.push(`required field: ${unresolvedField.label || unresolvedField.field || unresolvedField.controlId}`);
@@ -4276,7 +4642,7 @@
 
   function stageExitBlockers(map = buildPageMap(), decision = {}) {
     const blockers = [];
-    const currentSurface = map.currentSurface || map.activeSurface || { type: "page" };
+    const currentSurface = map.currentSurface || { type: "page" };
     const surfaceActive = Boolean(currentSurface.type && currentSurface.type !== "page");
     const targetControlId = decision.controlId || decision.targetSnapshot?.controlId || "";
     const targetControl = targetControlId
@@ -4304,7 +4670,7 @@
       });
     }
     if (!surfaceActive) {
-      const unresolvedGroup = (map.decisionGroups || []).find((group) => group.required && !["satisfied", "waived"].includes(group.status));
+      const unresolvedGroup = (map.decisionGroups || []).find((group) => group.required && !["satisfied", "waived", "waived_by_policy"].includes(group.status));
       if (unresolvedGroup) {
         blockers.push({
           code: "UNRESOLVED_DECISION_GROUP",
@@ -4326,7 +4692,7 @@
     const snapshotControlId = decision.controlId || decision.targetSnapshot?.controlId || targetControl?.controlId || "";
     const label = decision.targetLabel || decision.value || (target ? buttonText(target) || labelText(target) || target.innerText || "" : "");
     const section = target ? liveSectionForElement(map, target) : null;
-    const activeSurface = map.currentSurface || map.activeSurface || {};
+    const activeSurface = map.currentSurface || {};
     const base = {
       action: decision.action || "",
       targetId,
@@ -4341,8 +4707,13 @@
       declineChoiceIntent(decision)
       || /decline|safe_decline/.test(`${decision.intent || ""} ${decision.targetSnapshot?.semantic || ""} ${decision.targetSnapshot?.risk || ""}`)
     );
+    const choiceSurface = /dropdown|listbox|popover|menu/.test(String(activeForegroundSurface?.type || targetControl?.surfaceType || decision.targetSnapshot?.surfaceType || "").toLowerCase());
+    const foregroundChoiceSelection = Boolean(
+      /choice|radio|checkbox|option/.test(String(targetControl?.kind || targetControl?.role || decision.targetSnapshot?.kind || "").toLowerCase())
+      || (choiceSurface && (targetControl?.decisionGroupId || decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId))
+    );
     if (decision.expectedOutcome && typeof decision.expectedOutcome === "object") {
-      if (foregroundDecline && decision.expectedOutcome.type === "requirement_status") {
+      if (foregroundDecline && !foregroundChoiceSelection && decision.expectedOutcome.type === "requirement_status") {
         return {
           ...base,
           ...decision.expectedOutcome,
@@ -4373,7 +4744,7 @@
         };
       }
       if (activeSurface.type && activeSurface.type !== "page") {
-        if (foregroundDecline) {
+        if (foregroundDecline && !foregroundChoiceSelection) {
           return {
             ...base,
             type: "active_surface_dismissed",
@@ -4381,6 +4752,13 @@
             surfaceType: activeSurface.type,
             surfaceLabel: activeSurface.label || "",
             surfaceSignature: `${activeSurface.type || ""}:${activeSurface.id || ""}:${activeSurface.label || ""}:${(activeSurface.options || []).map((entry) => entry.id).join(",")}`
+          };
+        }
+        if (foregroundChoiceSelection) {
+          return {
+            ...base,
+            type: "control_selected",
+            decisionGroupId: targetControl?.decisionGroupId || ""
           };
         }
         return {
@@ -4410,12 +4788,87 @@
   function verifyExpectedOutcome(expected = {}, beforeMap = buildPageMap(), afterMap = buildPageMap(), target = null) {
     const startedAt = performance.now();
     const verification = verifyExpectedOutcomeInternal(expected, beforeMap, afterMap, target);
+    const feedback = transitionFeedbackForMaps(expected, beforeMap, afterMap, target, verification);
     logFlow("latency.span", {
       outcome_verification_ms: Math.round(performance.now() - startedAt),
       expectedOutcome: expected?.type || "",
       target: expected?.targetId || expected?.controlId || expected?.targetLabel || ""
     });
-    return verification;
+    return { ...verification, feedback };
+  }
+
+  function transitionFeedbackForMaps(expected = {}, beforeMap = {}, afterMap = {}, target = null, verification = {}) {
+    const controlId = expected.controlId || expected.targetSnapshot?.controlId || "";
+    const beforeControl = controlId ? (beforeMap.controls || []).find((control) => control.controlId === controlId) : null;
+    const afterControl = controlId ? (afterMap.controls || []).find((control) => control.controlId === controlId) : null;
+    const beforeControlState = beforeControl?.state || beforeControl?.controlState || {};
+    const afterControlState = afterControl?.state || afterControl?.controlState || {};
+    const controlChanged = JSON.stringify({
+      selected: Boolean(beforeControl?.selected || beforeControlState.selected || beforeControlState.checked),
+      value: beforeControlState.normalizedValue || beforeControlState.value || "",
+      expanded: beforeControlState.expanded
+    }) !== JSON.stringify({
+      selected: Boolean(afterControl?.selected || afterControlState.selected || afterControlState.checked),
+      value: afterControlState.normalizedValue || afterControlState.value || "",
+      expanded: afterControlState.expanded
+    });
+    const decisionGroupId = expected.decisionGroupId || beforeControl?.decisionGroupId || afterControl?.decisionGroupId || "";
+    const beforeGroup = decisionGroupId ? (beforeMap.decisionGroups || []).find((group) => group.decisionGroupId === decisionGroupId) : null;
+    const afterGroup = decisionGroupId ? (afterMap.decisionGroups || []).find((group) => group.decisionGroupId === decisionGroupId) : null;
+    const selectionChanged = Boolean(
+      (beforeGroup || afterGroup)
+      && `${beforeGroup?.selectedControlId || ""}:${beforeGroup?.status || ""}` !== `${afterGroup?.selectedControlId || ""}:${afterGroup?.status || ""}`
+    ) || Boolean(controlChanged && (
+      beforeControl?.selected !== afterControl?.selected
+      || beforeControlState.checked !== afterControlState.checked
+      || beforeControlState.normalizedValue !== afterControlState.normalizedValue
+    ));
+    const beforeSurface = beforeMap.currentSurface || {};
+    const afterSurface = afterMap.currentSurface || {};
+    const surfaceChanged = `${beforeSurface.id || ""}:${beforeSurface.type || "page"}:${beforeSurface.label || ""}`
+      !== `${afterSurface.id || ""}:${afterSurface.type || "page"}:${afterSurface.label || ""}`;
+    const beforeProgress = beforeMap.foreground?.progressMarkers || beforeMap.visualState?.foreground?.progressMarkers || beforeSurface.foreground?.progressMarkers || null;
+    const afterProgress = afterMap.foreground?.progressMarkers || afterMap.visualState?.foreground?.progressMarkers || afterSurface.foreground?.progressMarkers || null;
+    const progressChanged = JSON.stringify(beforeProgress) !== JSON.stringify(afterProgress);
+    const beforeErrors = [
+      ...actionableCheckoutErrors(beforeMap.errors || []),
+      ...(beforeMap.validationIssues || []).map((issue) => issue.message).filter(Boolean)
+    ];
+    const afterErrors = [
+      ...actionableCheckoutErrors(afterMap.errors || []),
+      ...(afterMap.validationIssues || []).map((issue) => issue.message).filter(Boolean)
+    ];
+    const validationAppeared = afterErrors.some((error) => !beforeErrors.includes(error));
+    const beforePrice = `${beforeMap.price?.amount ?? ""}:${beforeMap.price?.currency || ""}:${beforeMap.priceText || ""}`;
+    const afterPrice = `${afterMap.price?.amount ?? ""}:${afterMap.price?.currency || ""}:${afterMap.priceText || ""}`;
+    const domChanged = structuralPageSignature(beforeMap) !== structuralPageSignature(afterMap);
+    const beforeVisual = visualPageState(beforeMap);
+    const afterVisual = visualPageState(afterMap);
+    const visualChanged = beforeVisual?.fingerprint !== afterVisual?.fingerprint;
+    const navigationOccurred = beforeMap.step !== afterMap.step || (beforeMap.url || location.href) !== (afterMap.url || location.href);
+    const beforeOverlay = Boolean(beforeSurface.type && beforeSurface.type !== "page");
+    const afterOverlay = Boolean(afterSurface.type && afterSurface.type !== "page");
+    const overlayAppeared = Boolean(afterOverlay && (!beforeOverlay || surfaceChanged));
+    const targetFound = Boolean(target || beforeControl);
+    const targetVisible = Boolean((target && isVisible(target)) || (beforeControl && beforeControl.visualRegion?.inViewport !== false));
+    const targetReacted = Boolean(controlChanged || selectionChanged || surfaceChanged || progressChanged || navigationOccurred || validationAppeared || (!afterControl && beforeControl));
+    return {
+      dispatched: true,
+      targetFound,
+      targetVisible,
+      dispatchSucceeded: true,
+      targetReacted,
+      selectionChanged,
+      surfaceChanged,
+      progressChanged,
+      domChanged,
+      visualChanged,
+      navigationOccurred,
+      overlayAppeared,
+      validationAppeared,
+      priceChanged: beforePrice !== afterPrice,
+      outcomeVerified: verification.ok === true
+    };
   }
 
   function withOverlayProgressEvidence(verification = {}, progress = {}) {
@@ -4444,13 +4897,33 @@
     const foregroundChanged = beforeVisualState?.foreground?.fingerprint && afterVisualState?.foreground?.fingerprint
       && beforeVisualState.foreground.fingerprint !== afterVisualState.foreground.fingerprint;
     const progressMarkerChanged = JSON.stringify(beforeVisualState?.foreground?.progressMarkers || {}) !== JSON.stringify(afterVisualState?.foreground?.progressMarkers || {});
+    const beforeTransitionSurface = beforeMap.currentSurface || {};
+    const afterTransitionSurface = afterMap.currentSurface || {};
+    const surfaceChanged = `${beforeTransitionSurface.id || ""}:${beforeTransitionSurface.type || "page"}:${beforeTransitionSurface.label || ""}`
+      !== `${afterTransitionSurface.id || ""}:${afterTransitionSurface.type || "page"}:${afterTransitionSurface.label || ""}`;
+    const overlayAppeared = Boolean(
+      afterTransitionSurface.type
+      && afterTransitionSurface.type !== "page"
+      && (!beforeTransitionSurface.type || beforeTransitionSurface.type === "page" || surfaceChanged)
+    );
+    const beforeErrors = [
+      ...actionableCheckoutErrors(beforeMap.errors || []),
+      ...(beforeMap.validationIssues || []).map((issue) => issue.message).filter(Boolean)
+    ];
+    const afterErrors = [
+      ...actionableCheckoutErrors(afterMap.errors || []),
+      ...(afterMap.validationIssues || []).map((issue) => issue.message).filter(Boolean)
+    ];
+    const validationAppeared = afterErrors.some((error) => !beforeErrors.includes(error));
     const evidence = {
+      beforeObservationHash: observationHashForMap(beforeMap),
+      afterObservationHash: observationHashForMap(afterMap),
       beforeStep: beforeMap.step,
       afterStep: afterMap.step,
       beforeUrl: beforeMap.url || location.href,
       afterUrl: location.href,
-      beforeSurface: beforeMap.activeSurface?.label || "",
-      afterSurface: afterMap.activeSurface?.label || "",
+      beforeSurface: beforeMap.currentSurface?.label || "",
+      afterSurface: afterMap.currentSurface?.label || "",
       visual: {
         beforeFingerprint: beforeVisualState?.fingerprint || "",
         afterFingerprint: afterVisualState?.fingerprint || "",
@@ -4482,8 +4955,37 @@
         || afterControlState?.valuePresent
       )
     );
+    if (expected.type === "semantic_progress") {
+      const currentSurface = afterMap.currentSurface || {};
+      const actualNormalizedValue = String(afterControlState?.normalizedValue || "");
+      const wantedNormalizedValue = String(expected.expectedNormalizedValue || "");
+      const valueChanged = actualNormalizedValue !== String(expected.previousValue || "");
+      const goalSatisfied = Boolean(wantedNormalizedValue && actualNormalizedValue === wantedNormalizedValue);
+      const optionsAppeared = Boolean(
+        afterControlState?.expanded === true
+        || (currentSurface.type && currentSurface.type !== "page" && currentSurface.id !== String(expected.previousSurfaceId || ""))
+      );
+      const ok = goalSatisfied || optionsAppeared || valueChanged || foregroundChanged || progressMarkerChanged;
+      return {
+        ok,
+        code: ok ? "SEMANTIC_PROGRESS_OBSERVED" : "SEMANTIC_PROGRESS_NOT_OBSERVED",
+        message: ok
+          ? "The interaction produced fresh semantic progress for the unresolved control."
+          : "The interaction did not change the value, options surface, or foreground state.",
+        evidence: {
+          ...evidence,
+          goalSatisfied,
+          optionsAppeared,
+          valueChanged,
+          actualNormalizedValue,
+          wantedNormalizedValue,
+          control: afterControl || null,
+          currentSurface
+        }
+      };
+    }
     if (expected.type === "options_surface_appeared") {
-      const currentSurface = afterMap.currentSurface || afterMap.activeSurface || {};
+      const currentSurface = afterMap.currentSurface || {};
       const surfaceAppeared = Boolean(
         currentSurface.type
         && currentSurface.type !== "page"
@@ -4501,11 +5003,19 @@
     if (expected.type === "normalized_value_changed") {
       const actualNormalizedValue = String(afterControlState?.normalizedValue || "");
       const wantedNormalizedValue = String(expected.expectedNormalizedValue || "");
-      const currentSurface = afterMap.currentSurface || afterMap.activeSurface || {};
+      const currentSurface = afterMap.currentSurface || {};
       const surfaceDismissed = !expected.requireSurfaceDismissed
         || !expected.surfaceId
         || currentSurface.id !== expected.surfaceId;
-      const ok = Boolean(wantedNormalizedValue && actualNormalizedValue === wantedNormalizedValue && surfaceDismissed);
+      const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
+        issue.stageWide === true || (expected.controlId && issue.controlId === expected.controlId)
+      ));
+      const ok = Boolean(
+        wantedNormalizedValue
+        && actualNormalizedValue === wantedNormalizedValue
+        && surfaceDismissed
+        && ownedValidationErrors.length === 0
+      );
       return {
         ok,
         code: ok ? "NORMALIZED_VALUE_VERIFIED" : "NORMALIZED_VALUE_NOT_VERIFIED",
@@ -4515,6 +5025,7 @@
           actualNormalizedValue,
           wantedNormalizedValue,
           surfaceDismissed,
+          ownedValidationErrors,
           control: afterControl || null,
           currentSurface
         }
@@ -4556,8 +5067,100 @@
         evidence: { ...evidence, decisionGroup: group }
       };
     }
+    if (expected.type === "exact_free_option_selected") {
+      const group = afterDecisionGroup || (afterMap.decisionGroups || []).find((item) => (
+        (expected.sectionId && item.sectionId === expected.sectionId)
+        || (expected.sectionType && item.sectionType === expected.sectionType)
+        || (expected.requirementId && (item.requirementId === expected.requirementId || item.decisionGroupId === expected.requirementId))
+        || (expected.expectedSelectedLabel && (() => {
+          const observed = normalizeMatchText(item.selectedLabel || "");
+          const wanted = normalizeMatchText(expected.expectedSelectedLabel);
+          return Boolean(observed && wanted && (observed === wanted || observed.includes(wanted) || wanted.includes(observed)));
+        })())
+        || (expected.expectedSelectedControlId
+          && (item.alternatives || []).some((option) => option.controlId === expected.expectedSelectedControlId && option.selected))
+      )) || null;
+      const groupSelectedControlId = String(group?.selectedControlId || group?.selected?.controlId || "");
+      const expectedControlId = String(expected.expectedSelectedControlId || expected.controlId || "");
+      const exactCommitment = [...canonicalSelectionCommitments.values()].find((commitment) => {
+        if (!expectedControlId || commitment.controlId !== expectedControlId) return false;
+        const committed = normalizeMatchText(commitment.label || "");
+        const observed = normalizeMatchText(group?.selectedLabel || "");
+        return Boolean(committed && observed && (committed === observed || committed.includes(observed) || observed.includes(committed)));
+      }) || null;
+      const selectedControlId = exactCommitment?.controlId || groupSelectedControlId;
+      const selectedOption = (group?.alternatives || []).find((option) => (
+        option.selected === true || (groupSelectedControlId && option.controlId === groupSelectedControlId)
+      )) || null;
+      const selectedText = normalizeMatchText(`${exactCommitment?.semantic || ""} ${exactCommitment?.risk || ""} ${exactCommitment?.label || ""} ${selectedOption?.semantic || ""} ${selectedOption?.risk || ""} ${selectedOption?.label || group?.selectedSemantic || ""} ${group?.selectedLabel || ""}`);
+      const semanticDispositionVerified = /decline|safe decline|free|no extra|no thanks|none|without|skip/.test(selectedText);
+      const paidAlternativesSelected = (group?.alternatives || []).filter((option) => {
+        if (!(option.selected === true || (groupSelectedControlId && option.controlId === groupSelectedControlId))) return false;
+        const risk = normalizeMatchText(option.risk || "");
+        const semantic = normalizeMatchText(option.semantic || "");
+        return /money|payment/.test(risk) || /add paid extra|add extra|purchase|upgrade/.test(semantic);
+      });
+      const exactControlSelected = Boolean(expectedControlId && selectedControlId === expectedControlId);
+      const beforePriceAmount = expected.beforePriceAmount == null ? null : Number(expected.beforePriceAmount);
+      const afterPriceAmount = afterMap.price?.amount == null ? null : Number(afterMap.price.amount);
+      const priceDidNotIncrease = Number.isFinite(beforePriceAmount) && Number.isFinite(afterPriceAmount)
+        ? afterPriceAmount <= beforePriceAmount
+        : String(afterMap.priceText || "") === String(expected.beforePriceText || "");
+      const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
+        issue.stageWide === true
+        || (expectedControlId && issue.controlId === expectedControlId)
+        || (expected.sectionId && issue.sectionId === expected.sectionId)
+        || (expected.sectionType && issue.sectionType === expected.sectionType)
+      ));
+      const currentSurface = afterMap.currentSurface || {};
+      const surfaceDismissed = !expected.requireSurfaceDismissed
+        || !expected.expectedSurfaceId
+        || currentSurface.id !== expected.expectedSurfaceId;
+      const ok = Boolean(
+        group?.status === "satisfied"
+        && exactControlSelected
+        && semanticDispositionVerified
+        && paidAlternativesSelected.length === 0
+        && priceDidNotIncrease
+        && ownedValidationErrors.length === 0
+        && surfaceDismissed
+      );
+      return {
+        ok,
+        code: ok ? "EXACT_FREE_OPTION_VERIFIED" : "EXACT_FREE_OPTION_NOT_VERIFIED",
+        message: ok
+          ? "The exact canonical free/no-extra option is selected without a price increase or validation error."
+          : "The decision is not proven to be the exact canonical free/no-extra selection.",
+        evidence: {
+          ...evidence,
+          decisionGroup: group || null,
+          observedDecisionGroups: (afterMap.decisionGroups || []).map((item) => ({
+            decisionGroupId: item.decisionGroupId,
+            sectionType: item.sectionType,
+            sectionLabel: item.sectionLabel,
+            status: item.status,
+            selectedControlId: item.selectedControlId,
+            selectedLabel: item.selectedLabel,
+            alternatives: item.alternatives
+          })),
+          expectedControlId,
+          selectedControlId,
+          groupSelectedControlId,
+          exactCommitment,
+          exactControlSelected,
+          semanticDispositionVerified,
+          paidAlternativesSelected,
+          beforePriceAmount: Number.isFinite(beforePriceAmount) ? beforePriceAmount : null,
+          afterPriceAmount: Number.isFinite(afterPriceAmount) ? afterPriceAmount : null,
+          priceDidNotIncrease,
+          ownedValidationErrors,
+          surfaceDismissed,
+          currentSurface
+        }
+      };
+    }
     if (expected.type === "requirement_status") {
-      const activeSurfaceProgress = beforeMap.activeSurface?.label && beforeMap.activeSurface?.label !== afterMap.activeSurface?.label;
+      const activeSurfaceProgress = beforeMap.currentSurface?.label && beforeMap.currentSurface?.label !== afterMap.currentSurface?.label;
       const ok = logicalDecisionSatisfied || logicalControlSatisfied || (activeSurfaceProgress && !evidence.errors.length);
       return {
         ok,
@@ -4575,9 +5178,9 @@
       };
     }
     if (expected.type === "active_surface_change") {
-      const afterSurface = afterMap.activeSurface || {};
+      const afterSurface = afterMap.currentSurface || {};
       const afterSurfaceSignature = `${afterSurface.type || ""}:${afterSurface.label || ""}:${(afterSurface.options || []).map((entry) => entry.id).join(",")}`;
-      const beforeSurface = beforeMap.activeSurface || {};
+      const beforeSurface = beforeMap.currentSurface || {};
       const beforeSurfaceSignature = `${beforeSurface.type || ""}:${beforeSurface.label || ""}:${(beforeSurface.options || []).map((entry) => entry.id).join(",")}`;
       const ok = expected.surfaceSignature
         ? expected.surfaceSignature !== afterSurfaceSignature
@@ -4590,8 +5193,8 @@
       };
     }
     if (expected.type === "active_surface_dismissed") {
-      const afterSurface = afterMap.activeSurface || {};
-      const beforeSurface = beforeMap.activeSurface || {};
+      const afterSurface = afterMap.currentSurface || {};
+      const beforeSurface = beforeMap.currentSurface || {};
       const sameSurfaceId = expected.surfaceId && afterSurface.id === expected.surfaceId;
       const sameSurfaceLabel = normalizeMatchText(afterSurface.label || "") && normalizeMatchText(afterSurface.label || "") === normalizeMatchText(expected.surfaceLabel || "");
       const foregroundGone = !afterSurface.type || afterSurface.type === "page";
@@ -4621,6 +5224,25 @@
       const blockers = stageExitBlockers(afterMap, expected);
       if (changed && beforeMap.step !== afterMap.step) {
         return { ok: true, code: "STAGE_CHANGED", message: `Stage changed to ${afterMap.step}.`, evidence };
+      }
+      if (progressMarkerChanged) {
+        return { ok: true, code: "NAVIGATION_PROGRESS_CHANGED", message: "Navigation advanced the current progress marker.", evidence };
+      }
+      if (overlayAppeared || surfaceChanged) {
+        return {
+          ok: true,
+          code: overlayAppeared ? "NAVIGATION_POPUP_APPEARED" : "NAVIGATION_SURFACE_CHANGED",
+          message: overlayAppeared ? "Navigation produced a new foreground popup." : "Navigation changed the active surface.",
+          evidence
+        };
+      }
+      if (validationAppeared) {
+        return {
+          ok: true,
+          code: "NAVIGATION_VALIDATION_APPEARED",
+          message: "Navigation reached the page and produced fresh validation feedback.",
+          evidence: { ...evidence, errors }
+        };
       }
       if ((changed || visualChanged) && !blockers.length) {
         return { ok: true, code: "PAGE_CHANGED", message: "Page structure changed after navigation action.", evidence };
@@ -4702,7 +5324,8 @@
     const firstRect = element.getBoundingClientRect();
     const isOffscreen = firstRect.bottom < 0 || firstRect.top > window.innerHeight || firstRect.right < 0 || firstRect.left > window.innerWidth;
     if (isOffscreen) {
-      scrollElementWithinNearestContainer(element, { behavior: "smooth" });
+      cursor.classList.remove("is-visible", "is-clicking");
+      return;
     }
     const rect = element.getBoundingClientRect();
     const derivedLabel = actionLabel || (element.innerText || element.value || element.getAttribute("aria-label") || "working").replace(/\s+/g, " ").trim();
@@ -4826,7 +5449,7 @@
 
   async function waitForUiSettle(ms = 650) {
     const startedAt = performance.now();
-    await showAgentThought(document.activeElement || document.body, "Wait", "Watching page update", "Waiting for popups, dropdowns, validation, price/order changes, or URL changes.", 600);
+    await showAgentThought(null, "Wait", "Watching page update", "Waiting for popups, dropdowns, validation, price/order changes, or URL changes.", 600);
     await waitForPaint(ms);
     logFlow("latency.span", {
       page_settle_ms: Math.round(performance.now() - startedAt),
@@ -5088,7 +5711,7 @@
   }
 
   function visualPageState(map = agent.pageMap || {}) {
-    const activeSurface = map.currentSurface && map.currentSurface.type !== "page" ? map.currentSurface : (map.activeSurface || {});
+    const activeSurface = map.currentSurface || {};
     const foreground = foregroundSurfaceState(activeSurface);
     const surfaceControls = foreground.active
       ? [...(activeSurface.buttons || []), ...(activeSurface.options || [])]
@@ -5216,6 +5839,60 @@
       .filter((button) => isVisible(button) && !button.closest("#atw-sidebar"));
   }
 
+  function surfaceActionElements(overlay) {
+    if (!overlay) return [];
+    const roots = [overlay];
+    `${overlay.getAttribute?.("aria-owns") || ""} ${overlay.getAttribute?.("aria-controls") || ""}`
+      .split(/\s+/)
+      .filter(Boolean)
+      .forEach((id) => {
+        const root = document.getElementById(id);
+        if (root && isVisible(root)) roots.push(root);
+      });
+    return roots
+      .flatMap((root) => overlayButtons(root))
+      .filter((element, index, list) => element && list.indexOf(element) === index);
+  }
+
+  function surfaceMembershipForElement(element, surface = {}) {
+    if (!element) return { surfaceId: "", evidence: "missing_element" };
+    if (!surface?.type || surface.type === "page") return { surfaceId: "surface-page", evidence: "page_surface" };
+    const elementNodeId = elementId(element);
+    const registeredIds = new Set([
+      ...(surface.memberActuatorIds || []),
+      ...(surface.options || []).flatMap((item) => [item.id, item.stateElementId, item.preferredActivationElementId]),
+      ...(surface.buttons || []).flatMap((item) => [item.id, item.stateElementId, item.preferredActivationElementId])
+    ].filter(Boolean));
+    if (registeredIds.has(elementNodeId)) return { surfaceId: surface.id || "", evidence: "registered_surface_member" };
+    const surfaceElement = surface.id ? elementById(surface.id) : null;
+    if (surfaceElement && (surfaceElement === element || surfaceElement.contains(element))) {
+      return { surfaceId: surface.id || "", evidence: "dom_descendant" };
+    }
+    const ownedIds = `${surfaceElement?.getAttribute?.("aria-owns") || ""} ${surfaceElement?.getAttribute?.("aria-controls") || ""}`
+      .split(/\s+/)
+      .filter(Boolean);
+    if (ownedIds.some((id) => {
+      const root = document.getElementById(id);
+      return root && (root === element || root.contains(element));
+    })) return { surfaceId: surface.id || "", evidence: "aria_owned_root" };
+    const surfaceBox = surface.box;
+    const targetBox = elementBox(element);
+    if (surfaceBox && targetBox) {
+      const centerX = Number(targetBox.centerX ?? (targetBox.x + targetBox.width / 2));
+      const centerY = Number(targetBox.centerY ?? (targetBox.y + targetBox.height / 2));
+      const visuallyContained = centerX >= Number(surfaceBox.x)
+        && centerX <= Number(surfaceBox.x) + Number(surfaceBox.width)
+        && centerY >= Number(surfaceBox.y)
+        && centerY <= Number(surfaceBox.y) + Number(surfaceBox.height);
+      // Geometry is supporting evidence only: background controls can sit
+      // directly underneath an overlay and share its rectangle. Without DOM,
+      // ARIA, or registered-member proof, visual overlap must not grant
+      // foreground ownership.
+      if (visuallyContained) return { surfaceId: "surface-page", evidence: "visual_overlap_unconfirmed" };
+    }
+    return { surfaceId: "surface-page", evidence: "background_page" };
+  }
+
   function isTransientChoiceOverlay(overlay) {
     const role = overlay.getAttribute("role") || "";
     const text = overlayText(overlay).toLowerCase();
@@ -5266,7 +5943,7 @@
   }
 
   async function settleAndHandleInterrupts(context = "") {
-    await showAgentThought(document.activeElement || document.body, "Wait", "Letting the page react", `After ${context || "the last action"}: check modal, dropdown, loading, errors, disabled buttons, and DOM changes.`, 700);
+    await showAgentThought(null, "Wait", "Letting the page react", `After ${context || "the last action"}: check modal, dropdown, loading, errors, disabled buttons, and DOM changes.`, 700);
     await waitForPaint(1200);
     const overlays = activeOverlayElements();
     if (overlays.length) {
@@ -5306,14 +5983,30 @@
 
   function elementBox(element) {
     const rect = element.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const centerY = rect.top + rect.height / 2;
+    let inViewport = centerX >= 0 && centerX <= window.innerWidth && centerY >= 0 && centerY <= window.innerHeight;
+    for (let current = composedParent(element); inViewport && current && current !== document.body && current !== document.documentElement; current = composedParent(current)) {
+      const style = getComputedStyle(current);
+      const overflowX = style.overflowX || style.overflow || "visible";
+      const overflowY = style.overflowY || style.overflow || "visible";
+      if (!/(auto|scroll|overlay|hidden|clip)/.test(`${overflowX} ${overflowY}`)) continue;
+      const containerRect = current.getBoundingClientRect();
+      if (/(auto|scroll|overlay|hidden|clip)/.test(overflowX)) {
+        inViewport = inViewport && centerX >= containerRect.left && centerX <= containerRect.right;
+      }
+      if (/(auto|scroll|overlay|hidden|clip)/.test(overflowY)) {
+        inViewport = inViewport && centerY >= containerRect.top && centerY <= containerRect.bottom;
+      }
+    }
     return {
       x: Math.round(rect.left),
       y: Math.round(rect.top),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
-      centerX: Math.round(rect.left + rect.width / 2),
-      centerY: Math.round(rect.top + rect.height / 2),
-      inViewport: rect.bottom >= 0 && rect.right >= 0 && rect.top <= window.innerHeight && rect.left <= window.innerWidth
+      centerX: Math.round(centerX),
+      centerY: Math.round(centerY),
+      inViewport
     };
   }
 
@@ -5338,22 +6031,31 @@
   }
 
   function scrollElementWithinNearestContainer(element, options = {}) {
+    if (options.authority !== "governed_executor") {
+      return { ok: false, code: "UNGOVERNED_SCROLL_BLOCKED", container: null, moved: false };
+    }
     if (!element) return { ok: false, code: "TARGET_DISAPPEARED", container: null, moved: false };
     const container = nearestEffectiveScrollContainer(element);
     const behavior = options.behavior || "smooth";
     const amount = Number(options.amount || 0);
+    const strategy = options.strategy === "nearest_container" ? "nearest_container" : "target_center";
     const documentScroller = container === document.scrollingElement
       || container === document.documentElement
       || container === document.body;
     const before = documentScroller ? Number(window.scrollY || 0) : Number(container.scrollTop || 0);
-    if (documentScroller) {
-      if (amount) window.scrollBy({ top: amount, left: 0, behavior });
-      else element.scrollIntoView({ block: "center", inline: "nearest", behavior });
+    if (strategy === "target_center") {
+      element.scrollIntoView({ block: "center", inline: "nearest", behavior });
     } else {
       const targetBox = element.getBoundingClientRect();
-      const containerBox = container.getBoundingClientRect();
-      const centeredDelta = targetBox.top + targetBox.height / 2 - (containerBox.top + containerBox.height / 2);
-      container.scrollBy({ top: amount || centeredDelta, left: 0, behavior });
+      const viewportCenter = documentScroller
+        ? window.innerHeight / 2
+        : (() => {
+            const containerBox = container.getBoundingClientRect();
+            return containerBox.top + containerBox.height / 2;
+          })();
+      const centeredDelta = targetBox.top + targetBox.height / 2 - viewportCenter;
+      if (documentScroller) window.scrollBy({ top: centeredDelta || amount, left: 0, behavior });
+      else container.scrollBy({ top: centeredDelta || amount, left: 0, behavior });
     }
     const after = documentScroller ? Number(window.scrollY || 0) : Number(container.scrollTop || 0);
     return {
@@ -5362,9 +6064,53 @@
       container,
       containerId: documentScroller ? "document" : elementId(container),
       containerType: documentScroller ? "document" : "element",
+      strategy,
       before,
       after,
       moved: after !== before
+    };
+  }
+
+  async function waitForScrollSettle(element, options = {}) {
+    const container = options.container || nearestEffectiveScrollContainer(element);
+    const timeoutMs = Math.max(250, Number(options.timeoutMs || 3000));
+    const quietMs = Math.max(80, Number(options.quietMs || 140));
+    const documentScroller = container === document.scrollingElement
+      || container === document.documentElement
+      || container === document.body;
+    const sample = () => {
+      const rect = element?.getBoundingClientRect?.() || null;
+      return {
+        windowX: Number(window.scrollX || 0),
+        windowY: Number(window.scrollY || 0),
+        containerTop: documentScroller ? Number(window.scrollY || 0) : Number(container?.scrollTop || 0),
+        targetX: Number(rect?.left || 0),
+        targetY: Number(rect?.top || 0)
+      };
+    };
+    const changed = (before, after) => Object.keys(before).some((key) => Math.abs(before[key] - after[key]) > 0.5);
+    const startedAt = performance.now();
+    let lastChangeAt = startedAt;
+    let previous = sample();
+    while (performance.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const current = sample();
+      if (changed(previous, current)) lastChangeAt = performance.now();
+      previous = current;
+      if (performance.now() - startedAt >= quietMs && performance.now() - lastChangeAt >= quietMs) {
+        return {
+          settled: true,
+          timedOut: false,
+          durationMs: Math.round(performance.now() - startedAt),
+          targetInViewport: element ? elementBox(element).inViewport === true : false
+        };
+      }
+    }
+    return {
+      settled: false,
+      timedOut: true,
+      durationMs: Math.round(performance.now() - startedAt),
+      targetInViewport: element ? elementBox(element).inViewport === true : false
     };
   }
 
@@ -5423,8 +6169,8 @@
       || snapshot.risk === "safe_continue";
   }
 
-  function activeSurfaceEntries(surfaceOrMap) {
-    const surface = surfaceOrMap?.activeSurface || surfaceOrMap || {};
+  function currentSurfaceEntries(surfaceOrMap) {
+    const surface = surfaceOrMap?.currentSurface || surfaceOrMap || {};
     return [...(surface.options || []), ...(surface.buttons || [])]
       .filter((entry, index, list) => entry?.id && list.findIndex((item) => item?.id === entry.id) === index);
   }
@@ -5507,7 +6253,7 @@
     const type = isTransientChoiceOverlay(overlay) ? "dropdown" : /dialog|modal/i.test(role) || overlay.getAttribute("aria-modal") === "true" ? "modal" : "popover";
     const map = agent.pageMap || null;
     const parentContext = inferSurfaceParentDecisionContext(overlay, sections);
-    const options = overlayButtons(overlay).map((option) => {
+    const options = surfaceActionElements(overlay).map((option) => {
       const label = overlayChoiceText(option);
       const box = elementBox(option);
       return {
@@ -5545,8 +6291,8 @@
       label: text.slice(0, 800),
       role,
       taskHint: parentContext.parentSectionType || "",
-      options: prioritized.slice(0, 20),
-      buttons: prioritized.slice(0, 20),
+      options: prioritized,
+      buttons: prioritized,
       box: elementBox(overlay),
       accessibility: accessibilityNode(overlay, map)
     };
@@ -5672,6 +6418,25 @@
     const registryConflicts = activeObservationControlRegistry?.conflicts || [];
     const unresolvedGraphConflicts = registryConflicts.filter((conflict) => !conflict.resolved);
     const resolvedGraphConflicts = registryConflicts.filter((conflict) => conflict.resolved);
+    const classifiedGraphConflicts = unresolvedGraphConflicts.map((conflict) => {
+      const conflictControlIds = [
+        ...(conflict.controlIds || []),
+        conflict.existing?.controlId,
+        conflict.incoming?.controlId
+      ].filter(Boolean);
+      const conflictNodeIds = new Set([conflict.aliasId, ...(conflict.nodeIds || [])].filter(Boolean));
+      const affectedControlIds = controls.filter((control) => (
+        conflictControlIds.includes(control.controlId)
+        || controlMemberNodeIds(control).some((nodeId) => conflictNodeIds.has(nodeId))
+      )).map((control) => control.controlId);
+      return {
+        ...conflict,
+        classification: affectedControlIds.length ? "actionable" : "diagnostic",
+        affectedControlIds
+      };
+    });
+    const actionableGraphConflicts = classifiedGraphConflicts.filter((conflict) => conflict.classification === "actionable");
+    const diagnosticGraphConflicts = classifiedGraphConflicts.filter((conflict) => conflict.classification === "diagnostic");
     const duplicateElementRekeys = activeObservationElementRegistry?.duplicateRekeys || [];
     if (duplicateElementRekeys.length) {
       logFlow("element.duplicate_id_rekeyed", {
@@ -5680,9 +6445,13 @@
       });
     }
     const graphIntegrity = {
-      ok: unresolvedGraphConflicts.length === 0,
-      conflicts: unresolvedGraphConflicts.slice(0, 12),
+      ok: actionableGraphConflicts.length === 0,
+      conflicts: classifiedGraphConflicts.slice(0, 12),
       unresolvedConflictCount: unresolvedGraphConflicts.length,
+      actionableConflictCount: actionableGraphConflicts.length,
+      diagnosticConflictCount: diagnosticGraphConflicts.length,
+      actionableConflicts: actionableGraphConflicts.slice(0, 12),
+      diagnosticConflicts: diagnosticGraphConflicts.slice(0, 12),
       resolvedConflictCount: resolvedGraphConflicts.length,
       resolvedConflicts: resolvedGraphConflicts.slice(0, 12),
       duplicateElementRekeyCount: duplicateElementRekeys.length,
@@ -5691,7 +6460,7 @@
     const decisionGroups = buildCanonicalDecisionGroups(sections, controls, activeSurface);
     const surfaceModel = buildSurfaceStack(activeSurface, sections, taskQueue, overlays, step);
     const stageExit = buildStageExit(decisionGroups, fields, buttons, overlays, errors, step);
-    const transactionFingerprints = transactionFingerprintEvidence();
+    const transactionFacts = transactionFactsEvidence({ step, price, decisionGroups, activeSurface });
     const map = {
       site: inferCheckoutSite(),
       step,
@@ -5701,7 +6470,6 @@
       fields,
       buttons,
       overlays,
-      activeSurface,
       surfaceStack: surfaceModel.surfaceStack,
       currentSurface: surfaceModel.currentSurface,
       currentSurfaceTasks: surfaceModel.currentSurfaceTasks,
@@ -5711,8 +6479,7 @@
       paidChoices,
       price,
       priceText: price ? `${price.amount} ${price.currency}` : "",
-      itineraryFingerprint: transactionFingerprints.itineraryFingerprint,
-      offerFingerprint: transactionFingerprints.offerFingerprint,
+      transactionFacts,
       controls,
       graphIntegrity,
       decisionGroups,
@@ -5738,12 +6505,11 @@
         continueAllowed: stageExit.continueAllowed,
         priceText: price ? `${price.amount} ${price.currency}` : "",
         price,
-        itineraryFingerprint: transactionFingerprints.itineraryFingerprint,
-        offerFingerprint: transactionFingerprints.offerFingerprint
+        transactionFactsCompleteness: transactionFacts.itinerary.completeness
       }
     };
     map.accessibility = accessibilitySnapshot(map);
-    map.foreground = foregroundSurfaceState(map.currentSurface || map.activeSurface || {});
+    map.foreground = foregroundSurfaceState(map.currentSurface || {});
     map.visualState = visualPageState(map);
     return map;
   }
@@ -5956,6 +6722,26 @@
     return Boolean(top && (top === element || element.contains(top) || top.contains(element)));
   }
 
+  function uniqueControlIds(items = []) {
+    return [...new Set(items.map((item) => typeof item === "string" ? item : item?.controlId).filter(Boolean))];
+  }
+
+  function compactSurfaceReference(surface = {}) {
+    return {
+      id: surface.id || "",
+      type: surface.type || "page",
+      label: surface.label || "",
+      role: surface.role || "",
+      taskHint: surface.taskHint || "",
+      blocksBackground: Boolean(surface.blocksBackground),
+      parentSurfaceId: surface.parentSurfaceId || "",
+      observationId: surface.observationId || "",
+      memberControlIds: uniqueControlIds(surface.memberControlIds || surface.controlIds || surface.options || []),
+      memberActuatorIds: [...new Set(surface.memberActuatorIds || [])].filter(Boolean),
+      foreground: surface.foreground || surface.visualState?.foreground || null
+    };
+  }
+
   function compactPageMap(map) {
     // Section and task summaries are local diagnostics. The governed backend
     // receives canonical controls, decision groups, surfaces, and field/error
@@ -5978,49 +6764,41 @@
         scrollY: Math.round(window.scrollY),
         devicePixelRatio: window.devicePixelRatio || 1
       },
-      text: map.text,
-      fullText: map.fullText,
+      text: map.text || map.fullText,
       snapshotHash: observationHashForMap(map),
       graphIntegrity,
-      controlAliases: aliasIndex.entries.slice(0, 1200),
+      transactionFacts: map.transactionFacts || null,
+      controlAliases: aliasIndex.entries,
       price: map.price || null,
       priceText: map.priceText || map.summary?.priceText || "",
-      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || map.activeSurface || {}),
-      visualState: map.visualState || visualPageState(map),
+      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || {}),
       accessibility: map.accessibility ? {
         foregroundSurfaceId: map.accessibility.foregroundSurfaceId,
         foregroundSurfaceType: map.accessibility.foregroundSurfaceType,
         landmarkCount: map.accessibility.landmarkCount,
-        controls: (map.accessibility.controls || []).map((node) => ({
-          id: node.id,
-          role: node.role,
-          controlId: node.controlId || "",
-          decisionGroupId: node.decisionGroupId || "",
-          name: node.name,
-          state: node.state,
-          kind: node.kind,
-          sectionId: node.sectionId,
-          sectionType: node.sectionType,
-          sectionLabel: node.sectionLabel,
-          surfaceId: node.surfaceId,
-          surfaceType: node.surfaceType,
-          visualRef: node.visualRef || "",
-          box: node.box
-        })).slice(0, 120)
+        controlIds: uniqueControlIds(map.accessibility.controls || [])
       } : null,
       controls: (map.controls || []).map((control) => ({
         controlId: control.controlId,
+        stableKey: control.stableKey || "",
+        meaning: control.meaning || control.semantic || "",
+        structuredPrice: control.structuredPrice || null,
         visualRef: control.visualRef || "",
         decisionGroupId: control.decisionGroupId || "",
         label: control.label,
         accessibleName: control.accessibleName,
         kind: control.kind,
+        field: control.field || "",
         role: control.role,
+        domRole: control.domRole || "",
         semantic: control.semantic,
         risk: control.risk,
         state: control.state,
+        currentValue: control.currentValue || "",
+        capabilities: control.capabilities || [],
         selected: Boolean(control.selected),
         required: Boolean(control.required),
+        hasValue: Boolean(control.hasValue || control.state?.valuePresent || control.controlState?.valuePresent),
         sectionId: control.sectionId,
         sectionType: control.sectionType,
         sectionLabel: control.sectionLabel,
@@ -6031,6 +6809,7 @@
         preferredActivationElementId: control.preferredActivationElementId,
         operations: control.operations || {},
         recovery: control.recovery || {},
+        visualRegions: control.visualRegions || [],
         actuators: (control.actuators || []).map((item) => ({
           nodeId: item.nodeId,
           relation: item.relation,
@@ -6039,7 +6818,10 @@
           box: item.box
         })).slice(0, 8),
         visualRegion: control.visualRegion
-      })).slice(0, 180),
+      // Preserve the whole canonical page for local/server compression. The
+      // model never receives this raw registry; seat cells are aggregated by
+      // observation-markdown before any model call.
+      })),
       decisionGroups: (map.decisionGroups || []).map((group) => ({
         decisionGroupId: group.decisionGroupId,
         sectionId: group.sectionId,
@@ -6051,18 +6833,9 @@
         selectedControlId: group.selectedControlId,
         selectedLabel: group.selectedLabel,
         selectedSemantic: group.selectedSemantic,
-        alternatives: (group.alternatives || []).map((choice) => ({
-          controlId: choice.controlId,
-          targetId: choice.targetId,
-          visualRef: choice.visualRef || "",
-          label: choice.label,
-          semantic: choice.semantic,
-          risk: choice.risk,
-          selected: Boolean(choice.selected),
-          priceText: choice.priceText || ""
-        })).slice(0, 16),
+        alternativeControlIds: uniqueControlIds(group.alternatives || []),
         evidence: (group.evidence || []).slice(0, 5)
-      })).slice(0, 80),
+      })),
       errors: actionableCheckoutErrors(map.errors),
       validationIssues: (map.validationIssues || []).map((issue) => ({
         issueId: issue.issueId || "",
@@ -6086,162 +6859,36 @@
         paidChoice: Boolean(section.paidChoice),
         objective: section.objective,
         selected: section.selected || [],
-        choices: (section.choices || []).map((choice) => ({
-          id: choice.id,
-          controlId: choice.controlId || "",
-          visualRef: choice.visualRef || "",
-          decisionGroupId: choice.decisionGroupId || "",
-          label: choice.label,
-          selected: Boolean(choice.selected),
-          semantic: choice.semantic,
-          risk: choice.risk,
-          role: choice.role || "",
-          accessibility: choice.accessibility || null,
-          controlState: choice.controlState || null,
-          stateElementId: choice.stateElementId || "",
-          preferredActivationElementId: choice.preferredActivationElementId || "",
-          operations: choice.operations || {},
-          recovery: choice.recovery || {},
-          actuators: (choice.actuators || []).slice(0, 8),
-          visualRegion: choice.visualRegion || null,
-          box: choice.box
-        })),
+        controlIds: uniqueControlIds([
+          ...(section.fields || []),
+          ...(section.choices || []),
+          ...(section.buttons || [])
+        ]),
         box: section.box,
-        fields: (section.fields || []).map((field) => ({
-          id: field.id,
-          controlId: field.controlId || "",
-          visualRef: field.visualRef || "",
-          decisionGroupId: field.decisionGroupId || "",
-          label: field.label,
-          field: field.field,
-          kind: field.kind,
-          name: field.name || "",
-          placeholder: field.placeholder || "",
-          autocomplete: field.autocomplete || "",
-          inputMode: field.inputMode || "",
-          formatHint: field.formatHint || "",
-          options: (field.options || []).slice(0, 120),
-          semantic: field.semantic,
-          role: field.role || "",
-          accessibility: field.accessibility || null,
-          required: Boolean(field.required),
-          hasValue: Boolean(field.hasValue),
-          controlState: field.controlState || null,
-          stateElementId: field.stateElementId || "",
-          preferredActivationElementId: field.preferredActivationElementId || "",
-          operations: field.operations || {},
-          recovery: field.recovery || {},
-          actuators: (field.actuators || []).slice(0, 8),
-          visualRegion: field.visualRegion || null,
-          box: field.box
-        })).slice(0, 20),
-        buttons: (section.buttons || []).map((button) => ({
-          id: button.id,
-          controlId: button.controlId || "",
-          visualRef: button.visualRef || "",
-          decisionGroupId: button.decisionGroupId || "",
-          label: button.label,
-          risk: button.risk,
-          semantic: button.semantic,
-          role: button.role || "",
-          accessibility: button.accessibility || null,
-          controlState: button.controlState || null,
-          stateElementId: button.stateElementId || "",
-          preferredActivationElementId: button.preferredActivationElementId || "",
-          operations: button.operations || {},
-          recovery: button.recovery || {},
-          actuators: (button.actuators || []).slice(0, 8),
-          visualRegion: button.visualRegion || null,
-          box: button.box
-        })).slice(0, 20),
         text: section.text
-      })).slice(0, 20),
-      taskQueue: (map.taskQueue || []).map((task) => ({
-        id: task.id,
-        sectionId: task.sectionId,
-        sectionLabel: task.sectionLabel,
-        sectionType: task.sectionType,
-        order: task.order,
-        status: task.status,
-        objective: task.objective,
-        rule: task.rule
-      })).slice(0, 30),
+      })),
       stageExit: map.stageExit || {},
       summary: map.summary,
       coverage: map.coverage,
-      fields: map.fields.map((field) => ({
-        id: field.id,
-        controlId: field.controlId || "",
-        visualRef: field.visualRef || "",
-        label: field.label,
-        box: field.box,
-        kind: field.kind,
-        name: field.name || "",
-        placeholder: field.placeholder || "",
-        autocomplete: field.autocomplete || "",
-        inputMode: field.inputMode || "",
-        formatHint: field.formatHint || "",
-        options: (field.options || []).slice(0, 120),
-        field: field.field,
-        semantic: field.semantic || field.field,
-        role: field.role || "",
-        accessibility: field.accessibility || null,
-        required: field.required,
-        hasValue: Boolean(field.hasValue || field.value || field.controlState?.valuePresent),
-        value: field.value ? "[filled]" : "",
-        controlState: field.controlState || null,
-        stateElementId: field.stateElementId || "",
-        preferredActivationElementId: field.preferredActivationElementId || "",
-        operations: field.operations || {},
-        recovery: field.recovery || {},
-        actuators: (field.actuators || []).slice(0, 8),
-        visualRegion: field.visualRegion || null,
-        confidence: field.confidence
-      })),
-      buttons: map.buttons.map((button) => ({
-        id: button.id,
-        controlId: button.controlId || "",
-        visualRef: button.visualRef || "",
-        label: button.label,
-        box: button.box,
-        role: button.role || "",
-        semantic: button.semantic || "",
-        risk: button.risk,
-        controlState: button.controlState || null,
-        stateElementId: button.stateElementId || "",
-        preferredActivationElementId: button.preferredActivationElementId || "",
-        operations: button.operations || {},
-        recovery: button.recovery || {},
-        actuators: (button.actuators || []).slice(0, 8),
-        visualRegion: button.visualRegion || null,
-        accessibility: button.accessibility || null
-      })),
-      activeSurface: map.activeSurface || {
+      currentSurface: compactSurfaceReference(map.currentSurface || {
         type: "page",
-        id: "",
-        label: "",
-        role: "",
-        taskHint: "",
-        options: [],
-        buttons: [],
-        box: null
-      },
-      currentSurface: map.currentSurface || map.activeSurface || {
-        type: "page",
-        id: "",
+        id: "surface-page",
         label: "",
         taskQueue: []
-      },
-      surfaceStack: map.surfaceStack || [],
-      currentSurfaceTasks: map.currentSurfaceTasks || [],
-      backgroundTasks: map.backgroundTasks || [],
+      }),
+      surfaceStack: (map.surfaceStack || []).map(compactSurfaceReference),
       overlays: (map.overlays || []).map((overlay) => ({
         id: overlay.id,
         label: overlay.label,
         box: overlay.box,
         role: overlay.role
       })),
-      screenshotAnnotations: map.screenshotAnnotations || []
+      screenshotAnnotations: (map.screenshotAnnotations || []).map((annotation) => ({
+        visualRef: annotation.visualRef || "",
+        controlId: annotation.controlId || "",
+        decisionGroupId: annotation.decisionGroupId || "",
+        box: annotation.box || null
+      }))
     };
   }
 
@@ -6322,7 +6969,7 @@
       (section.fields || []).forEach(touch);
       (section.buttons || []).forEach(touch);
     });
-    [map.activeSurface, map.currentSurface].filter(Boolean).forEach((surface) => {
+    [map.currentSurface].filter(Boolean).forEach((surface) => {
       (surface.options || []).forEach(touch);
       (surface.buttons || []).forEach(touch);
     });
@@ -6332,16 +6979,21 @@
     });
   }
 
-  function prepareScreenshotAnnotations(map) {
+  function prepareScreenshotAnnotations(map, observationId = agent.activeObservationId || "") {
     const groups = new Map();
     const addList = (items, source) => (items || []).forEach((item) => addScreenshotAnnotationCandidate(groups, item, source));
-    const surfaces = [map.currentSurface, map.activeSurface].filter((surface) => surface?.type && surface.type !== "page");
-    surfaces.forEach((surface) => {
-      addList(surface.options, "surface.option");
-      addList(surface.buttons, "surface.button");
-    });
+    const finalControls = (map.controls || []).filter((control) => control?.controlId);
+    const controlsById = new Map(finalControls.map((control) => [control.controlId, control]));
     (map.controls || []).forEach((control) => {
       (control.recovery?.open?.regions || []).forEach((region, index) => {
+        const canonicalRegion = normalizeVisualRegionContract(region, {
+          observationId,
+          controlId: control.controlId,
+          operation: "open",
+          source: "control.recovery.open",
+          surfaceId: control.surfaceId || ""
+        });
+        Object.assign(region, canonicalRegion);
         addScreenshotAnnotationCandidate(groups, {
           annotationKey: `recovery:${control.controlId}:open:${index}`,
           controlId: control.controlId,
@@ -6352,21 +7004,25 @@
           semantic: control.semantic || "",
           risk: "safe",
           prefix: "R",
-          visualRegion: region
+          visualRegion: canonicalRegion
         }, "control.recovery.open");
       });
     });
-    addList(map.controls, "control");
-    addList(map.fields, "field");
-    addList(map.buttons, "button");
-    (map.sections || []).forEach((section) => {
-      addList(section.fields, "section.field");
-      addList(section.choices, "section.choice");
-      addList(section.buttons, "section.button");
-    });
+    // Screenshot grounding is a projection of the finalized canonical
+    // registry. Copied field/section/surface models can retain identities for
+    // controls that lost ownership during registry reconciliation, so they are
+    // intentionally not annotation sources.
+    addList(finalControls, "control");
 
     const counters = { B: 0, F: 0, O: 0, C: 0 };
     const annotations = [...groups.values()]
+      .filter((group) => {
+        const control = controlsById.get(group.controlId);
+        if (!control) return false;
+        if (!group.targetId) return group.source === "control.recovery.open";
+        return controlMemberNodeIds(control).includes(group.targetId)
+          || group.targetId === control.controlId;
+      })
       .filter((group) => group.box?.width > 0 && group.box?.height > 0)
       .sort((a, b) => (a.box.y - b.box.y) || (a.box.x - b.box.x))
       .slice(0, 80)
@@ -6471,6 +7127,86 @@
     }
   }
 
+  function observationTransportBytes(payload = {}) {
+    return new Blob([JSON.stringify(payload)]).size;
+  }
+
+  function smallerObservationTransport(payload = {}) {
+    const page = payload.page || {};
+    return {
+      ...payload,
+      transportMode: "compact_retry",
+      page: {
+        ...page,
+        text: compactText(page.text || "", 2_000),
+        foreground: page.foreground ? {
+          kind: page.foreground.kind || "",
+          label: page.foreground.label || "",
+          surfaceId: page.foreground.surfaceId || "",
+          progressMarkers: page.foreground.progressMarkers || null
+        } : null,
+        coverage: page.coverage ? {
+          controlCount: page.controls?.length || 0,
+          sectionCount: page.sections?.length || 0
+        } : null,
+        summary: page.summary ? {
+          title: compactText(page.summary.title || "", 200),
+          priceText: compactText(page.summary.priceText || "", 80)
+        } : null
+      }
+    };
+  }
+
+  async function uploadObservationScreenshot(apiBase, { sessionId, observationId, screenshotDataUrl, signal }) {
+    if (!screenshotDataUrl) return "";
+    const response = await fetch(`${apiBase}/agent/screenshot`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      signal,
+      body: JSON.stringify({ sessionId, observationId, screenshotDataUrl })
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || !body.screenshotId) {
+      const error = new Error(body.error || `screenshot upload returned ${response.status}`);
+      error.code = body.code || "SCREENSHOT_UPLOAD_FAILED";
+      error.retryable = body.retryable === true;
+      throw error;
+    }
+    return body.screenshotId;
+  }
+
+  async function postObservationWithSizeRecovery(apiBase, payload, signal) {
+    let outgoing = payload;
+    let bytes = observationTransportBytes(outgoing);
+    if (bytes > MAX_OBSERVATION_TRANSPORT_BYTES) {
+      outgoing = smallerObservationTransport(outgoing);
+      bytes = observationTransportBytes(outgoing);
+    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await fetch(`${apiBase}/agent/next-action`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal,
+        body: JSON.stringify(outgoing)
+      });
+      if (response.ok) return { response, bytes, transportMode: outgoing.transportMode || "canonical" };
+      const body = await response.json().catch(() => ({}));
+      if (body.code === "OBSERVATION_TOO_LARGE" && body.retryable === true && attempt === 0) {
+        outgoing = smallerObservationTransport(outgoing);
+        bytes = observationTransportBytes(outgoing);
+        continue;
+      }
+      const error = new Error(body.error || `agent returned ${response.status}`);
+      error.code = body.code || `HTTP_${response.status}`;
+      error.retryable = body.retryable === true;
+      throw error;
+    }
+    throw Object.assign(new Error("Observation transport retry exhausted."), {
+      code: "OBSERVATION_TOO_LARGE",
+      retryable: true
+    });
+  }
+
   async function requestAgentDecision(map, userMessage = "", clientLatency = {}, loopToken = {}) {
     const turnId = nextFlowId("turn");
     const observationId = nextFlowId("obs");
@@ -6514,10 +7250,17 @@
     });
     try {
       const settings = await storageGet(["apiBase"]);
-      const screenshotAnnotations = prepareScreenshotAnnotations(map);
+      const screenshotAnnotations = prepareScreenshotAnnotations(map, observationId);
       const screenshotStartedAt = performance.now();
       const screenshotDataUrl = await captureVisibleScreenshot(screenshotAnnotations);
       const screenshotCaptureMs = Math.round(performance.now() - screenshotStartedAt);
+      const apiBase = settings.apiBase || DEFAULT_API;
+      const screenshotId = await uploadObservationScreenshot(apiBase, {
+        sessionId: agent.sessionId,
+        observationId,
+        screenshotDataUrl,
+        signal: request.controller.signal
+      });
       logFlow("backend.request.send", {
         turnId,
         api: `${settings.apiBase || DEFAULT_API}/agent/next-action`,
@@ -6525,10 +7268,10 @@
         screenshotAnnotations: screenshotAnnotations.length,
         observation_build_ms: clientLatency.observation_build_ms ?? null,
         screenshot_capture_ms: screenshotCaptureMs,
-        activeSurface: map.activeSurface ? {
-          type: map.activeSurface.type,
-          taskHint: map.activeSurface.taskHint,
-          options: (map.activeSurface.options || []).map((option) => ({
+        currentSurface: map.currentSurface ? {
+          type: map.currentSurface.type,
+          taskHint: map.currentSurface.taskHint,
+          options: (map.currentSurface.options || []).map((option) => ({
             id: option.id,
             label: compactText(option.label, 100),
             risk: option.risk,
@@ -6539,34 +7282,36 @@
         } : null
       });
       const requestStartedAt = performance.now();
-      const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/next-action`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        signal: request.controller.signal,
-        body: JSON.stringify({
-          sessionId: agent.sessionId,
-          clientTurnId: turnId,
-          observationId,
-          observationSnapshot,
-          userIntent: userIntentText(),
-          userMessage,
-          traveler: traveler(),
-	          approvalState: {
-	            skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
-	            paymentApproved: false
-	          },
-	          actionHistory: agent.actionHistory.slice(-12),
-          // Best-effort context for the backend verifier — it independently judges
-          // whether the last action actually worked from the fresh screenshot/DOM
-          // rather than trusting this, so it doesn't need to be a strict schema.
-	          lastActionResult: agent.lastActionResult || agent.actionHistory[agent.actionHistory.length - 1] || null,
-          page: {
-            ...compactPageMap(map),
-            screenshotDataUrl
-          }
-        })
-      });
-      if (!response.ok) throw new Error(`agent returned ${response.status}`);
+      const canonicalPage = compactPageMap(map);
+      const observationPayload = {
+        sessionId: agent.sessionId,
+        clientTurnId: turnId,
+        observationId,
+        observationSnapshot,
+        userIntent: userIntentText(),
+        userMessage,
+        traveler: traveler(),
+	      approvalState: {
+	        skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
+	        paymentApproved: false
+	      },
+	      actionHistory: agent.actionHistory.slice(-12),
+        // Best-effort context for the backend verifier — it independently judges
+        // whether the last action actually worked from fresh browser evidence.
+	      lastActionResult: agent.lastActionResult || agent.actionHistory[agent.actionHistory.length - 1] || null,
+        page: {
+          ...canonicalPage,
+          screenshotId,
+          screenshotAnnotations: screenshotAnnotations.map((annotation) => ({
+            visualRef: annotation.visualRef || "",
+            controlId: annotation.controlId || "",
+            decisionGroupId: annotation.decisionGroupId || "",
+            box: annotation.box || null
+          }))
+        }
+      };
+      const transport = await postObservationWithSizeRecovery(apiBase, observationPayload, request.controller.signal);
+      const response = transport.response;
       const decision = await response.json();
       if (!agent.sessionId || !decision.sessionId || decision.sessionId !== agent.sessionId) {
         throw new Error("backend did not preserve the active durable checkout session");
@@ -6585,6 +7330,13 @@
         return null;
       }
       const requestUploadMs = Math.round(performance.now() - requestStartedAt);
+      logFlow("backend.request.transport", {
+        turnId,
+        observationId,
+        screenshotId,
+        observationBytes: transport.bytes,
+        transportMode: transport.transportMode
+      });
       agent.lastBackendDebug = decision.debug || null;
       const backendLatency = decision.debug?.latency || {};
       const modelUsage = decision.debug?.modelUsage || {};
@@ -6664,7 +7416,19 @@
         });
         return null;
       }
+      if (error?.code === "OBSERVATION_TOO_LARGE" && error.retryable === true) {
+        logFlow("backend.observation_too_large_retry", {
+          turnId,
+          observationId,
+          code: error.code,
+          reason: error.message
+        });
+        agent.loopRerunQueued = true;
+        setAgentActivity("Rebuilding page observation", "The browser payload was oversized; retrying with the compact transport.");
+        return null;
+      }
       const contextInvalidated = /extension context invalidated|context invalidated|receiving end does not exist/i.test(error.message || "");
+      const backendFailure = error?.code === "BACKEND_INTERNAL_ERROR" || /^HTTP_5\d\d$/.test(error?.code || "");
       const decision = {
         source: "system",
         action: "stop",
@@ -6672,11 +7436,15 @@
         value: "",
         message: contextInvalidated
           ? "Chrome invalidated the extension context after reload. Refresh this checkout tab, then start the agent again."
+          : backendFailure
+            ? `Agent backend error: ${error.message}. No browser action was dispatched.`
           : `AI agent unavailable: ${error.message}. I stopped because AI-only mode is enabled.`,
         needsApproval: true,
         risk: "uncertain",
         reason: contextInvalidated
           ? "Extension lifecycle error: this page is still running the old content script after extension reload."
+          : backendFailure
+            ? "The backend failed while processing the current observation; this is separate from AI service availability."
           : "AI-only mode: backend/OpenAI must provide the next action."
       };
       logAgentEvent("agent_decision", {
@@ -6696,7 +7464,7 @@
         message: decision.message,
         reason: decision.reason
       });
-      logFlow(contextInvalidated ? "extension.context_invalidated" : "backend.error", { turnId, error: error.message, decision });
+      logFlow(contextInvalidated ? "extension.context_invalidated" : backendFailure ? "backend.processing_error" : "backend.error", { turnId, error: error.message, code: error.code || "", decision });
       return decision;
     } finally {
       if (agent.activePlannerRequest === request) agent.activePlannerRequest = null;
@@ -6755,8 +7523,13 @@
     addAgentMessage("assistant", `Clicking: ${label}.`);
     await showAgentThought(element, "Exit", `Act: click ${label}`, "Checking whether the page advances.");
     flashElement(element);
-    scrollElementWithinNearestContainer(element, { behavior: "smooth" });
-    await sleep(250);
+    pushActionLedger({
+      actionId: options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
+      observationId: options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
+      stage: "dispatched",
+      action: governedDecision,
+      targetFingerprint: targetFingerprint(element, governedDecision)
+    });
     userLikeClick(element);
     await waitForUiSettle(700);
     await sleep(delay);
@@ -6946,44 +7719,46 @@
       const targetBefore = resolveDecisionTarget(decision, map)
         || elementById(decision.targetId || decision.targetSnapshot?.id || "");
       const beforeScrollY = Math.round(window.scrollY);
-      const scrollResult = scrollElementWithinNearestContainer(targetBefore, { amount, behavior: "smooth" });
+      const scrollStrategy = decision.expectedOutcome?.scrollStrategy === "nearest_container"
+        ? "nearest_container"
+        : "target_center";
+      const scrollResult = scrollElementWithinNearestContainer(targetBefore, {
+        amount,
+        behavior: "smooth",
+        strategy: scrollStrategy,
+        authority: "governed_executor"
+      });
       recordAction("scroll", {
         amount,
         controlId: decision.controlId || "",
         targetId: decision.targetId || "",
         containerId: scrollResult.containerId || "",
         containerType: scrollResult.containerType || "",
+        strategy: scrollResult.strategy || scrollStrategy,
         ok: scrollResult.ok
       });
-      await waitForUiSettle(600);
+      const scrollSettle = targetBefore && scrollResult.ok
+        ? await waitForScrollSettle(targetBefore, { container: scrollResult.container })
+        : { settled: false, timedOut: false, durationMs: 0, targetInViewport: false };
       const afterScrollY = Math.round(window.scrollY);
       const containerAfter = scrollResult.containerType === "element"
         ? Number(scrollResult.container?.scrollTop || 0)
         : afterScrollY;
-      const recoveredMap = rememberPagePlan(buildPageMap());
-      const recoveredControl = decision.controlId
-        ? (recoveredMap.controls || []).find((control) => control.controlId === decision.controlId)
-        : null;
-      const targetInView = Boolean(recoveredControl && recoveredControl.visualRegion?.inViewport !== false);
       const moved = Boolean(scrollResult.moved || afterScrollY !== beforeScrollY || containerAfter !== scrollResult.before);
-      const code = !targetBefore || !recoveredControl
-        ? "TARGET_DISAPPEARED"
-        : targetInView
-          ? "TARGET_IN_VIEW"
-          : "TARGET_STILL_OUT_OF_VIEW";
+      const code = targetBefore
+        ? "SCROLL_DISPATCHED_AWAITING_FRESH_OBSERVATION"
+        : "TARGET_DISAPPEARED";
       await pushVerificationLedger(
         actionId,
         actionObservationId,
         decision,
         decision.expectedOutcome || { type: "viewport_scrolled" },
         {
-          ok: Boolean(targetBefore && recoveredControl && targetInView && (moved || scrollResult.ok)),
+          ok: false,
           code,
           message: code === "TARGET_DISAPPEARED"
-            ? "The canonical recovery target disappeared and cannot be rebound."
-            : targetInView
-            ? "Viewport recovery completed and the pending canonical control can be rebound."
-            : "The canonical control remains outside the viewport after governed scrolling.",
+            ? "The canonical recovery target disappeared before scrolling could be dispatched."
+            : "Scroll was dispatched. A fresh browser observation must confirm the target exists and is in the viewport before the pending action can resume.",
           evidence: {
             beforeScrollY,
             afterScrollY,
@@ -6991,19 +7766,32 @@
             containerType: scrollResult.containerType || "",
             containerBefore: scrollResult.before ?? null,
             containerAfter,
+            scrollStrategy: scrollResult.strategy || scrollStrategy,
+            moved,
+            scrollSettled: scrollSettle.settled,
+            scrollSettleTimedOut: scrollSettle.timedOut,
+            scrollSettleDurationMs: scrollSettle.durationMs,
             controlId: decision.controlId || "",
             targetFoundBefore: Boolean(targetBefore),
-            targetFoundAfter: Boolean(recoveredControl),
-            targetInView
+            requiresFreshObservation: true
           }
         }
       );
-      await continueAfterAction(350);
+      await continueAfterAction(0);
       return;
     }
 
     if (decision.action === "keypress") {
-      const key = /escape/i.test(decision.keys || decision.value || "") ? "Escape" : /enter/i.test(decision.keys || decision.value || "") ? "Enter" : "";
+      const requestedKey = String(decision.keys || decision.value || "");
+      const key = /escape/i.test(requestedKey)
+        ? "Escape"
+        : /enter/i.test(requestedKey)
+          ? "Enter"
+          : /arrowdown/i.test(requestedKey)
+            ? "ArrowDown"
+            : /arrowup/i.test(requestedKey)
+              ? "ArrowUp"
+              : "";
       if (!key) {
         agent.awaiting = "manual";
         agent.running = false;
@@ -7011,9 +7799,46 @@
         renderSidebar("agent");
         return;
       }
-      dispatchKey(document.activeElement || document.body, key);
-      recordAction("keypress", { key });
+      const target = resolveDecisionTarget(decision, map);
+      if (!target || isPaymentField(target)) {
+        await rejectMechanicalAction(actionId, actionObservationId, decision, {
+          code: "CANONICAL_ACTUATOR_UNAVAILABLE",
+          message: "The governed keyboard strategy has no safe live target."
+        });
+        return;
+      }
+      const validation = validateResolvedTarget(decision, target, map);
+      if (!validation.ok) {
+        await rejectMechanicalAction(actionId, actionObservationId, decision, {
+          code: validation.code,
+          message: "The governed keyboard target failed live validation.",
+          expected: validation.expected,
+          live: validation.live
+        }, target);
+        return;
+      }
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "target_resolved",
+        action: decision,
+        targetFingerprint: targetFingerprint(target, decision)
+      });
+      target.focus?.({ preventScroll: true });
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "dispatched",
+        action: decision,
+        targetFingerprint: targetFingerprint(target, decision)
+      });
+      dispatchKey(target, key);
+      recordAction("keypress", { key, targetId: decision.targetId || "" });
       await waitForUiSettle(500);
+      const afterMap = rememberPagePlan(buildPageMap());
+      const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
+      const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+      await pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
       await continueAfterAction(350);
       return;
     }
@@ -7037,10 +7862,10 @@
       const x = Number(decision.x);
       const y = Number(decision.y);
       if (decision.x == null || decision.y == null || !Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) {
-        agent.awaiting = "manual";
-        agent.running = false;
-        addAgentMessage("assistant", "The AI gave an invalid click coordinate, so I stopped and rescanned.");
-        renderSidebar("agent");
+        await rejectMechanicalAction(actionId, actionObservationId, decision, {
+          code: "INVALID_CLICK_COORDINATE",
+          message: "The governed coordinate is outside the current viewport."
+        });
         return;
       }
       const hit = document.elementFromPoint(x, y);
@@ -7054,14 +7879,6 @@
       }
       const coordinateValidation = validateVisualCoordinateTarget(decision, target, map);
       if (!coordinateValidation.ok) {
-        pushActionLedger({
-          actionId,
-          observationId: actionObservationId,
-          stage: "rejected",
-          action: decision,
-          targetFingerprint: targetFingerprint(target, decision),
-          result: { ok: false, code: coordinateValidation.code, expected: coordinateValidation.expected, live: coordinateValidation.live }
-        });
         logFlow("target.validation_failed", {
           actionId,
           observationId: actionObservationId,
@@ -7069,7 +7886,12 @@
           expected: coordinateValidation.expected,
           live: coordinateValidation.live
         });
-        await continueAfterAction(150);
+        await rejectMechanicalAction(actionId, actionObservationId, decision, {
+          code: coordinateValidation.code,
+          message: "The governed visual region failed live validation.",
+          expected: coordinateValidation.expected,
+          live: coordinateValidation.live
+        }, target);
         return;
       }
       const targetLabel = decision.targetLabel || decision.value || buttonText(target) || labelText(target);
@@ -7091,6 +7913,13 @@
       });
       showAgentCursor(target, targetLabel || "click point");
       flashElement(target);
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "dispatched",
+        action: decision,
+        targetFingerprint: targetFingerprint(target, decision)
+      });
       clickViewportPoint(Math.round(x), Math.round(y));
       recordAction("click_xy", { x: Math.round(x), y: Math.round(y), label: targetLabel });
       await waitForUiSettle(700);
@@ -7160,7 +7989,7 @@
       });
       const resolvedTargetId = elementId(target);
       const button = map.buttons.find((item) => item.id === decision.targetId || item.id === resolvedTargetId);
-      const surfaceEntry = activeSurfaceEntryForElement(map, target);
+      const surfaceEntry = currentSurfaceEntryForElement(map, target);
       const targetText = labelText(target) || target.innerText || button?.label || "";
       if (surfaceEntry?.risk === "paid") {
         agent.awaiting = "extras";
@@ -7195,12 +8024,20 @@
         });
         return;
       }
-      const surfaceWasActive = Boolean(map.activeSurface?.type && map.activeSurface.type !== "page");
+      const surfaceWasActive = Boolean(map.currentSurface?.type && map.currentSurface.type !== "page");
       const beforeOverlay = surfaceWasActive ? activeOverlayElements()[0] : null;
       const beforeOverlaySignature = beforeOverlay ? overlaySignature(beforeOverlay) : "";
       const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
       showAgentCursor(target, button?.label || "clicking");
       flashElement(target);
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "dispatched",
+        action: decision,
+        targetFingerprint: targetFingerprint(target, decision)
+      });
+      rememberCanonicalSelectionCommitment(target, decision);
       userLikeClick(target);
       if (surfaceWasActive) {
         const progress = await waitForOverlayProgress(beforeOverlay, beforeOverlaySignature, 2200);
@@ -7300,6 +8137,13 @@
           }
         }, freshMap);
       };
+      pushActionLedger({
+        actionId,
+        observationId: actionObservationId,
+        stage: "dispatched",
+        action: decision,
+        targetFingerprint: targetFingerprint(target, decision)
+      });
       const result = await setFieldValue(target, governedValue, {
         fieldType: decision.action,
         resolveLiveElement
@@ -7308,6 +8152,8 @@
         await rejectMechanicalAction(actionId, actionObservationId, decision, {
           code: "FIELD_VALUE_NOT_VERIFIED",
           message: `The ${decision.action} operation did not retain the governed value.`,
+          dispatched: true,
+          targetResolved: true,
           details: result
         }, target);
         return;
@@ -7670,7 +8516,7 @@
       agent.pageMap = rememberPagePlan(buildPageMap());
       observationBuildMs += performance.now() - observationStartedAt;
       await showAgentThought(
-        document.activeElement || document.body,
+        null,
         "Observe",
         "Backend planner",
         "Reading the current page and sending it to the backend before taking any checkout action.",
@@ -7691,27 +8537,11 @@
         buttons: stableMap.buttons?.length || 0
       });
       if (stableMap.graphIntegrity && !stableMap.graphIntegrity.ok) {
-        const reason = `Control graph invalid: ${(stableMap.graphIntegrity.conflicts || []).length} incompatible ownership conflict(s).`;
-        logFlow("control.graph_invalid", {
-          reason,
+        logFlow("control.graph_conflicts_diagnostic", {
+          actionableConflictCount: Number(stableMap.graphIntegrity.actionableConflictCount || 0),
+          diagnosticConflictCount: Number(stableMap.graphIntegrity.diagnosticConflictCount || 0),
           conflicts: (stableMap.graphIntegrity.conflicts || []).slice(0, 8)
         });
-        await showAgentThought(
-          document.activeElement || document.body,
-          "Observe",
-          "Control graph invalid",
-          "I stopped before asking the AI because the same visible control has conflicting ownership in this observation.",
-          900
-        );
-        const decision = {
-          source: "system",
-          action: "ask_user",
-          message: reason,
-          reason,
-          needsUser: true
-        };
-        await executeAgentDecision(decision, stableMap);
-        return;
       }
 
       const userMessage = agent.pendingUserMessage;
@@ -8423,17 +9253,36 @@
         } : null
       }),
       createObservationControlRegistry,
+      compactPageMap,
+      compactSurfaceReference,
+      observationTransportBytes,
+      smallerObservationTransport,
+      uploadObservationScreenshot,
+      postObservationWithSizeRecovery,
+      prepareScreenshotAnnotations,
+      mapObservationSnapshot,
       materialObservationSignature,
       observationHashForMap,
       meaningfulActionBox,
       liveTargetSnapshot,
       validateResolvedTarget,
+      validateVisualCoordinateTarget,
       resolveDecisionTarget,
+      normalizeVisualRegionContract,
+      visualRegionContractsMatch,
       nearestEffectiveScrollContainer,
       scrollElementWithinNearestContainer,
+      waitForScrollSettle,
+      showAgentCursor,
+      rememberCanonicalSelectionCommitment,
       userLikeClick,
+      clickViewportPoint,
+      dispatchKey,
       setFieldValue,
+      expectedOutcomeForDecision,
       verifyExpectedOutcome,
+      transitionFeedbackForMaps,
+      rememberActionExecutionResult,
       withOverlayProgressEvidence
     });
     return;

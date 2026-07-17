@@ -173,7 +173,7 @@ function requirementsFromPageState(pageState) {
       type: gate.type === "payment" || gate.type === "final_purchase" ? "payment" : "legal_acceptance",
       label: gate.label,
       status: gate.status,
-      required: gate.status !== "satisfied",
+      required: !["satisfied", "waived_by_policy"].includes(gate.status),
       risk: gate.risk,
       evidence: gate.evidence,
       confidence: gate.confidence,

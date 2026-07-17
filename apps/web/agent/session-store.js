@@ -219,7 +219,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     const duplicate = db.prepare(`
       SELECT action_id, status FROM governed_actions
       WHERE transaction_id = ? AND observation_id = ? AND signature = ?
-        AND status IN ('allowed', 'dispatched', 'executed', 'verified')
+        AND status IN ('allowed', 'approved', 'dispatched', 'observed', 'verified')
       ORDER BY created_at DESC LIMIT 1
     `).get(transactionId, observationId, signature);
     if (duplicate) {
@@ -230,7 +230,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       INSERT INTO governed_actions(
         action_id, transaction_id, turn_id, observation_id, observation_hash,
         signature, status, action_json, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 'allowed', ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)
     `).run(action.id, transactionId, turnId, observationId, observationHash, signature, json(action, {}), at, at);
     return { ok: true, actionId: action.id, signature };
   }
@@ -241,6 +241,18 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       UPDATE governed_actions SET status = ?, result_json = ?, updated_at = ?
       WHERE action_id = ?
     `).run(String(status || "reported"), result == null ? null : json(result, {}), nowIso(), actionId);
+    return outcome.changes > 0;
+  }
+
+  function advanceGovernedAction(actionId, fromStatuses, status, result = null) {
+    if (!actionId) return false;
+    const allowed = [...new Set((Array.isArray(fromStatuses) ? fromStatuses : [fromStatuses]).filter(Boolean).map(String))];
+    if (!allowed.length) return false;
+    const placeholders = allowed.map(() => "?").join(", ");
+    const outcome = db.prepare(`
+      UPDATE governed_actions SET status = ?, result_json = ?, updated_at = ?
+      WHERE action_id = ? AND status IN (${placeholders})
+    `).run(String(status || "reported"), result == null ? null : json(result, {}), nowIso(), actionId, ...allowed);
     return outcome.changes > 0;
   }
 
@@ -274,15 +286,10 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       "TARGET_OBSERVATION_DRIFT"
     ]);
     if (staleCodes.has(code)) return null;
-    const attempted = result.executed === true || new Set([
-      "CANONICAL_ACTUATOR_UNAVAILABLE",
-      "ACTION_OPERATION_ACTUATOR_MISMATCH",
-      "TARGET_NOT_ACTIONABLE",
-      "TARGET_COVERED"
-    ]).has(code);
+    const attempted = result.dispatched === true || result.executed === true;
     if (!attempted) return null;
     const action = actionAttemptFromResult(result);
-    if (!["click", "type", "select", "click_xy"].includes(action.type)) return null;
+    if (!["click", "type", "select", "click_xy", "keypress"].includes(action.type)) return null;
     const signature = actuatorSignature(action);
     return {
       at: String(result.at || nowIso()),
@@ -313,14 +320,9 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     }));
     const actionId = String(result.actionId || result.action?.id || "");
     if (actionId) {
-      const status = result.verified === true
-        ? "verified"
-        : result.verified === false || result.ok === false
-            ? "failed"
-            : result.executed === true
-              ? "executed"
-              : "reported";
-      updateGovernedAction(actionId, status, result);
+      const dispatched = result.dispatched === true || result.executed === true;
+      const status = dispatched ? "dispatched" : "rejected_before_dispatch";
+      advanceGovernedAction(actionId, ["allowed", "approved", "dispatched"], status, result);
       recordActionEvent(updated.id, {
         actionId,
         observationId: String(result.observationId || ""),
@@ -346,10 +348,6 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       json(event, {}),
       at
     );
-    const stage = String(event.stage || "");
-    if (event.actionId && ["dispatched", "executed", "verified", "failed", "rejected", "blocked"].includes(stage)) {
-      updateGovernedAction(event.actionId, stage === "rejected" || stage === "blocked" ? "failed" : stage, event.result || event);
-    }
     return Number(outcome.lastInsertRowid);
   }
 
@@ -392,6 +390,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     getCurrentObservation,
     isCurrentObservation,
     reserveGovernedAction,
+    advanceGovernedAction,
     updateGovernedAction,
     getGovernedAction,
     recordActionResult,
@@ -417,6 +416,7 @@ const DEFAULT_METHODS = [
   "getCurrentObservation",
   "isCurrentObservation",
   "reserveGovernedAction",
+  "advanceGovernedAction",
   "updateGovernedAction",
   "getGovernedAction",
   "recordActionResult",

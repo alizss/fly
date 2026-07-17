@@ -1,4 +1,7 @@
 const { normalizeAction } = require("../../../packages/shared/agent-actions");
+const { conflictedControlIds } = require("./control-alias-index");
+const { currentSurface: authoritativeCurrentSurface } = require("./surface-contract");
+const { deriveActionSemantics } = require("./action-semantics");
 
 const COMPOUND_ACTIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
 
@@ -225,14 +228,30 @@ function canonicalField(page = {}, field = {}) {
   return (page.controls || []).find((control) => control.controlId === controlId) || null;
 }
 
-function activeSurface(page = {}) {
-  return [page.currentSurface, page.activeSurface]
-    .find((surface) => surface?.type && surface.type !== "page") || null;
+function profileFieldsForPage(page = {}) {
+  if (Array.isArray(page.fields) && page.fields.length) return page.fields;
+  return (page.controls || []).flatMap((control) => {
+    const field = String(control.field || control.semantic || "");
+    if (!PROFILE_FIELDS.has(field)) return [];
+    const state = control.state || control.controlState || {};
+    return [{
+      ...control,
+      id: control.stateElementId || control.controlId,
+      field,
+      controlState: state,
+      hasValue: Boolean(control.hasValue || state.valuePresent || state.checked || state.selected),
+      value: state.valuePresent ? "[filled]" : ""
+    }];
+  });
+}
+
+function ownedCurrentSurface(page = {}) {
+  return authoritativeCurrentSurface(page);
 }
 
 function planScope(observation = {}) {
   const page = observation.page || {};
-  const surface = activeSurface(page);
+  const surface = ownedCurrentSurface(page);
   return {
     stage: String(page.step || "unknown"),
     surfaceId: String(surface?.id || ""),
@@ -244,7 +263,7 @@ function planScope(observation = {}) {
 function fieldDescriptors(observation = {}, traveler = {}) {
   const page = observation.page || {};
   const ordinals = new Map();
-  return (page.fields || []).flatMap((field) => {
+  return profileFieldsForPage(page).flatMap((field) => {
     const semanticType = String(field.field || "");
     if (!PROFILE_FIELDS.has(semanticType)) return [];
     const ordinal = ordinals.get(semanticType) || 0;
@@ -263,14 +282,18 @@ function fieldDescriptors(observation = {}, traveler = {}) {
         : new RegExp(`\\b${wanted.replace(/[^a-z0-9]+/g, "\\s*")}\\b`, "i").test(candidate);
       if (!matches) return [];
     }
-    const nativeSelect = String(field.kind || "").toLowerCase() === "select";
-    const customCombobox = !nativeSelect && ["combobox", "listbox"].includes(String(control.role || field.role || "").toLowerCase());
     const choiceTerms = profileChoiceTerms(semanticType, value, traveler);
     const currentNormalizedValue = String(control.state?.normalizedValue || "");
     const desiredNormalizedValue = normalizedProfileValue(semanticType, value);
     const valueSatisfied = choiceLike
       ? Boolean(control.selected || control.state?.checked || control.state?.selected)
       : Boolean(desiredNormalizedValue && currentNormalizedValue === desiredNormalizedValue);
+    const validationIssues = scopedValidationIssues(page, {
+      controlIds: new Set([control.controlId].filter(Boolean)),
+      sectionIds: new Set([control.sectionId].filter(Boolean)),
+      sectionTypes: new Set([String(control.sectionType || field.sectionType || "").toLowerCase()].filter(Boolean)),
+      surfaceIds: new Set([control.surfaceId].filter(Boolean))
+    });
     return [{
       key: `${semanticType}:${ordinal}`,
       semanticType,
@@ -279,12 +302,14 @@ function fieldDescriptors(observation = {}, traveler = {}) {
       field,
       control,
       value,
-      actionType: choiceLike ? "click" : nativeSelect ? "select" : customCombobox ? "click" : "type",
-      choiceMode: customCombobox ? "custom_combobox" : nativeSelect ? "native_select" : choiceLike ? "choice" : "field",
+      observedRole: control.role || field.role || "",
+      observedCapabilities: control.capabilities || [],
+      choiceLike,
       choiceTerms,
       currentNormalizedValue,
       desiredNormalizedValue,
-      hasValue: valueSatisfied
+      hasValue: valueSatisfied && validationIssues.length === 0,
+      validationIssues
     }];
   }).sort((a, b) => {
     const ai = PROFILE_FIELD_ORDER.indexOf(a.semanticType);
@@ -295,7 +320,7 @@ function fieldDescriptors(observation = {}, traveler = {}) {
 
 function profileStageReadiness(observation = {}, traveler = {}) {
   const page = observation.page || {};
-  const fields = Array.isArray(page.fields) ? page.fields : [];
+  const fields = profileFieldsForPage(page);
   const descriptors = fieldDescriptors(observation, traveler);
   const step = String(page.step || "").toLowerCase();
   const hasProfileControls = fields.some((field) => PROFILE_FIELDS.has(String(field.field || "")));
@@ -322,9 +347,11 @@ function profileStageReadiness(observation = {}, traveler = {}) {
     return [{
       semanticType: String(field.field || "unknown"),
       controlId: String(field.controlId || ""),
-      label: String(field.label || field.field || "Required traveler field")
+      label: String(field.label || field.field || "Required traveler field"),
+      valueAvailable: Boolean(profileValue(String(field.field || ""), traveler, field))
     }];
   });
+  const missingUserData = unresolvedRequired.filter((item) => item.valueAvailable === false);
   const profileControlIds = new Set(fields
     .filter((field) => PROFILE_FIELDS.has(String(field.field || "")))
     .map((field) => String(field.controlId || ""))
@@ -341,25 +368,33 @@ function profileStageReadiness(observation = {}, traveler = {}) {
     shouldOwn: profileStage && unresolvedKnown.length > 0,
     unresolvedKnown,
     unresolvedRequired,
+    missingUserData,
     visibleErrors
   };
 }
 
 function atomFromDescriptor(planId, descriptor, observationId) {
+  const desiredNormalizedValue = descriptor.desiredNormalizedValue || normalizedProfileValue(descriptor.semanticType, descriptor.value);
   return {
     atomId: `${planId}:${descriptor.key}`,
     kind: "profile_field",
     semanticType: descriptor.semanticType,
     ordinal: descriptor.ordinal,
     label: descriptor.label,
+    semanticGoal: {
+      semanticType: descriptor.semanticType,
+      desiredValue: desiredNormalizedValue || descriptor.value || ""
+    },
+    postcondition: {
+      type: "normalized_value_changed",
+      expectedValue: desiredNormalizedValue || descriptor.value || ""
+    },
     valueRef: `profile://${descriptor.semanticType}`,
-    actionType: descriptor.actionType || "",
-    choiceMode: descriptor.choiceMode || "field",
-    phase: descriptor.choiceMode === "custom_combobox" ? "open" : "apply",
     expectedValue: descriptor.value,
-    expectedNormalizedValue: descriptor.desiredNormalizedValue || normalizedProfileValue(descriptor.semanticType, descriptor.value),
-    ownerControlId: descriptor.control?.controlId || "",
+    expectedNormalizedValue: desiredNormalizedValue,
     choiceTerms: descriptor.choiceTerms || [],
+    strategyHistory: [],
+    maxStrategyAttempts: 4,
     status: descriptor.hasValue ? "satisfied" : "pending",
     attempts: 0,
     lastActionId: "",
@@ -396,7 +431,13 @@ function clonePlan(plan = {}) {
   return {
     ...plan,
     scope: { ...(plan.scope || {}) },
-    atoms: (plan.atoms || []).map((atom) => ({ ...atom }))
+    atoms: (plan.atoms || []).map((atom) => ({
+      ...atom,
+      semanticGoal: { ...(atom.semanticGoal || {}) },
+      postcondition: { ...(atom.postcondition || {}) },
+      choiceTerms: [...(atom.choiceTerms || [])],
+      strategyHistory: [...(atom.strategyHistory || [])]
+    }))
   };
 }
 
@@ -412,15 +453,6 @@ function suspendPlan(plan, reason, observationId = "") {
     lastObservedObservationId: observationId || plan.lastObservedObservationId || "",
     updatedAt: new Date().toISOString()
   };
-}
-
-function recoveryOperationForAtom(atom = {}) {
-  if (atom.choiceMode === "custom_combobox" && atom.phase === "open") return "open";
-  if (atom.choiceMode === "custom_combobox" && atom.phase === "choose") return "choose";
-  if (atom.choiceMode === "choice") return "choose";
-  if (atom.actionType === "select") return "select";
-  if (atom.actionType === "type") return "type";
-  return "activate";
 }
 
 function validationIssueMessage(issue = {}) {
@@ -439,44 +471,29 @@ function scopedValidationIssues(page = {}, scope = {}) {
   return issues.filter((issue) => {
     if (!issue || !validationIssueMessage(issue)) return false;
     if (typeof issue === "string" || issue.stageWide === true) return true;
-    if (issue.controlId && controlIds.has(String(issue.controlId))) return true;
-    if (issue.sectionId && sectionIds.has(String(issue.sectionId))) return true;
-    if (issue.sectionType && sectionTypes.has(String(issue.sectionType).toLowerCase())) return true;
-    if (issue.surfaceId && surfaceIds.has(String(issue.surfaceId))) return true;
+    // Ownership is hierarchical and exclusive: a control-owned issue cannot
+    // fall through and invalidate every control in its containing section.
+    if (issue.controlId) return controlIds.has(String(issue.controlId));
+    if (issue.sectionId) return sectionIds.has(String(issue.sectionId));
+    if (issue.sectionType) return sectionTypes.has(String(issue.sectionType).toLowerCase());
+    if (issue.surfaceId) return surfaceIds.has(String(issue.surfaceId));
     return false;
   });
 }
 
-function recoveryExpectedOutcome(context = {}, observation = {}) {
-  if (context.operation === "open") {
-    const surface = activeSurface(observation.page || {});
-    return {
-      type: "options_surface_appeared",
-      controlId: context.controlId || "",
-      previousSurfaceId: surface?.id || "",
-      previousExpanded: Boolean(context.state?.expanded)
-    };
-  }
-  if (context.expectedNormalizedValue) {
-    return {
-      type: "normalized_value_changed",
-      controlId: context.controlId || "",
-      expectedNormalizedValue: context.expectedNormalizedValue
-    };
-  }
-  return {
-    type: context.capability?.expectedOutcome || "observable_change",
-    controlId: context.controlId || ""
-  };
-}
-
 function blockedObligationForPlan(plan = {}, observation = {}, traveler = {}, existing = null, blocker = {}) {
-  const context = skillRecoveryContext(plan, observation, traveler);
+  const context = skillRecoveryContext(plan, observation, traveler, { blockedObligation: existing });
   if (!context?.atomId || !context?.controlId) return null;
   const sameOwner = existing
     && existing.owner?.skillPlanId === context.planId
     && existing.owner?.atomId === context.atomId;
   const at = new Date().toISOString();
+  const attemptedStrategyIds = new Set([
+    ...(sameOwner ? existing.attempts || [] : []),
+    ...(sameOwner ? existing.rejectedBeforeDispatch || [] : [])
+  ].map((attempt) => attempt.strategyId).filter(Boolean));
+  const supportedStrategies = (context.supportedStrategies || [])
+    .filter((strategy) => !attemptedStrategyIds.has(strategy.strategyId));
   return {
     obligationId: sameOwner ? existing.obligationId : `blocked:${context.planId}:${context.atomId}`,
     kind: "skill_atom_recovery",
@@ -489,29 +506,30 @@ function blockedObligationForPlan(plan = {}, observation = {}, traveler = {}, ex
     },
     scope: {
       stage: String(observation.page?.step || ""),
-      surfaceId: String(observation.page?.currentSurface?.id || observation.page?.activeSurface?.id || "")
+      surfaceId: String(authoritativeCurrentSurface(observation.page || {}).id || "")
     },
     control: {
       controlId: context.controlId,
       label: context.controlLabel || context.label,
       semanticType: context.semanticType
     },
-    operation: context.operation,
+    semanticGoal: { ...(context.semanticGoal || {}) },
+    postcondition: { ...(context.expectedPostcondition || {}) },
+    supportedStrategies: supportedStrategies.map((strategy) => ({ ...strategy })),
     blocker: {
       code: String(blocker.code || existing?.blocker?.code || "ACTUATOR_UNPROVEN"),
       message: String(blocker.message || plan.suspendedReason || context.suspendedReason || "The owned atomic operation has no proven actuator.").slice(0, 500),
       observationId: String(observation.observationId || ""),
       at
     },
-    recoveryExpectedOutcome: recoveryExpectedOutcome(context, observation),
     expectedResult: {
-      type: context.expectedNormalizedValue ? "normalized_value_changed" : recoveryExpectedOutcome(context, observation).type,
+      type: "normalized_value_changed",
       controlId: context.controlId,
       expectedNormalizedValue: context.expectedNormalizedValue || ""
     },
     attempts: sameOwner ? [...(existing.attempts || [])] : [],
     proofs: sameOwner ? [...(existing.proofs || [])] : [],
-    status: sameOwner && !["resolved", "handed_off", "failed"].includes(existing.status) ? existing.status : "blocked",
+    status: "blocked",
     finalStatus: sameOwner ? existing.finalStatus || "pending" : "pending",
     finalReason: sameOwner ? existing.finalReason || "" : "",
     createdAt: sameOwner ? existing.createdAt || at : at,
@@ -524,23 +542,25 @@ function expectedSuccessCode(expectedType = "") {
     options_surface_appeared: "OPTIONS_SURFACE_APPEARED",
     normalized_value_changed: "NORMALIZED_VALUE_VERIFIED",
     field_value_changed: "FIELD_VALUE_VERIFIED",
-    control_selected: "CONTROL_SELECTED"
+    control_selected: "CONTROL_SELECTED",
+    semantic_progress: "SEMANTIC_PROGRESS_OBSERVED"
   }[expectedType] || "";
 }
 
 function exactRecoveryProof(obligation = {}, result = {}) {
-  const expected = obligation.recoveryExpectedOutcome || {};
+  const pending = obligation.pendingAction || {};
+  const expected = pending.expectedOutcome || {};
   const resultExpected = result.expectedOutcome || {};
   const outcomeCode = resultCode(result);
   const expectedCode = expectedSuccessCode(expected.type);
   const resultControlId = String(result.controlId || result.action?.controlId || result.targetSnapshot?.controlId || resultExpected.controlId || "");
   return Boolean(
-    result.executed === true
+    browserDispatched(result)
     && result.verified === true
     && result.skillPlanId === obligation.owner?.skillPlanId
     && result.skillAtomId === obligation.owner?.atomId
-    && resultControlId === obligation.control?.controlId
-    && result.operation === obligation.operation
+    && resultControlId === pending.controlId
+    && result.operation === pending.operation
     && resultExpected.type === expected.type
     && String(resultExpected.controlId || "") === String(expected.controlId || "")
     && (!expectedCode || outcomeCode === expectedCode)
@@ -548,42 +568,69 @@ function exactRecoveryProof(obligation = {}, result = {}) {
 }
 
 function recordBlockedObligationAttempt(obligation = {}, action = {}) {
-  if (!obligation?.obligationId || !["click", "type", "select", "click_xy"].includes(action.type)) return obligation;
+  if (!obligation?.obligationId || !["click", "type", "select", "click_xy", "keypress"].includes(action.type)) return obligation;
   const at = new Date().toISOString();
   return {
     ...obligation,
-    status: "recovering",
-    attempts: [
-      ...(obligation.attempts || []),
-      {
-        attempt: (obligation.attempts || []).length + 1,
-        actionId: action.id || "",
-        observationId: action.observationId || "",
-        controlId: action.controlId || "",
-        targetId: action.targetId || "",
-        visualRegion: action.visualRegion || null,
-        operation: action.operation || "",
-        actionType: action.type || "",
-        expectedOutcome: action.expectedOutcome || null,
-        status: "dispatched",
-        resultCode: "",
-        at
-      }
-    ],
+    status: "governed",
+    pendingAction: {
+      strategyId: actionSignatureForStrategy(action),
+      actionId: action.id || "",
+      observationId: action.observationId || "",
+      controlId: action.controlId || "",
+      targetId: action.targetId || "",
+      visualRegion: action.visualRegion || null,
+      operation: action.operation || "",
+      actionType: action.type || "",
+      value: action.value || "",
+      keys: action.keys || "",
+      expectedOutcome: action.expectedOutcome || null,
+      status: "governed",
+      at
+    },
     updatedAt: at
   };
 }
 
+function actionSignatureForStrategy(action = {}) {
+  const targetIdentity = ["type", "select", "keypress"].includes(action.type || "")
+    ? ""
+    : action.targetId || "";
+  return [
+    action.type || "",
+    action.operation || "",
+    targetIdentity,
+    action.value || "",
+    action.keys || "",
+    action.visualRegion ? `${action.visualRegion.x || 0},${action.visualRegion.y || 0}` : ""
+  ].join(":");
+}
+
 function reconcileBlockedObligationResult(obligation = {}, result = {}) {
   if (!obligation?.obligationId || !result?.actionId) return { obligation, exact: false };
-  const attempts = (obligation.attempts || []).map((attempt) => attempt.actionId === result.actionId
-    ? {
-        ...attempt,
-        status: result.verified === true ? "verified" : result.executed === true ? "failed" : "rejected",
-        resultCode: resultCode(result) || "",
-        completedAt: new Date().toISOString()
-      }
-    : attempt);
+  const pending = obligation.pendingAction?.actionId === result.actionId ? obligation.pendingAction : null;
+  if (!pending) return { obligation, exact: false };
+  const dispatched = browserDispatched(result);
+  const completedAt = new Date().toISOString();
+  const attempts = dispatched ? [
+    ...(obligation.attempts || []),
+    {
+      ...pending,
+      attempt: (obligation.attempts || []).length + 1,
+      status: result.verified === true ? "verified" : "failed",
+      resultCode: resultCode(result) || "",
+      completedAt
+    }
+  ] : [...(obligation.attempts || [])];
+  const rejectedBeforeDispatch = dispatched ? [...(obligation.rejectedBeforeDispatch || [])] : [
+    ...(obligation.rejectedBeforeDispatch || []),
+    {
+      ...pending,
+      status: "rejected_before_dispatch",
+      resultCode: resultCode(result) || "",
+      completedAt
+    }
+  ];
   const exact = exactRecoveryProof(obligation, result);
   const proof = exact ? {
     skillPlanId: result.skillPlanId,
@@ -601,8 +648,10 @@ function reconcileBlockedObligationResult(obligation = {}, result = {}) {
     obligation: {
       ...obligation,
       attempts,
+      rejectedBeforeDispatch,
+      pendingAction: null,
       proofs: proof ? [...(obligation.proofs || []), proof] : [...(obligation.proofs || [])],
-      status: exact ? "recovered" : obligation.status,
+      status: exact ? "progressed" : "blocked",
       updatedAt: new Date().toISOString()
     }
   };
@@ -615,25 +664,20 @@ const REISSUABLE_STALE_RESULT_CODES = new Set([
   "TARGET_OBSERVATION_DRIFT"
 ]);
 
-const RETRYABLE_MECHANICAL_RESULT_CODES = new Set([
-  "ACTIVE_SURFACE_NOT_CHANGED",
-  "OPTIONS_SURFACE_NOT_APPEARED",
-  "CANONICAL_ACTUATOR_UNAVAILABLE",
-  "ACTION_OPERATION_ACTUATOR_MISMATCH",
-  "TARGET_NOT_ACTIONABLE",
-  "TARGET_COVERED"
-]);
-
 function resultCode(result = {}) {
   return String(result?.outcome?.code || result?.code || result?.result?.code || "");
 }
 
 function shouldReissueUnexecutedAtom(result = {}) {
-  return result.executed === false && REISSUABLE_STALE_RESULT_CODES.has(resultCode(result));
+  return !browserDispatched(result) && REISSUABLE_STALE_RESULT_CODES.has(resultCode(result));
+}
+
+function browserDispatched(result = {}) {
+  return result.dispatched === true || result.executed === true || result.verified === true;
 }
 
 function reconcileDispatchedAtom(plan, lastActionResult = {}, observationId = "") {
-  const dispatched = plan.atoms.find((atom) => atom.status === "dispatched");
+  const dispatched = plan.atoms.find((atom) => ["proposed", "governed", "dispatched"].includes(atom.status));
   if (!dispatched) return { plan, ambiguous: false };
   const resultActionId = String(lastActionResult?.actionId || "");
   if (!resultActionId || resultActionId !== dispatched.lastActionId) {
@@ -642,8 +686,24 @@ function reconcileDispatchedAtom(plan, lastActionResult = {}, observationId = ""
       ambiguous: true
     };
   }
-  if (shouldReissueUnexecutedAtom(lastActionResult)) {
-    dispatched.status = "pending";
+  if (!browserDispatched(lastActionResult)) {
+    const stale = shouldReissueUnexecutedAtom(lastActionResult);
+    if (!stale && dispatched.lastStrategyId) {
+      dispatched.strategyHistory = [
+        ...(dispatched.strategyHistory || []),
+        {
+          strategyId: dispatched.lastStrategyId,
+          operation: dispatched.lastOperation || "",
+          targetId: dispatched.lastTargetId || "",
+          value: dispatched.lastStrategyValue || "",
+          keys: dispatched.lastStrategyKeys || "",
+          status: "rejected_before_dispatch",
+          resultCode: resultCode(lastActionResult) || "ACTION_NOT_DISPATCHED",
+          observationId,
+          at: new Date().toISOString()
+        }
+      ].slice(-20);
+    }
     dispatched.lastRejectedActionId = dispatched.lastActionId;
     dispatched.lastRejectedObservationId = dispatched.lastObservationId || "";
     dispatched.lastRejectionCode = resultCode(lastActionResult);
@@ -651,12 +711,32 @@ function reconcileDispatchedAtom(plan, lastActionResult = {}, observationId = ""
     dispatched.lastControlId = "";
     dispatched.lastObservationId = "";
     dispatched.reissueCount = Number(dispatched.reissueCount || 0) + 1;
-    return { plan, ambiguous: false, reissue: true };
+    if (stale) {
+      dispatched.status = "pending";
+      return { plan, ambiguous: false, reissue: true, rejectedBeforeDispatch: true };
+    }
+    dispatched.status = "pending";
+    return { plan, ambiguous: false, rejectedBeforeDispatch: true, recovery: true };
   }
+  dispatched.attempts = Number(dispatched.attempts || 0) + 1;
+  dispatched.lastDispatchedActionId = dispatched.lastActionId;
+  dispatched.strategyHistory = [
+    ...(dispatched.strategyHistory || []),
+    {
+      strategyId: dispatched.lastStrategyId || "",
+      operation: dispatched.lastOperation || lastActionResult.operation || "",
+      targetId: dispatched.lastTargetId || "",
+      value: dispatched.lastStrategyValue || "",
+      keys: dispatched.lastStrategyKeys || "",
+      status: lastActionResult.verified === true ? "verified_intermediate" : "failed",
+      resultCode: resultCode(lastActionResult) || (lastActionResult.verified === true ? "VERIFIED" : "OUTCOME_NOT_VERIFIED"),
+      observationId,
+      at: new Date().toISOString()
+    }
+  ].slice(-20);
   if (lastActionResult.verified !== true) {
     const code = resultCode(lastActionResult) || "OUTCOME_NOT_VERIFIED";
-    const maxAttempts = Math.max(1, Number(dispatched.operationActuatorCount || 1));
-    if (RETRYABLE_MECHANICAL_RESULT_CODES.has(code) && Number(dispatched.attempts || 0) < Math.min(3, maxAttempts)) {
+    if (Number(dispatched.attempts || 0) < Number(dispatched.maxStrategyAttempts || 4)) {
       dispatched.status = "pending";
       dispatched.lastFailedActionId = dispatched.lastActionId;
       dispatched.lastFailureCode = code;
@@ -671,20 +751,13 @@ function reconcileDispatchedAtom(plan, lastActionResult = {}, observationId = ""
       ambiguous: true
     };
   }
-  if (dispatched.choiceMode === "custom_combobox" && dispatched.phase === "open") {
-    dispatched.status = "pending";
-    dispatched.phase = "choose";
-    dispatched.openedObservationId = observationId;
-    dispatched.lastActionId = "";
-    dispatched.lastControlId = "";
-    dispatched.lastObservationId = "";
-    return { plan, ambiguous: false };
-  }
-  dispatched.status = "complete";
-  dispatched.completedObservationId = observationId;
-  dispatched.completionSource = "verified_action_result";
+  dispatched.status = "pending";
+  dispatched.lastProgressObservationId = observationId;
+  dispatched.lastActionId = "";
+  dispatched.lastControlId = "";
+  dispatched.lastObservationId = "";
   dispatched.verificationCode = String(lastActionResult?.outcome?.code || "VERIFIED");
-  return { plan, ambiguous: false };
+  return { plan, ambiguous: false, progress: true };
 }
 
 function extendPlan(plan, observation = {}, traveler = {}) {
@@ -699,37 +772,76 @@ function extendPlan(plan, observation = {}, traveler = {}) {
 }
 
 function descriptorForAtom(atom, observation = {}, traveler = {}) {
-  const customChoice = descriptorForCustomChoiceAtom(atom, observation);
-  if (customChoice) return customChoice;
-  return fieldDescriptors(observation, traveler)
+  const base = fieldDescriptors(observation, traveler)
     .find((descriptor) => descriptor.semanticType === atom.semanticType && descriptor.ordinal === atom.ordinal) || null;
+  const customChoice = descriptorForCustomChoiceAtom(atom, observation);
+  if (customChoice) {
+    return {
+      ...customChoice,
+      goalControl: base?.control || null,
+      goalControlId: base?.control?.controlId || ""
+    };
+  }
+  return base;
 }
 
-function skillRecoveryContext(plan = {}, observation = {}, traveler = {}) {
+function skillRecoveryContext(plan = {}, observation = {}, traveler = {}, state = {}) {
   const atom = currentProfileSkillAtom(plan);
   if (!atom) return null;
   const descriptor = descriptorForAtom(atom, observation, traveler);
-  const control = descriptor?.control || (observation.page?.controls || [])
-    .find((item) => item.controlId === atom.ownerControlId) || null;
-  const operation = recoveryOperationForAtom(atom);
-  const capability = control?.operations?.[operation] || null;
-  const recovery = control?.recovery?.[operation] || null;
+  const control = descriptor?.goalControl || descriptor?.control || null;
+  const supportedStrategies = strategyCandidatesForAtom(atom, descriptor, observation);
+  const page = observation.page || {};
+  const accessibilityCandidates = (page.accessibility?.controls || [])
+    .filter((item) => item.controlId === control?.controlId)
+    .slice(0, 12);
+  const browserHitTargets = supportedStrategies.flatMap((strategy) => strategy.targetIds || []).slice(0, 12);
+  const screenshotTargets = (page.screenshotAnnotations || [])
+    .filter((item) => item.controlId === control?.controlId)
+    .slice(0, 12);
+  const failedDispatchedAttempts = (state.failures || [])
+    .filter((failure) => failure.controlId === control?.controlId)
+    .slice(-12);
   return {
+    observationId: observation.observationId || "",
     planId: plan.planId || "",
     skillType: plan.skillType || "",
     atomId: atom.atomId || "",
     semanticType: atom.semanticType || "",
     ordinal: Number(atom.ordinal || 0),
     label: atom.label || descriptor?.label || atom.semanticType || "",
-    phase: atom.phase || "apply",
-    operation,
+    semanticGoal: atom.semanticGoal || {
+      semanticType: atom.semanticType || "",
+      desiredValue: atom.expectedNormalizedValue || atom.expectedValue || ""
+    },
+    desiredValue: atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue || atom.expectedValue || "",
+    currentValue: control?.state?.normalizedValue || control?.state?.valueText || "",
+    expectedPostcondition: atom.postcondition || {
+      type: "normalized_value_changed",
+      expectedValue: atom.expectedNormalizedValue || ""
+    },
     expectedNormalizedValue: atom.expectedNormalizedValue || "",
     choiceTerms: atom.choiceTerms || [],
-    controlId: control?.controlId || atom.ownerControlId || "",
+    controlId: control?.controlId || "",
     controlLabel: control?.label || descriptor?.label || "",
     state: control?.state || null,
-    capability,
-    recovery,
+    canonicalControl: control,
+    observedCapabilities: control?.capabilities || [],
+    supportedStrategies,
+    accessibilityCandidates,
+    browserHitTargets,
+    screenshotTargets,
+    boundedVisualRegions: supportedStrategies.flatMap((strategy) => strategy.visualRegion ? [strategy.visualRegion] : []),
+    currentSurface: ownedCurrentSurface(page),
+    foregroundOwnership: page.foreground || null,
+    failedDispatchedAttempts,
+    validationErrors: scopedValidationIssues(page, {
+      controlIds: new Set([control?.controlId].filter(Boolean)),
+      sectionIds: new Set([control?.sectionId].filter(Boolean)),
+      sectionTypes: new Set([String(control?.sectionType || "").toLowerCase()].filter(Boolean)),
+      surfaceIds: new Set([control?.surfaceId].filter(Boolean))
+    }),
+    risk: control?.risk || "safe",
     hasValue: Boolean(descriptor?.hasValue),
     suspendedReason: plan.suspendedReason || ""
   };
@@ -742,9 +854,32 @@ function resumeSuspendedSkillPlan(rawPlan, observation = {}, traveler = {}, last
   const atom = currentProfileSkillAtom(plan);
   if (!atom || !context) return { plan, resumable: false, context };
 
-  const exactRecoveryResult = Boolean(blockedObligation && exactRecoveryProof(blockedObligation, lastActionResult));
-  if (exactRecoveryResult && atom.choiceMode === "custom_combobox" && atom.phase === "open" && activeSurface(observation.page || {})) {
-    atom.phase = "choose";
+  const exactRecoveryResult = Boolean(
+    blockedObligation
+    && (
+      exactRecoveryProof(blockedObligation, lastActionResult)
+      || (blockedObligation.proofs || []).some((proof) => proof.actionId === lastActionResult.actionId)
+    )
+  );
+  if (exactRecoveryResult) {
+    const recoveredAttempt = (blockedObligation.attempts || []).findLast?.((attempt) => attempt.actionId === lastActionResult.actionId)
+      || (blockedObligation.attempts || []).slice(-1)[0];
+    if (recoveredAttempt?.strategyId) {
+      atom.strategyHistory = [
+        ...(atom.strategyHistory || []),
+        {
+          strategyId: recoveredAttempt.strategyId,
+          operation: recoveredAttempt.operation || "",
+          targetId: recoveredAttempt.targetId || "",
+          value: recoveredAttempt.value || "",
+          keys: recoveredAttempt.keys || "",
+          status: "verified_intermediate",
+          resultCode: recoveredAttempt.resultCode || resultCode(lastActionResult),
+          observationId: observation.observationId || "",
+          at: new Date().toISOString()
+        }
+      ].slice(-20);
+    }
     atom.status = "pending";
     atom.recoveredObservationId = observation.observationId || "";
   } else {
@@ -769,8 +904,7 @@ function scopeInterruption(plan, observation = {}) {
   const plannedSurface = plan.scope?.surfaceId || "";
   const currentSurface = current.surfaceId || "";
   const activeCustomChoice = (plan.atoms || []).find((atom) => atom.status === "pending"
-    && atom.choiceMode === "custom_combobox"
-    && atom.phase === "choose");
+    && (atom.choiceTerms || []).length);
   if (activeCustomChoice && currentSurface) return null;
   if (plannedSurface !== currentSurface) {
     return {
@@ -801,10 +935,10 @@ function choiceOptionScore(control = {}, terms = [], surface = {}) {
 }
 
 function descriptorForCustomChoiceAtom(atom, observation = {}) {
-  if (atom.choiceMode !== "custom_combobox" || atom.phase !== "choose") return null;
+  if (!(atom.choiceTerms || []).length) return null;
   const page = observation.page || {};
-  const surface = activeSurface(page);
-  if (!surface) return null;
+  const surface = ownedCurrentSurface(page);
+  if (!surface || surface.type === "page") return null;
   const ranked = (page.controls || [])
     .map((control) => ({ control, score: choiceOptionScore(control, atom.choiceTerms || [], surface) }))
     .filter((item) => item.score > 0)
@@ -818,96 +952,357 @@ function descriptorForCustomChoiceAtom(atom, observation = {}) {
     field: { kind: control.kind || control.role || "option" },
     control,
     value: atom.expectedValue,
-    actionType: "click",
-    choiceMode: "custom_combobox_option",
+    observedOption: true,
     choiceTerms: atom.choiceTerms || [],
     hasValue: Boolean(control.selected || control.state?.selected || control.state?.checked)
   };
 }
 
-function atomicActionForAtom(plan, atom, descriptor, observation = {}) {
+function strategyKey(strategy = {}) {
+  const targetIdentity = ["type", "select", "keypress"].includes(strategy.actionType || "")
+    ? ""
+    : strategy.targetId || "";
+  return [
+    strategy.actionType || "",
+    strategy.operation || "",
+    targetIdentity,
+    strategy.value || "",
+    strategy.keys || "",
+    strategy.visualRegion ? `${strategy.visualRegion.x || 0},${strategy.visualRegion.y || 0}` : ""
+  ].join(":");
+}
+
+function strategyWasTried(atom = {}, strategy = {}) {
+  const id = strategy.strategyId || strategyKey(strategy);
+  return (atom.strategyHistory || []).some((attempt) => attempt.strategyId === id);
+}
+
+function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}) {
+  const targetControl = descriptor.control || {};
+  const goalControl = descriptor.goalControl || targetControl;
+  const surface = ownedCurrentSurface(observation.page || {});
+  if (strategy.operation === "open") {
+    return {
+      type: "options_surface_appeared",
+      controlId: targetControl.controlId,
+      previousSurfaceId: surface?.id || "",
+      previousExpanded: Boolean(targetControl.state?.expanded)
+    };
+  }
+  if (strategy.operation === "type" && targetControl.role === "editable_combobox") {
+    return {
+      type: "semantic_progress",
+      controlId: goalControl.controlId,
+      expectedNormalizedValue: atom.expectedNormalizedValue || "",
+      previousSurfaceId: surface?.id || "",
+      previousValue: goalControl.state?.normalizedValue || ""
+    };
+  }
+  if (strategy.operation === "keyboard") {
+    return {
+      type: "semantic_progress",
+      controlId: goalControl.controlId,
+      expectedNormalizedValue: atom.expectedNormalizedValue || "",
+      previousSurfaceId: surface?.id || "",
+      previousValue: goalControl.state?.normalizedValue || ""
+    };
+  }
+  if (descriptor.observedOption && strategy.operation === "choose") {
+    return {
+      type: "normalized_value_changed",
+      controlId: goalControl.controlId,
+      expectedNormalizedValue: atom.expectedNormalizedValue || "",
+      surfaceId: surface?.id || "",
+      surfaceType: surface?.type || "",
+      surfaceLabel: surface?.label || "",
+      requireSurfaceDismissed: Boolean(surface)
+    };
+  }
+  if (["type", "select"].includes(strategy.operation)) {
+    return {
+      type: atom.postcondition?.type || "normalized_value_changed",
+      controlId: goalControl.controlId,
+      expectedValue: strategy.value || descriptor.value || "",
+      expectedNormalizedValue: atom.postcondition?.expectedValue || atom.expectedNormalizedValue || ""
+    };
+  }
+  if (strategy.operation === "choose") {
+    return {
+      type: descriptor.choiceLike ? "control_selected" : "normalized_value_changed",
+      controlId: goalControl.controlId,
+      expectedNormalizedValue: atom.expectedNormalizedValue || ""
+    };
+  }
+  return {
+    type: "semantic_progress",
+    controlId: goalControl.controlId,
+    expectedNormalizedValue: atom.expectedNormalizedValue || "",
+    previousSurfaceId: surface?.id || "",
+    previousValue: goalControl.state?.normalizedValue || ""
+  };
+}
+
+function strategyCandidatesForAtom(atom = {}, descriptor = null, observation = {}) {
+  if (!descriptor?.control) return [];
   const control = descriptor.control;
-  const nativeSelect = descriptor.field.kind === "select"
-    || control.kind === "select"
-    || control.role === "listbox" && control.state?.native === true;
+  const operations = control.operations || {};
+  const candidates = [];
+  const nextTarget = (capability) => (capability?.actuatorIds || [])
+    .find((targetId) => !(atom.strategyHistory || []).some((attempt) => (
+      attempt.operation === capability.operation && attempt.targetId === targetId
+    ))) || capability?.actuatorId || "";
+  const add = (strategy) => {
+    if (!strategy.targetId && !strategy.visualRegion) return;
+    const candidate = {
+      ...strategy,
+      controlId: control.controlId,
+      targetIds: strategy.targetId ? [strategy.targetId] : [],
+      strategyId: strategyKey({ ...strategy, controlId: control.controlId })
+    };
+    candidate.expectedOutcome = expectedOutcomeForStrategy(atom, descriptor, candidate, observation);
+    if (!strategyWasTried(atom, candidate)) candidates.push(candidate);
+  };
+
+  if (descriptor.observedOption && operations.choose) {
+    add({ operation: "choose", actionType: "click", targetId: nextTarget(operations.choose), value: "", keys: "" });
+    return candidates;
+  }
+  if (operations.select) {
+    add({ operation: "select", actionType: "select", targetId: nextTarget(operations.select), value: descriptor.value || atom.expectedValue || "", keys: "" });
+  }
+  if (operations.type) {
+    const queryValues = control.role === "editable_combobox"
+      ? [...new Set([
+          descriptor.value || atom.expectedValue || "",
+          ...(atom.choiceTerms || []).filter((term) => /[a-z]/i.test(term))
+        ].filter(Boolean))].slice(0, 3)
+      : [descriptor.value || atom.expectedValue || ""];
+    for (const value of queryValues) {
+      add({ operation: "type", actionType: "type", targetId: nextTarget(operations.type), value, keys: "" });
+    }
+  }
+  if (operations.open && control.state?.expanded !== true) {
+    add({ operation: "open", actionType: "click", targetId: nextTarget(operations.open), value: "", keys: "" });
+  }
+  if (operations.choose) {
+    add({ operation: "choose", actionType: "click", targetId: nextTarget(operations.choose), value: "", keys: "" });
+  }
+  if (operations.keyboard) {
+    add({
+      operation: "keyboard",
+      actionType: "keypress",
+      targetId: nextTarget(operations.keyboard),
+      value: "",
+      keys: control.state?.expanded === true ? "Enter" : "ArrowDown"
+    });
+  }
+  if (operations.activate) {
+    add({ operation: "activate", actionType: "click", targetId: nextTarget(operations.activate), value: "", keys: "" });
+  }
+  for (const [operation, recovery] of Object.entries(control.recovery || {})) {
+    if (!recovery?.requiresVisualConfirmation) continue;
+    for (const region of recovery.regions || []) {
+      add({
+        operation,
+        actionType: "click_xy",
+        targetId: "",
+        value: "",
+        keys: "",
+        visualRegion: region,
+        requiresAI: true
+      });
+    }
+  }
+  return candidates.slice(0, 12);
+}
+
+function atomicActionForStrategy(plan, atom, descriptor, strategy, observation = {}) {
+  const control = descriptor.control;
   const actionId = uid("act_skill");
-  const openingCustomChoice = atom.choiceMode === "custom_combobox" && atom.phase === "open";
-  const choosingCustomOption = atom.choiceMode === "custom_combobox" && atom.phase === "choose";
-  const operation = openingCustomChoice
-    ? "open"
-    : choosingCustomOption
-      ? "choose"
-      : actionTypeForOperation(atom, descriptor, nativeSelect);
-  const actionType = openingCustomChoice || choosingCustomOption
-    ? "click"
-    : atom.actionType || descriptor.actionType || (nativeSelect ? "select" : "type");
-  const surface = activeSurface(observation.page || {});
-  const capability = control.operations?.[operation] || null;
-  if (!capability?.actuatorIds?.length) return null;
-  const actuatorIds = capability?.actuatorIds || [];
-  const actuatorIndex = Math.min(Number(atom.attempts || 0), Math.max(0, actuatorIds.length - 1));
-  const operationTargetId = actuatorIds[actuatorIndex] || capability?.actuatorId || "";
-  atom.operationActuatorCount = actuatorIds.length;
-  const expectedOutcome = openingCustomChoice
-    ? {
-        type: "options_surface_appeared",
-        controlId: control.controlId,
-        previousSurfaceId: surface?.id || "",
-        previousExpanded: Boolean(control.state?.expanded)
-      }
-    : choosingCustomOption && surface
-      ? {
-          type: "normalized_value_changed",
-          controlId: atom.ownerControlId || "",
-          expectedNormalizedValue: atom.expectedNormalizedValue || "",
-          surfaceId: surface.id || "",
-          surfaceType: surface.type || "",
-          surfaceLabel: surface.label || "",
-          requireSurfaceDismissed: true
-        }
-      : actionType === "type" || actionType === "select"
-        ? {
-            type: "field_value_changed",
-            controlId: control.controlId,
-            expectedValue: descriptor.value,
-            expectedNormalizedValue: atom.expectedNormalizedValue || normalizedProfileValue(atom.semanticType, descriptor.value)
-          }
-        : operation === "choose"
-          ? {
-              type: "control_selected",
-              controlId: control.controlId,
-              expectedNormalizedValue: atom.expectedNormalizedValue || ""
-            }
-          : null;
+  atom.lastStrategyId = strategy.strategyId;
+  atom.lastOperation = strategy.operation;
+  atom.lastTargetId = strategy.targetId || "";
+  atom.lastStrategyValue = strategy.value || "";
+  atom.lastStrategyKeys = strategy.keys || "";
   return normalizeAction({
     id: actionId,
     observationId: observation.observationId || "",
     observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-    type: actionType,
-    intent: openingCustomChoice ? "open_profile_choice" : "satisfy_field",
-    operation,
+    type: strategy.actionType,
+    intent: "satisfy_semantic_goal",
+    operation: strategy.operation,
     skillPlanId: plan.planId,
     skillAtomId: atom.atomId,
     controlId: control.controlId,
     decisionGroupId: control.decisionGroupId || "",
-    targetId: operationTargetId || control.controlId,
+    targetId: strategy.targetId || "",
     targetLabel: control.label || descriptor.label || descriptor.semanticType,
-    value: actionType === "click" ? "" : descriptor.value,
+    value: strategy.value || "",
+    keys: strategy.keys || "",
+    x: strategy.visualRegion?.centerX,
+    y: strategy.visualRegion?.centerY,
+    visualRegion: strategy.visualRegion || null,
     risk: "safe",
     requiresApproval: false,
-    reason: openingCustomChoice
-      ? `Atomic ${plan.skillType} step: open ${descriptor.semanticType}.`
-      : `Atomic ${plan.skillType} step: fill ${descriptor.semanticType}.`,
+    reason: `Atomic ${plan.skillType} strategy ${strategy.operation} for semantic goal ${atom.semanticType}=${atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue}.`,
     targetSnapshot: null,
-    expectedOutcome
+    expectedOutcome: strategy.expectedOutcome
   });
 }
 
-function actionTypeForOperation(atom, descriptor, nativeSelect) {
-  if (atom.choiceMode === "choice" || descriptor.choiceMode === "choice") return "choose";
-  if (atom.actionType === "type" || descriptor.actionType === "type") return "type";
-  if (atom.actionType === "select" || descriptor.actionType === "select" || nativeSelect) return "select";
-  return "activate";
+function semanticGoalAtom(goal = {}, attemptedCandidateIds = []) {
+  return {
+    atomId: goal.goalId || "",
+    semanticType: goal.semanticType || "",
+    ordinal: Number(goal.ordinal || 0),
+    label: goal.label || goal.semanticType || "",
+    semanticGoal: {
+      semanticType: goal.semanticType || "",
+      desiredValue: goal.desiredValue || ""
+    },
+    postcondition: {
+      type: goal.postcondition?.type || "normalized_value_changed",
+      expectedValue: goal.postcondition?.expectedValue || goal.desiredValue || ""
+    },
+    expectedValue: goal.inputValue || goal.desiredValue || "",
+    expectedNormalizedValue: goal.desiredValue || "",
+    choiceTerms: [...(goal.choiceTerms || [])],
+    strategyHistory: (attemptedCandidateIds || []).map((strategyId) => ({
+      strategyId,
+      status: "attempted"
+    }))
+  };
+}
+
+function descriptorForSemanticGoal(goal = {}, observation = {}, traveler = {}) {
+  const atom = semanticGoalAtom(goal);
+  return descriptorForAtom(atom, observation, traveler);
+}
+
+function deriveProfileGoal(observation = {}, traveler = {}, currentGoal = null) {
+  const observationId = String(observation.observationId || "");
+  if (currentGoal?.goalId) {
+    const descriptor = descriptorForSemanticGoal(currentGoal, observation, traveler);
+    if (descriptor && !descriptor.hasValue) {
+      const goalControl = descriptor.goalControl || descriptor.control || {};
+      return {
+        ...currentGoal,
+        controlId: goalControl.controlId || currentGoal.controlId || "",
+        currentValue: goalControl.state?.normalizedValue || "",
+        observationId,
+        updatedAt: new Date().toISOString()
+      };
+    }
+    // A satisfied current goal is not a terminal signal. Fall through and
+    // select the next unresolved semantic descriptor from this observation.
+  }
+
+  const descriptor = fieldDescriptors(observation, traveler)
+    .find((item) => !item.hasValue);
+  if (!descriptor) return null;
+  const desiredValue = descriptor.desiredNormalizedValue
+    || normalizedProfileValue(descriptor.semanticType, descriptor.value)
+    || descriptor.value;
+  return {
+    goalId: `profile:${descriptor.semanticType}:${descriptor.ordinal}`,
+    kind: "profile_field",
+    semanticType: descriptor.semanticType,
+    ordinal: descriptor.ordinal,
+    label: descriptor.label || descriptor.semanticType,
+    desiredValue,
+    inputValue: descriptor.value,
+    choiceTerms: [...(descriptor.choiceTerms || [])],
+    controlId: descriptor.control?.controlId || "",
+    currentValue: descriptor.currentNormalizedValue || "",
+    postcondition: {
+      type: "normalized_value_changed",
+      expectedValue: desiredValue
+    },
+    observationId,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function profileGoalSatisfied(goal = {}, observation = {}, traveler = {}) {
+  if (!goal?.goalId) return false;
+  const descriptor = descriptorForSemanticGoal(goal, observation, traveler);
+  if (!descriptor?.hasValue) return false;
+  const goalControl = descriptor.goalControl || descriptor.control || {};
+  const issues = scopedValidationIssues(observation.page || {}, {
+    controlIds: new Set([goalControl.controlId, goal.controlId].filter(Boolean)),
+    sectionIds: new Set([goalControl.sectionId].filter(Boolean)),
+    sectionTypes: new Set([String(goalControl.sectionType || "").toLowerCase()].filter(Boolean)),
+    surfaceIds: new Set([goalControl.surfaceId].filter(Boolean))
+  });
+  return issues.length === 0;
+}
+
+function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, attemptedCandidateIds = []) {
+  if (!goal?.goalId) return [];
+  const descriptor = descriptorForSemanticGoal(goal, observation, traveler);
+  if (!descriptor || descriptor.hasValue) return [];
+  if (conflictedControlIds(observation.page || {}).has(descriptor.control?.controlId)) return [];
+  const atom = semanticGoalAtom(goal, attemptedCandidateIds);
+  return strategyCandidatesForAtom(atom, descriptor, observation).map((strategy) => ({
+    candidateId: strategy.strategyId,
+    goalId: goal.goalId,
+    type: strategy.actionType,
+    operation: strategy.operation,
+    ...deriveActionSemantics({
+      control: descriptor.control,
+      operation: strategy.operation,
+      type: strategy.actionType,
+      goal,
+      expectedOutcome: strategy.expectedOutcome
+    }),
+    controlId: strategy.controlId,
+    targetId: strategy.targetId || "",
+    value: strategy.value || "",
+    keys: strategy.keys || "",
+    visualRegion: strategy.visualRegion || null,
+    expectedOutcome: strategy.expectedOutcome,
+    requiresJudgment: Boolean(strategy.requiresAI),
+    summary: [
+      strategy.operation,
+      strategy.value ? `value=${strategy.value}` : "",
+      strategy.keys ? `keys=${strategy.keys}` : "",
+      strategy.visualRegion ? `visual=${strategy.visualRegion.source || "bounded-region"}` : ""
+    ].filter(Boolean).join(" ")
+  }));
+}
+
+function actionForProfileCandidate(goal = {}, candidate = {}, observation = {}) {
+  return normalizeAction({
+    id: uid("act_goal"),
+    observationId: observation.observationId || "",
+    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+    type: candidate.type,
+    intent: "satisfy_semantic_goal",
+    operation: candidate.operation,
+    goalId: goal.goalId,
+    candidateId: candidate.candidateId,
+    controlId: candidate.controlId || goal.controlId || "",
+    targetId: candidate.targetId || "",
+    targetLabel: goal.label || goal.semanticType || "",
+    value: candidate.value || "",
+    keys: candidate.keys || "",
+    x: candidate.visualRegion
+      ? Number(candidate.visualRegion.centerX ?? (Number(candidate.visualRegion.x || 0) + Number(candidate.visualRegion.width || 0) / 2))
+      : null,
+    y: candidate.visualRegion
+      ? Number(candidate.visualRegion.centerY ?? (Number(candidate.visualRegion.y || 0) + Number(candidate.visualRegion.height || 0) / 2))
+      : null,
+    visualRegion: candidate.visualRegion || null,
+    expectedOutcome: candidate.expectedOutcome,
+    interactionRole: candidate.interactionRole,
+    semanticEffect: candidate.semanticEffect,
+    expectedEvidence: candidate.expectedEvidence,
+    affordance: candidate.affordance || null,
+    risk: "safe",
+    requiresApproval: false,
+    reason: `Execute candidate ${candidate.candidateId} for ${goal.semanticType}=${goal.desiredValue}.`
+  });
 }
 
 function advanceSkillPlan(rawPlan, observation = {}, traveler = {}, lastActionResult = {}) {
@@ -945,7 +1340,7 @@ function advanceSkillPlan(rawPlan, observation = {}, traveler = {}, lastActionRe
 
   const atom = plan.atoms.find((item) => item.status === "pending");
   if (!atom) {
-    const profileFields = (observation.page?.fields || []).filter((field) => PROFILE_FIELDS.has(String(field.field || "")));
+    const profileFields = profileFieldsForPage(observation.page || {}).filter((field) => PROFILE_FIELDS.has(String(field.field || "")));
     const unresolvedRequired = profileFields.filter((field) => {
       if (!field.required || field.hasValue || field.controlState?.valuePresent) return false;
       if (["title", "gender"].includes(String(field.field || ""))) {
@@ -953,7 +1348,10 @@ function advanceSkillPlan(rawPlan, observation = {}, traveler = {}, lastActionRe
       }
       return true;
     });
-    const planControlIds = new Set((plan.atoms || []).map((item) => item.ownerControlId).filter(Boolean));
+    const planControlIds = new Set(profileFieldsForPage(observation.page || {})
+      .filter((field) => PROFILE_FIELDS.has(String(field.field || "")))
+      .map((field) => field.controlId)
+      .filter(Boolean));
     const visibleErrors = scopedValidationIssues(observation.page || {}, {
       controlIds: planControlIds,
       sectionTypes: new Set(["contact", "passenger", "traveler", "traveller", "document"])
@@ -976,13 +1374,16 @@ function advanceSkillPlan(rawPlan, observation = {}, traveler = {}, lastActionRe
     return { plan, action: null, status: "ambiguous", reason: plan.suspendedReason };
   }
 
-  const action = atomicActionForAtom(plan, atom, descriptor, observation);
-  if (!action) {
-    plan = suspendPlan(plan, `The canonical ${atom.semanticType} control does not publish an executable ${atom.phase === "open" ? "open" : atom.actionType || "activate"} operation.`, observationId);
+  const strategies = strategyCandidatesForAtom(atom, descriptor, observation);
+  if (strategies.length !== 1 || strategies[0]?.requiresAI) {
+    const reason = strategies.length
+      ? `The semantic goal ${atom.semanticType}=${atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue} has multiple grounded strategies and requires bounded strategy selection.`
+      : `The semantic goal ${atom.semanticType}=${atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue} has no untried grounded strategy in the current observation.`;
+    plan = suspendPlan(plan, reason, observationId);
     return { plan, action: null, status: "ambiguous", reason: plan.suspendedReason };
   }
-  atom.status = "dispatched";
-  atom.attempts = Number(atom.attempts || 0) + 1;
+  const action = atomicActionForStrategy(plan, atom, descriptor, strategies[0], observation);
+  atom.status = "proposed";
   atom.lastActionId = action.id;
   atom.lastControlId = descriptor.control.controlId;
   atom.lastObservationId = observationId;
@@ -990,16 +1391,27 @@ function advanceSkillPlan(rawPlan, observation = {}, traveler = {}, lastActionRe
   return { plan, action, atom, status: "action" };
 }
 
+function markSkillActionGoverned(rawPlan, actionId, observationId = "") {
+  const plan = clonePlan(rawPlan);
+  const atom = plan.atoms.find((item) => item.lastActionId === actionId && item.status === "proposed");
+  if (atom) {
+    atom.status = "governed";
+    atom.governedObservationId = observationId || atom.lastObservationId || "";
+  }
+  plan.updatedAt = new Date().toISOString();
+  return plan;
+}
+
 function failSkillAction(rawPlan, actionId, reason, observationId = "") {
   const plan = clonePlan(rawPlan);
-  const atom = plan.atoms.find((item) => item.lastActionId === actionId && item.status === "dispatched");
+  const atom = plan.atoms.find((item) => item.lastActionId === actionId && ["proposed", "governed", "dispatched"].includes(item.status));
   if (atom) atom.status = "blocked";
   return suspendPlan(plan, reason, observationId);
 }
 
 function prepareSkillViewportRecovery(rawPlan, actionId, observationId = "", maxRecoveries = 2) {
   const plan = clonePlan(rawPlan);
-  const atom = plan.atoms.find((item) => item.lastActionId === actionId && item.status === "dispatched");
+  const atom = plan.atoms.find((item) => item.lastActionId === actionId && ["proposed", "governed", "dispatched"].includes(item.status));
   if (!atom) {
     return { plan: suspendPlan(plan, "The recoverable action no longer belongs to an active skill atom.", observationId), recovered: false, exhausted: true };
   }
@@ -1042,15 +1454,8 @@ function expandSkillAction(action, observation = {}, traveler = {}) {
     };
   }
   return {
-    action: normalizeAction({
-      id: action.id,
-      observationId: action.observationId,
-      observationHash: action.observationHash,
-      type: "ask_user",
-      reason: advanced.reason || "No canonical profile-field atom can be executed from the current observation.",
-      risk: "uncertain",
-      requiresApproval: true
-    }),
+    action: null,
+    handoffReason: advanced.reason || "No canonical profile-field atom can be executed from the current observation.",
     expanded: true,
     exhausted: true,
     skill: action.type,
@@ -1069,11 +1474,13 @@ module.exports = {
   currentProfileSkillAtom,
   expandSkillAction,
   failSkillAction,
+  markSkillActionGoverned,
   prepareSkillViewportRecovery,
   profileStageReadiness,
   profileValue,
   resumeSuspendedSkillPlan,
   skillRecoveryContext,
+  strategyCandidatesForAtom,
   blockedObligationForPlan,
   exactRecoveryProof,
   recordBlockedObligationAttempt,
@@ -1081,5 +1488,9 @@ module.exports = {
   scopedValidationIssues,
   validationIssueMessage,
   normalizedPhoneParts,
-  dateValueForField
+  dateValueForField,
+  deriveProfileGoal,
+  profileGoalSatisfied,
+  candidatesForProfileGoal,
+  actionForProfileCandidate
 };

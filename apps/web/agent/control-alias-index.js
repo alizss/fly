@@ -131,6 +131,76 @@ function actionTargetAliases(action = {}) {
   ].map(cleanId).filter((aliasId, index, list) => aliasId && list.indexOf(aliasId) === index);
 }
 
+function graphConflicts(page = {}) {
+  const integrity = page.graphIntegrity || {};
+  const conflicts = [
+    ...(integrity.conflicts || []),
+    ...(integrity.aliasConflicts || [])
+  ];
+  const seen = new Set();
+  return conflicts.filter((conflict) => {
+    const key = JSON.stringify(conflict || {});
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function conflictControlIds(conflict = {}) {
+  return [
+    ...(conflict.controlIds || []),
+    conflict.existing?.controlId,
+    conflict.incoming?.controlId,
+    ...(conflict.owners || []).map((owner) => owner?.controlId)
+  ].map(cleanId).filter((controlId, index, list) => controlId && list.indexOf(controlId) === index);
+}
+
+function conflictAliasIds(conflict = {}) {
+  return [
+    conflict.aliasId,
+    ...(conflict.nodeIds || []),
+    ...(conflict.aliasIds || [])
+  ].map(cleanId).filter((aliasId, index, list) => aliasId && list.indexOf(aliasId) === index);
+}
+
+function conflictTouchesControl(conflict = {}, control = {}) {
+  const controlId = cleanId(control.controlId);
+  if (!controlId) return false;
+  if (conflictControlIds(conflict).includes(controlId)) return true;
+  const aliases = new Set(aliasRecordsForControl(control).map((record) => record.aliasId));
+  return conflictAliasIds(conflict).some((aliasId) => aliases.has(aliasId));
+}
+
+function classifyGraphConflicts(page = {}) {
+  const controls = page.controls || [];
+  const actionable = [];
+  const diagnostic = [];
+  for (const conflict of graphConflicts(page)) {
+    const affectedControlIds = controls
+      .filter((control) => conflictTouchesControl(conflict, control))
+      .map((control) => control.controlId);
+    const classified = { ...conflict, affectedControlIds };
+    if (affectedControlIds.length) actionable.push(classified);
+    else diagnostic.push(classified);
+  }
+  return { actionable, diagnostic };
+}
+
+function conflictedControlIds(page = {}) {
+  return new Set(classifyGraphConflicts(page).actionable.flatMap((conflict) => conflict.affectedControlIds || []));
+}
+
+function selectedActionGraphConflicts(action = {}, page = {}) {
+  const resolution = resolveActionControl(action, page);
+  const selectedControl = resolution.control
+    || (page.controls || []).find((control) => control.controlId === action.controlId)
+    || null;
+  if (!selectedControl) return [];
+  return classifyGraphConflicts(page).actionable.filter((conflict) => (
+    (conflict.affectedControlIds || []).includes(selectedControl.controlId)
+  ));
+}
+
 function resolveActionControl(action = {}, page = {}) {
   const index = buildControlAliasIndex(page);
   const aliasIds = actionTargetAliases(action);
@@ -153,5 +223,12 @@ module.exports = {
   actionTargetAliases,
   aliasRecordsForControl,
   buildControlAliasIndex,
+  classifyGraphConflicts,
+  conflictedControlIds,
+  conflictAliasIds,
+  conflictControlIds,
+  conflictTouchesControl,
+  graphConflicts,
+  selectedActionGraphConflicts,
   resolveActionControl
 };

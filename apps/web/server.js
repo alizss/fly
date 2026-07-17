@@ -7,8 +7,11 @@ const PORT = Number(process.env.PORT || 4173);
 const HOST = process.env.HOST || "127.0.0.1";
 const ROOT = path.resolve(__dirname, "../..");
 const PUBLIC_DIR = path.join(__dirname, "public");
-const DATA_DIR = path.join(ROOT, "work");
-const DB_FILE = path.join(DATA_DIR, "air-travel-wallet-db.json");
+const DATA_DIR = process.env.ATW_DATA_DIR || path.join(ROOT, "work");
+const DB_FILE = process.env.ATW_PROFILE_DB || path.join(DATA_DIR, "air-travel-wallet-db.json");
+const MAX_OBSERVATION_BYTES = 5_500_000;
+const MAX_SCREENSHOT_UPLOAD_BYTES = 12_000_000;
+const screenshotUploads = new Map();
 const KEY = crypto.createHash("sha256").update(process.env.ATW_ENCRYPTION_KEY || "local-dev-key-change-me").digest();
 const AGENT_MODEL = process.env.ATW_AGENT_MODEL || "gpt-4.1-mini";
 const AGENT_RECOVERY_MODEL = process.env.ATW_AGENT_RECOVERY_MODEL || AGENT_MODEL;
@@ -17,6 +20,7 @@ const agentLoop = require("./agent/loop");
 const agentSessionStore = require("./agent/session-store");
 const agentTraceStore = require("./agent/trace-store");
 const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
+const { PAGE_SURFACE_ID, normalizeSurface } = require("./agent/surface-contract");
 
 function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
@@ -66,7 +70,7 @@ function createAgentSession(body = {}) {
     status: "running",
     userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
     travelerIds: [traveler.id || body.travelerId || state.travelerId].filter(Boolean),
-    policySnapshot: {
+    userPolicy: {
       bookingRules: clampText(traveler.booking_rules, 800),
       baggagePreference: clampText(traveler.baggage_preference, 120),
       preferredSeat: clampText(traveler.preferred_seat, 120),
@@ -233,7 +237,9 @@ function ensureDb() {
 
 function readDb() {
   ensureDb();
-  const db = JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
+  const raw = fs.readFileSync(DB_FILE, "utf8");
+  const db = raw.trim() ? JSON.parse(raw) : seedDb();
+  if (!raw.trim()) writeDb(db);
   let changed = false;
   for (const traveler of db.traveler_profiles || []) {
     const defaults = {
@@ -316,17 +322,37 @@ function sendJson(res, status, payload) {
   res.end(body);
 }
 
-function readBody(req) {
+function requestBodyError(code, message, status = 413) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = status;
+  error.retryable = code === "OBSERVATION_TOO_LARGE";
+  return error;
+}
+
+function readBody(req, { maxBytes = 6_000_000, tooLargeCode = "REQUEST_TOO_LARGE" } = {}) {
   return new Promise((resolve, reject) => {
     let body = "";
+    let bytes = 0;
+    let oversized = false;
+    const contentLength = Number(req.headers["content-length"] || 0);
+    if (contentLength > maxBytes) {
+      oversized = true;
+    }
     req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 6_000_000) {
-        reject(new Error("Request body too large"));
-        req.destroy();
+      if (oversized) return;
+      bytes += Buffer.byteLength(chunk);
+      if (bytes > maxBytes) {
+        oversized = true;
+        body = "";
+        return;
       }
+      body += chunk;
     });
     req.on("end", () => {
+      if (oversized) {
+        return reject(requestBodyError(tooLargeCode, `Request body exceeds ${maxBytes} bytes.`));
+      }
       if (!body) return resolve({});
       try {
         resolve(JSON.parse(body));
@@ -335,6 +361,38 @@ function readBody(req) {
       }
     });
   });
+}
+
+function storeScreenshotUpload({ sessionId = "", observationId = "", screenshotDataUrl = "" } = {}) {
+  if (!screenshotDataUrl.startsWith("data:image/")) {
+    throw requestBodyError("SCREENSHOT_INVALID", "Screenshot upload must be a data:image URL.", 400);
+  }
+  const screenshotId = uid("shot");
+  screenshotUploads.set(screenshotId, {
+    screenshotId,
+    sessionId: clampText(sessionId, 120),
+    observationId: clampText(observationId, 120),
+    screenshotDataUrl,
+    createdAt: Date.now()
+  });
+  while (screenshotUploads.size > 40) {
+    screenshotUploads.delete(screenshotUploads.keys().next().value);
+  }
+  return screenshotId;
+}
+
+function screenshotForObservation(page = {}, body = {}) {
+  const screenshotId = clampText(page.screenshotId, 120);
+  if (!screenshotId) return { screenshotId: "", screenshotDataUrl: String(page.screenshotDataUrl || "") };
+  const upload = screenshotUploads.get(screenshotId);
+  if (!upload) throw requestBodyError("SCREENSHOT_REFERENCE_EXPIRED", "Screenshot reference is unknown or expired.", 409);
+  if (upload.sessionId && upload.sessionId !== clampText(body.sessionId, 120)) {
+    throw requestBodyError("SCREENSHOT_SESSION_MISMATCH", "Screenshot reference belongs to another checkout session.", 409);
+  }
+  if (upload.observationId && upload.observationId !== clampText(body.observationId, 120)) {
+    throw requestBodyError("SCREENSHOT_OBSERVATION_MISMATCH", "Screenshot reference belongs to another observation.", 409);
+  }
+  return { screenshotId, screenshotDataUrl: upload.screenshotDataUrl };
 }
 
 function clampText(value, max = 4000) {
@@ -418,8 +476,18 @@ function compactVisualState(state = {}) {
 
 function compactSurface(surface = {}) {
   if (!surface || typeof surface !== "object") {
-    return { type: "page", id: "", label: "", role: "", taskHint: "", box: null, options: [], buttons: [] };
+    return { type: "page", id: "", label: "", role: "", taskHint: "", box: null, memberControlIds: [], memberActuatorIds: [] };
   }
+  const surfaceMembers = [
+    ...(surface.memberControlIds || surface.controlIds || []),
+    ...(surface.options || []).map((item) => item.controlId),
+    ...(surface.buttons || []).map((item) => item.controlId)
+  ];
+  const surfaceActuators = [
+    ...(surface.memberActuatorIds || []),
+    ...(surface.options || []).flatMap((item) => [item.stateElementId, item.preferredActivationElementId]),
+    ...(surface.buttons || []).flatMap((item) => [item.stateElementId, item.preferredActivationElementId])
+  ];
   return {
     type: clampText(surface.type || "page", 40),
     id: clampText(surface.id || "", 80),
@@ -427,51 +495,14 @@ function compactSurface(surface = {}) {
     role: clampText(surface.role || "", 80),
     taskHint: clampText(surface.taskHint || "", 120),
     blocksBackground: Boolean(surface.blocksBackground),
+    parentSurfaceId: clampText(surface.parentSurfaceId, 80),
+    observationId: clampText(surface.observationId, 120),
+    memberControlIds: [...new Set(surfaceMembers.map((id) => clampText(id, 140)).filter(Boolean))],
+    memberActuatorIds: [...new Set(surfaceActuators.map((id) => clampText(id, 80)).filter(Boolean))],
     expectedResolution: clampText(surface.expectedResolution || "", 180),
     foreground: compactVisualState({ foreground: surface.foreground || surface.visualState?.foreground || null })?.foreground || null,
     visualState: compactVisualState(surface.visualState),
-    accessibility: compactAccessibilityNode(surface.accessibility),
-    box: surface.box || null,
-    options: Array.isArray(surface.options)
-      ? surface.options.map((option) => ({
-          id: clampText(option.id, 80),
-          controlId: clampText(option.controlId, 140),
-          visualRef: clampText(option.visualRef, 40),
-          label: clampText(option.label, 220),
-          semantic: clampText(option.semantic, 80),
-          risk: clampText(option.risk, 80),
-          role: clampText(option.role, 80),
-          selected: Boolean(option.selected),
-          controlState: option.controlState || option.state || null,
-          stateElementId: clampText(option.stateElementId, 80),
-          preferredActivationElementId: clampText(option.preferredActivationElementId, 80),
-          actuators: compactActuators(option.actuators),
-          operations: compactControlOperations(option.operations),
-          visualRegion: option.visualRegion || null,
-          accessibility: compactAccessibilityNode(option.accessibility),
-          box: option.box || null
-        })).slice(0, 24)
-      : [],
-    buttons: Array.isArray(surface.buttons)
-      ? surface.buttons.map((button) => ({
-          id: clampText(button.id, 80),
-          controlId: clampText(button.controlId, 140),
-          visualRef: clampText(button.visualRef, 40),
-          label: clampText(button.label, 220),
-          semantic: clampText(button.semantic, 80),
-          risk: clampText(button.risk, 80),
-          role: clampText(button.role, 80),
-          selected: Boolean(button.selected),
-          controlState: button.controlState || button.state || null,
-          stateElementId: clampText(button.stateElementId, 80),
-          preferredActivationElementId: clampText(button.preferredActivationElementId, 80),
-          actuators: compactActuators(button.actuators),
-          operations: compactControlOperations(button.operations),
-          visualRegion: button.visualRegion || null,
-          accessibility: compactAccessibilityNode(button.accessibility),
-          box: button.box || null
-        })).slice(0, 24)
-      : []
+    box: surface.box || null
   };
 }
 
@@ -490,6 +521,12 @@ function compactActuators(actuators = []) {
 function compactControlFields(item = {}) {
   return {
     controlId: clampText(item.controlId, 140),
+    stableKey: clampText(item.stableKey, 240),
+    meaning: clampText(item.meaning, 220),
+    structuredPrice: item.structuredPrice && Number.isFinite(Number(item.structuredPrice.amount)) ? {
+      amount: Number(item.structuredPrice.amount),
+      currency: clampText(item.structuredPrice.currency, 12)
+    } : null,
     visualRef: clampText(item.visualRef, 40),
     decisionGroupId: clampText(item.decisionGroupId, 140),
     controlKind: clampText(item.controlKind || item.kind, 80),
@@ -536,6 +573,10 @@ function compactControlRecovery(recovery = {}) {
             viewportWidth: Number(region.viewportWidth || 0),
             viewportHeight: Number(region.viewportHeight || 0),
             surfaceId: clampText(region.surfaceId, 80),
+            observationId: clampText(region.observationId, 120),
+            controlId: clampText(region.controlId, 140),
+            operation: clampText(region.operation, 40),
+            source: clampText(region.source, 120),
             inViewport: region.inViewport !== false,
             evidence: clampText(region.evidence, 120),
             confidence: Number(region.confidence || 0)
@@ -548,17 +589,25 @@ function compactControlRecovery(recovery = {}) {
 function compactLogicalControl(control = {}) {
   return {
     controlId: clampText(control.controlId, 140),
+    stableKey: clampText(control.stableKey, 240),
+    meaning: clampText(control.meaning, 220),
+    structuredPrice: control.structuredPrice && Number.isFinite(Number(control.structuredPrice.amount)) ? {
+      amount: Number(control.structuredPrice.amount),
+      currency: clampText(control.structuredPrice.currency, 12)
+    } : null,
     visualRef: clampText(control.visualRef, 40),
     decisionGroupId: clampText(control.decisionGroupId, 140),
     label: clampText(control.label, 220),
     accessibleName: clampText(control.accessibleName, 220),
     kind: clampText(control.kind, 80),
+    field: clampText(control.field, 80),
     role: clampText(control.role, 80),
     semantic: clampText(control.semantic, 80),
     risk: clampText(control.risk, 80),
     state: control.state || null,
     selected: Boolean(control.selected),
     required: Boolean(control.required),
+    hasValue: Boolean(control.hasValue || control.state?.valuePresent || control.controlState?.valuePresent),
     sectionId: clampText(control.sectionId, 80),
     sectionType: clampText(control.sectionType, 80),
     sectionLabel: clampText(control.sectionLabel, 160),
@@ -574,9 +623,14 @@ function compactLogicalControl(control = {}) {
   };
 }
 
-function compactDecisionGroup(group = {}) {
+function compactDecisionGroup(group = {}, controlsById = new Map()) {
+  const alternativeControlIds = Array.isArray(group.alternativeControlIds)
+    ? group.alternativeControlIds
+    : (group.alternatives || []).map((choice) => choice.controlId);
+  const ids = [...new Set(alternativeControlIds.map((id) => clampText(id, 140)).filter(Boolean))];
   return {
     decisionGroupId: clampText(group.decisionGroupId, 140),
+    surfaceId: clampText(group.surfaceId, 80),
     sectionId: clampText(group.sectionId, 80),
     sectionType: clampText(group.sectionType, 80),
     sectionLabel: clampText(group.sectionLabel, 160),
@@ -586,18 +640,21 @@ function compactDecisionGroup(group = {}) {
     selectedControlId: clampText(group.selectedControlId, 140),
     selectedLabel: clampText(group.selectedLabel, 220),
     selectedSemantic: clampText(group.selectedSemantic, 80),
-    alternatives: Array.isArray(group.alternatives)
-        ? group.alternatives.map((choice) => ({
-          controlId: clampText(choice.controlId, 140),
-          targetId: clampText(choice.targetId, 80),
-          visualRef: clampText(choice.visualRef, 40),
-          label: clampText(choice.label, 220),
-          semantic: clampText(choice.semantic, 80),
-          risk: clampText(choice.risk, 80),
-          selected: Boolean(choice.selected),
-          priceText: clampText(choice.priceText, 80)
-        })).slice(0, 16)
-      : [],
+    alternativeControlIds: ids,
+    alternatives: ids.flatMap((controlId) => {
+      const control = controlsById.get(controlId);
+      if (!control) return [];
+      return [{
+        controlId,
+        targetId: control.preferredActivationElementId || control.stateElementId || "",
+        visualRef: control.visualRef || "",
+        label: control.label || "",
+        semantic: control.semantic || "",
+        risk: control.risk || "",
+        selected: Boolean(control.selected || control.state?.selected || control.state?.checked),
+        priceText: ""
+      }];
+    }),
     evidence: Array.isArray(group.evidence) ? group.evidence.map((item) => clampText(item, 180)).slice(0, 5) : []
   };
 }
@@ -605,7 +662,8 @@ function compactDecisionGroup(group = {}) {
 function compactAgentPayload(body) {
   const page = body.page || {};
   const traveler = body.traveler || {};
-  const screenshotDataUrl = String(page.screenshotDataUrl || "");
+  const screenshot = screenshotForObservation(page, body);
+  const screenshotDataUrl = screenshot.screenshotDataUrl;
   const sections = Array.isArray(page.sections)
     ? page.sections.map((section) => ({
         id: clampText(section.id, 80),
@@ -616,53 +674,35 @@ function compactAgentPayload(body) {
         paidChoice: Boolean(section.paidChoice),
         selected: Array.isArray(section.selected) ? section.selected.map((item) => clampText(item, 120)).slice(0, 8) : [],
         box: section.box || null,
-        fields: Array.isArray(section.fields)
-          ? section.fields.map((field) => ({
-              id: clampText(field.id, 80),
-              ...compactControlFields(field),
-              label: clampText(field.label, 160),
-              field: clampText(field.field, 80),
-              kind: clampText(field.kind, 40),
-              semantic: clampText(field.semantic || field.field, 80),
-              role: clampText(field.role, 80),
-              accessibility: compactAccessibilityNode(field.accessibility),
-              required: Boolean(field.required),
-              hasValue: Boolean(field.hasValue),
-              box: field.box || null
-            })).slice(0, 20)
-          : [],
-        choices: Array.isArray(section.choices)
-          ? section.choices.map((choice) => ({
-              id: clampText(choice.id, 80),
-              ...compactControlFields(choice),
-              label: clampText(choice.label, 160),
-              selected: Boolean(choice.selected),
-              semantic: clampText(choice.semantic, 80),
-              risk: clampText(choice.risk, 80),
-              role: clampText(choice.role, 80),
-              accessibility: compactAccessibilityNode(choice.accessibility),
-              box: choice.box || null
-            })).slice(0, 20)
-          : [],
-        buttons: Array.isArray(section.buttons)
-          ? section.buttons.map((button) => ({
-              id: clampText(button.id, 80),
-              ...compactControlFields(button),
-              label: clampText(button.label, 160),
-              risk: clampText(button.risk, 80),
-              semantic: clampText(button.semantic, 80),
-              role: clampText(button.role, 80),
-              accessibility: compactAccessibilityNode(button.accessibility),
-              box: button.box || null
-            })).slice(0, 20)
-          : [],
+        controlIds: [...new Set((section.controlIds || [
+          ...(section.fields || []).map((item) => item.controlId),
+          ...(section.choices || []).map((item) => item.controlId),
+          ...(section.buttons || []).map((item) => item.controlId)
+        ]).map((id) => clampText(id, 140)).filter(Boolean))],
         text: clampText(section.text, 900)
-      })).slice(0, 20)
+      }))
     : [];
-  const activeSurface = compactSurface(page.activeSurface || {});
-  const currentSurface = compactSurface(page.currentSurface || page.activeSurface || {});
+  const observedCurrentSurface = compactSurface(page.currentSurface || page.activeSurface || {});
+  const currentSurface = {
+    ...observedCurrentSurface,
+    ...normalizeSurface(observedCurrentSurface, clampText(body.observationId || "", 120))
+  };
+  const canonicalControls = Array.isArray(page.controls)
+    ? page.controls.map(compactLogicalControl).filter((control) => control.controlId).map((control) => {
+        const surfaceId = control.surfaceId || (currentSurface.type === "page" ? PAGE_SURFACE_ID : "");
+        const belongsToCurrent = Boolean(surfaceId && surfaceId === currentSurface.id);
+        return {
+          ...control,
+          surfaceId,
+          surfaceType: control.surfaceType || (belongsToCurrent ? currentSurface.type : surfaceId === PAGE_SURFACE_ID ? "page" : ""),
+          surfaceLabel: control.surfaceLabel || (belongsToCurrent ? currentSurface.label : surfaceId === PAGE_SURFACE_ID ? "Page" : "")
+        };
+      })
+    : [];
+  const canonicalControlIds = new Set(canonicalControls.map((control) => control.controlId));
+  const canonicalControlsById = new Map(canonicalControls.map((control) => [control.controlId, control]));
   const surfaceStack = Array.isArray(page.surfaceStack)
-    ? page.surfaceStack.map(compactSurface).slice(0, 6)
+    ? page.surfaceStack.map(compactSurface)
     : [];
   return {
     sessionId: clampText(body.sessionId || "", 120),
@@ -733,9 +773,58 @@ function compactAgentPayload(body) {
       } : null,
       itineraryFingerprint: clampText(page.itineraryFingerprint || page.summary?.itineraryFingerprint, 160),
       offerFingerprint: clampText(page.offerFingerprint || page.summary?.offerFingerprint, 160),
+      transactionFacts: page.transactionFacts && typeof page.transactionFacts === "object" ? {
+        itinerary: {
+          completeness: clampText(page.transactionFacts.itinerary?.completeness || "unknown", 20),
+          segments: Array.isArray(page.transactionFacts.itinerary?.segments)
+            ? page.transactionFacts.itinerary.segments.map((segment) => ({
+                segmentId: clampText(segment.segmentId, 120),
+                origin: clampText(segment.origin, 12),
+                destination: clampText(segment.destination, 12),
+                departureDate: clampText(segment.departureDate, 40),
+                departureTime: clampText(segment.departureTime, 20),
+                arrivalTime: clampText(segment.arrivalTime, 20),
+                flightNumber: clampText(segment.flightNumber, 30)
+              })).slice(0, 12)
+            : []
+        },
+        travelers: Array.isArray(page.transactionFacts.travelers)
+          ? page.transactionFacts.travelers.map((entry) => ({
+              travelerId: clampText(entry.travelerId || entry.id, 120),
+              name: clampText(entry.name, 160)
+            })).slice(0, 12)
+          : [],
+        currency: clampText(page.transactionFacts.currency, 20),
+        basePrice: page.transactionFacts.basePrice && typeof page.transactionFacts.basePrice === "object" ? {
+          amount: Number.isFinite(Number(page.transactionFacts.basePrice.amount)) ? Number(page.transactionFacts.basePrice.amount) : null,
+          currency: clampText(page.transactionFacts.basePrice.currency, 20)
+        } : null,
+        totalPrice: page.transactionFacts.totalPrice && typeof page.transactionFacts.totalPrice === "object" ? {
+          amount: Number.isFinite(Number(page.transactionFacts.totalPrice.amount)) ? Number(page.transactionFacts.totalPrice.amount) : null,
+          currency: clampText(page.transactionFacts.totalPrice.currency, 20)
+        } : null,
+        fareBrand: clampText(page.transactionFacts.fareBrand, 120),
+        selectedExtras: Array.isArray(page.transactionFacts.selectedExtras)
+          ? page.transactionFacts.selectedExtras.map((extra) => ({
+              decisionGroupId: clampText(extra.decisionGroupId, 140),
+              label: clampText(extra.label, 180),
+              disposition: clampText(extra.disposition, 80),
+              priceAmount: Number.isFinite(Number(extra.priceAmount)) ? Number(extra.priceAmount) : null,
+              currency: clampText(extra.currency, 20)
+            })).slice(0, 40)
+          : [],
+        provenance: Array.isArray(page.transactionFacts.provenance)
+          ? page.transactionFacts.provenance.map((entry) => ({
+              source: clampText(entry.source, 80),
+              observationId: clampText(entry.observationId, 120),
+              confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0))
+            })).slice(0, 20)
+          : []
+      } : null,
       priceText: clampText(page.priceText, 80),
       price: page.price && typeof page.price === "object" ? page.price : null,
-      screenshotDataUrl: screenshotDataUrl.startsWith("data:image/") ? screenshotDataUrl.slice(0, 5_000_000) : "",
+      screenshotId: screenshot.screenshotId,
+      screenshotDataUrl: screenshotDataUrl.startsWith("data:image/") ? screenshotDataUrl : "",
       screenshotAnnotations: Array.isArray(page.screenshotAnnotations)
         ? page.screenshotAnnotations.map((item) => ({
             visualRef: clampText(item.visualRef, 40),
@@ -751,7 +840,7 @@ function compactAgentPayload(body) {
             required: Boolean(item.required),
             source: clampText(item.source, 80),
             box: item.box || null
-          })).filter((item) => item.visualRef).slice(0, 80)
+          })).filter((item) => item.visualRef && item.controlId && canonicalControlIds.has(item.controlId)).slice(0, 80)
         : [],
       foreground: compactVisualState({ foreground: page.foreground || page.visualState?.foreground || null })?.foreground || null,
       visualState: compactVisualState(page.visualState),
@@ -759,8 +848,8 @@ function compactAgentPayload(body) {
         foregroundSurfaceId: clampText(page.accessibility.foregroundSurfaceId, 80),
         foregroundSurfaceType: clampText(page.accessibility.foregroundSurfaceType, 80),
         landmarkCount: Number(page.accessibility.landmarkCount || 0),
-        controls: Array.isArray(page.accessibility.controls)
-          ? page.accessibility.controls.map(compactAccessibilityNode).filter(Boolean).slice(0, 120)
+        controlIds: Array.isArray(page.accessibility.controlIds)
+          ? page.accessibility.controlIds.map((id) => clampText(id, 140)).filter(Boolean)
           : []
       } : null,
       coverage: page.coverage || {},
@@ -781,52 +870,21 @@ function compactAgentPayload(body) {
       paidChoices: Array.isArray(page.paidChoices) ? page.paidChoices.map((item) => clampText(item, 160)).slice(0, 8) : [],
       completedFields: page.completedFields && typeof page.completedFields === "object" ? page.completedFields : {},
       sections,
-      controls: Array.isArray(page.controls)
-        ? page.controls.map(compactLogicalControl).filter((control) => control.controlId).slice(0, 180)
-        : [],
+      controls: canonicalControls,
       controlAliases: Array.isArray(page.controlAliases)
         ? page.controlAliases.map((entry) => ({
             aliasId: clampText(entry.aliasId, 140),
             controlId: clampText(entry.controlId, 140),
             kind: clampText(entry.kind, 40)
-          })).filter((entry) => entry.aliasId && entry.controlId).slice(0, 1200)
+          })).filter((entry) => entry.aliasId && entry.controlId)
         : [],
       decisionGroups: Array.isArray(page.decisionGroups)
-        ? page.decisionGroups.map(compactDecisionGroup).filter((group) => group.decisionGroupId).slice(0, 80)
+        ? page.decisionGroups.map((group) => compactDecisionGroup(group, canonicalControlsById)).filter((group) => group.decisionGroupId)
         : [],
       stageExit: page.stageExit || {},
       reconciliation: page.reconciliation || {},
-      activeSurface,
       currentSurface,
       surfaceStack,
-      fields: Array.isArray(page.fields)
-        ? page.fields.map((field) => ({
-            id: clampText(field.id, 80),
-            ...compactControlFields(field),
-            label: clampText(field.label, 220),
-            box: field.box || null,
-            kind: clampText(field.kind, 40),
-            field: clampText(field.field, 80),
-            semantic: clampText(field.semantic || field.field, 80),
-            role: clampText(field.role, 80),
-            accessibility: compactAccessibilityNode(field.accessibility),
-            required: Boolean(field.required),
-            hasValue: Boolean(field.value),
-            confidence: Number(field.confidence || 0)
-          })).slice(0, 80)
-        : [],
-      buttons: Array.isArray(page.buttons)
-        ? page.buttons.map((button) => ({
-            id: clampText(button.id, 80),
-            ...compactControlFields(button),
-            label: clampText(button.label, 180),
-            box: button.box || null,
-            role: clampText(button.role, 80),
-            semantic: clampText(button.semantic, 80),
-            risk: clampText(button.risk, 80),
-            accessibility: compactAccessibilityNode(button.accessibility)
-          })).slice(0, 80)
-        : [],
       overlays: Array.isArray(page.overlays)
         ? page.overlays.map((overlay) => ({
             id: clampText(overlay.id, 80),
@@ -847,6 +905,9 @@ async function decideAgentNextActionViaLoop(body) {
   if (!payload.sessionId) throw new Error("DURABLE_SESSION_REQUIRED");
   let state = agentSessionStore.getSession(payload.sessionId);
   if (!state) throw new Error("DURABLE_SESSION_NOT_FOUND");
+  const previousObservation = state.currentObservationId
+    ? agentSessionStore.getObservation(state.id, state.currentObservationId)
+    : null;
 
   const observation = {
     observationId: payload.observationId,
@@ -857,15 +918,18 @@ async function decideAgentNextActionViaLoop(body) {
   };
 
   agentSessionStore.recordObservation(state.id, observation);
+  // Previous browser evidence is read from the durable ledger and attached
+  // only for this turn. It is not nested into the newly persisted observation.
+  observation.previousObservation = previousObservation;
   state = agentSessionStore.getSession(state.id) || state;
   state = agentSessionStore.saveSession(withUpdate(state, {
     userIntent: payload.userIntent || state.userIntent || state.goal,
     travelerIds: [payload.traveler?.id || state.travelerId].filter(Boolean),
-    policySnapshot: {
-      bookingRules: payload.traveler?.booking_rules || state.policySnapshot?.bookingRules || "",
-      baggagePreference: payload.traveler?.baggage_preference || state.policySnapshot?.baggagePreference || "",
-      preferredSeat: payload.traveler?.preferred_seat || state.policySnapshot?.preferredSeat || "",
-      paymentPreference: payload.traveler?.payment_preference || state.policySnapshot?.paymentPreference || ""
+    userPolicy: {
+      bookingRules: payload.traveler?.booking_rules || state.userPolicy?.bookingRules || state.policySnapshot?.bookingRules || "",
+      baggagePreference: payload.traveler?.baggage_preference || state.userPolicy?.baggagePreference || state.policySnapshot?.baggagePreference || "",
+      preferredSeat: payload.traveler?.preferred_seat || state.userPolicy?.preferredSeat || state.policySnapshot?.preferredSeat || "",
+      paymentPreference: payload.traveler?.payment_preference || state.userPolicy?.paymentPreference || state.policySnapshot?.paymentPreference || ""
     },
     approvals: {
       ...(state.approvals || {}),
@@ -984,7 +1048,7 @@ function summarizeClientFlowLog(body) {
     site: clampText(page.site || "", 80),
     step: clampText(page.step || "", 80),
     controls: Array.isArray(page.visibleControls) ? page.visibleControls.length : undefined,
-    activeSurface: clampText(page.activeSurface?.label || page.activeSurface?.type || "", 140),
+    currentSurface: clampText(page.currentSurface?.label || page.currentSurface?.type || "", 140),
     reason: clampText(payload.reason || decision.reason || "", 180)
   };
 }
@@ -1129,8 +1193,20 @@ async function handleApi(req, res, pathname) {
     return sendJson(res, 200, { ok: true });
   }
 
+  if (req.method === "POST" && pathname === "/api/agent/screenshot") {
+    const body = await readBody(req, { maxBytes: MAX_SCREENSHOT_UPLOAD_BYTES, tooLargeCode: "SCREENSHOT_TOO_LARGE" });
+    const sessionId = clampText(body.sessionId || "", 120);
+    const observationId = clampText(body.observationId || "", 120);
+    if (!sessionId || !agentSessionStore.getSession(sessionId)) {
+      return sendJson(res, 409, { error: "A current checkout session is required for screenshot upload.", code: "DURABLE_SESSION_NOT_FOUND", retryable: false });
+    }
+    if (!observationId) return sendJson(res, 400, { error: "observationId is required.", code: "OBSERVATION_ID_REQUIRED", retryable: false });
+    const screenshotId = storeScreenshotUpload({ sessionId, observationId, screenshotDataUrl: String(body.screenshotDataUrl || "") });
+    return sendJson(res, 201, { screenshotId });
+  }
+
   if (req.method === "POST" && pathname === "/api/agent/next-action") {
-    const body = await readBody(req);
+    const body = await readBody(req, { maxBytes: MAX_OBSERVATION_BYTES, tooLargeCode: "OBSERVATION_TOO_LARGE" });
     const sessionId = clampText(body.sessionId || "", 120);
     if (!sessionId) return sendJson(res, 409, { error: "A durable checkout session is required before planning.", code: "DURABLE_SESSION_REQUIRED" });
     if (!agentSessionStore.getSession(sessionId)) {
@@ -1338,7 +1414,19 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith("/api/")) return await handleApi(req, res, url.pathname);
     serveStatic(req, res, url.pathname);
   } catch (error) {
-    sendJson(res, 500, { error: "Server error" });
+    if (error?.code && Number(error.status || 0) >= 400) {
+      return sendJson(res, Number(error.status), {
+        error: error.message || "Request failed",
+        code: error.code,
+        retryable: error.retryable === true
+      });
+    }
+    console.error("Unhandled server request error:", error);
+    sendJson(res, 500, {
+      error: "Agent backend processing failed",
+      code: "BACKEND_INTERNAL_ERROR",
+      retryable: false
+    });
   }
 });
 

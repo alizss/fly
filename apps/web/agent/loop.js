@@ -17,26 +17,37 @@
 // theoretical one, for a product whose whole point is being fast.
 
 const { classifyPageState } = require("./page-state-classifier");
-const { verifyAndPlan } = require("./verify-and-plan");
-const { governAction } = require("./action-governor");
+const { PlannerContractError, verifyAndPlan } = require("./verify-and-plan");
+const { selectCandidate } = require("./select-candidate");
+const {
+  deriveObservationGoal
+} = require("./observation-candidates");
+const {
+  actionForCurrentCandidate,
+  buildCurrentCandidateSet
+} = require("./current-candidate-builder");
+const { governAction, RECOVERABLE_GROUNDING_CODES } = require("./action-governor");
 const { buildControlAliasIndex, resolveActionControl } = require("./control-alias-index");
 const {
-  advanceSkillPlan,
-  createSkillPlan,
-  expandSkillAction,
-  failSkillAction,
-  prepareSkillViewportRecovery,
   profileStageReadiness,
-  resumeSuspendedSkillPlan,
-  skillRecoveryContext,
-  blockedObligationForPlan,
-  recordBlockedObligationAttempt,
-  reconcileBlockedObligationResult
+  deriveProfileGoal,
+  profileGoalSatisfied
 } = require("./skill-expander");
 const { writeTrace } = require("./trace-store");
-const { normalizeAction, actionSignature } = require("../../../packages/shared/agent-actions");
+const {
+  advanceActionLifecycle,
+  applyRecoveryBudget,
+  canonicalFailureCode,
+  wasDispatched
+} = require("./action-lifecycle");
+const {
+  normalizeAction,
+  actionSignature
+} = require("../../../packages/shared/agent-actions");
 const { withUpdate, normalizeStep } = require("../../../packages/shared/agent-state");
-const { missingRequired, normalizeRequirement } = require("../../../packages/shared/requirements");
+const { missingRequired, normalizeRequirement, requirementFulfilled } = require("../../../packages/shared/requirements");
+const { currentSurface, currentSurfaceId, surfaceBinding } = require("./surface-contract");
+const { compileTypedExpectedOutcome } = require("./action-semantics");
 
 const STALL_THRESHOLD = 3;
 
@@ -81,7 +92,7 @@ function decisionGroupRequirementType(group = {}) {
 }
 
 function decisionGroupRisk(group = {}) {
-  if (group.status === "satisfied") return "safe";
+  if (["satisfied", "waived_by_policy"].includes(group.status)) return "safe";
   const alternatives = group.alternatives || [];
   if (alternatives.some((choice) => choice.risk === "payment")) return "payment";
   if (alternatives.some((choice) => choice.risk === "legal")) return "legal";
@@ -94,22 +105,23 @@ function requirementFromDecisionGroup(group = {}, index = 0) {
   return normalizeRequirement({
     id: group.decisionGroupId || `decision_group_${index}`,
     decisionGroupId: group.decisionGroupId || "",
+    surfaceId: group.surfaceId || "",
     type: decisionGroupRequirementType(group),
     label: group.sectionLabel || group.sectionType || group.requirementId || group.decisionGroupId || `Decision ${index + 1}`,
-    status: group.status === "satisfied" ? "satisfied" : (group.status || "missing"),
+    status: ["satisfied", "waived_by_policy"].includes(group.status) ? group.status : (group.status || "missing"),
     required: Boolean(group.required),
     risk: decisionGroupRisk(group),
     evidence: [
       ...(group.evidence || []),
       group.selectedLabel ? `Selected option: ${group.selectedLabel}` : ""
     ].filter(Boolean).slice(0, 5),
-    confidence: group.status === "satisfied" ? 0.95 : 0.9,
+    confidence: ["satisfied", "waived_by_policy"].includes(group.status) ? 0.95 : 0.9,
     targetIds: [
       group.decisionGroupId,
       group.sectionId,
       group.requirementId,
       ...(group.alternatives || []).flatMap((choice) => [choice.controlId, choice.targetId])
-    ].filter(Boolean).slice(0, 10)
+    ].filter(Boolean)
   }, index);
 }
 
@@ -117,6 +129,7 @@ function withDecisionGroupFields(requirement = {}, group = {}) {
   return {
     ...requirement,
     decisionGroupId: group.decisionGroupId || "",
+    surfaceId: group.surfaceId || "",
     selectedControlId: group.selectedControlId || "",
     selectedLabel: group.selectedLabel || "",
     alternatives: (group.alternatives || []).map((choice) => ({
@@ -127,7 +140,7 @@ function withDecisionGroupFields(requirement = {}, group = {}) {
       risk: choice.risk || "",
       selected: Boolean(choice.selected),
       priceText: choice.priceText || ""
-    })).slice(0, 16)
+    }))
   };
 }
 
@@ -172,7 +185,7 @@ function desiredDispositionForRequirement(requirement = {}, traveler = {}) {
 }
 
 function interfaceStatusForRequirement(requirement = {}) {
-  if (requirement.status === "satisfied") return "complete";
+  if (requirementFulfilled(requirement)) return "complete";
   if (requirement.status === "conflicted") return "conflicted";
   if (requirement.status === "blocked") return "blocked";
   if (requirement.status === "needs_user") return "needs_user";
@@ -181,6 +194,7 @@ function interfaceStatusForRequirement(requirement = {}) {
 }
 
 function lifecycleStatusForRequirement(requirement = {}) {
+  if (requirement.status === "waived_by_policy") return "waived_by_policy";
   if (requirement.status === "satisfied") return "satisfied";
   if (requirement.status === "conflicted") return "conflicted";
   if (requirement.status === "blocked") return "blocked";
@@ -188,21 +202,17 @@ function lifecycleStatusForRequirement(requirement = {}) {
   return "active";
 }
 
-function activeSurfaceForRequirement(requirement = {}, page = {}) {
-  const surfaces = [page.currentSurface, page.activeSurface].filter((surface) => surface?.type && surface.type !== "page");
-  return surfaces.find((surface) => {
-    if (!surface) return false;
-    if (requirement.decisionGroupId && surface.decisionGroupId === requirement.decisionGroupId) return true;
-    if (requirement.decisionGroupId && String(requirement.decisionGroupId).includes(String(surface.id || "__none__"))) return true;
-    if ((requirement.targetIds || []).includes(surface.id)) return true;
-    if (requirement.sectionId && requirement.sectionId === surface.id) return true;
-    return false;
-  }) || null;
+function currentSurfaceForRequirement(requirement = {}, page = {}) {
+  const surface = currentSurface(page);
+  if (surface.type === "page") return null;
+  if (requirement.surfaceId && requirement.surfaceId !== surface.id) return null;
+  if (requirement.decisionGroupId && surface.decisionGroupId && requirement.decisionGroupId !== surface.decisionGroupId) return null;
+  return surface;
 }
 
 function requirementScope(requirement = {}, observation = {}, pageStep = "") {
   const page = observation?.page || {};
-  const surface = activeSurfaceForRequirement(requirement, page);
+  const surface = currentSurfaceForRequirement(requirement, page);
   const stage = pageStep || page.step || page.pageStep || "unknown";
   return {
     stage,
@@ -234,7 +244,7 @@ function canonicalRequirementLifecycle(requirements = [], observation = {}, prev
       interfaceStatus,
       createdObservationId: observationId,
       lastObservedObservationId: observationId,
-      resolvedByActionId: lifecycleStatus === "satisfied" ? lastActionId : "",
+      resolvedByActionId: ["satisfied", "waived_by_policy"].includes(lifecycleStatus) ? lastActionId : "",
       value: requirement.selectedLabel || requirement.value || "",
       stale: false
     };
@@ -332,13 +342,19 @@ function updateEvidenceMatchesRequirement(update = {}, requirement = {}, observa
 function deterministicRequirementEvidence(requirement = {}, observation = {}) {
   const page = observation?.page || {};
   const targetIds = new Set([requirement.id, ...(requirement.targetIds || [])].filter(Boolean));
-  const fields = page.fields || [];
+  const fields = Array.isArray(page.fields) && page.fields.length
+    ? page.fields
+    : (page.controls || []).filter((control) => control.field).map((control) => ({
+        ...control,
+        id: control.stateElementId || control.controlId,
+        hasValue: Boolean(control.hasValue || control.state?.valuePresent)
+      }));
 
   const decisionGroup = decisionGroupForRequirement(requirement, page);
   if (decisionGroup) {
     return {
       source: "deterministic_decision_group",
-      status: decisionGroup.status === "satisfied" ? "satisfied" : "missing",
+      status: ["satisfied", "waived_by_policy"].includes(decisionGroup.status) ? decisionGroup.status : "missing",
       evidence: decisionGroup.selectedLabel
         ? `Decision ${decisionGroup.sectionLabel || decisionGroup.decisionGroupId} selected ${decisionGroup.selectedLabel}.`
         : `Decision ${decisionGroup.sectionLabel || decisionGroup.decisionGroupId} has no selected option.`
@@ -369,7 +385,7 @@ function updateHasCurrentEvidence(update = {}, observation = {}, requirement = {
 }
 
 function requirementConflict(requirement = {}, verification = {}, observation = {}) {
-  if (!requirement || requirement.status === "satisfied") return false;
+  if (!requirement || requirementFulfilled(requirement)) return false;
   const update = verifierUpdateForRequirement(verification, requirement.id);
   const verifierClaimsSatisfied = update?.proposedStatus === "satisfied";
   if (!verifierClaimsSatisfied) return false;
@@ -379,7 +395,6 @@ function requirementConflict(requirement = {}, verification = {}, observation = 
 function reconcileRequirements(freshRequirements = [], verification = {}, observation = {}) {
   return freshRequirements.map((requirement) => {
     const deterministic = deterministicRequirementEvidence(requirement, observation);
-    const update = verifierUpdateForRequirement(verification, requirement.id);
     if (deterministic && deterministic.status !== "unknown") {
       return {
         ...requirement,
@@ -392,206 +407,33 @@ function reconcileRequirements(freshRequirements = [], verification = {}, observ
       };
     }
 
-    if (requirement.status === "satisfied") return requirement;
-
-    if (requirementConflict(requirement, verification, observation)) {
-      return {
-        ...requirement,
-        status: "conflicted",
-        required: true,
-        risk: requirement.risk || "uncertain",
-        evidence: [
-          ...(requirement.evidence || []),
-          "CONTRADICTORY_REQUIREMENT_STATE: fresh page evidence says unresolved, verifier claimed satisfied without same-observation proof."
-        ].slice(0, 5)
-      };
-    }
-
-    if (updateHasCurrentEvidence(update, observation, requirement)) {
-      return {
-        ...requirement,
-        status: "satisfied",
-        confidence: Math.max(requirement.confidence || 0, update.confidence || 0)
-      };
-    }
-
+    // Model verification is diagnostic only. Requirement truth comes from the
+    // fresh observer/classifier and deterministic browser evidence.
     return requirement;
+  });
+}
+
+function finalHandoffAction(reason, observation = {}, overrides = {}) {
+  return normalizeAction({
+    ...overrides,
+    observationId: overrides.observationId || observation.observationId || "",
+    observationHash: overrides.observationHash || observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+    type: "ask_user",
+    intent: "ask_user",
+    reason: String(reason || overrides.reason || "User input is required before another action."),
+    risk: overrides.risk || "uncertain",
+    requiresApproval: true
   });
 }
 
 function policyBlockedAction(governance, action) {
   if (governance.allow) return action;
   const reason = governance.reason || action.reason || "The action governor blocked the planned action.";
-  return normalizeAction({
+  return finalHandoffAction(reason, {}, {
     id: `${action.id || `act_${Date.now().toString(36)}`}:blocked`,
     observationId: action.observationId || "",
     observationHash: action.observationHash || "",
-    type: "ask_user",
-    reason,
-    risk: "uncertain",
-    requiresApproval: true
   });
-}
-
-function deterministicProfileOwnershipAction(observation = {}) {
-  return normalizeAction({
-    id: `act_profile_owner_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-    observationId: observation.observationId || "",
-    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-    type: "fill_visible_profile_fields",
-    intent: "fill_profile_fields",
-    risk: "safe",
-    requiresApproval: false,
-    reason: "Deterministic traveler/contact readiness owns this stage before general planning."
-  });
-}
-
-function ownedSkillRecoveryAction(action = {}, context = null, observation = {}) {
-  if (!context?.atomId || !context?.controlId) return action;
-  const page = observation.page || {};
-  const resolution = resolveActionControl(action, page);
-  const targetsOwnedControl = resolution.ok && resolution.control?.controlId === context.controlId;
-  const visualRecovery = action.type === "click_xy";
-  const suppliedRegion = action.visualRegion || {};
-  const matchesRecoveryRegion = (context.recovery?.regions || []).some((region) => (
-    Math.abs(Number(region.x) - Number(suppliedRegion.x)) <= 2
-    && Math.abs(Number(region.y) - Number(suppliedRegion.y)) <= 2
-    && Math.abs(Number(region.width) - Number(suppliedRegion.width)) <= 2
-    && Math.abs(Number(region.height) - Number(suppliedRegion.height)) <= 2
-  ));
-  const observationalRecovery = ["scroll", "wait", "ask_user"].includes(action.type);
-  if (visualRecovery && !matchesRecoveryRegion) {
-    return normalizeAction({
-      observationId: observation.observationId || "",
-      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "wait",
-      intent: "recover_skill_observation",
-      skillPlanId: context.planId,
-      skillAtomId: context.atomId,
-      controlId: context.controlId,
-      reason: `Rejected an unbound coordinate for ${context.label || context.semanticType}; collect a fresh observation and use only a supplied recovery region.`,
-      risk: "safe",
-      requiresApproval: false
-    });
-  }
-  if (!targetsOwnedControl && !visualRecovery && !observationalRecovery) {
-    return normalizeAction({
-      observationId: observation.observationId || "",
-      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "wait",
-      intent: "recover_skill_observation",
-      skillPlanId: context.planId,
-      skillAtomId: context.atomId,
-      controlId: context.controlId,
-      reason: `The proposed action would bypass unresolved ${context.label || context.semanticType}; reobserve that owned prerequisite instead.`,
-      risk: "safe",
-      requiresApproval: false
-    });
-  }
-  const expectedOutcome = context.operation === "open"
-    ? {
-        type: "options_surface_appeared",
-        controlId: context.controlId,
-        previousSurfaceId: (page.currentSurface?.type && page.currentSurface.type !== "page" ? page.currentSurface.id : page.activeSurface?.id) || "",
-        previousExpanded: Boolean(context.state?.expanded)
-      }
-    : action.expectedOutcome || null;
-  return normalizeAction({
-    ...action,
-    intent: observationalRecovery ? "recover_skill_observation" : "recover_skill_atom",
-    operation: observationalRecovery ? "" : context.operation,
-    skillPlanId: context.planId,
-    skillAtomId: context.atomId,
-    controlId: visualRecovery ? context.controlId : action.controlId,
-    expectedOutcome,
-    reason: `${action.reason || "Recover the unresolved profile control."} Owned prerequisite: ${context.label || context.semanticType}.`
-  });
-}
-
-function sameRegion(left = {}, right = {}) {
-  return ["x", "y", "width", "height"].every((key) => Math.abs(Number(left[key]) - Number(right[key])) <= 2);
-}
-
-function canonicalBlockedRecoveryAction(obligation = {}, observation = {}) {
-  const page = observation.page || {};
-  const control = (page.controls || []).find((item) => item.controlId === obligation.control?.controlId);
-  if (!control) return null;
-  const operation = obligation.operation || "";
-  const attemptedTargets = new Set((obligation.attempts || [])
-    .filter((attempt) => attempt.operation === operation)
-    .map((attempt) => attempt.targetId || `${attempt.actionType}:${attempt.visualRegion?.x || ""}:${attempt.visualRegion?.y || ""}`));
-  const capability = control.operations?.[operation] || null;
-  const targetId = (capability?.actuatorIds || []).find((id) => id && !attemptedTargets.has(id));
-  const base = {
-    id: `act_blocked_recovery_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-    observationId: observation.observationId || "",
-    observationHash: observation.observationSnapshot?.snapshotHash || page.snapshotHash || "",
-    intent: "recover_skill_atom",
-    operation,
-    skillPlanId: obligation.owner?.skillPlanId || "",
-    skillAtomId: obligation.owner?.atomId || "",
-    controlId: control.controlId,
-    targetLabel: `${control.label || obligation.control?.label || obligation.control?.semanticType || "control"} ${operation}`,
-    expectedOutcome: obligation.recoveryExpectedOutcome || null,
-    risk: "safe",
-    requiresApproval: false
-  };
-  if (targetId) {
-    return normalizeAction({
-      ...base,
-      type: operation === "type" ? "type" : operation === "select" ? "select" : "click",
-      targetId,
-      reason: `Execute the next untried canonical ${operation} actuator for the blocked ${obligation.control?.label || obligation.control?.semanticType}.`
-    });
-  }
-  const recovery = control.recovery?.[operation];
-  const annotations = page.screenshotAnnotations || [];
-  const region = (recovery?.regions || []).find((candidate) => {
-    const regionKey = `click_xy:${candidate.x}:${candidate.y}`;
-    if (attemptedTargets.has(regionKey)) return false;
-    return annotations.some((annotation) => (
-      annotation.controlId === control.controlId
-      && annotation.source === `control.recovery.${operation}`
-      && sameRegion(annotation.box || {}, candidate)
-    ));
-  });
-  if (!region || recovery?.requiresVisualConfirmation !== true) return null;
-  return normalizeAction({
-    ...base,
-    type: "click_xy",
-    targetId: "",
-    x: Number(region.centerX || (Number(region.x) + Number(region.width) / 2)),
-    y: Number(region.centerY || (Number(region.y) + Number(region.height) / 2)),
-    visualRegion: region,
-    reason: `Execute the screenshot-confirmed bounded ${operation} region for the blocked ${obligation.control?.label || obligation.control?.semanticType}.`
-  });
-}
-
-function resolvedBlockedObligation(obligation = {}, plan = {}, result = {}, observation = {}) {
-  if (!obligation?.owner?.atomId || obligation.owner.atomId !== result.skillAtomId) return obligation;
-  const atom = (plan.atoms || []).find((item) => item.atomId === obligation.owner.atomId);
-  const expected = obligation.expectedResult || {};
-  const control = (observation.page?.controls || []).find((item) => item.controlId === expected.controlId);
-  const finalValueMatches = !expected.expectedNormalizedValue
-    || String(control?.state?.normalizedValue || "") === String(expected.expectedNormalizedValue);
-  const exactFinalResult = result.executed === true
-    && result.verified === true
-    && result.skillPlanId === obligation.owner.skillPlanId
-    && result.skillAtomId === obligation.owner.atomId
-    && result.expectedOutcome?.type === expected.type
-    && String(result.expectedOutcome?.controlId || "") === String(expected.controlId || "")
-    && finalValueMatches;
-  if (!atom || !["complete", "satisfied"].includes(atom.status) || !exactFinalResult) return obligation;
-  return {
-    ...obligation,
-    status: "resolved",
-    finalStatus: "satisfied",
-    finalReason: expected.expectedNormalizedValue
-      ? `The blocked control retained ${expected.expectedNormalizedValue}.`
-      : "The blocked atom completed with exact governed verification.",
-    resolvedAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
 }
 
 function recoveryScrollAmount(action = {}, observation = {}) {
@@ -622,7 +464,8 @@ function viewportRecoveryAction(blockedAction = {}, observation = {}, recoveryCo
       type: "target_in_view",
       controlId: blockedAction.controlId || blockedAction.targetSnapshot?.controlId || "",
       recoveryOfActionId: blockedAction.id || "",
-      attempt: recoveryCount
+      attempt: recoveryCount,
+      scrollStrategy: recoveryCount >= 3 ? "nearest_container" : "target_center"
     },
     risk: "safe",
     requiresApproval: false,
@@ -630,7 +473,60 @@ function viewportRecoveryAction(blockedAction = {}, observation = {}, recoveryCo
   });
 }
 
-function pendingViewportRecovery(blockedAction = {}, recoveryCount = 1) {
+const MAX_VIEWPORT_RECOVERY_ATTEMPTS = 5;
+const MAX_CONSECUTIVE_VIEWPORT_FAILURES = 3;
+
+function viewportProgressSample(action = {}, observation = {}) {
+  const target = action.targetSnapshot || null;
+  const region = target?.visualRegion || target?.box || null;
+  const viewportHeight = Number(observation.page?.viewport?.height || 0);
+  const top = Number(region?.y);
+  const height = Number(region?.height || 0);
+  const center = Number.isFinite(top) ? top + height / 2 : null;
+  const distanceToViewport = center == null || !viewportHeight
+    ? null
+    : center < 0
+      ? Math.abs(center)
+      : center > viewportHeight
+        ? center - viewportHeight
+        : 0;
+  return {
+    observationId: observation.observationId || "",
+    exists: Boolean(target?.id && target?.controlId),
+    inViewport: region?.inViewport === true,
+    distanceToViewport: Number.isFinite(distanceToViewport) ? Math.round(distanceToViewport) : null,
+    at: new Date().toISOString()
+  };
+}
+
+function withViewportProgress(pending = {}, sample = {}) {
+  const history = Array.isArray(pending.viewportProgress) ? pending.viewportProgress : [];
+  const previous = history[history.length - 1] || null;
+  const previousDistance = typeof previous?.distanceToViewport === "number" ? previous.distanceToViewport : null;
+  const currentDistance = typeof sample?.distanceToViewport === "number" ? sample.distanceToViewport : null;
+  const measurableProgress = Boolean(
+    sample.inViewport
+    || (sample.exists && previous && !previous.exists)
+    || (previous
+      && previousDistance != null
+      && currentDistance != null
+      && currentDistance <= previousDistance - 8)
+  );
+  const comparableFailure = Boolean(previous && !sample.inViewport && !measurableProgress);
+  return {
+    ...pending,
+    viewportProgress: [...history, { ...sample, measurableProgress }].slice(-8),
+    noProgressFailureCount: measurableProgress
+      ? 0
+      : comparableFailure
+        ? Number(pending.noProgressFailureCount || 0) + 1
+        : Number(pending.noProgressFailureCount || 0),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function pendingViewportRecovery(blockedAction = {}, recoveryCount = 1, observation = {}) {
+  const initialProgress = viewportProgressSample(blockedAction, observation);
   return {
     type: "viewport_rebind",
     action: normalizeAction({
@@ -639,6 +535,8 @@ function pendingViewportRecovery(blockedAction = {}, recoveryCount = 1) {
       expectedOutcome: null
     }),
     recoveryCount,
+    viewportProgress: initialProgress.observationId ? [{ ...initialProgress, measurableProgress: false }] : [],
+    noProgressFailureCount: 0,
     blockedActionId: blockedAction.id || "",
     createdObservationId: blockedAction.observationId || "",
     updatedAt: new Date().toISOString()
@@ -657,6 +555,15 @@ function rebindPendingRecoveryAction(pending = {}, observation = {}) {
     expectedOutcome: null,
     reason: `Rebound pending governed action after viewport recovery: ${original.reason || original.intent || original.type || "action"}.`
   }), observation);
+}
+
+function pendingRecoveryTargetStatus(action = {}) {
+  const target = action.targetSnapshot || null;
+  const region = target?.visualRegion || target?.box || null;
+  return {
+    exists: Boolean(target?.id && target?.controlId),
+    inViewport: region?.inViewport === true
+  };
 }
 
 function summarizeTurn({ pageState, requirements, plannedAction, finalAction, policyDecision, deterministicAction }) {
@@ -699,7 +606,7 @@ function summarizeTurn({ pageState, requirements, plannedAction, finalAction, po
       status: gate.status,
       risk: gate.risk
     })),
-    activeSurface: pageState?.activeSurface || null
+    currentSurface: pageState?.currentSurface || null
   };
 }
 
@@ -719,6 +626,11 @@ function toClientDecision(action) {
     action: action.type,
     intent: action.intent || "",
     operation: action.operation || "",
+    interactionRole: action.interactionRole || "",
+    semanticEffect: action.semanticEffect || "",
+    expectedEvidence: action.expectedEvidence || "",
+    goalId: action.goalId || "",
+    candidateId: action.candidateId || "",
     skillPlanId: action.skillPlanId || "",
     skillAtomId: action.skillAtomId || "",
     requirementId: action.requirementId || "",
@@ -728,6 +640,7 @@ function toClientDecision(action) {
     targetSnapshot: action.targetSnapshot || null,
     decisionGroupId: action.decisionGroupId || action.targetSnapshot?.decisionGroupId || "",
     expectedOutcome: action.expectedOutcome || null,
+    affordance: action.affordance || null,
     value: action.value || action.targetLabel || "",
     x: action.x,
     y: action.y,
@@ -742,14 +655,7 @@ function toClientDecision(action) {
 }
 
 function askUserDecision(reason, observation = {}) {
-  return toClientDecision(normalizeAction({
-    type: "ask_user",
-    observationId: observation.observationId || "",
-    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-    reason,
-    risk: "uncertain",
-    requiresApproval: true
-  }));
+  return toClientDecision(finalHandoffAction(reason, observation));
 }
 
 function normalizeText(value = "") {
@@ -761,11 +667,15 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
   return {
     id: String(candidate.id || ""),
     controlId: String(candidate.controlId || ""),
+    stableKey: String(candidate.stableKey || ""),
+    meaning: String(candidate.meaning || candidate.semantic || candidate.label || ""),
+    structuredPrice: candidate.structuredPrice || null,
     visualRef: String(candidate.visualRef || ""),
     decisionGroupId: String(candidate.decisionGroupId || ""),
     label: String(candidate.label || ""),
     normalizedLabel: normalizeText(candidate.label || ""),
     role: String(candidate.role || ""),
+    domRole: String(candidate.domRole || ""),
     accessibleName: String(candidate.accessibility?.name || candidate.accessibleName || ""),
     accessibilityState: candidate.accessibility?.state || null,
     risk: String(candidate.risk || ""),
@@ -773,6 +683,8 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
     kind: String(candidate.kind || candidate.field || candidate.type || ""),
     controlKind: String(candidate.controlKind || candidate.kind || candidate.field || candidate.type || ""),
     state: candidate.controlState || candidate.state || null,
+    currentValue: String(candidate.currentValue || candidate.controlState?.normalizedValue || candidate.state?.normalizedValue || ""),
+    capabilities: Array.isArray(candidate.capabilities) ? candidate.capabilities.slice(0, 12) : [],
     selected: Boolean(candidate.selected),
     required: Boolean(candidate.required),
     hasValue: Boolean(candidate.hasValue || candidate.value),
@@ -783,6 +695,7 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
     actuators: Array.isArray(candidate.actuators) ? candidate.actuators.slice(0, 10) : [],
     operations: candidate.operations && typeof candidate.operations === "object" ? candidate.operations : {},
     recovery: candidate.recovery && typeof candidate.recovery === "object" ? candidate.recovery : {},
+    visualRegions: Array.isArray(candidate.visualRegions) ? candidate.visualRegions.slice(0, 12) : [],
     source,
     surfaceId: String(surface?.id || ""),
     surfaceType: String(surface?.type || "page"),
@@ -795,7 +708,7 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
 }
 
 function targetSnapshotForAction(action = {}, page = {}) {
-  if (!["click", "click_xy", "select", "type"].includes(action.type)) return null;
+  if (!["click", "click_xy", "select", "type", "keypress"].includes(action.type)) return null;
   const resolution = resolveActionControl(action, page);
   if (action.type === "click_xy" && resolution.ok) {
     const control = resolution.control;
@@ -839,8 +752,8 @@ function targetSnapshotForAction(action = {}, page = {}) {
       box: control.visualRegion || annotation?.box || null,
       controlState: control.state || null
     }, "canonical_alias_index", {
-      type: control.surfaceType || (control.sectionId ? "section" : "page"),
-      id: control.surfaceId || control.sectionId || "",
+      type: control.surfaceType || "page",
+      id: control.surfaceId || "",
       label: control.surfaceLabel || control.sectionLabel || "",
       sectionId: control.sectionId || "",
       sectionType: control.sectionType || "",
@@ -859,10 +772,10 @@ function targetSnapshotForAction(action = {}, page = {}) {
     } : null,
     visualRegion: action.visualRegion || null,
     source: "visual_fallback",
-    surfaceId: action.visualRegion?.surfaceId || (page.currentSurface && page.currentSurface.type !== "page" ? page.currentSurface?.id : page.activeSurface?.id) || "",
-    surfaceType: (page.currentSurface && page.currentSurface.type !== "page" ? page.currentSurface?.type : page.activeSurface?.type) || "page",
-    surfaceLabel: (page.currentSurface && page.currentSurface.type !== "page" ? page.currentSurface?.label : page.activeSurface?.label) || "",
-    surfaceNormalizedLabel: normalizeText((page.currentSurface && page.currentSurface.type !== "page" ? page.currentSurface?.label : page.activeSurface?.label) || "")
+    surfaceId: action.visualRegion?.surfaceId || currentSurfaceId(page),
+    surfaceType: currentSurface(page).type,
+    surfaceLabel: currentSurface(page).label,
+    surfaceNormalizedLabel: normalizeText(currentSurface(page).label)
   } : null;
 }
 
@@ -881,6 +794,84 @@ function bindTargetSnapshot(action = {}, observation = {}) {
   return withActionContract(bound, observation.page || {});
 }
 
+function observationSurfaceId(observation = {}) {
+  return currentSurfaceId(observation.page || {});
+}
+
+function candidateStrategySignature(goal = {}, candidate = {}) {
+  const affordance = candidate.affordance || {};
+  return [
+    affordance.stableKey || candidate.stableKey || candidate.controlId || "control",
+    affordance.actuator?.stableKey || candidate.operation || candidate.type || "actuator",
+    affordance.effect || candidate.semanticEffect || "effect",
+    candidate.value || "",
+    candidate.keys || ""
+  ].join(":");
+}
+
+function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedStrategySignatures = []) {
+  const binding = surfaceBinding(observation);
+  const attempted = new Set(attemptedStrategySignatures || []);
+  const candidates = buildCurrentCandidateSet({ goal, observation }).candidates.map((candidate) => {
+    const bound = bindTargetSnapshot(actionForCurrentCandidate(goal, candidate, observation), observation);
+    return {
+      ...candidate,
+      type: bound.type,
+      intent: bound.intent,
+      operation: bound.operation,
+      interactionRole: bound.interactionRole,
+      semanticEffect: bound.semanticEffect,
+      expectedEvidence: bound.expectedEvidence,
+      controlId: bound.controlId,
+      decisionGroupId: bound.decisionGroupId,
+      targetId: bound.targetId,
+      targetLabel: bound.targetLabel,
+      value: bound.value,
+      keys: bound.keys,
+      requirementId: bound.requirementId,
+      expectedOutcome: bound.expectedOutcome,
+      affordance: bound.affordance,
+      risk: bound.risk,
+      requiresApproval: bound.requiresApproval
+    };
+  }).filter((candidate) => (
+    !["click", "type", "select", "keypress", "click_xy"].includes(candidate.type)
+    || Boolean(candidate.controlId && candidate.targetId && candidate.expectedOutcome)
+  )).filter((candidate) => !attempted.has(candidateStrategySignature(goal, candidate)));
+  return { ...binding, candidates };
+}
+
+function groundedObservationCandidates(goal = {}, observation = {}) {
+  return groundedObservationCandidateSet(goal, observation).candidates;
+}
+
+function applyTransitionStatus(state = {}, observation = {}, previousObservation = null) {
+  const advanced = advanceActionLifecycle({ state, observation, previousObservation });
+  const transition = advanced.transition;
+  if (!advanced.lifecycle) return { ...advanced, transition: null };
+  const priorSignatures = [...(state.attemptedStrategySignatures || [])];
+  const governedAction = state.lastAction?.id === advanced.lifecycle.actionId
+    ? state.lastAction
+    : state.pendingAction?.action || observation.lastActionResult?.action || {};
+  const signature = candidateStrategySignature(state.currentGoal || {}, governedAction);
+  const attemptedStrategySignatures = transition?.status === "no_effect" && governedAction.controlId
+    ? [...new Set([...priorSignatures, signature])].slice(-12)
+    : ["achieved", "progressed", "blocked"].includes(transition?.status)
+      ? []
+      : priorSignatures;
+  return {
+    ...advanced,
+    state: withUpdate(advanced.state, {
+      lastTransition: transition || state.lastTransition || null,
+      attemptedStrategySignatures,
+      uncertainTransitionCount: transition?.status === "uncertain"
+        ? Number(state.uncertainTransitionCount || 0) + 1
+        : 0
+    }),
+    transition: transition || null
+  };
+}
+
 function inferActionIntent(action = {}) {
   const target = action.targetSnapshot || {};
   if (action.type === "fill_known_fields" || action.type === "fill_visible_profile_fields") return "fill_profile_fields";
@@ -896,8 +887,8 @@ function inferActionIntent(action = {}) {
 }
 
 function activeForegroundSurface(page = {}, target = {}) {
-  const candidates = [page.currentSurface, page.activeSurface].filter(Boolean);
-  const surface = candidates.find((item) => item?.type && item.type !== "page") || null;
+  const candidate = currentSurface(page);
+  const surface = candidate.type !== "page" ? candidate : null;
   if (!surface) return null;
   if (target.surfaceId && surface.id && target.surfaceId !== surface.id) return null;
   return surface;
@@ -906,6 +897,12 @@ function activeForegroundSurface(page = {}, target = {}) {
 function shouldRequireSurfaceDismissal(action = {}, page = {}) {
   const target = action.targetSnapshot || {};
   if (action.intent !== "decline_optional_extra") return false;
+  const choiceSurface = /dropdown|listbox|popover|menu/.test(String(target.surfaceType || "").toLowerCase());
+  const choiceSelection = Boolean(
+    /choice|radio|checkbox|option/.test(String(target.kind || target.role || "").toLowerCase())
+    || (choiceSurface && (action.decisionGroupId || target.decisionGroupId))
+  );
+  if (choiceSelection) return false;
   const targetSurfaceType = target.surfaceType || "";
   const actionSurface = targetSurfaceType && targetSurfaceType !== "page";
   const foreground = activeForegroundSurface(page, target);
@@ -933,6 +930,8 @@ function foregroundDismissedOutcome(action = {}, page = {}) {
 
 function expectedOutcomeForAction(action = {}, page = {}) {
   const target = action.targetSnapshot || {};
+  const foreground = activeForegroundSurface(page, target);
+  if (action.interactionRole) return compileTypedExpectedOutcome(action, page);
   if (shouldRequireSurfaceDismissal(action, page)) {
     return foregroundDismissedOutcome(action, page);
   }
@@ -959,31 +958,23 @@ function expectedOutcomeForAction(action = {}, page = {}) {
     };
   }
   if (action.intent === "decline_optional_extra") {
-    const requirementId = action.requirementId || target.decisionGroupId || "";
-    if (!requirementId) return null;
-    return {
-      type: "requirement_status",
-      requirementId,
-      status: "satisfied",
-      targetId: action.targetId || target.id || "",
-      decisionGroupId: action.decisionGroupId || target.decisionGroupId || "",
-      sectionId: target.sectionId || "",
-      sectionType: target.sectionType || "",
-      sectionLabel: target.sectionLabel || "",
-      surfaceId: target.surfaceId || "",
-      intent: action.intent,
-      mustNotIncreasePrice: true
-    };
+    // A decline intent is not a proof type. A radio/option must prove its exact
+    // selection, a Skip command must prove acknowledgement/waiver, and a Next
+    // control must prove progress. Derive that contract from the observed
+    // control and operation instead of forcing every decline into a choice.
+    return compileTypedExpectedOutcome({ ...action, expectedOutcome: null }, page);
   }
   if (action.intent === "open_choice_control") {
     return {
-      type: "active_surface_change",
+      type: "options_surface_appeared",
       targetId: action.targetId || target.id || "",
+      controlId: action.controlId || target.controlId || "",
       decisionGroupId: action.decisionGroupId || target.decisionGroupId || "",
       sectionId: target.sectionId || "",
       sectionType: target.sectionType || "",
       sectionLabel: target.sectionLabel || "",
       surfaceId: target.surfaceId || "",
+      previousSurfaceId: foreground?.id || "",
       intent: action.intent,
       mustNotIncreasePrice: true
     };
@@ -1063,14 +1054,7 @@ function withLatencyDebug(debug = {}, latency = {}, modelUsage = {}) {
 }
 
 function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, traceObservation, reason, error = null, latency = {}, modelUsage = {} }) {
-  const failureAction = normalizeAction({
-    observationId: traceObservation?.observationId || "",
-    observationHash: traceObservation?.observationSnapshot?.snapshotHash || traceObservation?.page?.snapshotHash || "",
-    type: "ask_user",
-    reason,
-    risk: "uncertain",
-    requiresApproval: true
-  });
+  const failureAction = finalHandoffAction(reason, traceObservation || {});
   const nextState = withUpdate(state, {
     lastAction: failureAction,
     status: "awaiting_user"
@@ -1111,6 +1095,390 @@ function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, t
   };
 }
 
+function browserDispatched(result = {}) {
+  return wasDispatched(result);
+}
+
+const STALE_IDENTITY_CODES = new Set([
+  "CANONICAL_ALIAS_UNRESOLVED",
+  "CANONICAL_ALIAS_CONFLICT",
+  "STALE_OBSERVATION",
+  "OBSERVATION_HASH_MISMATCH",
+  "PAGE_CHANGED_BEFORE_ACTION",
+  "TARGET_OBSERVATION_DRIFT",
+  "TARGET_DISAPPEARED",
+  "PLANNER_CANDIDATE_NOT_CURRENT",
+  ...RECOVERABLE_GROUNDING_CODES
+]);
+
+function actionResultCode(result = {}) {
+  return canonicalFailureCode(result);
+}
+
+function staleIdentityRejection(result = {}) {
+  return STALE_IDENTITY_CODES.has(actionResultCode(result));
+}
+
+function compactCurrentObservation(observation = {}) {
+  return {
+    observationId: observation.observationId || "",
+    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+    step: observation.page?.step || "",
+    url: observation.page?.url || "",
+    capturedAt: new Date().toISOString()
+  };
+}
+
+function reconcileSemanticGoalState(state = {}, observation = {}, traveler = {}) {
+  let currentGoal = state.currentGoal || null;
+  let pendingAction = state.pendingAction || null;
+  let attemptedCandidateIds = [...(state.attemptedCandidateIds || [])];
+  let verifiedResults = [...(state.verifiedResults || [])];
+  const result = observation.lastActionResult || {};
+
+  if (pendingAction?.actionId && result.actionId === pendingAction.actionId) {
+    if (pendingAction.status === "viewport_recovery") {
+      pendingAction = null;
+    } else {
+      if (browserDispatched(result) && pendingAction.candidateId) {
+        attemptedCandidateIds = [...new Set([
+          ...attemptedCandidateIds,
+          pendingAction.strategyId || pendingAction.candidateId
+        ])];
+      }
+      if (browserDispatched(result)) {
+        verifiedResults = [...verifiedResults, {
+          goalId: pendingAction.goalId || currentGoal?.goalId || "",
+          candidateId: pendingAction.candidateId || "",
+          actionId: result.actionId || "",
+          observationId: observation.observationId || "",
+          dispatched: true,
+          browserVerified: result.verified === true,
+          postconditionSatisfied: result.postconditionSatisfied === true,
+          outcomeCode: result.outcome?.code || result.failureCode || "",
+          at: new Date().toISOString()
+        }].slice(-40);
+      }
+      pendingAction = null;
+    }
+  }
+
+  if (currentGoal && profileGoalSatisfied(currentGoal, observation, traveler)) {
+    verifiedResults = [...verifiedResults, {
+      goalId: currentGoal.goalId,
+      candidateId: result.candidateId || "",
+      actionId: result.actionId || "",
+      observationId: observation.observationId || "",
+      browserVerified: true,
+      semanticPostconditionSatisfied: true,
+      desiredValue: currentGoal.desiredValue,
+      at: new Date().toISOString()
+    }].slice(-40);
+    currentGoal = null;
+    pendingAction = null;
+    attemptedCandidateIds = [];
+  }
+
+  currentGoal = deriveProfileGoal(observation, traveler, currentGoal);
+  if (!currentGoal) attemptedCandidateIds = [];
+  return withUpdate(state, {
+    userPolicy: state.userPolicy || state.policySnapshot || {},
+    transactionInvariants: state.transactionInvariants || state.invariantBaseline || null,
+    currentObservation: compactCurrentObservation(observation),
+    currentGoal,
+    pendingAction,
+    attemptedCandidateIds,
+    verifiedResults,
+    activeSkillPlan: undefined,
+    blockedObligation: undefined,
+    policySnapshot: undefined,
+    invariantBaseline: undefined
+  });
+}
+
+async function runProfileSemanticGoalTurn({
+  apiKey,
+  model,
+  recoveryModel,
+  dataDir,
+  state,
+  observation,
+  traveler,
+  transactionStore,
+  clientTurnId,
+  screenshotDataUrl,
+  traceObservation,
+  turnId,
+  latency
+}) {
+  let goalState = reconcileSemanticGoalState(state, observation, traveler);
+  const readiness = profileStageReadiness(observation, traveler);
+  if (!goalState.currentGoal) {
+    transactionStore?.saveSession?.(goalState);
+    if (readiness.ready || !readiness.profileStage) {
+      return { handled: false, state: goalState };
+    }
+    if (readiness.unresolvedKnown.length > 0) {
+      throw new Error(`PROFILE_PROGRESSION_INVARIANT: ${readiness.unresolvedKnown.map((item) => item.semanticType).join(",")} has known data but currentGoal is null.`);
+    }
+    if (readiness.missingUserData.length > 0) {
+      const missing = readiness.missingUserData.map((item) => item.label || item.semanticType).join(", ");
+      const reason = `Required traveler data is not available in the saved profile or current context: ${missing}.`;
+      const handoff = finalHandoffAction(reason, observation);
+      goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
+      transactionStore?.saveSession?.(goalState);
+      return {
+        handled: true,
+        state: goalState,
+        clientDecision: toClientDecision(handoff),
+        debug: withLatencyDebug({ currentGoal: null, finalAction: handoff, reason }, latency, modelUsageFromMetas(model, []))
+      };
+    }
+    const blockers = [
+      ...readiness.unresolvedRequired.map((item) => item.label),
+      ...readiness.visibleErrors
+    ].filter(Boolean).join("; ");
+    const reason = `Known traveler data exists, but no safe actionable control is available${blockers ? `: ${blockers}` : "."}`;
+    const handoff = finalHandoffAction(reason, observation);
+    goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
+    transactionStore?.saveSession?.(goalState);
+    return {
+      handled: true,
+      state: goalState,
+      clientDecision: toClientDecision(handoff),
+      debug: withLatencyDebug({ currentGoal: null, finalAction: handoff, reason, stopCategory: "safe_candidate_unavailable" }, latency, modelUsageFromMetas(model, []))
+    };
+  }
+
+  if (goalState.pendingAction) {
+    const reason = `The browser has not returned an execution result for ${goalState.pendingAction.candidateId || goalState.pendingAction.actionId}; stopping instead of issuing another action.`;
+    const handoff = finalHandoffAction(reason, observation, { goalId: goalState.currentGoal.goalId });
+    goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
+    transactionStore?.saveSession?.(goalState);
+    return {
+      handled: true,
+      state: goalState,
+      clientDecision: toClientDecision(handoff),
+      debug: withLatencyDebug({ currentGoal: goalState.currentGoal, finalAction: handoff, reason }, latency, modelUsageFromMetas(model, []))
+    };
+  }
+
+  const attempted = goalState.attemptedCandidateIds || [];
+  const candidates = buildCurrentCandidateSet({
+    goal: goalState.currentGoal,
+    observation,
+    traveler,
+    attemptedCandidateIds: attempted
+  }).candidates;
+  goalState = withUpdate(goalState, {
+    currentGoal: {
+      ...goalState.currentGoal,
+      candidates,
+      currentValue: deriveProfileGoal(observation, traveler, goalState.currentGoal)?.currentValue || goalState.currentGoal.currentValue || "",
+      observationId: observation.observationId || "",
+      updatedAt: new Date().toISOString()
+    }
+  });
+
+  if (attempted.length >= 3 || candidates.length === 0) {
+    const reason = attempted.length >= 3
+      ? `The recovery budget for ${goalState.currentGoal.label || goalState.currentGoal.semanticType} was exhausted after ${attempted.length} browser-dispatched candidates.`
+      : `No untried grounded candidate remains for ${goalState.currentGoal.label || goalState.currentGoal.semanticType}.`;
+    const handoff = finalHandoffAction(reason, observation, { goalId: goalState.currentGoal.goalId });
+    goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
+    transactionStore?.saveSession?.(goalState);
+    return {
+      handled: true,
+      state: goalState,
+      clientDecision: toClientDecision(handoff),
+      debug: withLatencyDebug({ currentGoal: goalState.currentGoal, candidates, finalAction: handoff }, latency, modelUsageFromMetas(model, []))
+    };
+  }
+
+  let candidate = candidates.length === 1 && !candidates[0].requiresJudgment
+    ? candidates[0]
+    : null;
+  let selectorMeta = null;
+  if (!candidate) {
+    try {
+      const selected = await selectCandidate({
+        apiKey,
+        model: recoveryModel || model,
+        goal: goalState.currentGoal,
+        candidates,
+        observation,
+        screenshotDataUrl
+      });
+      selectorMeta = selected.meta || null;
+      latency.verify_plan_model_ms = Number(selectorMeta?.durationMs || 0);
+      candidate = candidates.find((item) => item.candidateId === selected.candidateId) || null;
+    } catch (error) {
+      if (error?.code !== "PLANNER_CANDIDATE_NOT_CURRENT") throw error;
+      const reason = `The planner failed ${error.selectionAttempts || 3} bounded selections against the unchanged candidate set for ${goalState.currentGoal.label || goalState.currentGoal.semanticType}.`;
+      const handoff = finalHandoffAction(reason, observation, { goalId: goalState.currentGoal.goalId });
+      goalState = withUpdate(goalState, { pendingAction: null, lastAction: handoff, status: "awaiting_user" });
+      transactionStore?.saveSession?.(goalState);
+      return {
+        handled: true,
+        state: goalState,
+        clientDecision: toClientDecision(handoff),
+        debug: withLatencyDebug({
+          plannerFailureCategory: "candidate_selection_exhausted",
+          candidateSelectionAttempts: error.selectionAttempts || 3,
+          candidateSetObservationId: observation.observationId || "",
+          browserReobserved: false,
+          finalAction: handoff
+        }, latency, modelUsageFromMetas(recoveryModel || model, selectorMeta?.retryMetas || []))
+      };
+    }
+  }
+
+  if (!candidate) throw new Error("No grounded candidate was selected");
+  let action = bindTargetSnapshot(
+    actionForCurrentCandidate(goalState.currentGoal, candidate, observation),
+    observation
+  );
+  const policyStartedAt = Date.now();
+  let governance = governAction({
+    action,
+    state: goalState,
+    observation,
+    traveler,
+    approvals: goalState.approvals,
+    store: transactionStore,
+    turnId: clientTurnId || turnId
+  });
+  latency.policy_ms = Date.now() - policyStartedAt;
+  goalState = governance.state || goalState;
+
+  if (!governance.allow && governance.decision === "recoverable" && governance.code === "TARGET_OUT_OF_VIEW") {
+    const scrollAction = viewportRecoveryAction(action, observation, 1);
+    const scrollGovernance = governAction({
+      action: scrollAction,
+      state: goalState,
+      observation,
+      traveler,
+      approvals: goalState.approvals,
+      store: transactionStore,
+      turnId: clientTurnId || turnId
+    });
+    if (scrollGovernance.allow) {
+      governance = scrollGovernance;
+      goalState = scrollGovernance.state || goalState;
+      goalState = withUpdate(goalState, {
+        pendingAction: {
+          status: "viewport_recovery",
+          actionId: scrollAction.id,
+          goalId: goalState.currentGoal.goalId,
+          candidateId: candidate.candidateId,
+          candidate,
+          recoveryOfAction: action
+        },
+        lastAction: scrollAction,
+        status: "running"
+      });
+      action = scrollAction;
+    }
+  }
+
+  if (!governance.allow && governance.decision === "recoverable" && STALE_IDENTITY_CODES.has(governance.code)) {
+    const groundingBudget = applyRecoveryBudget(goalState, {
+      dispatched: false,
+      executed: false,
+      verified: false,
+      outcome: { code: governance.code }
+    });
+    goalState = withUpdate(groundingBudget.state, {
+      pendingAction: null,
+      stallCount: 0
+    });
+    action = groundingBudget.exhausted
+      ? finalHandoffAction(
+          "Three fresh profile candidate bindings were rejected before dispatch. Grounded replanning is exhausted.",
+          observation,
+          { goalId: goalState.currentGoal.goalId }
+        )
+      : normalizeAction({
+          observationId: observation.observationId || "",
+          observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+          type: "wait",
+          intent: "reobserve_after_grounding_rejection",
+          goalId: goalState.currentGoal.goalId,
+          candidateId: candidate.candidateId,
+          reason: `Discard ${governance.code}, capture a fresh observation, rebuild profile candidates, and replan the same goal.`,
+          risk: "safe",
+          requiresApproval: false
+        });
+    goalState = withUpdate(goalState, {
+      lastAction: action,
+      status: action.type === "ask_user" ? "awaiting_user" : "running"
+    });
+  } else if (!governance.allow) {
+    const reason = `The grounded candidate ${candidate.candidateId} was rejected by the safety governor: ${governance.reason || governance.code}.`;
+    action = finalHandoffAction(reason, observation, {
+      goalId: goalState.currentGoal.goalId,
+      candidateId: candidate.candidateId
+    });
+    goalState = withUpdate(goalState, { lastAction: action, status: "awaiting_user" });
+  } else if (action.type !== "scroll") {
+    goalState = withUpdate(goalState, {
+      pendingAction: {
+        status: "governed",
+        actionId: action.id,
+        goalId: goalState.currentGoal.goalId,
+        candidateId: candidate.candidateId,
+        strategyId: candidate.strategyId || candidate.candidateId,
+        expectedOutcome: action.expectedOutcome,
+        affordance: action.affordance,
+        interactionRole: action.interactionRole,
+        semanticEffect: action.semanticEffect,
+        expectedEvidence: action.expectedEvidence,
+        observationId: observation.observationId || ""
+      },
+      lastAction: action,
+      status: "running"
+    });
+  }
+
+  transactionStore?.recordActionEvent?.(goalState.id, {
+    actionId: action.id || "",
+    observationId: observation.observationId || "",
+    turnId: clientTurnId || turnId,
+    stage: governance.allow ? "semantic_candidate_governed" : "semantic_candidate_blocked",
+    goalId: goalState.currentGoal.goalId,
+    candidateId: candidate.candidateId,
+    action,
+    result: { allow: governance.allow, code: governance.code || "", reason: governance.reason || "" }
+  });
+  transactionStore?.saveSession?.(goalState);
+  const modelUsage = modelUsageFromMetas(recoveryModel || model, [selectorMeta]);
+  const debug = withLatencyDebug({
+    currentGoal: goalState.currentGoal,
+    candidates: candidates.map((item) => ({
+      candidateId: item.candidateId,
+      type: item.type,
+      operation: item.operation,
+      summary: item.summary
+    })),
+    selectedCandidateId: candidate.candidateId,
+    finalAction: action,
+    policyDecision: governance
+  }, latency, modelUsage);
+  writeTrace(dataDir, state.id, {
+    turnId,
+    screenshotDataUrl,
+    observation: traceObservation,
+    pageState: null,
+    requirements: goalState.activeRequirements || goalState.requirements || [],
+    verification: observation.lastActionResult || null,
+    plannedAction: { candidateId: candidate.candidateId },
+    policyDecision: governance,
+    executionResult: { currentGoal: goalState.currentGoal, pendingAction: goalState.pendingAction },
+    debug
+  });
+  return { handled: true, state: goalState, clientDecision: toClientDecision(action), debug };
+}
+
 /**
  * @param {Object} args
  * @param {string} args.apiKey
@@ -1135,378 +1503,182 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   };
   let classificationMeta = null;
   let verifyPlanMeta = null;
-
-  if (state.blockedObligation && observation.lastActionResult?.actionId) {
-    const reconciledObligation = reconcileBlockedObligationResult(state.blockedObligation, observation.lastActionResult);
-    state = withUpdate(state, { blockedObligation: reconciledObligation.obligation });
+  const authoritativeTransition = applyTransitionStatus(
+    state,
+    observation,
+    observation.previousObservation || null
+  );
+  state = authoritativeTransition.state;
+  observation = authoritativeTransition.observation;
+  const transition = authoritativeTransition.transition;
+  const lifecycle = authoritativeTransition.lifecycle;
+  const lifecycleDirective = authoritativeTransition.directive || "continue";
+  if (lifecycle) {
+    transactionStore?.recordActionEvent?.(state.id, {
+      actionId: lifecycle.actionId,
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: lifecycle.status,
+      lifecycle,
+      directive: lifecycleDirective
+    });
+    transactionStore?.advanceGovernedAction?.(
+      lifecycle.actionId,
+      ["allowed", "approved", "dispatched", "observed"],
+      lifecycle.status,
+      { lifecycle, transition }
+    );
+    state = withUpdate(state, {
+      pendingAction: ["rejected_before_dispatch", "observed", "verified", "failed", "unsafe"].includes(lifecycle.status)
+        ? null
+        : state.pendingAction,
+      stallCount: ["rejected_before_dispatch", "observed", "verified"].includes(lifecycle.status)
+        ? 0
+        : state.stallCount
+    });
+    transactionStore?.saveSession?.(state);
+  }
+  if (transition) {
+    const preserveViewportRecovery = state.pendingAction?.status === "viewport_recovery";
+    transactionStore?.recordActionEvent?.(state.id, {
+      actionId: transition.actionId,
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "transition_evaluated",
+      status: transition.status,
+      nextDirective: transition.nextDirective,
+      postcondition: transition.postcondition,
+      diff: transition.diff
+    });
+    state = withUpdate(state, {
+      currentBlocker: transition.status === "blocked" ? transition.blocker : null,
+      pendingAction: ["achieved", "progressed", "blocked"].includes(transition.status) && !preserveViewportRecovery
+        ? null
+        : state.pendingAction
+    });
     transactionStore?.saveSession?.(state);
   }
 
-  if (state.activeSkillPlan?.status === "suspended") {
-    const recoveryResume = resumeSuspendedSkillPlan(
-      state.activeSkillPlan,
-      observation,
-      traveler,
-      observation.lastActionResult || {},
-      state.blockedObligation
+  if (lifecycleDirective === "stop_for_safety" || transition?.status === "unsafe") {
+    const action = finalHandoffAction(
+      "Fresh browser evidence confirmed a policy or transaction-safety conflict. I stopped before another checkout action.",
+      observation
     );
-    if (recoveryResume.resumable) {
-      state = withUpdate(state, {
-        activeSkillPlan: recoveryResume.plan,
-        blockedObligation: {
-          ...state.blockedObligation,
-          status: "recovered",
-          updatedAt: new Date().toISOString()
-        },
-        status: "running"
-      });
-      transactionStore?.recordActionEvent?.(state.id, {
-        actionId: observation.lastActionResult?.actionId || "",
-        observationId: observation.observationId || "",
-        turnId: clientTurnId || turnId,
-        stage: "skill_recovery_resumed",
-        skillPlanId: recoveryResume.plan.planId,
-        skillAtomId: recoveryResume.atom?.atomId || "",
-        recoveryContext: recoveryResume.context
-      });
-      transactionStore?.saveSession?.(state);
-    }
+    const unsafeState = withUpdate(state, { lastAction: action, status: "awaiting_user" });
+    transactionStore?.saveSession?.(unsafeState);
+    return {
+      state: unsafeState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({ transition, finalAction: action }, latency, modelUsageFromMetas(model, []))
+    };
   }
 
-  // Known traveler/contact obligations are deterministic transaction work.
-  // Establish ownership before either model call so profile completion cannot
-  // depend on the planner voluntarily proposing a compound fill action.
-  const profileReadiness = profileStageReadiness(observation, traveler);
-  const existingSkillStatus = state.activeSkillPlan?.status || "";
-  if (profileReadiness.shouldOwn && !["running", "suspended"].includes(existingSkillStatus)) {
-    const ownershipAction = deterministicProfileOwnershipAction(observation);
-    const ownershipPlan = createSkillPlan(ownershipAction, observation, traveler);
-    if (ownershipPlan?.status === "running") {
-      state = withUpdate(state, {
-        activeSkillPlan: ownershipPlan,
-        status: "running"
-      });
-      transactionStore?.recordActionEvent?.(state.id, {
-        actionId: ownershipAction.id,
-        observationId: observation.observationId || "",
-        turnId: clientTurnId || turnId,
-        stage: "skill_plan_created",
-        skill: ownershipPlan.skillType,
-        skillPlanId: ownershipPlan.planId,
-        atomCount: ownershipPlan.atoms?.length || 0,
-        ownership: "deterministic_profile_stage",
-        readiness: profileReadiness
-      });
-      transactionStore?.saveSession?.(state);
-    }
+  if (lifecycleDirective === "handoff_recovery_exhausted") {
+    const reason = lifecycle?.dispatched
+      ? "Three browser-dispatched strategies produced no verified effect. Execution recovery is exhausted."
+      : "Three fresh grounded candidates were rejected before dispatch. Grounding recovery is exhausted.";
+    const action = finalHandoffAction(reason, observation);
+    const exhaustedState = withUpdate(state, { lastAction: action, status: "awaiting_user" });
+    transactionStore?.saveSession?.(exhaustedState);
+    return {
+      state: exhaustedState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({ lifecycle, lifecycleDirective, finalAction: action }, latency, modelUsageFromMetas(model, []))
+    };
   }
 
-  // A persisted skill owns its predictable next atoms. Resume it before any
-  // model call, but still bind and govern exactly one atom against this fresh
-  // observation. The AI is consulted again only after completion or when the
-  // live page/result no longer matches the skill contract.
-  if (state.activeSkillPlan?.status === "running") {
-    const previousDispatchedAtom = (state.activeSkillPlan.atoms || []).find((atom) => atom.status === "dispatched") || null;
-    const resumed = advanceSkillPlan(
-      state.activeSkillPlan,
-      observation,
-      traveler,
-      observation.lastActionResult || {}
-    );
-    let skillState = withUpdate(state, {
-      activeSkillPlan: resumed.plan,
-      lastVerification: observation.lastActionResult || state.lastVerification,
-      stallCount: 0
-    });
-    if (state.blockedObligation) {
-      skillState = withUpdate(skillState, {
-        blockedObligation: resolvedBlockedObligation(
-          state.blockedObligation,
-          resumed.plan,
-          observation.lastActionResult || {},
-          observation
-        )
-      });
-    }
-    if (previousDispatchedAtom && resumed.plan.atoms?.find((atom) => atom.atomId === previousDispatchedAtom.atomId)?.status === "complete") {
-      transactionStore?.recordActionEvent?.(skillState.id, {
-        actionId: previousDispatchedAtom.lastActionId || "",
-        observationId: observation.observationId || "",
-        turnId: clientTurnId || turnId,
-        stage: "skill_atom_verified",
-        skillPlanId: resumed.plan.planId,
-        skillAtomId: previousDispatchedAtom.atomId,
-        result: observation.lastActionResult || null
-      });
-    }
-    if (resumed.status === "action") {
-      const executableAction = bindTargetSnapshot(resumed.action, observation);
-      const policyStartedAt = Date.now();
-      let governance = governAction({
-        action: executableAction,
-        state: skillState,
-        observation,
-        traveler,
-        approvals: skillState.approvals,
-        store: transactionStore,
-        turnId: clientTurnId || turnId
-      });
-      latency.policy_ms = Date.now() - policyStartedAt;
-      skillState = governance.state || skillState;
-      let finalAction = executableAction;
-      if (!governance.allow) {
-        if (governance.decision === "recoverable" && governance.code === "TARGET_OUT_OF_VIEW") {
-          const recovery = prepareSkillViewportRecovery(
-            resumed.plan,
-            executableAction.id,
-            observation.observationId || ""
-          );
-          if (recovery.recovered) {
-            const scrollAction = viewportRecoveryAction(
-              executableAction,
-              observation,
-              recovery.atom?.viewportRecoveryCount || 1
-            );
-            const scrollGovernance = governAction({
-              action: scrollAction,
-              state: skillState,
-              observation,
-              traveler,
-              approvals: skillState.approvals,
-              store: transactionStore,
-              turnId: clientTurnId || turnId
-            });
-            governance = scrollGovernance;
-            if (scrollGovernance.allow) {
-              skillState = withUpdate(scrollGovernance.state || skillState, {
-                activeSkillPlan: recovery.plan,
-                lastAction: scrollAction,
-                status: "running"
-              });
-              finalAction = scrollAction;
-              transactionStore?.recordActionEvent?.(skillState.id, {
-                actionId: scrollAction.id,
-                observationId: observation.observationId || "",
-                turnId: clientTurnId || turnId,
-                stage: "skill_viewport_recovery_dispatched",
-                skillPlanId: recovery.plan.planId,
-                skillAtomId: recovery.atom?.atomId || "",
-                recoveryOfActionId: executableAction.id,
-                action: scrollAction
-              });
-            } else {
-              const failedPlan = failSkillAction(
-                resumed.plan,
-                executableAction.id,
-                scrollGovernance.reason || "The action governor blocked viewport recovery.",
-                observation.observationId || ""
-              );
-              skillState = withUpdate(skillState, { activeSkillPlan: failedPlan, status: "awaiting_user" });
-              finalAction = policyBlockedAction(scrollGovernance, scrollAction);
-            }
-          } else {
-            skillState = withUpdate(skillState, { activeSkillPlan: recovery.plan, status: "awaiting_user" });
-            finalAction = policyBlockedAction(governance, executableAction);
-          }
-        } else {
-          const failedPlan = failSkillAction(
-            resumed.plan,
-            executableAction.id,
-            governance.reason || "The action governor blocked this skill atom.",
-            observation.observationId || ""
-          );
-          skillState = withUpdate(skillState, { activeSkillPlan: failedPlan, status: "awaiting_user" });
-          finalAction = policyBlockedAction(governance, executableAction);
-        }
-      } else {
-        skillState = withUpdate(skillState, {
-          activeSkillPlan: resumed.plan,
-          lastAction: executableAction,
-          status: "running"
-        });
-        transactionStore?.recordActionEvent?.(skillState.id, {
-          actionId: executableAction.id,
+  if (transition?.status === "uncertain") {
+    const exhausted = Number(state.uncertainTransitionCount || 0) > 2;
+    const action = exhausted
+      ? finalHandoffAction("Fresh browser evidence remained insufficient after bounded reobservation, so I need help before acting.", observation)
+      : normalizeAction({
           observationId: observation.observationId || "",
-          turnId: clientTurnId || turnId,
-          stage: "skill_atom_dispatched",
-          skillPlanId: resumed.plan.planId,
-          skillAtomId: resumed.atom?.atomId || "",
-          action: executableAction
+          observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+          type: "wait",
+          intent: "reobserve_after_grounding_rejection",
+          reason: "The transition evidence is incomplete. Capture one fresh observation and rebind current controls without repeating the action.",
+          risk: "safe",
+          requiresApproval: false
         });
-      }
-      finalAction = bindTargetSnapshot(finalAction, observation);
-      skillState = withUpdate(skillState, { lastAction: finalAction });
-      transactionStore?.saveSession?.(skillState);
-      const debug = withLatencyDebug({
-        ...summarizeTurn({
-          pageState: null,
-          requirements: skillState.activeRequirements || skillState.requirements || [],
-          plannedAction: resumed.action,
-          finalAction,
-          policyDecision: governance,
-          deterministicAction: resumed.action
-        }),
-        skill: {
-          planId: resumed.plan.planId,
-          atomId: resumed.atom?.atomId || "",
-          status: resumed.plan.status,
-          remaining: (resumed.plan.atoms || []).filter((atom) => atom.status === "pending" || atom.status === "dispatched").length
-        }
-      }, latency, modelUsageFromMetas(model, []));
-      writeTrace(dataDir, state.id, {
-        turnId,
-        screenshotDataUrl,
-        observation: traceObservation,
-        pageState: null,
-        requirements: skillState.activeRequirements || skillState.requirements || [],
-        requirementLifecycle: skillState.requirementLifecycle || [],
-        verification: observation.lastActionResult || null,
-        plannedAction: resumed.action,
-        policyDecision: governance,
-        executionResult: { skillPlanId: resumed.plan.planId, skillAtomId: resumed.atom?.atomId || "" },
-        debug
-      });
-      return { state: skillState, clientDecision: toClientDecision(finalAction), debug };
-    }
-
-    const skillStage = resumed.status === "complete" ? "skill_completed" : "skill_suspended";
-    transactionStore?.recordActionEvent?.(skillState.id, {
-      actionId: previousDispatchedAtom?.lastActionId || "",
-      observationId: observation.observationId || "",
-      turnId: clientTurnId || turnId,
-      stage: skillStage,
-      skillPlanId: resumed.plan.planId,
-      reason: resumed.reason || ""
-    });
-    transactionStore?.saveSession?.(skillState);
-    state = skillState;
+    const uncertainState = withUpdate(state, { lastAction: action, status: exhausted ? "awaiting_user" : "running" });
+    transactionStore?.saveSession?.(uncertainState);
+    return {
+      state: uncertainState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({ transition, finalAction: action }, latency, modelUsageFromMetas(model, []))
+    };
   }
 
-  if (state.activeSkillPlan?.status === "suspended") {
-    const obligation = blockedObligationForPlan(
-      state.activeSkillPlan,
+  try {
+    const profileTurn = await runProfileSemanticGoalTurn({
+      apiKey,
+      model,
+      recoveryModel,
+      dataDir,
+      state,
       observation,
       traveler,
-      state.blockedObligation,
-      { code: "SKILL_ATOM_BLOCKED", message: state.activeSkillPlan.suspendedReason }
-    );
-    if (obligation) {
-      const recoveryAction = canonicalBlockedRecoveryAction(obligation, observation);
-      if (recoveryAction && (obligation.attempts || []).length < 3) {
-        const executableAction = bindTargetSnapshot(recoveryAction, observation);
-        const policyStartedAt = Date.now();
-        const governance = governAction({
-          action: executableAction,
-          state: withUpdate(state, { blockedObligation: obligation }),
-          observation,
-          traveler,
-          approvals: state.approvals,
-          store: transactionStore,
-          turnId: clientTurnId || turnId
-        });
-        latency.policy_ms = Date.now() - policyStartedAt;
-        if (governance.allow) {
-          const attemptedObligation = recordBlockedObligationAttempt(obligation, executableAction);
-          const recoveryState = withUpdate(governance.state || state, {
-            blockedObligation: attemptedObligation,
-            lastAction: executableAction,
-            status: "running"
-          });
-          transactionStore?.recordActionEvent?.(recoveryState.id, {
-            actionId: executableAction.id,
-            observationId: observation.observationId || "",
-            turnId: clientTurnId || turnId,
-            stage: "blocked_obligation_recovery_dispatched",
-            obligationId: attemptedObligation.obligationId,
-            skillPlanId: attemptedObligation.owner.skillPlanId,
-            skillAtomId: attemptedObligation.owner.atomId,
-            controlId: attemptedObligation.control.controlId,
-            operation: attemptedObligation.operation,
-            expectedOutcome: attemptedObligation.recoveryExpectedOutcome,
-            action: executableAction
-          });
-          transactionStore?.saveSession?.(recoveryState);
-          const debug = withLatencyDebug({
-            blockedObligation: attemptedObligation,
-            plannedAction: recoveryAction,
-            finalAction: executableAction,
-            policyDecision: governance
-          }, latency, modelUsageFromMetas(model, []));
-          writeTrace(dataDir, state.id, {
-            turnId,
-            screenshotDataUrl,
-            observation: traceObservation,
-            pageState: null,
-            requirements: recoveryState.activeRequirements || recoveryState.requirements || [],
-            requirementLifecycle: recoveryState.requirementLifecycle || [],
-            verification: observation.lastActionResult || null,
-            plannedAction: recoveryAction,
-            policyDecision: governance,
-            executionResult: { blockedObligation: attemptedObligation },
-            debug
-          });
-          return { state: recoveryState, clientDecision: toClientDecision(executableAction), debug };
-        }
-      }
-      const exhausted = (obligation.attempts || []).length >= 3;
-      const handedOff = {
-        ...obligation,
-        status: "handed_off",
-        finalStatus: "handed_off",
-        finalReason: exhausted
-          ? "All bounded canonical recovery candidates were exhausted."
-          : "No screenshot-confirmed or canonical actuator remains for this exact operation.",
-        updatedAt: new Date().toISOString()
-      };
-      const handoffAction = normalizeAction({
-        id: `act_blocked_handoff_${Date.now().toString(36)}`,
-        observationId: observation.observationId || "",
-        observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-        type: "ask_user",
-        skillPlanId: handedOff.owner.skillPlanId,
-        skillAtomId: handedOff.owner.atomId,
-        controlId: handedOff.control.controlId,
-        reason: `${handedOff.control.label || handedOff.control.semanticType} remains blocked: ${handedOff.finalReason}`,
-        risk: "uncertain",
-        requiresApproval: true
-      });
-      const handoffState = withUpdate(state, {
-        blockedObligation: handedOff,
-        lastAction: handoffAction,
-        status: "awaiting_user"
-      });
-      transactionStore?.saveSession?.(handoffState);
-      return {
-        state: handoffState,
-        clientDecision: toClientDecision(handoffAction),
-        debug: withLatencyDebug({ blockedObligation: handedOff, finalAction: handoffAction }, latency, modelUsageFromMetas(model, []))
-      };
-    }
+      transactionStore,
+      clientTurnId,
+      screenshotDataUrl,
+      traceObservation,
+      turnId,
+      latency
+    });
+    state = profileTurn.state || state;
+    if (profileTurn.handled) return profileTurn;
+  } catch (error) {
+    return safePlannerFailureResult({
+      dataDir,
+      state,
+      turnId,
+      screenshotDataUrl,
+      traceObservation,
+      reason: "AI candidate selection failed for the current grounded semantic goal.",
+      error,
+      latency,
+      modelUsage: modelUsageFromMetas(recoveryModel || model, [])
+    });
   }
 
   // A recoverable governor result preserves the semantic action across the
   // observation created by scrolling. Rebind that same action to the fresh
   // canonical registry before consulting the model again.
-  if (state.pendingRecoveryAction?.type === "viewport_rebind" && state.pendingRecoveryAction.action) {
-    const pending = state.pendingRecoveryAction;
+  if (state.pendingAction?.type === "viewport_rebind" && state.pendingAction.action) {
+    const pending = state.pendingAction;
     const reboundAction = rebindPendingRecoveryAction(pending, observation);
+    const targetStatus = pendingRecoveryTargetStatus(reboundAction);
+    const pendingWithProgress = withViewportProgress(
+      pending,
+      viewportProgressSample(reboundAction, observation)
+    );
     const policyStartedAt = Date.now();
-    let recoveryGovernance = governAction({
-      action: reboundAction,
-      state,
-      observation,
-      traveler,
-      approvals: state.approvals,
-      store: transactionStore,
-      turnId: clientTurnId || turnId
-    });
+    let recoveryGovernance = targetStatus.exists && targetStatus.inViewport
+      ? governAction({
+          action: reboundAction,
+          state,
+          observation,
+          traveler,
+          approvals: state.approvals,
+          store: transactionStore,
+          turnId: clientTurnId || turnId
+        })
+      : {
+          state,
+          allow: false,
+          decision: "recoverable",
+          code: targetStatus.exists ? "TARGET_OUT_OF_VIEW" : "TARGET_DISAPPEARED",
+          reason: targetStatus.exists
+            ? "The fresh observation has not yet confirmed the pending canonical target in the viewport."
+            : "The fresh observation cannot currently resolve the pending canonical target."
+        };
     latency.policy_ms = Date.now() - policyStartedAt;
     let recoveryState = recoveryGovernance.state || state;
     let finalAction = reboundAction;
 
-    if (recoveryGovernance.allow) {
+    if (recoveryGovernance.allow && targetStatus.exists && targetStatus.inViewport) {
       recoveryState = withUpdate(recoveryState, {
-        pendingRecoveryAction: null,
+        pendingAction: null,
         lastAction: reboundAction,
         status: "running"
       });
@@ -1520,8 +1692,9 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
         action: reboundAction
       });
     } else if (recoveryGovernance.decision === "recoverable"
-      && recoveryGovernance.code === "TARGET_OUT_OF_VIEW"
-      && Number(pending.recoveryCount || 0) < 2) {
+      && ["TARGET_OUT_OF_VIEW", "TARGET_DISAPPEARED"].includes(recoveryGovernance.code)
+      && Number(pendingWithProgress.recoveryCount || 0) < MAX_VIEWPORT_RECOVERY_ATTEMPTS
+      && Number(pendingWithProgress.noProgressFailureCount || 0) < MAX_CONSECUTIVE_VIEWPORT_FAILURES) {
       const nextRecoveryCount = Number(pending.recoveryCount || 0) + 1;
       const scrollAction = viewportRecoveryAction(reboundAction, observation, nextRecoveryCount);
       const scrollGovernance = governAction({
@@ -1537,8 +1710,8 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
         recoveryGovernance = scrollGovernance;
         finalAction = scrollAction;
         recoveryState = withUpdate(scrollGovernance.state || recoveryState, {
-          pendingRecoveryAction: {
-            ...pending,
+          pendingAction: {
+            ...pendingWithProgress,
             recoveryCount: nextRecoveryCount,
             updatedAt: new Date().toISOString()
           },
@@ -1549,7 +1722,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
           actionId: scrollAction.id,
           observationId: observation.observationId || "",
           turnId: clientTurnId || turnId,
-          stage: "pending_action_viewport_recovery_dispatched",
+          stage: "pending_action_viewport_recovery_governed",
           recoveryOfActionId: pending.blockedActionId || pending.action?.id || "",
           recoveryCount: nextRecoveryCount,
           action: scrollAction
@@ -1558,7 +1731,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
         recoveryGovernance = scrollGovernance;
         finalAction = policyBlockedAction(scrollGovernance, scrollAction);
         recoveryState = withUpdate(recoveryState, {
-          pendingRecoveryAction: null,
+          pendingAction: null,
           lastAction: finalAction,
           status: "awaiting_user"
         });
@@ -1566,7 +1739,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     } else {
       finalAction = policyBlockedAction(recoveryGovernance, reboundAction);
       recoveryState = withUpdate(recoveryState, {
-        pendingRecoveryAction: null,
+        pendingAction: null,
         lastAction: finalAction,
         status: "awaiting_user"
       });
@@ -1600,12 +1773,22 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       executionResult: {
         pendingRecovery: true,
         recoveryCount: pending.recoveryCount || 1,
-        recoveryOfActionId: pending.blockedActionId || pending.action?.id || ""
+        recoveryOfActionId: pending.blockedActionId || pending.action?.id || "",
+        freshTargetExists: targetStatus.exists,
+        freshTargetInViewport: targetStatus.inViewport,
+        viewportProgress: pendingWithProgress.viewportProgress,
+        noProgressFailureCount: pendingWithProgress.noProgressFailureCount
       },
       debug
     });
     return { state: recoveryState, clientDecision: toClientDecision(finalAction), debug };
   }
+
+  // The action lifecycle above is the sole authority for unchanged outcomes.
+  // A pre-dispatch rejection rebuilds from this observation; only a browser-
+  // dispatched unchanged transition consumes an execution strategy attempt.
+  const staleRejection = lifecycle?.status === "rejected_before_dispatch";
+  const recoverableExecutionFailure = lifecycle?.transitionStatus === "no_effect";
 
   // 1. Observe + classify typed page state. Requirements are derived from
   // typed buckets, so navigation actions like Continue/Next cannot be
@@ -1637,25 +1820,99 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   // that, what's next. Two OpenAI calls total per turn now, not three.
   let verification;
   let modelPlannedAction;
-  const recoveryContext = state.activeSkillPlan?.status === "suspended"
-    ? skillRecoveryContext(state.activeSkillPlan, observation, traveler)
-    : null;
-  const recoveryAttempts = Number(state.blockedObligation?.attempts?.length || 0);
-  const planningModel = recoveryContext && recoveryAttempts > 0 && recoveryModel ? recoveryModel : model;
+  let modelSelection;
+  const planningModel = model;
+  const observationGoal = deriveObservationGoal(observation, extracted.requirements || []);
+  const candidateSet = groundedObservationCandidateSet(
+    observationGoal,
+    observation,
+    state.attemptedStrategySignatures || []
+  );
+  const observationCandidates = candidateSet.candidates;
+  state = withUpdate(state, {
+    currentGoal: {
+      ...observationGoal,
+      label: observationGoal.semanticGoal,
+      candidateSet,
+      candidates: observationCandidates,
+      updatedAt: new Date().toISOString()
+    }
+  });
+  transactionStore?.saveSession?.(state);
   try {
-    ({ verification, action: modelPlannedAction, meta: verifyPlanMeta } = await verifyAndPlan({
+    ({ verification, selection: modelSelection, meta: verifyPlanMeta } = await verifyAndPlan({
       apiKey, model: planningModel, state, observation, currentRequirements: extracted.requirements, pageState: extracted.pageState,
-      traveler, actionHistory, screenshotDataUrl, skillRecovery: recoveryContext
+      traveler,
+      actionHistory,
+      screenshotDataUrl,
+      candidateSet,
+      semanticGoal: observationGoal
     }));
+    const selectedCandidate = modelSelection.candidate;
+    modelPlannedAction = bindTargetSnapshot(
+      actionForCurrentCandidate(observationGoal, selectedCandidate, observation),
+      observation
+    );
     latency.verify_plan_model_ms = Number(verifyPlanMeta?.durationMs || 0);
   } catch (error) {
+    if (error instanceof PlannerContractError) {
+      const selectionAttempts = Number(error.details?.selectionAttempts || 3);
+      const action = finalHandoffAction(
+        `The planner exhausted ${selectionAttempts} bounded reselections against the same unchanged candidate set.`,
+        observation,
+        { goalId: observationGoal.goalId }
+      );
+      const contractState = withUpdate(state, {
+        pendingAction: null,
+        lastAction: action,
+        stallCount: 0,
+        status: "awaiting_user"
+      });
+      transactionStore?.recordActionEvent?.(contractState.id, {
+        observationId: observation.observationId || "",
+        turnId: clientTurnId || turnId,
+        stage: "planner_contract_rejected",
+        code: error.code,
+        details: error.details || {},
+        dispatched: false,
+        candidateSelectionAttempts: selectionAttempts,
+        browserReobserved: false,
+        groundingRecoveryAttempts: Number(state.groundingRecoveryAttempts || 0),
+        executionRecoveryAttempts: Number(state.executionRecoveryAttempts || 0)
+      });
+      transactionStore?.saveSession?.(contractState);
+      const debug = withLatencyDebug({
+        plannerFailureCategory: "contract_rejection",
+        plannerContractCode: error.code,
+        plannerContractDetails: error.details || {},
+        candidateSelectionAttempts: selectionAttempts,
+        candidateSetObservationId: candidateSet.observationId || "",
+        browserReobserved: false,
+        groundingRecoveryAttempts: Number(state.groundingRecoveryAttempts || 0),
+        executionRecoveryAttempts: Number(state.executionRecoveryAttempts || 0),
+        finalAction: action
+      }, latency, modelUsageFromMetas(planningModel, [classificationMeta, verifyPlanMeta]));
+      writeTrace(dataDir, state.id, {
+        turnId,
+        screenshotDataUrl,
+        observation: traceObservation,
+        pageState: extracted.pageState,
+        requirements: extracted.requirements || [],
+        verification: null,
+        plannedAction: { rejectedCandidateId: error.details?.candidateId || "" },
+        policyDecision: { allow: false, decision: "recoverable", code: error.code },
+        executionResult: { dispatched: false, contractRejected: true },
+        debug
+      });
+      return { state: contractState, clientDecision: toClientDecision(action), debug };
+    }
     return safePlannerFailureResult({
       dataDir,
       state,
       turnId,
       screenshotDataUrl,
       traceObservation,
-      reason: "AI planner unavailable while choosing the next action. I stopped instead of using a deterministic checkout fallback.",
+      reason: "AI planner or model API unavailable while choosing the next action. This is an availability failure, not a planner-contract rejection.",
       error,
       latency,
       modelUsage: modelUsageFromMetas(model, [classificationMeta, verifyPlanMeta])
@@ -1705,19 +1962,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   const noCountImprovement = hadPreviousCount && missingCount >= state.lastMissingCount;
   const verifierSaysNoProgress = !verification.changed && !verification.lastActionWorked;
   const deterministicAction = null;
-  let plannedAction = ownedSkillRecoveryAction(modelPlannedAction, recoveryContext, observation);
-  if (recoveryContext && recoveryAttempts >= 3 && !["ask_user", "stop"].includes(plannedAction.type)) {
-    plannedAction = normalizeAction({
-      observationId: observation.observationId || "",
-      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "ask_user",
-      skillPlanId: recoveryContext.planId,
-      skillAtomId: recoveryContext.atomId,
-      reason: `The unresolved ${recoveryContext.label || recoveryContext.semanticType} control still has no proven actuator after three bounded semantic/visual recovery attempts.`,
-      risk: "uncertain",
-      requiresApproval: true
-    });
-  }
+  let plannedAction = modelPlannedAction;
 
   if (!plannedAction || !plannedAction.type) {
     nextState = withUpdate(nextState, { status: "awaiting_user" });
@@ -1743,7 +1988,11 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
 
   const samePlannedAction = Boolean(state.lastAction) && actionSignature(state.lastAction) === actionSignature(plannedAction);
   const plannedWait = plannedAction.type === "wait";
-  const repeatedNoProgress = Boolean(state.lastAction) && (samePlannedAction || plannedWait) && (noCountImprovement || verifierSaysNoProgress);
+  const repeatedNoProgress = !staleRejection
+    && !recoverableExecutionFailure
+    && Boolean(state.lastAction)
+    && (samePlannedAction || plannedWait)
+    && (noCountImprovement || verifierSaysNoProgress);
   const stallCount = repeatedNoProgress ? (state.stallCount || 0) + 1 : 0;
   nextState = withUpdate(nextState, { stallCount, lastMissingCount: missingCount });
 
@@ -1771,26 +2020,13 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
 
   // 4. Govern once — schema, stored observation, canonical target,
   // actionability, policy, transaction invariants, approval, duplication.
-  const skillExpansion = expandSkillAction(plannedAction, observation, traveler);
-  if (skillExpansion.expanded) {
-    nextState = withUpdate(nextState, { activeSkillPlan: skillExpansion.plan });
-    transactionStore?.recordActionEvent?.(nextState.id, {
-      actionId: plannedAction.id || "",
-      observationId: observation.observationId || "",
-      turnId: clientTurnId || turnId,
-      stage: "skill_plan_created",
-      skill: skillExpansion.skill,
-      skillPlanId: skillExpansion.plan?.planId || "",
-      atomCount: skillExpansion.plan?.atoms?.length || 0,
-      field: skillExpansion.field || "",
-      exhausted: Boolean(skillExpansion.exhausted),
-      atomicAction: skillExpansion.action
-    });
+  if (["fill_known_fields", "fill_visible_profile_fields"].includes(plannedAction.type)) {
+    plannedAction = finalHandoffAction(
+      "The general planner returned a deprecated compound profile action after local semantic-goal processing.",
+      observation
+    );
   }
-  const executablePlannedAction = bindTargetSnapshot(
-    skillExpansion.action,
-    observation
-  );
+  const executablePlannedAction = bindTargetSnapshot(plannedAction, observation);
   const policyStartedAt = Date.now();
   let governance = governAction({
     action: executablePlannedAction,
@@ -1805,97 +2041,73 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   nextState = governance.state || nextState;
 
   let finalAction = executablePlannedAction;
-  if (!governance.allow) {
-    if (governance.decision === "recoverable" && governance.code === "TARGET_OUT_OF_VIEW") {
-      if (skillExpansion.expanded && skillExpansion.plan) {
-        const recovery = prepareSkillViewportRecovery(
-          skillExpansion.plan,
-          executablePlannedAction.id,
-          observation.observationId || ""
-        );
-        if (recovery.recovered) {
-          const scrollAction = viewportRecoveryAction(
-            executablePlannedAction,
-            observation,
-            recovery.atom?.viewportRecoveryCount || 1
-          );
-          const scrollGovernance = governAction({
-            action: scrollAction,
-            state: nextState,
-            observation,
-            traveler,
-            approvals: nextState.approvals,
-            store: transactionStore,
-            turnId: clientTurnId || turnId
-          });
-          governance = scrollGovernance;
-          if (scrollGovernance.allow) {
-            finalAction = scrollAction;
-            nextState = withUpdate(scrollGovernance.state || nextState, {
-              activeSkillPlan: recovery.plan,
-              lastAction: scrollAction,
-              status: "running"
-            });
-          } else {
-            nextState = withUpdate(nextState, {
-              activeSkillPlan: failSkillAction(
-                recovery.plan,
-                executablePlannedAction.id,
-                scrollGovernance.reason || "The action governor blocked viewport recovery.",
-                observation.observationId || ""
-              )
-            });
-            finalAction = policyBlockedAction(scrollGovernance, scrollAction);
-          }
-        } else {
-          nextState = withUpdate(nextState, { activeSkillPlan: recovery.plan });
-          finalAction = policyBlockedAction(governance, executablePlannedAction);
-        }
-      } else {
-        const scrollAction = viewportRecoveryAction(executablePlannedAction, observation, 1);
-        const scrollGovernance = governAction({
-          action: scrollAction,
-          state: nextState,
-          observation,
-          traveler,
-          approvals: nextState.approvals,
-          store: transactionStore,
-          turnId: clientTurnId || turnId
-        });
-        governance = scrollGovernance;
-        if (scrollGovernance.allow) {
-          finalAction = scrollAction;
-          nextState = withUpdate(scrollGovernance.state || nextState, {
-            pendingRecoveryAction: pendingViewportRecovery(executablePlannedAction, 1),
-            lastAction: scrollAction,
-            status: "running"
-          });
-          transactionStore?.recordActionEvent?.(nextState.id, {
-            actionId: scrollAction.id,
-            observationId: observation.observationId || "",
-            turnId: clientTurnId || turnId,
-            stage: "pending_action_viewport_recovery_dispatched",
-            recoveryOfActionId: executablePlannedAction.id,
-            recoveryCount: 1,
-            action: scrollAction
-          });
-        } else {
-          finalAction = policyBlockedAction(scrollGovernance, scrollAction);
-        }
-      }
+  if (!governance.allow && governance.decision === "recoverable" && governance.code === "TARGET_OUT_OF_VIEW") {
+    const scrollAction = viewportRecoveryAction(executablePlannedAction, observation, 1);
+    const scrollGovernance = governAction({
+      action: scrollAction,
+      state: nextState,
+      observation,
+      traveler,
+      approvals: nextState.approvals,
+      store: transactionStore,
+      turnId: clientTurnId || turnId
+    });
+    governance = scrollGovernance;
+    if (scrollGovernance.allow) {
+      finalAction = scrollAction;
+      nextState = withUpdate(scrollGovernance.state || nextState, {
+        pendingAction: pendingViewportRecovery(executablePlannedAction, 1, observation),
+        lastAction: scrollAction,
+        status: "running"
+      });
+      transactionStore?.recordActionEvent?.(nextState.id, {
+        actionId: scrollAction.id,
+        observationId: observation.observationId || "",
+        turnId: clientTurnId || turnId,
+        stage: "pending_action_viewport_recovery_governed",
+        recoveryOfActionId: executablePlannedAction.id,
+        recoveryCount: 1,
+        action: scrollAction
+      });
     } else {
-      if (skillExpansion.expanded && skillExpansion.plan) {
-        nextState = withUpdate(nextState, {
-          activeSkillPlan: failSkillAction(
-            skillExpansion.plan,
-            executablePlannedAction.id,
-            governance.reason || "The action governor blocked the first skill atom.",
-            observation.observationId || ""
-          )
-        });
-      }
-      finalAction = policyBlockedAction(governance, executablePlannedAction);
+      finalAction = policyBlockedAction(scrollGovernance, scrollAction);
     }
+  } else if (!governance.allow && governance.decision === "recoverable" && STALE_IDENTITY_CODES.has(governance.code)) {
+    const groundingBudget = applyRecoveryBudget(nextState, {
+      dispatched: false,
+      executed: false,
+      verified: false,
+      outcome: { code: governance.code }
+    });
+    nextState = withUpdate(groundingBudget.state, { pendingAction: null, stallCount: 0 });
+    transactionStore?.recordActionEvent?.(nextState.id, {
+      actionId: executablePlannedAction.id || "",
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "grounding_replan",
+      code: governance.code,
+      dispatched: false,
+      groundingRecoveryAttempts: groundingBudget.groundingRecoveryAttempts,
+      executionRecoveryAttempts: groundingBudget.executionRecoveryAttempts
+    });
+    finalAction = groundingBudget.exhausted
+      ? finalHandoffAction(
+          "Three fresh candidate sets were rejected before dispatch. Grounded replanning is exhausted.",
+          observation
+        )
+      : normalizeAction({
+          observationId: observation.observationId || "",
+          observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+          type: "wait",
+          intent: "reobserve_after_grounding_rejection",
+          goalId: observationGoal.goalId,
+          candidateId: modelSelection?.candidateId || "",
+          reason: `Discard ${governance.code}, capture a fresh observation, rebuild the candidate set, and replan the same semantic goal.`,
+          risk: "safe",
+          requiresApproval: false
+        });
+  } else if (!governance.allow) {
+    finalAction = policyBlockedAction(governance, executablePlannedAction);
   }
   finalAction = bindTargetSnapshot(finalAction, observation);
 
@@ -1933,14 +2145,19 @@ module.exports = {
     bindTargetSnapshot,
     buildControlAliasIndex,
     canonicalRequirementLifecycle,
-    canonicalBlockedRecoveryAction,
     controlDecisionGroupId,
     decisionGroupForRequirement,
     deterministicRequirementEvidence,
     expectedOutcomeForAction,
+    applyRecoveryBudget,
+    applyTransitionStatus,
+    candidateStrategySignature,
+    groundedObservationCandidateSet,
+    groundedObservationCandidates,
+    observationSurfaceId,
     reconcileRequirements,
     requirementsWithDecisionGroups,
-    resolvedBlockedObligation,
+    staleIdentityRejection,
     targetSnapshotForAction,
     resolveActionControl,
     updateEvidenceMatchesRequirement

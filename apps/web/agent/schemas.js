@@ -57,7 +57,7 @@ const pageStateSchema = {
     "optionalPaidExtras",
     "navigationActions",
     "riskGates",
-    "activeSurface",
+    "currentSurface",
     "uncertainties",
     "summary"
   ],
@@ -146,7 +146,7 @@ const pageStateSchema = {
         }
       }
     },
-    activeSurface: {
+    currentSurface: {
       type: "object",
       additionalProperties: false,
       required: ["present", "type", "label", "taskHint", "targetIds", "summary"],
@@ -234,15 +234,23 @@ const plannerSchema = {
     visualRegion: {
       type: "object",
       additionalProperties: false,
-      required: ["x", "y", "width", "height", "viewportWidth", "viewportHeight", "surfaceId"],
+      required: ["x", "y", "width", "height", "centerX", "centerY", "viewportWidth", "viewportHeight", "surfaceId", "observationId", "controlId", "operation", "source", "confidence", "evidence"],
       properties: {
         x: { type: "number" },
         y: { type: "number" },
         width: { type: "number" },
         height: { type: "number" },
+        centerX: { type: "number" },
+        centerY: { type: "number" },
         viewportWidth: { type: "number" },
         viewportHeight: { type: "number" },
-        surfaceId: { type: "string" }
+        surfaceId: { type: "string" },
+        observationId: { type: "string" },
+        controlId: { type: "string" },
+        operation: { type: "string" },
+        source: { type: "string" },
+        confidence: { type: "number" },
+        evidence: { type: "string" }
       }
     },
     scrollY: { type: "number" },
@@ -263,8 +271,32 @@ const verifyAndPlanSchema = {
   required: ["verification", "action"],
   properties: {
     verification: verifierSchema,
-    action: plannerSchema
+    action: {
+      type: "object",
+      additionalProperties: false,
+      required: ["candidateId"],
+      properties: {
+        candidateId: { type: "string" }
+      }
+    }
   }
 };
 
-module.exports = { requirementSchema, requirementExtractorSchema, pageStateSchema, verifierSchema, plannerSchema, verifyAndPlanSchema };
+const candidateSelectionSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["candidateId"],
+  properties: {
+    candidateId: { type: "string" }
+  }
+};
+
+module.exports = {
+  requirementSchema,
+  requirementExtractorSchema,
+  pageStateSchema,
+  verifierSchema,
+  plannerSchema,
+  verifyAndPlanSchema,
+  candidateSelectionSchema
+};
