@@ -7,8 +7,38 @@ const {
   advanceActionLifecycle,
   canonicalFailureCode
 } = require("../../apps/web/agent/action-lifecycle");
-const { __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { allRequiredSatisfied, missingRequired, normalizeRequirement } = require("../../packages/shared/requirements");
+const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
+const {
+  applyAuthoritativeOutcomeToRequirements,
+  deriveAuthoritativeTaskContext
+} = require("../../apps/web/agent/task-action-context");
+const { candidateSelectionSchemaFor } = require("../../apps/web/agent/schemas");
+
+function actionableCapability(operation, actuatorId, { inViewport = true } = {}) {
+  const actionability = {
+    rendered: true,
+    visible: true,
+    enabled: true,
+    inViewport,
+    inCurrentSurface: true,
+    hitTested: inViewport,
+    notOccluded: inViewport,
+    operationAuthorized: true,
+    executable: inViewport,
+    revealable: !inViewport,
+    code: inViewport ? "ACTIONABLE" : "ACTUATOR_OUT_OF_VIEW",
+    operation
+  };
+  return {
+    operation,
+    actuatorId,
+    actuatorIds: [actuatorId],
+    actionability,
+    actionabilityByActuator: { [actuatorId]: actionability }
+  };
+}
 
 function observation(id, page = {}, lastActionResult = null) {
   return {
@@ -136,10 +166,57 @@ test("loop recovery counts dispatched no-effect and excludes that exact strategy
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.observation.lastActionResult.verified, false);
   assert.equal(applied.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
-  assert.deepEqual(applied.state.attemptedStrategySignatures, ["ctrl_flex:open:effect::"]);
+  assert.deepEqual(applied.state.attemptedStrategySignatures, ["click:open:ctrl_flex:,:"]);
   assert.equal(applied.directive, "try_distinct_capability");
-  assert.equal(applied.state.executionRecoveryAttempts, 1);
-  assert.equal(applied.state.groundingRecoveryAttempts, 0);
+  assert.equal(applied.state.recoveryState.attempts, 1);
+  assert.equal(applied.state.recoveryState.phase, "execution_no_effect");
+});
+
+test("three distinct no-effect strategies exhaust only one unchanged state and meaningful progress resets the counter", () => {
+  const samePage = {
+    currentSurface: { id: "seat_modal", type: "modal", label: "Seats" },
+    controls: ["one", "two", "three"].map((id) => ({ controlId: `ctrl_${id}`, label: id })),
+    decisionGroups: []
+  };
+  let state = { recoveryState: { attempts: 0, phase: "idle", stateHash: "", failedStrategySignatures: [] } };
+  let before = observation("budget_before", samePage);
+  before.observationSnapshot.snapshotHash = "unchanged_hash";
+
+  for (const [index, id] of ["one", "two", "three"].entries()) {
+    const action = {
+      id: `act_${id}`,
+      type: "click",
+      operation: "activate",
+      controlId: `ctrl_${id}`,
+      targetId: `el_${id}`,
+      expectedOutcome: { type: "stage_exit_or_feedback" }
+    };
+    const after = observation(`budget_after_${id}`, samePage, result(action.id));
+    after.observationSnapshot.snapshotHash = "unchanged_hash";
+    const advanced = advanceActionLifecycle({ state: { ...state, lastAction: action }, observation: after, previousObservation: before });
+    state = advanced.state;
+    assert.equal(state.recoveryState.attempts, index + 1);
+    assert.equal(advanced.directive, index === 2 ? "handoff_recovery_exhausted" : "try_distinct_capability");
+    before = after;
+  }
+
+  const progressAction = {
+    id: "act_progress",
+    type: "click",
+    operation: "activate",
+    controlId: "ctrl_three",
+    targetId: "el_three",
+    expectedOutcome: { type: "stage_exit_or_feedback" }
+  };
+  const progressed = observation("budget_progress", {
+    ...samePage,
+    currentSurface: { id: "confirm_modal", type: "modal", label: "Confirm" },
+    controls: [{ controlId: "ctrl_continue", label: "Continue" }]
+  }, result(progressAction.id));
+  const reset = advanceActionLifecycle({ state: { ...state, lastAction: progressAction }, observation: progressed, previousObservation: before });
+  assert.equal(reset.transition.status, "blocked");
+  assert.equal(reset.state.recoveryState.attempts, 0);
+  assert.deepEqual(reset.state.recoveryState.failedStrategySignatures, []);
 });
 
 test("pre-dispatch surface rejection on an unchanged page rebuilds without consuming execution recovery", () => {
@@ -164,8 +241,7 @@ test("pre-dispatch surface rejection on an unchanged page rebuilds without consu
         type: "click",
         controlId: "ctrl_no_thanks"
       },
-      groundingRecoveryAttempts: 0,
-      executionRecoveryAttempts: 0
+      recoveryState: { attempts: 0, phase: "idle", stateHash: "", failedStrategySignatures: [] }
     },
     observation: after,
     previousObservation: before
@@ -175,8 +251,8 @@ test("pre-dispatch surface rejection on an unchanged page rebuilds without consu
   assert.equal(advanced.lifecycle.dispatched, false);
   assert.equal(advanced.transition, null);
   assert.equal(advanced.directive, "rebuild_candidates");
-  assert.equal(advanced.state.groundingRecoveryAttempts, 1);
-  assert.equal(advanced.state.executionRecoveryAttempts, 0);
+  assert.equal(advanced.state.recoveryState.attempts, 0);
+  assert.equal(advanced.state.recoveryState.phase, "grounding_rejection");
   assert.notEqual(advanced.directive, "handoff_recovery_exhausted");
 });
 
@@ -237,7 +313,7 @@ test("typed seat commands use acknowledgement proof and no-effect selects a dist
       risk: "safe_decline",
       preferredActivationElementId: "el_skip",
       visualRegion: { inViewport: true },
-      operations: { activate: { operation: "activate", actuatorId: "el_skip", actuatorIds: ["el_skip"] } }
+      operations: { activate: actionableCapability("activate", "el_skip") }
     }, {
       controlId: "ctrl_next",
       sectionId: "section_seat",
@@ -249,7 +325,7 @@ test("typed seat commands use acknowledgement proof and no-effect selects a dist
       risk: "safe",
       preferredActivationElementId: "el_next",
       visualRegion: { inViewport: true },
-      operations: { activate: { operation: "activate", actuatorId: "el_next", actuatorIds: ["el_next"] } }
+      operations: { activate: actionableCapability("activate", "el_next") }
     }],
     decisionGroups: [{
       decisionGroupId: "dg_seat",
@@ -318,6 +394,468 @@ test("failed-strategy memory survives rerendered control and decision-group iden
     loopPrivate.candidateStrategySignature({ semanticType: "first wording" }, first),
     loopPrivate.candidateStrategySignature({ semanticType: "different wording" }, rerendered)
   );
+});
+
+test("sibling paid-extra groups form an exact work queue and broad family completion cannot waive peers", () => {
+  const groups = [
+    { decisionGroupId: "dg_airhelp", requirementId: "protection:airhelp", sectionType: "protection", sectionLabel: "AirHelp", surfaceId: "surface-page", required: true, status: "satisfied", selectedControlId: "ctrl_airhelp_none" },
+    { decisionGroupId: "dg_lost_baggage", requirementId: "protection:lost-baggage", sectionType: "protection", sectionLabel: "Lost baggage", surfaceId: "surface-page", required: true, status: "missing", selectedControlId: "" },
+    { decisionGroupId: "dg_premium_support", requirementId: "protection:premium-support", sectionType: "protection", sectionLabel: "Premium support", surfaceId: "surface-page", required: true, status: "missing", selectedControlId: "" }
+  ];
+  const current = observation("obs_exact_group_queue", {
+    currentSurface: { id: "surface-page", type: "page", label: "Optional protection" },
+    controls: [],
+    decisionGroups: groups
+  });
+  const requirements = groups.map((group) => ({
+    id: group.decisionGroupId,
+    requirementId: group.requirementId,
+    decisionGroupId: group.decisionGroupId,
+    type: "paid_extra_decision",
+    semanticType: "paid_extra_decision",
+    label: group.sectionLabel,
+    sectionType: group.sectionType,
+    status: group.status,
+    lifecycleStatus: group.status,
+    required: true,
+    risk: "money",
+    confidence: 0.95,
+    selectedControlId: group.selectedControlId
+  }));
+  const state = createCheckoutSessionState({ goal: "No paid extras", travelerId: "trav_exact_queue" });
+  state.approvals.skipPaidExtrasApproved = true;
+  state.requirementLifecycle = [requirements[0]];
+  state.currentObligation = {
+    userOutcome: {
+      semanticFamily: "protection",
+      desiredDisposition: "decline_paid",
+      status: "satisfied",
+      decisionGroupId: "dg_airhelp",
+      requirementId: "protection:airhelp",
+      selectedControlId: "ctrl_airhelp_none"
+    }
+  };
+
+  const context = deriveAuthoritativeTaskContext({
+    state,
+    observation: current,
+    requirements,
+    traveler: { booking_rules: "no paid extras" }
+  });
+  assert.equal(context.remainingGoal.decisionGroupId, "dg_lost_baggage");
+  assert.equal(context.userOutcome.status, "pending");
+
+  const broadFamilyContext = {
+    userOutcome: {
+      semanticFamily: "protection",
+      desiredDisposition: "decline_paid",
+      status: "satisfied",
+      decisionGroupId: "dg_airhelp",
+      requirementId: "protection:airhelp"
+    }
+  };
+  const reconciled = applyAuthoritativeOutcomeToRequirements(requirements, broadFamilyContext);
+  assert.equal(reconciled.find((item) => item.decisionGroupId === "dg_airhelp").status, "satisfied");
+  assert.equal(reconciled.find((item) => item.decisionGroupId === "dg_lost_baggage").status, "missing");
+  assert.equal(reconciled.find((item) => item.decisionGroupId === "dg_premium_support").status, "missing");
+
+  const completions = loopPrivate.exactDecisionCompletionRecords([], reconciled, current.observationId);
+  assert.deepEqual(completions, [{
+    surfaceId: "surface-page",
+    decisionGroupId: "dg_airhelp",
+    requirementId: "protection:airhelp",
+    selectedControlId: "ctrl_airhelp_none",
+    status: "satisfied",
+    observationId: "obs_exact_group_queue"
+  }]);
+});
+
+test("task-scoped filtering reduces 72 seat controls to untried safe Next and skips all AI calls", async () => {
+  const surfaceId = "seat_modal";
+  const groupId = "dg_seat";
+  const control = ({ id, label, risk = "safe", semantic = "choice", disabled = false, surface = surfaceId }) => ({
+    controlId: `ctrl_${id}`,
+    stableKey: `seat.${id}`,
+    meaning: label,
+    structuredPrice: risk === "money" ? { amount: 18, currency: "EUR" } : null,
+    decisionGroupId: surface === surfaceId ? groupId : "dg_other",
+    sectionId: surface === surfaceId ? "section_seats" : "section_help",
+    sectionType: surface === surfaceId ? "seats" : "help",
+    surfaceId: surface,
+    surfaceType: surface === surfaceId ? "modal" : "page",
+    label,
+    semantic,
+    risk,
+    kind: "button",
+    role: "button",
+    state: { disabled },
+    stateElementId: `el_${id}`,
+    preferredActivationElementId: `el_${id}`,
+    actuators: [{ nodeId: `el_${id}`, relation: "activation" }],
+    operations: { activate: actionableCapability("activate", `el_${id}`) },
+    visualRegion: { x: 10, y: 10, width: 120, height: 30, inViewport: true }
+  });
+  const paid = Array.from({ length: 68 }, (_, index) => control({
+    id: `paid_${index + 1}`,
+    label: `Seat ${index + 1} — 18 EUR`,
+    risk: "money",
+    semantic: "add_paid_extra"
+  }));
+  const skip = control({ id: "skip", label: "Skip seat selection", semantic: "decline_paid_extra" });
+  const next = control({ id: "next", label: "Next", semantic: "navigation" });
+  const unavailable = control({ id: "unavailable", label: "Not available", semantic: "unavailable", disabled: true });
+  const irrelevant = control({ id: "help", label: "Help", semantic: "help", surface: "surface-page" });
+  const controls = [...paid, skip, next, unavailable, irrelevant];
+  assert.equal(controls.length, 72);
+
+  const current = observation("obs_72_seats", {
+    currentSurface: {
+      id: surfaceId,
+      type: "modal",
+      label: "Reserve seating — Flight 1 of 2",
+      blocksBackground: true,
+      memberControlIds: controls.filter((item) => item.surfaceId === surfaceId).map((item) => item.controlId),
+      memberActuatorIds: controls.filter((item) => item.surfaceId === surfaceId).map((item) => item.preferredActivationElementId)
+    },
+    controls,
+    decisionGroups: [{
+      decisionGroupId: groupId,
+      requirementId: "seat_decision",
+      sectionId: "section_seats",
+      sectionType: "seats",
+      sectionLabel: "Seat selection",
+      surfaceId,
+      required: true,
+      status: "missing",
+      alternatives: [skip, unavailable, ...paid].map((item) => ({
+        controlId: item.controlId,
+        label: item.label,
+        risk: item.risk,
+        selected: false
+      }))
+    }]
+  });
+  const traveler = { id: "trav_72", booking_rules: "no paid seats and no paid extras" };
+  let state = createCheckoutSessionState({
+    goal: "Proceed without paid seats",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: current.page.url }
+  });
+  state.id = "txn_72_seats";
+  state.approvals.skipPaidExtrasApproved = true;
+  state.requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  state.activeRequirements = state.requirements;
+  state.currentObservation = { observationId: current.observationId, observationHash: current.observationSnapshot.snapshotHash };
+
+  const goal = require("../../apps/web/agent/observation-candidates").deriveObservationGoal(current, state.requirements);
+  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, current, [], { state, traveler, approvals: state.approvals });
+  assert.deepEqual(firstSet.candidates.map((candidate) => candidate.targetLabel).sort(), ["Next", "Skip seat selection"]);
+  const failedSkip = firstSet.candidates.find((candidate) => /skip/i.test(candidate.targetLabel));
+  state.currentGoal = goal;
+  state.failedStrategyMemory = [{
+    goalKey: loopPrivate.semanticGoalRecoveryKey(goal),
+    strategySignature: loopPrivate.candidateStrategySignature(goal, failedSkip),
+    stableControlKey: failedSkip.affordance.stableKey,
+    capability: failedSkip.operation
+  }];
+
+  const store = {
+    isCurrentObservation: (_transactionId, observationId, observationHash) => (
+      observationId === current.observationId && observationHash === current.observationSnapshot.snapshotHash
+    ),
+    reserveGovernedAction: () => ({ ok: true }),
+    recordActionEvent: () => {},
+    advanceGovernedAction: () => {},
+    saveSession: () => {}
+  };
+  const turn = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation: current,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_72"
+  });
+
+  assert.equal(turn.clientDecision.action, "click");
+  assert.equal(turn.clientDecision.targetLabel, "Next");
+  assert.equal(turn.clientDecision.affordance.effect, "advance_surface");
+  assert.equal(turn.clientDecision.affordance.policy.allow, true);
+  assert.equal(turn.debug.deterministic, true);
+  assert.deepEqual(turn.debug.modelUsage.calls, []);
+});
+
+test("completed no-paid-seat obligation remains satisfied and publishes only safe forward progress", async () => {
+  const surfaceId = "seat_modal";
+  const groupId = "dg_seat";
+  const control = ({ id, label, semantic, risk = "safe", price = null }) => ({
+    controlId: `ctrl_${id}`,
+    stableKey: `seat.${id}`,
+    meaning: label,
+    structuredPrice: price,
+    decisionGroupId: groupId,
+    sectionId: "section_seats",
+    sectionType: "seats",
+    surfaceId,
+    surfaceType: "modal",
+    label,
+    semantic,
+    risk,
+    kind: "button",
+    role: "button",
+    state: { disabled: false },
+    stateElementId: `el_${id}`,
+    preferredActivationElementId: `el_${id}`,
+    actuators: [{ nodeId: `el_${id}`, relation: "activation" }],
+    operations: { activate: actionableCapability("activate", `el_${id}`) },
+    visualRegion: { x: 10, y: 10, width: 120, height: 30, inViewport: true }
+  });
+  const chooseSeat = control({ id: "choose", label: "Choose seat", semantic: "seat_option" });
+  const paidSeat = control({ id: "paid", label: "Seat 1A — 18 EUR", semantic: "add_paid_extra", risk: "money", price: { amount: 18, currency: "EUR" } });
+  const back = control({ id: "back", label: "Back", semantic: "navigation" });
+  const details = control({ id: "details", label: "Price details", semantic: "information" });
+  const next = control({ id: "next", label: "Next", semantic: "navigation" });
+  const controls = [chooseSeat, paidSeat, back, details, next];
+  const current = observation("obs_completed_seat", {
+    currentSurface: {
+      id: surfaceId,
+      type: "modal",
+      label: "Reserve seating — Flight 1 of 2",
+      blocksBackground: true,
+      memberControlIds: controls.map((item) => item.controlId),
+      memberActuatorIds: controls.map((item) => item.preferredActivationElementId)
+    },
+    controls,
+    decisionGroups: [{
+      decisionGroupId: groupId,
+      requirementId: "seat_decision",
+      sectionId: "section_seats",
+      sectionType: "seats",
+      sectionLabel: "Seat selection",
+      surfaceId,
+      required: true,
+      status: "missing",
+      alternatives: [chooseSeat, paidSeat].map((item) => ({
+        controlId: item.controlId,
+        label: item.label,
+        risk: item.risk,
+        structuredPrice: item.structuredPrice,
+        selected: false
+      }))
+    }]
+  });
+  const traveler = { id: "trav_completed_seat", booking_rules: "no paid seats and no paid extras" };
+  let state = createCheckoutSessionState({
+    goal: "Proceed without paid seats",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: current.page.url }
+  });
+  state.id = "txn_completed_seat";
+  state.approvals.skipPaidExtrasApproved = true;
+  state.requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  state.activeRequirements = state.requirements;
+  state.currentObligation = {
+    userOutcome: {
+      semanticFamily: "seat",
+      desiredDisposition: "decline_paid",
+      status: "satisfied",
+      decisionGroupId: groupId
+    }
+  };
+
+  const context = deriveAuthoritativeTaskContext({ state, observation: current, requirements: state.requirements, traveler });
+  assert.equal(context.userOutcome.status, "satisfied");
+  assert.equal(context.interfaceStatus.status, "needs_advance");
+  assert.equal(context.remainingGoal.semanticType, "navigation");
+  const authoritativeRequirements = applyAuthoritativeOutcomeToRequirements(state.requirements, context);
+  assert.equal(authoritativeRequirements[0].status, "waived_by_policy");
+
+  const candidateSet = loopPrivate.groundedObservationCandidateSet(
+    context.remainingGoal,
+    current,
+    [],
+    { state: { ...state, requirements: authoritativeRequirements }, traveler, approvals: state.approvals }
+  );
+  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.targetLabel), ["Next"]);
+
+  const store = {
+    isCurrentObservation: (_transactionId, observationId, observationHash) => (
+      observationId === current.observationId && observationHash === current.observationSnapshot.snapshotHash
+    ),
+    reserveGovernedAction: () => ({ ok: true }),
+    recordActionEvent: () => {},
+    advanceGovernedAction: () => {},
+    saveSession: () => {}
+  };
+  const turn = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation: current,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_completed_seat"
+  });
+
+  assert.equal(turn.clientDecision.action, "click");
+  assert.equal(turn.clientDecision.targetLabel, "Next");
+  assert.equal(turn.state.currentObligation.userOutcome.status, "satisfied");
+  assert.equal(turn.state.currentGoal.semanticType, "navigation");
+  assert.equal(turn.debug.deterministic, true);
+  assert.deepEqual(turn.debug.modelUsage.calls, []);
+});
+
+test("planner candidate schema is a closed enum over the current observation", () => {
+  const schema = candidateSelectionSchemaFor(["obs_1:candidate_1", "obs_1:candidate_2"]);
+  assert.deepEqual(schema.properties.candidateId.enum, ["obs_1:candidate_1", "obs_1:candidate_2"]);
+  assert.equal(schema.additionalProperties, false);
+});
+
+test("invalid planner output retries the immutable candidate set without browser handoff", async () => {
+  const current = observation("obs_invalid_planner", {
+    currentSurface: {
+      id: "seat_modal",
+      type: "modal",
+      label: "Seat preference",
+      blocksBackground: true,
+      memberControlIds: ["ctrl_free_a", "ctrl_free_b"],
+      memberActuatorIds: ["el_free_a", "el_free_b"]
+    },
+    controls: ["a", "b"].map((suffix) => ({
+      controlId: `ctrl_free_${suffix}`,
+      stableKey: `seat.free.${suffix}`,
+      decisionGroupId: "dg_seat",
+      sectionId: "section_seat",
+      sectionType: "seats",
+      surfaceId: "seat_modal",
+      surfaceType: "modal",
+      label: `Free seating ${suffix.toUpperCase()}`,
+      semantic: "decline_paid_extra",
+      risk: "safe_decline",
+      kind: "button",
+      role: "button",
+      state: { disabled: false },
+      stateElementId: `el_free_${suffix}`,
+      preferredActivationElementId: `el_free_${suffix}`,
+      actuators: [{ nodeId: `el_free_${suffix}`, relation: "activation" }],
+      operations: { activate: actionableCapability("activate", `el_free_${suffix}`) },
+      visualRegion: { x: 20, y: 20, width: 120, height: 30, inViewport: true }
+    })),
+    decisionGroups: [{
+      decisionGroupId: "dg_seat",
+      requirementId: "seat_decision",
+      sectionId: "section_seat",
+      sectionType: "seats",
+      surfaceId: "seat_modal",
+      required: true,
+      status: "missing",
+      alternatives: [
+        { controlId: "ctrl_free_a", label: "Free seating A", risk: "safe_decline" },
+        { controlId: "ctrl_free_b", label: "Free seating B", risk: "safe_decline" }
+      ]
+    }]
+  });
+  const traveler = { id: "trav_invalid_planner", booking_rules: "no paid seats and no paid extras" };
+  const state = createCheckoutSessionState({
+    goal: "Proceed without paid seats",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: current.page.url }
+  });
+  state.id = "txn_invalid_planner";
+  state.approvals.skipPaidExtrasApproved = true;
+  state.requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  state.activeRequirements = state.requirements;
+  const store = {
+    isCurrentObservation: (_transactionId, observationId, observationHash) => (
+      observationId === current.observationId && observationHash === current.observationSnapshot.snapshotHash
+    ),
+    reserveGovernedAction: () => ({ ok: true }),
+    recordActionEvent: () => {},
+    advanceGovernedAction: () => {},
+    saveSession: () => {}
+  };
+  const previousFetch = global.fetch;
+  let calls = 0;
+  global.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      json: async () => ({ output_text: JSON.stringify({ candidateId: "invented_candidate" }) })
+    };
+  };
+  try {
+    const turn = await runLoopTurn({
+      apiKey: "test-key",
+      model: "test-model",
+      dataDir: "",
+      state,
+      observation: current,
+      traveler,
+      transactionStore: store,
+      clientTurnId: "turn_invalid_planner"
+    });
+    assert.equal(calls, 2);
+    assert.equal(turn.clientDecision.action, "wait");
+    assert.equal(turn.clientDecision.intent, "retry_planner_current_candidates");
+    assert.equal(turn.state.status, "running");
+    assert.equal(turn.debug.candidateGroundingRejected, true);
+    assert.equal(turn.debug.aiServiceUnavailable, false);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("only contradictory current browser evidence can reopen a completed policy outcome", () => {
+  const paidControl = {
+    controlId: "ctrl_paid_seat",
+    label: "Seat 1A — 18 EUR",
+    semantic: "add_paid_extra",
+    risk: "money",
+    structuredPrice: { amount: 18, currency: "EUR" },
+    selected: true
+  };
+  const current = observation("obs_paid_contradiction", {
+    currentSurface: { id: "seat_modal", type: "modal", label: "Reserve seating" },
+    controls: [paidControl],
+    decisionGroups: [{
+      decisionGroupId: "dg_seat",
+      requirementId: "seat_decision",
+      sectionType: "seats",
+      sectionLabel: "Seat selection",
+      surfaceId: "seat_modal",
+      required: true,
+      status: "satisfied",
+      selectedControlId: paidControl.controlId,
+      selectedLabel: paidControl.label,
+      alternatives: [paidControl]
+    }]
+  });
+  const requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  const state = {
+    id: "txn_paid_contradiction",
+    goal: "Proceed without paid seats",
+    approvals: { skipPaidExtrasApproved: true },
+    currentObligation: {
+      userOutcome: {
+        semanticFamily: "seat",
+        desiredDisposition: "decline_paid",
+        status: "satisfied",
+        decisionGroupId: "dg_seat"
+      }
+    }
+  };
+  const context = deriveAuthoritativeTaskContext({
+    state,
+    observation: current,
+    requirements,
+    traveler: { booking_rules: "no paid seats" }
+  });
+  assert.equal(context.userOutcome.status, "contradicted");
+  assert.equal(context.userOutcome.contradiction.code, "PAID_OPTION_SELECTED");
+  assert.equal(context.remainingGoal.decisionGroupId, "dg_seat");
 });
 
 test("typed waiver command is achieved by a browser-observed policy waiver without inventing a selected choice", () => {

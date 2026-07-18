@@ -547,10 +547,33 @@ function compactControlOperations(operations = {}) {
       operation: clampText(capability.operation || name, 40),
       actuatorId: clampText(capability.actuatorId, 80),
       actuatorIds: Array.isArray(capability.actuatorIds) ? capability.actuatorIds.map((id) => clampText(id, 80)).filter(Boolean).slice(0, 8) : [],
+      actionability: compactActuatorActionability(capability.actionability),
+      actionabilityByActuator: Object.fromEntries(Object.entries(capability.actionabilityByActuator || {})
+        .slice(0, 8)
+        .map(([id, evidence]) => [clampText(id, 80), compactActuatorActionability(evidence)])),
       precondition: capability.precondition || null,
       expectedOutcome: clampText(capability.expectedOutcome, 80)
     } : null
   ]));
+}
+
+function compactActuatorActionability(evidence = null) {
+  if (!evidence || typeof evidence !== "object") return null;
+  return {
+    rendered: evidence.rendered === true,
+    visible: evidence.visible === true,
+    enabled: evidence.enabled === true,
+    inViewport: evidence.inViewport === true,
+    inCurrentSurface: evidence.inCurrentSurface === true,
+    hitTested: evidence.hitTested === true,
+    notOccluded: evidence.notOccluded === true,
+    operationAuthorized: evidence.operationAuthorized === true,
+    executable: evidence.executable === true,
+    revealable: evidence.revealable === true,
+    code: clampText(evidence.code, 80),
+    surfaceId: clampText(evidence.surfaceId, 80),
+    operation: clampText(evidence.operation, 40)
+  };
 }
 
 function compactControlRecovery(recovery = {}) {

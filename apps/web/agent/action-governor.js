@@ -4,7 +4,8 @@ const {
   normalizeAction,
   normalizeVisualRegion,
   visualRegionsMatch,
-  actuatorSignature
+  actuatorSignature,
+  semanticGoalKey
 } = require("../../../packages/shared/agent-actions");
 const { classifyGraphConflicts, resolveActionControl, selectedActionGraphConflicts } = require("./control-alias-index");
 const { profileStageReadiness } = require("./skill-expander");
@@ -34,6 +35,10 @@ const RECOVERABLE_GROUNDING_CODES = new Set([
   "CANONICAL_ACTUATOR_UNAVAILABLE",
   "OPERATION_PRECONDITION_FAILED",
   "TARGET_DISAPPEARED",
+  "TARGET_NOT_RENDERED",
+  "TARGET_NOT_VISIBLE",
+  "TARGET_OCCLUDED",
+  "TARGET_ACTIONABILITY_UNPROVEN",
   "TARGET_OUTSIDE_CURRENT_SURFACE",
   "CONTROL_GRAPH_SELECTED_ACTION_AMBIGUOUS"
 ]);
@@ -181,6 +186,22 @@ function validateCanonicalTarget(action, observation, checks) {
       return fail("ACTION_OPERATION_ACTUATOR_MISMATCH", `The canonical control does not authorize ${action.operation} through the governed actuator.`, checks);
     }
     pass(checks, "CANONICAL_OPERATION_BOUND", `${action.operation}:${target.id}`);
+    const actionability = capability.actionabilityByActuator?.[target.id] || capability.actionability || null;
+    if (!actionability || actionability.executable !== true) {
+      if (actionability?.revealable === true && actionability.inViewport === false) {
+        return recoverable(
+          "TARGET_OUT_OF_VIEW",
+          "The exact canonical actuator is rendered, enabled, surface-owned, and revealable, but must be brought into view before live hit-testing and dispatch.",
+          checks
+        );
+      }
+      return recoverable(
+        "TARGET_ACTIONABILITY_UNPROVEN",
+        "The exact canonical actuator was not proven rendered, visible, enabled, current-surface owned, hit-tested, and unoccluded in this observation.",
+        checks
+      );
+    }
+    pass(checks, "CANONICAL_ACTUATOR_ACTIONABLE", `${action.operation}:${target.id}`);
     const precondition = capability.precondition || {};
     if (precondition.expanded === false && control.state?.expanded === true) {
       return fail("OPERATION_PRECONDITION_FAILED", "The canonical control is already expanded, so its open operation is no longer valid.", checks);
@@ -383,7 +404,11 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   }
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
     const signature = actuatorSignature(action);
-    const previousFailure = (state.failures || []).find((failure) => failure.actuatorSignature === signature);
+    const goalKey = semanticGoalKey(action);
+    const previousFailure = (state.failures || []).find((failure) => (
+      failure.actuatorSignature === signature
+      && (!failure.goalKey || failure.goalKey === goalKey)
+    ));
     if (previousFailure) {
       return denied({
         ...fail(

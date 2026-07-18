@@ -12,7 +12,7 @@ const {
   deriveObservationGoal
 } = require("../../apps/web/agent/observation-candidates");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
-const { advanceActionLifecycle } = require("../../apps/web/agent/action-lifecycle");
+const { advanceActionLifecycle, pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { sanitizedActionHistory } = require("../../apps/web/agent/model-context");
 const { resolvePlannerSelection } = require("../../apps/web/agent/verify-and-plan");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
@@ -233,7 +233,7 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
     <main>
       <h1>Choose your travel bundle</h1>
       <div id="bundle-scroll">
-        <fieldset>
+        <fieldset id="flex-group" role="radiogroup" aria-label="Flexible ticket decision">
           <legend>Bundle options</legend>
           <label><input type="radio" name="bundle" value="premium"> Premium bundle — 40 EUR</label>
           <div class="spacer"></div>
@@ -274,15 +274,30 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
   });
   state.id = "txn_scroll_snapback";
   state.approvals.skipPaidExtrasApproved = true;
+  const traveler = { id: "trav_scroll", booking_rules: "no extras" };
+  const goal = deriveObservationGoal(initial, []);
+  const candidateSet = buildCurrentCandidateSet({
+    goal,
+    observation: initial,
+    traveler,
+    state,
+    approvals: state.approvals
+  });
+  const pendingCandidate = candidateSet.candidates.find((candidate) => candidate.controlId === decline.controlId);
+  expect(pendingCandidate).toBeTruthy();
+  const currentGoal = { ...goal, candidateSet, candidates: candidateSet.candidates };
+  state.currentGoal = currentGoal;
   state.currentObservation = {
     observationId: initial.observationId,
     observationHash: initial.observationSnapshot.snapshotHash
   };
   state.lastAction = { id: "act_first_scroll", type: "scroll" };
-  state.pendingAction = {
-    type: "viewport_rebind",
-    recoveryCount: 1,
-    viewportProgress: [{
+  state.recoveryState = {
+    attempts: 0,
+    phase: "reveal",
+    stateHash: "",
+    failedStrategySignatures: [],
+    lastRevealSample: {
       observationId: initial.observationId,
       exists: true,
       inViewport: false,
@@ -290,14 +305,16 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
         Number(decline.visualRegion.y || 0)
         + Number(decline.visualRegion.height || 0) / 2
         - Number(initial.page.viewport?.height || 0)
-      )),
-      measurableProgress: false
-    }],
-    noProgressFailureCount: 0,
-    blockedActionId: originalClick.id,
-    createdObservationId: initial.observationId,
-    action: { ...originalClick, targetSnapshot: null, expectedOutcome: null }
+      ))
+    }
   };
+  state.pendingAction = pendingActionRecord({
+    action: { ...originalClick, targetSnapshot: null, expectedOutcome: null },
+    goal: currentGoal,
+    candidate: pendingCandidate,
+    status: "needs_reveal",
+    recoveryAttempts: 1
+  });
 
   const firstMovement = await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
@@ -339,15 +356,15 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
     dataDir: "",
     state,
     observation: snappedBack,
-    traveler: { id: "trav_scroll", booking_rules: "no extras" },
+    traveler,
     transactionStore: store,
     clientTurnId: "turn_centered_retry"
   });
   expect(retry.clientDecision.action).toBe("scroll");
   expect(retry.clientDecision.expectedOutcome.attempt).toBe(2);
   expect(retry.clientDecision.expectedOutcome.scrollStrategy).toBe("target_center");
-  expect(retry.state.pendingAction.recoveryCount).toBe(2);
-  expect(retry.state.pendingAction.noProgressFailureCount).toBe(1);
+  expect(retry.state.pendingAction.recoveryAttempts).toBe(2);
+  expect(retry.state.recoveryState.attempts).toBe(1);
   expect(retry.debug.modelUsage.calls).toHaveLength(0);
 
   await page.evaluate((decision) => {
@@ -380,18 +397,431 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
     dataDir: "",
     state,
     observation: visible,
-    traveler: { id: "trav_scroll", booking_rules: "no extras" },
+    traveler,
     transactionStore: store,
     clientTurnId: "turn_resume_decline"
   });
-  expect(resumed.clientDecision.action).toBe("click");
+  expect(
+    resumed.clientDecision.action,
+    JSON.stringify({ decision: resumed.clientDecision, state: resumed.state, debug: resumed.debug }, null, 2)
+  ).toBe("click");
   expect(resumed.clientDecision.controlId).toBe(decline.controlId);
-  expect(resumed.state.pendingAction).toBeNull();
+  expect(resumed.state.pendingAction.schemaVersion).toBe(2);
+  expect(resumed.state.pendingAction.status).toBe("ready");
+  expect(resumed.state.pendingAction.originalAction.id).toBe(resumed.clientDecision.actionId);
 
   const clicked = await executeAtomicBrowserDecision(page, resumed.clientDecision, "obs_bundle_satisfied");
   expect(clicked.verification.ok).toBe(true);
   expect(await page.evaluate(() => window.__declineClicks)).toBe(1);
   expect(clicked.observation.page.decisionGroups.some((group) => group.status === "satisfied")).toBe(true);
+});
+
+test("resolved extras preserve one offscreen Continue through reveal, fresh observation, rebind, and dispatch", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      #extras-scroll { height: 240px; overflow-y: auto; border: 1px solid #888; }
+      fieldset { min-height: 72px; }
+      .spacer { height: 700px; }
+    </style>
+    <main>
+      <h1 id="stage">Optional extras</h1>
+      <div id="extras-scroll">
+        <fieldset id="flex-group" role="radiogroup" aria-label="Flexible ticket decision">
+          <legend>Flexible ticket</legend>
+          <label><input type="radio" name="flex" value="paid" required> Flexible ticket — 35 EUR</label>
+          <label><input id="flex-free" type="radio" name="flex" value="none" required> No thanks</label>
+        </fieldset>
+        <div class="spacer"></div>
+        <button id="extras-continue" type="button">Continue</button>
+      </div>
+    </main>
+    <script>
+      window.__continueClicks = 0;
+      document.getElementById("flex-free").addEventListener("change", () => {
+        setTimeout(() => {
+          const protectGroup = document.createElement("fieldset");
+          protectGroup.id = "protect-group";
+          protectGroup.setAttribute("role", "radiogroup");
+          protectGroup.setAttribute("aria-label", "Travel protection decision");
+          protectGroup.innerHTML =
+            '<legend>Travel protection</legend>' +
+            '<label><input type="radio" name="protect" value="paid" required> Protection — 25 EUR</label>' +
+            '<label><input id="protect-free" type="radio" name="protect" value="none" required> No thanks</label>';
+          document.getElementById("flex-group").remove();
+          document.getElementById("extras-scroll").insertBefore(protectGroup, document.querySelector(".spacer"));
+          document.getElementById("stage").textContent = "Travel protection";
+        }, 120);
+      });
+      document.getElementById("extras-continue").addEventListener("click", () => {
+        if (!document.getElementById("protect-free")?.checked) return;
+        window.__continueClicks += 1;
+        document.body.dataset.stage = "next-stage";
+        document.getElementById("stage").textContent = "Next checkout stage";
+      });
+    </script>
+  `);
+
+  const traveler = { id: "trav_extras_continue", booking_rules: "no paid extras" };
+  let state = createCheckoutSessionState({
+    goal: "Resolve all extras and continue",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: page.url() }
+  });
+  state.id = "txn_extras_continue_reveal";
+  state.approvals.skipPaidExtrasApproved = true;
+  const store = inMemoryGovernorStore();
+  const selectedControls = [];
+
+  const nextTurn = async (observation, turnId) => {
+    store.remember(state.id, observation);
+    const turn = await runLoopTurn({
+      apiKey: "",
+      model: "must-not-be-called",
+      dataDir: "",
+      state,
+      observation,
+      traveler,
+      transactionStore: store,
+      clientTurnId: turnId
+    });
+    state = turn.state;
+    expect(turn.debug.modelUsage.calls).toHaveLength(0);
+    return turn;
+  };
+
+  let observation = await browserObservation(page, "obs_extras_initial");
+  const firstTurn = await nextTurn(observation, "turn_extra_1");
+  expect(firstTurn.clientDecision.action).toBe("click");
+  expect(firstTurn.clientDecision.targetLabel).toMatch(/no thanks/i);
+  selectedControls.push(firstTurn.clientDecision.controlId);
+  const firstExecuted = await executeAtomicBrowserDecision(page, firstTurn.clientDecision, "obs_extra_1_commit");
+  expect(firstExecuted.verification.ok).toBe(true);
+  await page.waitForTimeout(160);
+  expect(await page.locator("#flex-group").count()).toBe(0);
+  const secondSurface = await browserObservation(page, "obs_extra_1_selected");
+  secondSurface.previousObservation = observation;
+  secondSurface.lastActionResult = firstExecuted.result;
+  observation = secondSurface;
+
+  let secondTurn = await nextTurn(observation, "turn_extra_2");
+  if (secondTurn.clientDecision.action === "scroll") {
+    await page.evaluate((decision) => {
+      const hooks = window.__ATW_TEST__;
+      const map = hooks.buildPageMap();
+      const target = hooks.resolveDecisionTarget(decision, map);
+      hooks.scrollElementWithinNearestContainer(target, {
+        behavior: "auto",
+        strategy: "target_center",
+        authority: "governed_executor"
+      });
+    }, secondTurn.clientDecision);
+    const secondVisible = await browserObservation(page, "obs_extra_2_visible");
+    secondVisible.previousObservation = observation;
+    secondVisible.lastActionResult = {
+      actionId: secondTurn.clientDecision.actionId,
+      observationId: secondTurn.clientDecision.observationId,
+      dispatched: true,
+      executed: true,
+      verified: false,
+      outcome: { code: "SCROLL_DISPATCHED_AWAITING_FRESH_OBSERVATION" }
+    };
+    observation = secondVisible;
+    secondTurn = await nextTurn(observation, "turn_extra_2_resume");
+  }
+  expect(secondTurn.clientDecision.action, JSON.stringify({ decision: secondTurn.clientDecision, debug: secondTurn.debug }, null, 2)).toBe("click");
+  expect(secondTurn.clientDecision.targetLabel).toMatch(/no thanks/i);
+  selectedControls.push(secondTurn.clientDecision.controlId);
+  const secondExecuted = await executeAtomicBrowserDecision(page, secondTurn.clientDecision, "obs_extra_2_selected");
+  expect(secondExecuted.verification.ok).toBe(true);
+  expect(await page.locator("#protect-free").isChecked()).toBe(true);
+  secondExecuted.observation.previousObservation = observation;
+  observation = secondExecuted.observation;
+  expect(new Set(selectedControls).size).toBe(2);
+
+  const revealTurn = await nextTurn(observation, "turn_continue_reveal");
+  expect(
+    revealTurn.clientDecision.action,
+    JSON.stringify({ decision: revealTurn.clientDecision, state: revealTurn.state, debug: revealTurn.debug }, null, 2)
+  ).toBe("scroll");
+  expect(revealTurn.state.pendingAction.schemaVersion).toBe(2);
+  expect(revealTurn.state.pendingAction.status).toBe("needs_reveal");
+  expect(revealTurn.state.pendingAction.originalAction.targetLabel).toMatch(/continue/i);
+
+  await page.evaluate((decision) => {
+    const hooks = window.__ATW_TEST__;
+    const map = hooks.buildPageMap();
+    const target = hooks.resolveDecisionTarget(decision, map);
+    hooks.scrollElementWithinNearestContainer(target, {
+      behavior: "auto",
+      strategy: "target_center",
+      authority: "governed_executor"
+    });
+  }, revealTurn.clientDecision);
+  const visible = await browserObservation(page, "obs_continue_visible");
+  visible.previousObservation = observation;
+  visible.lastActionResult = {
+    actionId: revealTurn.clientDecision.actionId,
+    observationId: revealTurn.clientDecision.observationId,
+    dispatched: true,
+    executed: true,
+    verified: false,
+    outcome: { code: "SCROLL_DISPATCHED_AWAITING_FRESH_OBSERVATION" }
+  };
+  const resumed = await nextTurn(visible, "turn_continue_resume");
+  expect(
+    resumed.clientDecision.action,
+    JSON.stringify({ decision: resumed.clientDecision, state: resumed.state, debug: resumed.debug }, null, 2)
+  ).toBe("click");
+  expect(resumed.clientDecision.targetLabel).toMatch(/continue/i);
+  expect(resumed.state.pendingAction.status).toBe("ready");
+  expect(resumed.state.pendingAction.originalAction.id).toBe(resumed.clientDecision.actionId);
+
+  const continued = await executeAtomicBrowserDecision(page, resumed.clientDecision, "obs_extras_advanced");
+  expect(continued.result.dispatched).toBe(true);
+  expect(await page.locator("body").getAttribute("data-stage")).toBe("next-stage");
+  expect(await page.evaluate(() => window.__continueClicks)).toBe(1);
+});
+
+test("three sibling extras resolve as an exact decision-group queue before Continue is published", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { margin: 0; font-family: sans-serif; }
+      #extras-scroll { height: 520px; overflow-y: auto; border: 1px solid #888; }
+      fieldset { margin: 16px; padding: 12px; }
+      label { display: block; padding: 6px; }
+      .spacer { height: 620px; }
+    </style>
+    <main>
+      <h1 id="stage">Optional protection and support</h1>
+      <section aria-label="Optional extras">
+        <div id="extras-scroll">
+          <fieldset role="radiogroup" aria-label="AirHelp">
+            <legend>AirHelp</legend>
+            <label><input type="radio" name="airhelp" value="add" required> Add AirHelp — 18 EUR</label>
+            <label><input id="airhelp-none" type="radio" name="airhelp" value="none" required> No thanks</label>
+          </fieldset>
+          <fieldset role="radiogroup" aria-label="Lost baggage">
+            <legend>Lost baggage</legend>
+            <label><input type="radio" name="lost-baggage" value="add" required> Add lost baggage protection — 12 EUR</label>
+            <label><input id="lost-baggage-none" type="radio" name="lost-baggage" value="none" required> No thanks</label>
+          </fieldset>
+          <div role="group" aria-label="Premium support">
+            <h2>Premium support</h2>
+            <button id="premium-support-add" type="button" aria-pressed="false">Add premium support — 9 EUR</button>
+            <button id="premium-support-none" type="button" aria-pressed="false">No thanks</button>
+          </div>
+          <div class="spacer"></div>
+          <button id="continue-extras" type="button">Continue</button>
+        </div>
+      </section>
+    </main>
+    <script>
+      window.__continueClicks = 0;
+      for (const id of ["premium-support-add", "premium-support-none"]) {
+        document.getElementById(id).addEventListener("click", () => {
+          document.getElementById("premium-support-add").setAttribute("aria-pressed", String(id === "premium-support-add"));
+          document.getElementById("premium-support-none").setAttribute("aria-pressed", String(id === "premium-support-none"));
+        });
+      }
+      document.getElementById("continue-extras").addEventListener("click", () => {
+        const complete = ["airhelp-none", "lost-baggage-none"].every((id) => document.getElementById(id).checked)
+          && document.getElementById("premium-support-none").getAttribute("aria-pressed") === "true";
+        if (!complete) return;
+        window.__continueClicks += 1;
+        document.body.dataset.stage = "payment-review";
+        document.getElementById("stage").textContent = "Payment review";
+      });
+    </script>
+  `);
+
+  const traveler = { id: "trav_exact_group_queue", booking_rules: "no paid extras" };
+  let state = createCheckoutSessionState({
+    goal: "Decline every paid extra and continue",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: page.url() }
+  });
+  state.id = "txn_exact_group_queue";
+  state.approvals.skipPaidExtrasApproved = true;
+  const store = inMemoryGovernorStore();
+
+  const nextTurn = async (observation, turnId) => {
+    store.remember(state.id, observation);
+    const turn = await runLoopTurn({
+      apiKey: "",
+      model: "must-not-be-called",
+      dataDir: "",
+      state,
+      observation,
+      traveler,
+      transactionStore: store,
+      clientTurnId: turnId
+    });
+    state = turn.state;
+    expect(turn.debug.modelUsage.calls).toHaveLength(0);
+    return turn;
+  };
+
+  let observation = await browserObservation(page, "obs_exact_groups_0");
+  const initialGroups = observation.page.decisionGroups.filter((group) => (
+    /airhelp|lost baggage|premium support/i.test(`${group.sectionLabel || ""} ${group.requirementId || ""}`)
+  ));
+  expect(initialGroups, JSON.stringify({
+    groups: observation.page.decisionGroups,
+    premiumControls: observation.page.controls.filter((control) => /premium support|no thanks/i.test(control.label || ""))
+  }, null, 2)).toHaveLength(3);
+  expect(new Set(initialGroups.map((group) => group.decisionGroupId)).size).toBe(3);
+  for (const group of initialGroups) {
+    expect(group.status).toBe("missing");
+    expect(group.alternativeControlIds).toHaveLength(2);
+    expect(new Set(group.alternativeControlIds).size).toBe(2);
+  }
+
+  const completedGroupIds = [];
+  for (let index = 0; index < 3; index += 1) {
+    const unresolved = observation.page.decisionGroups.find((group) => (
+      group.required && !["satisfied", "waived_by_policy"].includes(group.status)
+    ));
+    expect(unresolved).toBeTruthy();
+    const turn = await nextTurn(observation, `turn_exact_group_${index + 1}`);
+    expect(
+      turn.clientDecision.action,
+      JSON.stringify({ decision: turn.clientDecision, state: turn.state, debug: turn.debug, groups: observation.page.decisionGroups }, null, 2)
+    ).toBe("click");
+    expect(turn.clientDecision.targetLabel).toMatch(/no thanks/i);
+    expect(turn.clientDecision.decisionGroupId).toBe(unresolved.decisionGroupId);
+    expect(turn.state.currentGoal.candidates.every((candidate) => candidate.decisionGroupId === unresolved.decisionGroupId)).toBe(true);
+    expect(turn.state.currentGoal.candidates.some((candidate) => /continue/i.test(candidate.targetLabel || ""))).toBe(false);
+
+    completedGroupIds.push(unresolved.decisionGroupId);
+    const executed = await executeAtomicBrowserDecision(page, turn.clientDecision, `obs_exact_groups_${index + 1}`);
+    expect(executed.verification.ok, JSON.stringify({
+      decision: turn.clientDecision,
+      validation: executed.validation,
+      verification: executed.verification,
+      groups: executed.observation.page.decisionGroups
+    }, null, 2)).toBe(true);
+    executed.observation.previousObservation = observation;
+    observation = executed.observation;
+
+    const exactCompleted = observation.page.decisionGroups.find((group) => group.decisionGroupId === unresolved.decisionGroupId);
+    expect(exactCompleted.status).toBe("satisfied");
+    expect(exactCompleted.selectedControlId).toBe(turn.clientDecision.controlId);
+    const unresolvedSiblings = observation.page.decisionGroups.filter((group) => (
+      group.required
+      && group.decisionGroupId !== unresolved.decisionGroupId
+      && !completedGroupIds.includes(group.decisionGroupId)
+    ));
+    expect(unresolvedSiblings.every((group) => group.status === "missing")).toBe(true);
+  }
+
+  expect(new Set(completedGroupIds).size).toBe(3);
+  const revealContinue = await nextTurn(observation, "turn_exact_groups_continue_reveal");
+  expect(revealContinue.clientDecision.action).toBe("scroll");
+  expect(revealContinue.state.pendingAction.originalAction.targetLabel).toMatch(/continue/i);
+
+  await page.evaluate((decision) => {
+    const hooks = window.__ATW_TEST__;
+    const map = hooks.buildPageMap();
+    const target = hooks.resolveDecisionTarget(decision, map);
+    hooks.scrollElementWithinNearestContainer(target, {
+      behavior: "auto",
+      strategy: "target_center",
+      authority: "governed_executor"
+    });
+  }, revealContinue.clientDecision);
+  const visible = await browserObservation(page, "obs_exact_groups_continue_visible");
+  visible.previousObservation = observation;
+  visible.lastActionResult = {
+    actionId: revealContinue.clientDecision.actionId,
+    observationId: revealContinue.clientDecision.observationId,
+    dispatched: true,
+    executed: true,
+    verified: false,
+    outcome: { code: "SCROLL_DISPATCHED_AWAITING_FRESH_OBSERVATION" }
+  };
+  const resumedContinue = await nextTurn(visible, "turn_exact_groups_continue_resume");
+  expect(resumedContinue.clientDecision.action).toBe("click");
+  expect(resumedContinue.clientDecision.targetLabel).toMatch(/continue/i);
+
+  const continued = await executeAtomicBrowserDecision(page, resumedContinue.clientDecision, "obs_exact_groups_payment_review");
+  expect(continued.result.dispatched).toBe(true);
+  expect(await page.locator("body").getAttribute("data-stage")).toBe("payment-review");
+  expect(await page.evaluate(() => window.__continueClicks)).toBe(1);
+
+  const records = resumedContinue.state.decisionCompletions || [];
+  for (const groupId of completedGroupIds) {
+    const record = records.find((item) => item.decisionGroupId === groupId);
+    expect(record).toMatchObject({
+      decisionGroupId: groupId,
+      status: "satisfied"
+    });
+    expect(record.requirementId).toBeTruthy();
+    expect(record.selectedControlId).toBeTruthy();
+    expect(record.observationId).toBeTruthy();
+  }
+});
+
+test("paid product detail buttons remain context and never become singleton required decisions", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Configure your trip</h1>
+      <section aria-label="Optional products">
+        <h2>Build your own bundle</h2>
+        <fieldset role="radiogroup" aria-label="Bundle tier">
+          <legend>Bundle tier</legend>
+          <label><input type="radio" name="bundle-tier" value="standard"> Standard — 20 EUR</label>
+          <label><input type="radio" name="bundle-tier" value="premium"> Premium — 40 EUR</label>
+        </fieldset>
+        <label><input id="bundle-decline" type="checkbox" value="none"> No thanks — continue without bundle</label>
+        <button id="standard-details" type="button">Standard — 20 EUR. Click to learn bundle details</button>
+        <button id="premium-details" type="button">Premium — 40 EUR. Click to learn bundle details</button>
+        <button id="sms-details" type="button">Booking number by SMS included in Premium+</button>
+        <div role="group" aria-label="AirHelp Plus">
+          <h3>AirHelp Plus</h3>
+          <button id="airhelp-add" type="button" aria-pressed="false">Add AirHelp Plus — 18 EUR</button>
+          <button id="airhelp-decline" type="button" aria-pressed="false">No thanks</button>
+        </div>
+      </section>
+      <button type="button">Continue</button>
+    </main>
+  `);
+
+  const observation = await browserObservation(page, "obs_detail_buttons_are_context");
+  const detailControls = observation.page.controls.filter((control) => (
+    /click to learn bundle details|booking number by sms/i.test(control.label || "")
+  ));
+  expect(detailControls).toHaveLength(3);
+
+  const groupedControlIds = new Set(observation.page.decisionGroups.flatMap((group) => (
+    group.alternativeControlIds || []
+  )));
+  for (const control of detailControls) {
+    expect(groupedControlIds.has(control.controlId), JSON.stringify(observation.page.decisionGroups, null, 2)).toBe(false);
+  }
+
+  const bundleDecline = observation.page.controls.find((control) => /continue without bundle/i.test(control.label || ""));
+  expect(bundleDecline).toBeTruthy();
+  const bundleGroup = observation.page.decisionGroups.find((group) => (
+    group.alternativeControlIds?.includes(bundleDecline.controlId)
+  ));
+  expect(bundleGroup).toBeTruthy();
+  expect(bundleGroup.required).toBe(true);
+  expect(bundleGroup.alternativeControlIds).toHaveLength(3);
+  expect(bundleGroup.alternativeControlIds.filter((id) => (
+    observation.page.controls.find((control) => control.controlId === id)?.risk === "money"
+  ))).toHaveLength(2);
+
+  const airHelpGroup = observation.page.decisionGroups.find((group) => (
+    /airhelp/i.test(`${group.sectionLabel || ""} ${group.requirementId || ""}`)
+  ));
+  expect(airHelpGroup).toBeTruthy();
+  expect(airHelpGroup.required).toBe(true);
+  expect(airHelpGroup.alternativeControlIds).toHaveLength(2);
+  expect(observation.page.controls.some((control) => (
+    airHelpGroup.alternativeControlIds.includes(control.controlId)
+    && /no thanks/i.test(control.label || "")
+  ))).toBe(true);
 });
 
 async function executeUnifiedCandidate({ page, store, state, goal, candidate, observation, nextObservationId, turnId }) {
@@ -1628,17 +2058,12 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   expect(staleGovernance.allow).toBe(false);
   expect(staleGovernance.decision).toBe("recoverable");
   expect(staleGovernance.code).toMatch(/CANONICAL_ALIAS_UNRESOLVED|CURRENT_GOAL_CANDIDATE_MISMATCH/);
-  const staleRecovery = loopPrivate.applyRecoveryBudget(state, {
-    actionId: staleProposal.id,
-    observationId: observation.observationId,
-    dispatched: false,
-    executed: false,
-    verified: false,
-    outcome: { code: staleGovernance.code }
+  const staleRecovery = loopPrivate.updateRecoveryState(state, {
+    kind: "grounding_rejection",
+    code: staleGovernance.code
   });
-  expect(staleRecovery.classification).toBe("grounding_replan");
-  expect(staleRecovery.groundingRecoveryAttempts).toBe(1);
-  expect(staleRecovery.executionRecoveryAttempts).toBe(0);
+  expect(staleRecovery.classification).toBe("grounding_rejection");
+  expect(staleRecovery.recoveryState.attempts).toBe(0);
   expect(staleRecovery.exhausted).toBe(false);
   state = staleRecovery.state;
 
@@ -1814,6 +2239,8 @@ test("large canonical observation uploads screenshot separately and reaches a gr
       screenshotId,
       mapControlCount: map.controls.length,
       transportControlCount: canonicalPage.controls.length,
+      currentSurface: canonicalPage.currentSurface,
+      emailControl: canonicalPage.controls.find((control) => control.semantic === "email" || /email/i.test(control.label || "")) || null,
       bytes,
       transportMode: posted.transportMode,
       containsInlineScreenshot: JSON.stringify(payload).includes("data:image/png"),
@@ -1836,7 +2263,7 @@ test("large canonical observation uploads screenshot separately and reaches a gr
   expect(transport.containsInlineScreenshot).toBe(false);
   expect(transport.sectionUsesIdsOnly).toBe(true);
   expect(transport.surfaceUsesIdsOnly).toBe(true);
-  expect(transport.decision).toMatchObject({
+  expect(transport.decision, JSON.stringify({ currentSurface: transport.currentSurface, emailControl: transport.emailControl, decision: transport.decision })).toMatchObject({
     sessionId: session.id,
     observationId: transport.observationId,
     action: "type",
@@ -1858,6 +2285,7 @@ test("final safe checkout replay advances completed traveler through both seat l
       [hidden] { display: none !important; }
       section { margin: 12px; padding: 12px; border: 1px solid #aaa; }
       #seats { position: fixed; inset: 50px 100px auto; background: white; z-index: 20; }
+      #seat-footer { position: fixed; left: 102px; top: 122px; z-index: 21; background: white; }
     </style>
     <main>
       <h1 id="stage-title">Passenger information</h1>
@@ -1960,7 +2388,16 @@ test("final safe checkout replay advances completed traveler through both seat l
     };
     store.remember(state.id, observation);
     const candidate = candidateSet.candidates.find(matcher);
-    expect(candidate, JSON.stringify({ goal, candidates: candidateSet.candidates })).toBeTruthy();
+    expect(candidate, JSON.stringify({
+      goal,
+      candidates: candidateSet.candidates,
+      controls: (observation.page.controls || []).map((control) => ({
+        label: control.label,
+        controlId: control.controlId,
+        surfaceId: control.surfaceId,
+        operations: control.operations
+      }))
+    })).toBeTruthy();
     expect(candidate.risk).toBe("safe");
     expect(candidate.targetLabel).not.toMatch(/paid|pay now|\b\d+\s*EUR/i);
     expect(candidate.affordance?.stableKey).toBeTruthy();
@@ -2029,14 +2466,14 @@ test("final safe checkout replay advances completed traveler through both seat l
   expect(rejected.result.dispatched).toBe(false);
   expect(rejected.validation.code).toBe("TARGET_OUTSIDE_CURRENT_SURFACE");
   const recovery = advanceActionLifecycle({
-    state: { ...state, lastAction: wrongSurfaceAction, groundingRecoveryAttempts: 0, executionRecoveryAttempts: 0 },
+    state: { ...state, lastAction: wrongSurfaceAction, recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] } },
     observation: rejected.observation,
     previousObservation: observation
   });
   expect(recovery.lifecycle.status).toBe("rejected_before_dispatch");
   expect(recovery.directive).toBe("rebuild_candidates");
-  expect(recovery.state.groundingRecoveryAttempts).toBe(1);
-  expect(recovery.state.executionRecoveryAttempts).toBe(0);
+  expect(recovery.state.recoveryState.attempts).toBe(0);
+  expect(recovery.state.recoveryState.phase).toBe("grounding_rejection");
   expect(recovery.directive).not.toContain("handoff");
   observation = rejected.observation;
   observation = await execute(observation, (candidate) => /no thanks/i.test(candidate.targetLabel), "obs_final_seat_1_declined");
@@ -2054,4 +2491,147 @@ test("final safe checkout replay advances completed traveler through both seat l
   expect(new Set(actions.map((entry) => entry.candidateId)).size).toBe(actions.length);
   expect(actions.every((entry) => entry.plannedObservationId !== entry.resultObservationId)).toBe(true);
   expect(actions.every((entry) => entry.risk === "safe")).toBe(true);
+});
+
+test("authoritative actionability excludes an occluded ghost and completes popup-to-summary navigation", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { font-family: sans-serif; margin: 24px; }
+      .action { position: relative; display: inline-block; margin: 8px; }
+      #ghost-cover { position: absolute; inset: 0; z-index: 3; background: rgba(255,255,255,.01); }
+      #confirm { position: fixed; inset: 80px 120px; z-index: 20; background: white; border: 2px solid #222; padding: 24px; }
+      [hidden] { display: none !important; }
+    </style>
+    <main id="checkout">
+      <h1 id="stage">Seats</h1>
+      <div id="initial-actions">
+        <span class="action"><button id="ghost-next" type="button">Next</button><span id="ghost-cover"></span></span>
+        <button id="real-next" type="button">Next</button>
+      </div>
+      <section id="summary" hidden><h2>Seat summary</h2><button id="summary-next" type="button">Next</button></section>
+      <button id="pay" type="button" hidden>Pay now</button>
+    </main>
+    <div id="confirm" role="dialog" aria-modal="true" aria-label="Continue without seats?" hidden>
+      <p>Continue without seats?</p><button id="confirm-continue" type="button">Continue</button>
+    </div>
+    <script>
+      document.getElementById("real-next").addEventListener("click", () => { document.getElementById("confirm").hidden = false; });
+      document.getElementById("confirm-continue").addEventListener("click", () => {
+        document.getElementById("confirm").hidden = true;
+        document.getElementById("initial-actions").hidden = true;
+        document.getElementById("summary").hidden = false;
+        document.getElementById("stage").textContent = "Summary";
+      });
+      document.getElementById("summary-next").addEventListener("click", () => {
+        document.getElementById("summary").hidden = true;
+        document.getElementById("pay").hidden = false;
+        document.body.dataset.stage = "payment-review";
+      });
+    </script>
+  `);
+
+  const store = inMemoryGovernorStore();
+  let state = createCheckoutSessionState({ goal: "Reach payment review safely", travelerId: "trav_actionability", site: { host: "example.test", url: page.url() } });
+  state.id = "txn_actionability_replay";
+  const traveler = { id: "trav_actionability", booking_rules: "no paid extras" };
+
+  const executeCurrent = async (before, label, nextObservationId) => {
+    const requirements = loopPrivate.requirementsWithDecisionGroups([], before);
+    const goal = deriveObservationGoal(before, requirements);
+    const scopedState = { ...state, requirements, activeRequirements: requirements };
+    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, before, [], { state: scopedState, traveler, approvals: state.approvals });
+    const candidate = candidateSet.candidates.find((item) => item.targetLabel === label);
+    expect(candidate, JSON.stringify(candidateSet)).toBeTruthy();
+    state = {
+      ...state,
+      currentGoal: { ...goal, candidateSet, candidates: candidateSet.candidates },
+      currentObservation: { observationId: before.observationId, observationHash: before.observationSnapshot.snapshotHash },
+      requirements,
+      activeRequirements: requirements
+    };
+    store.remember(state.id, before);
+    const action = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(goal, candidate, before), before);
+    const governed = governAction({ action, state, observation: before, traveler, store, turnId: nextObservationId });
+    expect(governed.allow, `${governed.code}: ${governed.reason}`).toBe(true);
+    state = governed.state || state;
+    const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), nextObservationId);
+    expect(executed.validation.ok, JSON.stringify(executed.validation)).toBe(true);
+    expect(executed.result.dispatched).toBe(true);
+    return executed.observation;
+  };
+
+  let observation = await browserObservation(page, "obs_actionability_initial");
+  const ghost = observation.page.controls.find((control) => control.label === "Next" && control.operations?.activate?.actionability?.executable === false);
+  const real = observation.page.controls.find((control) => control.label === "Next" && control.operations?.activate?.actionability?.executable === true);
+  expect(ghost).toBeTruthy();
+  expect(ghost.operations.activate.actionability.code).toBe("ACTUATOR_OCCLUDED");
+  expect(real).toBeTruthy();
+  const initialGoal = deriveObservationGoal(observation, []);
+  const initialCandidates = loopPrivate.groundedObservationCandidateSet(initialGoal, observation).candidates;
+  expect(initialCandidates.some((candidate) => candidate.controlId === ghost.controlId)).toBe(false);
+  expect(initialCandidates.filter((candidate) => candidate.targetLabel === "Next")).toHaveLength(1);
+
+  const initiallyValid = initialCandidates.find((candidate) => candidate.controlId === real.controlId);
+  const liveGateAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(initialGoal, initiallyValid, observation), observation);
+  await page.evaluate(() => {
+    const target = document.getElementById("real-next");
+    const box = target.getBoundingClientRect();
+    const cover = document.createElement("div");
+    cover.id = "late-cover";
+    Object.assign(cover.style, { position: "fixed", left: `${box.left}px`, top: `${box.top}px`, width: `${box.width}px`, height: `${box.height}px`, zIndex: "50", background: "rgba(255,255,255,.01)" });
+    document.body.appendChild(cover);
+  });
+  const rejectedAtDispatch = await executeAtomicBrowserDecision(page, toClientDecision(liveGateAction), "obs_actionability_late_occlusion");
+  expect(rejectedAtDispatch.validation.code).toBe("TARGET_OCCLUDED");
+  expect(rejectedAtDispatch.result.dispatched).toBe(false);
+  await page.locator("#late-cover").evaluate((node) => node.remove());
+
+  observation = await executeCurrent(observation, "Next", "obs_actionability_popup");
+  expect(observation.page.currentSurface.type).toBe("modal");
+  expect(observation.page.currentSurface.label).toMatch(/continue without seats/i);
+  observation = await executeCurrent(observation, "Continue", "obs_actionability_summary");
+  expect(await page.locator("#stage").textContent()).toBe("Summary");
+  await executeCurrent(observation, "Next", "obs_actionability_payment");
+  expect(await page.locator("body").getAttribute("data-stage")).toBe("payment-review");
+  expect(await page.locator("#pay").isVisible()).toBe(true);
+});
+
+test("task-scoped no-effect memory survives rerender while useful progress resets only the consecutive budget", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main><h1>Optional choice</h1><div id="actions"><button name="dead-next" type="button">Next</button><button id="continue-stage" type="button">Continue</button></div></main>
+    <div id="confirm" role="dialog" aria-modal="true" aria-label="Confirm" hidden><button id="continue" type="button">Continue</button></div>
+    <script>document.getElementById("continue-stage").addEventListener("click", () => { document.getElementById("confirm").hidden = false; });</script>
+  `);
+
+  const before = await browserObservation(page, "obs_memory_before");
+  const goal = deriveObservationGoal(before, []);
+  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, before);
+  const dead = firstSet.candidates.find((candidate) => candidate.targetLabel === "Next");
+  expect(dead).toBeTruthy();
+  const deadAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(goal, dead, before), before);
+  const deadExecution = await executeAtomicBrowserDecision(page, toClientDecision(deadAction), "obs_memory_no_effect");
+  expect(deadExecution.result.dispatched).toBe(true);
+  const failed = loopPrivate.applyTransitionStatus({ currentGoal: goal, lastAction: deadAction, attemptedStrategySignatures: [], failedStrategyMemory: [], recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] } }, deadExecution.observation, before);
+  expect(failed.transition.status).toBe("no_effect");
+  expect(failed.state.recoveryState.attempts).toBe(1);
+  expect(failed.state.failedStrategyMemory).toHaveLength(1);
+
+  await page.evaluate(() => {
+    const old = document.querySelector("button[name='dead-next']");
+    old.replaceWith(old.cloneNode(true));
+  });
+  const rerendered = await browserObservation(page, "obs_memory_rerendered");
+  const rerenderedGoal = deriveObservationGoal(rerendered, []);
+  const failedSignatures = loopPrivate.failedStrategySignaturesForGoal(failed.state, rerenderedGoal);
+  const retrySet = loopPrivate.groundedObservationCandidateSet(rerenderedGoal, rerendered, failedSignatures);
+  expect(retrySet.candidates.some((candidate) => candidate.targetLabel === "Next")).toBe(false);
+  const next = retrySet.candidates.find((candidate) => candidate.targetLabel === "Continue");
+  expect(next).toBeTruthy();
+
+  const nextAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(rerenderedGoal, next, rerendered), rerendered);
+  const nextExecution = await executeAtomicBrowserDecision(page, toClientDecision(nextAction), "obs_memory_progress");
+  const progressed = loopPrivate.applyTransitionStatus({ ...failed.state, currentGoal: rerenderedGoal, lastAction: nextAction }, nextExecution.observation, rerendered);
+  expect(progressed.transition.status).toBe("blocked");
+  expect(progressed.state.recoveryState.attempts).toBe(0);
+  expect(progressed.state.failedStrategyMemory).toHaveLength(1);
 });

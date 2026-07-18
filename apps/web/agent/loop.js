@@ -10,18 +10,12 @@
 // within the same request. Each HTTP call is one full lap: verify what the
 // previous action did, then plan+policy-check the next one.
 //
-// Two OpenAI calls per turn, not three: verify+plan are combined
-// (verify-and-plan.js) since "given what just happened, what's next" is one
-// judgment, not two round-trips — the original 3-call version measured
-// 15-30+ seconds per turn in practice, which is a real cost, not a
-// theoretical one, for a product whose whole point is being fast.
+// Zero model calls when task/policy filtering leaves one obvious safe action.
+// Ambiguous turns use at most two: classification plus combined verify/plan.
+// The original 3-call version measured 15-30+ seconds per turn in practice,
+// which is a real cost for a product whose whole point is being fast.
 
-const { classifyPageState } = require("./page-state-classifier");
-const { PlannerContractError, verifyAndPlan } = require("./verify-and-plan");
 const { selectCandidate } = require("./select-candidate");
-const {
-  deriveObservationGoal
-} = require("./observation-candidates");
 const {
   actionForCurrentCandidate,
   buildCurrentCandidateSet
@@ -36,20 +30,28 @@ const {
 const { writeTrace } = require("./trace-store");
 const {
   advanceActionLifecycle,
-  applyRecoveryBudget,
   canonicalFailureCode,
+  normalizePendingAction,
+  pendingActionNeedsResult,
+  pendingActionRecord,
+  recoverBeforeDispatch,
+  updateRecoveryState,
   wasDispatched
 } = require("./action-lifecycle");
 const {
   normalizeAction,
-  actionSignature
+  actuatorSignature,
+  semanticGoalKey
 } = require("../../../packages/shared/agent-actions");
 const { withUpdate, normalizeStep } = require("../../../packages/shared/agent-state");
 const { missingRequired, normalizeRequirement, requirementFulfilled } = require("../../../packages/shared/requirements");
 const { currentSurface, currentSurfaceId, surfaceBinding } = require("./surface-contract");
 const { compileTypedExpectedOutcome } = require("./action-semantics");
-
-const STALL_THRESHOLD = 3;
+const {
+  applyAuthoritativeOutcomeToRequirements,
+  contextForPublishedGoal,
+  deriveAuthoritativeTaskContext
+} = require("./task-action-context");
 
 function isContinueRequirement(req) {
   if (!req) return false;
@@ -71,8 +73,13 @@ function sameNormalizedText(a = "", b = "") {
 }
 
 function decisionGroupMatchesRequirement(group = {}, requirement = {}) {
+  const exactGroupId = String(requirement.decisionGroupId || requirement.scope?.decisionGroupId || "");
+  if (exactGroupId) return String(group.decisionGroupId || "") === exactGroupId;
+  const exactRequirementId = String(requirement.requirementId || requirement.id || "");
+  if (exactRequirementId && (exactRequirementId === group.decisionGroupId || exactRequirementId === group.requirementId)) return true;
   const targetIds = new Set([requirement.id, ...(requirement.targetIds || [])].filter(Boolean));
-  if (targetIds.has(group.decisionGroupId) || targetIds.has(group.sectionId) || targetIds.has(group.requirementId)) return true;
+  if (targetIds.has(group.decisionGroupId) || targetIds.has(group.requirementId)) return true;
+  if ((group.alternativeControlIds || []).some((controlId) => targetIds.has(controlId))) return true;
   if ((group.alternatives || []).some((choice) => targetIds.has(choice.controlId) || targetIds.has(choice.targetId))) return true;
   return sameNormalizedText(group.sectionLabel, requirement.label) || sameNormalizedText(group.sectionType, requirement.label) || sameNormalizedText(group.requirementId, requirement.id);
 }
@@ -120,6 +127,7 @@ function requirementFromDecisionGroup(group = {}, index = 0) {
       group.decisionGroupId,
       group.sectionId,
       group.requirementId,
+      ...(group.alternativeControlIds || []),
       ...(group.alternatives || []).flatMap((choice) => [choice.controlId, choice.targetId])
     ].filter(Boolean)
   }, index);
@@ -140,7 +148,8 @@ function withDecisionGroupFields(requirement = {}, group = {}) {
       risk: choice.risk || "",
       selected: Boolean(choice.selected),
       priceText: choice.priceText || ""
-    }))
+    })),
+    alternativeControlIds: [...(group.alternativeControlIds || [])]
   };
 }
 
@@ -244,6 +253,7 @@ function canonicalRequirementLifecycle(requirements = [], observation = {}, prev
       interfaceStatus,
       createdObservationId: observationId,
       lastObservedObservationId: observationId,
+      observationId,
       resolvedByActionId: ["satisfied", "waived_by_policy"].includes(lifecycleStatus) ? lastActionId : "",
       value: requirement.selectedLabel || requirement.value || "",
       stale: false
@@ -278,6 +288,26 @@ function activeRequirementView(lifecycle = []) {
   return (lifecycle || []).filter((item) => item.lifecycleStatus !== "stale");
 }
 
+function exactDecisionCompletionRecords(previous = [], lifecycle = [], observationId = "") {
+  const byIdentity = new Map((previous || []).map((record) => [
+    `${record.surfaceId || ""}:${record.decisionGroupId || ""}:${record.requirementId || ""}`,
+    record
+  ]));
+  for (const requirement of lifecycle || []) {
+    if (!requirement.decisionGroupId || !["satisfied", "waived_by_policy"].includes(requirement.lifecycleStatus || requirement.status)) continue;
+    const record = {
+      surfaceId: requirement.surfaceId || requirement.scope?.surfaceId || "surface-page",
+      decisionGroupId: requirement.decisionGroupId,
+      requirementId: requirement.requirementId || requirement.id || requirement.decisionGroupId,
+      selectedControlId: requirement.selectedControlId || "",
+      status: requirement.lifecycleStatus || requirement.status,
+      observationId: requirement.lastObservedObservationId || requirement.observationId || observationId || ""
+    };
+    byIdentity.set(`${record.surfaceId}:${record.decisionGroupId}:${record.requirementId}`, record);
+  }
+  return [...byIdentity.values()].slice(-120);
+}
+
 function requirementsWithDecisionGroups(classifiedRequirements = [], observation = {}) {
   const page = observation?.page || {};
   const groups = page.decisionGroups || [];
@@ -302,7 +332,17 @@ function requirementsWithDecisionGroups(classifiedRequirements = [], observation
   const groupedIds = new Set(groupRequirements.map((req) => req.id).filter(Boolean));
   const filteredClassified = (classifiedRequirements || []).flatMap((requirement) => {
     const group = decisionGroupForRequirement(requirement, page);
-    if (!group?.decisionGroupId) return [withoutCanonicalGroup(requirement)];
+    if (!group?.decisionGroupId) {
+      const persistedExactGroup = Boolean(
+        requirement.decisionGroupId
+        && (requirement.scope || requirement.lifecycleStatus || requirement.observationId)
+      );
+      // A lifecycle-owned exact group that is absent from the fresh canonical
+      // registry has left the active observation scope. Do not revive it as a
+      // current conflict; canonicalRequirementLifecycle retains it as stale.
+      if (persistedExactGroup) return [];
+      return [withoutCanonicalGroup(requirement)];
+    }
     // Choice-like requirements are represented by the canonical group. Field,
     // payment, and unrelated requirements remain separate.
     if (/decision|legal_acceptance|unknown/.test(requirement.type || "")) return [];
@@ -473,9 +513,6 @@ function viewportRecoveryAction(blockedAction = {}, observation = {}, recoveryCo
   });
 }
 
-const MAX_VIEWPORT_RECOVERY_ATTEMPTS = 5;
-const MAX_CONSECUTIVE_VIEWPORT_FAILURES = 3;
-
 function viewportProgressSample(action = {}, observation = {}) {
   const target = action.targetSnapshot || null;
   const region = target?.visualRegion || target?.box || null;
@@ -499,9 +536,7 @@ function viewportProgressSample(action = {}, observation = {}) {
   };
 }
 
-function withViewportProgress(pending = {}, sample = {}) {
-  const history = Array.isArray(pending.viewportProgress) ? pending.viewportProgress : [];
-  const previous = history[history.length - 1] || null;
+function viewportProgress(previous = null, sample = {}) {
   const previousDistance = typeof previous?.distanceToViewport === "number" ? previous.distanceToViewport : null;
   const currentDistance = typeof sample?.distanceToViewport === "number" ? sample.distanceToViewport : null;
   const measurableProgress = Boolean(
@@ -512,40 +547,29 @@ function withViewportProgress(pending = {}, sample = {}) {
       && currentDistance != null
       && currentDistance <= previousDistance - 8)
   );
-  const comparableFailure = Boolean(previous && !sample.inViewport && !measurableProgress);
   return {
-    ...pending,
-    viewportProgress: [...history, { ...sample, measurableProgress }].slice(-8),
-    noProgressFailureCount: measurableProgress
-      ? 0
-      : comparableFailure
-        ? Number(pending.noProgressFailureCount || 0) + 1
-        : Number(pending.noProgressFailureCount || 0),
-    updatedAt: new Date().toISOString()
+    ...sample,
+    measurableProgress
   };
 }
 
-function pendingViewportRecovery(blockedAction = {}, recoveryCount = 1, observation = {}) {
-  const initialProgress = viewportProgressSample(blockedAction, observation);
-  return {
-    type: "viewport_rebind",
+function pendingRevealAction(blockedAction = {}, recoveryAttempts = 1, candidate = null, goal = {}) {
+  return pendingActionRecord({
     action: normalizeAction({
       ...blockedAction,
       targetSnapshot: null,
       expectedOutcome: null
     }),
-    recoveryCount,
-    viewportProgress: initialProgress.observationId ? [{ ...initialProgress, measurableProgress: false }] : [],
-    noProgressFailureCount: 0,
-    blockedActionId: blockedAction.id || "",
-    createdObservationId: blockedAction.observationId || "",
-    updatedAt: new Date().toISOString()
-  };
+    candidate,
+    goal,
+    status: "needs_reveal",
+    recoveryAttempts
+  });
 }
 
-function rebindPendingRecoveryAction(pending = {}, observation = {}) {
-  const original = pending.action || {};
-  return bindTargetSnapshot(normalizeAction({
+function rebindPendingRecoveryAction(pending = {}, observation = {}, state = {}, traveler = {}) {
+  const original = pending.originalAction || {};
+  const direct = bindTargetSnapshot(normalizeAction({
     ...original,
     id: `act_rebind_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
     observationId: observation.observationId || "",
@@ -555,6 +579,33 @@ function rebindPendingRecoveryAction(pending = {}, observation = {}) {
     expectedOutcome: null,
     reason: `Rebound pending governed action after viewport recovery: ${original.reason || original.intent || original.type || "action"}.`
   }), observation);
+  if (!pending.semanticGoal?.goalId) {
+    return { action: direct, candidateSet: null, candidate: pending.candidate || null };
+  }
+
+  const reboundSet = buildCurrentCandidateSet({
+    goal: pending.semanticGoal,
+    observation,
+    traveler,
+    state,
+    approvals: state.approvals,
+    attemptedCandidateIds: [],
+    attemptedStrategySignatures: []
+  });
+  const previous = pending.candidate || {};
+  const previousStableKey = previous.affordance?.stableKey || previous.stableKey || "";
+  const reboundCandidate = (reboundSet.candidates || []).find((candidate) => (
+    previousStableKey
+      && (candidate.affordance?.stableKey || candidate.stableKey || "") === previousStableKey
+      && candidate.operation === previous.operation
+  )) || ((reboundSet.candidates || []).length === 1 ? reboundSet.candidates[0] : null);
+  if (!reboundCandidate) return { action: direct, candidateSet: reboundSet, candidate: null };
+  const action = bindTargetSnapshot(normalizeAction({
+    ...actionForCurrentCandidate(pending.semanticGoal, reboundCandidate, observation),
+    id: `act_rebind_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+    reason: `Rebound the same semantic action to the fresh canonical control after viewport recovery: ${original.reason || original.intent || original.type || "action"}.`
+  }), observation);
+  return { action, candidateSet: reboundSet, candidate: reboundCandidate };
 }
 
 function pendingRecoveryTargetStatus(action = {}) {
@@ -652,10 +703,6 @@ function toClientDecision(action) {
     risk: action.risk,
     reason: action.reason
   };
-}
-
-function askUserDecision(reason, observation = {}) {
-  return toClientDecision(finalHandoffAction(reason, observation));
 }
 
 function normalizeText(value = "") {
@@ -799,20 +846,32 @@ function observationSurfaceId(observation = {}) {
 }
 
 function candidateStrategySignature(goal = {}, candidate = {}) {
-  const affordance = candidate.affordance || {};
-  return [
-    affordance.stableKey || candidate.stableKey || candidate.controlId || "control",
-    affordance.actuator?.stableKey || candidate.operation || candidate.type || "actuator",
-    affordance.effect || candidate.semanticEffect || "effect",
-    candidate.value || "",
-    candidate.keys || ""
-  ].join(":");
+  return actuatorSignature(candidate);
 }
 
-function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedStrategySignatures = []) {
+function semanticGoalRecoveryKey(goal = {}) {
+  return semanticGoalKey(goal);
+}
+
+function failedStrategySignaturesForGoal(state = {}, goal = {}) {
+  const goalKey = semanticGoalRecoveryKey(goal);
+  return (state.failedStrategyMemory || [])
+    .filter((entry) => entry.goalKey === goalKey)
+    .map((entry) => entry.strategySignature)
+    .filter(Boolean);
+}
+
+function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedStrategySignatures = [], context = {}) {
   const binding = surfaceBinding(observation);
-  const attempted = new Set(attemptedStrategySignatures || []);
-  const candidates = buildCurrentCandidateSet({ goal, observation }).candidates.map((candidate) => {
+  const built = buildCurrentCandidateSet({
+    goal,
+    observation,
+    state: context.state || {},
+    traveler: context.traveler || {},
+    approvals: context.approvals || {},
+    attemptedStrategySignatures
+  });
+  const candidates = built.candidates.map((candidate) => {
     const bound = bindTargetSnapshot(actionForCurrentCandidate(goal, candidate, observation), observation);
     return {
       ...candidate,
@@ -837,36 +896,97 @@ function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedS
   }).filter((candidate) => (
     !["click", "type", "select", "keypress", "click_xy"].includes(candidate.type)
     || Boolean(candidate.controlId && candidate.targetId && candidate.expectedOutcome)
-  )).filter((candidate) => !attempted.has(candidateStrategySignature(goal, candidate)));
-  return { ...binding, candidates };
+  ));
+  return { ...binding, candidates, excludedCandidates: built.excludedCandidates || [] };
 }
 
 function groundedObservationCandidates(goal = {}, observation = {}) {
   return groundedObservationCandidateSet(goal, observation).candidates;
 }
 
+function deterministicTaskCandidate(candidateSet = {}) {
+  const candidates = candidateSet.candidates || [];
+  if (candidates.length !== 1) return null;
+  const candidate = candidates[0];
+  if (["ask_user", "final_review"].includes(candidate.type)) return candidate;
+  const executable = ["click", "type", "select", "keypress", "scroll", "click_xy"].includes(candidate.type);
+  if (!executable
+    || candidate.requiresJudgment
+    || candidate.requiresApproval
+    || candidate.risk !== "safe"
+    || candidate.policyDecision?.allow !== true
+    || candidate.affordance?.actuator?.proven !== true) return null;
+  return candidate;
+}
+
+function deterministicSafeForwardCandidate(candidateSet = {}) {
+  const candidates = (candidateSet.candidates || []).filter((candidate) => {
+    const executable = ["click", "keypress", "scroll"].includes(candidate.type);
+    return executable
+      && candidate.interactionRole === "navigation"
+      && candidate.semanticEffect === "advance"
+      && candidate.expectedEvidence === "progress_changed"
+      && !candidate.requiresJudgment
+      && !candidate.requiresApproval
+      && candidate.risk === "safe"
+      && candidate.policyDecision?.allow === true
+      && candidate.affordance?.actuator?.proven === true;
+  });
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function deterministicTransitionVerification(transition = null) {
+  const achieved = transition?.status === "achieved";
+  const changed = Boolean(transition && ["achieved", "progressed", "blocked"].includes(transition.status));
+  return {
+    ok: achieved,
+    changed,
+    lastActionWorked: achieved,
+    blockers: transition?.status === "blocked" ? [transition.blocker?.label || "A new blocker appeared."] : [],
+    priceChanged: Boolean(transition?.diff?.priceChanged),
+    riskChanged: transition?.status === "unsafe",
+    evidence: transition ? [`Browser transition: ${transition.status}.`] : [],
+    confidence: transition ? 1 : 0,
+    requirementUpdates: []
+  };
+}
+
 function applyTransitionStatus(state = {}, observation = {}, previousObservation = null) {
   const advanced = advanceActionLifecycle({ state, observation, previousObservation });
   const transition = advanced.transition;
   if (!advanced.lifecycle) return { ...advanced, transition: null };
-  const priorSignatures = [...(state.attemptedStrategySignatures || [])];
+  const pending = normalizePendingAction(state.pendingAction);
   const governedAction = state.lastAction?.id === advanced.lifecycle.actionId
     ? state.lastAction
-    : state.pendingAction?.action || observation.lastActionResult?.action || {};
+    : pending?.originalAction || observation.lastActionResult?.action || {};
   const signature = candidateStrategySignature(state.currentGoal || {}, governedAction);
-  const attemptedStrategySignatures = transition?.status === "no_effect" && governedAction.controlId
-    ? [...new Set([...priorSignatures, signature])].slice(-12)
-    : ["achieved", "progressed", "blocked"].includes(transition?.status)
-      ? []
-      : priorSignatures;
+  const goalKey = semanticGoalRecoveryKey(state.currentGoal || {});
+  const failedStrategyMemory = [...(state.failedStrategyMemory || [])];
+  if (transition?.status === "no_effect" && governedAction.type !== "scroll" && governedAction.controlId && signature) {
+    const affordance = governedAction.affordance || {};
+    const entry = {
+      goalKey,
+      strategySignature: signature,
+      stableControlKey: affordance.stableKey || governedAction.controlId || "",
+      capability: governedAction.operation || governedAction.type || "",
+      semanticEffect: affordance.effect || governedAction.semanticEffect || "",
+      observationId: observation.observationId || ""
+    };
+    if (!failedStrategyMemory.some((item) => item.goalKey === goalKey && item.strategySignature === signature)) {
+      failedStrategyMemory.push(entry);
+    }
+  }
+  const rememberedForGoal = failedStrategyMemory
+    .filter((entry) => entry.goalKey === goalKey)
+    .map((entry) => entry.strategySignature)
+    .filter(Boolean);
+  const attemptedStrategySignatures = [...new Set(rememberedForGoal)].slice(-12);
   return {
     ...advanced,
     state: withUpdate(advanced.state, {
       lastTransition: transition || state.lastTransition || null,
       attemptedStrategySignatures,
-      uncertainTransitionCount: transition?.status === "uncertain"
-        ? Number(state.uncertainTransitionCount || 0) + 1
-        : 0
+      failedStrategyMemory: failedStrategyMemory.slice(-80)
     }),
     transition: transition || null
   };
@@ -1095,6 +1215,14 @@ function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, t
   };
 }
 
+function plannerFailureReason(error) {
+  const message = String(error?.message || error || "");
+  if (/returned no output text|invalid JSON after retry/i.test(message)) {
+    return "AI planner returned no usable candidate selection after a bounded retry.";
+  }
+  return "AI planner or model API unavailable while choosing between multiple current candidates.";
+}
+
 function browserDispatched(result = {}) {
   return wasDispatched(result);
 }
@@ -1131,36 +1259,32 @@ function compactCurrentObservation(observation = {}) {
 
 function reconcileSemanticGoalState(state = {}, observation = {}, traveler = {}) {
   let currentGoal = state.currentGoal || null;
-  let pendingAction = state.pendingAction || null;
+  let pendingAction = normalizePendingAction(state.pendingAction);
   let attemptedCandidateIds = [...(state.attemptedCandidateIds || [])];
   let verifiedResults = [...(state.verifiedResults || [])];
   const result = observation.lastActionResult || {};
 
-  if (pendingAction?.actionId && result.actionId === pendingAction.actionId) {
-    if (pendingAction.status === "viewport_recovery") {
-      pendingAction = null;
-    } else {
-      if (browserDispatched(result) && pendingAction.candidateId) {
-        attemptedCandidateIds = [...new Set([
-          ...attemptedCandidateIds,
-          pendingAction.strategyId || pendingAction.candidateId
-        ])];
-      }
-      if (browserDispatched(result)) {
-        verifiedResults = [...verifiedResults, {
-          goalId: pendingAction.goalId || currentGoal?.goalId || "",
-          candidateId: pendingAction.candidateId || "",
-          actionId: result.actionId || "",
-          observationId: observation.observationId || "",
-          dispatched: true,
-          browserVerified: result.verified === true,
-          postconditionSatisfied: result.postconditionSatisfied === true,
-          outcomeCode: result.outcome?.code || result.failureCode || "",
-          at: new Date().toISOString()
-        }].slice(-40);
-      }
-      pendingAction = null;
+  if (pendingAction?.originalAction?.id && result.actionId === pendingAction.originalAction.id) {
+    if (browserDispatched(result) && pendingAction.candidateId) {
+      attemptedCandidateIds = [...new Set([
+        ...attemptedCandidateIds,
+        pendingAction.candidateStableKey || pendingAction.candidateId
+      ])];
     }
+    if (browserDispatched(result)) {
+      verifiedResults = [...verifiedResults, {
+        goalId: pendingAction.semanticGoalId || currentGoal?.goalId || "",
+        candidateId: pendingAction.candidateId || "",
+        actionId: result.actionId || "",
+        observationId: observation.observationId || "",
+        dispatched: true,
+        browserVerified: result.verified === true,
+        postconditionSatisfied: result.postconditionSatisfied === true,
+        outcomeCode: result.outcome?.code || result.failureCode || "",
+        at: new Date().toISOString()
+      }].slice(-40);
+    }
+    pendingAction = null;
   }
 
   if (currentGoal && profileGoalSatisfied(currentGoal, observation, traveler)) {
@@ -1196,289 +1320,6 @@ function reconcileSemanticGoalState(state = {}, observation = {}, traveler = {})
   });
 }
 
-async function runProfileSemanticGoalTurn({
-  apiKey,
-  model,
-  recoveryModel,
-  dataDir,
-  state,
-  observation,
-  traveler,
-  transactionStore,
-  clientTurnId,
-  screenshotDataUrl,
-  traceObservation,
-  turnId,
-  latency
-}) {
-  let goalState = reconcileSemanticGoalState(state, observation, traveler);
-  const readiness = profileStageReadiness(observation, traveler);
-  if (!goalState.currentGoal) {
-    transactionStore?.saveSession?.(goalState);
-    if (readiness.ready || !readiness.profileStage) {
-      return { handled: false, state: goalState };
-    }
-    if (readiness.unresolvedKnown.length > 0) {
-      throw new Error(`PROFILE_PROGRESSION_INVARIANT: ${readiness.unresolvedKnown.map((item) => item.semanticType).join(",")} has known data but currentGoal is null.`);
-    }
-    if (readiness.missingUserData.length > 0) {
-      const missing = readiness.missingUserData.map((item) => item.label || item.semanticType).join(", ");
-      const reason = `Required traveler data is not available in the saved profile or current context: ${missing}.`;
-      const handoff = finalHandoffAction(reason, observation);
-      goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
-      transactionStore?.saveSession?.(goalState);
-      return {
-        handled: true,
-        state: goalState,
-        clientDecision: toClientDecision(handoff),
-        debug: withLatencyDebug({ currentGoal: null, finalAction: handoff, reason }, latency, modelUsageFromMetas(model, []))
-      };
-    }
-    const blockers = [
-      ...readiness.unresolvedRequired.map((item) => item.label),
-      ...readiness.visibleErrors
-    ].filter(Boolean).join("; ");
-    const reason = `Known traveler data exists, but no safe actionable control is available${blockers ? `: ${blockers}` : "."}`;
-    const handoff = finalHandoffAction(reason, observation);
-    goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
-    transactionStore?.saveSession?.(goalState);
-    return {
-      handled: true,
-      state: goalState,
-      clientDecision: toClientDecision(handoff),
-      debug: withLatencyDebug({ currentGoal: null, finalAction: handoff, reason, stopCategory: "safe_candidate_unavailable" }, latency, modelUsageFromMetas(model, []))
-    };
-  }
-
-  if (goalState.pendingAction) {
-    const reason = `The browser has not returned an execution result for ${goalState.pendingAction.candidateId || goalState.pendingAction.actionId}; stopping instead of issuing another action.`;
-    const handoff = finalHandoffAction(reason, observation, { goalId: goalState.currentGoal.goalId });
-    goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
-    transactionStore?.saveSession?.(goalState);
-    return {
-      handled: true,
-      state: goalState,
-      clientDecision: toClientDecision(handoff),
-      debug: withLatencyDebug({ currentGoal: goalState.currentGoal, finalAction: handoff, reason }, latency, modelUsageFromMetas(model, []))
-    };
-  }
-
-  const attempted = goalState.attemptedCandidateIds || [];
-  const candidates = buildCurrentCandidateSet({
-    goal: goalState.currentGoal,
-    observation,
-    traveler,
-    attemptedCandidateIds: attempted
-  }).candidates;
-  goalState = withUpdate(goalState, {
-    currentGoal: {
-      ...goalState.currentGoal,
-      candidates,
-      currentValue: deriveProfileGoal(observation, traveler, goalState.currentGoal)?.currentValue || goalState.currentGoal.currentValue || "",
-      observationId: observation.observationId || "",
-      updatedAt: new Date().toISOString()
-    }
-  });
-
-  if (attempted.length >= 3 || candidates.length === 0) {
-    const reason = attempted.length >= 3
-      ? `The recovery budget for ${goalState.currentGoal.label || goalState.currentGoal.semanticType} was exhausted after ${attempted.length} browser-dispatched candidates.`
-      : `No untried grounded candidate remains for ${goalState.currentGoal.label || goalState.currentGoal.semanticType}.`;
-    const handoff = finalHandoffAction(reason, observation, { goalId: goalState.currentGoal.goalId });
-    goalState = withUpdate(goalState, { lastAction: handoff, status: "awaiting_user" });
-    transactionStore?.saveSession?.(goalState);
-    return {
-      handled: true,
-      state: goalState,
-      clientDecision: toClientDecision(handoff),
-      debug: withLatencyDebug({ currentGoal: goalState.currentGoal, candidates, finalAction: handoff }, latency, modelUsageFromMetas(model, []))
-    };
-  }
-
-  let candidate = candidates.length === 1 && !candidates[0].requiresJudgment
-    ? candidates[0]
-    : null;
-  let selectorMeta = null;
-  if (!candidate) {
-    try {
-      const selected = await selectCandidate({
-        apiKey,
-        model: recoveryModel || model,
-        goal: goalState.currentGoal,
-        candidates,
-        observation,
-        screenshotDataUrl
-      });
-      selectorMeta = selected.meta || null;
-      latency.verify_plan_model_ms = Number(selectorMeta?.durationMs || 0);
-      candidate = candidates.find((item) => item.candidateId === selected.candidateId) || null;
-    } catch (error) {
-      if (error?.code !== "PLANNER_CANDIDATE_NOT_CURRENT") throw error;
-      const reason = `The planner failed ${error.selectionAttempts || 3} bounded selections against the unchanged candidate set for ${goalState.currentGoal.label || goalState.currentGoal.semanticType}.`;
-      const handoff = finalHandoffAction(reason, observation, { goalId: goalState.currentGoal.goalId });
-      goalState = withUpdate(goalState, { pendingAction: null, lastAction: handoff, status: "awaiting_user" });
-      transactionStore?.saveSession?.(goalState);
-      return {
-        handled: true,
-        state: goalState,
-        clientDecision: toClientDecision(handoff),
-        debug: withLatencyDebug({
-          plannerFailureCategory: "candidate_selection_exhausted",
-          candidateSelectionAttempts: error.selectionAttempts || 3,
-          candidateSetObservationId: observation.observationId || "",
-          browserReobserved: false,
-          finalAction: handoff
-        }, latency, modelUsageFromMetas(recoveryModel || model, selectorMeta?.retryMetas || []))
-      };
-    }
-  }
-
-  if (!candidate) throw new Error("No grounded candidate was selected");
-  let action = bindTargetSnapshot(
-    actionForCurrentCandidate(goalState.currentGoal, candidate, observation),
-    observation
-  );
-  const policyStartedAt = Date.now();
-  let governance = governAction({
-    action,
-    state: goalState,
-    observation,
-    traveler,
-    approvals: goalState.approvals,
-    store: transactionStore,
-    turnId: clientTurnId || turnId
-  });
-  latency.policy_ms = Date.now() - policyStartedAt;
-  goalState = governance.state || goalState;
-
-  if (!governance.allow && governance.decision === "recoverable" && governance.code === "TARGET_OUT_OF_VIEW") {
-    const scrollAction = viewportRecoveryAction(action, observation, 1);
-    const scrollGovernance = governAction({
-      action: scrollAction,
-      state: goalState,
-      observation,
-      traveler,
-      approvals: goalState.approvals,
-      store: transactionStore,
-      turnId: clientTurnId || turnId
-    });
-    if (scrollGovernance.allow) {
-      governance = scrollGovernance;
-      goalState = scrollGovernance.state || goalState;
-      goalState = withUpdate(goalState, {
-        pendingAction: {
-          status: "viewport_recovery",
-          actionId: scrollAction.id,
-          goalId: goalState.currentGoal.goalId,
-          candidateId: candidate.candidateId,
-          candidate,
-          recoveryOfAction: action
-        },
-        lastAction: scrollAction,
-        status: "running"
-      });
-      action = scrollAction;
-    }
-  }
-
-  if (!governance.allow && governance.decision === "recoverable" && STALE_IDENTITY_CODES.has(governance.code)) {
-    const groundingBudget = applyRecoveryBudget(goalState, {
-      dispatched: false,
-      executed: false,
-      verified: false,
-      outcome: { code: governance.code }
-    });
-    goalState = withUpdate(groundingBudget.state, {
-      pendingAction: null,
-      stallCount: 0
-    });
-    action = groundingBudget.exhausted
-      ? finalHandoffAction(
-          "Three fresh profile candidate bindings were rejected before dispatch. Grounded replanning is exhausted.",
-          observation,
-          { goalId: goalState.currentGoal.goalId }
-        )
-      : normalizeAction({
-          observationId: observation.observationId || "",
-          observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-          type: "wait",
-          intent: "reobserve_after_grounding_rejection",
-          goalId: goalState.currentGoal.goalId,
-          candidateId: candidate.candidateId,
-          reason: `Discard ${governance.code}, capture a fresh observation, rebuild profile candidates, and replan the same goal.`,
-          risk: "safe",
-          requiresApproval: false
-        });
-    goalState = withUpdate(goalState, {
-      lastAction: action,
-      status: action.type === "ask_user" ? "awaiting_user" : "running"
-    });
-  } else if (!governance.allow) {
-    const reason = `The grounded candidate ${candidate.candidateId} was rejected by the safety governor: ${governance.reason || governance.code}.`;
-    action = finalHandoffAction(reason, observation, {
-      goalId: goalState.currentGoal.goalId,
-      candidateId: candidate.candidateId
-    });
-    goalState = withUpdate(goalState, { lastAction: action, status: "awaiting_user" });
-  } else if (action.type !== "scroll") {
-    goalState = withUpdate(goalState, {
-      pendingAction: {
-        status: "governed",
-        actionId: action.id,
-        goalId: goalState.currentGoal.goalId,
-        candidateId: candidate.candidateId,
-        strategyId: candidate.strategyId || candidate.candidateId,
-        expectedOutcome: action.expectedOutcome,
-        affordance: action.affordance,
-        interactionRole: action.interactionRole,
-        semanticEffect: action.semanticEffect,
-        expectedEvidence: action.expectedEvidence,
-        observationId: observation.observationId || ""
-      },
-      lastAction: action,
-      status: "running"
-    });
-  }
-
-  transactionStore?.recordActionEvent?.(goalState.id, {
-    actionId: action.id || "",
-    observationId: observation.observationId || "",
-    turnId: clientTurnId || turnId,
-    stage: governance.allow ? "semantic_candidate_governed" : "semantic_candidate_blocked",
-    goalId: goalState.currentGoal.goalId,
-    candidateId: candidate.candidateId,
-    action,
-    result: { allow: governance.allow, code: governance.code || "", reason: governance.reason || "" }
-  });
-  transactionStore?.saveSession?.(goalState);
-  const modelUsage = modelUsageFromMetas(recoveryModel || model, [selectorMeta]);
-  const debug = withLatencyDebug({
-    currentGoal: goalState.currentGoal,
-    candidates: candidates.map((item) => ({
-      candidateId: item.candidateId,
-      type: item.type,
-      operation: item.operation,
-      summary: item.summary
-    })),
-    selectedCandidateId: candidate.candidateId,
-    finalAction: action,
-    policyDecision: governance
-  }, latency, modelUsage);
-  writeTrace(dataDir, state.id, {
-    turnId,
-    screenshotDataUrl,
-    observation: traceObservation,
-    pageState: null,
-    requirements: goalState.activeRequirements || goalState.requirements || [],
-    verification: observation.lastActionResult || null,
-    plannedAction: { candidateId: candidate.candidateId },
-    policyDecision: governance,
-    executionResult: { currentGoal: goalState.currentGoal, pendingAction: goalState.pendingAction },
-    debug
-  });
-  return { handled: true, state: goalState, clientDecision: toClientDecision(action), debug };
-}
-
 /**
  * @param {Object} args
  * @param {string} args.apiKey
@@ -1501,7 +1342,6 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     verify_plan_model_ms: 0,
     policy_ms: 0
   };
-  let classificationMeta = null;
   let verifyPlanMeta = null;
   const authoritativeTransition = applyTransitionStatus(
     state,
@@ -1514,6 +1354,9 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   const lifecycle = authoritativeTransition.lifecycle;
   const lifecycleDirective = authoritativeTransition.directive || "continue";
   if (lifecycle) {
+    const pendingBeforeLifecycle = normalizePendingAction(state.pendingAction);
+    const preservePendingRecovery = pendingBeforeLifecycle?.status === "needs_reveal"
+      && pendingBeforeLifecycle.originalAction?.id !== lifecycle.actionId;
     transactionStore?.recordActionEvent?.(state.id, {
       actionId: lifecycle.actionId,
       observationId: observation.observationId || "",
@@ -1530,6 +1373,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     );
     state = withUpdate(state, {
       pendingAction: ["rejected_before_dispatch", "observed", "verified", "failed", "unsafe"].includes(lifecycle.status)
+        && !preservePendingRecovery
         ? null
         : state.pendingAction,
       stallCount: ["rejected_before_dispatch", "observed", "verified"].includes(lifecycle.status)
@@ -1539,7 +1383,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     transactionStore?.saveSession?.(state);
   }
   if (transition) {
-    const preserveViewportRecovery = state.pendingAction?.status === "viewport_recovery";
+    const preserveViewportRecovery = normalizePendingAction(state.pendingAction)?.status === "needs_reveal";
     transactionStore?.recordActionEvent?.(state.id, {
       actionId: transition.actionId,
       observationId: observation.observationId || "",
@@ -1588,19 +1432,16 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   }
 
   if (transition?.status === "uncertain") {
-    const exhausted = Number(state.uncertainTransitionCount || 0) > 2;
-    const action = exhausted
-      ? finalHandoffAction("Fresh browser evidence remained insufficient after bounded reobservation, so I need help before acting.", observation)
-      : normalizeAction({
-          observationId: observation.observationId || "",
-          observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-          type: "wait",
-          intent: "reobserve_after_grounding_rejection",
-          reason: "The transition evidence is incomplete. Capture one fresh observation and rebind current controls without repeating the action.",
-          risk: "safe",
-          requiresApproval: false
-        });
-    const uncertainState = withUpdate(state, { lastAction: action, status: exhausted ? "awaiting_user" : "running" });
+    const action = normalizeAction({
+      observationId: observation.observationId || "",
+      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+      type: "wait",
+      intent: "reobserve_after_grounding_rejection",
+      reason: "The transition evidence is incomplete. Capture one fresh observation and rebind current controls without repeating the action.",
+      risk: "safe",
+      requiresApproval: false
+    });
+    const uncertainState = withUpdate(state, { lastAction: action, status: "running" });
     transactionStore?.saveSession?.(uncertainState);
     return {
       state: uncertainState,
@@ -1609,76 +1450,91 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     };
   }
 
-  try {
-    const profileTurn = await runProfileSemanticGoalTurn({
-      apiKey,
-      model,
-      recoveryModel,
-      dataDir,
-      state,
-      observation,
-      traveler,
-      transactionStore,
-      clientTurnId,
-      screenshotDataUrl,
-      traceObservation,
-      turnId,
-      latency
-    });
-    state = profileTurn.state || state;
-    if (profileTurn.handled) return profileTurn;
-  } catch (error) {
-    return safePlannerFailureResult({
-      dataDir,
-      state,
-      turnId,
-      screenshotDataUrl,
-      traceObservation,
-      reason: "AI candidate selection failed for the current grounded semantic goal.",
-      error,
-      latency,
-      modelUsage: modelUsageFromMetas(recoveryModel || model, [])
-    });
-  }
-
   // A recoverable governor result preserves the semantic action across the
   // observation created by scrolling. Rebind that same action to the fresh
   // canonical registry before consulting the model again.
-  if (state.pendingAction?.type === "viewport_rebind" && state.pendingAction.action) {
-    const pending = state.pendingAction;
-    const reboundAction = rebindPendingRecoveryAction(pending, observation);
+  const normalizedPending = normalizePendingAction(state.pendingAction);
+  if (normalizedPending?.status === "needs_reveal" && normalizedPending.originalAction) {
+    const pending = normalizedPending;
+    const rebound = rebindPendingRecoveryAction(pending, observation, state, traveler);
+    const reboundAction = rebound.action;
     const targetStatus = pendingRecoveryTargetStatus(reboundAction);
-    const pendingWithProgress = withViewportProgress(
-      pending,
+    const revealSample = viewportProgress(
+      state.recoveryState?.lastRevealSample || null,
       viewportProgressSample(reboundAction, observation)
     );
+    const reboundState = rebound.candidateSet && pending.semanticGoal
+      ? withUpdate(state, {
+          currentGoal: {
+            ...pending.semanticGoal,
+            candidateSet: rebound.candidateSet,
+            candidates: rebound.candidateSet.candidates,
+            updatedAt: new Date().toISOString()
+          }
+        })
+      : state;
+    if (!targetStatus.exists) {
+      const grounding = recoverBeforeDispatch({
+        state: reboundState,
+        action: reboundAction,
+        code: "TARGET_DISAPPEARED"
+      });
+      const action = normalizeAction({
+        observationId: observation.observationId || "",
+        observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+        type: "wait",
+        intent: "reobserve_after_grounding_rejection",
+        goalId: pending.semanticGoalId || "",
+        reason: "The pending target disappeared. Discard its binding, rebuild candidates from the fresh surface, and reselect without consuming an execution attempt.",
+        risk: "safe",
+        requiresApproval: false
+      });
+      const recoveryState = withUpdate(grounding.state, { pendingAction: null, lastAction: action, status: "running" });
+      transactionStore?.saveSession?.(recoveryState);
+      return {
+        state: recoveryState,
+        clientDecision: toClientDecision(action),
+        debug: withLatencyDebug({ pendingAction: pending, groundingRejection: grounding, finalAction: action, resumedBeforePlanning: true }, latency, modelUsageFromMetas(model, []))
+      };
+    }
+
+    const revealRecovery = updateRecoveryState(reboundState, {
+      kind: "reveal",
+      code: targetStatus.inViewport ? "TARGET_IN_VIEW" : "TARGET_OUT_OF_VIEW",
+      sample: revealSample,
+      measurableProgress: revealSample.measurableProgress
+    });
     const policyStartedAt = Date.now();
     let recoveryGovernance = targetStatus.exists && targetStatus.inViewport
       ? governAction({
           action: reboundAction,
-          state,
+          state: revealRecovery.state,
           observation,
           traveler,
-          approvals: state.approvals,
+          approvals: revealRecovery.state.approvals,
           store: transactionStore,
           turnId: clientTurnId || turnId
         })
       : {
-          state,
+          state: revealRecovery.state,
           allow: false,
           decision: "recoverable",
-          code: targetStatus.exists ? "TARGET_OUT_OF_VIEW" : "TARGET_DISAPPEARED",
-          reason: targetStatus.exists
-            ? "The fresh observation has not yet confirmed the pending canonical target in the viewport."
-            : "The fresh observation cannot currently resolve the pending canonical target."
+          code: "TARGET_OUT_OF_VIEW",
+          reason: "The fresh observation has not yet confirmed the pending canonical target in the viewport."
         };
     latency.policy_ms = Date.now() - policyStartedAt;
-    let recoveryState = recoveryGovernance.state || state;
+    let recoveryState = recoveryGovernance.state || reboundState;
     let finalAction = reboundAction;
 
     if (recoveryGovernance.allow && targetStatus.exists && targetStatus.inViewport) {
       recoveryState = withUpdate(recoveryState, {
-        pendingAction: null,
+        pendingAction: pendingActionRecord({
+          action: reboundAction,
+          candidate: rebound.candidate || pending.candidate,
+          goal: pending.semanticGoal || { goalId: pending.semanticGoalId },
+          status: "ready",
+          recoveryAttempts: revealRecovery.recoveryState.attempts
+        }),
         lastAction: reboundAction,
         status: "running"
       });
@@ -1687,16 +1543,15 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
         observationId: observation.observationId || "",
         turnId: clientTurnId || turnId,
         stage: "pending_action_rebound_dispatched",
-        recoveryOfActionId: pending.blockedActionId || pending.action?.id || "",
-        recoveryCount: pending.recoveryCount || 1,
+        recoveryOfActionId: pending.originalAction.id,
+        recoveryAttempts: revealRecovery.recoveryState.attempts,
         action: reboundAction
       });
     } else if (recoveryGovernance.decision === "recoverable"
-      && ["TARGET_OUT_OF_VIEW", "TARGET_DISAPPEARED"].includes(recoveryGovernance.code)
-      && Number(pendingWithProgress.recoveryCount || 0) < MAX_VIEWPORT_RECOVERY_ATTEMPTS
-      && Number(pendingWithProgress.noProgressFailureCount || 0) < MAX_CONSECUTIVE_VIEWPORT_FAILURES) {
-      const nextRecoveryCount = Number(pending.recoveryCount || 0) + 1;
-      const scrollAction = viewportRecoveryAction(reboundAction, observation, nextRecoveryCount);
+      && recoveryGovernance.code === "TARGET_OUT_OF_VIEW"
+      && !revealRecovery.exhausted) {
+      const nextRecoveryAttempt = Number(revealRecovery.recoveryState.attempts || 0) + 1;
+      const scrollAction = viewportRecoveryAction(reboundAction, observation, nextRecoveryAttempt);
       const scrollGovernance = governAction({
         action: scrollAction,
         state: recoveryState,
@@ -1710,11 +1565,13 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
         recoveryGovernance = scrollGovernance;
         finalAction = scrollAction;
         recoveryState = withUpdate(scrollGovernance.state || recoveryState, {
-          pendingAction: {
-            ...pendingWithProgress,
-            recoveryCount: nextRecoveryCount,
-            updatedAt: new Date().toISOString()
-          },
+          pendingAction: pendingActionRecord({
+            action: pending.originalAction,
+            candidate: pending.candidate,
+            goal: pending.semanticGoal,
+            status: "needs_reveal",
+            recoveryAttempts: nextRecoveryAttempt
+          }),
           lastAction: scrollAction,
           status: "running"
         });
@@ -1722,20 +1579,60 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
           actionId: scrollAction.id,
           observationId: observation.observationId || "",
           turnId: clientTurnId || turnId,
-          stage: "pending_action_viewport_recovery_governed",
-          recoveryOfActionId: pending.blockedActionId || pending.action?.id || "",
-          recoveryCount: nextRecoveryCount,
+          stage: "pending_action_reveal_governed",
+          recoveryOfActionId: pending.originalAction.id,
+          recoveryAttempts: nextRecoveryAttempt,
           action: scrollAction
         });
+      } else if (scrollGovernance.decision === "recoverable") {
+        const grounding = recoverBeforeDispatch({
+          state: recoveryState,
+          action: scrollAction,
+          code: scrollGovernance.code || "SCROLL_GROUNDING_REJECTED"
+        });
+        recoveryState = grounding.state;
+        finalAction = normalizeAction({
+          observationId: observation.observationId || "",
+          observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+          type: "wait",
+          intent: "reobserve_after_grounding_rejection",
+          goalId: pending.semanticGoalId || "",
+          reason: "The governed reveal binding was rejected before dispatch. Rebuild it from a fresh observation without consuming an execution attempt.",
+          risk: "safe",
+          requiresApproval: false
+        });
+        recoveryState = withUpdate(recoveryState, { pendingAction: null, lastAction: finalAction, status: "running" });
       } else {
         recoveryGovernance = scrollGovernance;
         finalAction = policyBlockedAction(scrollGovernance, scrollAction);
-        recoveryState = withUpdate(recoveryState, {
-          pendingAction: null,
-          lastAction: finalAction,
-          status: "awaiting_user"
-        });
+        recoveryState = withUpdate(recoveryState, { pendingAction: null, lastAction: finalAction, status: "awaiting_user" });
       }
+    } else if (recoveryGovernance.decision === "recoverable"
+      && recoveryGovernance.code === "TARGET_OUT_OF_VIEW"
+      && revealRecovery.exhausted) {
+      finalAction = finalHandoffAction(
+        "The pending control remained unreachable after three grounded reveal attempts and no safe current alternative could be dispatched.",
+        observation
+      );
+      recoveryState = withUpdate(recoveryState, { pendingAction: null, lastAction: finalAction, status: "awaiting_user" });
+    } else if (recoveryGovernance.decision === "recoverable") {
+      const grounding = recoverBeforeDispatch({
+        state: recoveryState,
+        action: reboundAction,
+        code: recoveryGovernance.code || "PENDING_ACTION_GROUNDING_REJECTED"
+      });
+      recoveryState = grounding.state;
+      finalAction = normalizeAction({
+        observationId: observation.observationId || "",
+        observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+        type: "wait",
+        intent: "reobserve_after_grounding_rejection",
+        goalId: pending.semanticGoalId || "",
+        reason: "The rebound pending action was rejected before dispatch. Rebuild current candidates from fresh browser evidence without consuming an execution attempt.",
+        risk: "safe",
+        requiresApproval: false
+      });
+      recoveryState = withUpdate(recoveryState, { pendingAction: null, lastAction: finalAction, status: "running" });
     } else {
       finalAction = policyBlockedAction(recoveryGovernance, reboundAction);
       recoveryState = withUpdate(recoveryState, {
@@ -1772,64 +1669,338 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       policyDecision: recoveryGovernance,
       executionResult: {
         pendingRecovery: true,
-        recoveryCount: pending.recoveryCount || 1,
-        recoveryOfActionId: pending.blockedActionId || pending.action?.id || "",
+        recoveryAttempts: pending.recoveryAttempts,
+        recoveryOfActionId: pending.originalAction.id,
         freshTargetExists: targetStatus.exists,
         freshTargetInViewport: targetStatus.inViewport,
-        viewportProgress: pendingWithProgress.viewportProgress,
-        noProgressFailureCount: pendingWithProgress.noProgressFailureCount
+        revealProgress: revealSample,
+        recoveryState: recoveryState.recoveryState
       },
       debug
     });
     return { state: recoveryState, clientDecision: toClientDecision(finalAction), debug };
   }
 
+  // An approved action must be observed before any new goal or candidate set
+  // is derived. Missing execution feedback is a resume condition, not a new
+  // planning turn and not a user-facing failure.
+  if (pendingActionNeedsResult(state, observation)) {
+    const pending = normalizePendingAction(state.pendingAction);
+    const action = normalizeAction({
+      observationId: observation.observationId || "",
+      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+      type: "wait",
+      intent: "await_pending_action_result",
+      goalId: pending?.semanticGoalId || "",
+      candidateId: pending?.candidateId || "",
+      reason: `Wait for browser evidence for pending action ${pending?.originalAction?.id || ""}; do not derive or dispatch another action.`,
+      risk: "safe",
+      requiresApproval: false
+    });
+    const waitingState = withUpdate(state, { lastAction: action, status: "running" });
+    transactionStore?.saveSession?.(waitingState);
+    return {
+      state: waitingState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({ pendingAction: pending, finalAction: action, resumedBeforePlanning: true }, latency, modelUsageFromMetas(model, []))
+    };
+  }
+
+  // Profile specialization publishes only the next semantic field goal. It
+  // no longer selects candidates, governs, recovers, or hands off.
+  state = reconcileSemanticGoalState(state, observation, traveler);
+  const profileReadiness = profileStageReadiness(observation, traveler);
+  const publishedProfileGoal = profileReadiness.profileStage && !profileReadiness.ready
+    ? state.currentGoal
+    : null;
+  if (profileReadiness.profileStage && !profileReadiness.ready && !publishedProfileGoal) {
+    const missing = profileReadiness.missingUserData || [];
+    const blockers = [
+      ...missing.map((item) => item.label || item.semanticType),
+      ...(profileReadiness.unresolvedKnown || []).map((item) => item.label || item.semanticType),
+      ...(profileReadiness.visibleErrors || [])
+    ].filter(Boolean);
+    const reason = missing.length
+      ? `Required traveler data is not available in the saved profile or current context: ${blockers.join(", ")}.`
+      : `No safe grounded profile candidate remains${blockers.length ? `: ${blockers.join("; ")}` : "."}`;
+    const action = finalHandoffAction(reason, observation);
+    const stoppedState = withUpdate(state, { lastAction: action, status: "awaiting_user" });
+    transactionStore?.saveSession?.(stoppedState);
+    return {
+      state: stoppedState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({ currentGoal: null, finalAction: action, reason, stopCategory: missing.length ? "missing_user_data" : "safe_candidate_unavailable" }, latency, modelUsageFromMetas(model, []))
+    };
+  }
+
   // The action lifecycle above is the sole authority for unchanged outcomes.
   // A pre-dispatch rejection rebuilds from this observation; only a browser-
   // dispatched unchanged transition consumes an execution strategy attempt.
-  const staleRejection = lifecycle?.status === "rejected_before_dispatch";
-  const recoverableExecutionFailure = lifecycle?.transitionStatus === "no_effect";
+  // Build the task-scoped contract before consulting a model. Canonical
+  // decision groups, current-surface ownership, policy, unavailable state and
+  // failed stable strategies are sufficient for an obvious single action.
+  // In that case the model must not rediscover or reinterpret the contract.
+  const observedCanonicalRequirements = requirementsWithDecisionGroups(
+    state.activeRequirements || state.requirements || [],
+    observation
+  );
+  const taskContext = publishedProfileGoal
+    ? contextForPublishedGoal({ state, observation, goal: publishedProfileGoal })
+    : deriveAuthoritativeTaskContext({
+        state,
+        observation,
+        requirements: observedCanonicalRequirements,
+        traveler,
+        transition
+      });
+  const canonicalRequirements = applyAuthoritativeOutcomeToRequirements(
+    observedCanonicalRequirements,
+    taskContext
+  );
+  const canonicalState = withUpdate(state, {
+    requirements: canonicalRequirements,
+    activeRequirements: canonicalRequirements,
+    currentObligation: taskContext
+  });
+  const canonicalGoal = taskContext.remainingGoal;
+  const canonicalFailedStrategies = failedStrategySignaturesForGoal(state, canonicalGoal);
+  const canonicalCandidateSet = groundedObservationCandidateSet(
+    canonicalGoal,
+    observation,
+    canonicalFailedStrategies,
+    { state: canonicalState, traveler, approvals: state.approvals }
+  );
+  const obviousCandidate = deterministicTaskCandidate(canonicalCandidateSet)
+    || deterministicSafeForwardCandidate(canonicalCandidateSet);
 
-  // 1. Observe + classify typed page state. Requirements are derived from
-  // typed buckets, so navigation actions like Continue/Next cannot be
-  // misclassified as missing requirements.
-  let extracted;
-  try {
-    extracted = await classifyPageState({ apiKey, model, observation, screenshotDataUrl, traveler });
-    classificationMeta = extracted.meta || null;
-    latency.classification_model_ms = Number(classificationMeta?.durationMs || 0);
-    extracted = {
-      ...extracted,
-      requirements: requirementsWithDecisionGroups(extracted.requirements || [], observation)
-    };
-  } catch (error) {
-    return safePlannerFailureResult({
-      dataDir,
-      state,
-      turnId,
-      screenshotDataUrl,
-      traceObservation,
-      reason: "AI planner unavailable during page classification. I stopped instead of using a deterministic checkout fallback.",
-      error,
-      latency,
-      modelUsage: modelUsageFromMetas(model, [classificationMeta])
+  // An empty executable set is a grounding/policy outcome, not an OpenAI
+  // outage and not a reason to ask the model to invent an action. Preserve the
+  // exact goal and report the actual blocker through the final handoff path.
+  if (!canonicalCandidateSet.candidates.length) {
+    const reason = `No safe grounded candidate is available for the current goal: ${canonicalGoal.semanticGoal || "current checkout decision"}.`;
+    const action = finalHandoffAction(reason, observation);
+    const stoppedState = withUpdate(canonicalState, {
+      currentGoal: {
+        ...canonicalGoal,
+        label: canonicalGoal.semanticGoal,
+        candidateSet: canonicalCandidateSet,
+        candidates: [],
+        updatedAt: new Date().toISOString()
+      },
+      pendingAction: null,
+      lastAction: action,
+      status: "awaiting_user"
     });
+    transactionStore?.saveSession?.(stoppedState);
+    transactionStore?.recordActionEvent?.(stoppedState.id, {
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "no_safe_grounded_candidate",
+      goalId: canonicalGoal.goalId || "",
+      dispatched: false,
+      modelCalled: false,
+      excludedCandidates: canonicalCandidateSet.excludedCandidates?.length || 0
+    });
+    return {
+      state: stoppedState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({
+        currentGoal: stoppedState.currentGoal,
+        finalAction: action,
+        stopCategory: "safe_candidate_unavailable",
+        aiServiceUnavailable: false,
+        modelCalled: false
+      }, latency, modelUsageFromMetas(publishedProfileGoal ? (recoveryModel || model) : model, []))
+    };
   }
 
-  // 2. Verify + plan in one call: did the previous action work, and given
-  // that, what's next. Two OpenAI calls total per turn now, not three.
+  let extracted;
   let verification;
   let modelPlannedAction;
   let modelSelection;
-  const planningModel = model;
-  const observationGoal = deriveObservationGoal(observation, extracted.requirements || []);
-  const candidateSet = groundedObservationCandidateSet(
-    observationGoal,
-    observation,
-    state.attemptedStrategySignatures || []
-  );
-  const observationCandidates = candidateSet.candidates;
+  let observationGoal;
+  let candidateSet;
+  let observationCandidates;
+  let deterministicAction = null;
+  const planningModel = publishedProfileGoal ? (recoveryModel || model) : model;
+  let modelUsage;
+
+  if (obviousCandidate) {
+    extracted = {
+      pageState: null,
+      pageStep: observation.page?.step || state.currentStep || "unknown",
+      requirements: canonicalRequirements,
+      uncertainties: [],
+      summary: "One policy-allowed task candidate remained after canonical filtering."
+    };
+    verification = deterministicTransitionVerification(transition);
+    observationGoal = canonicalGoal;
+    candidateSet = canonicalCandidateSet;
+    observationCandidates = candidateSet.candidates;
+    modelSelection = { candidateId: obviousCandidate.candidateId, candidate: obviousCandidate };
+    modelPlannedAction = bindTargetSnapshot(
+      actionForCurrentCandidate(observationGoal, obviousCandidate, observation),
+      observation
+    );
+    deterministicAction = modelPlannedAction;
+    modelUsage = modelUsageFromMetas(planningModel, []);
+    transactionStore?.recordActionEvent?.(state.id, {
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "deterministic_task_candidate_selected",
+      candidateId: obviousCandidate.candidateId,
+      candidateCount: 1,
+      modelCalled: false
+    });
+  } else {
+    // The task context above is the only semantic authority. Classification
+    // cannot replace its remaining goal or reopen a completed obligation.
+    // Genuine ambiguity is a closed selection over current candidate IDs.
+    extracted = {
+      pageState: null,
+      pageStep: observation.page?.step || state.currentStep || "unknown",
+      requirements: canonicalRequirements,
+      uncertainties: [],
+      summary: "Selection is scoped to the authoritative obligation and current candidate set."
+    };
+    verification = deterministicTransitionVerification(transition);
+    observationGoal = canonicalGoal;
+    candidateSet = canonicalCandidateSet;
+    observationCandidates = candidateSet.candidates;
+    try {
+      let selected;
+      try {
+        selected = await selectCandidate({
+          apiKey,
+          model: planningModel,
+          goal: observationGoal,
+          candidates: observationCandidates,
+          observation,
+          screenshotDataUrl
+        });
+      } catch (error) {
+        if (error?.code !== "PLANNER_CANDIDATE_NOT_CURRENT") throw error;
+        candidateSet = groundedObservationCandidateSet(
+          observationGoal,
+          observation,
+          failedStrategySignaturesForGoal(state, observationGoal),
+          { state: canonicalState, traveler, approvals: state.approvals }
+        );
+        observationCandidates = candidateSet.candidates;
+        const rebuiltObvious = deterministicTaskCandidate(candidateSet)
+          || deterministicSafeForwardCandidate(candidateSet);
+        selected = rebuiltObvious
+          ? { candidateId: rebuiltObvious.candidateId, candidate: rebuiltObvious, meta: null }
+          : await selectCandidate({
+              apiKey,
+              model: planningModel,
+              goal: observationGoal,
+              candidates: observationCandidates,
+              observation,
+              screenshotDataUrl
+            });
+        transactionStore?.recordActionEvent?.(state.id, {
+          observationId: observation.observationId || "",
+          turnId: clientTurnId || turnId,
+          stage: "candidate_selection_rebuilt",
+          dispatched: false,
+          browserReobserved: false,
+          candidateCount: observationCandidates.length
+        });
+      }
+      verifyPlanMeta = selected.meta || null;
+      latency.verify_plan_model_ms = Number(verifyPlanMeta?.durationMs || 0);
+      const selectedCandidate = selected.candidate
+        || observationCandidates.find((candidate) => candidate.candidateId === selected.candidateId)
+        || null;
+      if (!selectedCandidate) {
+        const error = new Error("The schema-bound planner did not resolve a current candidate.");
+        error.code = "PLANNER_CANDIDATE_NOT_CURRENT";
+        throw error;
+      }
+      modelSelection = { candidateId: selectedCandidate.candidateId, candidate: selectedCandidate };
+      modelPlannedAction = bindTargetSnapshot(
+        actionForCurrentCandidate(observationGoal, selectedCandidate, observation),
+        observation
+      );
+    } catch (error) {
+      if (error?.code === "PLANNER_CANDIDATE_NOT_CURRENT" && observationCandidates.length) {
+        const fallbackCandidate = deterministicSafeForwardCandidate(candidateSet)
+          || deterministicTaskCandidate(candidateSet);
+        if (fallbackCandidate) {
+          modelSelection = { candidateId: fallbackCandidate.candidateId, candidate: fallbackCandidate };
+          modelPlannedAction = bindTargetSnapshot(
+            actionForCurrentCandidate(observationGoal, fallbackCandidate, observation),
+            observation
+          );
+          deterministicAction = modelPlannedAction;
+        } else {
+          const retryAction = normalizeAction({
+            observationId: observation.observationId || "",
+            observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+            type: "wait",
+            intent: "retry_planner_current_candidates",
+            goalId: observationGoal.goalId || "",
+            reason: "Candidate grounding was rejected before browser dispatch. Retry selection against this same immutable candidate set without reobserving the page.",
+            risk: "safe",
+            requiresApproval: false
+          });
+          const plannerRecovery = updateRecoveryState(canonicalState, {
+            kind: "planner_rejection",
+            code: "PLANNER_CANDIDATE_NOT_CURRENT"
+          });
+          const retryState = withUpdate(plannerRecovery.state, {
+            currentGoal: {
+              ...observationGoal,
+              label: observationGoal.semanticGoal,
+              candidateSet,
+              candidates: observationCandidates,
+              updatedAt: new Date().toISOString()
+            },
+            pendingAction: null,
+            lastAction: retryAction,
+            status: "running"
+          });
+          transactionStore?.saveSession?.(retryState);
+          transactionStore?.recordActionEvent?.(retryState.id, {
+            observationId: observation.observationId || "",
+            turnId: clientTurnId || turnId,
+            stage: "planner_candidate_grounding_rejected",
+            dispatched: false,
+            browserReobserved: false,
+            candidateCount: observationCandidates.length,
+            recoveryState: retryState.recoveryState
+          });
+          return {
+            state: retryState,
+            clientDecision: toClientDecision(retryAction),
+            debug: withLatencyDebug({
+              candidateGroundingRejected: true,
+              aiServiceUnavailable: false,
+              candidateSet,
+              finalAction: retryAction
+            }, latency, modelUsageFromMetas(planningModel, [verifyPlanMeta]))
+          };
+        }
+      } else {
+        return safePlannerFailureResult({
+          dataDir,
+          state: canonicalState,
+          turnId,
+          screenshotDataUrl,
+          traceObservation,
+          reason: plannerFailureReason(error),
+          error,
+          latency,
+          modelUsage: modelUsageFromMetas(model, [verifyPlanMeta])
+        });
+      }
+    }
+    modelUsage = modelUsageFromMetas(planningModel, [verifyPlanMeta]);
+  }
+
   state = withUpdate(state, {
+    currentObligation: taskContext,
     currentGoal: {
       ...observationGoal,
       label: observationGoal.semanticGoal,
@@ -1839,91 +2010,14 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     }
   });
   transactionStore?.saveSession?.(state);
-  try {
-    ({ verification, selection: modelSelection, meta: verifyPlanMeta } = await verifyAndPlan({
-      apiKey, model: planningModel, state, observation, currentRequirements: extracted.requirements, pageState: extracted.pageState,
-      traveler,
-      actionHistory,
-      screenshotDataUrl,
-      candidateSet,
-      semanticGoal: observationGoal
-    }));
-    const selectedCandidate = modelSelection.candidate;
-    modelPlannedAction = bindTargetSnapshot(
-      actionForCurrentCandidate(observationGoal, selectedCandidate, observation),
-      observation
-    );
-    latency.verify_plan_model_ms = Number(verifyPlanMeta?.durationMs || 0);
-  } catch (error) {
-    if (error instanceof PlannerContractError) {
-      const selectionAttempts = Number(error.details?.selectionAttempts || 3);
-      const action = finalHandoffAction(
-        `The planner exhausted ${selectionAttempts} bounded reselections against the same unchanged candidate set.`,
-        observation,
-        { goalId: observationGoal.goalId }
-      );
-      const contractState = withUpdate(state, {
-        pendingAction: null,
-        lastAction: action,
-        stallCount: 0,
-        status: "awaiting_user"
-      });
-      transactionStore?.recordActionEvent?.(contractState.id, {
-        observationId: observation.observationId || "",
-        turnId: clientTurnId || turnId,
-        stage: "planner_contract_rejected",
-        code: error.code,
-        details: error.details || {},
-        dispatched: false,
-        candidateSelectionAttempts: selectionAttempts,
-        browserReobserved: false,
-        groundingRecoveryAttempts: Number(state.groundingRecoveryAttempts || 0),
-        executionRecoveryAttempts: Number(state.executionRecoveryAttempts || 0)
-      });
-      transactionStore?.saveSession?.(contractState);
-      const debug = withLatencyDebug({
-        plannerFailureCategory: "contract_rejection",
-        plannerContractCode: error.code,
-        plannerContractDetails: error.details || {},
-        candidateSelectionAttempts: selectionAttempts,
-        candidateSetObservationId: candidateSet.observationId || "",
-        browserReobserved: false,
-        groundingRecoveryAttempts: Number(state.groundingRecoveryAttempts || 0),
-        executionRecoveryAttempts: Number(state.executionRecoveryAttempts || 0),
-        finalAction: action
-      }, latency, modelUsageFromMetas(planningModel, [classificationMeta, verifyPlanMeta]));
-      writeTrace(dataDir, state.id, {
-        turnId,
-        screenshotDataUrl,
-        observation: traceObservation,
-        pageState: extracted.pageState,
-        requirements: extracted.requirements || [],
-        verification: null,
-        plannedAction: { rejectedCandidateId: error.details?.candidateId || "" },
-        policyDecision: { allow: false, decision: "recoverable", code: error.code },
-        executionResult: { dispatched: false, contractRejected: true },
-        debug
-      });
-      return { state: contractState, clientDecision: toClientDecision(action), debug };
-    }
-    return safePlannerFailureResult({
-      dataDir,
-      state,
-      turnId,
-      screenshotDataUrl,
-      traceObservation,
-      reason: "AI planner or model API unavailable while choosing the next action. This is an availability failure, not a planner-contract rejection.",
-      error,
-      latency,
-      modelUsage: modelUsageFromMetas(model, [classificationMeta, verifyPlanMeta])
-    });
-  }
-  const modelUsage = modelUsageFromMetas(planningModel, [classificationMeta, verifyPlanMeta]);
 
   // Fresh page evidence is the source of truth. The verifier can propose
   // updates, but it may not blindly override current-page unresolved evidence.
   // Contradictions become blockers instead of silently turning into satisfied.
-  const mergedRequirements = reconcileRequirements(extracted.requirements, verification, observation);
+  const mergedRequirements = applyAuthoritativeOutcomeToRequirements(
+    reconcileRequirements(extracted.requirements, verification, observation),
+    taskContext
+  );
   const requirementLifecycle = canonicalRequirementLifecycle(
     mergedRequirements,
     observation,
@@ -1938,6 +2032,11 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     requirements: activeRequirements,
     requirementLifecycle,
     activeRequirements,
+    decisionCompletions: exactDecisionCompletionRecords(
+      state.decisionCompletions || [],
+      requirementLifecycle,
+      observation.observationId || ""
+    ),
     lastVerification: verification
   });
 
@@ -1948,74 +2047,19 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     }
   }
 
-  // 3. Stall check. Primary signal is the actual missing-requirements count,
-  // not the verifier's self-reported changed/lastActionWorked flags — those
-  // turned out to say "changed" even across 3 consecutive no-op "wait"
-  // actions where the missing count never moved, which let a real stall run
-  // for ~90s uncaught. A number we compute ourselves is trustworthy in a way
-  // an LLM's self-report about its own progress isn't. This runs after the
-  // combined call (it needs the merged count), so a stall still overrides
-  // the planned action rather than skipping the call — but that's still one
-  // fewer call than the old 3-call version even in the stalling case.
-  const missingCount = actionableMissingRequired(activeRequirements).length;
-  const hadPreviousCount = typeof state.lastMissingCount === "number";
-  const noCountImprovement = hadPreviousCount && missingCount >= state.lastMissingCount;
-  const verifierSaysNoProgress = !verification.changed && !verification.lastActionWorked;
-  const deterministicAction = null;
   let plannedAction = modelPlannedAction;
 
   if (!plannedAction || !plannedAction.type) {
-    nextState = withUpdate(nextState, { status: "awaiting_user" });
-    const reason = "AI planner did not return a next action. I stopped instead of using a deterministic checkout fallback.";
-    const clientDecision = askUserDecision(reason, observation);
-    const debug = withLatencyDebug(
-      summarizeTurn({ pageState: extracted.pageState, requirements: activeRequirements, plannedAction, finalAction: clientDecision, policyDecision: null, deterministicAction }),
-      latency,
-      modelUsage
-    );
-    writeTrace(dataDir, state.id, {
-      turnId, screenshotDataUrl, observation: traceObservation, pageState: extracted.pageState, requirements: activeRequirements, requirementLifecycle, verification,
-      plannedAction, policyDecision: null,
-      executionResult: { stopped: true, reason },
-      debug
+    plannedAction = normalizeAction({
+      observationId: observation.observationId || "",
+      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+      type: "wait",
+      intent: "rebuild_current_action_context",
+      goalId: observationGoal?.goalId || "",
+      reason: "No executable action was compiled. Preserve the current goal and rebuild its grounded candidates without treating this as a browser failure.",
+      risk: "safe",
+      requiresApproval: false
     });
-    return {
-      state: nextState,
-      clientDecision,
-      debug
-    };
-  }
-
-  const samePlannedAction = Boolean(state.lastAction) && actionSignature(state.lastAction) === actionSignature(plannedAction);
-  const plannedWait = plannedAction.type === "wait";
-  const repeatedNoProgress = !staleRejection
-    && !recoverableExecutionFailure
-    && Boolean(state.lastAction)
-    && (samePlannedAction || plannedWait)
-    && (noCountImprovement || verifierSaysNoProgress);
-  const stallCount = repeatedNoProgress ? (state.stallCount || 0) + 1 : 0;
-  nextState = withUpdate(nextState, { stallCount, lastMissingCount: missingCount });
-
-  if (stallCount >= STALL_THRESHOLD) {
-    const reason = `I tried the same thing ${stallCount} times without progress (blockers: ${verification.blockers.join("; ") || "unclear"}). Stopping so you can take over.`;
-    nextState = withUpdate(nextState, { status: "awaiting_user" });
-    const clientDecision = askUserDecision(reason, observation);
-    const debug = withLatencyDebug(
-      summarizeTurn({ pageState: extracted.pageState, requirements: activeRequirements, plannedAction, finalAction: clientDecision, policyDecision: null, deterministicAction: null }),
-      latency,
-      modelUsage
-    );
-    writeTrace(dataDir, state.id, {
-      turnId, screenshotDataUrl, observation: traceObservation, pageState: extracted.pageState, requirements: activeRequirements, requirementLifecycle, verification,
-      plannedAction, policyDecision: null,
-      executionResult: { stalled: true, reason },
-      debug
-    });
-    return {
-      state: nextState,
-      clientDecision,
-      debug
-    };
   }
 
   // 4. Govern once — schema, stored observation, canonical target,
@@ -2055,8 +2099,18 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     governance = scrollGovernance;
     if (scrollGovernance.allow) {
       finalAction = scrollAction;
-      nextState = withUpdate(scrollGovernance.state || nextState, {
-        pendingAction: pendingViewportRecovery(executablePlannedAction, 1, observation),
+      const revealStarted = updateRecoveryState(scrollGovernance.state || nextState, {
+        kind: "reveal_started",
+        code: "TARGET_OUT_OF_VIEW",
+        sample: viewportProgressSample(executablePlannedAction, observation)
+      });
+      nextState = withUpdate(revealStarted.state, {
+        pendingAction: pendingRevealAction(
+          executablePlannedAction,
+          1,
+          modelSelection?.candidate || null,
+          observationGoal
+        ),
         lastAction: scrollAction,
         status: "running"
       });
@@ -2064,22 +2118,21 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
         actionId: scrollAction.id,
         observationId: observation.observationId || "",
         turnId: clientTurnId || turnId,
-        stage: "pending_action_viewport_recovery_governed",
+        stage: "pending_action_reveal_governed",
         recoveryOfActionId: executablePlannedAction.id,
-        recoveryCount: 1,
+        recoveryAttempts: 1,
         action: scrollAction
       });
     } else {
       finalAction = policyBlockedAction(scrollGovernance, scrollAction);
     }
   } else if (!governance.allow && governance.decision === "recoverable" && STALE_IDENTITY_CODES.has(governance.code)) {
-    const groundingBudget = applyRecoveryBudget(nextState, {
-      dispatched: false,
-      executed: false,
-      verified: false,
-      outcome: { code: governance.code }
+    const groundingBudget = recoverBeforeDispatch({
+      state: nextState,
+      action: executablePlannedAction,
+      code: governance.code
     });
-    nextState = withUpdate(groundingBudget.state, { pendingAction: null, stallCount: 0 });
+    nextState = withUpdate(groundingBudget.state, { pendingAction: null });
     transactionStore?.recordActionEvent?.(nextState.id, {
       actionId: executablePlannedAction.id || "",
       observationId: observation.observationId || "",
@@ -2087,31 +2140,38 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       stage: "grounding_replan",
       code: governance.code,
       dispatched: false,
-      groundingRecoveryAttempts: groundingBudget.groundingRecoveryAttempts,
-      executionRecoveryAttempts: groundingBudget.executionRecoveryAttempts
+      recoveryState: groundingBudget.recoveryState
     });
-    finalAction = groundingBudget.exhausted
-      ? finalHandoffAction(
-          "Three fresh candidate sets were rejected before dispatch. Grounded replanning is exhausted.",
-          observation
-        )
-      : normalizeAction({
-          observationId: observation.observationId || "",
-          observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-          type: "wait",
-          intent: "reobserve_after_grounding_rejection",
-          goalId: observationGoal.goalId,
-          candidateId: modelSelection?.candidateId || "",
-          reason: `Discard ${governance.code}, capture a fresh observation, rebuild the candidate set, and replan the same semantic goal.`,
-          risk: "safe",
-          requiresApproval: false
-        });
+    finalAction = normalizeAction({
+      observationId: observation.observationId || "",
+      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+      type: "wait",
+      intent: "reobserve_after_grounding_rejection",
+      goalId: observationGoal.goalId,
+      candidateId: modelSelection?.candidateId || "",
+      reason: `Discard ${governance.code}, capture a fresh observation, rebuild the candidate set, and replan the same semantic goal.`,
+      risk: "safe",
+      requiresApproval: false
+    });
   } else if (!governance.allow) {
     finalAction = policyBlockedAction(governance, executablePlannedAction);
   }
   finalAction = bindTargetSnapshot(finalAction, observation);
 
+  const pendingExecutableAction = governance.allow === true
+    && ["click", "type", "select", "keypress", "scroll", "click_xy"].includes(finalAction.type)
+    && !nextState.pendingAction;
+  const authoritativePendingAction = pendingExecutableAction
+    ? pendingActionRecord({
+        action: finalAction,
+        candidate: modelSelection?.candidate || null,
+        goal: observationGoal,
+        status: "ready"
+      })
+    : nextState.pendingAction;
+
   nextState = withUpdate(nextState, {
+    pendingAction: authoritativePendingAction,
     lastAction: finalAction,
     status: finalAction.type === "ask_user" || finalAction.type === "final_review" ? "awaiting_user" : "running"
   });
@@ -2127,6 +2187,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     executionResult: { stillMissingCount: actionableMissingRequired(activeRequirements).length },
     debug
   });
+  transactionStore?.saveSession?.(nextState);
 
   return {
     state: nextState,
@@ -2138,7 +2199,6 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
 module.exports = {
   runLoopTurn,
   toClientDecision,
-  askUserDecision,
   __private: {
     actionableMissingRequired,
     activeRequirementView,
@@ -2148,10 +2208,14 @@ module.exports = {
     controlDecisionGroupId,
     decisionGroupForRequirement,
     deterministicRequirementEvidence,
+    exactDecisionCompletionRecords,
     expectedOutcomeForAction,
-    applyRecoveryBudget,
+    updateRecoveryState,
     applyTransitionStatus,
     candidateStrategySignature,
+    semanticGoalRecoveryKey,
+    failedStrategySignaturesForGoal,
+    deterministicSafeForwardCandidate,
     groundedObservationCandidateSet,
     groundedObservationCandidates,
     observationSurfaceId,

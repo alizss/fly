@@ -63,10 +63,23 @@ async function callStructured({ apiKey, model, instructions, payload, screenshot
       throw new Error(`OpenAI ${schemaName} request failed: ${response.status} ${errorText.slice(0, 300)}`);
     }
     const data = await response.json();
-    const text = extractResponseText(data);
-    if (!text) throw new Error(`OpenAI ${schemaName} returned no output text`);
+    const outputText = extractResponseText(data);
+    if (!outputText) {
+      const incompleteReason = data?.incomplete_details?.reason || "";
+      const outputTypes = (data?.output || []).flatMap((item) => (
+        (item?.content || []).map((content) => content?.type).filter(Boolean)
+      ));
+      lastParseError = new Error(
+        `OpenAI ${schemaName} returned no output text`
+        + `${data?.status ? ` (status=${data.status})` : ""}`
+        + `${incompleteReason ? ` (incomplete_reason=${incompleteReason})` : ""}`
+        + `${outputTypes.length ? ` (output_types=${outputTypes.join(",")})` : ""}`
+      );
+      if (attempt === 0) continue;
+      throw lastParseError;
+    }
     try {
-      const parsed = JSON.parse(text);
+      const parsed = JSON.parse(outputText);
       const meta = {
         schemaName,
         model: data.model || model,

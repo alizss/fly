@@ -13,7 +13,8 @@
 
 function isDeclineOrSkipAction(action) {
   const target = action.targetSnapshot || {};
-  return action.intent === "decline_optional_extra"
+  return ["select_free_option", "skip_current_item", "dismiss_surface"].includes(action.affordance?.effect)
+    || action.intent === "decline_optional_extra"
     || target.semantic === "decline_paid_extra"
     || target.semantic === "decline_baggage"
     || target.semantic === "safe_decline"
@@ -37,7 +38,8 @@ function looksLikeContinueAction(action) {
   if (action.type !== "click" && action.type !== "click_xy") return false;
   if (isDeclineOrSkipAction(action)) return false;
   const target = action.targetSnapshot || {};
-  return action.intent === "navigate_stage"
+  return action.affordance?.effect === "advance_surface"
+    || action.intent === "navigate_stage"
     || target.semantic === "continue"
     || target.risk === "safe_continue";
 }
@@ -80,7 +82,9 @@ function looksLikeLegalAcceptance(action) {
 function looksLikePaidExtraSelection(action) {
   if (isNonMutatingAction(action) || isDeclineOrSkipAction(action) || isOpenChoiceControlAction(action)) return false;
   const target = action.targetSnapshot || {};
-  return action.risk === "money"
+  return Number(action.affordance?.structuredPrice?.amount) > 0
+    || action.affordance?.risk === "money"
+    || action.risk === "money"
     || target.risk === "money"
     || target.risk === "paid"
     || ["add_paid_extra", "select_paid_seat", "select_paid_baggage"].includes(action.intent)
@@ -153,7 +157,18 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
   // Continue/advance: only once every required requirement is actually satisfied.
   if (looksLikeContinueAction(action)) {
     const { requirementFulfilled } = require("../requirements");
-    const missing = (state?.requirements || []).filter((req) => !requirementFulfilled(req) && blocksContinue(req, profile));
+    const task = action.affordance?.task || {};
+    const advancesOwnedOptionalDecision = action.affordance?.effect === "advance_surface"
+      && task.desiredValue === "free_or_no_extra"
+      && Boolean(task.decisionGroupId || task.requirementId)
+      && action.risk === "safe";
+    const missing = (state?.requirements || []).filter((req) => {
+      if (requirementFulfilled(req) || !blocksContinue(req, profile)) return false;
+      const requirementId = String(req.decisionGroupId || req.scope?.decisionGroupId || req.id || "");
+      if (advancesOwnedOptionalDecision
+        && [task.decisionGroupId, task.requirementId].filter(Boolean).includes(requirementId)) return false;
+      return true;
+    });
     if (missing.length) {
       return { allow: false, decision: "deny", reason: `${missing.length} required item(s) not yet satisfied: ${missing.map((r) => r.label).join(", ")}.` };
     }

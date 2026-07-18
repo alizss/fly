@@ -7,7 +7,8 @@ function normalized(value = "") {
 }
 
 function choiceLike(control = {}) {
-  return /radio|checkbox|option|choice/.test(normalized(`${control.kind || ""} ${control.role || ""}`));
+  return control.state?.pressable === true
+    || /radio|checkbox|option|choice/.test(normalized(`${control.kind || ""} ${control.role || ""}`));
 }
 
 function navigationLike(control = {}, goal = {}) {
@@ -15,7 +16,17 @@ function navigationLike(control = {}, goal = {}) {
 }
 
 function safeWaiver(control = {}, goal = {}) {
-  return /decline|free|no[_ -]?extra|without|waive/.test(normalized(`${control.semantic || ""} ${control.risk || ""} ${goal.desiredValue || ""}`));
+  return /decline|free|safe_decline|no[_ -]?extra|without|waive|skip/.test(
+    normalized(`${control.semantic || ""} ${control.risk || ""} ${control.label || ""}`)
+  );
+}
+
+function paidChoiceLike(control = {}) {
+  if (safeWaiver(control)) return false;
+  return Number(control.structuredPrice?.amount) > 0
+    || /add_paid|paid_extra|select_paid|purchase|upgrade|money/.test(
+      normalized(`${control.semantic || ""} ${control.risk || ""}`)
+    );
 }
 
 function fromExpectedOutcome(expectedOutcome = {}) {
@@ -37,6 +48,9 @@ function deriveActionSemantics({ control = {}, operation = "", type = "", goal =
     return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
   }
   if (op === "choose" || choiceLike(control)) {
+    return { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" };
+  }
+  if (op === "activate" && paidChoiceLike(control)) {
     return { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" };
   }
   if (op === "keyboard") {
@@ -173,6 +187,13 @@ function buildSemanticAffordance({ candidate = {}, control = {}, goal = {}, post
       ? { amount: Number(structuredPrice.amount), currency: String(structuredPrice.currency || "") }
       : null,
     risk: String(candidate.risk || control.risk || "uncertain"),
+    task: Object.freeze({
+      goalId: String(goal.goalId || ""),
+      semanticType: String(goal.semanticType || ""),
+      desiredValue: String(goal.desiredValue || ""),
+      decisionGroupId: String(goal.decisionGroupId || candidate.decisionGroupId || control.decisionGroupId || ""),
+      requirementId: String(goal.requirementId || candidate.requirementId || "")
+    }),
     capability,
     actuator: Object.freeze({
       stableKey: `${stableKey}:actuator:${capability}`,

@@ -1,5 +1,5 @@
 const { callStructured } = require("./openai-client");
-const { candidateSelectionSchema } = require("./schemas");
+const { candidateSelectionSchemaFor } = require("./schemas");
 
 const INSTRUCTIONS = [
   "Select exactly one candidateId for the current semantic checkout goal.",
@@ -19,6 +19,11 @@ async function selectCandidate({
   observation,
   screenshotDataUrl = ""
 }) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    const error = new Error("No current executable candidates were published for planner selection.");
+    error.code = "NO_CURRENT_CANDIDATES";
+    throw error;
+  }
   const needsScreenshot = candidates.some((candidate) => candidate.visualRegion);
   const payload = {
       observationId: observation.observationId || "",
@@ -44,16 +49,18 @@ async function selectCandidate({
       }))
     };
   const metas = [];
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; attempt <= 1; attempt += 1) {
     const { data, meta } = await callStructured({
       apiKey,
       model,
       instructions: INSTRUCTIONS,
       payload: { ...payload, candidateSelectionAttempt: attempt },
       screenshotDataUrl: needsScreenshot ? screenshotDataUrl : "",
-      schema: candidateSelectionSchema,
+      schema: candidateSelectionSchemaFor(candidates.map((candidate) => candidate.candidateId)),
       schemaName: "checkout_candidate_selection",
-      maxOutputTokens: 120,
+      // Keep the response compact, but leave enough room for the structured
+      // output machinery to emit the observation-bound enum value reliably.
+      maxOutputTokens: 400,
       returnMeta: true
     });
     metas.push(meta);
@@ -67,7 +74,7 @@ async function selectCandidate({
   }
   const error = new Error("Candidate selector exhausted bounded reselection against the unchanged candidate set.");
   error.code = "PLANNER_CANDIDATE_NOT_CURRENT";
-  error.selectionAttempts = 3;
+  error.selectionAttempts = 1;
   throw error;
 }
 

@@ -20,6 +20,7 @@
  * @property {string} at
  * @property {string} actionSignature
  * @property {string} actuatorSignature
+ * @property {string} goalKey
  * @property {string} actionId
  * @property {string} observationId
  * @property {string} controlId
@@ -50,15 +51,16 @@
  * @property {string} currentObservationId
  * @property {string} currentObservationHash
  * @property {Object[]} requirementLifecycle
+ * @property {Object[]} decisionCompletions
  * @property {Object[]} activeRequirements
  * @property {Object|null} currentObservation
  * @property {Object|null} currentGoal
+ * @property {Object|null} currentObligation
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
  * @property {string[]} attemptedCandidateIds
- * @property {number} staleRecoveryAttempts
- * @property {number} groundingRecoveryAttempts
- * @property {number} executionRecoveryAttempts
+ * @property {Object[]} failedStrategyMemory
+ * @property {Object} recoveryState
  * @property {Object[]} verifiedResults
  * @property {Object} userPolicy
  * @property {Object|null} transactionInvariants
@@ -95,15 +97,24 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     currentStep: "unknown",
     requirements: [],
     requirementLifecycle: [],
+    decisionCompletions: [],
     activeRequirements: [],
     currentObservation: null,
     currentGoal: null,
+    currentObligation: null,
     pendingAction: null,
     actionLifecycle: null,
     attemptedCandidateIds: [],
-    staleRecoveryAttempts: 0,
-    groundingRecoveryAttempts: 0,
-    executionRecoveryAttempts: 0,
+    failedStrategyMemory: [],
+    recoveryState: {
+      attempts: 0,
+      phase: "idle",
+      stateHash: "",
+      failedStrategySignatures: [],
+      lastCode: "",
+      lastRevealSample: null,
+      updatedAt: ""
+    },
     verifiedResults: [],
     approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalApproved: false, priceIncreaseApproved: false },
     priceHistory: [],

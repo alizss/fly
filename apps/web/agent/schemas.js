@@ -291,6 +291,36 @@ const candidateSelectionSchema = {
   }
 };
 
+function candidateSelectionSchemaFor(candidateIds = []) {
+  const ids = [...new Set((candidateIds || []).map(String).filter(Boolean))];
+  return {
+    ...candidateSelectionSchema,
+    properties: {
+      candidateId: ids.length
+        ? { type: "string", enum: ids }
+        : { type: "string" }
+    }
+  };
+}
+
+function verifyAndPlanSchemaFor(candidateIds = []) {
+  const ids = [...new Set((candidateIds || []).map(String).filter(Boolean))];
+  return {
+    ...verifyAndPlanSchema,
+    properties: {
+      ...verifyAndPlanSchema.properties,
+      action: {
+        ...verifyAndPlanSchema.properties.action,
+        properties: {
+          candidateId: ids.length
+            ? { type: "string", enum: ids }
+            : { type: "string" }
+        }
+      }
+    }
+  };
+}
+
 module.exports = {
   requirementSchema,
   requirementExtractorSchema,
@@ -298,5 +328,7 @@ module.exports = {
   verifierSchema,
   plannerSchema,
   verifyAndPlanSchema,
-  candidateSelectionSchema
+  candidateSelectionSchema,
+  candidateSelectionSchemaFor,
+  verifyAndPlanSchemaFor
 };

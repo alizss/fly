@@ -33,6 +33,30 @@ function semanticGoalForGroup(group = {}) {
   return `resolve ${group.sectionLabel || group.sectionType || group.requirementId || "current decision"}`;
 }
 
+function requiredDecisionGroupsForCurrentSurface(page = {}) {
+  const surface = currentSurface(page);
+  return (page.decisionGroups || []).filter((group) => {
+    if (group.required !== true) return false;
+    if (surface.type === "page") {
+      return !group.surfaceId || group.surfaceId === "surface-page" || group.surfaceType === "page";
+    }
+    return group.surfaceId === surface.id;
+  });
+}
+
+function unresolvedRequiredDecisionGroups(page = {}, resolvedDecisionGroupIds = []) {
+  const resolved = new Set((resolvedDecisionGroupIds || []).filter(Boolean).map(String));
+  return requiredDecisionGroupsForCurrentSurface(page)
+    .filter((group) => (
+      !resolved.has(String(group.decisionGroupId || group.requirementId || ""))
+      && !["satisfied", "waived", "waived_by_policy"].includes(group.status)
+    ));
+}
+
+function allRequiredDecisionGroupsResolved(page = {}, resolvedDecisionGroupIds = []) {
+  return unresolvedRequiredDecisionGroups(page, resolvedDecisionGroupIds).length === 0;
+}
+
 function deriveObservationGoal(observation = {}, requirements = []) {
   const page = observation.page || {};
   const groups = page.decisionGroups || [];
@@ -107,14 +131,33 @@ function controlsForGoal(page = {}, goal = {}) {
   const controls = page.controls || [];
   const group = (page.decisionGroups || []).find((item) => item.decisionGroupId === goal.decisionGroupId) || null;
   if (!group) {
-    return controls.filter((control) => /continue|next|proceed|navigation/.test(`${control.semantic || ""} ${control.risk || ""} ${control.label || ""}`.toLowerCase()));
+    const completedDecisionGroupId = String(goal.completedDecisionGroupId || "");
+    if (goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [completedDecisionGroupId])) return [];
+    return controls.filter((control) => {
+      const text = `${control.semantic || ""} ${control.risk || ""} ${control.meaning || ""} ${control.label || ""}`.toLowerCase();
+      if (/\bback\b|previous|go back|price|details|learn more|info(?:rmation)?|edit|change/.test(text)) return false;
+      if (/choose|select|pick/.test(text) && /seat|bag|bundle|extra|upgrade/.test(text)) return false;
+      if (Number(control.structuredPrice?.amount) > 0 || /add_paid|money|purchase|premium|upgrade/.test(text)) return false;
+      const forward = /navigation|safe_continue|continue|next|proceed|advance|done|finish|confirm|close|dismiss/.test(text);
+      const newSurfaceCommand = Boolean(
+        completedDecisionGroupId
+        && control.decisionGroupId
+        && control.decisionGroupId !== completedDecisionGroupId
+        && /no thanks|without|decline|skip/.test(text)
+      );
+      return forward || newSurfaceCommand;
+    });
   }
-  const groupControlIds = new Set((group.alternatives || []).map((item) => item.controlId).filter(Boolean));
+  const groupControlIds = new Set([
+    ...(group.alternativeControlIds || []),
+    ...(group.alternatives || []).map((item) => item.controlId)
+  ].filter(Boolean));
+  const hasExactGroupMembers = groupControlIds.size > 0;
   return controls.filter((control) => (
     control.decisionGroupId === group.decisionGroupId
     || groupControlIds.has(control.controlId)
-    || (group.sectionId && control.sectionId === group.sectionId)
-    || (group.sectionType && control.sectionType === group.sectionType)
+    || (!hasExactGroupMembers && group.sectionId && control.sectionId === group.sectionId)
+    || (!hasExactGroupMembers && !group.sectionId && group.sectionType && control.sectionType === group.sectionType)
   ));
 }
 
@@ -131,18 +174,20 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   const raw = [];
 
   for (const control of controls) {
-    const operations = Object.entries(control.operations || {}).filter(([, capability]) => capability?.actuatorId || capability?.actuatorIds?.length);
+    const operations = Object.entries(control.operations || {}).filter(([, capability]) => (
+      (capability?.actuatorId || capability?.actuatorIds?.length)
+      && (capability?.actionability?.executable === true || capability?.actionability?.revealable === true)
+    ));
     const usable = operations;
     for (const [operation, capability] of usable) {
       if (!["open", "choose", "activate", "keyboard"].includes(operation)) continue;
-      const visible = control.visualRegion?.inViewport === true;
-      const actionType = visible ? operationActionType(operation) : "scroll";
+      const actionability = capability.actionability || {};
+      const visible = actionability.executable === true;
+      const actionType = operationActionType(operation);
       const targetId = capability.actuatorId || capability.actuatorIds?.[0] || control.preferredActivationElementId || control.stateElementId;
       if (!targetId) continue;
-      const risk = actionType === "scroll"
-        ? "safe"
-        : normalizedRisk(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`, operation, control.structuredPrice);
-      const semantics = deriveActionSemantics({ control, operation: actionType === "scroll" ? "scroll_to" : operation, type: actionType, goal });
+      const risk = normalizedRisk(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`, operation, control.structuredPrice);
+      const semantics = deriveActionSemantics({ control, operation, type: actionType, goal });
       raw.push({
         candidateId: "",
         semanticGoal: goal.semanticGoal,
@@ -151,33 +196,29 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         meaning: control.meaning || control.semantic || control.accessibleName || control.label || operation,
         structuredPrice: control.structuredPrice || null,
         type: actionType,
-        operation: actionType === "scroll" ? "scroll_to" : operation,
+        operation,
+        authorizedOperation: operation,
+        actionability,
         ...semantics,
         controlId: control.controlId,
         decisionGroupId: goal.decisionGroupId || control.decisionGroupId || "",
         targetId,
         targetLabel: control.label || control.accessibleName || control.semantic || operation,
         requirementId: goal.requirementId || "",
-        intent: actionType === "scroll" ? "recover_target_viewport" : intentFor(control, operation, goal),
-        expectedOutcome: actionType === "scroll" ? {
-          type: "target_in_view",
-          controlId: control.controlId,
-          attempt: 1,
-          scrollStrategy: "target_center"
-        } : null,
+        intent: intentFor(control, operation, goal),
+        expectedOutcome: null,
         risk,
         requiresApproval: ["money", "payment", "legal"].includes(risk),
         visible,
         value: "",
         keys: operation === "keyboard" ? "ArrowDown" : "",
-        summary: actionType === "scroll"
-          ? `Bring the current ${control.label || control.semantic || "control"} into view.`
-          : `${operation} the current ${control.label || control.semantic || "control"}.`
+        needsReveal: !visible && actionability.revealable === true,
+        summary: `${operation} the current ${control.label || control.semantic || "control"}${visible ? "." : " after revealing it."}`
       });
     }
   }
 
-  if (!raw.length) {
+  if (!raw.length && !(goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [goal.completedDecisionGroupId]))) {
     const paymentReview = goal.semanticType === "payment_review";
     raw.push({
       candidateId: "",
@@ -242,8 +283,11 @@ function actionForObservationCandidate(goal = {}, candidate = {}, observation = 
 }
 
 module.exports = {
+  allRequiredDecisionGroupsResolved,
   actionForObservationCandidate,
   buildObservationCandidateSet,
   deriveObservationGoal,
+  requiredDecisionGroupsForCurrentSurface,
+  unresolvedRequiredDecisionGroups,
   rawObservationCandidates
 };

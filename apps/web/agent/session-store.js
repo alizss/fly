@@ -3,7 +3,7 @@ const path = require("path");
 const { DatabaseSync } = require("node:sqlite");
 
 const { createCheckoutSessionState, withUpdate } = require("../../../packages/shared/agent-state");
-const { actionSignature, actuatorSignature, normalizeAction } = require("../../../packages/shared/agent-actions");
+const { actionSignature, actuatorSignature, normalizeAction, semanticGoalKey } = require("../../../packages/shared/agent-actions");
 
 const DEFAULT_DB_PATH = process.env.ATW_TRANSACTION_DB
   || path.resolve(__dirname, "../../../work/agent-transactions.sqlite");
@@ -272,11 +272,15 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       controlId: reportedAction.controlId || target.controlId || "",
       targetId: reportedAction.targetId || target.id || "",
       targetSnapshot: target,
-      value: reportedAction.value || ""
+      value: reportedAction.value || "",
+      affordance: reportedAction.affordance || null,
+      semanticEffect: reportedAction.semanticEffect || "",
+      goalId: reportedAction.goalId || "",
+      requirementId: reportedAction.requirementId || ""
     });
   }
 
-  function failureFromResult(result = {}) {
+  function failureFromResult(result = {}, state = {}) {
     if (result.verified === true) return null;
     const code = String(result.outcome?.code || result.code || "");
     const staleCodes = new Set([
@@ -295,6 +299,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       at: String(result.at || nowIso()),
       actionSignature: actionSignature(action),
       actuatorSignature: signature,
+      goalKey: semanticGoalKey(action.affordance?.task ? action : (state.currentGoal || action)),
       actionId: String(result.actionId || action.id || ""),
       observationId: String(result.observationId || ""),
       controlId: String(action.controlId || ""),
@@ -308,9 +313,12 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
   function recordActionResult(transactionId, result = {}, patch = {}) {
     const state = getSession(transactionId);
     if (!state) return null;
-    const failure = failureFromResult(result);
+    const failure = failureFromResult(result, state);
     const failures = [...(state.failures || [])];
-    if (failure && !failures.some((item) => item.actuatorSignature === failure.actuatorSignature)) {
+    if (failure && !failures.some((item) => (
+      item.actuatorSignature === failure.actuatorSignature
+      && item.goalKey === failure.goalKey
+    ))) {
       failures.push(failure);
     }
     const updated = saveSession(withUpdate(state, {

@@ -167,11 +167,32 @@ function normalizeAction(raw = {}) {
 function actuatorSignature(action = {}) {
   const affordance = action.affordance || {};
   if (affordance.stableKey && affordance.actuator?.stableKey && affordance.effect) {
-    return `${affordance.stableKey}:${affordance.actuator.stableKey}:${affordance.effect}:${action.value || action.keys || action.scrollY || ""}`;
+    return [
+      affordance.stableKey,
+      affordance.actuator.stableKey,
+      affordance.effect,
+      action.value || "",
+      action.keys || "",
+      action.scrollY || ""
+    ].join(":");
   }
   const type = action.type || action.action || "";
   const target = action.targetSnapshot || {};
   return `${type}:${action.operation || ""}:${action.controlId || target.controlId || ""}:${action.targetId || target.id || `${action.x ?? ""},${action.y ?? ""}`}:${action.value || action.keys || action.scrollY || ""}`;
+}
+
+function semanticGoalKey(source = {}) {
+  const goal = source.affordance?.task || source.currentGoal || source;
+  const stableScope = goal.semanticType
+    || goal.sectionType
+    || goal.semanticGoal
+    || goal.requirementId
+    || goal.decisionGroupId
+    || "current_goal";
+  const normalize = (value) => String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
+  return [stableScope, goal.desiredValue || "", Number.isFinite(Number(goal.ordinal)) ? `ordinal:${Number(goal.ordinal)}` : ""]
+    .map(normalize)
+    .join("|");
 }
 
 /** Two actions are "the same attempt" if they'd resolve to the same target+value+type. */
@@ -185,5 +206,6 @@ module.exports = {
   visualRegionsMatch,
   actionSignature,
   actuatorSignature,
+  semanticGoalKey,
   ACTION_TYPES
 };

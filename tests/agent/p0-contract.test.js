@@ -19,11 +19,36 @@ const { compactWholePageMarkdown } = require("../../apps/web/agent/observation-m
 const { conciseActionFeedback, diffObservations, formatObservationDiffMarkdown } = require("../../apps/web/agent/observation-diff");
 const {
   actionForObservationCandidate,
+  allRequiredDecisionGroupsResolved,
   deriveObservationGoal,
   rawObservationCandidates
 } = require("../../apps/web/agent/observation-candidates");
 const { canonicalizePageSurface, currentSurface, surfaceBinding } = require("../../apps/web/agent/surface-contract");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+
+function actionableCapability(operation, actuatorId, { inViewport = true } = {}) {
+  const actionability = {
+    rendered: true,
+    visible: true,
+    enabled: true,
+    inViewport,
+    inCurrentSurface: true,
+    hitTested: inViewport,
+    notOccluded: inViewport,
+    operationAuthorized: true,
+    executable: inViewport,
+    revealable: !inViewport,
+    code: inViewport ? "ACTIONABLE" : "ACTUATOR_OUT_OF_VIEW",
+    operation
+  };
+  return {
+    operation,
+    actuatorId,
+    actuatorIds: [actuatorId],
+    actionability,
+    actionabilityByActuator: { [actuatorId]: actionability }
+  };
+}
 
 function observationWithGroups() {
   return {
@@ -201,7 +226,7 @@ test("fresh observation candidates expose only current canonical flexible-ticket
         risk: "safe",
         stateElementId: "node_flexible_state",
         preferredActivationElementId: "node_flexible_opener",
-        operations: { open: { actuatorId: "node_flexible_opener" } },
+        operations: { open: actionableCapability("open", "node_flexible_opener") },
         visualRegion: { x: 20, y: 40, width: 240, height: 36, inViewport: true }
       }],
       decisionGroups: [{
@@ -246,7 +271,7 @@ test("governor rejects an expired candidate-set envelope before target execution
   const observation = observationWithGroups();
   observation.page.currentSurface = { id: "page", type: "page" };
   observation.page.controls[1].operations = {
-    choose: { actuatorId: "atw-flex-label", actuatorIds: ["atw-flex-label"] }
+    choose: actionableCapability("choose", "atw-flex-label")
   };
   observation.page.controls[1].visualRegion.inViewport = true;
   const goal = deriveObservationGoal(observation, []);
@@ -272,26 +297,22 @@ test("stale canonical identity failures trigger bounded fresh replanning", () =>
   }
   assert.equal(__private.staleIdentityRejection({ outcome: { code: "VALIDATION_ERROR" } }), false);
 
-  const initial = { groundingRecoveryAttempts: 0, executionRecoveryAttempts: 0, lastAction: { type: "click" } };
-  const preDispatch = __private.applyRecoveryBudget(initial, {
-    dispatched: false,
-    executed: false,
-    verified: false,
-    outcome: { code: "CURRENT_GOAL_CANDIDATE_MISMATCH" }
+  const initial = { recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] }, lastAction: { type: "click" } };
+  const preDispatch = __private.updateRecoveryState(initial, {
+    kind: "grounding_rejection",
+    code: "CURRENT_GOAL_CANDIDATE_MISMATCH"
   });
-  assert.equal(preDispatch.classification, "grounding_replan");
-  assert.equal(preDispatch.groundingRecoveryAttempts, 1);
-  assert.equal(preDispatch.executionRecoveryAttempts, 0);
+  assert.equal(preDispatch.classification, "grounding_rejection");
+  assert.equal(preDispatch.recoveryState.attempts, 0);
 
-  const dispatched = __private.applyRecoveryBudget(preDispatch.state, {
-    dispatched: true,
-    executed: true,
-    verified: false,
-    outcome: { code: "EXACT_FREE_OPTION_NOT_VERIFIED" }
+  const dispatched = __private.updateRecoveryState(preDispatch.state, {
+    kind: "execution_no_effect",
+    code: "EXACT_FREE_OPTION_NOT_VERIFIED",
+    stateHash: "same_state",
+    strategySignature: "click:choose:ctrl_free"
   });
-  assert.equal(dispatched.classification, "execution_strategy");
-  assert.equal(dispatched.groundingRecoveryAttempts, 1);
-  assert.equal(dispatched.executionRecoveryAttempts, 1);
+  assert.equal(dispatched.classification, "execution_no_effect");
+  assert.equal(dispatched.recoveryState.attempts, 1);
 });
 
 test("planner executable contract contains only the authoritative candidateId", () => {
@@ -315,19 +336,15 @@ test("planner executable contract contains only the authoritative candidateId", 
     (error) => error instanceof PlannerContractError && error.code === "PLANNER_CANDIDATE_NOT_CURRENT"
   );
 
-  const recovered = __private.applyRecoveryBudget({
-    groundingRecoveryAttempts: 0,
-    executionRecoveryAttempts: 0,
+  const recovered = __private.updateRecoveryState({
+    recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] },
     lastAction: { type: "click" }
   }, {
-    dispatched: false,
-    executed: false,
-    verified: false,
-    outcome: { code: "PLANNER_CANDIDATE_NOT_CURRENT" }
+    kind: "planner_rejection",
+    code: "PLANNER_CANDIDATE_NOT_CURRENT"
   });
-  assert.equal(recovered.classification, "grounding_replan");
-  assert.equal(recovered.groundingRecoveryAttempts, 1);
-  assert.equal(recovered.executionRecoveryAttempts, 0);
+  assert.equal(recovered.classification, "planner_rejection");
+  assert.equal(recovered.recoveryState.attempts, 0);
   assert.equal(recovered.exhausted, false);
 });
 
@@ -378,7 +395,7 @@ test("the server-owned semantic affordance is unchanged from candidate through a
         role: "radio",
         stateElementId: "el_random_input",
         preferredActivationElementId: "el_random_label",
-        operations: { choose: { actuatorId: "el_random_label", actuatorIds: ["el_random_label", "el_random_input"] } },
+        operations: { choose: actionableCapability("choose", "el_random_label") },
         visualRegion: { x: 10, y: 10, width: 180, height: 30, inViewport: true }
       }],
       decisionGroups: [{
@@ -400,6 +417,13 @@ test("the server-owned semantic affordance is unchanged from candidate through a
     meaning: "free random seat",
     structuredPrice: { amount: 0, currency: "EUR" },
     risk: "safe",
+    task: {
+      goalId: goal.goalId,
+      semanticType: goal.semanticType,
+      desiredValue: goal.desiredValue,
+      decisionGroupId: "dg_seat",
+      requirementId: "dg_seat"
+    },
     capability: "choose",
     actuator: {
       stableKey: "seat_preference.random.free:actuator:choose",
@@ -409,7 +433,12 @@ test("the server-owned semantic affordance is unchanged from candidate through a
       source: "canonical_operation"
     },
     effect: "select_free_option",
-    postcondition: candidate.expectedOutcome
+    postcondition: candidate.expectedOutcome,
+    policy: {
+      allow: true,
+      decision: "allow",
+      reason: "Typed target contract identifies this as declining/skipping an optional extra."
+    }
   });
   assert.deepEqual(action.affordance, candidate.affordance);
   assert.equal(action.affordance.postcondition.type, "exact_free_option_selected");
@@ -592,7 +621,7 @@ test("risk-scoped candidate generation excludes only controls touched by graph c
           semantic: "decline_paid_extra",
           risk: "safe_decline",
           visualRegion: { inViewport: true },
-          operations: { choose: { actuatorId: "el_no_thanks", actuatorIds: ["el_no_thanks"] } }
+          operations: { choose: actionableCapability("choose", "el_no_thanks") }
         },
         {
           controlId: "ctrl_unavailable",
@@ -604,7 +633,7 @@ test("risk-scoped candidate generation excludes only controls touched by graph c
           semantic: "seat_unavailable",
           risk: "safe",
           visualRegion: { inViewport: true },
-          operations: { choose: { actuatorId: "el_unavailable", actuatorIds: ["el_unavailable"] } }
+          operations: { choose: actionableCapability("choose", "el_unavailable") }
         }
       ],
       decisionGroups: [{
@@ -644,7 +673,7 @@ test("currentSurface is the sole candidate and envelope ownership authority", ()
         risk: "safe_decline",
         surfaceId: "surface_current_popover",
         visualRegion: { inViewport: true },
-        operations: { choose: { actuatorId: "el_no_thanks", actuatorIds: ["el_no_thanks"] } }
+        operations: { choose: actionableCapability("choose", "el_no_thanks") }
       },
       {
         controlId: "ctrl_missing_surface",
@@ -652,7 +681,7 @@ test("currentSurface is the sole candidate and envelope ownership authority", ()
         label: "Not available",
         surfaceId: "",
         visualRegion: { inViewport: true },
-        operations: { choose: { actuatorId: "el_missing", actuatorIds: ["el_missing"] } }
+        operations: { choose: actionableCapability("choose", "el_missing") }
       },
       {
         controlId: "ctrl_background",
@@ -660,7 +689,7 @@ test("currentSurface is the sole candidate and envelope ownership authority", ()
         label: "Background continue",
         surfaceId: "surface-page",
         visualRegion: { inViewport: true },
-        operations: { activate: { actuatorId: "el_background", actuatorIds: ["el_background"] } }
+        operations: { activate: actionableCapability("activate", "el_background") }
       }
     ],
     decisionGroups: [{
@@ -813,6 +842,50 @@ test("P0.4 Continue blocks missing required decision groups but not unselected p
   );
   const allowed = evaluateActionPolicy(continueAction, { requirements: allSatisfied, priceHistory: [] }, { booking_rules: "no extras no seats" }, {});
   assert.equal(allowed.allow, true);
+});
+
+test("navigation candidates remain unpublished until every required current-surface decision group is exact-resolved", () => {
+  const continueControl = {
+    controlId: "ctrl_continue_exact_gate",
+    stableKey: "navigation.continue",
+    label: "Continue",
+    semantic: "continue",
+    risk: "safe",
+    kind: "button",
+    role: "button",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    stateElementId: "el_continue_exact_gate",
+    preferredActivationElementId: "el_continue_exact_gate",
+    operations: { activate: actionableCapability("activate", "el_continue_exact_gate") }
+  };
+  const observation = {
+    observationId: "obs_exact_navigation_gate",
+    observationSnapshot: { snapshotHash: "hash_exact_navigation_gate" },
+    page: {
+      snapshotHash: "hash_exact_navigation_gate",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [continueControl],
+      decisionGroups: [
+        { decisionGroupId: "dg_airhelp", surfaceId: "surface-page", required: true, status: "satisfied" },
+        { decisionGroupId: "dg_lost_baggage", surfaceId: "surface-page", required: true, status: "missing" },
+        { decisionGroupId: "dg_premium_support", surfaceId: "surface-page", required: true, status: "missing" }
+      ]
+    }
+  };
+  const navigationGoal = {
+    goalId: "goal_continue_exact_gate",
+    semanticGoal: "continue checkout",
+    semanticType: "navigation",
+    desiredValue: "next_stage"
+  };
+
+  assert.equal(allRequiredDecisionGroupsResolved(observation.page), false);
+  assert.deepEqual(rawObservationCandidates(observation, navigationGoal), []);
+
+  observation.page.decisionGroups = observation.page.decisionGroups.map((group) => ({ ...group, status: "satisfied" }));
+  assert.equal(allRequiredDecisionGroupsResolved(observation.page), true);
+  assert.equal(rawObservationCandidates(observation, navigationGoal)[0].controlId, continueControl.controlId);
 });
 
 test("P0.6 typed policy trusts canonical semantic risk instead of button wording", () => {

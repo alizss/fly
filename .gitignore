@@ -6,6 +6,7 @@ node_modules.*/
 # Local runtime data and generated artifacts
 work/
 outputs/
+agent-traces/
 
 # Environment and secrets
 .env

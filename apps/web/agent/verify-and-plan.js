@@ -9,7 +9,7 @@
 // flow this has never seen, not just the ones it's been tested against.
 
 const { callStructured } = require("./openai-client");
-const { verifyAndPlanSchema } = require("./schemas");
+const { verifyAndPlanSchemaFor } = require("./schemas");
 const { latestPrice } = require("../../../packages/shared/agent-state");
 const {
   semanticActionContext,
@@ -167,7 +167,7 @@ async function verifyAndPlan({ apiKey, model, state, observation, currentRequire
       candidateSelectionAttempt: attempt
     },
     screenshotDataUrl,
-    schema: verifyAndPlanSchema,
+    schema: verifyAndPlanSchemaFor(candidates.map((candidate) => candidate.candidateId)),
     schemaName: "checkout_verify_and_plan",
     maxOutputTokens: 1400,
     returnMeta: true

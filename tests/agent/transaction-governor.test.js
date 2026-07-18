@@ -7,26 +7,44 @@ const path = require("path");
 const { createStore } = require("../../apps/web/agent/session-store");
 const { governAction } = require("../../apps/web/agent/action-governor");
 const {
-  advanceSkillPlan,
-  createSkillPlan,
-  currentProfileSkillAtom,
   dateValueForField,
-  expandSkillAction,
   normalizedPhoneParts,
   profileStageReadiness,
   deriveProfileGoal,
   profileGoalSatisfied,
   candidatesForProfileGoal,
-  actionForProfileCandidate,
-  resumeSuspendedSkillPlan,
-  skillRecoveryContext,
-  blockedObligationForPlan,
-  exactRecoveryProof,
-  recordBlockedObligationAttempt,
-  reconcileBlockedObligationResult
+  actionForProfileCandidate
 } = require("../../apps/web/agent/skill-expander");
 const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
+const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { deriveObservationGoal } = require("../../apps/web/agent/observation-candidates");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
+
+function actionableCapability(operation, actuatorId, { inViewport = true, actuatorIds = [actuatorId] } = {}) {
+  const actionability = {
+    rendered: true,
+    visible: true,
+    enabled: true,
+    inViewport,
+    inCurrentSurface: true,
+    hitTested: inViewport,
+    notOccluded: inViewport,
+    operationAuthorized: true,
+    executable: inViewport,
+    revealable: !inViewport,
+    code: inViewport ? "ACTIONABLE" : "ACTUATOR_OUT_OF_VIEW",
+    operation
+  };
+  return {
+    operation,
+    actuatorId,
+    actuatorIds,
+    precondition: { disabled: false },
+    actionability,
+    actionabilityByActuator: Object.fromEntries(actuatorIds.map((id) => [id, id === actuatorId ? actionability : { ...actionability, executable: false, revealable: false }]))
+  };
+}
 
 function fixture() {
   const state = createCheckoutSessionState({
@@ -67,6 +85,7 @@ function fixture() {
             { nodeId: "el_decline_label", relation: "label" },
             { nodeId: "el_decline_wrapper", relation: "wrapper" }
           ],
+          operations: { activate: actionableCapability("activate", "el_decline") },
           visualRegion: { x: 100, y: 100, width: 180, height: 40, inViewport: true }
         }
       ],
@@ -74,6 +93,24 @@ function fixture() {
     }
   };
   return { state, observation };
+}
+
+function pendingDeclineContext(observation, state, traveler) {
+  observation.page.decisionGroups = [{
+    decisionGroupId: "dg_baggage_confirm",
+    requirementId: "dg_baggage_confirm",
+    sectionType: "baggage",
+    sectionLabel: "Optional baggage",
+    status: "missing",
+    required: true,
+    surfaceId: "surface_1",
+    alternatives: [{ controlId: "ctrl_decline", label: "I'll go without", priceAmount: 0 }]
+  }];
+  const goal = deriveObservationGoal(observation, []);
+  const candidateSet = buildCurrentCandidateSet({ goal, observation, traveler, state, approvals: state.approvals });
+  const currentGoal = { ...goal, candidateSet, candidates: candidateSet.candidates };
+  state.currentGoal = currentGoal;
+  return { goal: currentGoal, candidate: candidateSet.candidates[0] };
 }
 
 function tempDb() {
@@ -232,7 +269,7 @@ test("risk-scoped governor preserves unrelated conflicts but blocks selected own
 
   const diagnosticFixture = fixture();
   diagnosticFixture.observation.page.controls[0].operations = {
-    activate: { actuatorId: "el_decline", actuatorIds: ["el_decline"], precondition: { disabled: false } }
+    activate: actionableCapability("activate", "el_decline")
   };
   diagnosticFixture.observation.page.graphIntegrity = {
     ok: false,
@@ -258,7 +295,7 @@ test("risk-scoped governor preserves unrelated conflicts but blocks selected own
 
   const selectedFixture = fixture();
   selectedFixture.observation.page.controls[0].operations = {
-    activate: { actuatorId: "el_decline", actuatorIds: ["el_decline"], precondition: { disabled: false } }
+    activate: actionableCapability("activate", "el_decline")
   };
   selectedFixture.observation.page.graphIntegrity = {
     ok: false,
@@ -574,56 +611,6 @@ test("P0.6 rejects actions bound to a stale stored observation", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.4 expands a profile skill into one canonical atomic field action", () => {
-  const { observation } = fixture();
-  observation.page.fields = [{
-    id: "el_email",
-    controlId: "ctrl_email",
-    field: "email",
-    label: "Email",
-    kind: "email",
-    hasValue: false
-  }];
-  observation.page.controls.push({
-    controlId: "ctrl_email",
-    label: "Email",
-    kind: "email",
-    role: "textbox",
-    semantic: "email",
-    risk: "safe",
-    surfaceId: "surface_1",
-    state: { disabled: false },
-    stateElementId: "el_email",
-    preferredActivationElementId: "el_email_label",
-    actuators: [
-      { nodeId: "el_email", relation: "state" },
-      { nodeId: "el_email_label", relation: "label" }
-    ],
-    operations: {
-      activate: null,
-      open: null,
-      choose: null,
-      type: { operation: "type", actuatorId: "el_email", actuatorIds: ["el_email"], precondition: { disabled: false }, expectedOutcome: "normalized_value_changed" },
-      select: null
-    },
-    visualRegion: { x: 100, y: 200, width: 240, height: 40, inViewport: true }
-  });
-  const result = expandSkillAction({
-    id: "act_fill",
-    type: "fill_visible_profile_fields",
-    observationId: "obs_1",
-    observationHash: "hash_1",
-    risk: "safe",
-    reason: "Fill traveler details."
-  }, observation, { id: "trav_1", email: "ali@example.test" });
-  assert.equal(result.expanded, true);
-  assert.equal(result.action.type, "type");
-  assert.equal(result.action.controlId, "ctrl_email");
-  assert.equal(result.action.operation, "type");
-  assert.equal(result.action.targetId, "el_email");
-  assert.equal(result.action.value, "ali@example.test");
-});
-
 function profileFormObservation({ observationId = "obs_form_1", emailFilled = false, phoneFilled = false } = {}) {
   const snapshotHash = `${observationId}_hash`;
   return {
@@ -660,7 +647,7 @@ function profileFormObservation({ observationId = "obs_form_1", emailFilled = fa
             activate: null,
             open: null,
             choose: null,
-            type: { operation: "type", actuatorId: `el_email_${observationId}`, actuatorIds: [`el_email_${observationId}`], precondition: { disabled: false }, expectedOutcome: "normalized_value_changed" },
+            type: { ...actionableCapability("type", `el_email_${observationId}`), expectedOutcome: "normalized_value_changed" },
             select: null
           }
         },
@@ -683,7 +670,7 @@ function profileFormObservation({ observationId = "obs_form_1", emailFilled = fa
             activate: null,
             open: null,
             choose: null,
-            type: { operation: "type", actuatorId: `el_phone_${observationId}`, actuatorIds: [`el_phone_${observationId}`], precondition: { disabled: false }, expectedOutcome: "normalized_value_changed" },
+            type: { ...actionableCapability("type", `el_phone_${observationId}`), expectedOutcome: "normalized_value_changed" },
             select: null
           }
         }
@@ -777,7 +764,7 @@ function completeProfileObservation({ observationId = "obs_complete_profile", fi
       ? {
           activate: null,
           open: null,
-          choose: { operation: "choose", actuatorId: `label_${field.id}`, actuatorIds: [`label_${field.id}`, field.id], precondition: { disabled: false }, expectedOutcome: "control_selected" },
+          choose: { ...actionableCapability("choose", `label_${field.id}`, { actuatorIds: [`label_${field.id}`, field.id] }), expectedOutcome: "control_selected" },
           type: null,
           select: null
         }
@@ -787,13 +774,13 @@ function completeProfileObservation({ observationId = "obs_complete_profile", fi
             open: null,
             choose: null,
             type: null,
-            select: { operation: "select", actuatorId: field.id, actuatorIds: [field.id], precondition: { disabled: false }, expectedOutcome: "normalized_value_changed" }
+            select: { ...actionableCapability("select", field.id), expectedOutcome: "normalized_value_changed" }
           }
         : {
             activate: null,
             open: null,
             choose: null,
-            type: { operation: "type", actuatorId: field.id, actuatorIds: [field.id], precondition: { disabled: false }, expectedOutcome: "normalized_value_changed" },
+            type: { ...actionableCapability("type", field.id), expectedOutcome: "normalized_value_changed" },
             select: null
           }
   }));
@@ -814,48 +801,6 @@ function completeProfileObservation({ observationId = "obs_complete_profile", fi
   };
 }
 
-test("P0.4 complete profile skill passes 20 ordered blank-form replays without model work", () => {
-  const traveler = {
-    id: "trav_ali",
-    email: "ali@example.test",
-    phone: "+38670328922",
-    nationality: "Slovenia",
-    gender: "male",
-    first_name: "Ali",
-    last_name: "Sifrar",
-    date_of_birth: "2003-05-31"
-  };
-  const expectedOrder = ["email", "confirm_email", "phone_country_code", "phone", "title", "first_name", "last_name", "date_of_birth"];
-
-  for (let replay = 0; replay < 20; replay += 1) {
-    const filled = new Set();
-    let observation = completeProfileObservation({ observationId: `obs_profile_${replay}_0`, filled });
-    let plan = createSkillPlan({ id: `act_parent_${replay}`, type: "fill_visible_profile_fields" }, observation, traveler);
-    let step = advanceSkillPlan(plan, observation, traveler, {});
-    const observedOrder = [];
-    let atomIndex = 0;
-    while (step.action) {
-      observedOrder.push(step.atom.semanticType);
-      if (step.atom.semanticType === "phone_country_code") assert.equal(step.action.value, "+386");
-      if (step.atom.semanticType === "phone") assert.equal(step.action.value, "70328922");
-      if (step.atom.semanticType === "title") assert.equal(step.action.type, "click");
-      if (step.atom.semanticType === "date_of_birth") assert.equal(step.action.value, "31-05-2003");
-      filled.add(step.atom.semanticType);
-      atomIndex += 1;
-      observation = completeProfileObservation({ observationId: `obs_profile_${replay}_${atomIndex}`, filled });
-      step = advanceSkillPlan(step.plan, observation, traveler, {
-        actionId: step.action.id,
-        executed: true,
-        verified: true,
-        outcome: { code: step.atom.semanticType === "title" ? "CONTROL_SELECTED" : "FIELD_VALUE_VERIFIED" }
-      });
-    }
-    assert.equal(step.status, "complete");
-    assert.deepEqual(observedOrder, expectedOrder);
-    assert.equal(step.plan.atoms.every((atom) => ["complete", "satisfied"].includes(atom.status)), true);
-  }
-});
-
 test("P0.4 normalizes phone parts and field-specific dates", () => {
   assert.deepEqual(normalizedPhoneParts({ phone: "+386 70 328 922", nationality: "Slovenia" }), {
     countryCode: "+386",
@@ -868,172 +813,6 @@ test("P0.4 normalizes phone parts and field-specific dates", () => {
     label: "Month",
     options: [{ value: "05", label: "May" }]
   }), "05");
-});
-
-test("P0.4 persists a custom country-code choice as governed open and choose atoms", () => {
-  const traveler = { phone: "+38670328922", nationality: "Slovenia" };
-  const closedObservation = {
-    observationId: "obs_country_closed",
-    observationSnapshot: { snapshotHash: "hash_country_closed" },
-    page: {
-      step: "traveler_information",
-      snapshotHash: "hash_country_closed",
-      activeSurface: { id: "", type: "page", label: "" },
-      currentSurface: { id: "", type: "page", label: "" },
-      errors: [],
-      fields: [{
-        id: "el_country_input",
-        controlId: "ctrl_country",
-        field: "phone_country_code",
-        label: "Country code",
-        kind: "text",
-        role: "combobox",
-        hasValue: true,
-        controlState: { valuePresent: true, valueText: "+44-1481", normalizedValue: "+441481", expanded: false }
-      }],
-      controls: [{
-        controlId: "ctrl_country",
-        label: "Country code",
-        kind: "select",
-        role: "combobox",
-        semantic: "phone_country_code",
-        risk: "safe",
-        surfaceId: "",
-        state: { disabled: false, valuePresent: true, valueText: "+44-1481", normalizedValue: "+441481", expanded: false },
-        stateElementId: "el_country_input",
-        preferredActivationElementId: "el_country_label",
-        actuators: [
-          { nodeId: "el_country_input", relation: "state" },
-          { nodeId: "el_country_label", relation: "label" },
-          { nodeId: "el_country_arrow", relation: "activation" }
-        ],
-        operations: {
-          activate: null,
-          open: { operation: "open", actuatorId: "el_country_arrow", actuatorIds: ["el_country_arrow", "el_country_input"], precondition: { expanded: false }, expectedOutcome: "options_surface_appeared" },
-          choose: null,
-          type: null,
-          select: null
-        }
-      }]
-    }
-  };
-  const plan = createSkillPlan({ id: "act_country_parent", type: "fill_visible_profile_fields" }, closedObservation, traveler);
-  const open = advanceSkillPlan(plan, closedObservation, traveler, {});
-  assert.equal(open.status, "action");
-  assert.equal(open.action.type, "click");
-  assert.equal(open.action.intent, "satisfy_semantic_goal");
-  assert.equal(open.action.operation, "open");
-  assert.equal(open.action.targetId, "el_country_arrow");
-  assert.equal(open.action.expectedOutcome.type, "options_surface_appeared");
-
-  const openedObservation = {
-    observationId: "obs_country_opened",
-    observationSnapshot: { snapshotHash: "hash_country_opened" },
-    page: {
-      ...closedObservation.page,
-      snapshotHash: "hash_country_opened",
-      activeSurface: { id: "surface_country", type: "dropdown", label: "Country code" },
-      currentSurface: { id: "surface_country", type: "dropdown", label: "Country code" },
-      controls: [
-        ...closedObservation.page.controls,
-        {
-          controlId: "ctrl_country_slovenia",
-          label: "Slovenia +386",
-          accessibleName: "Slovenia +386",
-          kind: "option",
-          role: "option",
-          semantic: "choice",
-          risk: "safe",
-          surfaceId: "surface_country",
-          surfaceType: "dropdown",
-          state: { disabled: false, selected: false },
-          stateElementId: "el_country_slovenia",
-          preferredActivationElementId: "el_country_slovenia",
-          actuators: [{ nodeId: "el_country_slovenia", relation: "state" }],
-          operations: {
-            activate: null,
-            open: null,
-            choose: { operation: "choose", actuatorId: "el_country_slovenia", actuatorIds: ["el_country_slovenia"], precondition: { disabled: false }, expectedOutcome: "control_selected" },
-            type: null,
-            select: null
-          }
-        },
-        {
-          controlId: "ctrl_country_guernsey",
-          label: "Guernsey +44-1481",
-          accessibleName: "Guernsey +44-1481",
-          kind: "option",
-          role: "option",
-          semantic: "choice",
-          risk: "safe",
-          surfaceId: "surface_country",
-          surfaceType: "dropdown",
-          state: { disabled: false, selected: false },
-          stateElementId: "el_country_guernsey",
-          preferredActivationElementId: "el_country_guernsey",
-          actuators: [{ nodeId: "el_country_guernsey", relation: "state" }],
-          operations: {
-            activate: null,
-            open: null,
-            choose: { operation: "choose", actuatorId: "el_country_guernsey", actuatorIds: ["el_country_guernsey"], precondition: { disabled: false }, expectedOutcome: "control_selected" },
-            type: null,
-            select: null
-          }
-        }
-      ]
-    }
-  };
-  const choose = advanceSkillPlan(open.plan, openedObservation, traveler, {
-    actionId: open.action.id,
-    executed: true,
-    verified: true,
-    outcome: { code: "OPTIONS_SURFACE_APPEARED" }
-  });
-  assert.equal(choose.status, "action");
-  assert.equal(choose.action.type, "click");
-  assert.equal(choose.action.operation, "choose");
-  assert.equal(choose.action.controlId, "ctrl_country_slovenia");
-  assert.equal(choose.action.expectedOutcome.type, "normalized_value_changed");
-  assert.equal(choose.action.expectedOutcome.expectedNormalizedValue, "+386");
-});
-
-test("P0.4 does not complete while visible validation errors remain", () => {
-  const traveler = {
-    email: "ali@example.test",
-    phone: "+38670328922",
-    nationality: "Slovenia",
-    gender: "male",
-    first_name: "Ali",
-    last_name: "Sifrar",
-    date_of_birth: "2003-05-31"
-  };
-  const filled = new Set();
-  let observation = completeProfileObservation({ observationId: "obs_validation_0", filled });
-  let result = advanceSkillPlan(
-    createSkillPlan({ id: "act_parent_validation", type: "fill_visible_profile_fields" }, observation, traveler),
-    observation,
-    traveler,
-    {}
-  );
-  let index = 0;
-  while (result.action) {
-    filled.add(result.atom.semanticType);
-    index += 1;
-    observation = completeProfileObservation({
-      observationId: `obs_validation_${index}`,
-      filled,
-      errors: filled.has("date_of_birth") ? ["Date of birth is invalid"] : []
-    });
-    result = advanceSkillPlan(result.plan, observation, traveler, {
-      actionId: result.action.id,
-      executed: true,
-      verified: true,
-      outcome: { code: result.atom.semanticType === "title" ? "CONTROL_SELECTED" : "FIELD_VALUE_VERIFIED" }
-    });
-  }
-  assert.equal(result.status, "ambiguous");
-  assert.equal(result.plan.status, "suspended");
-  assert.match(result.reason, /no untried grounded strategy|validation errors remain/i);
 });
 
 test("P0 scoped validation blocks only its canonical profile owner or an explicit stage-wide issue", () => {
@@ -1432,85 +1211,6 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.4 persists a multi-atom skill and rebinds each atom to the fresh observation", () => {
-  const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222" };
-  const firstObservation = profileFormObservation();
-  const plan = createSkillPlan({ id: "act_parent", type: "fill_visible_profile_fields" }, firstObservation, traveler);
-  const first = advanceSkillPlan(plan, firstObservation, traveler, {});
-  assert.equal(first.status, "action");
-  assert.equal(first.action.controlId, "ctrl_email_obs_form_1");
-  assert.equal(first.action.skillPlanId, plan.planId);
-  assert.equal(first.action.skillAtomId, first.atom.atomId);
-
-  const secondObservation = profileFormObservation({ observationId: "obs_form_2", emailFilled: true });
-  const second = advanceSkillPlan(first.plan, secondObservation, traveler, {
-    actionId: first.action.id,
-    verified: true,
-    outcome: { code: "FIELD_VALUE_VERIFIED" }
-  });
-  assert.equal(second.status, "action");
-  assert.equal(second.action.controlId, "ctrl_phone_obs_form_2");
-  assert.notEqual(second.action.controlId, "ctrl_phone_obs_form_1");
-  assert.equal(second.plan.atoms.find((atom) => atom.semanticType === "email").status, "satisfied");
-
-  const finalObservation = profileFormObservation({ observationId: "obs_form_3", emailFilled: true, phoneFilled: true });
-  const complete = advanceSkillPlan(second.plan, finalObservation, traveler, {
-    actionId: second.action.id,
-    verified: true,
-    outcome: { code: "FIELD_VALUE_VERIFIED" }
-  });
-  assert.equal(complete.status, "complete");
-  assert.equal(complete.plan.status, "complete");
-  assert.equal(complete.plan.atoms.every((atom) => ["complete", "satisfied"].includes(atom.status)), true);
-});
-
-test("P0.4 changes strategy or suspends when an exact atomic result fails", () => {
-  const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222" };
-  const firstObservation = profileFormObservation();
-  const first = advanceSkillPlan(
-    createSkillPlan({ id: "act_parent", type: "fill_visible_profile_fields" }, firstObservation, traveler),
-    firstObservation,
-    traveler,
-    {}
-  );
-  const failed = advanceSkillPlan(first.plan, profileFormObservation({ observationId: "obs_form_failed" }), traveler, {
-    actionId: first.action.id,
-    verified: false,
-    outcome: { code: "FIELD_VALUE_NOT_VERIFIED" }
-  });
-  assert.equal(failed.status, "ambiguous");
-  assert.equal(failed.plan.status, "suspended");
-  assert.match(failed.reason, /no untried grounded strategy/i);
-});
-
-test("P0.3 reissues an unexecuted stale skill atom against the fresh observation", () => {
-  const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222" };
-  const firstObservation = profileFormObservation({ observationId: "obs_before_stale" });
-  const first = advanceSkillPlan(
-    createSkillPlan({ id: "act_parent", type: "fill_visible_profile_fields" }, firstObservation, traveler),
-    firstObservation,
-    traveler,
-    {}
-  );
-  const freshObservation = profileFormObservation({ observationId: "obs_after_stale" });
-  const reissued = advanceSkillPlan(first.plan, freshObservation, traveler, {
-    actionId: first.action.id,
-    executed: false,
-    verified: false,
-    outcome: { code: "OBSERVATION_HASH_MISMATCH" }
-  });
-
-  assert.equal(reissued.status, "action");
-  assert.equal(reissued.plan.status, "running");
-  assert.equal(reissued.action.skillAtomId, first.action.skillAtomId);
-  assert.equal(reissued.action.observationId, "obs_after_stale");
-  assert.equal(reissued.action.controlId, "ctrl_email_obs_after_stale");
-  assert.notEqual(reissued.action.id, first.action.id);
-  assert.equal(reissued.atom.reissueCount, 1);
-  assert.equal(reissued.atom.lastRejectedActionId, first.action.id);
-  assert.equal(reissued.atom.lastRejectionCode, "OBSERVATION_HASH_MISMATCH");
-});
-
 test("Unified semantic goal state survives a SQLite restart", () => {
   const { dir, dbPath } = tempDb();
   const { state } = fixture();
@@ -1823,7 +1523,8 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(recovery.clientDecision.needsApproval, false);
   assert.equal(recovery.debug.modelUsage.calls.length, 0);
   assert.equal(recovery.state.currentGoal.semanticType, "email");
-  assert.equal(recovery.state.pendingAction.status, "viewport_recovery");
+  assert.equal(recovery.state.pendingAction.schemaVersion, 2);
+  assert.equal(recovery.state.pendingAction.status, "needs_reveal");
 
   const fresh = profileFormObservation({ observationId: "obs_profile_scrolled" });
   fresh.page.viewport = { width: 1200, height: 800 };
@@ -1851,7 +1552,7 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(rebound.clientDecision.controlId, "ctrl_email_obs_profile_scrolled");
   assert.equal(rebound.clientDecision.observationId, "obs_profile_scrolled");
   assert.equal(rebound.debug.modelUsage.calls.length, 0);
-  assert.notEqual(rebound.clientDecision.actionId, recovery.state.pendingAction.recoveryOfAction.id);
+  assert.notEqual(rebound.clientDecision.actionId, recovery.state.pendingAction.originalAction.id);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1878,11 +1579,11 @@ test("P0.4 profile readiness becomes eligible only after canonical fields and er
 test("P0.7 a pending ordinary action rebinds after viewport recovery without a model call", async () => {
   const { dir, dbPath } = tempDb();
   const { state, observation } = fixture();
-  state.pendingAction = {
-    type: "viewport_rebind",
-    recoveryCount: 1,
-    blockedActionId: "act_decline_offscreen",
-    createdObservationId: "obs_before_scroll",
+  const traveler = { id: "trav_1", booking_rules: "no extras" };
+  const pending = pendingDeclineContext(observation, state, traveler);
+  state.pendingAction = pendingActionRecord({
+    status: "needs_reveal",
+    recoveryAttempts: 1,
     action: {
       id: "act_decline_offscreen",
       type: "click",
@@ -1894,8 +1595,10 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
       targetId: "ctrl_decline",
       risk: "safe",
       reason: "Decline the optional baggage after bringing it into view."
-    }
-  };
+    },
+    goal: pending.goal,
+    candidate: pending.candidate
+  });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -1906,7 +1609,7 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
     dataDir: dir,
     state: store.getSession(state.id),
     observation,
-    traveler: { id: "trav_1", booking_rules: "no extras" },
+    traveler,
     transactionStore: store,
     clientTurnId: "turn_pending_rebind"
   });
@@ -1914,9 +1617,52 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
   assert.equal(result.clientDecision.action, "click");
   assert.equal(result.clientDecision.controlId, "ctrl_decline");
   assert.equal(result.clientDecision.targetId, "el_decline");
-  assert.equal(result.clientDecision.expectedOutcome.type, "active_surface_dismissed");
-  assert.equal(result.state.pendingAction, null);
+  assert.equal(result.clientDecision.expectedOutcome.type, "command_acknowledged");
+  assert.equal(result.state.pendingAction.schemaVersion, 2);
+  assert.equal(result.state.pendingAction.status, "ready");
+  assert.equal(result.state.pendingAction.originalAction.id, result.clientDecision.actionId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("authoritative lifecycle waits for browser evidence before deriving or planning another goal", async () => {
+  const { dir, dbPath } = tempDb();
+  const { state, observation } = fixture();
+  state.pendingAction = pendingActionRecord({
+    status: "ready",
+    action: {
+      id: "act_pending_click",
+      type: "click",
+      observationId: "obs_1",
+      observationHash: "hash_1",
+      controlId: "ctrl_decline",
+      targetId: "el_decline",
+      risk: "safe"
+    },
+    candidate: null,
+    goal: { goalId: "goal_decline_baggage" }
+  });
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler: { id: "trav_1", booking_rules: "no extras" },
+    transactionStore: store,
+    clientTurnId: "turn_wait_pending_result"
+  });
+
+  assert.equal(result.clientDecision.action, "wait");
+  assert.equal(result.clientDecision.intent, "await_pending_action_result");
+  assert.equal(result.state.pendingAction.originalAction.id, "act_pending_click");
+  assert.equal(result.debug.resumedBeforePlanning, true);
+  assert.deepEqual(result.debug.modelUsage.calls, []);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1931,11 +1677,11 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
     height: 40,
     inViewport: false
   };
-  state.pendingAction = {
-    type: "viewport_rebind",
-    recoveryCount: 1,
-    blockedActionId: "act_decline_offscreen",
-    createdObservationId: "obs_before_scroll",
+  const traveler = { id: "trav_1", booking_rules: "no extras" };
+  const pending = pendingDeclineContext(observation, state, traveler);
+  state.pendingAction = pendingActionRecord({
+    status: "needs_reveal",
+    recoveryAttempts: 1,
     action: {
       id: "act_decline_offscreen",
       type: "click",
@@ -1947,8 +1693,10 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
       targetId: "ctrl_decline",
       risk: "safe",
       reason: "Decline the optional baggage after bringing it into view."
-    }
-  };
+    },
+    goal: pending.goal,
+    candidate: pending.candidate
+  });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -1959,14 +1707,14 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
     dataDir: dir,
     state: store.getSession(state.id),
     observation,
-    traveler: { id: "trav_1", booking_rules: "no extras" },
+    traveler,
     transactionStore: store,
     clientTurnId: "turn_pending_scroll_again"
   });
 
   assert.equal(result.clientDecision.action, "scroll");
   assert.equal(result.clientDecision.intent, "recover_target_viewport");
-  assert.equal(result.state.pendingAction.recoveryCount, 2);
+  assert.equal(result.state.pendingAction.recoveryAttempts, 2);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1977,18 +1725,23 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
   const { state, observation } = fixture();
   observation.page.viewport = { width: 1200, height: 800 };
   observation.page.controls[0].visualRegion = { x: 100, y: 1200, width: 180, height: 40, inViewport: false };
-  state.pendingAction = {
-    type: "viewport_rebind",
-    recoveryCount: 4,
-    noProgressFailureCount: 2,
-    viewportProgress: [{
+  const traveler = { id: "trav_1", booking_rules: "no extras" };
+  const pending = pendingDeclineContext(observation, state, traveler);
+  state.recoveryState = {
+    attempts: 2,
+    phase: "reveal",
+    stateHash: "",
+    failedStrategySignatures: [],
+    lastRevealSample: {
       observationId: "obs_previous_scroll",
       exists: true,
       inViewport: false,
-      distanceToViewport: 900,
-      measurableProgress: false
-    }],
-    blockedActionId: "act_decline_progress",
+      distanceToViewport: 900
+    }
+  };
+  state.pendingAction = pendingActionRecord({
+    status: "needs_reveal",
+    recoveryAttempts: 2,
     action: {
       id: "act_decline_progress",
       type: "click",
@@ -1999,8 +1752,10 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
       targetId: "ctrl_decline",
       risk: "safe",
       reason: "Resume the optional-extra decline after viewport recovery."
-    }
-  };
+    },
+    goal: pending.goal,
+    candidate: pending.candidate
+  });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -2011,15 +1766,16 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
     dataDir: dir,
     state: store.getSession(state.id),
     observation,
-    traveler: { id: "trav_1", booking_rules: "no extras" },
+    traveler,
     transactionStore: store,
     clientTurnId: "turn_viewport_progress"
   });
 
   assert.equal(result.clientDecision.action, "scroll");
-  assert.equal(result.clientDecision.expectedOutcome.attempt, 5);
-  assert.equal(result.state.pendingAction.noProgressFailureCount, 0);
-  assert.equal(result.state.pendingAction.viewportProgress.at(-1).measurableProgress, true);
+  assert.equal(result.clientDecision.expectedOutcome.attempt, 1);
+  assert.equal(result.state.pendingAction.recoveryAttempts, 1);
+  assert.equal(result.state.recoveryState.attempts, 0);
+  assert.equal(result.state.recoveryState.lastRevealSample.measurableProgress, true);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2029,18 +1785,23 @@ test("P0.7 user handoff occurs only after bounded genuine viewport failures", as
   const { state, observation } = fixture();
   observation.page.viewport = { width: 1200, height: 800 };
   observation.page.controls[0].visualRegion = { x: 100, y: 1280, width: 180, height: 40, inViewport: false };
-  state.pendingAction = {
-    type: "viewport_rebind",
-    recoveryCount: 3,
-    noProgressFailureCount: 2,
-    viewportProgress: [{
+  const traveler = { id: "trav_1", booking_rules: "no extras" };
+  const pending = pendingDeclineContext(observation, state, traveler);
+  state.recoveryState = {
+    attempts: 2,
+    phase: "reveal",
+    stateHash: "",
+    failedStrategySignatures: [],
+    lastRevealSample: {
       observationId: "obs_previous_unchanged_scroll",
       exists: true,
       inViewport: false,
-      distanceToViewport: 500,
-      measurableProgress: false
-    }],
-    blockedActionId: "act_decline_stuck",
+      distanceToViewport: 500
+    }
+  };
+  state.pendingAction = pendingActionRecord({
+    status: "needs_reveal",
+    recoveryAttempts: 2,
     action: {
       id: "act_decline_stuck",
       type: "click",
@@ -2051,8 +1812,10 @@ test("P0.7 user handoff occurs only after bounded genuine viewport failures", as
       targetId: "ctrl_decline",
       risk: "safe",
       reason: "Resume the optional-extra decline after viewport recovery."
-    }
-  };
+    },
+    goal: pending.goal,
+    candidate: pending.candidate
+  });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -2063,7 +1826,7 @@ test("P0.7 user handoff occurs only after bounded genuine viewport failures", as
     dataDir: dir,
     state: store.getSession(state.id),
     observation,
-    traveler: { id: "trav_1", booking_rules: "no extras" },
+    traveler,
     transactionStore: store,
     clientTurnId: "turn_viewport_genuine_failure"
   });

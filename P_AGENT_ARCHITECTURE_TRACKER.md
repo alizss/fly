@@ -1,6 +1,6 @@
 # Agent Architecture Tracker
 
-Last updated: 2026-07-16
+Last updated: 2026-07-18
 
 This tracker follows [AGENT_ARCHITECTURE_PLAN.md](./AGENT_ARCHITECTURE_PLAN.md) as the canonical roadmap. The plan defines the architecture and ordering; this file records implementation and live-test evidence.
 
@@ -27,6 +27,49 @@ The current root objective is:
 > from scoped evidence in the current canonical observation. A missing target,
 > global prose, recovery dispatch, or suspended skill is never proof of
 > completion.
+
+### Live Multi-Leg Seat Lifecycle Regression - 2026-07-18
+
+Session `chk_mrq3a7ykx5x3mi` reached the two-leg seat flow but did not complete it without handoff:
+
+1. The agent selected free random seating for the first leg and verified `Next` by observing the second leg.
+2. On the second leg, fresh observations exposed both `Next` and `Skip seat selection`. The agent repeatedly preferred `Skip seat selection`; browser dispatch succeeded, but the page did not change.
+3. Bounded recovery eventually used `Next`, handled the `Are you sure?` modal with `Continue`, and reached the zero-price seat summary. This proves observation, target binding, clicking, fresh reobservation, and popup handling can work in the same run.
+4. The zero-price summary still classified `Seat not selected` as an unresolved seat requirement. It therefore selected `Skip seat selection` again instead of treating the no-paid-seat policy as resolved and the remaining interface obligation as simple forward navigation.
+5. Useful intermediate transitions (`Next`, `Continue`, summary/seat-map changes) did not clear the accumulated no-effect recovery state for the multi-step seat obligation. One more ineffective skip exhausted the execution budget while a current, enabled `Next` remained visible.
+
+Root conclusion: the live blocker is the generic multi-step obligation lifecycle, not a missing Gotogate seat selector. A negative policy outcome such as `no paid seats` must be represented separately from interface progression. After that policy is resolved, current `Next`/`Continue` controls advance the flow, and no-effect strategy history must be scoped to the current surface/capability and reset after meaningful progress. P0.11, P1.3, and P2.3 remain `[~]` until this exact replay reaches the next checkout stage without handoff.
+
+Follow-up session `chk_mrq5ugvbv91j4j` proves the lifecycle changes are present but do not yet close the gate:
+
+1. The agent used current `Next`, handled the fresh no-seat confirmation with `Continue`, and reached the zero-price summary. The hidden `Skip seat selection` helper was correctly non-executable, and useful transitions no longer exhausted the prior execution budget.
+2. The classifier still recreated an unresolved seat obligation on the zero-price summary and retained contradictory/stale seat evidence. This sent planning back toward seat-preference/seat-selection controls even though the user policy outcome was already satisfied and safe forward navigation remained.
+3. On the final summary the current raw grounded set contained five candidates (`Next`, seat-preference link, `Choose seat`, `Price`, and `Back`). The model returned invented ID `obs_mrq67101_522:candidate_16` on all three attempts. The server correctly rejected it as `PLANNER_CANDIDATE_NOT_CURRENT`; no browser action was dispatched, but the loop handed off instead of selecting the uniquely policy-aligned safe `Next` candidate.
+
+Acceptance remains open until one current-surface semantic state removes stale/background optional-extra obligations, and model selection is structurally constrained to an actual candidate from that state (with deterministic selection when filtering leaves one safe policy-aligned candidate). Repeating an unchanged prompt three times is not recovery.
+
+Follow-up session `chk_mrq8lzr81ee851` advanced through both seat legs and their confirmations, reached the extra-services page, selected and browser-verified the free/no-extra AirHelp option, and derived a single navigation goal for `Continue`. The first observation correctly emitted a governed scroll because `Continue` was outside the viewport. The fresh post-scroll observation then proved the same canonical `Continue` control visible, enabled, hit-tested, current-surface-owned, and executable. Nevertheless, `requirementsWithDecisionGroups` converted five previously handled/offscreen decisions to `conflicted` because their canonical groups were absent from the fresh observation. The policy layer therefore denied the only `Continue` candidate as “5 required item(s) not yet satisfied”; selection received no allowed candidate, one identical server rebuild changed nothing, and the loop handed off without dispatching the visible button.
+
+This reopens the acceptance gate on a sharper invariant: absence after scrolling or leaving an interaction region is not contradictory evidence and must never erase a browser-verified outcome. Resolved obligations must persist by stable semantic/scope identity, while current observation updates only the remaining interface goal. Candidate selection must also short-circuit truthfully when policy filtering produces zero candidates; it must not report this as model grounding failure. P0.11 remains `[~]` until the same flow preserves prior outcomes across viewport changes and dispatches the current safe `Continue`.
+
+Follow-up session `chk_mrqbgnztag1of6` reproduced the same failure after the lifecycle refactor. The new pending-action schema and unified recovery state are present, but the ordinary candidate builder still replaces an offscreen `activate Continue` capability with a standalone `scroll_to` candidate. The lifecycle verified that scroll as an achieved action, cleared the original work, and entered planning again instead of rebinding/resuming `Continue`. The fresh observation exposed exactly one raw candidate—visible, safe `Continue`—but policy excluded it because the same five historical requirements remained falsely `conflicted`. The final allowed candidate set was empty; no model call occurred (`0` tokens, `0` calls), yet the UI incorrectly reported “AI planner or model API unavailable while choosing between multiple current candidates.”
+
+Therefore the consolidation is partial, not acceptance-complete. Offscreen state must remain a property of the original candidate/capability rather than becoming a replacement semantic action; the single lifecycle must own reveal and resume. Missing/offscreen historical groups must preserve verified outcomes, and empty-after-policy must be reported and recovered as a semantic-policy inconsistency rather than model ambiguity.
+
+Deeper inspection of `chk_mrqbgnztag1of6` corrects the ordering of causes: the first failure occurred before `Continue`. Perception placed AirHelp, baggage protection, mobile plan, SMS, and premium support radio pairs into one section-level canonical decision group (`contact`). Selecting only AirHelp `No thanks` therefore marked the entire group satisfied and derived navigation as the remaining goal, even though four independent required radio groups remained unresolved. The later scroll/resume and policy failures are downstream consequences. Canonical decision-group identity must be based on the smallest mutually exclusive choice set (native radio `name`, ARIA radiogroup/fieldset ownership, or an equivalent local choice container), not the broad visual section. One selected alternative may satisfy only its own group. The extras acceptance replay must prove every independent required group is resolved before `Continue` becomes eligible.
+
+### First Live Checkout-To-Payment Success - 2026-07-18
+
+Session `chk_mrqghs7tdvoni9` is the first recorded live run in this pass to complete traveler details, baggage/extras, both seat legs and confirmation surfaces, then reach `https://en-en.gotogate.com/rf/payment` without manual correction or a paid extra. The final observation preserved the two-leg ZAG-SJJ itinerary, traveler/contact facts, no checked baggage, and the observed `208 EUR` total. This counts as `1/5` toward the repeated live payment-page gate; it does not yet close that gate.
+
+The terminal handoff is expected for the current supported scope: the persisted user intent explicitly says `Stop before real payment`, P0.8 payment authorization is not implemented, and P3 secure/tokenized payment work has not started. No card data or final purchase action should occur in this state.
+
+Two payment-boundary correctness issues remain:
+
+1. The `/rf/payment` observation is incorrectly labeled `confirmation`, so the lifecycle derives `continue checkout` and falls back to the generic `no current grounded control` message instead of declaring the payment handoff complete.
+2. Before stopping, the agent classified the required travel-conditions checkbox as safe `traveler_title` and selected it. Legal acceptance is not traveler-profile data and should not be performed as an ordinary safe choice.
+
+The root correction is a generic terminal-boundary contract, not a Gotogate payment patch: fresh URL, progress-marker, heading, and sensitive-field evidence must classify the current stage as `payment`; entering that stage must reconcile the transaction to `payment_review_reached`, suppress ordinary checkout planning, and produce an explicit user handoff. Legal acceptance, payment credentials, and purchase submission require their own typed semantics and authorization. The current release target remains reaching payment review; autonomous payment remains blocked by P0.8/P3.
 
 ## P0 Reliable Execution Vertical Slice
 
@@ -93,7 +136,7 @@ Closure requires:
 - `[ ]` Country code, local phone, title, all required fields, and date of birth are correct in every live run.
 - `[ ]` Zero visible validation errors remain and no baggage/extras action starts before profile completion.
 - `[ ]` Safe decline and paid acceptance retain distinct controls and actuators on live popups, with zero registry conflicts and false intent mismatches.
-- `[ ]` Five consecutive live Gotogate runs reach the payment page without manual correction or paid extras and follow the saved baggage/seat policy.
+- `[~]` One of five consecutive live Gotogate runs has reached the payment page without manual correction or paid extras while following the saved baggage/seat policy (`chk_mrqghs7tdvoni9`). Four more consecutive successes are required.
 - `[ ]` Every live action has a verified ledger result and no false stale-target handoff occurs.
 
 Until those live checks pass, P0.4, P0.7, and the ordinary-DOM portion of P0.9 remain `[~]` even though their implementation/replay contracts are green.
