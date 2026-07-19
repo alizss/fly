@@ -815,6 +815,51 @@ test("P0.4 normalizes phone parts and field-specific dates", () => {
   }), "05");
 });
 
+test("profile DOB candidate carries formatted input and canonical verification", () => {
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "title", "first_name", "last_name"]);
+  const observation = completeProfileObservation({ observationId: "obs_dob_codec", filled });
+  const traveler = {
+    first_name: "Ali",
+    last_name: "SIFRAR",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    gender: "male",
+    date_of_birth: "2003-05-31"
+  };
+  const goal = deriveProfileGoal(observation, traveler);
+  assert.equal(goal.semanticType, "date_of_birth");
+  assert.equal(goal.inputValue, "31-05-2003");
+  assert.equal(goal.desiredValue, "2003-05-31");
+  assert.equal(goal.postcondition.type, "date_value_committed");
+  const candidate = candidatesForProfileGoal(goal, observation, traveler)[0];
+  assert.equal(candidate.value, "31-05-2003");
+  assert.equal(candidate.expectedOutcome.type, "date_value_committed");
+  assert.equal(candidate.expectedOutcome.expectedCanonicalValue, "2003-05-31");
+});
+
+test("profile DOB goal publishes no executable candidate when format evidence is ambiguous", () => {
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "title", "first_name", "last_name"]);
+  const observation = completeProfileObservation({ observationId: "obs_dob_ambiguous", filled });
+  const field = observation.page.fields.find((item) => item.semantic === "date_of_birth");
+  const control = observation.page.controls.find((item) => item.semantic === "date_of_birth");
+  field.label = "Date of birth";
+  field.placeholder = "";
+  field.formatHint = "";
+  control.label = "Date of birth";
+  control.accessibleName = "Date of birth";
+  const traveler = {
+    first_name: "Ali",
+    last_name: "SIFRAR",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    gender: "male",
+    date_of_birth: "2003-05-31"
+  };
+  const goal = deriveProfileGoal(observation, traveler);
+  assert.equal(goal.codecError.code, "AMBIGUOUS_DATE_FORMAT");
+  assert.deepEqual(candidatesForProfileGoal(goal, observation, traveler), []);
+});
+
 test("P0 scoped validation blocks only its canonical profile owner or an explicit stage-wide issue", () => {
   const traveler = {
     email: "ali@example.test",

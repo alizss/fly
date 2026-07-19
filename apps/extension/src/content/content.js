@@ -351,14 +351,22 @@
 
   function detectField(input) {
     const text = labelText(input);
-    const localText = localLabelText(input);
+    const dateGroup = input.closest?.("fieldset, [role='group']");
+    const dateGroupLabel = [
+      dateGroup?.querySelector?.("legend")?.textContent,
+      dateGroup?.getAttribute?.("aria-label"),
+      dateGroup?.getAttribute?.("aria-labelledby")
+        ? document.getElementById(dateGroup.getAttribute("aria-labelledby"))?.textContent
+        : ""
+    ].filter(Boolean).join(" ");
+    const localText = `${localLabelText(input)} ${dateGroupLabel}`.replace(/\s+/g, " ").toLowerCase();
     if (/confirm.*e-?mail|repeat.*e-?mail/.test(localText)) return { field: "confirm_email", confidence: 0.95 };
     if (/\bsurname\b|family.?name|last.?name/.test(localText)) return { field: "last_name", confidence: 0.93 };
     if (/first.*middle|first.?name|given.?name|forename/.test(localText)) return { field: "first_name", confidence: 0.93 };
     if (/mobile|phone|telephone/.test(localText) && !/country|dial|calling/.test(localText)) return { field: "phone", confidence: 0.92 };
     if (/country.*code|dial.*code|calling.*code/.test(localText)) return { field: "phone_country_code", confidence: 0.9 };
     if (/\be-?mail\b/.test(localText)) return { field: "email", confidence: 0.9 };
-    if (/birth|dob/.test(localText)) return { field: "date_of_birth", confidence: 0.9 };
+    if (/birth|dob|bday-(?:day|month|year)/.test(`${localText} ${input.getAttribute?.("autocomplete") || ""}`)) return { field: "date_of_birth", confidence: 0.9 };
     if (/nationality|citizenship/.test(localText)) return { field: "nationality", confidence: 0.9 };
     let best = null;
     for (const [field, terms] of Object.entries(FIELD_MATCHERS)) {
@@ -3347,8 +3355,157 @@
     return text.toLowerCase();
   }
 
+  function describedText(element) {
+    return String(element?.getAttribute?.("aria-describedby") || "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.textContent || "")
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 500);
+  }
+
+  function observedLocale() {
+    return String(document.documentElement?.lang || navigator.language || "").trim();
+  }
+
+  function dateFormatFromTokens(hint = "") {
+    const normalized = String(hint || "").toLowerCase()
+      .replace(/year/g, "yyyy")
+      .replace(/month/g, "mm")
+      .replace(/day/g, "dd");
+    const tokens = [...normalized.matchAll(/yyyy|yy|mm|dd/g)].map((match) => ({
+      token: match[0].startsWith("y") ? "y" : match[0].startsWith("m") ? "m" : "d",
+      index: match.index
+    }));
+    const unique = [];
+    for (const token of tokens) {
+      if (!unique.some((item) => item.token === token.token)) unique.push(token);
+    }
+    if (unique.length !== 3) return null;
+    unique.sort((a, b) => a.index - b.index);
+    const format = unique.map((item) => item.token).join("");
+    if (!/^(dmy|mdy|ymd)$/.test(format)) return null;
+    return {
+      format,
+      separator: normalized.match(/[-/.]/)?.[0] || "-",
+      source: "explicit_format_hint"
+    };
+  }
+
+  function dateFormatFromLocale(locale = "") {
+    if (!/^[a-z]{2,3}[-_][a-z]{2}$/i.test(String(locale || ""))) return null;
+    try {
+      const parts = new Intl.DateTimeFormat(String(locale).replace("_", "-"), {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        timeZone: "UTC"
+      }).formatToParts(new Date(Date.UTC(2003, 10, 22)));
+      const format = parts.filter((part) => ["day", "month", "year"].includes(part.type))
+        .map((part) => part.type[0]).join("");
+      if (!/^(dmy|mdy|ymd)$/.test(format)) return null;
+      return {
+        format,
+        separator: parts.find((part) => part.type === "literal")?.value?.match(/[-/.]/)?.[0] || "/",
+        source: "explicit_locale"
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function dateFieldEvidenceForElement(element) {
+    if (!element) return null;
+    const inputType = String(element.getAttribute?.("type") || element.type || "").toLowerCase();
+    const autocomplete = String(element.getAttribute?.("autocomplete") || "").toLowerCase();
+    const placeholder = String(element.getAttribute?.("placeholder") || "");
+    const pattern = String(element.getAttribute?.("pattern") || "");
+    const description = describedText(element);
+    const label = labelText(element) || accessibleName(element) || "";
+    const name = String(element.getAttribute?.("name") || "");
+    const locale = observedLocale();
+    const hint = `${label} ${name} ${placeholder}`.toLowerCase();
+    let component = "";
+    if (/bday-day/.test(autocomplete)) component = "day";
+    else if (/bday-month/.test(autocomplete)) component = "month";
+    else if (/bday-year/.test(autocomplete)) component = "year";
+    else {
+      const hasFullTokens = Boolean(dateFormatFromTokens(`${placeholder} ${pattern} ${description} ${label} ${name}`));
+      if (!hasFullTokens) {
+        const matches = [
+          ["day", /(^|[^a-z])(day|dd)([^a-z]|$)/],
+          ["month", /(^|[^a-z])(month|mm)([^a-z]|$)/],
+          ["year", /(^|[^a-z])(year|yyyy)([^a-z]|$)/]
+        ].filter(([, regex]) => regex.test(hint));
+        if (matches.length === 1) component = matches[0][0];
+      }
+    }
+    const explicit = dateFormatFromTokens(`${placeholder} ${pattern} ${description} ${label} ${name} ${autocomplete}`);
+    const localized = !explicit && inputType !== "date" && !component ? dateFormatFromLocale(locale) : null;
+    const contract = inputType === "date"
+      ? { format: "ymd", separator: "-", source: "native_date_input" }
+      : component
+        ? { component, source: "component_semantics" }
+        : explicit || localized;
+    return {
+      inputType,
+      placeholder: placeholder.slice(0, 120),
+      pattern: pattern.slice(0, 180),
+      description,
+      label: String(label).slice(0, 220),
+      name: name.slice(0, 120),
+      autocomplete: autocomplete.slice(0, 80),
+      inputMode: String(element.getAttribute?.("inputmode") || "").slice(0, 40),
+      locale: locale.slice(0, 40),
+      options: element.tagName === "SELECT"
+        ? [...element.options].map((option) => ({ value: option.value, label: compactText(option.textContent || option.label || option.value, 120) })).slice(0, 120)
+        : [],
+      format: contract?.format || "",
+      component: contract?.component || "",
+      separator: contract?.separator || "",
+      source: contract?.source || "",
+      ambiguous: !contract
+    };
+  }
+
+  function validCanonicalDate(value = "") {
+    const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return "";
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(Date.UTC(year, month - 1, day));
+    return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+      ? `${match[1]}-${match[2]}-${match[3]}`
+      : "";
+  }
+
+  function decodeObservedDateValue(value = "", dateField = {}) {
+    const raw = String(value || "").trim();
+    if (dateField.component) {
+      const digits = raw.match(/\d{1,4}/)?.[0] || "";
+      if (!digits) return {};
+      return {
+        component: dateField.component,
+        componentValue: digits.padStart(dateField.component === "year" ? 4 : 2, "0")
+      };
+    }
+    if (!dateField.format) return {};
+    const values = raw.match(/\d+/g) || [];
+    if (values.length !== 3) return {};
+    const parts = Object.fromEntries(dateField.format.split("").map((token, index) => [token, values[index]]));
+    const canonicalDateValue = validCanonicalDate(
+      `${String(parts.y || "").padStart(4, "0")}-${String(parts.m || "").padStart(2, "0")}-${String(parts.d || "").padStart(2, "0")}`
+    );
+    return canonicalDateValue ? { canonicalDateValue } : {};
+  }
+
   function controlStateForElement(element, semantic = "") {
     const value = currentElementValue(element);
+    const dateField = semantic === "date_of_birth" ? dateFieldEvidenceForElement(element) : null;
+    const decodedDate = dateField ? decodeObservedDateValue(value, dateField) : {};
     const exposesChoiceValue = isDropdownLikeElement(element) || implicitRole(element) === "option";
     const valueText = exposesChoiceValue && value && !isPlaceholderChoiceValue(value)
       ? compactText(value, 180)
@@ -3359,8 +3516,13 @@
       valuePresent: Boolean(value && String(value).trim()),
       value: value ? "[filled]" : "",
       valueText,
-      normalizedValue: normalizedControlValue(value, semantic, element),
-      normalizationMode: semantic === "phone_country_code" ? "country_code" : semantic === "phone" ? "phone" : "text",
+      normalizedValue: semantic === "date_of_birth"
+        ? (decodedDate.canonicalDateValue || decodedDate.componentValue || "")
+        : normalizedControlValue(value, semantic, element),
+      canonicalDateValue: decodedDate.canonicalDateValue || "",
+      dateComponent: decodedDate.component || "",
+      dateComponentValue: decodedDate.componentValue || "",
+      normalizationMode: semantic === "phone_country_code" ? "country_code" : semantic === "phone" ? "phone" : semantic === "date_of_birth" ? "date_codec" : "text",
       disabled: isDisabledLike(element),
       required: Boolean(element?.required === true || element?.getAttribute?.("aria-required") === "true"),
       expanded: element?.getAttribute?.("aria-expanded") === "true",
@@ -3792,6 +3954,7 @@
     ].filter((item) => item.element);
     const boxes = members.map((item) => isVisible(item.element) ? elementBox(item.element) : null).filter(Boolean);
     const state = controlStateForElement(stateElement, semantic);
+    const dateField = semantic === "date_of_birth" ? dateFieldEvidenceForElement(stateElement) : null;
     const domRole = implicitRole(stateElement) || implicitRole(element);
     const operations = controlOperationsForElement({ element, stateElement, activationElement, kind, role: domRole, state });
     for (const [operation, capability] of Object.entries(operations)) {
@@ -3888,6 +4051,7 @@
       semanticIntent: semantic,
       risk: choiceRisk(label),
       structuredPrice: structuredPriceFromText(label),
+      dateField,
       state,
       currentValue: state.normalizedValue || state.valueText || "",
       capabilities: observedCapabilities(operations, perceptionRole),
@@ -3919,6 +4083,7 @@
     model.stableKey = control.stableKey || model.stableKey || "";
     model.meaning = control.meaning || model.meaning || control.semantic || "";
     model.structuredPrice = control.structuredPrice || model.structuredPrice || null;
+    model.dateField = control.dateField || model.dateField || null;
     model.decisionGroupId = control.decisionGroupId || model.decisionGroupId || "";
     model.controlKind = control.kind;
     model.controlState = control.state;
@@ -5270,6 +5435,37 @@
         code: ok ? "OPTIONS_SURFACE_APPEARED" : "OPTIONS_SURFACE_NOT_APPEARED",
         message: ok ? "The canonical choice options are now visible." : "The canonical open operation did not expose its options surface.",
         evidence: { ...evidence, control: afterControl || null, currentSurface }
+      };
+    }
+    if (expected.type === "date_value_committed") {
+      const codec = expected.dateCodec || afterControl?.dateField || {};
+      const actualCanonicalValue = String(afterControlState?.canonicalDateValue || "");
+      const actualComponentValue = String(afterControlState?.dateComponentValue || "");
+      const wantedCanonicalValue = String(expected.expectedCanonicalValue || "");
+      const wantedComponentValue = String(expected.expectedNormalizedValue || "");
+      const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
+        issue.stageWide === true || (expected.controlId && issue.controlId === expected.controlId)
+      ));
+      const exactValue = codec.kind === "component"
+        ? Boolean(wantedComponentValue && actualComponentValue === wantedComponentValue)
+        : Boolean(wantedCanonicalValue && actualCanonicalValue === wantedCanonicalValue);
+      const ok = exactValue && ownedValidationErrors.length === 0;
+      return {
+        ok,
+        code: ok ? "DATE_VALUE_VERIFIED" : "DATE_VALUE_NOT_VERIFIED",
+        message: ok
+          ? "The live date value parses back to the saved canonical date."
+          : "The live date value did not parse back to the saved canonical date, or validation remains visible.",
+        evidence: {
+          ...evidence,
+          codec,
+          actualCanonicalValue,
+          wantedCanonicalValue,
+          actualComponentValue,
+          wantedComponentValue,
+          ownedValidationErrors,
+          control: afterControl || null
+        }
       };
     }
     if (expected.type === "normalized_value_changed") {
@@ -6642,8 +6838,12 @@
         label: labelText(input),
         name: input.getAttribute("name") || "",
         placeholder: input.getAttribute("placeholder") || "",
+        pattern: input.getAttribute("pattern") || "",
+        description: describedText(input),
         autocomplete: input.getAttribute("autocomplete") || "",
         inputMode: input.getAttribute("inputmode") || "",
+        inputType: String(input.getAttribute("type") || input.type || "").toLowerCase(),
+        locale: observedLocale(),
         formatHint: [input.getAttribute("placeholder"), input.getAttribute("aria-label"), input.getAttribute("name")]
           .filter(Boolean).join(" ").slice(0, 180),
         options: input.tagName === "SELECT"
@@ -6654,6 +6854,7 @@
         role: implicitRole(input),
         field: semantic,
         semantic,
+        dateField: semantic === "date_of_birth" ? dateFieldEvidenceForElement(input) : null,
         required: input.required || /\*/.test(labelText(input)),
         value,
         hasValue: Boolean(value),
@@ -7125,6 +7326,7 @@
         stableKey: control.stableKey || "",
         meaning: control.meaning || control.semantic || "",
         structuredPrice: control.structuredPrice || null,
+        dateField: control.dateField || null,
         visualRef: control.visualRef || "",
         decisionGroupId: control.decisionGroupId || "",
         label: control.label,

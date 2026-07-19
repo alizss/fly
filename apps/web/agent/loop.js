@@ -1777,7 +1777,9 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   // outage and not a reason to ask the model to invent an action. Preserve the
   // exact goal and report the actual blocker through the final handoff path.
   if (!canonicalCandidateSet.candidates.length) {
-    const reason = `No safe grounded candidate is available for the current goal: ${canonicalGoal.semanticGoal || "current checkout decision"}.`;
+    const reason = canonicalGoal.codecError?.code === "AMBIGUOUS_DATE_FORMAT"
+      ? "The date-of-birth field does not expose an unambiguous format. I will not guess the day/month order; please enter the saved DOB manually for this field."
+      : `No safe grounded candidate is available for the current goal: ${canonicalGoal.semanticGoal || "current checkout decision"}.`;
     const action = finalHandoffAction(reason, observation);
     const stoppedState = withUpdate(canonicalState, {
       currentGoal: {
@@ -1807,7 +1809,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       debug: withLatencyDebug({
         currentGoal: stoppedState.currentGoal,
         finalAction: action,
-        stopCategory: "safe_candidate_unavailable",
+        stopCategory: canonicalGoal.codecError?.code === "AMBIGUOUS_DATE_FORMAT" ? "ambiguous_date_format" : "safe_candidate_unavailable",
         aiServiceUnavailable: false,
         modelCalled: false
       }, latency, modelUsageFromMetas(publishedProfileGoal ? (recoveryModel || model) : model, []))

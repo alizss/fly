@@ -170,6 +170,32 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
       evidence: { ...exact.evidence, browserVerifiedBeforeDismissal }
     };
   }
+  if (type === "date_value_committed") {
+    const codec = expected.dateCodec || afterControl?.dateField || {};
+    const wantedCanonicalValue = String(expected.expectedCanonicalValue || "");
+    const wantedComponentValue = String(expected.expectedNormalizedValue || "");
+    const actualCanonicalValue = String(afterControl?.state?.canonicalDateValue || "");
+    const actualComponentValue = String(afterControl?.state?.dateComponentValue || "");
+    const validation = (afterPage.validationIssues || []).some((issue) => (
+      issue.stageWide === true || (controlId && issue.controlId === controlId)
+    ));
+    const exact = codec.kind === "component"
+      ? Boolean(wantedComponentValue && actualComponentValue === wantedComponentValue)
+      : Boolean(wantedCanonicalValue && actualCanonicalValue === wantedCanonicalValue);
+    return {
+      type,
+      satisfied: exact && !validation,
+      evidence: {
+        controlId,
+        codec,
+        wantedCanonicalValue,
+        actualCanonicalValue,
+        wantedComponentValue,
+        actualComponentValue,
+        validation
+      }
+    };
+  }
   if (["normalized_value_changed", "field_value_changed"].includes(type)) {
     const wanted = text(expected.expectedNormalizedValue || expected.expectedValue || action.value || "").replace(/\s+/g, "");
     const actual = controlValue(afterControl || {});

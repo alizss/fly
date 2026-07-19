@@ -2,6 +2,11 @@ const { normalizeAction } = require("../../../packages/shared/agent-actions");
 const { conflictedControlIds } = require("./control-alias-index");
 const { currentSurface: authoritativeCurrentSurface } = require("./surface-contract");
 const { deriveActionSemantics } = require("./action-semantics");
+const {
+  normalizeCanonicalDate,
+  encodeDateForField,
+  decodeDateFromField
+} = require("./date-field-codec");
 
 const COMPOUND_ACTIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
 
@@ -99,15 +104,6 @@ function normalizedTitle(traveler = {}) {
   return "";
 }
 
-function parsedDate(value = "") {
-  const raw = String(value || "").trim();
-  let match = raw.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
-  if (match) return { year: match[1], month: match[2].padStart(2, "0"), day: match[3].padStart(2, "0") };
-  match = raw.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
-  if (match) return { year: match[3], month: match[2].padStart(2, "0"), day: match[1].padStart(2, "0") };
-  return null;
-}
-
 function matchingOptionValue(field = {}, wanted = "", alternatives = []) {
   const options = Array.isArray(field.options) ? field.options : [];
   const candidates = [wanted, ...alternatives].map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
@@ -131,6 +127,7 @@ function normalizedProfileValue(semanticType = "", value = "") {
     return digits ? `+${digits}` : "";
   }
   if (semanticType === "phone") return text.replace(/[^0-9]/g, "").replace(/^0+/, "");
+  if (semanticType === "date_of_birth") return normalizeCanonicalDate(text);
   return text.toLowerCase();
 }
 
@@ -167,32 +164,15 @@ function valueMatchesChoice(actual = "", terms = []) {
 }
 
 function dateValueForField(value, field = {}) {
-  const date = parsedDate(value);
-  if (!date) return String(value || "");
-  const hint = [field.label, field.placeholder, field.name, field.autocomplete, field.formatHint]
-    .filter(Boolean).join(" ").toLowerCase();
-  const monthNames = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
-  if (/\bday\b|\bdd\b/.test(hint) && !/month|year|yyyy|mm[-/.]dd/.test(hint)) {
-    return matchingOptionValue(field, date.day, [String(Number(date.day))]);
-  }
-  if (/\bmonth\b|\bmm\b/.test(hint) && !/day|year|yyyy|dd[-/.]mm/.test(hint)) {
-    return matchingOptionValue(field, date.month, [String(Number(date.month)), monthNames[Number(date.month) - 1]]);
-  }
-  if (/\byear\b|\byyyy\b/.test(hint) && !/day|month|dd|mm/.test(hint)) {
-    return matchingOptionValue(field, date.year);
-  }
-  if (field.kind === "date") return `${date.year}-${date.month}-${date.day}`;
-  if (/mm[-/.]dd[-/.]yyyy|month.+day.+year/.test(hint)) return `${date.month}/${date.day}/${date.year}`;
-  if (/yyyy[-/.]mm[-/.]dd|year.+month.+day/.test(hint)) return `${date.year}-${date.month}-${date.day}`;
-  const separator = hint.includes("/") ? "/" : hint.includes(".") ? "." : "-";
-  return `${date.day}${separator}${date.month}${separator}${date.year}`;
+  const encoded = encodeDateForField(value, field);
+  return encoded.ok ? encoded.value : "";
 }
 
 function uid(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-function profileValue(fieldType = "", traveler = {}, field = {}) {
+function profileCanonicalValue(fieldType = "", traveler = {}) {
   const document = traveler.document || {};
   const phone = normalizedPhoneParts(traveler);
   const title = normalizedTitle(traveler);
@@ -215,7 +195,12 @@ function profileValue(fieldType = "", traveler = {}, field = {}) {
     passport_expiry: document.expiry_date,
     document_expiry: document.expiry_date
   };
-  const value = String(values[fieldType] || "");
+  return String(values[fieldType] || "");
+}
+
+function profileValue(fieldType = "", traveler = {}, field = {}) {
+  const title = normalizedTitle(traveler);
+  const value = profileCanonicalValue(fieldType, traveler);
   if (fieldType === "date_of_birth") return dateValueForField(value, field);
   if (["title", "gender"].includes(fieldType) && field.kind === "select") {
     return matchingOptionValue(field, title, title === "Mrs/Ms" ? ["Mrs", "Ms", "Miss"] : [title]);
@@ -269,8 +254,12 @@ function fieldDescriptors(observation = {}, traveler = {}) {
     const ordinal = ordinals.get(semanticType) || 0;
     ordinals.set(semanticType, ordinal + 1);
     const control = canonicalField(page, field);
-    const value = profileValue(semanticType, traveler, field);
-    if (!control || !value || control.state?.disabled === true) return [];
+    const canonicalValue = profileCanonicalValue(semanticType, traveler);
+    const dateEncoding = semanticType === "date_of_birth"
+      ? encodeDateForField(canonicalValue, { ...field, dateField: control?.dateField || field.dateField })
+      : null;
+    const value = dateEncoding ? (dateEncoding.ok ? dateEncoding.value : "") : profileValue(semanticType, traveler, field);
+    if (!control || !canonicalValue || control.state?.disabled === true) return [];
     const choiceLike = ["title", "gender"].includes(semanticType)
       && (["radio", "checkbox", "choice"].includes(String(field.kind || "").toLowerCase())
         || ["radio", "checkbox"].includes(String(control.role || "").toLowerCase()));
@@ -283,8 +272,19 @@ function fieldDescriptors(observation = {}, traveler = {}) {
       if (!matches) return [];
     }
     const choiceTerms = profileChoiceTerms(semanticType, value, traveler);
-    const currentNormalizedValue = String(control.state?.normalizedValue || "");
-    const desiredNormalizedValue = normalizedProfileValue(semanticType, value);
+    const observedDate = semanticType === "date_of_birth" && dateEncoding?.ok
+      ? decodeDateFromField(String(control.state?.rawValue || control.state?.normalizedValue || ""), dateEncoding.codec)
+      : null;
+    const currentNormalizedValue = String(
+      semanticType === "date_of_birth"
+        ? (dateEncoding?.codec?.kind === "full"
+          ? control.state?.canonicalDateValue || observedDate?.canonicalValue || ""
+          : control.state?.dateComponentValue || observedDate?.componentValue || "")
+        : control.state?.normalizedValue || ""
+    );
+    const desiredNormalizedValue = dateEncoding?.ok
+      ? dateEncoding.expectedNormalizedValue
+      : normalizedProfileValue(semanticType, value);
     const valueSatisfied = choiceLike
       ? Boolean(control.selected || control.state?.checked || control.state?.selected)
       : Boolean(desiredNormalizedValue && currentNormalizedValue === desiredNormalizedValue);
@@ -308,6 +308,12 @@ function fieldDescriptors(observation = {}, traveler = {}) {
       choiceTerms,
       currentNormalizedValue,
       desiredNormalizedValue,
+      canonicalValue: semanticType === "date_of_birth" ? normalizeCanonicalDate(canonicalValue) : "",
+      dateCodec: dateEncoding?.codec || null,
+      codecError: dateEncoding && !dateEncoding.ok ? {
+        code: dateEncoding.code || "AMBIGUOUS_DATE_FORMAT",
+        reason: dateEncoding.reason || "The observed date format is ambiguous."
+      } : null,
       hasValue: valueSatisfied && validationIssues.length === 0,
       validationIssues
     }];
@@ -348,7 +354,7 @@ function profileStageReadiness(observation = {}, traveler = {}) {
       semanticType: String(field.field || "unknown"),
       controlId: String(field.controlId || ""),
       label: String(field.label || field.field || "Required traveler field"),
-      valueAvailable: Boolean(profileValue(String(field.field || ""), traveler, field))
+      valueAvailable: Boolean(profileCanonicalValue(String(field.field || ""), traveler))
     }];
   });
   const missingUserData = unresolvedRequired.filter((item) => item.valueAvailable === false);
@@ -386,12 +392,16 @@ function atomFromDescriptor(planId, descriptor, observationId) {
       desiredValue: desiredNormalizedValue || descriptor.value || ""
     },
     postcondition: {
-      type: "normalized_value_changed",
-      expectedValue: desiredNormalizedValue || descriptor.value || ""
+      type: descriptor.semanticType === "date_of_birth" ? "date_value_committed" : "normalized_value_changed",
+      expectedValue: desiredNormalizedValue || descriptor.value || "",
+      expectedCanonicalValue: descriptor.canonicalValue || "",
+      dateCodec: descriptor.dateCodec || null
     },
     valueRef: `profile://${descriptor.semanticType}`,
     expectedValue: descriptor.value,
     expectedNormalizedValue: desiredNormalizedValue,
+    expectedCanonicalValue: descriptor.canonicalValue || "",
+    dateCodec: descriptor.dateCodec || null,
     choiceTerms: descriptor.choiceTerms || [],
     strategyHistory: [],
     maxStrategyAttempts: 4,
@@ -541,6 +551,7 @@ function expectedSuccessCode(expectedType = "") {
   return {
     options_surface_appeared: "OPTIONS_SURFACE_APPEARED",
     normalized_value_changed: "NORMALIZED_VALUE_VERIFIED",
+    date_value_committed: "DATE_VALUE_VERIFIED",
     field_value_changed: "FIELD_VALUE_VERIFIED",
     control_selected: "CONTROL_SELECTED",
     semantic_progress: "SEMANTIC_PROGRESS_OBSERVED"
@@ -1019,6 +1030,17 @@ function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}
     };
   }
   if (["type", "select"].includes(strategy.operation)) {
+    if (descriptor.semanticType === "date_of_birth" && descriptor.dateCodec) {
+      return {
+        type: "date_value_committed",
+        controlId: goalControl.controlId,
+        expectedValue: strategy.value || descriptor.value || "",
+        expectedNormalizedValue: atom.expectedNormalizedValue || descriptor.desiredNormalizedValue || "",
+        expectedCanonicalValue: atom.expectedCanonicalValue || descriptor.canonicalValue || "",
+        dateCodec: atom.dateCodec || descriptor.dateCodec,
+        requireNoValidationError: true
+      };
+    }
     return {
       type: atom.postcondition?.type || "normalized_value_changed",
       controlId: goalControl.controlId,
@@ -1162,10 +1184,14 @@ function semanticGoalAtom(goal = {}, attemptedCandidateIds = []) {
     },
     postcondition: {
       type: goal.postcondition?.type || "normalized_value_changed",
-      expectedValue: goal.postcondition?.expectedValue || goal.desiredValue || ""
+      expectedValue: goal.postcondition?.expectedValue || goal.desiredValue || "",
+      expectedCanonicalValue: goal.postcondition?.expectedCanonicalValue || goal.canonicalValue || "",
+      dateCodec: goal.postcondition?.dateCodec || goal.dateCodec || null
     },
     expectedValue: goal.inputValue || goal.desiredValue || "",
     expectedNormalizedValue: goal.desiredValue || "",
+    expectedCanonicalValue: goal.canonicalValue || "",
+    dateCodec: goal.dateCodec || null,
     choiceTerms: [...(goal.choiceTerms || [])],
     strategyHistory: (attemptedCandidateIds || []).map((strategyId) => ({
       strategyId,
@@ -1189,6 +1215,17 @@ function deriveProfileGoal(observation = {}, traveler = {}, currentGoal = null) 
         ...currentGoal,
         controlId: goalControl.controlId || currentGoal.controlId || "",
         currentValue: goalControl.state?.normalizedValue || "",
+        inputValue: descriptor.value || currentGoal.inputValue || "",
+        desiredValue: descriptor.desiredNormalizedValue || currentGoal.desiredValue || "",
+        canonicalValue: descriptor.canonicalValue || currentGoal.canonicalValue || "",
+        dateCodec: descriptor.dateCodec || currentGoal.dateCodec || null,
+        codecError: descriptor.codecError || null,
+        postcondition: descriptor.semanticType === "date_of_birth" ? {
+          type: "date_value_committed",
+          expectedValue: descriptor.desiredNormalizedValue || "",
+          expectedCanonicalValue: descriptor.canonicalValue || "",
+          dateCodec: descriptor.dateCodec || null
+        } : currentGoal.postcondition,
         observationId,
         updatedAt: new Date().toISOString()
       };
@@ -1214,9 +1251,14 @@ function deriveProfileGoal(observation = {}, traveler = {}, currentGoal = null) 
     choiceTerms: [...(descriptor.choiceTerms || [])],
     controlId: descriptor.control?.controlId || "",
     currentValue: descriptor.currentNormalizedValue || "",
+    canonicalValue: descriptor.canonicalValue || "",
+    dateCodec: descriptor.dateCodec || null,
+    codecError: descriptor.codecError || null,
     postcondition: {
-      type: "normalized_value_changed",
-      expectedValue: desiredValue
+      type: descriptor.semanticType === "date_of_birth" ? "date_value_committed" : "normalized_value_changed",
+      expectedValue: desiredValue,
+      expectedCanonicalValue: descriptor.canonicalValue || "",
+      dateCodec: descriptor.dateCodec || null
     },
     observationId,
     createdAt: new Date().toISOString(),
@@ -1242,6 +1284,7 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
   if (!goal?.goalId) return [];
   const descriptor = descriptorForSemanticGoal(goal, observation, traveler);
   if (!descriptor || descriptor.hasValue) return [];
+  if (descriptor.codecError) return [];
   if (conflictedControlIds(observation.page || {}).has(descriptor.control?.controlId)) return [];
   const atom = semanticGoalAtom(goal, attemptedCandidateIds);
   return strategyCandidatesForAtom(atom, descriptor, observation).map((strategy) => ({

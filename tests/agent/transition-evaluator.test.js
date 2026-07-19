@@ -87,6 +87,43 @@ test("authoritative transition achieves only the exact free selection", () => {
   assert.equal(transition.postcondition.evidence.selectedControlId, "ctrl_free");
 });
 
+test("DOB transition requires the exact canonical date and no owned validation error", () => {
+  const before = observation("dob_before", {
+    step: "traveler_information",
+    currentSurface: { id: "page", type: "page", label: "Traveler" },
+    controls: [{ controlId: "ctrl_dob", semantic: "date_of_birth", state: { canonicalDateValue: "" } }]
+  });
+  const action = {
+    id: "act_dob",
+    controlId: "ctrl_dob",
+    operation: "type",
+    expectedOutcome: {
+      type: "date_value_committed",
+      controlId: "ctrl_dob",
+      expectedCanonicalValue: "2003-05-31",
+      expectedNormalizedValue: "2003-05-31",
+      dateCodec: { ok: true, kind: "full", format: "dmy", separator: "-" }
+    }
+  };
+  const exact = observation("dob_exact", {
+    step: "traveler_information",
+    currentSurface: { id: "page", type: "page", label: "Traveler" },
+    controls: [{ controlId: "ctrl_dob", semantic: "date_of_birth", state: { canonicalDateValue: "2003-05-31", normalizedValue: "2003-05-31" } }]
+  }, result("act_dob"));
+  const achieved = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: exact });
+  assert.equal(achieved.status, "achieved");
+
+  const invalid = observation("dob_invalid", {
+    step: "traveler_information",
+    currentSurface: { id: "page", type: "page", label: "Traveler" },
+    controls: [{ controlId: "ctrl_dob", semantic: "date_of_birth", state: { canonicalDateValue: "2003-05-31", normalizedValue: "2003-05-31" } }],
+    validationIssues: [{ issueId: "dob_error", controlId: "ctrl_dob", message: "Invalid date" }]
+  }, result("act_dob"));
+  const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: invalid });
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.postcondition.satisfied, false);
+});
+
 test("authoritative transition distinguishes blocked, progressed, no-effect, uncertain, and unsafe", () => {
   const before = observation("before", {
     currentSurface: { id: "page", type: "page", label: "Seats" },

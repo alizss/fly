@@ -1109,6 +1109,101 @@ test("P0.4 browser replay fills the complete profile and chooses the exact count
   expect(result.graphIntegrity.ok).toBe(true);
 });
 
+test("cross-site DOB fields expose a codec and verify the live value canonically", async ({ page }) => {
+  await loadProducer(page, profileFixturePath);
+  const results = await page.evaluate(async () => {
+    const hooks = window.__ATW_TEST__;
+    hooks.setAppDataForTest({
+      travelers: [{
+        id: "trav_date_codec",
+        first_name: "Ali",
+        last_name: "SIFRAR",
+        email: "ali@example.test",
+        date_of_birth: "2003-05-31"
+      }],
+      preferences: {}
+    }, "trav_date_codec");
+    const variants = [
+      { name: "day_first", type: "text", placeholder: "DD-MM-YYYY", value: "31-05-2003", canonical: "2003-05-31", format: "dmy" },
+      { name: "month_first", type: "text", placeholder: "MM/DD/YYYY", value: "05/31/2003", canonical: "2003-05-31", format: "mdy" },
+      { name: "native_date", type: "date", placeholder: "", value: "2003-05-31", canonical: "2003-05-31", format: "ymd" }
+    ];
+    const observed = [];
+    for (const variant of variants) {
+      const input = document.getElementById("dob");
+      input.type = variant.type;
+      input.placeholder = variant.placeholder;
+      input.value = "";
+      const before = hooks.buildPageMap();
+      const beforeControl = before.controls.find((control) => control.semantic === "date_of_birth");
+      const target = hooks.resolveDecisionTarget({
+        action: "type",
+        operation: "type",
+        controlId: beforeControl.controlId,
+        targetId: beforeControl.operations.type.actuatorId
+      }, before);
+      const fill = await hooks.setFieldValue(target, variant.value, {
+        fieldType: "date_of_birth",
+        compareMode: "text"
+      });
+      const after = hooks.buildPageMap();
+      const afterControl = after.controls.find((control) => control.semantic === "date_of_birth");
+      const verification = hooks.verifyExpectedOutcome({
+        type: "date_value_committed",
+        controlId: afterControl.controlId,
+        expectedNormalizedValue: variant.canonical,
+        expectedCanonicalValue: variant.canonical,
+        dateCodec: { ok: true, kind: "full", format: variant.format }
+      }, before, after, target);
+      observed.push({
+        name: variant.name,
+        fillOk: fill.ok,
+        format: afterControl.dateField?.format,
+        canonical: afterControl.state?.canonicalDateValue,
+        verified: verification.ok,
+        code: verification.code
+      });
+    }
+
+    const input = document.getElementById("dob");
+    input.type = "text";
+    input.placeholder = "";
+    input.removeAttribute("pattern");
+    input.removeAttribute("aria-describedby");
+    document.documentElement.lang = "en";
+    input.value = "";
+    const ambiguousMap = hooks.buildPageMap();
+    const ambiguous = ambiguousMap.controls.find((control) => control.semantic === "date_of_birth");
+    input.closest("label").remove();
+    const fieldset = document.createElement("fieldset");
+    fieldset.innerHTML = `
+      <legend>Date of birth</legend>
+      <label>Day<select name="birth_day" autocomplete="bday-day"><option value="31">31</option></select></label>
+      <label>Month<select name="birth_month" autocomplete="bday-month"><option value="05">May</option></select></label>
+      <label>Year<select name="birth_year" autocomplete="bday-year"><option value="2003">2003</option></select></label>
+    `;
+    document.getElementById("traveler-form").appendChild(fieldset);
+    const splitMap = hooks.buildPageMap();
+    const split = splitMap.controls
+      .filter((control) => control.semantic === "date_of_birth")
+      .map((control) => ({ component: control.dateField?.component, format: control.dateField?.format }))
+      .sort((a, b) => a.component.localeCompare(b.component));
+    return { observed, ambiguous: ambiguous.dateField, split };
+  });
+
+  expect(results.observed).toEqual([
+    { name: "day_first", fillOk: true, format: "dmy", canonical: "2003-05-31", verified: true, code: "DATE_VALUE_VERIFIED" },
+    { name: "month_first", fillOk: true, format: "mdy", canonical: "2003-05-31", verified: true, code: "DATE_VALUE_VERIFIED" },
+    { name: "native_date", fillOk: true, format: "ymd", canonical: "2003-05-31", verified: true, code: "DATE_VALUE_VERIFIED" }
+  ]);
+  expect(results.ambiguous).toMatchObject({ ambiguous: true, format: "" });
+  expect(results.split).toEqual([
+    { component: "day", format: "" },
+    { component: "month", format: "" },
+    { component: "year", format: "" }
+  ]);
+});
+
 test("P0.5 browser observation publishes structured transaction facts instead of visible-text fingerprints", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>

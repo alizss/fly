@@ -21,6 +21,7 @@ const agentSessionStore = require("./agent/session-store");
 const agentTraceStore = require("./agent/trace-store");
 const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
 const { PAGE_SURFACE_ID, normalizeSurface } = require("./agent/surface-contract");
+const { normalizeCanonicalDate } = require("./agent/date-field-codec");
 
 function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
@@ -1143,6 +1144,11 @@ function extensionBootstrapPayload(db) {
 }
 
 function travelerFromBody(body, existing = {}) {
+  const rawDateOfBirth = String(body.date_of_birth || "").trim();
+  const dateOfBirth = normalizeCanonicalDate(rawDateOfBirth);
+  if (rawDateOfBirth && !dateOfBirth) {
+    throw requestBodyError("INVALID_DATE_OF_BIRTH", "Date of birth must be a real date stored as YYYY-MM-DD.", 400);
+  }
   return {
     ...existing,
     workspace_id: body.workspace_id || existing.workspace_id || "",
@@ -1150,7 +1156,7 @@ function travelerFromBody(body, existing = {}) {
     first_name: String(body.first_name || "").trim(),
     middle_name: String(body.middle_name || "").trim(),
     last_name: String(body.last_name || "").trim(),
-    date_of_birth: body.date_of_birth || "",
+    date_of_birth: dateOfBirth,
     gender: body.gender || "",
     nationality: body.nationality || "",
     email: body.email || "",

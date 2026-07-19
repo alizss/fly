@@ -34,7 +34,7 @@ function fromExpectedOutcome(expectedOutcome = {}) {
   if (type === "target_in_view") return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "target_visible" };
   if (/options_surface_appeared|active_surface_change|semantic_progress/.test(type)) return { interactionRole: "opener", semanticEffect: "open", expectedEvidence: "options_appeared" };
   if (/exact_free_option_selected|control_selected|section_choice_verified/.test(type)) return { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" };
-  if (/normalized_value_changed|field_value_changed/.test(type)) return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
+  if (/normalized_value_changed|field_value_changed|date_value_committed/.test(type)) return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
   if (/stage_exit_or_feedback/.test(type)) return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "progress_changed" };
   if (/active_surface_dismissed|command_acknowledged|requirement_status/.test(type)) return { interactionRole: "command", semanticEffect: "waive", expectedEvidence: "dismissed" };
   return null;
@@ -152,7 +152,7 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
     return {
       ...existing,
       ...base,
-      type: "normalized_value_changed",
+      type: existing.type === "date_value_committed" ? "date_value_committed" : "normalized_value_changed",
       expectedValue: existing.expectedValue || action.value || "",
       expectedNormalizedValue: existing.expectedNormalizedValue || action.value || ""
     };
