@@ -119,8 +119,58 @@ function recoveryStateFor(state = {}) {
     failedStrategySignatures: [...(existing.failedStrategySignatures || state.unchangedStateFailedStrategySignatures || [])],
     lastCode: String(existing.lastCode || ""),
     lastRevealSample: existing.lastRevealSample || null,
+    outcomeId: String(existing.outcomeId || ""),
+    transitionTrail: [...(existing.transitionTrail || [])].slice(-12),
     updatedAt: existing.updatedAt || ""
   };
+}
+
+function semanticStateKey(observation = {}) {
+  const page = observation.page || {};
+  const surface = page.currentSurface || page.activeSurface || page.foreground || {};
+  const progress = page.foreground?.progressMarkers || page.visualState?.foreground?.progressMarkers || {};
+  return JSON.stringify({
+    stage: page.step || "unknown",
+    surfaceType: surface.type || "page",
+    surfaceClass: surface.surfaceClass || "unknown",
+    taskHint: surface.taskHint || "",
+    label: String(surface.label || "").replace(/\s+/g, " ").trim().slice(0, 120).toLowerCase(),
+    progress
+  });
+}
+
+function registerParentTransition(state = {}, action = {}, transition = {}, beforeObservation = {}, afterObservation = {}) {
+  const outcomeId = String(transition.parentProgress?.outcomeId || "");
+  if (!outcomeId || transition.parentProgress?.completed === true) return state;
+  const recovery = recoveryStateFor(state);
+  const from = semanticStateKey(beforeObservation);
+  const to = semanticStateKey(afterObservation);
+  const strategySignature = actuatorSignature(action);
+  const priorTrail = recovery.outcomeId === outcomeId ? recovery.transitionTrail : [];
+  const prior = priorTrail[priorTrail.length - 1] || null;
+  const cycle = Boolean(prior && prior.from === to && prior.to === from && from !== to);
+  const failedStrategySignatures = [...recovery.failedStrategySignatures];
+  if (cycle) {
+    for (const signature of [prior.strategySignature, strategySignature]) {
+      if (signature && !failedStrategySignatures.includes(signature)) failedStrategySignatures.push(signature);
+    }
+  }
+  const transitionTrail = [...priorTrail, {
+    from,
+    to,
+    strategySignature,
+    parentProgress: transition.parentProgress.status
+  }].slice(-12);
+  return stateWithRecovery(state, {
+    ...recovery,
+    outcomeId,
+    transitionTrail,
+    failedStrategySignatures,
+    attempts: cycle ? Math.max(recovery.attempts + 1, failedStrategySignatures.length) : recovery.attempts,
+    phase: cycle ? "parent_cycle" : recovery.phase,
+    lastCode: cycle ? "PARENT_OUTCOME_CYCLE" : recovery.lastCode,
+    updatedAt: new Date().toISOString()
+  });
 }
 
 function stateWithRecovery(state = {}, recoveryState = {}) {
@@ -252,6 +302,16 @@ function transitionResult(result = {}, transition = null) {
     transitionStatus: transition.status,
     transitionDirective: transition.nextDirective,
     transition,
+    localMechanicalResult: transition.localMechanicalResult || transition.localEffect || null,
+    currentObligationResult: transition.currentObligationResult || null,
+    durableObjectiveProgress: transition.durableObjectiveProgress || transition.parentProgress || null,
+    localEffect: transition.localEffect || transition.physicalResult || null,
+    physicalResult: transition.physicalResult || null,
+    physicalEffectVerified: transition.localEffect?.verified === true || transition.physicalResult?.verified === true,
+    parentProgress: transition.parentProgress || null,
+    taskOutcome: transition.taskOutcome || "",
+    taskOutcomeCompleted: (transition.durableObjectiveProgress || transition.parentProgress)?.completed === true,
+    completionAuthority: "task_state",
     postconditionSatisfied: transition.status === "achieved",
     expectedOutcomeObserved: transition.status === "achieved",
     verified: transition.status === "achieved"
@@ -328,9 +388,9 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
         strategySignature: signature
       });
       lifecycle = { ...lifecycle, status: "failed", dispatched: true, observed, verified: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
-      directive = recovery.exhausted
-        ? "handoff_recovery_exhausted"
-        : "try_distinct_capability";
+      // A finite no-effect budget suppresses repeated strategies, but it does
+      // not justify a handoff while another safe grounded capability exists.
+      directive = "try_distinct_capability";
       }
     } else if (transition.status === "unsafe") {
       lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, transitionStatus: "unsafe", resultCode: code };
@@ -338,18 +398,21 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
     } else {
       recovery = updateRecoveryState(state, { kind: "uncertain", code });
       lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, transitionStatus: "uncertain", resultCode: code };
-      directive = recovery.exhausted ? "handoff_recovery_exhausted" : "reobserve_rebind";
+      directive = "reobserve_rebind";
     }
   }
 
-  const nextState = { ...recovery.state, actionLifecycle: lifecycle };
+  const parentTrackedState = transition
+    ? registerParentTransition(recovery.state, action, transition, previousObservation || {}, observation)
+    : recovery.state;
+  const nextState = { ...parentTrackedState, actionLifecycle: lifecycle };
   return {
     state: nextState,
     observation: { ...observation, lastActionResult: transitionResult(result, transition), transitionEvaluation: transition || undefined },
     lifecycle,
     transition,
     directive,
-    exhausted: directive === "handoff_recovery_exhausted"
+    exhausted: false
   };
 }
 

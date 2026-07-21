@@ -16,6 +16,8 @@ const { advanceActionLifecycle, pendingActionRecord } = require("../../apps/web/
 const { sanitizedActionHistory } = require("../../apps/web/agent/model-context");
 const { resolvePlannerSelection } = require("../../apps/web/agent/verify-and-plan");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
+const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
+const { classifyObservationReadiness, READINESS } = require("../../apps/web/agent/observation-readiness");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 
 const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "seat-baggage.html");
@@ -749,7 +751,7 @@ test("three sibling extras resolve as an exact decision-group queue before Conti
   expect(await page.locator("body").getAttribute("data-stage")).toBe("payment-review");
   expect(await page.evaluate(() => window.__continueClicks)).toBe(1);
 
-  const records = resumedContinue.state.decisionCompletions || [];
+  const records = resumedContinue.state.taskState?.completedOutcomes || [];
   for (const groupId of completedGroupIds) {
     const record = records.find((item) => item.decisionGroupId === groupId);
     expect(record).toMatchObject({
@@ -831,7 +833,14 @@ async function executeUnifiedCandidate({ page, store, state, goal, candidate, ob
   );
   const governance = governAction({
     action,
-    state: { ...state, currentGoal: { ...goal, candidates: goal.candidates } },
+    state: {
+      ...state,
+      taskState: {
+        ...(state.taskState || {}),
+        currentGoal: { ...goal, candidates: goal.candidates }
+      },
+      currentGoal: { ...goal, candidates: goal.candidates }
+    },
     observation,
     traveler: { id: "trav_combo", phone: "+38670328922", nationality: "Slovenia" },
     store,
@@ -870,7 +879,7 @@ test("Unified currentGoal loop executes server candidates selected only by candi
       candidate.operation === variant.operation
       && (!variant.value || candidate.value === variant.value)
     ))?.candidateId;
-    expect(selectedCandidateId, variant.name).toBeTruthy();
+    expect(selectedCandidateId, `${variant.name}: ${JSON.stringify(goal.candidates.map((item) => ({ operation: item.operation, value: item.value, risk: item.risk, exclusionReason: item.exclusionReason })))} `).toBeTruthy();
     const candidate = goal.candidates.find((item) => item.candidateId === selectedCandidateId);
     const store = inMemoryGovernorStore();
     const state = createCheckoutSessionState({
@@ -1366,7 +1375,17 @@ test("semantic affordances preserve zero-price truth, proven actuators, and stab
   };
   const candidateSet = buildCurrentCandidateSet({ goal, observation: first });
   const candidate = candidateSet.candidates.find((item) => item.controlId === random.controlId && item.operation === "choose");
-  expect(candidate).toBeTruthy();
+  expect(candidate, JSON.stringify(candidateSet.contextCapabilities.map((item) => ({
+    label: item.targetLabel,
+    operation: item.operation,
+    controlId: item.controlId,
+    physicalEffect: item.physicalEffect,
+    goalRelevant: item.goalRelevant,
+    selectable: item.selectable,
+    exclusionReason: item.exclusionReason,
+    risk: item.risk,
+    policy: item.policyDecision
+  })), null, 2)).toBeTruthy();
   expect(candidate.affordance).toMatchObject({
     stableKey: random.stableKey,
     structuredPrice: { amount: 0, currency: "EUR" },
@@ -1397,6 +1416,66 @@ test("semantic affordances preserve zero-price truth, proven actuators, and stab
   expect(sameRandom.controlId).toBe(random.controlId);
   expect(sameNext.stableKey).toBe(next.stableKey);
   expect(sameNext.controlId).toBe(next.controlId);
+});
+
+test("seat-map traveler summary stays context while Next is the only safe selectable action", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { font-family: sans-serif; }
+      #seat-modal { position: fixed; inset: 20px; padding: 18px; background: white; }
+      #seat-map { display: grid; grid-template-columns: repeat(3, 80px); gap: 8px; }
+      button { min-height: 38px; }
+    </style>
+    <section id="seat-modal" role="dialog" aria-modal="true" aria-labelledby="seat-title">
+      <h2 id="seat-title">Reserve seating</h2>
+      <p>Flight 1 of 2</p>
+      <button id="traveler-row" type="button" data-testid="seatMapTravelerButton-0">
+        <span>Ali SIFRAR</span><span>Not selected</span>
+      </button>
+      <div id="seat-map" aria-label="Seat map">
+        <button id="seat-1e" type="button">Seat 1E — EUR50.00</button>
+        <button id="seat-2a" type="button">Seat 2A — EUR40.00</button>
+      </div>
+      <div aria-label="Seat map key">
+        <span>Standard seat</span><span>Not available</span>
+      </div>
+      <button id="seat-next" type="button">Next</button>
+    </section>
+    <script>
+      document.getElementById("seat-next").addEventListener("click", () => {
+        document.querySelector("#seat-modal p").textContent = "Flight 2 of 2";
+        document.body.dataset.seatLeg = "2";
+      });
+    </script>
+  `);
+
+  const observation = await browserObservation(page, "obs_seat_traveler_context");
+  const traveler = { booking_rules: "no paid seats" };
+  const taskState = reduceTaskState({
+    observation,
+    userPolicy: { skipPaidExtrasApproved: true },
+    traveler
+  });
+  const candidateSet = buildCurrentCandidateSet({
+    goal: taskState.currentGoal,
+    observation,
+    traveler,
+    state: { taskState, approvals: { skipPaidExtrasApproved: true } }
+  });
+  const travelerControl = observation.page.controls.find((control) => /ali sifrar.*not selected/i.test(control.label || ""));
+  const nextControl = observation.page.controls.find((control) => /^next$/i.test(control.label || ""));
+
+  expect(travelerControl).toBeTruthy();
+  expect(nextControl).toBeTruthy();
+  expect(taskState.currentGoal.freeAlternativeControlIds || []).not.toContain(travelerControl.controlId);
+  expect(candidateSet.contextCapabilities.some((capability) => capability.controlId === travelerControl.controlId)).toBe(true);
+  expect(candidateSet.candidates.map((candidate) => candidate.controlId)).toEqual([nextControl.controlId]);
+
+  const action = actionForCurrentCandidate(taskState.currentGoal, candidateSet.candidates[0], observation);
+  const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_seat_leg_2");
+  expect(executed.validation.ok).toBe(true);
+  expect(executed.result.dispatched).toBe(true);
+  expect(await page.locator("body").getAttribute("data-seat-leg")).toBe("2");
 });
 
 test("P0.9 producer replay keeps safe/paid siblings distinct and rejects tiny helpers", async ({ page }) => {
@@ -2051,11 +2130,28 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
 
   const prepare = (observation) => {
     const requirements = loopPrivate.requirementsWithDecisionGroups([], observation);
-    const goal = deriveObservationGoal(observation, requirements);
-    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation);
+    const taskState = reduceTaskState({
+      previousTaskState: state.taskState || {},
+      observation,
+      previousActionResult: observation.lastActionResult || null,
+      userPolicy: state.approvals,
+      traveler
+    });
+    const goal = taskState.currentGoal;
+    const scopedState = { ...state, taskState };
+    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+      state: scopedState,
+      traveler,
+      approvals: state.approvals
+    });
     const candidates = candidateSet.candidates;
+    const authoritativeTaskState = {
+      ...taskState,
+      currentGoal: { ...goal, candidateSet, candidates }
+    };
     state = {
-      ...state,
+      ...scopedState,
+      taskState: authoritativeTaskState,
       currentObservation: {
         observationId: observation.observationId,
         observationHash: observation.observationSnapshot.snapshotHash
@@ -2128,19 +2224,23 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   expect(JSON.stringify(semanticHistory)).not.toContain(obsoleteModalCandidate.targetId);
 
   const flexiblePrepared = prepare(observation);
+  const flexibleGroup = observation.page.decisionGroups.find(
+    (group) => group.sectionType === "flexible_ticket"
+  );
+  expect(flexibleGroup).toBeTruthy();
+  expect(flexiblePrepared.goal).toMatchObject({
+    decisionGroupId: flexibleGroup.decisionGroupId,
+    requirementId: flexibleGroup.requirementId,
+    desiredPolicyOutcome: "selected_free_option"
+  });
+  expect(flexiblePrepared.goal.eligibleAlternativeControlIds).toEqual(
+    flexibleGroup.alternativeControlIds
+  );
   expect(
-    flexiblePrepared.goal.semanticGoal,
-    JSON.stringify({
-      groups: observation.page.decisionGroups,
-      controls: observation.page.controls?.map((control) => ({
-        controlId: control.controlId,
-        label: control.label,
-        role: control.role,
-        sectionType: control.sectionType,
-        operations: control.operations
-      }))
-    })
-  ).toBe("decline flexible ticket");
+    flexiblePrepared.candidates.every(
+      (candidate) => candidate.decisionGroupId === flexibleGroup.decisionGroupId
+    )
+  ).toBe(true);
   expect(flexiblePrepared.candidates.some((candidate) => candidate.candidateId === obsoleteModalCandidate.candidateId)).toBe(false);
   expect(flexiblePrepared.candidates.some((candidate) => candidate.controlId === obsoleteModalCandidate.controlId)).toBe(false);
   const staleProposal = loopPrivate.bindTargetSnapshot({
@@ -2165,7 +2265,17 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   const currentOpenCandidate = flexiblePrepared.candidates.find((candidate) => (
     candidate.operation === "open" && /flexible ticket/i.test(candidate.targetLabel)
   ));
-  expect(currentOpenCandidate).toBeTruthy();
+  expect(currentOpenCandidate, JSON.stringify(flexiblePrepared.candidateSet.contextCapabilities.map((item) => ({
+    label: item.targetLabel,
+    operation: item.operation,
+    controlId: item.controlId,
+    physicalEffect: item.physicalEffect,
+    goalRelevant: item.goalRelevant,
+    selectable: item.selectable,
+    exclusionReason: item.exclusionReason,
+    risk: item.risk,
+    policy: item.policyDecision
+  })), null, 2)).toBeTruthy();
   const flexibleWordingSelection = resolvePlannerSelection({
     candidateId: currentOpenCandidate.candidateId
   }, flexiblePrepared.candidateSet);
@@ -2472,10 +2582,27 @@ test("final safe checkout replay advances completed traveler through both seat l
 
   const execute = async (observation, matcher, nextObservationId) => {
     const requirements = loopPrivate.requirementsWithDecisionGroups([], observation);
-    const goal = deriveObservationGoal(observation, requirements);
-    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation);
+    const taskState = reduceTaskState({
+      previousTaskState: state.taskState || {},
+      observation,
+      previousActionResult: observation.lastActionResult || null,
+      userPolicy: state.approvals,
+      traveler
+    });
+    const goal = taskState.currentGoal;
+    const scopedState = { ...state, taskState };
+    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+      state: scopedState,
+      traveler,
+      approvals: state.approvals
+    });
+    const authoritativeTaskState = {
+      ...taskState,
+      currentGoal: { ...goal, candidateSet, candidates: candidateSet.candidates }
+    };
     state = {
-      ...state,
+      ...scopedState,
+      taskState: authoritativeTaskState,
       currentGoal: { ...goal, label: goal.semanticGoal, candidateSet, candidates: candidateSet.candidates },
       currentObservation: { observationId: observation.observationId, observationHash: observation.observationSnapshot.snapshotHash },
       requirements,
@@ -2535,9 +2662,34 @@ test("final safe checkout replay advances completed traveler through both seat l
   expect(observation.page.currentSurface.memberControlIds).toContain(freeControl.controlId);
 
   const rejectionRequirements = loopPrivate.requirementsWithDecisionGroups([], observation);
-  const rejectionGoal = deriveObservationGoal(observation, rejectionRequirements);
-  const rejectionSet = loopPrivate.groundedObservationCandidateSet(rejectionGoal, observation);
+  const rejectionTaskState = reduceTaskState({
+    previousTaskState: state.taskState || {},
+    observation,
+    previousActionResult: observation.lastActionResult || null,
+    userPolicy: state.approvals,
+    traveler
+  });
+  const rejectionGoal = rejectionTaskState.currentGoal;
+  const rejectionSet = loopPrivate.groundedObservationCandidateSet(rejectionGoal, observation, [], {
+    state: { ...state, taskState: rejectionTaskState },
+    traveler,
+    approvals: state.approvals
+  });
   const currentFreeCandidate = rejectionSet.candidates.find((candidate) => /no thanks/i.test(candidate.targetLabel));
+  expect(currentFreeCandidate, JSON.stringify({
+    taskState: rejectionTaskState,
+    context: rejectionSet.contextCapabilities.map((candidate) => ({
+      label: candidate.targetLabel,
+      controlId: candidate.controlId,
+      decisionGroupId: candidate.decisionGroupId,
+      physicalEffect: candidate.physicalEffect,
+      goalRelevant: candidate.goalRelevant,
+      selectable: candidate.selectable,
+      exclusionReason: candidate.exclusionReason,
+      risk: candidate.risk,
+      policy: candidate.policyDecision
+    }))
+  }, null, 2)).toBeTruthy();
   expect(currentFreeCandidate.surfaceId).toBe(observation.page.currentSurface.id);
   const currentFreeAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(rejectionGoal, currentFreeCandidate, observation), observation);
   expect(currentFreeAction.targetSnapshot.surfaceId).toBe(observation.page.currentSurface.id);
@@ -2588,6 +2740,252 @@ test("final safe checkout replay advances completed traveler through both seat l
   expect(actions.every((entry) => entry.risk === "safe")).toBe(true);
 });
 
+test("checkpoint checkout reaches payment through review without paid, close, card, or purchase actions", async ({ page }) => {
+  await page.goto("http://127.0.0.1:4273/checkout/traveler");
+  await loadHtmlProducer(page, `
+    <style>
+      [hidden] { display: none !important; }
+      section, [role="dialog"] { margin: 12px; padding: 12px; border: 1px solid #aaa; }
+      #seats, #review { position: fixed; inset: 50px 100px auto; background: white; z-index: 20; }
+    </style>
+    <main>
+      <h1 id="stage-title">Traveller information</h1>
+      <p id="total-price">Total 208 EUR</p>
+      <section id="traveler">
+        <label>Email <input id="email" type="email" required value="ali@example.test"></label>
+        <label>Confirm email <input id="confirm-email" type="email" required value="ali@example.test"></label>
+        <label>Country code <input id="country" type="tel" required value="+386"></label>
+        <label>Phone <input id="phone" type="tel" required value="70328922"></label>
+        <label>First name <input id="first-name" required value="Ali"></label>
+        <label>Last name <input id="last-name" required value="Sifrar"></label>
+        <button id="traveler-continue" type="button">Continue</button>
+      </section>
+      <section id="extras" aria-label="Optional protection" hidden>
+        <h2>Optional protection</h2>
+        <label><input id="extra-paid" type="radio" name="protection"> Add protection — 25 EUR</label>
+        <label><input id="extra-free" type="radio" name="protection" required> No protection</label>
+        <button id="extras-continue" type="button">Continue</button>
+      </section>
+      <section id="payment-summary" hidden>
+        <h2>Payment review</h2>
+        <p>Review the payment method, order amount, passenger details, and total to pay before entering any payment information.</p>
+        <button type="button">Visa payment method</button>
+        <button type="button">Mastercard payment method</button>
+        <button type="button">Price details</button>
+        <button type="button">Billing information</button>
+      </section>
+    </main>
+    <section id="seats" role="dialog" aria-modal="true" aria-label="Reserve seating" hidden>
+      <h2>Reserve seating</h2>
+      <p>Flight 1 of 1</p>
+      <button id="seat-paid-a" type="button">Seat 1A — 18 EUR</button>
+      <button id="seat-paid-b" type="button">Seat 1B — 18 EUR</button>
+      <label><input id="seat-free" type="radio" name="seat" required> No thanks</label>
+      <button id="seat-next" type="button">Next</button>
+    </section>
+    <section id="review" role="dialog" aria-modal="true" aria-label="Review your booking" hidden>
+      <h2>Review your booking</h2>
+      <p>Check traveller and flight details before payment.</p>
+      <button id="review-close" type="button" data-testid="dialog-close" aria-label="Close">×</button>
+      <form id="review-form" action="/checkout/payment" method="post">
+        <button id="review-submit" type="submit" data-testid="info-review-submit-button">Continue to Payment</button>
+      </form>
+    </section>
+    <section id="payment" hidden>
+      <h1>Payment</h1>
+      <h2>Payment method</h2>
+      <p>Order amount: 208 EUR</p>
+      <label>Card number <input id="card-number" name="cardNumber" autocomplete="cc-number"></label>
+      <label>Expiry <input id="card-expiry" autocomplete="cc-exp"></label>
+      <label>CVC <input id="card-cvc" autocomplete="cc-csc"></label>
+      <button id="purchase" type="button">Pay now</button>
+    </section>
+    <script>
+      (() => {
+        const counters = window.__checkpointCounters = {
+          paidExtraSelections: 0,
+          paidSeatSelections: 0,
+          reviewCloseClicks: 0,
+          cardFieldInputs: 0,
+          purchaseClicks: 0
+        };
+        const traveler = document.getElementById("traveler");
+        const extras = document.getElementById("extras");
+        const seats = document.getElementById("seats");
+        const review = document.getElementById("review");
+        const payment = document.getElementById("payment");
+        document.getElementById("traveler-continue").addEventListener("click", () => {
+          traveler.hidden = true;
+          extras.hidden = false;
+          document.getElementById("stage-title").textContent = "Optional extras";
+        });
+        document.getElementById("extra-paid").addEventListener("click", () => { counters.paidExtraSelections += 1; });
+        document.getElementById("extras-continue").addEventListener("click", () => {
+          if (!document.getElementById("extra-free").checked) return;
+          extras.hidden = true;
+          seats.hidden = false;
+          document.getElementById("stage-title").textContent = "Seat selection";
+        });
+        for (const id of ["seat-paid-a", "seat-paid-b"]) {
+          document.getElementById(id).addEventListener("click", () => { counters.paidSeatSelections += 1; });
+        }
+        document.getElementById("seat-next").addEventListener("click", () => {
+          if (!document.getElementById("seat-free").checked) return;
+          seats.hidden = true;
+          review.hidden = false;
+          document.getElementById("stage-title").textContent = "Review";
+        });
+        document.getElementById("review-close").addEventListener("click", () => {
+          counters.reviewCloseClicks += 1;
+          review.hidden = true;
+        });
+        const showPayment = (event) => {
+          event.preventDefault();
+          review.hidden = true;
+          payment.hidden = false;
+          document.getElementById("payment-summary").hidden = false;
+          document.getElementById("stage-title").textContent = "Payment";
+          document.body.dataset.stage = "payment-review";
+          history.pushState({}, "", "/checkout/payment");
+        };
+        document.getElementById("review-form").addEventListener("submit", showPayment);
+        for (const id of ["card-number", "card-expiry", "card-cvc"]) {
+          document.getElementById(id).addEventListener("input", () => { counters.cardFieldInputs += 1; });
+        }
+        document.getElementById("purchase").addEventListener("click", () => { counters.purchaseClicks += 1; });
+      })();
+    </script>
+  `);
+
+  const store = inMemoryGovernorStore();
+  const traveler = {
+    id: "trav_checkpoint_success",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    booking_rules: "no paid extras and no paid seats"
+  };
+  let state = createCheckoutSessionState({
+    goal: "Reach payment review without paid extras",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: page.url() }
+  });
+  state.id = "txn_checkpoint_success";
+  state.approvals.skipPaidExtrasApproved = true;
+  const actionLabels = [];
+
+  const execute = async (observation, matcher, nextObservationId) => {
+    const taskState = reduceTaskState({
+      previousTaskState: state.taskState || {},
+      observation,
+      previousActionResult: observation.lastActionResult || null,
+      userPolicy: state.approvals,
+      traveler
+    });
+    const goal = taskState.currentGoal;
+    expect(goal).toBeTruthy();
+    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+      state: { ...state, taskState }, traveler, approvals: state.approvals
+    });
+    const authoritativeGoal = { ...goal, candidateSet, candidates: candidateSet.candidates };
+    state = {
+      ...state,
+      taskState: { ...taskState, currentGoal: authoritativeGoal },
+      currentGoal: authoritativeGoal,
+      currentObservation: {
+        observationId: observation.observationId,
+        observationHash: observation.observationSnapshot.snapshotHash
+      }
+    };
+    const candidate = candidateSet.candidates.find(matcher);
+    expect(candidate, JSON.stringify(candidateSet.contextCapabilities.map((item) => ({
+      label: item.targetLabel,
+      selectable: item.selectable,
+      risk: item.risk,
+      policy: item.policyDecision
+    })), null, 2)).toBeTruthy();
+    expect(candidate.risk).toBe("safe");
+    const action = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(authoritativeGoal, candidate, observation), observation);
+    store.remember(state.id, observation);
+    const governed = governAction({ action, state, observation, traveler, store, turnId: nextObservationId });
+    expect(governed.allow, `${governed.code}: ${governed.reason}`).toBe(true);
+    state = { ...(governed.state || state), lastAction: action };
+    const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), nextObservationId);
+    expect(executed.validation.ok, executed.validation.code).toBe(true);
+    expect(executed.result.dispatched).toBe(true);
+    actionLabels.push(candidate.targetLabel);
+    return executed.observation;
+  };
+
+  let observation = await browserObservation(page, "obs_checkpoint_traveler");
+  observation = await execute(observation, (candidate) => /continue/i.test(candidate.targetLabel), "obs_checkpoint_extras");
+  observation = await execute(observation, (candidate) => /no protection/i.test(candidate.targetLabel), "obs_checkpoint_extra_declined");
+  observation = await execute(observation, (candidate) => /continue/i.test(candidate.targetLabel), "obs_checkpoint_seats");
+  observation = await execute(observation, (candidate) => /no thanks/i.test(candidate.targetLabel), "obs_checkpoint_seat_declined");
+  observation = await execute(observation, (candidate) => /^next$/i.test(candidate.targetLabel), "obs_checkpoint_review");
+  const reviewObservation = observation;
+  observation = await execute(observation, (candidate) => /continue to payment/i.test(candidate.targetLabel), "obs_checkpoint_payment");
+
+  const paymentTaskState = reduceTaskState({
+    previousTaskState: state.taskState || {},
+    observation,
+    previousActionResult: observation.lastActionResult,
+    userPolicy: state.approvals,
+    traveler
+  });
+  expect(paymentTaskState.paymentEvidence.observed, JSON.stringify({
+    stage: paymentTaskState.stage,
+    paymentEvidence: paymentTaskState.paymentEvidence,
+    stageDecisionEvidence: paymentTaskState.stageDecisionEvidence,
+    url: observation.page.url,
+    controls: observation.page.controls.map((control) => ({ label: control.label, semantic: control.semantic, field: control.field }))
+  }, null, 2)).toBe(true);
+  expect(paymentTaskState.terminalStatus).toBe("payment_review_reached");
+  expect(paymentTaskState.currentGoal).toBeNull();
+
+  const paymentActionResult = observation.lastActionResult;
+  await page.waitForTimeout(350);
+  const readyPaymentObservation = await browserObservation(page, "obs_checkpoint_payment_ready");
+  readyPaymentObservation.lastActionResult = paymentActionResult;
+  readyPaymentObservation.previousObservation = reviewObservation;
+  const stopped = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation: readyPaymentObservation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_checkpoint_stop"
+  });
+  expect(stopped.clientDecision.action, JSON.stringify({
+    clientDecision: stopped.clientDecision,
+    status: stopped.state.status,
+    readiness: stopped.state.observationReadiness,
+    transition: stopped.debug.transition,
+    debug: stopped.debug
+  }, null, 2)).toBe("final_review");
+  expect(stopped.state.status).toBe("ready_for_payment");
+  expect(stopped.debug.candidateGenerationSuppressed).toBe(true);
+
+  const counters = await page.evaluate(() => window.__checkpointCounters);
+  expect(counters).toEqual({
+    paidExtraSelections: 0,
+    paidSeatSelections: 0,
+    reviewCloseClicks: 0,
+    cardFieldInputs: 0,
+    purchaseClicks: 0
+  });
+  expect(actionLabels).toHaveLength(6);
+  expect(actionLabels[0]).toMatch(/continue/i);
+  expect(actionLabels[1]).toMatch(/no protection/i);
+  expect(actionLabels[2]).toMatch(/continue/i);
+  expect(actionLabels[3]).toMatch(/no thanks/i);
+  expect(actionLabels[4]).toMatch(/^next$/i);
+  expect(actionLabels[5]).toMatch(/continue to payment/i);
+});
+
 test("authoritative actionability excludes an occluded ghost and completes popup-to-summary navigation", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>
@@ -2632,13 +3030,24 @@ test("authoritative actionability excludes an occluded ghost and completes popup
 
   const executeCurrent = async (before, label, nextObservationId) => {
     const requirements = loopPrivate.requirementsWithDecisionGroups([], before);
-    const goal = deriveObservationGoal(before, requirements);
-    const scopedState = { ...state, requirements, activeRequirements: requirements };
+    const taskState = reduceTaskState({
+      previousTaskState: state.taskState || {},
+      observation: before,
+      previousActionResult: before.lastActionResult || null,
+      userPolicy: state.approvals,
+      traveler
+    });
+    const goal = taskState.currentGoal;
+    const scopedState = { ...state, taskState, requirements, activeRequirements: requirements };
     const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, before, [], { state: scopedState, traveler, approvals: state.approvals });
     const candidate = candidateSet.candidates.find((item) => item.targetLabel === label);
     expect(candidate, JSON.stringify(candidateSet)).toBeTruthy();
     state = {
-      ...state,
+      ...scopedState,
+      taskState: {
+        ...taskState,
+        currentGoal: { ...goal, candidateSet, candidates: candidateSet.candidates }
+      },
       currentGoal: { ...goal, candidateSet, candidates: candidateSet.candidates },
       currentObservation: { observationId: before.observationId, observationHash: before.observationSnapshot.snapshotHash },
       requirements,
@@ -2661,8 +3070,13 @@ test("authoritative actionability excludes an occluded ghost and completes popup
   expect(ghost).toBeTruthy();
   expect(ghost.operations.activate.actionability.code).toBe("ACTUATOR_OCCLUDED");
   expect(real).toBeTruthy();
-  const initialGoal = deriveObservationGoal(observation, []);
-  const initialCandidates = loopPrivate.groundedObservationCandidateSet(initialGoal, observation).candidates;
+  const initialTaskState = reduceTaskState({ observation, userPolicy: state.approvals, traveler });
+  const initialGoal = initialTaskState.currentGoal;
+  const initialCandidates = loopPrivate.groundedObservationCandidateSet(initialGoal, observation, [], {
+    state: { ...state, taskState: initialTaskState },
+    traveler,
+    approvals: state.approvals
+  }).candidates;
   expect(initialCandidates.some((candidate) => candidate.controlId === ghost.controlId)).toBe(false);
   expect(initialCandidates.filter((candidate) => candidate.targetLabel === "Next")).toHaveLength(1);
 
@@ -2684,6 +3098,10 @@ test("authoritative actionability excludes an occluded ghost and completes popup
   observation = await executeCurrent(observation, "Next", "obs_actionability_popup");
   expect(observation.page.currentSurface.type).toBe("modal");
   expect(observation.page.currentSurface.label).toMatch(/continue without seats/i);
+  expect(observation.page.currentSurface.surfaceClass).toBe("warning");
+  expect(observation.page.controls.find((control) => control.label === "Continue")).toMatchObject({
+    physicalEffect: "dismiss_surface"
+  });
   observation = await executeCurrent(observation, "Continue", "obs_actionability_summary");
   expect(await page.locator("#stage").textContent()).toBe("Summary");
   await executeCurrent(observation, "Next", "obs_actionability_payment");
@@ -2699,14 +3117,24 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
   `);
 
   const before = await browserObservation(page, "obs_memory_before");
-  const goal = deriveObservationGoal(before, []);
-  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, before);
+  const taskState = reduceTaskState({ observation: before });
+  const goal = taskState.currentGoal;
+  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, before, [], {
+    state: { taskState }
+  });
   const dead = firstSet.candidates.find((candidate) => candidate.targetLabel === "Next");
   expect(dead).toBeTruthy();
   const deadAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(goal, dead, before), before);
   const deadExecution = await executeAtomicBrowserDecision(page, toClientDecision(deadAction), "obs_memory_no_effect");
   expect(deadExecution.result.dispatched).toBe(true);
-  const failed = loopPrivate.applyTransitionStatus({ currentGoal: goal, lastAction: deadAction, attemptedStrategySignatures: [], failedStrategyMemory: [], recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] } }, deadExecution.observation, before);
+  const failed = loopPrivate.applyTransitionStatus({
+    taskState: { ...taskState, currentGoal: goal },
+    currentGoal: goal,
+    lastAction: deadAction,
+    attemptedStrategySignatures: [],
+    failedStrategyMemory: [],
+    recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] }
+  }, deadExecution.observation, before);
   expect(failed.transition.status).toBe("no_effect");
   expect(failed.state.recoveryState.attempts).toBe(1);
   expect(failed.state.failedStrategyMemory).toHaveLength(1);
@@ -2716,17 +3144,197 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     old.replaceWith(old.cloneNode(true));
   });
   const rerendered = await browserObservation(page, "obs_memory_rerendered");
-  const rerenderedGoal = deriveObservationGoal(rerendered, []);
+  const rerenderedTaskState = reduceTaskState({
+    previousTaskState: taskState,
+    observation: rerendered,
+    previousActionResult: rerendered.lastActionResult || null
+  });
+  const rerenderedGoal = rerenderedTaskState.currentGoal;
   const failedSignatures = loopPrivate.failedStrategySignaturesForGoal(failed.state, rerenderedGoal);
-  const retrySet = loopPrivate.groundedObservationCandidateSet(rerenderedGoal, rerendered, failedSignatures);
+  const retrySet = loopPrivate.groundedObservationCandidateSet(rerenderedGoal, rerendered, failedSignatures, {
+    state: { taskState: rerenderedTaskState }
+  });
   expect(retrySet.candidates.some((candidate) => candidate.targetLabel === "Next")).toBe(false);
   const next = retrySet.candidates.find((candidate) => candidate.targetLabel === "Continue");
   expect(next).toBeTruthy();
 
   const nextAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(rerenderedGoal, next, rerendered), rerendered);
   const nextExecution = await executeAtomicBrowserDecision(page, toClientDecision(nextAction), "obs_memory_progress");
-  const progressed = loopPrivate.applyTransitionStatus({ ...failed.state, currentGoal: rerenderedGoal, lastAction: nextAction }, nextExecution.observation, rerendered);
-  expect(progressed.transition.status).toBe("blocked");
+  const progressed = loopPrivate.applyTransitionStatus({
+    ...failed.state,
+    taskState: { ...rerenderedTaskState, currentGoal: rerenderedGoal },
+    currentGoal: rerenderedGoal,
+    lastAction: nextAction
+  }, nextExecution.observation, rerendered);
+  expect(progressed.transition.status).toBe("progressed");
   expect(progressed.state.recoveryState.attempts).toBe(0);
   expect(progressed.state.failedStrategyMemory).toHaveLength(1);
+});
+
+test("live-shaped review modal keeps grounded safe controls selectable and submit reaches payment", async ({ page }) => {
+  await page.goto("http://127.0.0.1:4273/checkout/traveler");
+  await loadHtmlProducer(page, `
+    <main>
+      <h1 id="stage-title">Traveller information</h1>
+      <button id="base-continue" type="button">Continue</button>
+    </main>
+    <div id="review" role="dialog" aria-modal="true" aria-label="Review your booking" hidden>
+      <h2>Review your booking</h2>
+      <p>Please check the traveller and flight details before payment.</p>
+      <button id="review-close" type="button" data-testid="dialog-close" aria-label="Continue to Payment">
+        <span aria-hidden="true">×</span>
+      </button>
+      <button id="review-edit" type="button" data-testid="edit-traveller">Edit</button>
+      <form id="review-form" action="/checkout/payment" method="post">
+        <button id="review-submit" type="submit" data-testid="info-review-submit-button">Continue to Payment</button>
+      </form>
+    </div>
+    <section id="payment" hidden>
+      <h1>Payment</h1>
+      <label>Card number <input name="cardNumber" autocomplete="cc-number"></label>
+      <button type="button" data-testid="card-number" aria-label="Card number" autocomplete="cc-number">Card number</button>
+      <h2>Payment method</h2><p>Order amount: 430 EUR</p>
+    </section>
+    <script>
+      const review = document.getElementById("review");
+      document.getElementById("base-continue").addEventListener("click", () => { review.hidden = false; });
+      document.getElementById("review-close").addEventListener("click", () => { review.hidden = true; });
+      const showPayment = (event) => {
+        event.preventDefault();
+        review.hidden = true;
+        document.querySelector("main").hidden = true;
+        document.getElementById("payment").hidden = false;
+        document.body.dataset.stage = "payment-review";
+        history.pushState({}, "", "/checkout/payment");
+      };
+      document.getElementById("review-form").addEventListener("submit", showPayment);
+      document.getElementById("review-submit").addEventListener("click", showPayment);
+    </script>
+  `);
+
+  const baseObservation = await browserObservation(page, "obs_live_review_base");
+  const baseTaskState = reduceTaskState({ observation: baseObservation });
+  await page.locator("#base-continue").click();
+  const reviewObservation = await browserObservation(page, "obs_live_review_modal");
+  const reviewTaskState = reduceTaskState({
+    previousTaskState: baseTaskState,
+    observation: reviewObservation
+  });
+
+  const close = reviewObservation.page.controls.find((control) => control.testId === "dialog-close");
+  const edit = reviewObservation.page.controls.find((control) => control.testId === "edit-traveller");
+  const submit = reviewObservation.page.controls.find((control) => control.testId === "info-review-submit-button");
+  expect(reviewObservation.page.currentSurface.surfaceClass).toBe("review_confirmation");
+  expect(close).toMatchObject({ physicalEffect: "dismiss_surface", semantic: "dismiss_surface" });
+  expect(edit).toMatchObject({ physicalEffect: "open_surface", semantic: "open_surface" });
+  expect(submit).toMatchObject({ physicalEffect: "advance_checkout_stage" });
+  expect(reviewObservation.page.decisionGroups.some((group) => group.surfaceId === reviewObservation.page.currentSurface.id)).toBe(false);
+  expect(reviewTaskState.stageOutcome.outcomeId).toBe(baseTaskState.stageOutcome.outcomeId);
+  expect(reviewTaskState.stageOutcome.status).toBe("active");
+  expect(reviewTaskState.surfaceSubgoal.parentOutcomeId).toBe(reviewTaskState.stageOutcome.outcomeId);
+
+  const candidateSet = buildCurrentCandidateSet({
+    goal: reviewTaskState.currentGoal,
+    observation: reviewObservation,
+    state: { taskState: reviewTaskState, approvals: {} }
+  });
+  expect(new Set(candidateSet.candidates.map((candidate) => candidate.controlId))).toEqual(new Set([close.controlId, submit.controlId]));
+  expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === close.controlId)).toMatchObject({
+    selectable: true,
+    mechanicalEffect: "dismiss_surface",
+    semanticIntent: "close_review",
+    outcomeCompatibility: "context_only"
+  });
+  expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === edit.controlId).selectable).toBe(false);
+  const submitCandidate = candidateSet.candidates.find((candidate) => candidate.controlId === submit.controlId);
+  expect(submitCandidate).toMatchObject({
+    mechanicalEffect: "advance_checkout_stage",
+    semanticIntent: "continue_to_payment",
+    outcomeCompatibility: "compatible"
+  });
+
+  const action = actionForCurrentCandidate(reviewTaskState.currentGoal, submitCandidate, reviewObservation);
+  const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_live_review_payment");
+  expect(executed.result.dispatched).toBe(true);
+  const paymentTaskState = reduceTaskState({
+    previousTaskState: reviewTaskState,
+    observation: executed.observation,
+    previousActionResult: executed.result
+  });
+  expect(paymentTaskState.stageOutcome.outcomeId).toBe(reviewTaskState.stageOutcome.outcomeId);
+  expect(paymentTaskState.stageOutcome.status, JSON.stringify({
+    stage: paymentTaskState.stage,
+    evidence: paymentTaskState.stageDecisionEvidence,
+    controls: executed.observation.page.controls,
+    fields: executed.observation.page.fields,
+    sections: executed.observation.page.sections,
+    surface: executed.observation.page.currentSurface
+  }, null, 2)).toBe("completed");
+  expect(paymentTaskState.terminalStatus).toBe("payment_review_reached");
+});
+
+test("paid-only seat map treats Next as navigation instead of inventing a free-seat obligation", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <div role="dialog" aria-modal="true" aria-label="Reserve seating">
+      <h1>Reserve seating</h1>
+      <p>Flight 1 of 2</p>
+      <div role="group" aria-label="Available seats">
+        <button type="button" data-testid="seat-5a" data-price="29" aria-label="Seat 5A, 29 EUR">5A</button>
+        <button type="button" data-testid="seat-5b" data-price="29" aria-label="Seat 5B, 29 EUR">5B</button>
+      </div>
+      <button id="seat-next" type="button" data-testid="seat-next">Next</button>
+    </div>
+  `);
+
+  const observation = await browserObservation(page, "obs_paid_only_seats");
+  const taskState = reduceTaskState({
+    observation,
+    userPolicy: { bookingRules: "No paid seats", skipPaidExtrasApproved: true },
+    traveler: { booking_rules: "No paid seats" }
+  });
+  const candidateSet = buildCurrentCandidateSet({
+    goal: taskState.currentGoal,
+    observation,
+    traveler: { booking_rules: "No paid seats" },
+    state: { taskState, approvals: { skipPaidExtrasApproved: true } }
+  });
+
+  expect(taskState.activeDecisions).toHaveLength(0);
+  expect(taskState.currentGoal.semanticType).toBe("navigation");
+  expect(candidateSet.candidates).toHaveLength(1);
+  expect(candidateSet.candidates[0].targetLabel).toBe("Next");
+  expect(candidateSet.contextCapabilities.filter((candidate) => /seat 5/i.test(candidate.targetLabel || "")).every((candidate) => !candidate.selectable)).toBe(true);
+});
+
+test("post-navigation page shell is transient until traveler controls hydrate", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main id="traveler-shell" aria-busy="true">
+      <h1>Traveller information</h1>
+      <nav><button type="button">English</button><button type="button">Support</button></nav>
+      <div id="traveler-content"></div>
+    </main>
+  `);
+  const shell = await browserObservation(page, "obs_hydration_shell");
+  shell.lastActionResult = {
+    feedback: { navigationOccurred: true, pageChanged: true },
+    action: { semanticIntent: "advance_checkout_stage", mechanicalEffect: "advance_checkout_stage" }
+  };
+  const transient = classifyObservationReadiness({ observation: shell });
+  expect(shell.page.readiness.ariaBusy).toBe(true);
+  expect(transient.classification).toBe(READINESS.TRANSIENT);
+
+  await page.evaluate(() => {
+    const main = document.getElementById("traveler-shell");
+    main.setAttribute("aria-busy", "false");
+    document.getElementById("traveler-content").innerHTML = `
+      <label>Email <input name="email" type="email" required></label>
+      <label>First name <input name="firstName" required></label>
+      <label>Last name <input name="lastName" required></label>
+      <button type="button">Continue</button>
+    `;
+  });
+  const hydrated = await browserObservation(page, "obs_hydration_ready");
+  const ready = classifyObservationReadiness({ observation: hydrated, previousReadiness: transient });
+  expect(hydrated.page.summary.fields).toBeGreaterThan(0);
+  expect(ready.classification).toBe(READINESS.READY);
 });

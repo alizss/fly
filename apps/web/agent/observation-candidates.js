@@ -129,8 +129,23 @@ function intentFor(control = {}, operation = "", goal = {}) {
 
 function controlsForGoal(page = {}, goal = {}) {
   const controls = page.controls || [];
+  if (goal.semanticType === "surface_ambiguity" || goal.selectionMode === "ai_ambiguity") {
+    return controls;
+  }
+  const exactEligibleIds = new Set((goal.eligibleAlternativeControlIds || []).filter(Boolean));
+  if (goal.decisionGroupId && exactEligibleIds.size) {
+    return controls.filter((control) => exactEligibleIds.has(control.controlId));
+  }
   const group = (page.decisionGroups || []).find((item) => item.decisionGroupId === goal.decisionGroupId) || null;
   if (!group) {
+    const directlyOwned = goal.decisionGroupId
+      ? controls.filter((control) => control.decisionGroupId === goal.decisionGroupId)
+      : [];
+    if (directlyOwned.length) return directlyOwned;
+    const authoritativeNavigationIds = new Set((goal.actionableControlIds || []).filter(Boolean));
+    if (goal.semanticType === "navigation" && authoritativeNavigationIds.size) {
+      return controls.filter((control) => authoritativeNavigationIds.has(control.controlId));
+    }
     const completedDecisionGroupId = String(goal.completedDecisionGroupId || "");
     if (goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [completedDecisionGroupId])) return [];
     return controls.filter((control) => {
@@ -172,6 +187,8 @@ function rawObservationCandidates(observation = {}, goal = {}) {
     && controlBelongsToCurrentSurface(control, page)
   ));
   const raw = [];
+  const freeAlternativeIds = new Set((goal.freeAlternativeControlIds || []).filter(Boolean));
+  const paidAlternativeIds = new Set((goal.paidAlternativeControlIds || []).filter(Boolean));
 
   for (const control of controls) {
     const operations = Object.entries(control.operations || {}).filter(([, capability]) => (
@@ -186,12 +203,32 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       const actionType = operationActionType(operation);
       const targetId = capability.actuatorId || capability.actuatorIds?.[0] || control.preferredActivationElementId || control.stateElementId;
       if (!targetId) continue;
-      const risk = normalizedRisk(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`, operation, control.structuredPrice);
-      const semantics = deriveActionSemantics({ control, operation, type: actionType, goal });
+      const interpretedFree = freeAlternativeIds.has(control.controlId)
+        && goal.desiredPolicyOutcome === "selected_free_option";
+      const interpretedPaid = paidAlternativeIds.has(control.controlId);
+      const risk = interpretedFree
+        ? "safe"
+        : interpretedPaid
+          ? "money"
+          : normalizedRisk(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`, operation, control.structuredPrice);
+      const rawChoiceLike = /choice|option|radio|checkbox/.test(
+        `${control.kind || ""} ${control.role || ""} ${control.semantic || ""}`.toLowerCase()
+      );
+      const semantics = (interpretedFree || interpretedPaid) && rawChoiceLike
+        ? { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" }
+        : interpretedFree && foreground && operation === "activate"
+          ? { interactionRole: "command", semanticEffect: "waive", expectedEvidence: "dismissed" }
+          : deriveActionSemantics({ control, operation, type: actionType, goal });
       raw.push({
         candidateId: "",
         semanticGoal: goal.semanticGoal,
-        semantic: control.semantic || operation,
+        semantic: interpretedFree ? "select_free_option" : (control.semantic || operation),
+        physicalEffect: interpretedFree
+          ? "select_free_option"
+          : interpretedPaid
+            ? "select_paid_option"
+            : (control.physicalEffect || ""),
+        policyOutcome: interpretedFree ? "selected_free_option" : (interpretedPaid ? "selected_paid_option" : "selected_policy_allowed_option"),
         stableKey: control.stableKey || `control:${control.controlId}`,
         meaning: control.meaning || control.semantic || control.accessibleName || control.label || operation,
         structuredPrice: control.structuredPrice || null,
@@ -205,7 +242,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         targetId,
         targetLabel: control.label || control.accessibleName || control.semantic || operation,
         requirementId: goal.requirementId || "",
-        intent: intentFor(control, operation, goal),
+        intent: interpretedFree ? "decline_optional_extra" : intentFor(control, operation, goal),
         expectedOutcome: null,
         risk,
         requiresApproval: ["money", "payment", "legal"].includes(risk),
@@ -218,7 +255,9 @@ function rawObservationCandidates(observation = {}, goal = {}) {
     }
   }
 
-  if (!raw.length && !(goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [goal.completedDecisionGroupId]))) {
+  if (!raw.length
+    && goal.semanticType !== "surface_ambiguity"
+    && !(goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [goal.completedDecisionGroupId]))) {
     const paymentReview = goal.semanticType === "payment_review";
     raw.push({
       candidateId: "",

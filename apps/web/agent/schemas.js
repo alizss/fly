@@ -221,9 +221,7 @@ const plannerSchema = {
         "wait",
         "ask_user",
         "final_review",
-        "stop",
-        "fill_known_fields",
-        "fill_visible_profile_fields"
+        "stop"
       ]
     },
     targetId: { type: "string" },
@@ -285,9 +283,19 @@ const verifyAndPlanSchema = {
 const candidateSelectionSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["candidateId"],
+  required: ["candidateId", "semanticOutcome"],
   properties: {
-    candidateId: { type: "string" }
+    candidateId: { type: "string" },
+    semanticOutcome: {
+      type: "string",
+      enum: [
+        "satisfy_current_decision",
+        "advance_current_surface",
+        "dismiss_current_surface",
+        "request_user_input",
+        "stop_for_payment_review"
+      ]
+    }
   }
 };
 
@@ -296,6 +304,7 @@ function candidateSelectionSchemaFor(candidateIds = []) {
   return {
     ...candidateSelectionSchema,
     properties: {
+      ...candidateSelectionSchema.properties,
       candidateId: ids.length
         ? { type: "string", enum: ids }
         : { type: "string" }

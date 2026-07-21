@@ -37,7 +37,7 @@ function summarizeAgentSession(session) {
     id: session.id,
     status: session.status,
     goal: session.goal,
-    currentStage: session.currentStep,
+    currentStage: session.taskState?.stage || session.currentStep,
     travelerName: "",
     approvals: session.approvals,
     completedFields: [],
@@ -48,8 +48,9 @@ function summarizeAgentSession(session) {
     lastPageSummary: {
       site: session.site?.host || "",
       url: session.site?.url || "",
-      requirements: (session.requirements || []).length,
-      missing: (session.requirements || []).filter((req) => req.required && req.status !== "satisfied").length
+      requirements: (session.legacyRequirementsDiagnostic?.requirements || []).length,
+      missing: (session.taskState?.activeDecisions || []).filter((decision) => decision.required === true).length
+        + (session.taskState?.validationBlockers || []).length
     },
     failures: session.failures || [],
     events: []
@@ -495,6 +496,7 @@ function compactSurface(surface = {}) {
     label: clampText(surface.label || "", 1200),
     role: clampText(surface.role || "", 80),
     taskHint: clampText(surface.taskHint || "", 120),
+    surfaceClass: clampText(surface.surfaceClass || "unknown", 40),
     blocksBackground: Boolean(surface.blocksBackground),
     parentSurfaceId: clampText(surface.parentSurfaceId, 80),
     observationId: clampText(surface.observationId, 120),
@@ -524,6 +526,16 @@ function compactControlFields(item = {}) {
     controlId: clampText(item.controlId, 140),
     stableKey: clampText(item.stableKey, 240),
     meaning: clampText(item.meaning, 220),
+    physicalEffect: clampText(item.physicalEffect, 80),
+    testId: clampText(item.testId, 160),
+    formAction: clampText(item.formAction, 300),
+    formMethod: clampText(item.formMethod, 40),
+    formId: clampText(item.formId, 160),
+    ownText: clampText(item.ownText, 220),
+    ariaLabel: clampText(item.ariaLabel, 220),
+    title: clampText(item.title, 220),
+    iconOnly: Boolean(item.iconOnly),
+    semanticConflict: Boolean(item.semanticConflict),
     structuredPrice: item.structuredPrice && Number.isFinite(Number(item.structuredPrice.amount)) ? {
       amount: Number(item.structuredPrice.amount),
       currency: clampText(item.structuredPrice.currency, 12)
@@ -623,10 +635,20 @@ function compactLogicalControl(control = {}) {
     decisionGroupId: clampText(control.decisionGroupId, 140),
     label: clampText(control.label, 220),
     accessibleName: clampText(control.accessibleName, 220),
+    testId: clampText(control.testId, 160),
+    formAction: clampText(control.formAction, 300),
+    formMethod: clampText(control.formMethod, 40),
+    formId: clampText(control.formId, 160),
+    ownText: clampText(control.ownText, 220),
+    ariaLabel: clampText(control.ariaLabel, 220),
+    title: clampText(control.title, 220),
+    iconOnly: Boolean(control.iconOnly),
     kind: clampText(control.kind, 80),
     field: clampText(control.field, 80),
     role: clampText(control.role, 80),
     semantic: clampText(control.semantic, 80),
+    physicalEffect: clampText(control.physicalEffect, 80),
+    semanticConflict: Boolean(control.semanticConflict),
     risk: clampText(control.risk, 80),
     state: control.state || null,
     selected: Boolean(control.selected),
@@ -877,6 +899,14 @@ function compactAgentPayload(body) {
           : []
       } : null,
       coverage: page.coverage || {},
+      readiness: page.readiness && typeof page.readiness === "object" ? {
+        documentReadyState: clampText(page.readiness.documentReadyState, 24),
+        ariaBusy: Boolean(page.readiness.ariaBusy),
+        loadingIndicatorCount: Number(page.readiness.loadingIndicatorCount || 0),
+        mainTextLength: Number(page.readiness.mainTextLength || 0),
+        visibleMainCount: Number(page.readiness.visibleMainCount || 0),
+        stableForMs: Number(page.readiness.stableForMs || 0)
+      } : {},
       visibleText: clampText(page.text || page.fullText, 6000),
       errors: Array.isArray(page.errors) ? page.errors.map((item) => clampText(item, 220)).slice(0, 8) : [],
       validationIssues: Array.isArray(page.validationIssues)
@@ -996,7 +1026,8 @@ async function decideAgentNextActionViaLoop(body) {
       expectedOutcome: clientDecision.expectedOutcome?.type || "",
       risk: clientDecision.risk || "",
       stallCount: nextState.stallCount || 0,
-      requirementsMissing: (nextState.requirements || []).filter((r) => r.required && r.status !== "satisfied").length,
+      requirementsMissing: (nextState.taskState?.activeDecisions || []).filter((decision) => decision.required === true).length
+        + (nextState.taskState?.validationBlockers || []).length,
       missing: (debug?.missing || []).map((item) => item.label).slice(0, 4),
       nav: (debug?.navigation || []).map((item) => `${item.action}:${item.label}:${item.enabled ? "on" : "off"}:${item.risk}`).slice(0, 5),
       riskGates: (debug?.riskGates || []).map((item) => `${item.type}:${item.label}:${item.status}:${item.risk}`).slice(0, 4),

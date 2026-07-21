@@ -299,7 +299,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       at: String(result.at || nowIso()),
       actionSignature: actionSignature(action),
       actuatorSignature: signature,
-      goalKey: semanticGoalKey(action.affordance?.task ? action : (state.currentGoal || action)),
+      goalKey: semanticGoalKey(action.affordance?.task ? action : (state.taskState?.currentGoal || action)),
       actionId: String(result.actionId || action.id || ""),
       observationId: String(result.observationId || ""),
       controlId: String(action.controlId || ""),

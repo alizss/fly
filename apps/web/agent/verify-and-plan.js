@@ -121,7 +121,7 @@ async function verifyAndPlan({ apiKey, model, state, observation, currentRequire
   };
   const candidates = Array.isArray(boundCandidateSet.candidates) ? boundCandidateSet.candidates : [];
   const plannerPayload = {
-    previousRequirements: (state?.requirements || []).map((req) => ({ id: req.id, label: req.label, status: req.status, required: req.required })),
+    previousRequirements: (state?.legacyRequirementsDiagnostic?.requirements || []).map((req) => ({ id: req.id, label: req.label, status: req.status, required: req.required })),
     lastAction: semanticActionContext(state?.lastAction || {}, observation?.lastActionResult || {}),
     currentStep: state?.currentStep || "unknown",
     currentRequirements,

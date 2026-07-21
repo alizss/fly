@@ -279,10 +279,12 @@ test("governor rejects an expired candidate-set envelope before target execution
   const candidate = candidateSet.candidates[0];
   const action = __private.bindTargetSnapshot(actionForObservationCandidate(goal, candidate, observation), observation);
   const failure = governorPrivate.currentGoalCandidateFailure(action, {
-    currentGoal: {
-      ...goal,
-      candidateSet: { ...candidateSet, observationHash: "expired_hash" },
-      candidates: candidateSet.candidates
+    taskState: {
+      currentGoal: {
+        ...goal,
+        candidateSet: { ...candidateSet, observationHash: "expired_hash" },
+        candidates: candidateSet.candidates
+      }
     }
   }, observation, []);
 
@@ -422,7 +424,8 @@ test("the server-owned semantic affordance is unchanged from candidate through a
       semanticType: goal.semanticType,
       desiredValue: goal.desiredValue,
       decisionGroupId: "dg_seat",
-      requirementId: "dg_seat"
+      requirementId: "dg_seat",
+      outcomeContract: candidate.outcomeContract
     },
     capability: "choose",
     actuator: {
@@ -433,6 +436,10 @@ test("the server-owned semantic affordance is unchanged from candidate through a
       source: "canonical_operation"
     },
     effect: "select_free_option",
+    physicalEffect: "select_free_option",
+    mechanicalEffect: "select_free_option",
+    semanticIntent: "select_policy_safe_option",
+    expectedPostconditions: [candidate.expectedOutcome],
     postcondition: candidate.expectedOutcome,
     policy: {
       allow: true,
@@ -823,7 +830,7 @@ test("P0.10 fails closed when a choice requirement has no canonical decision gro
   }, requirement, observation), false);
 });
 
-test("P0.4 Continue blocks missing required decision groups but not unselected paid alternatives in satisfied groups", () => {
+test("Continue policy treats TaskState and legacy requirements as guidance, not click authority", () => {
   const observation = observationWithGroups();
   const requirements = __private.requirementsWithDecisionGroups([], observation);
   const continueAction = {
@@ -833,15 +840,31 @@ test("P0.4 Continue blocks missing required decision groups but not unselected p
     risk: "safe"
   };
 
-  const blocked = evaluateActionPolicy(continueAction, { requirements, priceHistory: [] }, { booking_rules: "no extras no seats" }, {});
-  assert.equal(blocked.allow, false);
-  assert.match(blocked.reason, /Flexible Ticket/);
+  const blocked = evaluateActionPolicy(continueAction, {
+    taskState: {
+      activeDecisions: [{ decisionGroupId: "dg_flexible_ticket", family: "extras", status: "active", required: true }],
+      validationBlockers: []
+    },
+    requirements: [],
+    legacyRequirementsDiagnostic: { diagnosticOnly: true, requirements: [] },
+    priceHistory: []
+  }, { booking_rules: "no extras no seats" }, {});
+  assert.equal(blocked.allow, true);
 
-  const allSatisfied = requirements.map((req) =>
-    req.id === "dg_flexible_ticket" ? { ...req, status: "satisfied", selectedLabel: "None of the passengers" } : req
-  );
-  const allowed = evaluateActionPolicy(continueAction, { requirements: allSatisfied, priceHistory: [] }, { booking_rules: "no extras no seats" }, {});
+  const allowed = evaluateActionPolicy(continueAction, {
+    taskState: { activeDecisions: [], validationBlockers: [] },
+    requirements,
+    legacyRequirementsDiagnostic: { diagnosticOnly: true, requirements },
+    priceHistory: []
+  }, { booking_rules: "no extras no seats" }, {});
   assert.equal(allowed.allow, true);
+
+  const validationBlocked = evaluateActionPolicy(continueAction, {
+    taskState: { activeDecisions: [], validationBlockers: [{ issueId: "current_error", message: "Review this field" }] },
+    requirements: [],
+    priceHistory: []
+  }, { booking_rules: "no extras no seats" }, {});
+  assert.equal(validationBlocked.allow, true);
 });
 
 test("navigation candidates remain unpublished until every required current-surface decision group is exact-resolved", () => {

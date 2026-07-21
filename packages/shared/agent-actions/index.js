@@ -11,6 +11,12 @@
  * @property {"choice"|"command"|"opener"|"navigation"|"field"} [interactionRole]
  * @property {"select"|"waive"|"open"|"advance"|"set_value"} [semanticEffect]
  * @property {"selected"|"dismissed"|"options_appeared"|"progress_changed"|"value_changed"|"target_visible"} [expectedEvidence]
+ * @property {string} [semanticOutcome]
+ * @property {string} [mechanicalEffect]
+ * @property {string} [semanticIntent]
+ * @property {Object[]} [expectedPostconditions]
+ * @property {"compatible"|"context_only"|"unknown"} [outcomeCompatibility]
+ * @property {string} [physicalEffect]
  * @property {string} [goalId]
  * @property {string} [candidateId]
  * @property {string} [skillPlanId]
@@ -124,16 +130,27 @@ function normalizeTargetId(value) {
 
 function normalizeAction(raw = {}) {
   const region = raw.visualRegion && typeof raw.visualRegion === "object" ? raw.visualRegion : null;
+  const mechanicalEffect = String(raw.mechanicalEffect || raw.physicalEffect || raw.affordance?.mechanicalEffect || raw.affordance?.physicalEffect || raw.affordance?.effect || "").slice(0, 80);
+  const semanticIntent = String(raw.semanticIntent || raw.intent || "").slice(0, 160);
+  const expectedPostconditions = Array.isArray(raw.expectedPostconditions)
+    ? raw.expectedPostconditions.filter((item) => item && typeof item === "object").map((item) => ({ ...item })).slice(0, 8)
+    : (raw.expectedOutcome && typeof raw.expectedOutcome === "object" ? [{ ...raw.expectedOutcome }] : []);
   return {
     id: String(raw.id || `act_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
     type: ACTION_TYPES.has(raw.type) ? raw.type : "stop",
     observationId: raw.observationId ? String(raw.observationId).slice(0, 120) : "",
     observationHash: raw.observationHash ? String(raw.observationHash).slice(0, 120) : "",
-    intent: raw.intent ? String(raw.intent).slice(0, 120) : "",
+    intent: String(raw.intent || semanticIntent || "").slice(0, 120),
     operation: raw.operation ? String(raw.operation).slice(0, 40) : "",
     interactionRole: raw.interactionRole ? String(raw.interactionRole).slice(0, 40) : "",
     semanticEffect: raw.semanticEffect ? String(raw.semanticEffect).slice(0, 40) : "",
     expectedEvidence: raw.expectedEvidence ? String(raw.expectedEvidence).slice(0, 40) : "",
+    semanticOutcome: raw.semanticOutcome ? String(raw.semanticOutcome).slice(0, 80) : "",
+    mechanicalEffect,
+    semanticIntent,
+    expectedPostconditions,
+    outcomeCompatibility: ["compatible", "context_only", "unknown"].includes(raw.outcomeCompatibility) ? raw.outcomeCompatibility : "unknown",
+    physicalEffect: mechanicalEffect,
     goalId: raw.goalId ? String(raw.goalId).slice(0, 200) : "",
     candidateId: raw.candidateId ? String(raw.candidateId).slice(0, 240) : "",
     skillPlanId: raw.skillPlanId ? String(raw.skillPlanId).slice(0, 160) : "",

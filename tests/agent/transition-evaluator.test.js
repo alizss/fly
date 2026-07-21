@@ -62,7 +62,7 @@ function result(actionId = "act_1") {
   return { actionId, dispatched: true, executed: true, verified: false };
 }
 
-test("authoritative transition achieves only the exact free selection", () => {
+test("authoritative transition records exact free selection as fresh visible progress", () => {
   const before = observation("before", {
     controls: [{ controlId: "ctrl_free", decisionGroupId: "dg_seat", label: "No thanks", semantic: "decline_paid_extra", risk: "safe_decline", selected: false }],
     decisionGroups: [{ decisionGroupId: "dg_seat", status: "missing", selectedControlId: "" }]
@@ -82,8 +82,8 @@ test("authoritative transition achieves only the exact free selection", () => {
     browserResult: result(),
     afterObservation: after
   });
-  assert.equal(transition.status, "achieved");
-  assert.equal(transition.nextDirective, "advance_goal");
+  assert.equal(transition.status, "progressed");
+  assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
   assert.equal(transition.postcondition.evidence.selectedControlId, "ctrl_free");
 });
 
@@ -111,7 +111,7 @@ test("DOB transition requires the exact canonical date and no owned validation e
     controls: [{ controlId: "ctrl_dob", semantic: "date_of_birth", state: { canonicalDateValue: "2003-05-31", normalizedValue: "2003-05-31" } }]
   }, result("act_dob"));
   const achieved = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: exact });
-  assert.equal(achieved.status, "achieved");
+  assert.equal(achieved.status, "progressed");
 
   const invalid = observation("dob_invalid", {
     step: "traveler_information",
@@ -120,11 +120,11 @@ test("DOB transition requires the exact canonical date and no owned validation e
     validationIssues: [{ issueId: "dob_error", controlId: "ctrl_dob", message: "Invalid date" }]
   }, result("act_dob"));
   const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: invalid });
-  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.status, "progressed");
   assert.equal(blocked.postcondition.satisfied, false);
 });
 
-test("authoritative transition distinguishes blocked, progressed, no-effect, uncertain, and unsafe", () => {
+test("authoritative transition treats popup changes as progress and still distinguishes no-effect, uncertain, and unsafe", () => {
   const before = observation("before", {
     currentSurface: { id: "page", type: "page", label: "Seats" },
     controls: [{ controlId: "ctrl_next", label: "Next", state: { disabled: false } }]
@@ -136,9 +136,9 @@ test("authoritative transition distinguishes blocked, progressed, no-effect, unc
     controls: [{ controlId: "ctrl_continue_without", label: "Continue without seats" }]
   }, result());
   const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(), afterObservation: blockedAfter });
-  assert.equal(blocked.status, "blocked");
-  assert.equal(blocked.nextDirective, "resolve_blocker");
-  assert.equal(blocked.blocker.surfaceId, "confirm");
+  assert.equal(blocked.status, "progressed");
+  assert.equal(blocked.nextDirective, "rebuild_from_fresh_observation");
+  assert.equal(blocked.blocker, null);
 
   const progressedAfter = observation("progressed", {
     currentSurface: { id: "page", type: "page", label: "Seats" },
@@ -233,7 +233,7 @@ test("three distinct no-effect strategies exhaust only one unchanged state and m
     const advanced = advanceActionLifecycle({ state: { ...state, lastAction: action }, observation: after, previousObservation: before });
     state = advanced.state;
     assert.equal(state.recoveryState.attempts, index + 1);
-    assert.equal(advanced.directive, index === 2 ? "handoff_recovery_exhausted" : "try_distinct_capability");
+    assert.equal(advanced.directive, "try_distinct_capability");
     before = after;
   }
 
@@ -251,7 +251,7 @@ test("three distinct no-effect strategies exhaust only one unchanged state and m
     controls: [{ controlId: "ctrl_continue", label: "Continue" }]
   }, result(progressAction.id));
   const reset = advanceActionLifecycle({ state: { ...state, lastAction: progressAction }, observation: progressed, previousObservation: before });
-  assert.equal(reset.transition.status, "blocked");
+  assert.equal(reset.transition.status, "progressed");
   assert.equal(reset.state.recoveryState.attempts, 0);
   assert.deepEqual(reset.state.recoveryState.failedStrategySignatures, []);
 });
@@ -322,14 +322,14 @@ test("useful unexpected transition is observed progress, not verified success", 
     previousObservation: before
   });
 
-  assert.equal(advanced.transition.status, "blocked");
+  assert.equal(advanced.transition.status, "progressed");
   assert.equal(advanced.lifecycle.status, "observed");
   assert.equal(advanced.lifecycle.observed, true);
   assert.equal(advanced.lifecycle.verified, false);
-  assert.equal(advanced.directive, "resolve_blocker");
+  assert.equal(advanced.directive, "rebuild_candidates");
 });
 
-test("typed seat commands use acknowledgement proof and no-effect selects a distinct navigation capability", () => {
+test("typed seat choices keep safe navigation selectable even when compatibility is context-only", () => {
   const before = observation("typed_before", {
     currentSurface: {
       id: "seat_modal",
@@ -347,6 +347,7 @@ test("typed seat commands use acknowledgement proof and no-effect selects a dist
       kind: "button",
       role: "button",
       semantic: "decline_paid_extra",
+      physicalEffect: "select_free_option",
       risk: "safe_decline",
       preferredActivationElementId: "el_skip",
       visualRegion: { inViewport: true },
@@ -369,7 +370,7 @@ test("typed seat commands use acknowledgement proof and no-effect selects a dist
       sectionId: "section_seat",
       surfaceId: "seat_modal",
       status: "missing",
-      required: true,
+      required: false,
       alternatives: []
     }]
   });
@@ -382,17 +383,24 @@ test("typed seat commands use acknowledgement proof and no-effect selects a dist
     requirementId: "dg_seat",
     observationId: before.observationId
   };
-  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, before);
+  const taskStateContext = {
+    state: {
+      taskState: {
+        activeDecisions: [{ decisionGroupId: "dg_seat", family: "seat", status: "active", required: false }],
+        validationBlockers: []
+      },
+      requirements: [],
+      priceHistory: []
+    }
+  };
+  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, before, [], taskStateContext);
   const skip = firstSet.candidates.find((candidate) => candidate.controlId === "ctrl_skip");
   const next = firstSet.candidates.find((candidate) => candidate.controlId === "ctrl_next");
 
-  assert.equal(skip.interactionRole, "command");
-  assert.equal(skip.semanticEffect, "waive");
-  assert.equal(skip.expectedEvidence, "dismissed");
-  assert.equal(skip.expectedOutcome.type, "command_acknowledged");
-  assert.equal(next.interactionRole, "navigation");
-  assert.equal(next.semanticEffect, "advance");
-  assert.equal(next.expectedOutcome.type, "stage_exit_or_feedback");
+  assert.equal(skip.physicalEffect, "select_free_option");
+  assert.equal(skip.expectedOutcome.type, "exact_free_option_selected");
+  assert.equal(next.controlId, "ctrl_next");
+  assert.equal(firstSet.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_next").outcomeCompatibility, "context_only");
 
   const dispatchedSkip = { ...skip, id: "act_skip" };
   const unchanged = observation("typed_unchanged", before.page, result(dispatchedSkip.id));
@@ -404,7 +412,7 @@ test("typed seat commands use acknowledgement proof and no-effect selects a dist
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.directive, "try_distinct_capability");
 
-  const retrySet = loopPrivate.groundedObservationCandidateSet(goal, unchanged, applied.state.attemptedStrategySignatures);
+  const retrySet = loopPrivate.groundedObservationCandidateSet(goal, unchanged, applied.state.attemptedStrategySignatures, taskStateContext);
   assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_skip"), false);
   assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_next"), true);
 });
@@ -563,7 +571,9 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
       sectionLabel: "Seat selection",
       surfaceId,
       required: true,
-      status: "missing",
+      status: "satisfied",
+      selectedControlId: skip.controlId,
+      selectedLabel: skip.label,
       alternatives: [skip, unavailable, ...paid].map((item) => ({
         controlId: item.controlId,
         label: item.label,
@@ -583,18 +593,18 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
   state.requirements = loopPrivate.requirementsWithDecisionGroups([], current);
   state.activeRequirements = state.requirements;
   state.currentObservation = { observationId: current.observationId, observationHash: current.observationSnapshot.snapshotHash };
+  state.taskState = {
+    stage: "seats",
+    activeDecisions: [],
+    validationBlockers: [],
+    completedOutcomes: [{ decisionGroupId: groupId, surfaceId, status: "satisfied", selectedControlId: skip.controlId }]
+  };
 
   const goal = require("../../apps/web/agent/observation-candidates").deriveObservationGoal(current, state.requirements);
   const firstSet = loopPrivate.groundedObservationCandidateSet(goal, current, [], { state, traveler, approvals: state.approvals });
-  assert.deepEqual(firstSet.candidates.map((candidate) => candidate.targetLabel).sort(), ["Next", "Skip seat selection"]);
-  const failedSkip = firstSet.candidates.find((candidate) => /skip/i.test(candidate.targetLabel));
+  assert.deepEqual(firstSet.candidates.map((candidate) => candidate.targetLabel), ["Next"]);
   state.currentGoal = goal;
-  state.failedStrategyMemory = [{
-    goalKey: loopPrivate.semanticGoalRecoveryKey(goal),
-    strategySignature: loopPrivate.candidateStrategySignature(goal, failedSkip),
-    stableControlKey: failedSkip.affordance.stableKey,
-    capability: failedSkip.operation
-  }];
+  state.failedStrategyMemory = [];
 
   const store = {
     isCurrentObservation: (_transactionId, observationId, observationHash) => (
@@ -701,6 +711,17 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
       decisionGroupId: groupId
     }
   };
+  state.taskState = {
+    stage: "seats",
+    activeDecisions: [],
+    validationBlockers: [],
+    completedOutcomes: [{
+      decisionGroupId: groupId,
+      requirementId: "seat_decision",
+      surfaceId,
+      status: "satisfied"
+    }]
+  };
 
   const context = deriveAuthoritativeTaskContext({ state, observation: current, requirements: state.requirements, traveler });
   assert.equal(context.userOutcome.status, "satisfied");
@@ -715,7 +736,16 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
     [],
     { state: { ...state, requirements: authoritativeRequirements }, traveler, approvals: state.approvals }
   );
-  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.targetLabel), ["Next"]);
+  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.targetLabel), ["Next"], JSON.stringify(candidateSet.contextCapabilities.map((candidate) => ({
+    label: candidate.targetLabel,
+    effect: candidate.mechanicalEffect,
+    intent: candidate.semanticIntent,
+    compatibility: candidate.outcomeCompatibility,
+    reason: candidate.outcomeCompatibilityReason,
+    exclusion: candidate.exclusionReason,
+    relevant: candidate.goalRelevant,
+    policy: candidate.policyDecision
+  })), null, 2));
 
   const store = {
     isCurrentObservation: (_transactionId, observationId, observationHash) => (
@@ -748,6 +778,14 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
 test("planner candidate schema is a closed enum over the current observation", () => {
   const schema = candidateSelectionSchemaFor(["obs_1:candidate_1", "obs_1:candidate_2"]);
   assert.deepEqual(schema.properties.candidateId.enum, ["obs_1:candidate_1", "obs_1:candidate_2"]);
+  assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort());
+  assert.deepEqual(schema.properties.semanticOutcome.enum, [
+    "satisfy_current_decision",
+    "advance_current_surface",
+    "dismiss_current_surface",
+    "request_user_input",
+    "stop_for_payment_review"
+  ]);
   assert.equal(schema.additionalProperties, false);
 });
 
@@ -895,7 +933,7 @@ test("only contradictory current browser evidence can reopen a completed policy 
   assert.equal(context.remainingGoal.decisionGroupId, "dg_seat");
 });
 
-test("typed waiver command is achieved by a browser-observed policy waiver without inventing a selected choice", () => {
+test("generic command acknowledgement cannot complete a decision or parent outcome", () => {
   const before = observation("waiver_before", {
     decisionGroups: [{ decisionGroupId: "dg_seat", status: "missing", selectedControlId: "" }]
   });
@@ -923,9 +961,9 @@ test("typed waiver command is achieved by a browser-observed policy waiver witho
     afterObservation: after
   });
 
-  assert.equal(transition.status, "achieved");
-  assert.equal(transition.postcondition.type, "command_acknowledged");
-  assert.equal(transition.postcondition.evidence.resolutionStatus, "waived_by_policy");
+  assert.equal(transition.status, "progressed");
+  assert.equal(transition.postcondition.satisfied, false);
+  assert.equal(transition.taskOutcomeCompleted, false);
   assert.equal(after.page.decisionGroups[0].selectedControlId, "");
 });
 

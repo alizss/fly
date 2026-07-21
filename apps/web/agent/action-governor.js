@@ -12,6 +12,14 @@ const { profileStageReadiness } = require("./skill-expander");
 const { invariantDecision, prepareTransactionInvariants } = require("./invariants");
 const { PAGE_SURFACE_ID, controlBelongsToCurrentSurface, currentSurface, currentSurfaceId } = require("./surface-contract");
 const { approveActionLifecycle, proposeActionLifecycle, rejectActionLifecycle } = require("./action-lifecycle");
+const {
+  assessOutcomeCompatibility,
+  expectedPostconditionsForAction,
+  normalizedActionSemantics,
+  outcomeContractForGoal,
+  predictPhysicalEffect,
+  semanticIntentForAction
+} = require("./action-semantics");
 
 const DOM_MUTATIONS = new Set(["click", "type", "select", "keypress"]);
 const COMPOUND_MUTATIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
@@ -69,7 +77,7 @@ function currentObservationSurfaceId(observation = {}) {
 }
 
 function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = []) {
-  const goal = state.currentGoal;
+  const goal = state.taskState?.currentGoal;
   if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   // An action with no candidate claim is an ownership violation. Let the
   // ownership check below report that precise prerequisite error; candidate
@@ -127,7 +135,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
 }
 
 function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
-  const goal = state.currentGoal;
+  const goal = state.taskState?.currentGoal;
   if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   if (action.candidateId && action.goalId === goal.goalId) return null;
   const control = canonicalControlForAction(action, page) || {};
@@ -148,7 +156,16 @@ function actionTargetsLaterCheckoutWork(action = {}, page = {}) {
     || ["navigate_stage", "decline_optional_extra", "resolve_active_surface"].includes(action.intent);
 }
 
-function incompleteProfileStageBlocks(action = {}, observation = {}, traveler = {}) {
+function incompleteProfileStageBlocks(action = {}, observation = {}, traveler = {}, state = {}) {
+  const taskState = state.taskState || null;
+  if (taskState) {
+    const ownsProfileGoal = taskState.stage === "traveler_information"
+      && taskState.currentGoal?.kind === "profile_field";
+    return ownsProfileGoal && actionTargetsLaterCheckoutWork(action, observation.page || {})
+      ? (taskState.profileReadiness || { ready: false, unresolvedKnown: [], unresolvedRequired: [], visibleErrors: [] })
+      : null;
+  }
+  // Migration-only fallback for persisted sessions created before TaskState.
   const readiness = profileStageReadiness(observation, traveler);
   return !readiness.ready && actionTargetsLaterCheckoutWork(action, observation.page || {})
     ? readiness
@@ -375,7 +392,45 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   }
   pass(checks, "SEMANTIC_GOAL_SEQUENCE_VALID");
 
-  const profileReadiness = incompleteProfileStageBlocks(action, observation, traveler);
+  if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
+    const goal = state.taskState?.currentGoal || {};
+    const contract = goal.outcomeContract || outcomeContractForGoal(goal, observation);
+    const parentContract = state.taskState?.stageOutcome?.outcomeContract || goal.parentOutcomeContract || contract;
+    const explicitMechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || action.physicalEffect || "";
+    const mechanicalEffect = explicitMechanicalEffect || predictPhysicalEffect({
+      semantics: normalizedActionSemantics(action, { control: action.targetSnapshot || {}, goal, expectedOutcome: action.expectedOutcome }),
+      control: action.targetSnapshot || {},
+      candidate: action,
+      goal
+    });
+    const semanticIntent = action.semanticIntent || semanticIntentForAction({
+      mechanicalEffect,
+      control: action.targetSnapshot || {},
+      candidate: action,
+      goal,
+      observation
+    });
+    const expectedPostconditions = action.expectedPostconditions?.length
+      ? action.expectedPostconditions
+      : expectedPostconditionsForAction({ expectedOutcome: action.expectedOutcome, semanticIntent, mechanicalEffect, goal });
+    const compatibility = assessOutcomeCompatibility({
+      goal,
+      durableObjective: parentContract,
+      mechanicalEffect,
+      semanticIntent,
+      expectedPostconditions,
+      candidate: action,
+      control: action.targetSnapshot || {},
+      observation
+    });
+    // Compatibility is planner guidance and trace evidence, not click
+    // authority. Grounding, actionability, policy and approval checks below
+    // remain hard gates even when semantic classification is unknown.
+    pass(checks, "OUTCOME_COMPATIBILITY_DIAGNOSTIC",
+      `${compatibility.status}:${compatibility.reason}:${parentContract.taskOutcome}/${contract.taskOutcome}:${mechanicalEffect}:${semanticIntent}`);
+  }
+
+  const profileReadiness = incompleteProfileStageBlocks(action, observation, traveler, state);
   if (profileReadiness) {
     const blockers = [
       ...profileReadiness.unresolvedKnown.map((item) => item.label),
@@ -434,16 +489,10 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   const exactForegroundChoice = action.expectedOutcome?.type === "exact_free_option_selected"
     && Boolean(action.expectedOutcome?.expectedSelectedControlId || action.expectedOutcome?.controlId)
     && Boolean(action.expectedOutcome?.decisionGroupId || action.decisionGroupId);
-  const typedWaiverCommand = action.interactionRole === "command"
-    && action.semanticEffect === "waive"
-    && action.expectedEvidence === "dismissed"
-    && action.expectedOutcome?.type === "command_acknowledged"
-    && Boolean(action.expectedOutcome?.decisionGroupId || action.decisionGroupId);
   if (action.intent === "decline_optional_extra" && foreground.type !== "page"
     && action.expectedOutcome?.type !== "active_surface_dismissed"
-    && !exactForegroundChoice
-    && !typedWaiverCommand) {
-    return denied({ ...fail("FOREGROUND_POSTCONDITION_REQUIRED", "A foreground decline must prove the exact free choice or carry a typed waiver command contract with fresh acknowledgement evidence.", checks), action, state });
+    && !exactForegroundChoice) {
+    return denied({ ...fail("FOREGROUND_POSTCONDITION_REQUIRED", "A foreground decline must prove the exact free choice or the exact surface dismissal; generic command acknowledgement is not completion evidence.", checks), action, state });
   }
   pass(checks, "EXPECTED_OUTCOME_BOUND", action.expectedOutcome?.type || "control-flow");
 

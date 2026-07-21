@@ -1,8 +1,10 @@
 # Agent Architecture Tracker
 
-Last updated: 2026-07-18
+Last updated: 2026-07-20
 
 This tracker follows [AGENT_ARCHITECTURE_PLAN.md](./AGENT_ARCHITECTURE_PLAN.md) as the canonical roadmap. The plan defines the architecture and ordering; this file records implementation and live-test evidence.
+
+For the short ordered execution list, see [FLY_EXECUTION_TODO.md](./FLY_EXECUTION_TODO.md). For the current code and runtime explanation, see [CURRENT_CODEBASE_ENGINEERING_HANDOFF.md](./CURRENT_CODEBASE_ENGINEERING_HANDOFF.md).
 
 Status key:
 
@@ -12,21 +14,271 @@ Status key:
 
 ## Current Position
 
-Current implementation pass: `P0 safety/state foundations are valuable, but the implementation has drifted from AI-led ambiguity recovery into deterministic capability gating`
+Current implementation pass: `the optional-control obligation regression and typed physical-effect layer are covered by tests. The newest live run completes traveler data, extras, scrolling/rebinding, and the seat flow, but loops at the final review modal because the unfinished reach-payment goal is replaced by a broad modal decision that permits dismissal`
 
-Next architecture gate: `restore the roadmap boundary: skills own semantic goals, AI/perception resolves ambiguous interaction, deterministic infrastructure governs, executes, verifies, and records`
+Next architecture gate: `preserve one durable parent outcome across intermediate surfaces, build decision groups only from real alternatives/obligations, and detect no-net-progress surface cycles. Then filter by the parent-compatible effect and replay the final review modal repeatedly before starting the three-engine acceptance corpus`
 
-- `P0`: `[~]` Durable transactions, immutable observations, prerequisite continuity, policy, invariants, atomic execution, and verification remain the correct foundation. The current implementation overextends P0 by requiring deterministic canonical capability proof before ordinary safe ambiguity can reach AI/perception recovery.
-- `P1`: `[~]` Unified observation now includes semantic model, interaction graph, and annotated DOM/ARIA screenshot IDs; compression, diffing, and complex-surface feedback remain incomplete.
-- `P2`: `[~]` A few regression tests and traces exist, and profile filling now uses the reusable persisted-skill runtime, but there is no broad replay corpus or checkout-skill library yet.
+- `P0`: `[~]` Durable transactions, immutable observations, prerequisite continuity, policy, invariants, atomic execution, fresh reobservation, verification, and bounded recovery are working together in live checkout. The immediate P0 gap is durable task-outcome truth: an intermediate surface can replace the parent goal, allowing a locally correct dismissal to count while payment remains unreached.
+- `P1`: `[~]` Unified observation includes canonical controls, capabilities, surfaces, DOM/ARIA evidence, visual regions, fresh diffs, and bounded dense-surface projection. The immediate P1 gap is control-evidence lineage: nearby/surface text still overwrites the icon-only close control's label even though the typed physical-effect layer now recovers `dismiss_surface`.
+- `P2`: `[~]` The current suite passes `110/110` unit tests and `37/37` browser/cross-layer tests. A local same-label close-vs-submit contract test passes, but the faithful reducer/lifecycle replay is missing: it does not reproduce the live modal becoming a generic decision and the `base → modal → base` cycle. There is still no three-engine replay corpus or repeated cross-site acceptance proof.
 - `P3-P5`: `[ ]` Not started.
 
 The current root objective is:
 
-> Persist the semantic obligation, refresh its physical binding, and advance only
-> from scoped evidence in the current canonical observation. A missing target,
-> global prose, recovery dispatch, or suspended skill is never proof of
-> completion.
+> Keep one durable transaction/stage outcome across every intermediate surface.
+> Fresh observations may change the temporary surface/action subgoal and its
+> physical binding, but only the exact parent postcondition can complete the
+> parent outcome. Local action success is never automatically checkout progress.
+
+### Current Core Architecture Gap — Durable Goal Hierarchy
+
+TaskState should remain the sole production semantic authority. The regression is not evidence that the project should restore the earlier loose AI loop or parallel legacy controllers. The missing component is hierarchy inside that authority:
+
+```text
+transaction outcome: complete checkout safely
+→ stage outcome: reach payment review
+→ temporary surface subgoal: resolve current popup/review/seat/warning
+→ atomic action: execute one grounded current capability
+```
+
+Current code recreates a flat `currentGoal` from each observation. In session `chk_mrtds157i3oqo5`, the final review surface therefore replaced `reach payment review` with a generic modal decision. Although the newer effect layer correctly typed the chosen close actuator as `dismiss_surface`, the broad replacement goal permitted that effect and compiled it to `command_acknowledged`. The local dismissal succeeded, payment did not, and the base page reopened the modal.
+
+The gate closes only when:
+
+- `[ ]` Parent goal IDs and postconditions survive popups, rerenders, scrolling, and intermediate pages.
+- `[ ]` Foreground surfaces create temporary subgoals without replacing unfinished transaction/stage outcomes.
+- `[ ]` Blocking decision groups require real alternatives or a proven obligation; navigation/review surfaces are not generic decisions.
+- `[ ]` Candidate effects must satisfy both the parent outcome and current subgoal.
+- `[ ]` Transition evaluation records local physical effect separately from net parent progress.
+- `[ ]` Recovery detects `base → modal → base` and other semantic cycles under the stable parent goal.
+- `[ ]` A faithful reducer/lifecycle replay reproduces the live modal decision-group shape and reaches fresh payment evidence.
+
+This is the reusable correction for arbitrary airline/OTA popups and intermediate surfaces. It must not be implemented as a Gotogate selector, label rule, fixed step sequence, or new popup-specific skill.
+
+### Live Optional-Control Obligation Regression - 2026-07-20
+
+Sessions `chk_mrszs3fkaxbcun` and `chk_mrt0fbhf8zpgve` reproduce the same deterministic pre-dispatch failure after a refresh, proving this is deployed semantic-state behavior rather than a stale content script or transient model/API issue.
+
+1. Contact details, country code, phone, names, and date of birth were observed on the traveler page. The required title radio group was still empty.
+2. The current observation also contained the optional newsletter opt-out checkbox: `I do not wish to receive any newsletters...`.
+3. `normalizeObservedDecision()` defaults every unresolved observed decision group to `active`, even when `group.required === false`; it waives an optional group only when the browser reports `not_applicable`.
+4. `activeDecisions` therefore promoted the optional newsletter group into the authoritative current goal: `resolve the exact current decision decision`.
+5. That group exposed one uncertain generic `choice`. The safe candidate filter correctly refused to execute it, while the required title and all later controls became context-only because they did not belong to the mistaken current goal.
+6. The loop stopped with `No safe grounded candidate...` before any model call or browser dispatch. Restarting on a fresh session reproduced the same result.
+
+Root conclusion: the new single-authority direction is correct, but its obligation predicate is incomplete. **Observed and unresolved does not mean required and blocking.** This is not a missing checkbox/title skill, perception failure, or Gotogate selector bug.
+
+Required correction:
+
+```text
+fresh observed control/group
+-> prove it is an obligation from required metadata, scoped validation,
+   explicit user policy, or a progression constraint
+-> only then allow it to become the blocking current goal
+-> otherwise retain it as optional context and continue required work
+```
+
+Required generic regression:
+
+```text
+contact data filled
++ optional newsletter checkbox unchecked
++ required title empty
+-> newsletter remains optional_available/non-blocking
+-> TaskState chooses and resolves title
+-> required traveler fields complete
+-> baggage/extras/navigation continue normally
+-> no user handoff for the newsletter control
+```
+
+Also cover the inverse cases: an explicit saved newsletter preference may create a goal, and a genuinely required legal/payment consent must remain governed and cannot be silently waived. Ask the user only when a **proven required** obligation lacks safe data or a safe grounded action.
+
+### Current Code And Live-Run Audit - 2026-07-19
+
+Current HEAD: `041a8a7 Add cross-site DOB codec to payment baseline`.
+
+Verified automated baseline:
+
+- `99/99` agent unit tests pass in the current TaskState consolidation.
+- `35/35` browser and cross-layer tests pass.
+- The browser suite required normal localhost permission; its first sandbox failure was an `EPERM` bind failure, not a product-test failure.
+
+Latest live session `chk_mrs2u53jvr244r` proves the reusable foundation can:
+
+1. Fill contact, country code, phone, traveler identity, and date of birth from the profile.
+2. Traverse four different seat legs using current observed controls rather than a stored airline procedure.
+3. Handle intermediate seat confirmations and continue from fresh foreground surfaces.
+4. Resolve independent paid-extra decisions with free/no-extra choices.
+5. Advance through `Continue to Payment` and reach `https://en-en.gotogate.com/rf/payment`.
+6. Initially stop and ask the user at payment review because no authorized payment action exists.
+
+This does **not** count as a safe consecutive acceptance pass. A later observation of the same payment URL was classified as `confirmation`, ordinary planning resumed, and the agent selected the travel-conditions checkbox. Legal acceptance is not traveler-profile data and must not be executed without explicit authorization.
+
+The live result narrows the root problem. Fly is not missing another click, scroll, country-code, popup, or seat skill. It still has several layers that independently decide what the page means:
+
+- The extension builds decision groups, section status, task queues, stage exits, and step classifications.
+- The backend independently derives requirements, goals, semantic families, policy contradictions, task context, and transitions.
+- Browser verification and backend transition evaluation both interpret semantic success.
+
+When these authorities disagree, a valid current control is rejected, a background obligation can override a foreground popup, or a terminal payment page can become an ordinary checkout page again.
+
+The next root-level implementation gates are:
+
+- `[~]` **One authoritative semantic-state reducer.** `task-state-reducer.js` now consumes the prior state, fresh observation, last result, user policy, and traveler profile; it owns stage, foreground surface, decisions, preserved completions, current goal, ambiguity, and terminal output. It is not yet the sole downstream authority: the legacy requirement reconciliation/lifecycle is still written into `state.requirements`, and shared policy still uses those requirements to veto forward navigation.
+- `[~]` **Grounded ambiguity resolution before handoff.** Unknown foreground surfaces and missing goal-relevant capabilities now produce `surface_ambiguity`; AI receives a closed current-observation candidate schema and a semantic outcome, while the governor remains the final dispatch gate. The current ambiguity candidate set still makes policy-denied money/legal/payment controls selectable rather than context-only, so a bad selection can cause an avoidable handoff instead of choosing a safe alternative.
+- `[~]` **Sticky payment-review boundary.** The reducer already detects payment from combined route/progress/field/heading evidence, and the loop suppresses candidate generation when `payment_review_reached`. This was implemented despite payment being described as deferred. It is not sticky yet: `terminalStatus` is recomputed only from the latest observation and does not preserve a prior terminal state across an ambiguous or regressed observation.
+- `[ ]` **Remove parallel/dead authorities after replay equivalence.** Retire unused page-state classifier, requirement extractor, verify-and-plan path, legacy direct form filling, and the unused persisted skill-plan/recovery machinery. Reduce the main loop to orchestration of reducer -> candidates -> selection -> governor -> lifecycle.
+- `[ ]` **Three-engine acceptance corpus.** Prove the same semantic loop on a normal airline checkout, an aggressive low-cost/upsell checkout, and an OTA/custom-SPA checkout. Record checkout-to-payment rate, manual interventions, unsafe actions, model calls, latency, and typed handoff reasons.
+
+Acceptance for this gate is not “Gotogate works once.” It is repeated payment-review arrival with zero paid extras, zero legal/payment actions, no manual correction, and no airline-specific procedure required across all three engine families.
+
+### Post-Implementation Architecture Review - 2026-07-20
+
+The uncommitted consolidation is directionally correct and mechanically green:
+
+- `task-state-reducer.js` is present and integrated before new planning.
+- The extension publishes `step: unknown` and no longer publishes an executable task queue, reducing extension-owned semantic authority.
+- Background decisions are suspended under a foreground surface.
+- Exact completed outcomes survive rerender, scrolling, and surface replacement.
+- Unknown foreground surfaces expose current grounded capabilities to bounded AI selection.
+- Candidate selection is schema-closed over current candidate IDs and now returns a typed semantic outcome.
+- Legacy requirement output is stored under `legacyRequirementsDiagnostic`; shared policy and current candidate selection consume TaskState rather than `state.requirements`.
+- AI receives the complete current-surface capability context with policy/selectability annotations, while its executable schema contains only policy-safe selectable candidate IDs.
+- Deterministic selection and AI selection consume the same filtered candidate set; deterministic selection runs only for a singleton.
+- `npm run check` passes.
+- `101/101` unit tests pass.
+- `35/35` browser and cross-layer tests pass.
+
+The consolidation must remain `[~]` until these remaining boundaries are closed:
+
+1. `goalForDecision()` still passes the exact TaskState decision back through the broad legacy `deriveObservationGoal()` classifier. This can rewrite a cabin-baggage decision as `decline checked baggage` and empty the safe selectable set despite a current free sibling.
+2. Payment terminal handling is partial and non-sticky. Either remove the partial terminal branch until intentionally implemented or finish the durable invariant before another live payment run.
+3. The old requirement/verification modules and diagnostic lifecycle calculations remain in the codebase. They are no longer correctness authorities, but should be removed only after reducer-driven replay equivalence; do not continue evolving them as a parallel planner.
+
+No additional airline-specific skill is justified by this review. The immediate work is authority consolidation, then one live Gotogate replay, then the three-engine acceptance corpus.
+
+### Live Exact-Decision Goal Regression - 2026-07-20
+
+Session `chk_mrswcreqw6rzul` proves the TaskState and safe-candidate changes are deployed, but exposes one remaining parallel semantic authority:
+
+1. The agent filled and canonically verified date of birth without a model call.
+2. The fresh observation contained two independent current-surface baggage groups: cabin baggage and checked baggage. Each had its own alternatives and exact `decisionGroupId`.
+3. TaskState correctly selected the first active instance, the cabin-baggage group.
+4. `goalForDecision()` then called the older page-wide `deriveObservationGoal()` mapper. That mapper classifies every baggage family as `decline checked baggage`, regardless of the exact selected decision instance.
+5. The cabin free alternative was observed as a generic `choice` with uncertain risk, while its sibling was a positive-price `add_paid_extra`. Because the goal/candidate contract did not normalize that exact contrast, the policy-safe selectable set became empty and the run stopped before browser dispatch with `No safe grounded candidate is available for the current goal: decline checked baggage.`
+6. This was not an AI, scrolling, target-binding, governor, or executor failure. No model call or browser action was attempted for the failed turn.
+
+The root correction is not a Gotogate baggage rule and must not restore a page-wide deterministic fallback. TaskState must construct the semantic goal directly from the exact active decision and its observed alternatives. The goal contract must preserve its `decisionGroupId`, eligible alternative control IDs, desired policy disposition, and exact postcondition unchanged through candidate construction. Within that exact group, a zero/no-price alternative contrasted with a positive-price sibling can be normalized as a safe free/decline outcome even when its raw control semantic is merely `choice`.
+
+Required regression:
+
+```text
+observe cabin baggage: [no hand baggage, paid 8 kg]
+and checked baggage: [no checked baggage, paid 10 kg, paid 20 kg]
+→ TaskState owns the exact cabin group
+→ select and verify its free alternative
+→ fresh observation
+→ TaskState owns the exact checked group
+→ select and verify its free alternative
+→ publish Continue only after both exact groups are resolved
+```
+
+Current verification after the live failure: `npm run check` passes, `101/101` unit tests pass, and `35/35` browser/cross-layer tests pass. The gate remains `[~]` because those tests do not yet include this exact two-group live shape.
+
+### Live Close-Versus-Submit Semantic Collision - 2026-07-20
+
+Session `chk_mrsxngupndkbft` proves the exact-decision correction materially improved the live path: the agent completed profile data, independent extras, flexible ticket decisions, four seat legs, seat confirmations, and every final-page no-extra decision. It reached the `Review Your Details` foreground modal immediately before payment. It then looped between the base-page `Continue` and that modal.
+
+The trace proves the browser executor clicked the exact target selected by the backend. The failure occurred earlier, in observation semantics:
+
+1. The modal exposed two different canonical buttons.
+2. The icon-only close control had stable identity `testid:dialog-close` and a 50x50 region at the modal's top-right, but it was observed with label and accessible name `Continue to Payment`.
+3. The real forward CTA had stable identity `testid:info-review-submit-button` and was also observed as `Continue to Payment`.
+4. Both became safe selectable candidates with the same command effect and the same `command_acknowledged` postcondition.
+5. The model selected the first candidate, which was the close control. Its exact actuator was dispatched, the modal disappeared, and generic dismissal verification marked the action successful.
+6. Payment was not reached, so the base-page `Continue` became current again and reopened the same modal. The cycle repeated.
+
+This is not a Gotogate procedure gap, an executor miss, or a need for another click skill. It is a reusable perception-and-postcondition defect: two physical commands with opposite effects were collapsed into one semantic action, and surface disappearance was accepted where the real goal required stage advancement.
+
+Required correction:
+
+```text
+observe each physical command's own accessible/local evidence
+→ classify close/dismiss separately from submit/advance
+→ expose both as context, but only goal-compatible effects as selectable
+→ dispatch the exact selected actuator
+→ treat modal disappearance as intermediate evidence
+→ complete only when the payment stage/route or another typed forward transition is observed
+```
+
+Required generic regression:
+
+```text
+foreground modal contains an icon-only X and a primary Continue to Payment CTA
+→ X is observed as close/dismiss_surface
+→ CTA is observed as submit/advance_stage
+→ advance-to-payment goal cannot select the dismiss control
+→ click exact CTA
+→ modal dismissal alone is not terminal success
+→ fresh payment-stage evidence satisfies the goal
+→ base Continue is never reopened
+```
+
+Cover icon-only close controls, misleading or missing ARIA names, portal-rendered modals, rerendered element IDs, and close/submit controls with similar nearby text. Do not add a Gotogate text-selector procedure or an arbitrary delay as the primary fix.
+
+Follow-up session `chk_mrt344jsgmy9r8` proves this gate remains open in the current working tree after the optional-control correction. The agent completed the preceding checkout flow, clicked base-page `Continue`, and observed the final `Review Your Details` surface. It then selected candidate 1 for `Continue to Payment`, whose stored stable identity was actually `testid:dialog-close`. The exact close actuator dispatched and generic `command_acknowledged/dismissed` verification marked it successful. The base-page `Continue` then became current again. Static checks, `104/104` unit tests, and `35/35` browser replays all pass, so the missing regression is specifically cross-layer local command-effect preservation and goal-compatible transition verification.
+
+Newest reviewed session `chk_mrt52jzad6yzxd` reproduces the same collision after completing the expanded current checkout path: traveler/profile work, exact cabin and checked-baggage choices, bundle and flexible-ticket handling, governed viewport recovery, both seat legs, the seat warning, and all five final-page no-extra groups. The final stored target again has `testid:dialog-close`, a 50x50 top-right region, and the borrowed label `Continue to Payment`. It is emitted as `semanticEffect=advance` with `expectedEvidence=dismissed`; modal disappearance is accepted as `OBSERVABLE_CHANGE`, then base-page Continue reopens the modal. Current verification after this session is `npm run check`, `105/105` unit tests, and `36/36` browser/cross-layer tests. The architecture gate remains open because the passing suite still lacks the exact physical-effect collision.
+
+Follow-up session `chk_mrtds157i3oqo5` proves the physical-effect correction is deployed but is not sufficient. The close actuator still borrows the CTA label, yet it now carries `physicalEffect=dismiss_surface`. The reducer nevertheless converts the entire review modal into an active `contact` decision group and replaces the unfinished `reach payment review` outcome with `resolve the exact current decision`. That broad decision contract permits `dismiss_surface`; because the control also has a decision-group ID, expected-outcome compilation downgrades it to `command_acknowledged`. The loop therefore alternates base Continue and modal close indefinitely. Recovery cannot see the net cycle because failed-strategy memory is keyed to the observation-scoped current goal, which changes on each surface. Current verification is `npm run check`, `110/110` unit tests, and `37/37` browser/cross-layer tests. The passing review-dialog replay explicitly assumes no modal decision group, so it does not reproduce this live reducer/lifecycle shape.
+
+### Live Dense-Seat Strategy And Transport Regression - 2026-07-20
+
+Session `chk_mrszf11j6xi43x` reached the seat stage after successfully resolving the preceding checkout decisions. The apparent seat-modal wait is not a model or executor stall. The trace proves two sequential failures:
+
+1. The current observation exposed the seat surface, its `Next` transition, and seat-related controls.
+2. TaskState restricted execution to the direct alternatives of the active seat decision. It therefore made the safe `Next` transition context-only even though this checkout expresses “no paid seat” indirectly as `Next -> fresh warning -> Continue`.
+3. `decisionOptionContract()` inferred that any non-priced sibling of a paid option was a free option. This incorrectly admitted the traveler selector `Ali SIFRAR Not selected` as the one safe selectable candidate.
+4. The executor clicked that exact selected target. Verification correctly rejected it with `EXACT_FREE_OPTION_NOT_VERIFIED`; this was not a missed click.
+5. The resulting dense seat-map observation expanded to more than 200 controls. Every subsequent request exceeded the server's 5.5 MB observation limit and was rejected before the backend loop or model ran.
+6. `smallerObservationTransport()` retained the full controls, aliases, operations, recovery regions, and actuators, so each retry remained oversized. The client then scheduled the same impossible retry indefinitely.
+
+The close-versus-submit correction did not cause this failure. The wrong first action comes from the uncommitted TaskState option contract; the transport loop is an older latent P1.2 defect exposed by the larger seat surface.
+
+Required root corrections:
+
+```text
+semantic outcome: no paid seat
+-> observe candidate-local evidence
+-> direct verified free option if one exists
+-> otherwise allow grounded safe transition strategies such as Next
+-> reobserve the fresh warning/confirmation surface
+-> continue only while price and paid-selection evidence remain unchanged
+-> complete when the typed no-paid-seat outcome is observed
+```
+
+- A control is free/decline only from positive evidence on that control itself: explicit zero price, free/skip/decline semantics, or an observed exact state. A paid sibling and the desired policy are not evidence that another control is free.
+- Structural controls, legends, and traveler selectors cannot become decision alternatives unless their observed semantic effect matches the goal.
+- Goal-compatible strategies may include current-surface transition commands, not only direct decision-group alternatives. Intermediate transitions remain incomplete until a fresh typed outcome proves the user policy.
+- Build a bounded transport projection for dense surfaces. Aggregate repetitive paid seat cells, deduplicate alias/actuator/recovery evidence, preserve every unresolved decision and safe navigation control, and assert serialized bytes are below the client budget before sending.
+- One compact retry is allowed. Repeating an unchanged oversized body is not recovery and must terminate with a typed diagnostic.
+
+Required cross-layer regression:
+
+```text
+observe traveler selector + 200 paid/unavailable seat cells + Next
+-> traveler selector and legend are not free alternatives
+-> no direct free seat option exists
+-> Next remains a selectable grounded transition strategy
+-> serialized observation remains below the transport budget
+-> click Next
+-> observe warning/confirmation
+-> choose the current safe no-paid-seat continuation
+-> verify no paid seat and no price increase
+-> advance to the next leg/stage without retry loop or handoff
+```
+
+This keeps P0.10, P1.2, P0.11, and P2.3 `[~]`. Do not add a Gotogate seat selector, raise the request limit as the primary fix, or restore a page-wide fallback.
 
 ### Live Multi-Leg Seat Lifecycle Regression - 2026-07-18
 

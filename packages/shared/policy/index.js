@@ -13,7 +13,7 @@
 
 function isDeclineOrSkipAction(action) {
   const target = action.targetSnapshot || {};
-  return ["select_free_option", "skip_current_item", "dismiss_surface"].includes(action.affordance?.effect)
+  return (action.affordance?.physicalEffect || action.affordance?.effect) === "select_free_option"
     || action.intent === "decline_optional_extra"
     || target.semantic === "decline_paid_extra"
     || target.semantic === "decline_baggage"
@@ -38,19 +38,10 @@ function looksLikeContinueAction(action) {
   if (action.type !== "click" && action.type !== "click_xy") return false;
   if (isDeclineOrSkipAction(action)) return false;
   const target = action.targetSnapshot || {};
-  return action.affordance?.effect === "advance_surface"
+  return ["advance_surface", "advance_checkout_stage"].includes(action.affordance?.physicalEffect || action.affordance?.effect)
     || action.intent === "navigate_stage"
     || target.semantic === "continue"
     || target.risk === "safe_continue";
-}
-
-function blocksContinue(req, profile = {}) {
-  if (!req || ["satisfied", "waived", "stale"].includes(req.status)) return false;
-  if (req.status === "conflicted") return true;
-  // A typed Continue requirement is the action itself, not a prerequisite.
-  if (req.type === "continue") return false;
-  if (req.required) return true;
-  return false;
 }
 
 function looksLikeCardField(action) {
@@ -154,25 +145,9 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
     return { allow: false, decision: "ask_user", reason: "This looks like selecting a paid extra with no saved preference either way. Confirm before adding it." };
   }
 
-  // Continue/advance: only once every required requirement is actually satisfied.
-  if (looksLikeContinueAction(action)) {
-    const { requirementFulfilled } = require("../requirements");
-    const task = action.affordance?.task || {};
-    const advancesOwnedOptionalDecision = action.affordance?.effect === "advance_surface"
-      && task.desiredValue === "free_or_no_extra"
-      && Boolean(task.decisionGroupId || task.requirementId)
-      && action.risk === "safe";
-    const missing = (state?.requirements || []).filter((req) => {
-      if (requirementFulfilled(req) || !blocksContinue(req, profile)) return false;
-      const requirementId = String(req.decisionGroupId || req.scope?.decisionGroupId || req.id || "");
-      if (advancesOwnedOptionalDecision
-        && [task.decisionGroupId, task.requirementId].filter(Boolean).includes(requirementId)) return false;
-      return true;
-    });
-    if (missing.length) {
-      return { allow: false, decision: "deny", reason: `${missing.length} required item(s) not yet satisfied: ${missing.map((r) => r.label).join(", ")}.` };
-    }
-  }
+  // TaskState describes remaining work but does not veto a grounded safe
+  // foreground click. If Continue exposes validation or another popup, the
+  // fresh observation becomes the next source of action guidance.
 
   return { allow: true, decision: "allow", reason: "No policy restriction matched; routine action." };
 }

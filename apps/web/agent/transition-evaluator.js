@@ -1,6 +1,7 @@
 const { diffObservations } = require("./observation-diff");
 const { currentSurface } = require("./surface-contract");
-const { normalizedActionSemantics } = require("./action-semantics");
+const { normalizedActionSemantics, outcomeContractForGoal } = require("./action-semantics");
+const { decideStage } = require("./task-state-reducer");
 
 const UNSAFE_CODES = new Set([
   "ITINERARY_ROUTE_CHANGED",
@@ -82,38 +83,6 @@ function expectedFor(governedAction = {}, browserResult = {}) {
   return governedAction.expectedOutcome || browserResult.expectedOutcome || {};
 }
 
-function fulfilledStatus(status = "") {
-  return ["satisfied", "waived", "waived_by_policy"].includes(String(status || ""));
-}
-
-function commandAcknowledged(expected = {}, action = {}, beforePage = {}, afterPage = {}, diff = {}) {
-  const groupId = expected.decisionGroupId || expected.requirementId || action.decisionGroupId || action.requirementId || "";
-  const beforeGroup = groupById(beforePage, groupId);
-  const afterGroup = groupById(afterPage, groupId);
-  const acceptedStatuses = new Set(expected.acceptedRequirementStatuses || [expected.expectedRequirementStatus || "satisfied"]);
-  const groupResolved = Boolean(afterGroup && (acceptedStatuses.has(afterGroup.status) || fulfilledStatus(afterGroup.status)));
-  const previousSurfaceId = expected.previousSurfaceId || expected.surfaceId || action.targetSnapshot?.surfaceId || surfaceOf(beforePage).id || "";
-  const afterSurfaceId = surfaceOf(afterPage).id || "";
-  const surfaceChanged = Boolean(diff.modalClosed || diff.surfaceChanged || (previousSurfaceId && previousSurfaceId !== afterSurfaceId));
-  const targetDisappeared = (diff.disappeared || []).some((item) => item.controlId === (expected.controlId || action.controlId));
-  const prerequisiteCleared = Boolean(beforeGroup && !afterGroup && (surfaceChanged || diff.stageChanged || diff.progressChanged || diff.urlChanged));
-  const targetReacted = diff.targetReacted === true;
-  const acknowledged = groupResolved || surfaceChanged || prerequisiteCleared || targetDisappeared || targetReacted;
-  return {
-    satisfied: acknowledged,
-    evidence: {
-      groupId,
-      beforeStatus: beforeGroup?.status || "",
-      afterStatus: afterGroup?.status || "",
-      resolutionStatus: groupResolved && action.semanticEffect === "waive" ? "waived_by_policy" : (afterGroup?.status || ""),
-      surfaceChanged,
-      prerequisiteCleared,
-      targetDisappeared,
-      targetReacted
-    }
-  };
-}
-
 function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPage = {}) {
   const groupId = expected.decisionGroupId || action.decisionGroupId || action.targetSnapshot?.decisionGroupId || "";
   const group = groupById(afterPage, groupId);
@@ -148,11 +117,6 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
   const afterControl = controlById(afterPage, controlId);
   const type = expected.type || "observable_change";
   const semantics = normalizedActionSemantics(action, { expectedOutcome: expected });
-
-  if (semantics.interactionRole === "command" || type === "command_acknowledged") {
-    const acknowledged = commandAcknowledged(expected, action, beforePage, afterPage, diff);
-    return { type: "command_acknowledged", satisfied: acknowledged.satisfied, evidence: acknowledged.evidence };
-  }
 
   if (type === "exact_free_option_selected") {
     const exact = exactFreeSelection(expected, action, beforePage, afterPage);
@@ -232,6 +196,40 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
     const satisfied = Boolean(diff.stageChanged || diff.urlChanged || diff.progressChanged || diff.modalOpened || diff.modalClosed || diff.errorsAppeared?.length || diff.surfaceChanged);
     return { type, satisfied, evidence: { stageChanged: diff.stageChanged, progressChanged: diff.progressChanged, modalOpened: diff.modalOpened, errorsAppeared: diff.errorsAppeared } };
   }
+  if (type === "current_surface_advanced") {
+    const advanced = Boolean(
+      diff.progressChanged
+      || diff.stageChanged
+      || diff.urlChanged
+      || (diff.surfaceChanged && !diff.modalOpened && !diff.modalClosed)
+    );
+    return {
+      type,
+      satisfied: advanced,
+      evidence: {
+        stageChanged: diff.stageChanged,
+        urlChanged: diff.urlChanged,
+        progressChanged: diff.progressChanged,
+        surfaceChanged: diff.surfaceChanged,
+        modalOpened: diff.modalOpened,
+        modalClosed: diff.modalClosed
+      }
+    };
+  }
+  if (type === "checkout_stage_advanced") {
+    const advanced = Boolean(diff.stageChanged || diff.urlChanged || diff.progressChanged);
+    return {
+      type,
+      satisfied: advanced,
+      evidence: {
+        stageChanged: diff.stageChanged,
+        urlChanged: diff.urlChanged,
+        progressChanged: diff.progressChanged,
+        modalOpened: diff.modalOpened,
+        modalClosed: diff.modalClosed
+      }
+    };
+  }
   if (["section_choice_verified", "observable_change"].includes(type)) {
     return { type, satisfied: meaningfulDiff(diff) && browserResult.dispatched === true, evidence: { targetReacted: diff.targetReacted } };
   }
@@ -240,6 +238,57 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
     satisfied: Boolean(browserResult.verified === true && meaningfulDiff(diff)),
     evidence: { browserVerified: browserResult.verified === true, targetReacted: diff.targetReacted }
   };
+}
+
+function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}) {
+  const predictedEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || action.physicalEffect || "unknown";
+  if (diff.modalOpened) {
+    return { effect: "open_surface", verified: true, evidence: { modalOpened: true } };
+  }
+  if (postcondition.satisfied && postcondition.type === "exact_free_option_selected") {
+    return { effect: "select_free_option", verified: true, evidence: postcondition.evidence };
+  }
+  if (postcondition.satisfied && postcondition.type === "control_selected") {
+    return { effect: predictedEffect === "select_paid_option" ? "select_paid_option" : predictedEffect, verified: true, evidence: postcondition.evidence };
+  }
+  if (postcondition.satisfied && ["normalized_value_changed", "field_value_changed", "date_value_committed"].includes(postcondition.type)) {
+    return { effect: predictedEffect === "enter_payment_credentials" ? "enter_payment_credentials" : "set_field_value", verified: true, evidence: postcondition.evidence };
+  }
+  if (postcondition.satisfied && postcondition.type === "checkout_stage_advanced") {
+    return { effect: "advance_checkout_stage", verified: true, evidence: postcondition.evidence };
+  }
+  if (postcondition.satisfied && postcondition.type === "current_surface_advanced") {
+    return { effect: "advance_surface", verified: true, evidence: postcondition.evidence };
+  }
+  if (diff.modalClosed && !diff.stageChanged && !diff.urlChanged && !diff.progressChanged) {
+    return { effect: "dismiss_surface", verified: true, evidence: { modalClosed: true } };
+  }
+  if (postcondition.satisfied) {
+    return { effect: predictedEffect, verified: true, evidence: postcondition.evidence };
+  }
+  return { effect: meaningfulDiff(diff) ? "unknown" : predictedEffect, verified: false, evidence: postcondition.evidence || {} };
+}
+
+function currentObligationResultFor(action = {}, postcondition = {}, localMechanicalResult = {}, diff = {}) {
+  const taskOutcome = action.affordance?.task?.outcomeContract?.taskOutcome || "";
+  const compatibility = action.outcomeCompatibility || "unknown";
+  const completed = postcondition.satisfied === true;
+  const progress = !completed && (
+    localMechanicalResult.verified === true
+    || meaningfulDiff(diff)
+  );
+  return Object.freeze({
+    outcomeId: action.affordance?.task?.surfaceSubgoalId || action.goalId || "",
+    taskOutcome,
+    status: completed ? "completed" : (progress ? "progress" : "no_progress"),
+    completed,
+    compatibility,
+    evidence: Object.freeze({
+      postconditionType: postcondition.type || "",
+      postconditionSatisfied: postcondition.satisfied === true,
+      mechanicalEffect: localMechanicalResult.effect || "unknown"
+    })
+  });
 }
 
 function blockerFrom(afterObservation = {}, diff = {}) {
@@ -253,6 +302,28 @@ function blockerFrom(afterObservation = {}, diff = {}) {
   return null;
 }
 
+function parentProgressFor(action = {}, afterObservation = {}, localEffect = {}, diff = {}) {
+  const task = action.affordance?.task || {};
+  const contract = task.parentOutcomeContract || task.outcomeContract || {};
+  const outcomeId = task.stageOutcomeId || contract.outcomeId || task.transactionOutcomeId || "";
+  const taskOutcome = contract.taskOutcome || "";
+  const observedStage = decideStage(afterObservation).stage;
+  const completed = taskOutcome === "payment_review_reached"
+    ? observedStage === "payment"
+    : taskOutcome === "booking_confirmed"
+      ? observedStage === "confirmation"
+      : false;
+  const usefulLocalProgress = localEffect.verified === true;
+  const usefulObservedProgress = meaningfulDiff(diff);
+  return Object.freeze({
+    outcomeId,
+    taskOutcome,
+    status: completed ? "completed" : (usefulLocalProgress || usefulObservedProgress ? "progress" : "no_progress"),
+    completed,
+    evidence: Object.freeze({ observedStage, stageChanged: diff.stageChanged, urlChanged: diff.urlChanged, progressChanged: diff.progressChanged })
+  });
+}
+
 function evaluateTransition({ beforeObservation = null, governedAction = {}, browserResult = {}, afterObservation = {} } = {}) {
   const diff = diffObservations(beforeObservation, afterObservation);
   const expected = expectedFor(governedAction, browserResult);
@@ -261,10 +332,12 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
   const afterPage = pageOf(afterObservation);
   const postcondition = evaluatePostcondition(expected, governedAction, beforeObservation || {}, afterObservation, diff, browserResult);
   const actionSemantics = normalizedActionSemantics(governedAction, { expectedOutcome: expected });
+  const outcomeContract = governedAction.affordance?.task?.outcomeContract
+    || outcomeContractForGoal(governedAction.goal || {}, beforeObservation || {});
+  const localMechanicalResult = verifiedPhysicalResult(governedAction, postcondition, diff);
+  const currentObligationResult = currentObligationResultFor(governedAction, postcondition, localMechanicalResult, diff);
+  const durableObjectiveProgress = parentProgressFor(governedAction, afterObservation, localMechanicalResult, diff);
   const dispatched = browserResult.dispatched === true || browserResult.executed === true;
-  const unexpectedModal = Boolean(diff.modalOpened && !["options_surface_appeared", "active_surface_change", "semantic_progress"].includes(expected.type));
-  const newValidation = Boolean(diff.errorsAppeared?.length);
-
   let status;
   let nextDirective;
   if (UNSAFE_CODES.has(code) || (priceIncreased(beforePage, afterPage) && expected.mustNotIncreasePrice === true)) {
@@ -273,10 +346,7 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
   } else if (!beforeObservation?.observationId || !afterObservation?.observationId || !dispatched) {
     status = "uncertain";
     nextDirective = "reobserve_rebind";
-  } else if (unexpectedModal || newValidation) {
-    status = "blocked";
-    nextDirective = "resolve_blocker";
-  } else if (postcondition.satisfied) {
+  } else if (durableObjectiveProgress.completed) {
     status = "achieved";
     nextDirective = "advance_goal";
   } else if (meaningfulDiff(diff)) {
@@ -302,8 +372,20 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
     actionId: browserResult.actionId || governedAction.id || "",
     interactionRole: actionSemantics.interactionRole,
     semanticEffect: actionSemantics.semanticEffect,
-    expectedEvidence: actionSemantics.expectedEvidence
+    expectedEvidence: actionSemantics.expectedEvidence,
+    predictedMechanicalEffect: governedAction.mechanicalEffect || governedAction.affordance?.mechanicalEffect || governedAction.affordance?.physicalEffect || governedAction.affordance?.effect || governedAction.physicalEffect || "unknown",
+    predictedPhysicalEffect: governedAction.mechanicalEffect || governedAction.affordance?.mechanicalEffect || governedAction.affordance?.physicalEffect || governedAction.affordance?.effect || governedAction.physicalEffect || "unknown",
+    localMechanicalResult,
+    currentObligationResult,
+    durableObjectiveProgress,
+    localEffect: localMechanicalResult,
+    physicalResult: localMechanicalResult,
+    parentProgress: durableObjectiveProgress,
+    surfaceTaskOutcome: outcomeContract.taskOutcome,
+    taskOutcome: durableObjectiveProgress.taskOutcome || outcomeContract.taskOutcome,
+    taskOutcomeCompleted: durableObjectiveProgress.completed,
+    completionAuthority: "task_state"
   };
 }
 
-module.exports = { evaluatePostcondition, evaluateTransition, meaningfulDiff };
+module.exports = { currentObligationResultFor, evaluatePostcondition, evaluateTransition, meaningfulDiff, parentProgressFor, verifiedPhysicalResult };

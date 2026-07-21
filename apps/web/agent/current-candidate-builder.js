@@ -10,7 +10,16 @@ const {
   controlBelongsToCurrentSurface,
   surfaceBinding
 } = require("./surface-contract");
-const { buildSemanticAffordance, compileTypedExpectedOutcome } = require("./action-semantics");
+const {
+  buildSemanticAffordance,
+  compileTypedExpectedOutcome,
+  assessOutcomeCompatibility,
+  expectedPostconditionsForAction,
+  outcomeContractForGoal,
+  predictPhysicalEffect,
+  semanticIntentForAction,
+  normalizedActionSemantics
+} = require("./action-semantics");
 const { evaluateActionPolicy } = require("../../../packages/shared/policy");
 const { actuatorSignature } = require("../../../packages/shared/agent-actions");
 
@@ -61,6 +70,49 @@ function observationHash(observation = {}) {
   return String(observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "");
 }
 
+function capabilityKey(candidate = {}) {
+  return [candidate.controlId, candidate.operation, candidate.targetId, candidate.type, candidate.value, candidate.keys]
+    .map(String)
+    .join("::");
+}
+
+function relevantToVisibleSurface(goal = {}, candidate = {}, isGoalCandidate = false) {
+  if (isGoalCandidate) return true;
+  if (goal.selectionMode === "ai_ambiguity" || goal.semanticType === "surface_ambiguity") return true;
+  if (goal.kind === "profile_field" || goal.decisionGroupId) return false;
+  if (goal.semanticType === "navigation") {
+    const ids = new Set(goal.actionableControlIds || []);
+    return ids.has(candidate.controlId);
+  }
+  return false;
+}
+
+function allCurrentCapabilityCandidates(goal = {}, observation = {}, traveler = {}) {
+  const goalCandidates = goal.kind === "profile_field"
+    ? candidatesForProfileGoal(goal, observation, traveler, [])
+    : buildObservationCandidateSet(goal, observation).candidates;
+  const contextGoal = {
+    ...goal,
+    kind: "",
+    semanticType: "surface_ambiguity",
+    selectionMode: "ai_ambiguity",
+    decisionGroupId: "",
+    requirementId: "",
+    eligibleAlternativeControlIds: [],
+    freeAlternativeControlIds: [],
+    paidAlternativeControlIds: []
+  };
+  const surfaceCandidates = buildObservationCandidateSet(contextGoal, observation).candidates;
+  const byCapability = new Map(surfaceCandidates.map((candidate) => [capabilityKey(candidate), candidate]));
+  // Goal-specific candidates replace the contextual version of the same
+  // capability so their typed postcondition remains authoritative.
+  for (const candidate of goalCandidates) byCapability.set(capabilityKey(candidate), candidate);
+  return {
+    goalCandidateKeys: new Set(goalCandidates.map(capabilityKey)),
+    candidates: [...byCapability.values()]
+  };
+}
+
 function bindCandidateEnvelope(candidate = {}, index, observation = {}, binding = {}) {
   return {
     ...candidate,
@@ -84,31 +136,80 @@ function buildCurrentCandidateSet({
 } = {}) {
   const binding = surfaceBinding(observation);
   const page = observation.page || {};
+  const foregroundOwnsSelection = binding.surfaceType !== "page";
   const attempted = new Set(attemptedCandidateIds || []);
   const attemptedStrategies = new Set(attemptedStrategySignatures || []);
-  const raw = goal.kind === "profile_field"
-    ? candidatesForProfileGoal(goal, observation, traveler, [])
-    : buildObservationCandidateSet(goal, observation).candidates;
-  const current = raw.filter((candidate) => {
+  const outcomeContract = outcomeContractForGoal(goal, observation);
+  const parentOutcomeContract = state.taskState?.stageOutcome?.outcomeContract
+    || goal.parentOutcomeContract
+    || outcomeContract;
+  const allCapabilities = allCurrentCapabilityCandidates(goal, observation, traveler);
+  const current = allCapabilities.candidates.filter((candidate) => {
     if (!["click", "type", "select", "keypress", "scroll", "click_xy"].includes(candidate.type)) return true;
     const control = (page.controls || []).find((item) => item.controlId === candidate.controlId);
     return Boolean(control && controlBelongsToCurrentSurface(control, page));
   }).map((candidate, index) => {
     const bound = bindCandidateEnvelope(candidate, index, observation, binding);
     const control = (page.controls || []).find((item) => item.controlId === bound.controlId) || {};
-    const expectedOutcome = compileTypedExpectedOutcome(bound, page);
-    const affordance = buildSemanticAffordance({ candidate: bound, control, goal, postcondition: expectedOutcome });
+    const semantics = normalizedActionSemantics(bound, { control, goal, expectedOutcome: bound.expectedOutcome });
+    const physicalEffect = predictPhysicalEffect({ semantics, control, candidate: bound, goal: { ...goal, outcomeContract } });
+    const expectedOutcome = compileTypedExpectedOutcome({ ...bound, physicalEffect, goal: { ...goal, outcomeContract } }, page);
+    const semanticIntent = semanticIntentForAction({
+      mechanicalEffect: physicalEffect,
+      control,
+      candidate: bound,
+      goal,
+      observation
+    });
+    const expectedPostconditions = expectedPostconditionsForAction({
+      expectedOutcome,
+      semanticIntent,
+      mechanicalEffect: physicalEffect,
+      goal
+    });
+    const outcomeCompatibility = assessOutcomeCompatibility({
+      goal,
+      durableObjective: parentOutcomeContract,
+      mechanicalEffect: physicalEffect,
+      semanticIntent,
+      expectedPostconditions,
+      candidate: bound,
+      control,
+      observation
+    });
+    const affordance = buildSemanticAffordance({
+      candidate: { ...bound, physicalEffect, mechanicalEffect: physicalEffect, semanticIntent, expectedPostconditions },
+      control,
+      goal: { ...goal, outcomeContract },
+      postcondition: expectedOutcome
+    });
     const actionabilityFailure = candidateActionabilityFailure(bound, control);
     const grounded = {
       ...bound,
+      // A visible foreground surface owns the next click. TaskState remains
+      // useful planning context, but it cannot hide a grounded safe control
+      // merely because its predicted semantic effect is incomplete/unknown.
+      goalRelevant: foregroundOwnsSelection
+        ? relevantToVisibleSurface(goal, bound, allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)))
+        : allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)),
+      risk: bound.risk || (goal.kind === "profile_field" ? "safe" : "uncertain"),
+      requiresApproval: Boolean(bound.requiresApproval),
       expectedOutcome,
+      expectedPostconditions,
+      physicalEffect,
+      mechanicalEffect: physicalEffect,
+      semanticIntent,
+      outcomeContract,
+      parentOutcomeContract,
+      outcomeCompatibility: outcomeCompatibility.status,
+      outcomeCompatibilityReason: outcomeCompatibility.reason,
       affordance,
       requiresJudgment: Boolean(bound.requiresJudgment || bound.risk === "uncertain")
     };
     const policyState = state && Object.keys(state).length
       ? {
-          ...state,
-          requirements: Array.isArray(state.requirements) ? state.requirements : [],
+          taskState: state.taskState || null,
+          approvals: state.approvals || {},
           priceHistory: Array.isArray(state.priceHistory) ? state.priceHistory : []
         }
       : null;
@@ -138,21 +239,39 @@ function buildCurrentCandidateSet({
           : ""
     };
   });
-  const excludedCandidates = current.filter((candidate) => (
+  const excludedCandidates = current.filter((candidate) => candidate.goalRelevant && (
     Boolean(candidate.exclusionReason)
-    || attempted.has(candidate.candidateId)
-    || attempted.has(candidate.strategyId)
-    || attemptedStrategies.has(actuatorSignature(candidate))
+      || attempted.has(candidate.candidateId)
+      || attempted.has(candidate.strategyId)
+      || attemptedStrategies.has(actuatorSignature(candidate))
   ));
+  const selectable = current.filter((candidate) => {
+    if (!candidate.goalRelevant) return false;
+    const hardExclusion = controlUnavailable((page.controls || []).find((item) => item.controlId === candidate.controlId) || {})
+      || ["CONTROL_UNAVAILABLE", "ACTIONABILITY_UNPROVEN", "TARGET_NOT_ACTIONABLE", "TARGET_NOT_REVEALABLE"].includes(candidate.exclusionReason);
+    if (hardExclusion) return false;
+    if (candidate.exclusionReason) return false;
+    const nonMutating = ["ask_user", "wait"].includes(candidate.type);
+    if (!nonMutating && (candidate.risk !== "safe" || candidate.requiresApproval)) return false;
+    return !attempted.has(candidate.candidateId)
+      && !attempted.has(candidate.strategyId)
+      && !attemptedStrategies.has(actuatorSignature(candidate));
+  });
+  const selectableIds = new Set(selectable.map((candidate) => candidate.candidateId));
   return {
     ...binding,
+    // Context is complete; selection is policy-safe. The model can understand
+    // blocked controls without receiving their IDs in its selectable enum.
+    contextCapabilities: current.map((candidate) => ({
+      ...candidate,
+      capabilityId: capabilityKey(candidate),
+      policyStatus: candidate.policyDecision?.allow === true
+        ? (candidate.goalRelevant ? "allowed" : "context_only")
+        : String(candidate.policyDecision?.decision || "denied"),
+      selectable: selectableIds.has(candidate.candidateId)
+    })),
     excludedCandidates,
-    candidates: current.filter((candidate) => (
-      !candidate.exclusionReason
-      && !attempted.has(candidate.candidateId)
-      && !attempted.has(candidate.strategyId)
-      && !attemptedStrategies.has(actuatorSignature(candidate))
-    ))
+    candidates: selectable
   };
 }
 
@@ -169,6 +288,11 @@ function actionForCurrentCandidate(goal = {}, candidate = {}, observation = {}) 
     interactionRole: candidate.interactionRole || action.interactionRole || "",
     semanticEffect: candidate.semanticEffect || action.semanticEffect || "",
     expectedEvidence: candidate.expectedEvidence || action.expectedEvidence || "",
+    physicalEffect: candidate.physicalEffect || candidate.affordance?.physicalEffect || action.affordance?.physicalEffect || "",
+    mechanicalEffect: candidate.mechanicalEffect || candidate.physicalEffect || candidate.affordance?.mechanicalEffect || action.affordance?.mechanicalEffect || "",
+    semanticIntent: candidate.semanticIntent || action.semanticIntent || action.intent || "",
+    expectedPostconditions: candidate.expectedPostconditions || action.expectedPostconditions || (candidate.expectedOutcome ? [candidate.expectedOutcome] : []),
+    outcomeCompatibility: candidate.outcomeCompatibility || "unknown",
     affordance: candidate.affordance || action.affordance || null
   };
 }

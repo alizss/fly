@@ -83,19 +83,7 @@ function exactDecisionGroupId(goal = {}) {
 function previousResolvedOutcome(state = {}, family = "unknown", goal = {}) {
   const groupId = exactDecisionGroupId(goal);
   if (!groupId) return null;
-  const previous = state.currentObligation?.userOutcome;
-  if (previous
-    && previous.semanticFamily === family
-    && String(previous.decisionGroupId || previous.requirementId || "") === groupId
-    && RESOLVED.has(previous.status)) return previous;
-  const lifecycleOutcome = (state.requirementLifecycle || []).find((item) => (
-    semanticFamily(item) === family
-    && String(item.decisionGroupId || item.requirementId || item.id || "") === groupId
-    && (item.desiredDisposition === "decline" || item.status === "waived_by_policy")
-    && RESOLVED.has(item.lifecycleStatus || item.status)
-  )) || null;
-  if (lifecycleOutcome) return lifecycleOutcome;
-  return (state.decisionCompletions || []).find((item) => (
+  return (state.taskState?.completedOutcomes || []).find((item) => (
     String(item.decisionGroupId || item.requirementId || "") === groupId
     && RESOLVED.has(item.status)
   )) || null;
@@ -105,14 +93,13 @@ function transitionResolvedOutcome(state = {}, transition = null, family = "unkn
   if (transition?.status !== "achieved") return false;
   const groupId = exactDecisionGroupId(goal);
   if (!groupId) return false;
-  const previousFamily = state.currentObligation?.userOutcome?.semanticFamily
-    || semanticFamily(state.currentGoal || {});
+  const previousFamily = semanticFamily(state.taskState?.currentGoal || {});
   if (previousFamily !== family) return false;
   const action = state.lastAction || {};
   const actionGroupId = String(action.decisionGroupId || action.requirementId || action.expectedOutcome?.decisionGroupId || "");
   if (actionGroupId !== groupId) return false;
   return action.semanticEffect === "waive"
-    || ["select_free_option", "skip_current_item", "dismiss_surface"].includes(action.affordance?.effect)
+    || (action.affordance?.physicalEffect || action.affordance?.effect) === "select_free_option"
     || action.expectedOutcome?.expectedDisposition === "decline_free_no_extra";
 }
 

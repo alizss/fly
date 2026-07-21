@@ -103,6 +103,7 @@
     lastActionResult: null,
     lastBackendDebug: null,
     pageMap: null,
+    lastPageMutationAt: Date.now(),
     pageUnderstanding: null,
     observerTab: "summary",
     lifecycleId: 0,
@@ -199,8 +200,19 @@
   }
 
   function rememberPagePlan(map) {
-    agent.sectionPlan = map?.sections || [];
-    agent.taskQueue = map?.taskQueue || [];
+    agent.sectionPlan = (map?.sections || []).map((section) => ({
+      id: section.id,
+      label: section.label,
+      type: section.type,
+      controlIds: uniqueControlIds([
+        ...(section.fields || []),
+        ...(section.choices || []),
+        ...(section.buttons || [])
+      ])
+    }));
+    // Legacy extension task queues are diagnostic-only and are no longer
+    // allowed to compete with the backend TaskState reducer.
+    agent.taskQueue = [];
     return map;
   }
 
@@ -1360,7 +1372,9 @@
       label,
       url: location.href,
       site: map.site,
-      step: map.step,
+      // The extension reports observed facts and capabilities only. Checkout
+      // stage is reduced authoritatively by the backend from this payload.
+      step: "unknown",
       signature: pageSignature(map).slice(0, 900),
       snapshotHash: observationHashForMap(map),
       graphIntegrity: map.graphIntegrity || null,
@@ -1618,13 +1632,10 @@
       || verification.code === "STAGE_CHANGED"
       || verification.code === "OBSERVABLE_CHANGE"
     );
-    const postconditionSatisfied = Boolean(
-      verification.ok
-      && (
-        ["normalized_value_changed", "field_value_changed", "control_selected"].includes(expectedOutcome.type)
-        || verification.evidence?.goalSatisfied === true
-      )
-    );
+    // This flag describes only the browser-local postcondition. Durable parent
+    // progress is evaluated by TaskState after the fresh observation, so the
+    // result can never claim verified=true while postconditionSatisfied=false.
+    const postconditionSatisfied = Boolean(verification.ok);
     const result = {
       at: new Date().toISOString(),
       actionId,
@@ -1633,6 +1644,9 @@
       observationHash: decision.observationHash || "",
       requirementId: decision.requirementId || "",
       intent: decision.intent || "",
+      semanticIntent: decision.semanticIntent || decision.intent || "",
+      mechanicalEffect: decision.mechanicalEffect || decision.physicalEffect || "",
+      expectedPostconditions: Array.isArray(decision.expectedPostconditions) ? decision.expectedPostconditions : [],
       operation: decision.operation || "",
       goalId: decision.goalId || "",
       candidateId: decision.candidateId || "",
@@ -1655,6 +1669,9 @@
         id: decision.actionId || decision.id || actionId,
         action: decision.action || "",
         intent: decision.intent || "",
+        semanticIntent: decision.semanticIntent || decision.intent || "",
+        mechanicalEffect: decision.mechanicalEffect || decision.physicalEffect || "",
+        expectedPostconditions: Array.isArray(decision.expectedPostconditions) ? decision.expectedPostconditions : [],
         operation: decision.operation || "",
         controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
         targetId: decision.targetId || "",
@@ -1693,6 +1710,9 @@
       observationHash: decision.observationHash || "",
       requirementId: decision.requirementId || "",
       intent: decision.intent || "",
+      semanticIntent: decision.semanticIntent || decision.intent || "",
+      mechanicalEffect: decision.mechanicalEffect || decision.physicalEffect || "",
+      expectedPostconditions: Array.isArray(decision.expectedPostconditions) ? decision.expectedPostconditions : [],
       operation: decision.operation || "",
       goalId: decision.goalId || "",
       candidateId: decision.candidateId || "",
@@ -1714,6 +1734,9 @@
         id: decision.actionId || decision.id || actionId,
         action: decision.action || "",
         intent: decision.intent || "",
+        semanticIntent: decision.semanticIntent || decision.intent || "",
+        mechanicalEffect: decision.mechanicalEffect || decision.physicalEffect || "",
+        expectedPostconditions: Array.isArray(decision.expectedPostconditions) ? decision.expectedPostconditions : [],
         operation: decision.operation || "",
         controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
         targetId: decision.targetId || "",
@@ -2411,6 +2434,77 @@
       if (label && !/^(on|true|false)$/i.test(label)) return compactText(label, 220);
     }
     return "";
+  }
+
+  function controlOwnedText(element) {
+    if (!element) return "";
+    const role = implicitRole(element);
+    const tag = String(element.tagName || "").toLowerCase();
+    if (!/button|option|link/.test(`${role} ${tag}`)) return "";
+    return compactText(element.innerText || element.textContent || "", 220);
+  }
+
+  function controlOwnedEvidence(element) {
+    const form = element?.form || element?.closest?.("form") || null;
+    return {
+      testId: compactText(element?.getAttribute?.("data-testid") || element?.getAttribute?.("data-test-id") || element?.getAttribute?.("data-test") || "", 160),
+      formAction: compactText(element?.getAttribute?.("formaction") || form?.getAttribute?.("action") || "", 300),
+      formMethod: compactText(element?.getAttribute?.("formmethod") || form?.getAttribute?.("method") || "", 40).toLowerCase(),
+      formId: compactText(form?.getAttribute?.("id") || form?.getAttribute?.("name") || "", 160),
+      ownText: controlOwnedText(element),
+      ariaLabel: compactText(element?.getAttribute?.("aria-label") || "", 220),
+      title: compactText(element?.getAttribute?.("title") || "", 220),
+      tagName: String(element?.tagName || "").toLowerCase(),
+      role: String(implicitRole(element) || "").toLowerCase(),
+      type: compactText(element?.getAttribute?.("type") || "", 40).toLowerCase(),
+      iconOnly: Boolean(element?.querySelector?.("svg, [class*='icon'], [data-icon]") && !controlOwnedText(element))
+    };
+  }
+
+  function resolveOwnedControlMeaning(evidence = {}, fallbackSemantic = "", surfaceType = "page") {
+    const identity = `${evidence.testId || ""} ${evidence.formId || ""} ${evidence.formAction || ""}`.trim().toLowerCase();
+    const ownMeaning = `${evidence.ownText || ""} ${evidence.title || ""}`.trim().toLowerCase();
+    const accessibleHint = String(evidence.ariaLabel || "").trim().toLowerCase();
+    const strongDismiss = /(?:^|[-_])(dialog|modal|seatmap)?[-_]?close(?:$|[-_])|dismiss|close-button/.test(identity)
+      || /^(close|dismiss)( window| dialog| modal)?$/.test(ownMeaning)
+      || (evidence.iconOnly && /^(close|dismiss|x)$/.test(accessibleHint));
+    const strongAdvance = /submit|continue|proceed|next|saveandcontinue|payment/.test(identity)
+      || evidence.type === "submit"
+      || /^(continue|next|proceed|submit)( to payment)?$/.test(ownMeaning);
+    const strongOpen = /edit|change|open/.test(identity)
+      || /^(edit|change|open)\b/.test(ownMeaning);
+    const choiceControl = /radio|checkbox|option/.test(`${evidence.role || ""} ${evidence.type || ""}`);
+    const explicitDeclineCommand = /^(?:no,?\s*thanks|not now|skip|decline|(?:i(?:'|’)ll )?go without|continue without|without)\b/.test(ownMeaning);
+
+    // Conflicting structural identities are not guessed. A misleading ARIA
+    // label alone is contextual evidence and cannot overwrite test-id/form/
+    // own-text identity (for example an icon X labelled by its parent CTA).
+    if (strongDismiss && (evidence.type === "submit" || /submit|payment/.test(identity))) {
+      return { semantic: "unknown", physicalEffect: "unknown", conflict: true };
+    }
+    if (strongDismiss) return { semantic: "dismiss_surface", physicalEffect: "dismiss_surface", conflict: false };
+    if (strongOpen) return { semantic: "open_surface", physicalEffect: "open_surface", conflict: false };
+    if (strongAdvance) {
+      const checkoutStage = /payment/.test(`${identity} ${ownMeaning}`) || surfaceType === "page";
+      return {
+        semantic: "continue",
+        physicalEffect: checkoutStage ? "advance_checkout_stage" : "advance_surface",
+        conflict: false
+      };
+    }
+    if (/decline_paid_extra|decline_baggage|safe_decline|select_free_option/.test(fallbackSemantic)) {
+      if (!choiceControl && surfaceType !== "page" && explicitDeclineCommand) {
+        return { semantic: fallbackSemantic, physicalEffect: "dismiss_surface", conflict: false };
+      }
+      return { semantic: fallbackSemantic, physicalEffect: "select_free_option", conflict: false };
+    }
+    if (/add_paid_extra|select_paid_option/.test(fallbackSemantic)) {
+      return { semantic: fallbackSemantic, physicalEffect: "select_paid_option", conflict: false };
+    }
+    if (/email|phone|name|date_of_birth|passport|field/.test(fallbackSemantic)) {
+      return { semantic: fallbackSemantic, physicalEffect: "set_field_value", conflict: false };
+    }
+    return { semantic: fallbackSemantic || "unknown", physicalEffect: "unknown", conflict: false };
   }
 
   function textFromIds(ids = "") {
@@ -3923,6 +4017,7 @@
     const wrapper = controlWrapperForElement(element, stateElement);
     const activationElement = labelElement || clickableAncestor(element) || clickableAncestor(wrapper) || stateElement;
     const kind = controlKindForElement(stateElement);
+    const ownedEvidence = controlOwnedEvidence(stateElement);
     const directName = directControlName(stateElement) || directControlName(element);
     const label = compactText(
       kind === "button"
@@ -3936,11 +4031,28 @@
           || controlText(stateElement)),
       220
     );
-    const semantic = /radio|checkbox|option/.test(kind) ? semanticChoiceType(label) : (semanticFieldType({ label, kind, field: context.field || "" }) || semanticChoiceType(label));
+    const fieldSemantic = semanticFieldType({ label, kind, field: context.field || "" });
     const sectionType = context.sectionType || context.section?.type || "";
     const sectionLabel = context.sectionLabel || context.section?.label || "";
     const sectionId = context.sectionId || context.section?.id || "";
     const surface = context.surface || {};
+    const fallbackSemantic = /radio|checkbox|option/.test(kind)
+      ? semanticChoiceType(label)
+      : (fieldSemantic !== "unknown" ? fieldSemantic : semanticChoiceType(label));
+    const ownedMeaning = resolveOwnedControlMeaning(ownedEvidence, fallbackSemantic, surface.type || "page");
+    const structuredPrice = structuredPriceFromText(label);
+    const choiceControl = /radio|checkbox|option|choice/.test(`${kind || ""} ${ownedEvidence.role || ""} ${ownedEvidence.type || ""} ${fallbackSemantic || ""}`.toLowerCase());
+    let physicalEffect = ownedMeaning.physicalEffect === "unknown" && choiceControl && Number(structuredPrice?.amount) === 0
+      ? "select_free_option"
+      : ownedMeaning.physicalEffect === "unknown" && choiceControl && Number(structuredPrice?.amount) > 0
+        ? "select_paid_option"
+        : ownedMeaning.physicalEffect;
+    if (surface.surfaceClass === "warning"
+      && surfaceLooksLikeSeatSkip(surface)
+      && /^(continue|next|proceed|go without|continue without)\b/i.test(label)) {
+      physicalEffect = "dismiss_surface";
+    }
+    const semantic = ownedMeaning.semantic || fallbackSemantic || "unknown";
     const surfaceDecisionGroupId = surface?.type && surface.type !== "page"
       ? (surface.decisionGroupId || decisionGroupIdForContext({ sectionType: surface.taskHint || surface.type || "", sectionLabel: surface.parentSectionLabel || surface.label || surface.taskHint || "" }))
       : "";
@@ -4044,13 +4156,23 @@
       meaning: semantic || label,
       label,
       accessibleName: accessibleName(stateElement) || accessibleName(element),
+      testId: ownedEvidence.testId,
+      formAction: ownedEvidence.formAction,
+      formMethod: ownedEvidence.formMethod,
+      formId: ownedEvidence.formId,
+      ownText: ownedEvidence.ownText,
+      ariaLabel: ownedEvidence.ariaLabel,
+      title: ownedEvidence.title,
+      iconOnly: ownedEvidence.iconOnly,
       kind,
       role: perceptionRole,
       domRole,
       semantic,
       semanticIntent: semantic,
+      physicalEffect: physicalEffect || "unknown",
+      semanticConflict: ownedMeaning.conflict === true,
       risk: choiceRisk(label),
-      structuredPrice: structuredPriceFromText(label),
+      structuredPrice,
       dateField,
       state,
       currentValue: state.normalizedValue || state.valueText || "",
@@ -4100,6 +4222,7 @@
     model.visualRegions = control.visualRegions || [];
     model.semantic = model.semantic || control.semantic;
     model.semanticIntent = model.semanticIntent || control.semanticIntent || control.semantic;
+    model.physicalEffect = control.physicalEffect || model.physicalEffect || "unknown";
     model.risk = control.risk || model.risk;
     model.role = control.role || model.role;
     model.domRole = control.domRole || model.domRole || "";
@@ -4431,10 +4554,24 @@
         return groups;
       })
       .slice(0, 80);
-    const surfaceGroups = activeSurface?.type && activeSurface.type !== "page" && Array.isArray(activeSurface.options) && activeSurface.options.length
+    const structuralSurfaceChoices = (activeSurface?.options || []).filter((option) => (
+      option.choiceStructure === true
+      || /radio|checkbox|option/.test(String(option.accessibility?.role || "").toLowerCase())
+    ));
+    const surfaceDecisionOptions = structuralSurfaceChoices.length
+      ? (activeSurface?.options || []).filter((option) => (
+          option.choiceStructure === true
+          || /radio|checkbox|option/.test(String(option.accessibility?.role || "").toLowerCase())
+          || ["select_free_option", "select_paid_option"].includes(option.physicalEffect)
+        ))
+      : [];
+    // A surface is not a decision merely because it contains several
+    // commands. Only actual mutually-exclusive choice capabilities form a
+    // decision group; review/edit/close/continue commands remain capabilities.
+    const surfaceGroups = activeSurface?.type && activeSurface.type !== "page" && surfaceDecisionOptions.length >= 2
       ? [(() => {
           const decisionGroupId = activeSurface.decisionGroupId || decisionGroupIdForContext({ sectionType: activeSurface.taskHint || activeSurface.type || "", sectionLabel: activeSurface.parentSectionLabel || activeSurface.label || activeSurface.taskHint || "" });
-          const alternatives = (activeSurface.options || []).map((option) => {
+          const alternatives = surfaceDecisionOptions.map((option) => {
             const control = byControlId.get(option.controlId) || {};
             const selected = Boolean(option.selected || control.selected || control.state?.checked || control.state?.selected);
             return {
@@ -4442,6 +4579,7 @@
               targetId: option.id || control.preferredActivationElementId || control.stateElementId || "",
               label: option.label || control.label || "",
               semantic: option.semantic || control.semantic || "",
+              physicalEffect: option.physicalEffect || control.physicalEffect || "unknown",
               risk: option.risk || control.risk || "",
               selected,
               priceText: (option.label || "").match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
@@ -4455,8 +4593,10 @@
             sectionType: activeSurface.parentSectionType || activeSurface.taskHint || activeSurface.type || "",
             sectionLabel: activeSurface.parentSectionLabel || activeSurface.label || activeSurface.taskHint || "",
             requirementId: activeSurface.taskHint || activeSurface.parentSectionType || activeSurface.type || activeSurface.id || "",
-            required: true,
-            status: selected ? "satisfied" : "missing",
+            required: surfaceDecisionOptions.some((option) => option.accessibility?.required === true || option.accessibility?.state?.required === true),
+            status: selected
+              ? "satisfied"
+              : (surfaceDecisionOptions.some((option) => option.accessibility?.required === true || option.accessibility?.state?.required === true) ? "missing" : "optional"),
             selectedControlId: selected?.controlId || "",
             selectedLabel: selected?.label || "",
             selectedSemantic: selected?.semantic || "",
@@ -5687,6 +5827,28 @@
         }
       };
     }
+    if (expected.type === "current_surface_advanced") {
+      const stepChanged = beforeMap.step !== afterMap.step;
+      const urlChanged = String(beforeMap.url || "") !== String(afterMap.url || location.href);
+      const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged || (surfaceChanged && !overlayAppeared));
+      return {
+        ok,
+        code: ok ? "CURRENT_SURFACE_ADVANCED" : "CURRENT_SURFACE_NOT_ADVANCED",
+        message: ok ? "The current surface produced fresh forward-progress evidence." : "The current surface did not produce forward-progress evidence.",
+        evidence: { ...evidence, stepChanged, urlChanged, progressMarkerChanged, surfaceChanged, overlayAppeared }
+      };
+    }
+    if (expected.type === "checkout_stage_advanced") {
+      const stepChanged = beforeMap.step !== afterMap.step;
+      const urlChanged = String(beforeMap.url || "") !== String(afterMap.url || location.href);
+      const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged);
+      return {
+        ok,
+        code: ok ? "CHECKOUT_STAGE_ADVANCED" : "CHECKOUT_STAGE_NOT_ADVANCED",
+        message: ok ? "Fresh stage, URL, or progress-marker evidence proves checkout advanced." : "No fresh checkout-stage evidence was observed.",
+        evidence: { ...evidence, stepChanged, urlChanged, progressMarkerChanged, overlayAppeared, surfaceChanged }
+      };
+    }
     if (expected.type === "stage_exit_or_feedback") {
       const errors = actionableCheckoutErrors(afterMap.errors || []);
       const blockers = stageExitBlockers(afterMap, expected);
@@ -6047,6 +6209,31 @@
       iframes: iframes.length,
       accessibleIframes,
       blockedIframes: Math.max(0, iframes.length - accessibleIframes)
+    };
+  }
+
+  function pageReadinessFacts() {
+    const loadingSelectors = [
+      "[aria-busy='true']",
+      "[role='progressbar']",
+      "[data-loading='true']",
+      "[data-testid*='loading']",
+      ".loading",
+      ".loader",
+      ".spinner",
+      "[class*='skeleton']"
+    ].join(",");
+    const loadingIndicators = queryAllDeep(loadingSelectors)
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar, #atw-agent-cursor"));
+    const main = queryAllDeep("main, [role='main']").find((element) => isVisible(element)) || document.body;
+    const mainText = compactText(main?.innerText || main?.textContent || "", 10_000);
+    return {
+      documentReadyState: document.readyState || "unknown",
+      ariaBusy: Boolean(queryAllDeep("[aria-busy='true']").some((element) => isVisible(element))),
+      loadingIndicatorCount: loadingIndicators.length,
+      mainTextLength: mainText.length,
+      visibleMainCount: queryAllDeep("main, [role='main']").filter(isVisible).length,
+      stableForMs: Math.max(0, Date.now() - Number(agent.lastPageMutationAt || Date.now()))
     };
   }
 
@@ -6700,6 +6887,31 @@
     };
   }
 
+  function classifySurfaceSemantics(overlay, options = [], type = "popover") {
+    const localText = compactText(overlayText(overlay), 1200).toLowerCase();
+    const structuralChoices = options.filter((option) => (
+      option.choiceStructure === true
+      || /radio|checkbox|option/.test(String(option.accessibility?.role || "").toLowerCase())
+    ));
+    const choiceOptions = structuralChoices.length
+      ? options.filter((option) => (
+          option.choiceStructure === true
+          || /radio|checkbox|option/.test(String(option.accessibility?.role || "").toLowerCase())
+          || ["select_free_option", "select_paid_option"].includes(option.physicalEffect)
+        ))
+      : [];
+    const fieldCount = overlay?.querySelectorAll?.("input:not([type='hidden']), select, textarea")?.length || 0;
+    const effects = new Set(options.map((option) => option.physicalEffect).filter(Boolean));
+    if (choiceOptions.length >= 2) return "choice_set";
+    if (fieldCount > 0) return "form";
+    if (/review|verify|check your (details|information)/.test(localText)
+      && (effects.has("advance_surface") || effects.has("advance_checkout_stage"))) return "review_confirmation";
+    if (/warning|are you sure|attention|unable|problem|error|continue without|haven.?t selected a seat|not selected.*seat|seat.*not selected|without.*seat|skip seat selection/.test(localText)) return "warning";
+    if (effects.has("advance_surface") || effects.has("advance_checkout_stage")) return "navigation";
+    if (type !== "page" && options.length === 0) return "information";
+    return "unknown";
+  }
+
   function buildActiveSurface(overlays = activeOverlayElements(), sections = [], taskQueue = []) {
     const overlay = overlays[0];
     if (!overlay) {
@@ -6723,11 +6935,29 @@
     const parentContext = inferSurfaceParentDecisionContext(overlay, sections);
     const options = surfaceActionElements(overlay).map((option) => {
       const label = overlayChoiceText(option);
+      const ownedEvidence = controlOwnedEvidence(option);
+      const fallbackSemantic = overlayOptionSemantic(label);
+      const meaning = resolveOwnedControlMeaning(ownedEvidence, fallbackSemantic, type);
       const box = elementBox(option);
+      const choiceStructure = Boolean(
+        option.matches?.("input[type='radio'], input[type='checkbox'], [role='option']")
+        || option.querySelector?.("input[type='radio'], input[type='checkbox'], [role='option']")
+      );
       return {
         id: elementId(option),
         label,
-        semantic: overlayOptionSemantic(label),
+        semantic: meaning.semantic,
+        physicalEffect: meaning.physicalEffect,
+        semanticConflict: meaning.conflict === true,
+        testId: ownedEvidence.testId,
+        formAction: ownedEvidence.formAction,
+        formMethod: ownedEvidence.formMethod,
+        formId: ownedEvidence.formId,
+        ownText: ownedEvidence.ownText,
+        ariaLabel: ownedEvidence.ariaLabel,
+        title: ownedEvidence.title,
+        iconOnly: ownedEvidence.iconOnly,
+        choiceStructure,
         risk: overlayOptionRisk(label),
         selected: isChoiceSelected(option) || option.getAttribute?.("aria-selected") === "true",
         decisionGroupId: parentContext.decisionGroupId || "",
@@ -6747,7 +6977,8 @@
       ...options.filter((option) => NAV_CONTROL_LABEL.test(option.label)),
       ...options.filter((option) => !NAV_CONTROL_LABEL.test(option.label))
     ];
-    const surface = {
+    const surfaceClass = classifySurfaceSemantics(overlay, prioritized, type);
+    let surface = {
       type,
       id: elementId(overlay),
       decisionGroupId: parentContext.decisionGroupId || "",
@@ -6759,11 +6990,20 @@
       label: text.slice(0, 800),
       role,
       taskHint: parentContext.parentSectionType || "",
+      surfaceClass,
       options: prioritized,
       buttons: prioritized,
       box: elementBox(overlay),
       accessibility: accessibilityNode(overlay, map)
     };
+    if (surface.surfaceClass === "warning" && surfaceLooksLikeSeatSkip(surface)) {
+      const corrected = surface.options.map((option) => (
+        /^(continue|next|proceed|go without|continue without)\b/i.test(option.label || "")
+          ? { ...option, physicalEffect: "dismiss_surface" }
+          : option
+      ));
+      surface = { ...surface, options: corrected, buttons: corrected };
+    }
     return {
       ...surface,
       visualState: foregroundSurfaceState(surface)
@@ -6940,6 +7180,7 @@
       text,
       fullText,
       coverage: pageCoverage(),
+      readiness: pageReadinessFacts(),
       fields,
       buttons,
       overlays,
@@ -7276,6 +7517,7 @@
       label: surface.label || "",
       role: surface.role || "",
       taskHint: surface.taskHint || "",
+      surfaceClass: surface.surfaceClass || "unknown",
       blocksBackground: Boolean(surface.blocksBackground),
       parentSurfaceId: surface.parentSurfaceId || "",
       observationId: surface.observationId || "",
@@ -7299,7 +7541,7 @@
     return {
       site: map.site,
       url: location.href,
-      step: map.step,
+      step: "unknown",
       viewport: {
         width: window.innerWidth,
         height: window.innerHeight,
@@ -7331,11 +7573,21 @@
         decisionGroupId: control.decisionGroupId || "",
         label: control.label,
         accessibleName: control.accessibleName,
+        testId: control.testId || "",
+        formAction: control.formAction || "",
+        formMethod: control.formMethod || "",
+        formId: control.formId || "",
+        ownText: control.ownText || "",
+        ariaLabel: control.ariaLabel || "",
+        title: control.title || "",
+        iconOnly: Boolean(control.iconOnly),
         kind: control.kind,
         field: control.field || "",
         role: control.role,
         domRole: control.domRole || "",
         semantic: control.semantic,
+        physicalEffect: control.physicalEffect || "unknown",
+        semanticConflict: Boolean(control.semanticConflict),
         risk: control.risk,
         state: control.state,
         currentValue: control.currentValue || "",
@@ -7399,11 +7651,8 @@
         label: section.label,
         type: section.type,
         order: section.order,
-        status: section.status,
         required: Boolean(section.required),
         paidChoice: Boolean(section.paidChoice),
-        objective: section.objective,
-        selected: section.selected || [],
         controlIds: uniqueControlIds([
           ...(section.fields || []),
           ...(section.choices || []),
@@ -7412,9 +7661,16 @@
         box: section.box,
         text: section.text
       })),
-      stageExit: map.stageExit || {},
-      summary: map.summary,
+      summary: {
+        fields: map.fields?.length || 0,
+        buttons: map.buttons?.length || 0,
+        controls: map.controls?.length || 0,
+        decisionGroups: map.decisionGroups?.length || 0,
+        overlays: map.overlays?.length || 0,
+        priceText: map.priceText || ""
+      },
       coverage: map.coverage,
+      readiness: map.readiness || {},
       currentSurface: compactSurfaceReference(map.currentSurface || {
         type: "page",
         id: "surface-page",
@@ -9755,6 +10011,7 @@
   function watchForCheckoutChanges() {
     const observer = new MutationObserver((mutations) => {
       const pageChanged = mutations.some((mutation) => !mutation.target.closest?.("#atw-sidebar"));
+      if (pageChanged) agent.lastPageMutationAt = Date.now();
       if (!pageChanged || renderTimer) return;
       renderTimer = setTimeout(() => {
         renderTimer = null;

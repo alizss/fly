@@ -40,7 +40,7 @@
  * @property {string[]} travelerIds
  * @property {{host: string, url: string, sellerName?: string}} site
  * @property {CheckoutStep} currentStep
- * @property {import("../requirements").CheckoutRequirement[]} requirements
+ * @property {{diagnosticOnly: true, requirements: import("../requirements").CheckoutRequirement[]}} legacyRequirementsDiagnostic
  * @property {ApprovalState} approvals
  * @property {PriceSnapshot[]} priceHistory
  * @property {SelectedOption[]} selectedOptions
@@ -50,12 +50,11 @@
  * @property {string[]} traceIds
  * @property {string} currentObservationId
  * @property {string} currentObservationHash
- * @property {Object[]} requirementLifecycle
- * @property {Object[]} decisionCompletions
- * @property {Object[]} activeRequirements
  * @property {Object|null} currentObservation
  * @property {Object|null} currentGoal
  * @property {Object|null} currentObligation
+ * @property {Object|null} taskState
+ * @property {Object} observationReadiness
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
  * @property {string[]} attemptedCandidateIds
@@ -95,13 +94,19 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     userPolicy: {},
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
     currentStep: "unknown",
-    requirements: [],
-    requirementLifecycle: [],
-    decisionCompletions: [],
-    activeRequirements: [],
+    legacyRequirementsDiagnostic: { diagnosticOnly: true, requirements: [] },
     currentObservation: null,
     currentGoal: null,
     currentObligation: null,
+    taskState: null,
+    observationReadiness: {
+      classification: "READY",
+      key: "",
+      attempts: 0,
+      maxAttempts: 3,
+      reason: "",
+      evidence: null
+    },
     pendingAction: null,
     actionLifecycle: null,
     attemptedCandidateIds: [],

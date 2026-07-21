@@ -110,6 +110,12 @@ function pendingDeclineContext(observation, state, traveler) {
   const candidateSet = buildCurrentCandidateSet({ goal, observation, traveler, state, approvals: state.approvals });
   const currentGoal = { ...goal, candidateSet, candidates: candidateSet.candidates };
   state.currentGoal = currentGoal;
+  state.taskState = {
+    stage: "extras",
+    currentGoal,
+    activeDecisions: [],
+    validationBlockers: []
+  };
   return { goal: currentGoal, candidate: candidateSet.candidates[0] };
 }
 
@@ -1056,6 +1062,13 @@ test("P0.4 governor blocks baggage and extras while the profile skill is incompl
     label: "Email",
     candidates: []
   };
+  state.taskState = {
+    stage: "traveler_information",
+    currentGoal: state.currentGoal,
+    activeDecisions: [],
+    validationBlockers: [],
+    profileReadiness: { ready: false, unresolvedKnown: [{ label: "Email" }], unresolvedRequired: [], visibleErrors: [] }
+  };
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -1116,6 +1129,12 @@ test("P0.5/P0.6 governor blocks phone while country-code prerequisite owns the p
   });
   state.id = "txn_country_dependency";
   state.currentGoal = deriveProfileGoal(observation, traveler);
+  state.taskState = {
+    stage: "traveler_information",
+    currentGoal: state.currentGoal,
+    activeDecisions: [],
+    validationBlockers: []
+  };
   assert.equal(state.currentGoal.semanticType, "phone_country_code");
   const phoneControl = observation.page.controls.find((control) => control.semantic === "phone");
 
@@ -1217,6 +1236,12 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
   state.id = "txn_visual_country";
   state.currentGoal = deriveProfileGoal(observation, traveler);
   state.currentGoal.candidates = candidatesForProfileGoal(state.currentGoal, observation, traveler);
+  state.taskState = {
+    stage: "traveler_information",
+    currentGoal: state.currentGoal,
+    activeDecisions: [],
+    validationBlockers: []
+  };
   const candidate = state.currentGoal.candidates.find((item) => item.type === "click_xy");
   assert.ok(candidate);
 
@@ -1662,7 +1687,7 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
   assert.equal(result.clientDecision.action, "click");
   assert.equal(result.clientDecision.controlId, "ctrl_decline");
   assert.equal(result.clientDecision.targetId, "el_decline");
-  assert.equal(result.clientDecision.expectedOutcome.type, "command_acknowledged");
+  assert.equal(result.clientDecision.expectedOutcome.type, "exact_free_option_selected");
   assert.equal(result.state.pendingAction.schemaVersion, 2);
   assert.equal(result.state.pendingAction.status, "ready");
   assert.equal(result.state.pendingAction.originalAction.id, result.clientDecision.actionId);
