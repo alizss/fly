@@ -30,6 +30,31 @@ const PROFILE_FIELDS = new Set([
   "document_expiry"
 ]);
 
+const PROFILE_FIELD_ALIASES = new Map(Object.entries({
+  title: ["title", "traveler_title", "traveller_title", "salutation", "gender_title", "honorific"],
+  gender: ["gender", "sex"],
+  first_name: ["first_name", "firstname", "given_name", "given_names", "forename"],
+  middle_name: ["middle_name", "middlename"],
+  last_name: ["last_name", "lastname", "surname", "family_name"],
+  full_name: ["full_name", "fullname", "passenger_name", "traveler_name", "traveller_name"],
+  email: ["email", "email_address", "e_mail"],
+  confirm_email: ["confirm_email", "email_confirmation", "repeat_email", "confirm_email_address"],
+  phone: ["phone", "phone_number", "mobile", "mobile_number", "telephone", "tel"],
+  phone_country_code: ["phone_country_code", "country_dial_code", "dial_code", "calling_code", "country_calling_code"],
+  date_of_birth: ["date_of_birth", "birth_date", "birthdate", "dob", "bday"],
+  nationality: ["nationality", "citizenship"],
+  passport_number: ["passport_number", "passport_no"],
+  document_number: ["document_number", "travel_document_number", "identity_document_number"],
+  issuing_country: ["issuing_country", "document_issuing_country", "passport_issuing_country"],
+  passport_expiry: ["passport_expiry", "passport_expiration", "passport_expiry_date"],
+  document_expiry: ["document_expiry", "document_expiration", "document_expiry_date"]
+}).flatMap(([canonical, aliases]) => aliases.map((alias) => [alias, canonical])));
+
+function normalizeProfileFieldType(value = "") {
+  const alias = String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return PROFILE_FIELD_ALIASES.get(alias) || "";
+}
+
 const PROFILE_FIELD_ORDER = [
   "email",
   "confirm_email",
@@ -120,6 +145,7 @@ function normalizedComparableValue(value = "") {
 }
 
 function normalizedProfileValue(semanticType = "", value = "") {
+  semanticType = normalizeProfileFieldType(semanticType) || semanticType;
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text) return "";
   if (semanticType === "phone_country_code") {
@@ -173,6 +199,7 @@ function uid(prefix) {
 }
 
 function profileCanonicalValue(fieldType = "", traveler = {}) {
+  fieldType = normalizeProfileFieldType(fieldType) || fieldType;
   const document = traveler.document || {};
   const phone = normalizedPhoneParts(traveler);
   const title = normalizedTitle(traveler);
@@ -199,6 +226,7 @@ function profileCanonicalValue(fieldType = "", traveler = {}) {
 }
 
 function profileValue(fieldType = "", traveler = {}, field = {}) {
+  fieldType = normalizeProfileFieldType(fieldType) || fieldType;
   const title = normalizedTitle(traveler);
   const value = profileCanonicalValue(fieldType, traveler);
   if (fieldType === "date_of_birth") return dateValueForField(value, field);
@@ -214,9 +242,14 @@ function canonicalField(page = {}, field = {}) {
 }
 
 function profileFieldsForPage(page = {}) {
-  if (Array.isArray(page.fields) && page.fields.length) return page.fields;
+  if (Array.isArray(page.fields) && page.fields.length) {
+    return page.fields.map((field) => {
+      const fieldType = normalizeProfileFieldType(field.fieldType || field.field || field.semantic || "");
+      return fieldType ? { ...field, fieldType, field: fieldType } : field;
+    });
+  }
   return (page.controls || []).flatMap((control) => {
-    const field = String(control.field || control.semantic || "");
+    const field = normalizeProfileFieldType(control.fieldType || control.field || control.semantic || "");
     if (!PROFILE_FIELDS.has(field)) return [];
     const state = control.state || control.controlState || {};
     return [{
@@ -249,7 +282,7 @@ function fieldDescriptors(observation = {}, traveler = {}) {
   const page = observation.page || {};
   const ordinals = new Map();
   return profileFieldsForPage(page).flatMap((field) => {
-    const semanticType = String(field.field || "");
+    const semanticType = normalizeProfileFieldType(field.fieldType || field.field || "");
     if (!PROFILE_FIELDS.has(semanticType)) return [];
     const ordinal = ordinals.get(semanticType) || 0;
     ordinals.set(semanticType, ordinal + 1);
@@ -265,10 +298,13 @@ function fieldDescriptors(observation = {}, traveler = {}) {
         || ["radio", "checkbox"].includes(String(control.role || "").toLowerCase()));
     if (choiceLike) {
       const candidate = `${field.label || ""} ${control.label || ""} ${control.accessibleName || ""}`.toLowerCase();
-      const wanted = value.toLowerCase();
-      const matches = wanted === "mrs/ms"
-        ? /\bmrs\b|\bms\b|\bmiss\b/.test(candidate)
-        : new RegExp(`\\b${wanted.replace(/[^a-z0-9]+/g, "\\s*")}\\b`, "i").test(candidate);
+      const wanted = normalizedProfileValue(semanticType, value);
+      const optionValue = String(control.state?.optionValue || "");
+      const matches = optionValue
+        ? optionValue === wanted
+        : wanted === "mrs/ms"
+          ? /\bmrs\b|\bms\b|\bmiss\b/.test(candidate)
+          : new RegExp(`\\b${wanted.replace(/[^a-z0-9]+/g, "\\s*")}\\b`, "i").test(candidate);
       if (!matches) return [];
     }
     const choiceTerms = profileChoiceTerms(semanticType, value, traveler);
@@ -280,13 +316,28 @@ function fieldDescriptors(observation = {}, traveler = {}) {
         ? (dateEncoding?.codec?.kind === "full"
           ? control.state?.canonicalDateValue || observedDate?.canonicalValue || ""
           : control.state?.dateComponentValue || observedDate?.componentValue || "")
-        : control.state?.normalizedValue || ""
+        : control.state?.selectedValue || control.state?.normalizedValue || ""
     );
     const desiredNormalizedValue = dateEncoding?.ok
       ? dateEncoding.expectedNormalizedValue
       : normalizedProfileValue(semanticType, value);
+    const sameChoiceGroup = (candidate = {}) => {
+      const candidateType = normalizeProfileFieldType(candidate.fieldType || candidate.field || candidate.semantic || "");
+      if (candidateType !== semanticType) return false;
+      if (control.decisionGroupId && candidate.decisionGroupId) return candidate.decisionGroupId === control.decisionGroupId;
+      return Boolean(control.sectionId && candidate.sectionId === control.sectionId);
+    };
+    const conflictingSelectedControls = choiceLike
+      ? (page.controls || []).filter((candidate) => sameChoiceGroup(candidate)
+        && candidate.controlId !== control.controlId
+        && Boolean(candidate.selected || candidate.state?.checked || candidate.state?.selected))
+      : [];
     const valueSatisfied = choiceLike
-      ? Boolean(control.selected || control.state?.checked || control.state?.selected)
+      ? Boolean(
+          (control.selected || control.state?.checked || control.state?.selected)
+          && (control.state?.selectedValue || control.state?.optionValue || desiredNormalizedValue) === desiredNormalizedValue
+          && conflictingSelectedControls.length === 0
+        )
       : Boolean(desiredNormalizedValue && currentNormalizedValue === desiredNormalizedValue);
     const validationIssues = scopedValidationIssues(page, {
       controlIds: new Set([control.controlId].filter(Boolean)),
@@ -315,7 +366,8 @@ function fieldDescriptors(observation = {}, traveler = {}) {
         reason: dateEncoding.reason || "The observed date format is ambiguous."
       } : null,
       hasValue: valueSatisfied && validationIssues.length === 0,
-      validationIssues
+      validationIssues,
+      conflictingSelectedControlIds: conflictingSelectedControls.map((candidate) => candidate.controlId).filter(Boolean)
     }];
   }).sort((a, b) => {
     const ai = PROFILE_FIELD_ORDER.indexOf(a.semanticType);
@@ -329,7 +381,7 @@ function profileStageReadiness(observation = {}, traveler = {}) {
   const fields = profileFieldsForPage(page);
   const descriptors = fieldDescriptors(observation, traveler);
   const step = String(page.step || "").toLowerCase();
-  const hasProfileControls = fields.some((field) => PROFILE_FIELDS.has(String(field.field || "")));
+  const hasProfileControls = fields.some((field) => PROFILE_FIELDS.has(normalizeProfileFieldType(field.fieldType || field.field || "")));
   const profileStage = hasProfileControls || /traveler|traveller|passenger|contact|document/.test(step);
   const unresolvedKnown = descriptors
     .filter((descriptor) => !descriptor.hasValue)
@@ -342,24 +394,24 @@ function profileStageReadiness(observation = {}, traveler = {}) {
     }));
   const unresolvedRequired = fields.flatMap((field) => {
     if (!field.required) return [];
+    const semanticType = normalizeProfileFieldType(field.fieldType || field.field || "");
+    if (!PROFILE_FIELDS.has(semanticType)) return [];
+    const canonicalValue = profileCanonicalValue(semanticType, traveler);
+    if (canonicalValue && descriptors.some((descriptor) => descriptor.semanticType === semanticType && descriptor.hasValue)) return [];
+    if (canonicalValue && descriptors.some((descriptor) => descriptor.semanticType === semanticType && !descriptor.hasValue)) return [];
     const state = field.controlState || {};
     const satisfied = Boolean(field.hasValue || state.valuePresent || state.checked || state.selected);
-    if (satisfied) return [];
-    if (["title", "gender"].includes(String(field.field || ""))) {
-      const peerSatisfied = fields.some((peer) => peer.field === field.field
-        && Boolean(peer.hasValue || peer.controlState?.checked || peer.controlState?.selected));
-      if (peerSatisfied) return [];
-    }
+    if (canonicalValue && satisfied) return [];
     return [{
-      semanticType: String(field.field || "unknown"),
+      semanticType,
       controlId: String(field.controlId || ""),
       label: String(field.label || field.field || "Required traveler field"),
-      valueAvailable: Boolean(profileCanonicalValue(String(field.field || ""), traveler))
+      valueAvailable: Boolean(canonicalValue)
     }];
-  });
+  }).filter((item, index, list) => list.findIndex((other) => other.semanticType === item.semanticType) === index);
   const missingUserData = unresolvedRequired.filter((item) => item.valueAvailable === false);
   const profileControlIds = new Set(fields
-    .filter((field) => PROFILE_FIELDS.has(String(field.field || "")))
+    .filter((field) => PROFILE_FIELDS.has(normalizeProfileFieldType(field.fieldType || field.field || "")))
     .map((field) => String(field.controlId || ""))
     .filter(Boolean));
   const validationIssues = scopedValidationIssues(page, {
@@ -1052,6 +1104,9 @@ function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}
     return {
       type: descriptor.choiceLike ? "control_selected" : "normalized_value_changed",
       controlId: goalControl.controlId,
+      decisionGroupId: goalControl.decisionGroupId || targetControl.decisionGroupId || "",
+      expectedSelectedControlId: goalControl.controlId,
+      conflictingControlIds: descriptor.conflictingSelectedControlIds || [],
       expectedNormalizedValue: atom.expectedNormalizedValue || ""
     };
   }
@@ -1511,6 +1566,7 @@ function expandSkillAction(action, observation = {}, traveler = {}) {
 module.exports = {
   PROFILE_FIELDS,
   PROFILE_FIELD_ORDER,
+  normalizeProfileFieldType,
   profileStageReadiness,
   profileValue,
   scopedValidationIssues,

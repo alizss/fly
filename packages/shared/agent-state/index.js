@@ -54,9 +54,12 @@
  * @property {Object|null} currentGoal
  * @property {Object|null} currentObligation
  * @property {Object|null} taskState
+ * @property {Object|null} terminalGoalLatch
  * @property {Object} observationReadiness
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
+ * @property {{semanticOwnership?: Object, candidateSelection?: Object}|null} aiDecisionCache
+ * @property {Object|null} fastStaleRecovery
  * @property {string[]} attemptedCandidateIds
  * @property {Object[]} failedStrategyMemory
  * @property {Object} recoveryState
@@ -99,6 +102,7 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     currentGoal: null,
     currentObligation: null,
     taskState: null,
+    terminalGoalLatch: null,
     observationReadiness: {
       classification: "READY",
       key: "",
@@ -109,6 +113,8 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     },
     pendingAction: null,
     actionLifecycle: null,
+    aiDecisionCache: null,
+    fastStaleRecovery: null,
     attemptedCandidateIds: [],
     failedStrategyMemory: [],
     recoveryState: {

@@ -5,6 +5,7 @@ const {
   normalizeVisualRegion,
   visualRegionsMatch,
   actuatorSignature,
+  decisionInstanceKey,
   semanticGoalKey
 } = require("../../../packages/shared/agent-actions");
 const { classifyGraphConflicts, resolveActionControl, selectedActionGraphConflicts } = require("./control-alias-index");
@@ -350,7 +351,15 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   pass(checks, "ACTION_SCHEMA_VALID");
 
   if (!store?.isCurrentObservation(state.id, action.observationId, action.observationHash)) {
-    return denied({ ...fail("STALE_OBSERVATION", "The proposed action is not bound to the stored current observation.", checks), action, state });
+    return denied({
+      ...recoverable(
+        "STALE_OBSERVATION",
+        "The proposed action is not bound to the stored current observation. Capture one fresh observation and attempt a stable semantic rebind.",
+        checks
+      ),
+      action,
+      state
+    });
   }
   pass(checks, "OBSERVATION_CURRENT");
 
@@ -460,9 +469,12 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
     const signature = actuatorSignature(action);
     const goalKey = semanticGoalKey(action);
+    const currentDecisionInstanceId = action.decisionInstanceId || decisionInstanceKey(action, observation);
     const previousFailure = (state.failures || []).find((failure) => (
       failure.actuatorSignature === signature
       && (!failure.goalKey || failure.goalKey === goalKey)
+      && Boolean(failure.decisionInstanceId)
+      && failure.decisionInstanceId === currentDecisionInstanceId
     ));
     if (previousFailure) {
       return denied({

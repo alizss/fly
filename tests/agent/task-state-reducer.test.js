@@ -243,6 +243,423 @@ test("only exact fresh paid selection evidence reopens a completed decision", ()
   assert.equal(selectedPaid.completedOutcomes.some((outcome) => outcome.decisionGroupId === "seat_leg_2"), false);
 });
 
+test("direct paid semantics reopen a manually changed completion and an exact remove option resolves it", () => {
+  const paid = control("premium_addon", {
+    decisionGroupId: "trip_addon",
+    label: "Premium add-on",
+    semantic: "add_paid_extra",
+    risk: "money"
+  });
+  const remove = control("remove_addon", {
+    decisionGroupId: "trip_addon",
+    label: "Remove add-on",
+    // Local extraction can retain paid-looking surrounding semantics. The
+    // exact free/remove contrast remains authoritative for reconciliation.
+    semantic: "add_paid_extra",
+    risk: "money"
+  });
+  const group = (selectedControlId) => ({
+    decisionGroupId: "trip_addon",
+    requirementId: "extras:trip-addon",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    sectionType: "extras",
+    sectionLabel: "Trip add-on",
+    required: false,
+    status: "satisfied",
+    selectedControlId,
+    alternatives: [paid, remove]
+  });
+  const previousTaskState = {
+    completedOutcomes: [{
+      decisionGroupId: "trip_addon",
+      requirementId: "extras:trip-addon",
+      surfaceId: "surface-page",
+      status: "satisfied",
+      selectedControlId: "remove_addon"
+    }]
+  };
+  const observation = (observationId, selectedControlId) => ({
+    observationId,
+    page: {
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [paid, remove, control("continue", { label: "Continue", semantic: "continue", risk: "safe_continue" })],
+      decisionGroups: [group(selectedControlId)],
+      validationIssues: []
+    }
+  });
+
+  const conflicted = reduceTaskState({
+    previousTaskState,
+    observation: observation("obs_manual_paid_change", "premium_addon"),
+    userPolicy: { bookingRules: "Decline all paid extras" }
+  });
+  assert.equal(conflicted.activeDecisions[0].status, "conflicted");
+  assert.equal(conflicted.activeDecisions[0].reopenEvidence.code, "EXACT_SELECTED_OPTION_CONTRADICTS_POLICY");
+  assert.equal(conflicted.completedOutcomes.some((outcome) => outcome.decisionGroupId === "trip_addon"), false);
+  assert.deepEqual(conflicted.currentGoal.freeAlternativeControlIds, ["remove_addon"]);
+
+  const repaired = reduceTaskState({
+    previousTaskState: conflicted,
+    observation: observation("obs_manual_paid_repaired", "remove_addon"),
+    userPolicy: { bookingRules: "Decline all paid extras" }
+  });
+  assert.equal(repaired.activeDecisions.length, 0);
+  assert.equal(repaired.completedOutcomes.find((outcome) => outcome.decisionGroupId === "trip_addon").selectedControlId, "remove_addon");
+  assert.equal(repaired.currentGoal.semanticType, "navigation");
+});
+
+test("a proven paid conflict with a current-surface reversal outranks navigation despite stale surface metadata", () => {
+  const decisionGroupId = "optional_selection";
+  const paid = control("paid_choice", {
+    surfaceId: "flow_modal",
+    surfaceType: "modal",
+    decisionGroupId,
+    semantic: "add_paid_extra",
+    risk: "money",
+    structuredPrice: { amount: 26, currency: "EUR" }
+  });
+  const reverse = control("free_reversal", {
+    surfaceId: "flow_modal",
+    surfaceType: "modal",
+    decisionGroupId,
+    semantic: "remove_paid_extra",
+    risk: "safe_decline",
+    structuredPrice: { amount: 0, currency: "EUR" }
+  });
+  const navigate = control("advance_flow", {
+    surfaceId: "flow_modal",
+    surfaceType: "modal",
+    semantic: "navigation",
+    risk: "safe_continue"
+  });
+  const previousTaskState = {
+    completedOutcomes: [{
+      decisionGroupId,
+      requirementId: "extras:optional-selection",
+      surfaceId: "surface-page",
+      status: "satisfied",
+      selectedControlId: "free_reversal"
+    }]
+  };
+  const observation = {
+    observationId: "obs_paid_conflict_in_foreground",
+    page: {
+      currentSurface: { id: "flow_modal", type: "modal", memberControlIds: [paid.controlId, reverse.controlId, navigate.controlId] },
+      controls: [paid, reverse, navigate],
+      decisionGroups: [{
+        decisionGroupId,
+        requirementId: "extras:optional-selection",
+        // This intentionally simulates stale ownership from a portal/rerender.
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionType: "extras",
+        required: false,
+        status: "satisfied",
+        selectedControlId: paid.controlId,
+        selectedEvidence: {
+          selected: true,
+          disposition: "paid",
+          selectedControlId: paid.controlId,
+          structuredPrice: { amount: 26, currency: "EUR" }
+        },
+        alternativeControlIds: [paid.controlId, reverse.controlId],
+        alternatives: [paid, reverse]
+      }],
+      validationIssues: []
+    }
+  };
+
+  const state = reduceTaskState({
+    previousTaskState,
+    observation,
+    userPolicy: { bookingRules: "Decline all paid extras" }
+  });
+  assert.equal(state.activeDecisions[0].status, "conflicted");
+  assert.equal(state.currentGoal.decisionGroupId, decisionGroupId);
+  assert.deepEqual(state.currentGoal.freeAlternativeControlIds, [reverse.controlId]);
+  const candidates = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    traveler: { booking_rules: "Decline all paid extras" },
+    state: { taskState: state, approvals: {} }
+  });
+  assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [reverse.controlId]);
+  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === navigate.controlId).selectable, false);
+});
+
+test("an unknown optional manual selection invalidates the old completion without blocking navigation", () => {
+  const state = reduceTaskState({
+    previousTaskState: {
+      completedOutcomes: [{
+        decisionGroupId: "optional_unknown",
+        surfaceId: "surface-page",
+        status: "satisfied",
+        selectedControlId: "old_choice"
+      }]
+    },
+    observation: {
+      observationId: "obs_optional_changed",
+      page: {
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [
+          control("new_choice", { decisionGroupId: "optional_unknown", risk: "uncertain" }),
+          control("continue", { label: "Continue", semantic: "continue", risk: "safe_continue" })
+        ],
+        decisionGroups: [{
+          decisionGroupId: "optional_unknown",
+          surfaceId: "surface-page",
+          surfaceType: "page",
+          sectionType: "unknown",
+          required: false,
+          status: "satisfied",
+          selectedControlId: "new_choice"
+        }],
+        validationIssues: []
+      }
+    }
+  });
+
+  assert.equal(state.observedDecisions[0].status, "stale");
+  assert.equal(state.observedDecisions[0].reopenEvidence.code, "EXACT_SELECTED_CONTROL_CHANGED");
+  assert.equal(state.completedOutcomes.some((outcome) => outcome.decisionGroupId === "optional_unknown"), false);
+  assert.equal(state.activeDecisions.length, 0);
+  assert.equal(state.currentGoal.semanticType, "navigation");
+});
+
+test("grounded semantic ownership turns an ambiguous paid summary into the exact policy conflict", () => {
+  const observation = {
+    observationId: "obs_ambiguous_paid_summary",
+    page: {
+      url: "https://example.test/checkout/seats",
+      currentSurface: { id: "surface-page", type: "page", label: "Reserve seating" },
+      controls: [
+        control("remove_selected_item", {
+          decisionGroupId: "dg_selected_item",
+          label: "Remove",
+          semantic: "remove_paid_extra",
+          risk: "safe_decline"
+        }),
+        control("advance_checkout", { label: "Proceed", semantic: "navigation", risk: "safe_continue" })
+      ],
+      decisionGroups: [{
+        decisionGroupId: "dg_selected_item",
+        requirementId: "unknown:selected-item",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionType: "unknown",
+        sectionLabel: "Selected item",
+        required: false,
+        status: "satisfied",
+        selectedControlId: "",
+        selectedLabel: "Selected item 26 EUR",
+        selectedEvidence: {
+          selected: true,
+          disposition: "paid",
+          structuredPrice: { amount: 26, currency: "EUR" },
+          source: "owned_selected_item_summary",
+          ownerElementId: "selected-item"
+        },
+        semanticOwnership: {
+          status: "resolved",
+          family: "seat",
+          source: "grounded_ai",
+          controlId: "remove_selected_item"
+        },
+        removalControlId: "remove_selected_item",
+        alternatives: [{ controlId: "remove_selected_item", semantic: "remove_paid_extra", risk: "safe_decline" }]
+      }],
+      validationIssues: []
+    }
+  };
+
+  const state = reduceTaskState({ observation, traveler: { booking_rules: "No paid seats" } });
+  assert.equal(state.activeDecisions.length, 1);
+  assert.equal(state.activeDecisions[0].status, "conflicted");
+  assert.equal(state.activeDecisions[0].family, "seat");
+  assert.equal(state.currentGoal.decisionGroupId, "dg_selected_item");
+  assert.deepEqual(state.currentGoal.freeAlternativeControlIds, ["remove_selected_item"]);
+  assert.equal(state.currentGoal.actionableControlIds, undefined);
+});
+
+test("fresh transaction-backed paid truth cannot remain satisfied when selected evidence is missing", () => {
+  const reversal = control("reverse_paid_selection", {
+    surfaceId: "current_modal",
+    surfaceType: "modal",
+    decisionGroupId: "dg_live_summary",
+    label: "Undo",
+    semantic: "remove_paid_extra",
+    risk: "safe_decline"
+  });
+  const navigation = control("advance_modal", {
+    surfaceId: "current_modal",
+    surfaceType: "modal",
+    label: "Proceed",
+    semantic: "navigation",
+    risk: "safe_continue"
+  });
+  const observation = {
+    observationId: "obs_transaction_paid_truth",
+    page: {
+      currentSurface: {
+        id: "current_modal",
+        type: "modal",
+        memberControlIds: [reversal.controlId, navigation.controlId]
+      },
+      controls: [reversal, navigation],
+      decisionGroups: [{
+        decisionGroupId: "dg_live_summary",
+        surfaceId: "current_modal",
+        sectionType: "unknown",
+        sectionLabel: "Unrelated nearby heading",
+        status: "satisfied",
+        selectedControlId: "",
+        selectedLabel: "Selected item 23 EUR",
+        selectedSemantic: "selected_paid_item",
+        selectedEvidence: null,
+        semanticOwnership: null,
+        removalControlId: null,
+        alternativeControlIds: [reversal.controlId],
+        alternatives: [{ controlId: reversal.controlId }]
+      }],
+      transactionFacts: {
+        selectedExtras: [{
+          decisionGroupId: "dg_live_summary",
+          label: "Selected item 23 EUR",
+          disposition: "paid",
+          priceAmount: 23,
+          currency: "EUR"
+        }]
+      },
+      validationIssues: []
+    }
+  };
+
+  const state = reduceTaskState({
+    observation,
+    userPolicy: { bookingRules: "No paid extras" }
+  });
+  assert.equal(state.activeDecisions[0].status, "conflicted");
+  assert.equal(state.activeDecisions[0].reopenEvidence.structuredPrice.amount, 23);
+  assert.equal(state.currentGoal.decisionGroupId, "dg_live_summary");
+  assert.deepEqual(state.currentGoal.freeAlternativeControlIds, [reversal.controlId]);
+  const candidates = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    traveler: { booking_rules: "No paid extras" },
+    state: { taskState: state, approvals: {} }
+  });
+  assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [reversal.controlId]);
+  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === navigation.controlId).selectable, false);
+});
+
+test("decline policy is scoped to the matching optional family", () => {
+  const seat = control("paid_seat", {
+    decisionGroupId: "seat_group",
+    label: "Selected seat",
+    risk: "money",
+    semantic: "add_paid_extra",
+    structuredPrice: { amount: 19, currency: "EUR" }
+  });
+  const bundle = control("paid_bundle", {
+    decisionGroupId: "bundle_group",
+    label: "Selected bundle",
+    risk: "money",
+    semantic: "add_paid_extra",
+    structuredPrice: { amount: 29, currency: "EUR" }
+  });
+  const observation = {
+    observationId: "obs_family_policy",
+    page: {
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [seat, bundle],
+      decisionGroups: [
+        {
+          decisionGroupId: "seat_group",
+          surfaceId: "surface-page",
+          sectionType: "seat",
+          sectionLabel: "Seat selection",
+          status: "satisfied",
+          selectedControlId: "paid_seat"
+        },
+        {
+          decisionGroupId: "bundle_group",
+          surfaceId: "surface-page",
+          sectionType: "bundle",
+          sectionLabel: "Travel bundle",
+          status: "satisfied",
+          selectedControlId: "paid_bundle"
+        }
+      ],
+      validationIssues: []
+    }
+  };
+
+  const seatsOnly = reduceTaskState({ observation, traveler: { booking_rules: "No paid seats" } });
+  assert.deepEqual(seatsOnly.activeDecisions.map((decision) => decision.decisionGroupId), ["seat_group"]);
+  assert.equal(seatsOnly.observedDecisions.find((decision) => decision.decisionGroupId === "bundle_group").status, "satisfied");
+  assert.deepEqual(seatsOnly.safetyRestrictions.declinePaidExtrasByFamily, {
+    seat: true,
+    baggage: false,
+    insurance: false,
+    extras: false
+  });
+
+  const bundlesOnly = reduceTaskState({ observation, traveler: { booking_rules: "No bundles" } });
+  assert.deepEqual(bundlesOnly.activeDecisions.map((decision) => decision.decisionGroupId), ["bundle_group"]);
+  assert.equal(bundlesOnly.observedDecisions.find((decision) => decision.decisionGroupId === "seat_group").status, "satisfied");
+});
+
+test("an exact paid-item authorization conflicting with decline policy requires user resolution", () => {
+  const paid = control("paid_bundle", {
+    decisionGroupId: "bundle_authorized",
+    label: "All passengers",
+    risk: "money",
+    semantic: "add_paid_extra",
+    structuredPrice: { amount: 29, currency: "EUR" }
+  });
+  const free = control("free_bundle", {
+    decisionGroupId: "bundle_authorized",
+    label: "None",
+    risk: "safe_decline",
+    semantic: "decline_paid_extra",
+    structuredPrice: { amount: 0, currency: "EUR" }
+  });
+  const state = reduceTaskState({
+    observation: {
+      observationId: "obs_authorized_policy_conflict",
+      page: {
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [paid, free],
+        decisionGroups: [{
+          decisionGroupId: "bundle_authorized",
+          surfaceId: "surface-page",
+          sectionType: "bundle",
+          sectionLabel: "Travel bundle",
+          status: "satisfied",
+          selectedControlId: "paid_bundle",
+          selectedEvidence: {
+            selected: true,
+            disposition: "paid",
+            selectedControlId: "paid_bundle",
+            structuredPrice: { amount: 29, currency: "EUR" }
+          },
+          alternatives: [{ controlId: "paid_bundle" }, { controlId: "free_bundle" }]
+        }],
+        validationIssues: []
+      }
+    },
+    userPolicy: {
+      bookingRules: "Decline all paid extras",
+      paidExtraAuthorizations: [{ authorizationId: "auth_bundle", decisionGroupId: "bundle_authorized" }]
+    }
+  });
+
+  assert.equal(state.activeDecisions[0].status, "blocked");
+  assert.equal(state.activeDecisions[0].reopenEvidence.code, "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT");
+  assert.equal(state.activeDecisions[0].reopenEvidence.authorizationId, "auth_bundle");
+});
+
 test("backend payment stage ignores extension hint and suppresses ordinary goals", () => {
   const state = reduceTaskState({
     observation: {
@@ -267,6 +684,94 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
   assert.equal(state.paymentEvidence.signalCount >= 3, true);
   assert.equal(state.safetyRestrictions.paymentSubmissionRequiresApproval, true);
   assert.equal(state.safetyRestrictions.paymentCredentialsBlocked, true);
+});
+
+test("verified payment completion remains latched after redirect to a new search page", () => {
+  const payment = reduceTaskState({
+    observation: {
+      observationId: "obs_payment_latch",
+      page: {
+        url: "https://example.test/rf/payment",
+        text: "Payment details. Choose payment method. Total to pay 208 EUR.",
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [control("card_latch", { semantic: "card_number" })],
+        foreground: { progressMarkers: { payment: "current" } },
+        decisionGroups: []
+      }
+    }
+  });
+  assert.equal(payment.terminalGoalLatch.locked, true);
+
+  const redirected = reduceTaskState({
+    previousTaskState: payment,
+    observation: {
+      observationId: "obs_redirected_search",
+      page: {
+        url: "https://example.test/rf/start",
+        text: "Configure your trip. Choose your bundle. Select a new flight.",
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [control("new_search", { semantic: "flight_search" })],
+        decisionGroups: []
+      }
+    }
+  });
+  assert.equal(redirected.stage, "flight_selection");
+  assert.equal(redirected.checkoutBoundary.status, "new_search_page");
+  assert.equal(redirected.terminalGoalLatch.locked, true);
+  assert.equal(redirected.terminalStatus, "payment_review_reached");
+  assert.equal(redirected.goal.status, "completed");
+  assert.equal(redirected.currentGoal, null);
+
+  const unrelated = reduceTaskState({
+    previousTaskState: redirected,
+    observation: {
+      observationId: "obs_unrelated_page",
+      page: {
+        url: "https://example.test/account",
+        text: "Account home",
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [],
+        decisionGroups: []
+      }
+    }
+  });
+  assert.equal(unrelated.terminalStatus, "payment_review_reached");
+  assert.equal(unrelated.currentGoal, null);
+});
+
+test("an active checkout redirected to the search start is classified as checkout left", () => {
+  const active = reduceTaskState({
+    observation: {
+      observationId: "obs_active_extras",
+      page: {
+        url: "https://example.test/rf/extras",
+        text: "Choose your bundle",
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [],
+        decisionGroups: []
+      }
+    }
+  });
+  assert.equal(active.stage, "extras");
+
+  const left = reduceTaskState({
+    previousTaskState: active,
+    observation: {
+      observationId: "obs_search_start",
+      page: {
+        step: "extras",
+        url: "https://example.test/rf/start",
+        text: "Choose your bundle. Start a new flight search.",
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [],
+        decisionGroups: []
+      }
+    }
+  });
+  assert.equal(left.stage, "flight_selection");
+  assert.equal(left.terminalStatus, "checkout_left");
+  assert.equal(left.checkoutBoundary.leftActiveCheckout, true);
+  assert.equal(left.currentGoal, null);
 });
 
 test("unknown foreground gives AI complete context but only policy-safe selectable IDs", () => {

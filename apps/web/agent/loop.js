@@ -15,7 +15,11 @@
 // The original 3-call version measured 15-30+ seconds per turn in practice,
 // which is a real cost for a product whose whole point is being fast.
 
-const { selectCandidate } = require("./select-candidate");
+const {
+  applySemanticOwnershipResolution,
+  resolveSemanticOwnership,
+  selectCandidate
+} = require("./select-candidate");
 const {
   actionForCurrentCandidate,
   buildCurrentCandidateSet
@@ -39,6 +43,7 @@ const {
 const {
   normalizeAction,
   actuatorSignature,
+  decisionInstanceKey,
   semanticGoalKey
 } = require("../../../packages/shared/agent-actions");
 const { withUpdate, normalizeStep } = require("../../../packages/shared/agent-state");
@@ -321,8 +326,31 @@ function requirementsWithDecisionGroups(classifiedRequirements = [], observation
   const page = observation?.page || {};
   const groups = page.decisionGroups || [];
   const choiceRequirement = (requirement = {}) => /decision|legal_acceptance/.test(requirement.type || requirement.semanticType || "");
-  const withoutCanonicalGroup = (requirement = {}) => choiceRequirement(requirement)
-    ? {
+  const freshFreeSelection = (requirement = {}) => {
+    const exactId = String(requirement.decisionGroupId || requirement.scope?.decisionGroupId || requirement.id || "");
+    if (!exactId) return null;
+    return (page.transactionFacts?.selectedExtras || []).find((extra) => (
+      String(extra.decisionGroupId || "") === exactId
+      && Number(extra.priceAmount) === 0
+      && /free|decline|remove|skip|without|none|not selected|no extra/.test(normalizeText(extra.disposition || ""))
+    )) || null;
+  };
+  const withoutCanonicalGroup = (requirement = {}) => {
+    const freshFree = freshFreeSelection(requirement);
+    if (choiceRequirement(requirement) && freshFree) {
+      return {
+        ...requirement,
+        status: "satisfied",
+        required: false,
+        confidence: Math.max(Number(requirement.confidence || 0), 0.95),
+        evidence: [
+          `FRESH_FREE_SELECTION_OBSERVED: ${freshFree.label || freshFree.decisionGroupId}.`,
+          ...(requirement.evidence || [])
+        ].slice(0, 5)
+      };
+    }
+    return choiceRequirement(requirement)
+      ? {
         ...requirement,
         status: "conflicted",
         required: true,
@@ -331,8 +359,9 @@ function requirementsWithDecisionGroups(classifiedRequirements = [], observation
           "CANONICAL_DECISION_GROUP_MISSING: choice completion cannot be derived without an observed decision group.",
           ...(requirement.evidence || [])
         ].slice(0, 5)
-      }
-    : requirement;
+        }
+      : requirement;
+  };
   if (!groups.length) return (classifiedRequirements || []).map(withoutCanonicalGroup);
 
   const groupRequirements = groups.map((group, index) =>
@@ -627,7 +656,167 @@ function pendingRecoveryTargetStatus(action = {}) {
   };
 }
 
-function summarizeTurn({ pageState, requirements, plannedAction, finalAction, policyDecision, deterministicAction }) {
+function actionAdvancesCheckout(action = {}) {
+  const effect = action.mechanicalEffect
+    || action.physicalEffect
+    || action.affordance?.mechanicalEffect
+    || action.affordance?.physicalEffect
+    || action.affordance?.effect
+    || "";
+  return ["advance_surface", "advance_checkout_stage"].includes(effect)
+    || ["navigate_stage", "advance_current_surface", "continue_checkout"].includes(action.semanticIntent || action.intent || "");
+}
+
+function freshPaidPolicyConflict(taskState = {}) {
+  return (taskState.activeDecisions || []).find((decision) => (
+    decision.status === "conflicted"
+    && /SELECTED_OPTION_(?:PRICE_EXCEEDS|CONTRADICTS)_POLICY/.test(String(decision.reopenEvidence?.code || ""))
+  )) || null;
+}
+
+function stableDecisionValue(value) {
+  if (Array.isArray(value)) return value.map(stableDecisionValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value).sort().map((key) => [key, stableDecisionValue(value[key])])
+  );
+}
+
+function aiDecisionPolicyFingerprint(userPolicy = {}, traveler = {}) {
+  return JSON.stringify(stableDecisionValue({
+    userPolicy,
+    travelerPreferences: {
+      bookingRules: traveler.booking_rules || "",
+      seat: traveler.seat_preference || "",
+      baggage: traveler.baggage_preference || "",
+      payment: traveler.payment_preference || ""
+    }
+  }));
+}
+
+function observationDecisionHash(observation = {}) {
+  return String(observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "");
+}
+
+function decisionConflictId(goal = {}) {
+  return String(goal.decisionGroupId || goal.requirementId || goal.goalId || "");
+}
+
+function reusableSemanticOwnershipDecision(cache = null, observation = {}, policyFingerprint = "") {
+  const entry = cache?.semanticOwnership;
+  if (!entry || entry.observationHash !== observationDecisionHash(observation)) return null;
+  if (entry.policyFingerprint !== policyFingerprint) return null;
+  if (!entry.conflictId || !entry.stableControlIdentity || !entry.intendedOutcome || !entry.confidence) return null;
+  const groupExists = (observation.page?.decisionGroups || []).some((group) => (
+    String(group.decisionGroupId || group.requirementId || "") === entry.conflictId
+  ));
+  const currentControl = (observation.page?.controls || []).find((control) => (
+    String(control.stableKey || control.controlId || "") === entry.stableControlIdentity
+  ));
+  if (!groupExists || !currentControl) return null;
+  try {
+    return applySemanticOwnershipResolution(observation, {
+      ...(entry.resolution || {}),
+      decisionGroupId: entry.conflictId,
+      controlId: currentControl.controlId
+    });
+  } catch {
+    return null;
+  }
+}
+
+function semanticOwnershipCacheEntry(observation = {}, policyFingerprint = "", resolution = null) {
+  if (!resolution?.decisionGroupId || !resolution?.controlId || !resolution?.intendedOutcome) return null;
+  const control = (observation.page?.controls || []).find((item) => item.controlId === resolution.controlId) || {};
+  return Object.freeze({
+    observationId: String(observation.observationId || ""),
+    observationHash: observationDecisionHash(observation),
+    policyFingerprint,
+    conflictId: String(resolution.decisionGroupId),
+    controlId: String(resolution.controlId),
+    stableControlIdentity: String(control.stableKey || control.controlId || resolution.controlId),
+    intendedOutcome: String(resolution.intendedOutcome),
+    confidence: String(resolution.confidence || "unknown"),
+    resolution: Object.freeze({ ...resolution })
+  });
+}
+
+function candidateIntendedOutcome(candidate = {}, selection = {}) {
+  return String(candidate.intendedOutcome || candidate.semanticIntent || selection.semanticOutcome || "unknown");
+}
+
+function candidateSelectionCacheEntry({ observation = {}, goal = {}, candidate = {}, selection = {}, policyFingerprint = "" } = {}) {
+  if (!candidate.candidateId || !candidate.controlId) return null;
+  return Object.freeze({
+    observationId: String(observation.observationId || ""),
+    observationHash: observationDecisionHash(observation),
+    policyFingerprint,
+    conflictId: decisionConflictId(goal),
+    goalId: String(goal.goalId || ""),
+    candidateId: String(candidate.candidateId),
+    controlId: String(candidate.controlId),
+    stableControlIdentity: String(candidate.affordance?.stableKey || candidate.stableKey || candidate.controlId),
+    operation: String(candidate.operation || candidate.type || ""),
+    intendedOutcome: candidateIntendedOutcome(candidate, selection),
+    semanticOutcome: String(selection.semanticOutcome || "satisfy_current_decision"),
+    confidence: String(selection.confidence || "unknown")
+  });
+}
+
+function reusableCandidateSelection(cache = null, observation = {}, goal = {}, candidateSet = {}, policyFingerprint = "") {
+  const entry = cache?.candidateSelection;
+  if (!entry || entry.observationHash !== observationDecisionHash(observation)) return null;
+  if (entry.policyFingerprint !== policyFingerprint) return null;
+  if (entry.conflictId !== decisionConflictId(goal) || entry.goalId !== String(goal.goalId || "")) return null;
+  const candidate = (candidateSet.candidates || []).find((item) => (
+    String(item.affordance?.stableKey || item.stableKey || item.controlId) === entry.stableControlIdentity
+    && String(item.operation || item.type || "") === entry.operation
+    && candidateIntendedOutcome(item, entry) === entry.intendedOutcome
+    && item.policyDecision?.allow === true
+    && item.risk === "safe"
+    && item.requiresApproval !== true
+  ));
+  if (!candidate) return null;
+  return {
+    candidateId: candidate.candidateId,
+    candidate,
+    semanticOutcome: entry.semanticOutcome,
+    confidence: entry.confidence,
+    meta: null,
+    reused: true
+  };
+}
+
+function staleActionRecoveryEntry(action = {}, candidate = {}, goal = {}, policyFingerprint = "", code = "") {
+  if (!["OBSERVATION_HASH_MISMATCH", "STALE_OBSERVATION"].includes(code)) return null;
+  const stableControlIdentity = String(candidate.affordance?.stableKey || candidate.stableKey || action.affordance?.stableKey || action.controlId || "");
+  if (!stableControlIdentity) return null;
+  return Object.freeze({
+    code,
+    conflictId: decisionConflictId(goal),
+    goalId: String(goal.goalId || action.goalId || ""),
+    stableControlIdentity,
+    operation: String(candidate.operation || action.operation || action.type || ""),
+    intendedOutcome: candidateIntendedOutcome(candidate, action),
+    policyFingerprint,
+    attempts: 1
+  });
+}
+
+function reusableStaleActionCandidate(entry = null, goal = {}, candidateSet = {}, policyFingerprint = "") {
+  if (!entry || entry.attempts !== 1 || entry.policyFingerprint !== policyFingerprint) return null;
+  if (entry.conflictId !== decisionConflictId(goal) || entry.goalId !== String(goal.goalId || "")) return null;
+  return (candidateSet.candidates || []).find((candidate) => (
+    String(candidate.affordance?.stableKey || candidate.stableKey || candidate.controlId) === entry.stableControlIdentity
+    && String(candidate.operation || candidate.type || "") === entry.operation
+    && candidateIntendedOutcome(candidate, entry) === entry.intendedOutcome
+    && candidate.policyDecision?.allow === true
+    && candidate.risk === "safe"
+    && candidate.requiresApproval !== true
+  )) || null;
+}
+
+function summarizeTurn({ pageState, requirements, plannedAction, finalAction, policyDecision, deterministicAction, reusedAiDecision = {} }) {
   return {
     planned: {
       type: plannedAction?.type || "",
@@ -647,6 +836,10 @@ function summarizeTurn({ pageState, requirements, plannedAction, finalAction, po
       reason: policyDecision.reason
     } : null,
     deterministic: Boolean(deterministicAction),
+    reusedAiDecision: {
+      semanticOwnership: reusedAiDecision.semanticOwnership === true,
+      candidateSelection: reusedAiDecision.candidateSelection === true
+    },
     missing: actionableMissingRequired(requirements).slice(0, 6).map((req) => ({
       id: req.id,
       type: req.type,
@@ -694,6 +887,7 @@ function toClientDecision(action) {
     semanticIntent: action.semanticIntent || action.intent || "",
     expectedPostconditions: action.expectedPostconditions || (action.expectedOutcome ? [action.expectedOutcome] : []),
     goalId: action.goalId || "",
+    decisionInstanceId: action.decisionInstanceId || "",
     candidateId: action.candidateId || "",
     skillPlanId: action.skillPlanId || "",
     skillAtomId: action.skillAtomId || "",
@@ -732,6 +926,8 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
     structuredPrice: candidate.structuredPrice || null,
     visualRef: String(candidate.visualRef || ""),
     decisionGroupId: String(candidate.decisionGroupId || ""),
+    policyCorrectionForDecisionGroupId: String(candidate.policyCorrectionForDecisionGroupId || ""),
+    semanticOwnershipLinkId: String(candidate.semanticOwnershipLinkId || ""),
     label: String(candidate.label || ""),
     normalizedLabel: normalizeText(candidate.label || ""),
     role: String(candidate.role || ""),
@@ -741,6 +937,8 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
     risk: String(candidate.risk || ""),
     semantic: String(candidate.semantic || ""),
     kind: String(candidate.kind || candidate.field || candidate.type || ""),
+    fieldType: String(candidate.fieldType || candidate.field || ""),
+    fieldClassification: candidate.fieldClassification || null,
     controlKind: String(candidate.controlKind || candidate.kind || candidate.field || candidate.type || ""),
     state: candidate.controlState || candidate.state || null,
     currentValue: String(candidate.currentValue || candidate.controlState?.normalizedValue || candidate.state?.normalizedValue || ""),
@@ -841,17 +1039,29 @@ function targetSnapshotForAction(action = {}, page = {}) {
 
 function bindTargetSnapshot(action = {}, observation = {}) {
   if (!action) return action;
-  const targetSnapshot = targetSnapshotForAction(action, observation.page || {});
+  const observedTargetSnapshot = targetSnapshotForAction(action, observation.page || {});
+  const targetSnapshot = observedTargetSnapshot ? {
+    ...observedTargetSnapshot,
+    intendedOutcome: action.intendedOutcome || "",
+    semanticOwnershipLinkId: action.semanticOwnershipLinkId || "",
+    policyCorrectionForDecisionGroupId: action.policyCorrectionForDecisionGroupId || ""
+  } : null;
   const bound = normalizeAction({
     ...action,
     observationId: action.observationId || observation.observationId || "",
     observationHash: action.observationHash || observation.observationSnapshot?.snapshotHash || "",
     controlId: targetSnapshot?.controlId || action.controlId || "",
-    decisionGroupId: targetSnapshot?.decisionGroupId || action.decisionGroupId || "",
+    decisionGroupId: targetSnapshot?.policyCorrectionForDecisionGroupId
+      || targetSnapshot?.decisionGroupId
+      || action.decisionGroupId
+      || "",
     targetId: targetSnapshot?.id || action.targetId || "",
     targetSnapshot: targetSnapshot || null
   });
-  return withActionContract(bound, observation.page || {});
+  return withActionContract({
+    ...bound,
+    decisionInstanceId: bound.decisionInstanceId || decisionInstanceKey(bound, observation)
+  }, observation.page || {});
 }
 
 function observationSurfaceId(observation = {}) {
@@ -862,14 +1072,20 @@ function candidateStrategySignature(goal = {}, candidate = {}) {
   return actuatorSignature(candidate);
 }
 
-function semanticGoalRecoveryKey(goal = {}) {
-  return semanticGoalKey(goal);
+function semanticGoalRecoveryKey(goal = {}, observation = {}) {
+  return `${semanticGoalKey(goal)}::${decisionInstanceKey(goal, observation)}`;
 }
 
-function failedStrategySignaturesForGoal(state = {}, goal = {}) {
-  const goalKey = semanticGoalRecoveryKey(goal);
-  return (state.failedStrategyMemory || [])
-    .filter((entry) => entry.goalKey === goalKey)
+function failedStrategySignaturesForGoal(state = {}, goal = {}, observation = {}) {
+  const goalKey = semanticGoalRecoveryKey(goal, observation);
+  const scopedFailures = (state.failedStrategyMemory || [])
+    .filter((entry) => entry.goalKey === goalKey);
+  const repeatedStrategyFailed = scopedFailures.some((entry) => Number(entry.failureCount || 1) >= 2);
+  return scopedFailures
+    .filter((entry) => (
+      Number(entry.failureCount || 1) >= 2
+      || (repeatedStrategyFailed && Number(entry.failureCount || 1) >= 1)
+    ))
     .map((entry) => entry.strategySignature)
     .filter(Boolean);
 }
@@ -957,24 +1173,45 @@ function applyTransitionStatus(state = {}, observation = {}, previousObservation
     : pending?.originalAction || observation.lastActionResult?.action || {};
   const authoritativeGoal = state.taskState?.currentGoal || {};
   const signature = candidateStrategySignature(authoritativeGoal, governedAction);
-  const goalKey = semanticGoalRecoveryKey(authoritativeGoal);
+  const decisionObservation = previousObservation?.observationId ? previousObservation : observation;
+  const decisionInstanceId = governedAction.decisionInstanceId
+    || decisionInstanceKey(governedAction, decisionObservation);
+  const goalKey = semanticGoalRecoveryKey(authoritativeGoal, decisionObservation);
   const failedStrategyMemory = [...(state.failedStrategyMemory || [])];
   if (transition?.status === "no_effect" && governedAction.type !== "scroll" && governedAction.controlId && signature) {
     const affordance = governedAction.affordance || {};
     const entry = {
       goalKey,
+      decisionInstanceId,
+      semanticGoalKey: semanticGoalKey(authoritativeGoal),
       strategySignature: signature,
       stableControlKey: affordance.stableKey || governedAction.controlId || "",
       capability: governedAction.operation || governedAction.type || "",
       semanticEffect: affordance.effect || governedAction.semanticEffect || "",
-      observationId: observation.observationId || ""
+      observationId: observation.observationId || "",
+      failureCount: 1
     };
-    if (!failedStrategyMemory.some((item) => item.goalKey === goalKey && item.strategySignature === signature)) {
+    const existingIndex = failedStrategyMemory.findIndex((item) => (
+      item.goalKey === goalKey && item.strategySignature === signature
+    ));
+    if (existingIndex >= 0) {
+      failedStrategyMemory[existingIndex] = {
+        ...failedStrategyMemory[existingIndex],
+        decisionInstanceId,
+        observationId: observation.observationId || "",
+        failureCount: Number(failedStrategyMemory[existingIndex].failureCount || 1) + 1
+      };
+    } else {
       failedStrategyMemory.push(entry);
     }
   }
-  const rememberedForGoal = failedStrategyMemory
-    .filter((entry) => entry.goalKey === goalKey)
+  const scopedFailures = failedStrategyMemory.filter((entry) => entry.goalKey === goalKey);
+  const repeatedStrategyFailed = scopedFailures.some((entry) => Number(entry.failureCount || 1) >= 2);
+  const rememberedForGoal = scopedFailures
+    .filter((entry) => (
+      Number(entry.failureCount || 1) >= 2
+      || (repeatedStrategyFailed && Number(entry.failureCount || 1) >= 1)
+    ))
     .map((entry) => entry.strategySignature)
     .filter(Boolean);
   const attemptedStrategySignatures = [...new Set(rememberedForGoal)].slice(-12);
@@ -983,7 +1220,8 @@ function applyTransitionStatus(state = {}, observation = {}, previousObservation
     state: withUpdate(advanced.state, {
       lastTransition: transition || state.lastTransition || null,
       attemptedStrategySignatures,
-      failedStrategyMemory: failedStrategyMemory.slice(-80)
+      failedStrategyMemory: failedStrategyMemory.slice(-80),
+      ...(transition?.status === "no_effect" ? { aiDecisionCache: null } : {})
     }),
     transition: transition || null
   };
@@ -1275,6 +1513,15 @@ function compactCurrentObservation(observation = {}) {
   };
 }
 
+function pendingActionSupersededByFreshPage(pending = null, observation = {}) {
+  const normalized = normalizePendingAction(pending);
+  if (!normalized?.originalAction?.id || normalized.status === "needs_reveal") return false;
+  if (observation.lastActionResult?.actionId === normalized.originalAction.id) return false;
+  const sourceHash = String(normalized.sourceObservationHash || normalized.originalAction.observationHash || "");
+  const currentHash = String(observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "");
+  return Boolean(sourceHash && currentHash && sourceHash !== currentHash);
+}
+
 function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) {
   let currentGoal = state.taskState?.currentGoal || null;
   let pendingAction = normalizePendingAction(state.pendingAction);
@@ -1361,6 +1608,39 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     policy_ms: 0
   };
   let verifyPlanMeta = null;
+  const persistedTerminalLatch = state.terminalGoalLatch || state.taskState?.terminalGoalLatch || null;
+  if (persistedTerminalLatch?.locked === true
+    && persistedTerminalLatch.terminalStatus === "payment_review_reached") {
+    const terminalAction = normalizeAction({
+      observationId: observation.observationId || "",
+      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+      type: "final_review",
+      intent: "payment_review_reached",
+      reason: "Payment review was already verified for this booking request. The completed checkout goal remains closed.",
+      risk: "payment",
+      requiresApproval: true
+    });
+    const terminalState = withUpdate(state, {
+      terminalGoalLatch: persistedTerminalLatch,
+      currentGoal: null,
+      currentObligation: null,
+      pendingAction: null,
+      lastAction: terminalAction,
+      status: "ready_for_payment",
+      paymentState: { ...(state.paymentState || {}), status: "review_reached" }
+    });
+    transactionStore?.saveSession?.(terminalState);
+    return {
+      state: terminalState,
+      clientDecision: toClientDecision(terminalAction),
+      debug: withLatencyDebug({
+        taskState: terminalState.taskState,
+        finalAction: terminalAction,
+        terminalGoalLatched: true,
+        candidateGenerationSuppressed: true
+      }, latency, modelUsageFromMetas(model, []))
+    };
+  }
   const authoritativeTransition = applyTransitionStatus(
     state,
     observation,
@@ -1515,15 +1795,74 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   // foreground surface or stage invalidates obsolete recovery ownership, so
   // an old target can never be rebound ahead of the current TaskState.
   state = recordPreviousActionFacts(state, observation, traveler);
+  const effectiveUserPolicy = {
+    ...(state.approvals || {}),
+    ...(state.userPolicy || {})
+  };
+  const decisionPolicyFingerprint = aiDecisionPolicyFingerprint(effectiveUserPolicy, traveler);
+  let semanticOwnershipResolution = null;
+  let semanticOwnershipReused = false;
+  try {
+    const cachedOwnership = reusableSemanticOwnershipDecision(
+      state.aiDecisionCache,
+      observation,
+      decisionPolicyFingerprint
+    );
+    const resolvedOwnership = cachedOwnership || await resolveSemanticOwnership({
+        apiKey,
+        model,
+        observation,
+        userPolicy: effectiveUserPolicy,
+        traveler,
+        taskState: state.taskState || {},
+        screenshotDataUrl
+      });
+    semanticOwnershipReused = Boolean(cachedOwnership?.resolution);
+    observation = resolvedOwnership.observation;
+    semanticOwnershipResolution = resolvedOwnership.resolution;
+    latency.classification_model_ms += Number(resolvedOwnership.meta?.durationMs || 0);
+  } catch (error) {
+    const action = finalHandoffAction(
+      "A selected paid item has unclear semantic ownership, and it could not be safely resolved from the current surface. I stopped before changing it or navigating.",
+      observation
+    );
+    const stoppedState = withUpdate(state, { lastAction: action, status: "awaiting_user" });
+    transactionStore?.saveSession?.(stoppedState);
+    return {
+      state: stoppedState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({
+        semanticOwnershipError: { code: error?.code || "SEMANTIC_OWNERSHIP_UNAVAILABLE", message: error?.message || "" },
+        finalAction: action,
+        aiServiceUnavailable: true
+      }, latency, modelUsageFromMetas(model, []))
+    };
+  }
+  if (semanticOwnershipResolution?.status === "unknown") {
+    const action = finalHandoffAction(
+      "The selected paid item is grounded, but its meaning is still unclear. I stopped before removing it or leaving the current checkout state.",
+      observation
+    );
+    const stoppedState = withUpdate(state, { lastAction: action, status: "awaiting_user" });
+    transactionStore?.saveSession?.(stoppedState);
+    return {
+      state: stoppedState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({ semanticOwnershipResolution, finalAction: action }, latency, modelUsageFromMetas(model, []))
+    };
+  }
   const observedCanonicalRequirements = requirementsWithDecisionGroups(
     legacyRequirementsForDebug(state),
     observation
   );
   let taskState = reduceTaskState({
-    previousTaskState: state.taskState || {},
+    previousTaskState: {
+      ...(state.taskState || {}),
+      terminalGoalLatch: state.terminalGoalLatch || state.taskState?.terminalGoalLatch || null
+    },
     observation,
     previousActionResult: observation.lastActionResult || null,
-    userPolicy: state.userPolicy || state.approvals || {},
+    userPolicy: effectiveUserPolicy,
     traveler,
     parentObjective: {
       goal: state.goal || "Complete this checkout safely to payment review.",
@@ -1554,8 +1893,99 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     legacyRequirementsDiagnostic: {
       diagnosticOnly: true,
       requirements: observedCanonicalRequirements
+    },
+    semanticOwnershipResolution,
+    aiDecisionCache: {
+      ...(state.aiDecisionCache || {}),
+      ...(semanticOwnershipResolution
+        ? {
+            semanticOwnership: semanticOwnershipCacheEntry(
+              observation,
+              decisionPolicyFingerprint,
+              semanticOwnershipResolution
+            )
+          }
+        : {})
     }
   });
+
+  // The current browser state wins over an undispatched/stale prediction. If
+  // the page changed without a matching result for the pending action, cancel
+  // that binding and plan from the fresh surface instead of waiting for an
+  // obsolete DOM outcome.
+  const stalePending = normalizePendingAction(state.pendingAction);
+  if (pendingActionSupersededByFreshPage(stalePending, observation)) {
+    transactionStore?.recordActionEvent?.(state.id, {
+      actionId: stalePending.originalAction.id || "",
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "pending_action_cancelled_by_fresh_page",
+      sourceObservationHash: stalePending.sourceObservationHash || "",
+      currentObservationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+      dispatched: false
+    });
+    state = withUpdate(state, {
+      pendingAction: null,
+      attemptedCandidateIds: [],
+      attemptedStrategySignatures: [],
+      status: "running"
+    });
+  }
+
+  // A pending advance is never stronger than newer exact selection truth.
+  // Manual changes, rerenders, and late selector hydration can reveal a paid
+  // conflict after navigation was planned. Cancel that stale plan and let the
+  // freshly reduced decision own this turn.
+  const pendingBeforeConflictReconciliation = normalizePendingAction(state.pendingAction);
+  const observedPaidConflict = freshPaidPolicyConflict(taskState);
+  if (pendingBeforeConflictReconciliation?.originalAction
+    && actionAdvancesCheckout(pendingBeforeConflictReconciliation.originalAction)
+    && observedPaidConflict) {
+    transactionStore?.recordActionEvent?.(state.id, {
+      actionId: pendingBeforeConflictReconciliation.originalAction.id || "",
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "pending_navigation_preempted_by_policy_conflict",
+      decisionGroupId: observedPaidConflict.decisionGroupId,
+      conflict: observedPaidConflict.reopenEvidence,
+      dispatched: false
+    });
+    state = withUpdate(state, {
+      pendingAction: null,
+      attemptedCandidateIds: [],
+      currentGoal: taskState.currentGoal,
+      status: "running"
+    });
+  }
+
+  const authorizationConflict = (taskState.activeDecisions || []).find((decision) => (
+    decision.reopenEvidence?.code === "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT"
+  ));
+  if (authorizationConflict) {
+    const action = finalHandoffAction(
+      "A current paid selection conflicts with both the saved decline policy and an explicit item authorization. I stopped before changing or advancing it.",
+      observation
+    );
+    const blockedState = withUpdate(state, {
+      pendingAction: null,
+      lastAction: action,
+      status: "awaiting_user"
+    });
+    transactionStore?.recordActionEvent?.(blockedState.id, {
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "policy_authorization_conflict",
+      decisionGroupId: authorizationConflict.decisionGroupId,
+      conflict: authorizationConflict.reopenEvidence,
+      dispatched: false
+    });
+    transactionStore?.saveSession?.(blockedState);
+    return {
+      state: blockedState,
+      clientDecision: toClientDecision(action),
+      debug: withLatencyDebug({ taskState, authorizationConflict, finalAction: action }, latency, modelUsageFromMetas(model, []))
+    };
+  }
 
   // A recoverable governor result preserves the semantic action across the
   // observation created by scrolling. Rebind that same action to the fresh
@@ -1850,6 +2280,28 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   // failed stable strategies are sufficient for an obvious single action.
   // In that case the model must not rediscover or reinterpret the contract.
   if (taskState.terminalStatus !== "active") {
+    if (taskState.terminalStatus === "checkout_left") {
+      const action = finalHandoffAction(
+        "The browser has left the active checkout and is now on a new flight-search page. Start a new booking request to continue from this page.",
+        observation
+      );
+      const stoppedState = withUpdate(state, {
+        taskState,
+        terminalGoalLatch: taskState.terminalGoalLatch,
+        currentStep: taskState.stage,
+        currentGoal: null,
+        currentObligation: null,
+        pendingAction: null,
+        lastAction: action,
+        status: "awaiting_user"
+      });
+      transactionStore?.saveSession?.(stoppedState);
+      return {
+        state: stoppedState,
+        clientDecision: toClientDecision(action),
+        debug: withLatencyDebug({ taskState, finalAction: action, candidateGenerationSuppressed: true, checkoutBoundary: taskState.checkoutBoundary }, latency, modelUsageFromMetas(model, []))
+      };
+    }
     const terminalAction = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
@@ -1863,6 +2315,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     });
     const terminalState = withUpdate(state, {
       taskState,
+      terminalGoalLatch: taskState.terminalGoalLatch,
       currentStep: taskState.stage,
       currentGoal: null,
       currentObligation: null,
@@ -1927,7 +2380,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     transactionStore?.saveSession?.(stoppedState);
     return { state: stoppedState, clientDecision: toClientDecision(action), debug: withLatencyDebug({ taskState, finalAction: action }, latency, modelUsageFromMetas(model, [])) };
   }
-  const canonicalFailedStrategies = failedStrategySignaturesForGoal(state, canonicalGoal);
+  const canonicalFailedStrategies = failedStrategySignaturesForGoal(state, canonicalGoal, observation);
   let canonicalCandidateSet = groundedObservationCandidateSet(
     canonicalGoal,
     observation,
@@ -1946,7 +2399,18 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   });
   canonicalGoal = taskState.currentGoal;
   canonicalState = withUpdate(canonicalState, { taskState, currentGoal: canonicalGoal });
-  let obviousCandidate = deterministicTaskCandidate(canonicalCandidateSet);
+  const staleReboundCandidate = reusableStaleActionCandidate(
+    state.fastStaleRecovery,
+    canonicalGoal,
+    canonicalCandidateSet,
+    decisionPolicyFingerprint
+  );
+  let obviousCandidate = staleReboundCandidate || deterministicTaskCandidate(canonicalCandidateSet);
+  const staleActionReused = Boolean(staleReboundCandidate);
+  if (state.fastStaleRecovery) {
+    state = withUpdate(state, { fastStaleRecovery: null });
+    canonicalState = withUpdate(canonicalState, { fastStaleRecovery: null });
+  }
 
   // An empty executable set is a grounding/policy outcome, not an OpenAI
   // outage and not a reason to ask the model to invent an action. Preserve the
@@ -1997,6 +2461,8 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   let candidateSet;
   let observationCandidates;
   let deterministicAction = null;
+  let candidateSelectionDecision = null;
+  let candidateSelectionReused = false;
   const planningModel = publishedProfileGoal ? (recoveryModel || model) : model;
   let modelUsage;
 
@@ -2015,6 +2481,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     modelSelection = {
       candidateId: obviousCandidate.candidateId,
       candidate: obviousCandidate,
+      confidence: "deterministic",
       semanticOutcome: obviousCandidate.interactionRole === "navigation"
         ? "advance_current_surface"
         : "satisfy_current_decision"
@@ -2031,7 +2498,8 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       stage: "deterministic_task_candidate_selected",
       candidateId: obviousCandidate.candidateId,
       candidateCount: 1,
-      modelCalled: false
+      modelCalled: false,
+      staleActionReused
     });
   } else {
     // The task context above is the only semantic authority. Classification
@@ -2051,22 +2519,41 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     try {
       let selected;
       try {
-        selected = await selectCandidate({
-          apiKey,
-          model: planningModel,
-          goal: observationGoal,
-          taskState,
-          candidates: observationCandidates,
-          contextCapabilities: candidateSet.contextCapabilities,
+        selected = reusableCandidateSelection(
+          state.aiDecisionCache,
           observation,
-          screenshotDataUrl
-        });
+          observationGoal,
+          candidateSet,
+          decisionPolicyFingerprint
+        );
+        if (selected) {
+          candidateSelectionReused = true;
+          transactionStore?.recordActionEvent?.(state.id, {
+            observationId: observation.observationId || "",
+            turnId: clientTurnId || turnId,
+            stage: "ai_candidate_decision_reused",
+            candidateId: selected.candidateId,
+            controlId: selected.candidate.controlId,
+            modelCalled: false
+          });
+        } else {
+          selected = await selectCandidate({
+            apiKey,
+            model: planningModel,
+            goal: observationGoal,
+            taskState,
+            candidates: observationCandidates,
+            contextCapabilities: candidateSet.contextCapabilities,
+            observation,
+            screenshotDataUrl
+          });
+        }
       } catch (error) {
         if (error?.code !== "PLANNER_CANDIDATE_NOT_CURRENT") throw error;
         candidateSet = groundedObservationCandidateSet(
           observationGoal,
           observation,
-          failedStrategySignaturesForGoal(state, observationGoal),
+          failedStrategySignaturesForGoal(state, observationGoal, observation),
           { state: canonicalState, traveler, approvals: state.approvals }
         );
         observationCandidates = candidateSet.candidates;
@@ -2105,8 +2592,17 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       modelSelection = {
         candidateId: selectedCandidate.candidateId,
         candidate: selectedCandidate,
+        confidence: selected.confidence || "unknown",
+        reused: selected.reused === true,
         semanticOutcome: selected.semanticOutcome || "satisfy_current_decision"
       };
+      candidateSelectionDecision = candidateSelectionCacheEntry({
+        observation,
+        goal: observationGoal,
+        candidate: selectedCandidate,
+        selection: modelSelection,
+        policyFingerprint: decisionPolicyFingerprint
+      });
       modelPlannedAction = bindTargetSnapshot(
         { ...actionForCurrentCandidate(observationGoal, selectedCandidate, observation), semanticOutcome: modelSelection.semanticOutcome },
         observation
@@ -2118,6 +2614,7 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
           modelSelection = {
             candidateId: fallbackCandidate.candidateId,
             candidate: fallbackCandidate,
+            confidence: "deterministic",
             semanticOutcome: fallbackCandidate.interactionRole === "navigation"
               ? "advance_current_surface"
               : "satisfy_current_decision"
@@ -2329,7 +2826,16 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       action: executablePlannedAction,
       code: governance.code
     });
-    nextState = withUpdate(groundingBudget.state, { pendingAction: null });
+    nextState = withUpdate(groundingBudget.state, {
+      pendingAction: null,
+      fastStaleRecovery: staleActionRecoveryEntry(
+        executablePlannedAction,
+        modelSelection?.candidate || {},
+        observationGoal,
+        decisionPolicyFingerprint,
+        governance.code
+      )
+    });
     transactionStore?.recordActionEvent?.(nextState.id, {
       actionId: executablePlannedAction.id || "",
       observationId: observation.observationId || "",
@@ -2346,7 +2852,41 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       intent: "reobserve_after_grounding_rejection",
       goalId: observationGoal.goalId,
       candidateId: modelSelection?.candidateId || "",
-      reason: `Discard ${governance.code}, capture a fresh observation, rebuild the candidate set, and replan the same semantic goal.`,
+      reason: `Discard ${governance.code}, capture one fresh observation, and rebind the same safe semantic control before considering new reasoning.`,
+      risk: "safe",
+      requiresApproval: false
+    });
+  } else if (!governance.allow
+    && governance.decision === "recoverable"
+    && governance.code === "UNAPPROVED_SELECTED_EXTRA"
+    && governance.details?.groundedReversal?.controlId) {
+    nextState = withUpdate(nextState, {
+      pendingAction: null,
+      currentBlocker: {
+        classification: "reconcile_selected_extra",
+        code: governance.code,
+        ...governance.details.groundedReversal
+      }
+    });
+    transactionStore?.recordActionEvent?.(nextState.id, {
+      actionId: executablePlannedAction.id || "",
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "selected_extra_reconciliation",
+      code: governance.code,
+      recoveryDirective: "reconcile_selected_extra",
+      dispatched: false,
+      groundedReversal: governance.details.groundedReversal
+    });
+    finalAction = normalizeAction({
+      observationId: observation.observationId || "",
+      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+      type: "wait",
+      intent: "reconcile_selected_extra",
+      semanticIntent: "remove_unrequested_paid_selection",
+      mechanicalEffect: "unknown",
+      expectedPostconditions: [],
+      reason: "Removing an unrequested paid option before continuing. Reobserve and rebuild the exact grounded correction.",
       risk: "safe",
       requiresApproval: false
     });
@@ -2370,11 +2910,28 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   nextState = withUpdate(nextState, {
     pendingAction: authoritativePendingAction,
     lastAction: finalAction,
-    status: finalAction.type === "ask_user" || finalAction.type === "final_review" ? "awaiting_user" : "running"
+    status: finalAction.type === "ask_user" || finalAction.type === "final_review" ? "awaiting_user" : "running",
+    aiDecisionCache: governance.allow === true && candidateSelectionDecision
+      ? {
+          ...(nextState.aiDecisionCache || {}),
+          candidateSelection: candidateSelectionDecision
+        }
+      : nextState.aiDecisionCache
   });
 
   const debug = withLatencyDebug(
-    summarizeTurn({ pageState: extracted.pageState, requirements: activeRequirements, plannedAction, finalAction, policyDecision: governance, deterministicAction }),
+    summarizeTurn({
+      pageState: extracted.pageState,
+      requirements: activeRequirements,
+      plannedAction,
+      finalAction,
+      policyDecision: governance,
+      deterministicAction,
+      reusedAiDecision: {
+        semanticOwnership: semanticOwnershipReused,
+        candidateSelection: candidateSelectionReused
+      }
+    }),
     latency,
     modelUsage
   );
@@ -2409,7 +2966,15 @@ module.exports = {
     expectedOutcomeForAction,
     updateRecoveryState,
     applyTransitionStatus,
+    pendingActionSupersededByFreshPage,
     candidateStrategySignature,
+    candidateSelectionCacheEntry,
+    reusableCandidateSelection,
+    staleActionRecoveryEntry,
+    reusableStaleActionCandidate,
+    semanticOwnershipCacheEntry,
+    reusableSemanticOwnershipDecision,
+    aiDecisionPolicyFingerprint,
     semanticGoalRecoveryKey,
     failedStrategySignaturesForGoal,
     groundedObservationCandidateSet,

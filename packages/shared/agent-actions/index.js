@@ -17,7 +17,11 @@
  * @property {Object[]} [expectedPostconditions]
  * @property {"compatible"|"context_only"|"unknown"} [outcomeCompatibility]
  * @property {string} [physicalEffect]
+ * @property {string} [intendedOutcome]
+ * @property {string} [semanticOwnershipLinkId]
+ * @property {string} [policyCorrectionForDecisionGroupId]
  * @property {string} [goalId]
+ * @property {string} [decisionInstanceId]
  * @property {string} [candidateId]
  * @property {string} [skillPlanId]
  * @property {string} [skillAtomId]
@@ -151,7 +155,11 @@ function normalizeAction(raw = {}) {
     expectedPostconditions,
     outcomeCompatibility: ["compatible", "context_only", "unknown"].includes(raw.outcomeCompatibility) ? raw.outcomeCompatibility : "unknown",
     physicalEffect: mechanicalEffect,
+    intendedOutcome: raw.intendedOutcome ? String(raw.intendedOutcome).slice(0, 120) : "",
+    semanticOwnershipLinkId: raw.semanticOwnershipLinkId ? String(raw.semanticOwnershipLinkId).slice(0, 260) : "",
+    policyCorrectionForDecisionGroupId: raw.policyCorrectionForDecisionGroupId ? String(raw.policyCorrectionForDecisionGroupId).slice(0, 140) : "",
     goalId: raw.goalId ? String(raw.goalId).slice(0, 200) : "",
+    decisionInstanceId: raw.decisionInstanceId ? String(raw.decisionInstanceId).slice(0, 900) : "",
     candidateId: raw.candidateId ? String(raw.candidateId).slice(0, 240) : "",
     skillPlanId: raw.skillPlanId ? String(raw.skillPlanId).slice(0, 160) : "",
     skillAtomId: raw.skillAtomId ? String(raw.skillAtomId).slice(0, 200) : "",
@@ -212,6 +220,72 @@ function semanticGoalKey(source = {}) {
     .join("|");
 }
 
+function normalizedInstanceFact(value = "") {
+  return String(value || "").replace(/\s+/g, " ").trim().toLowerCase().slice(0, 180);
+}
+
+/**
+ * Fresh-browser identity for one current checkout decision. This scopes
+ * recovery memory only; it does not classify the page or authorize actions.
+ */
+function decisionInstanceKey(source = {}, observation = {}) {
+  const page = observation.page || {};
+  const goal = source.affordance?.task || source.currentGoal || source;
+  const target = source.targetSnapshot || {};
+  const decisionGroupId = String(
+    source.policyCorrectionForDecisionGroupId
+    || source.decisionGroupId
+    || goal.decisionGroupId
+    || target.policyCorrectionForDecisionGroupId
+    || target.decisionGroupId
+    || ""
+  );
+  const group = (page.decisionGroups || []).find((item) => (
+    String(item.decisionGroupId || item.requirementId || "") === decisionGroupId
+  )) || {};
+  const surface = page.currentSurface || page.activeSurface || page.foreground || {};
+  const progress = page.foreground?.progressMarkers
+    || page.visualState?.foreground?.progressMarkers
+    || surface.foreground?.progressMarkers
+    || surface.visualState?.progressMarkers
+    || {};
+  const passenger = group.passengerId
+    || group.travelerId
+    || group.passengerOrdinal
+    || group.travelerOrdinal
+    || goal.passengerId
+    || goal.travelerId
+    || progress.passengerOrdinal
+    || progress.travelerOrdinal
+    || surface.passengerId
+    || surface.travelerId
+    || "";
+  const selected = [
+    group.selectedEvidence?.selectedControlId || group.selectedControlId || goal.selectedControlId,
+    group.selectedEvidence?.ownerElementId,
+    group.selectedEvidence?.selectedLabel || group.selectedLabel || goal.selectedLabel
+  ].filter(Boolean).join("|");
+  return JSON.stringify({
+    stage: normalizedInstanceFact(page.step || page.pageStep || goal.stage || "unknown"),
+    surface: normalizedInstanceFact([
+      surface.id || target.surfaceId || group.surfaceId || "surface-page",
+      surface.type || target.surfaceType || group.surfaceType || "page",
+      surface.surfaceClass || surface.taskHint || "",
+      surface.label || target.surfaceLabel || ""
+    ].filter(Boolean).join("|")),
+    repeatedStep: normalizedInstanceFact([
+      progress.flightOrdinal,
+      progress.route,
+      progress.step,
+      progress.current,
+      progress.segment
+    ].filter(Boolean).join("|")),
+    passenger: normalizedInstanceFact(passenger),
+    decisionGroup: normalizedInstanceFact(decisionGroupId || group.requirementId || goal.requirementId),
+    selectedItem: normalizedInstanceFact(selected)
+  });
+}
+
 /** Two actions are "the same attempt" if they'd resolve to the same target+value+type. */
 function actionSignature(action) {
   return actuatorSignature(action);
@@ -223,6 +297,7 @@ module.exports = {
   visualRegionsMatch,
   actionSignature,
   actuatorSignature,
+  decisionInstanceKey,
   semanticGoalKey,
   ACTION_TYPES
 };

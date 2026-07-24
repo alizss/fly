@@ -388,9 +388,28 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
   if (existing.type === "target_in_view" || semantics.expectedEvidence === "target_visible") {
     return { ...existing, ...base, type: "target_in_view" };
   }
+  if (existing.type === "policy_conflict_resolved"
+    || (existing.type === "options_surface_appeared" && existing.intendedOutcome === "open_correction_surface")) {
+    return { ...base, ...existing, type: existing.type };
+  }
   if (["select_free_option", "select_paid_option"].includes(physicalEffect)) {
     const disposition = normalized(`${action.semantic || ""} ${action.policyOutcome || ""} ${action.risk || ""} ${control.semantic || ""} ${control.risk || ""}`);
     const structuredPrice = action.affordance?.structuredPrice || control.structuredPrice || null;
+    const decisionGroupId = base.decisionGroupId;
+    const beforeDecisionGroup = (page.decisionGroups || []).find((group) => (
+      group.decisionGroupId === decisionGroupId || group.requirementId === decisionGroupId
+    )) || null;
+    const semanticOwnershipLink = (page.semanticOwnershipLinks || []).find((link) => (
+      link.sourceDecisionGroupId === decisionGroupId
+      && link.correctionControlId === base.controlId
+      && link.status === "resolved"
+    )) || null;
+    const beforeSelectedChargeAmount = Number(beforeDecisionGroup?.selectedEvidence?.structuredPrice?.amount);
+    const selectedDisposition = normalized(beforeDecisionGroup?.selectedEvidence?.disposition || "");
+    const correctingPaidConflict = physicalEffect === "select_free_option" && Boolean(
+      selectedDisposition === "paid"
+      || (Number.isFinite(beforeSelectedChargeAmount) && beforeSelectedChargeAmount > 0)
+    );
     const exactFree = physicalEffect === "select_free_option" || Number(structuredPrice?.amount) === 0
       || /decline|safe_decline|free|selected_free_option|no[_ -]?extra|without/.test(disposition)
       || existing.type === "exact_free_option_selected";
@@ -402,6 +421,10 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
       expectedSelectedLabel: action.targetLabel || target.label || control.label || existing.expectedSelectedLabel || "",
       expectedDisposition: exactFree ? "decline_free_no_extra" : "selected",
       prohibitPaidAlternative: exactFree,
+      requireChargeRemoved: correctingPaidConflict,
+      semanticOwnershipLinkId: semanticOwnershipLink?.linkId || "",
+      correctionDecisionGroupId: semanticOwnershipLink?.correctionDecisionGroupId || "",
+      beforeSelectedChargeAmount: Number.isFinite(beforeSelectedChargeAmount) ? beforeSelectedChargeAmount : null,
       requireSurfaceDismissed: false,
       beforePriceAmount: Number.isFinite(Number(page.price?.amount)) ? Number(page.price.amount) : null,
       beforePriceText: page.priceText || "",

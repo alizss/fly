@@ -645,12 +645,22 @@ function compactLogicalControl(control = {}) {
     iconOnly: Boolean(control.iconOnly),
     kind: clampText(control.kind, 80),
     field: clampText(control.field, 80),
+    fieldType: clampText(control.fieldType, 80),
+    fieldClassification: control.fieldClassification?.fieldType ? {
+      fieldType: clampText(control.fieldClassification.fieldType, 80),
+      source: clampText(control.fieldClassification.source, 80),
+      confidence: Number(control.fieldClassification.confidence || 0),
+      evidence: Array.isArray(control.fieldClassification.evidence)
+        ? control.fieldClassification.evidence.map((item) => clampText(item, 180)).filter(Boolean).slice(0, 4)
+        : []
+    } : null,
     role: clampText(control.role, 80),
     semantic: clampText(control.semantic, 80),
     physicalEffect: clampText(control.physicalEffect, 80),
     semanticConflict: Boolean(control.semanticConflict),
     risk: clampText(control.risk, 80),
     state: control.state || null,
+    currentValue: clampText(control.currentValue || control.state?.selectedValue || control.state?.normalizedValue, 240),
     selected: Boolean(control.selected),
     required: Boolean(control.required),
     hasValue: Boolean(control.hasValue || control.state?.valuePresent || control.controlState?.valuePresent),
@@ -669,13 +679,74 @@ function compactLogicalControl(control = {}) {
   };
 }
 
-function compactDecisionGroup(group = {}, controlsById = new Map()) {
+function compactStructuredPrice(price = null) {
+  if (!price || !Number.isFinite(Number(price.amount))) return null;
+  return {
+    amount: Number(price.amount),
+    currency: clampText(price.currency, 12)
+  };
+}
+
+function compactDecisionGroup(group = {}, controlsById = new Map(), selectedExtras = []) {
   const alternativeControlIds = Array.isArray(group.alternativeControlIds)
     ? group.alternativeControlIds
     : (group.alternatives || []).map((choice) => choice.controlId);
   const ids = [...new Set(alternativeControlIds.map((id) => clampText(id, 140)).filter(Boolean))];
+  const decisionGroupId = clampText(group.decisionGroupId, 140);
+  const transactionSelection = (selectedExtras || []).find((extra) => (
+    clampText(extra?.decisionGroupId, 140) === decisionGroupId
+    && (
+      Number(extra?.priceAmount) > 0
+      || (
+        /paid|money|selected_paid/.test(clampText(extra?.disposition, 80).toLowerCase())
+        && !/decline|free|remove|skip|without|none|not selected|no extra/.test(clampText(extra?.disposition, 80).toLowerCase())
+      )
+    )
+  )) || null;
+  const ownedReversalId = clampText(group.removalControlId, 140)
+    || ids.find((controlId) => {
+      const control = controlsById.get(controlId) || {};
+      return /remove|decline|free|skip|without|none|deselect|clear/.test(
+        `${control.semantic || ""} ${control.physicalEffect || ""} ${control.risk || ""}`.toLowerCase()
+      );
+    })
+    || "";
+  const rawEvidence = group.selectedEvidence || null;
+  const selectedEvidence = rawEvidence || transactionSelection
+    ? {
+        selected: rawEvidence?.selected === true || Boolean(transactionSelection),
+        disposition: clampText(rawEvidence?.disposition || transactionSelection?.disposition || "unknown", 40),
+        structuredPrice: compactStructuredPrice(rawEvidence?.structuredPrice)
+          || (transactionSelection && Number.isFinite(Number(transactionSelection.priceAmount))
+            ? { amount: Number(transactionSelection.priceAmount), currency: clampText(transactionSelection.currency, 12) }
+            : null),
+        source: clampText(rawEvidence?.source || (transactionSelection ? "transaction_selected_extra" : ""), 80),
+        ownerElementId: clampText(rawEvidence?.ownerElementId, 140),
+        selectedControlId: clampText(rawEvidence?.selectedControlId || group.selectedControlId, 140),
+        selectedLabel: clampText(rawEvidence?.selectedLabel || group.selectedLabel || transactionSelection?.label, 220),
+        semantic: clampText(rawEvidence?.semantic || group.selectedSemantic || (transactionSelection ? "selected_paid_item" : ""), 80),
+        risk: clampText(rawEvidence?.risk || (transactionSelection ? "money" : ""), 80)
+      }
+    : null;
+  const rawOwnership = group.semanticOwnership || null;
+  const semanticOwnership = rawOwnership || (transactionSelection && ownedReversalId)
+    ? {
+        status: clampText(rawOwnership?.status || "unknown", 40),
+        family: clampText(rawOwnership?.family, 40),
+        source: clampText(rawOwnership?.source || "transaction_fact_requires_semantic_resolution", 100),
+        nearbySectionType: clampText(rawOwnership?.nearbySectionType || group.sectionType || "unknown", 80),
+        nearbySectionLabel: clampText(rawOwnership?.nearbySectionLabel || group.sectionLabel, 160),
+        ownerElementId: clampText(rawOwnership?.ownerElementId || selectedEvidence?.ownerElementId, 140),
+        controlId: clampText(rawOwnership?.controlId || ownedReversalId, 140),
+        requirement: clampText(rawOwnership?.requirement, 40),
+        priceDisposition: clampText(rawOwnership?.priceDisposition || selectedEvidence?.disposition, 40),
+        policyCompatibility: clampText(rawOwnership?.policyCompatibility, 40),
+        confidence: clampText(rawOwnership?.confidence, 40),
+        rationale: clampText(rawOwnership?.rationale, 240)
+      }
+    : null;
   return {
-    decisionGroupId: clampText(group.decisionGroupId, 140),
+    decisionGroupId,
     surfaceId: clampText(group.surfaceId, 80),
     sectionId: clampText(group.sectionId, 80),
     sectionType: clampText(group.sectionType, 80),
@@ -686,6 +757,9 @@ function compactDecisionGroup(group = {}, controlsById = new Map()) {
     selectedControlId: clampText(group.selectedControlId, 140),
     selectedLabel: clampText(group.selectedLabel, 220),
     selectedSemantic: clampText(group.selectedSemantic, 80),
+    semanticOwnership,
+    selectedEvidence,
+    removalControlId: ownedReversalId,
     alternativeControlIds: ids,
     alternatives: ids.flatMap((controlId) => {
       const control = controlsById.get(controlId);
@@ -696,8 +770,10 @@ function compactDecisionGroup(group = {}, controlsById = new Map()) {
         visualRef: control.visualRef || "",
         label: control.label || "",
         semantic: control.semantic || "",
+        physicalEffect: control.physicalEffect || "unknown",
         risk: control.risk || "",
         selected: Boolean(control.selected || control.state?.selected || control.state?.checked),
+        structuredPrice: compactStructuredPrice(control.structuredPrice),
         priceText: ""
       }];
     }),
@@ -705,7 +781,79 @@ function compactDecisionGroup(group = {}, controlsById = new Map()) {
   };
 }
 
-function compactAgentPayload(body) {
+function mergeObservationRecords(previous = [], incoming = [], key, removedIds = new Set()) {
+  const records = new Map();
+  for (const item of previous || []) {
+    const id = String(key(item) || "");
+    if (id && !removedIds.has(id)) records.set(id, item);
+  }
+  for (const item of incoming || []) {
+    const id = String(key(item) || "");
+    if (id) records.set(id, item);
+  }
+  return [...records.values()];
+}
+
+function hydrateIncrementalAgentBody(body = {}) {
+  const update = body.observationUpdate || {};
+  if (update.mode !== "incremental" || body.page?.incremental !== true) return body;
+  const sessionId = clampText(body.sessionId || "", 120);
+  const previous = sessionId ? agentSessionStore.getCurrentObservation(sessionId) : null;
+  const previousHash = String(previous?.observationSnapshot?.snapshotHash || previous?.page?.snapshotHash || "");
+  if (!previous?.page || !update.baseSnapshotHash || update.baseSnapshotHash !== previousHash) {
+    const error = new Error("Incremental observation base does not match the current canonical page.");
+    error.code = "OBSERVATION_RESYNC_REQUIRED";
+    error.retryable = true;
+    throw error;
+  }
+  const delta = body.page || {};
+  const diff = update.diff || {};
+  const removedControlIds = new Set((diff.removedControls || []).map((entry) => String(entry.controlId || "")).filter(Boolean));
+  const changedControlIds = new Set([
+    ...(delta.controls || []).map((control) => String(control.controlId || "")),
+    ...removedControlIds
+  ].filter(Boolean));
+  const previousAliases = (previous.page.controlAliases || []).filter((entry) => !changedControlIds.has(String(entry.controlId || "")));
+  const controls = mergeObservationRecords(
+    previous.page.controls,
+    delta.controls,
+    (control) => control.controlId,
+    removedControlIds
+  );
+  const aliases = mergeObservationRecords(
+    previousAliases,
+    delta.controlAliases,
+    (entry) => entry.aliasId
+  ).filter((entry) => controls.some((control) => control.controlId === entry.controlId));
+  const decisionGroups = mergeObservationRecords(
+    previous.page.decisionGroups,
+    delta.decisionGroups,
+    (group) => group.decisionGroupId
+  ).filter((group) => (
+    !group.selectedControlId || controls.some((control) => control.controlId === group.selectedControlId)
+  ));
+  const sections = mergeObservationRecords(
+    previous.page.sections,
+    delta.sections,
+    (section) => section.id
+  );
+  return {
+    ...body,
+    transportMode: body.transportMode || "incremental_diff",
+    page: {
+      ...previous.page,
+      ...delta,
+      incremental: false,
+      controls,
+      controlAliases: aliases,
+      decisionGroups,
+      sections
+    }
+  };
+}
+
+function compactAgentPayload(rawBody) {
+  const body = hydrateIncrementalAgentBody(rawBody);
   const page = body.page || {};
   const traveler = body.traveler || {};
   const screenshot = screenshotForObservation(page, body);
@@ -755,6 +903,14 @@ function compactAgentPayload(body) {
     clientTurnId: clampText(body.clientTurnId || "", 120),
     observationId: clampText(body.observationId || "", 120),
     observationSnapshot: body.observationSnapshot || null,
+    observationUpdate: body.observationUpdate && typeof body.observationUpdate === "object" ? {
+      mode: clampText(body.observationUpdate.mode || "full_snapshot", 40),
+      baseSnapshotHash: clampText(body.observationUpdate.baseSnapshotHash, 120),
+      snapshotHash: clampText(body.observationUpdate.snapshotHash, 120),
+      diff: body.observationUpdate.diff && typeof body.observationUpdate.diff === "object"
+        ? body.observationUpdate.diff
+        : null
+    } : null,
     userIntent: clampText(body.userIntent || "Complete checkout safely for the selected traveler.", 800),
     userMessage: clampText(body.userMessage || "", 800),
     approvalState: {
@@ -933,7 +1089,11 @@ function compactAgentPayload(body) {
           })).filter((entry) => entry.aliasId && entry.controlId)
         : [],
       decisionGroups: Array.isArray(page.decisionGroups)
-        ? page.decisionGroups.map((group) => compactDecisionGroup(group, canonicalControlsById)).filter((group) => group.decisionGroupId)
+        ? page.decisionGroups.map((group) => compactDecisionGroup(
+            group,
+            canonicalControlsById,
+            page.transactionFacts?.selectedExtras || []
+          )).filter((group) => group.decisionGroupId)
         : [],
       stageExit: page.stageExit || {},
       reconciliation: page.reconciliation || {},
@@ -966,6 +1126,7 @@ async function decideAgentNextActionViaLoop(body) {
   const observation = {
     observationId: payload.observationId,
     observationSnapshot: payload.observationSnapshot,
+    observationUpdate: payload.observationUpdate,
     userIntent: payload.userIntent,
     page: payload.page,
     lastActionResult: payload.lastActionResult || null
@@ -1276,6 +1437,13 @@ async function handleApi(req, res, pathname) {
       const decision = await decideAgentNextActionViaLoop(body);
       return sendJson(res, 200, decision);
     } catch (error) {
+      if (error.code === "OBSERVATION_RESYNC_REQUIRED") {
+        return sendJson(res, 409, {
+          error: error.message,
+          code: error.code,
+          retryable: true
+        });
+      }
       if (/^DURABLE_SESSION_/.test(error.message || "")) {
         return sendJson(res, 409, { error: error.message, code: error.message });
       }

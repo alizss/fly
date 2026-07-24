@@ -1,5 +1,5 @@
 const { evaluateTransition } = require("./transition-evaluator");
-const { actuatorSignature } = require("../../../packages/shared/agent-actions");
+const { actuatorSignature, decisionInstanceKey } = require("../../../packages/shared/agent-actions");
 
 const MAX_RECOVERY_ATTEMPTS = 3;
 const PENDING_ACTION_SCHEMA_VERSION = 2;
@@ -9,9 +9,6 @@ const FAILURE_CODE_ALIASES = Object.freeze({
 });
 
 const UNSAFE_FAILURE_CODES = new Set([
-  "POLICY_BLOCKED",
-  "BLOCKED_BY_POLICY",
-  "BLOCKED_BY_SAFETY",
   "PAYMENT_AUTHORIZATION_REQUIRED",
   "DUPLICATE_PAYMENT_ATTEMPT",
   "ITINERARY_ROUTE_CHANGED",
@@ -19,8 +16,7 @@ const UNSAFE_FAILURE_CODES = new Set([
   "ITINERARY_TIME_CHANGED",
   "ITINERARY_FLIGHT_CHANGED",
   "TRAVELER_CHANGED",
-  "CURRENCY_CHANGED",
-  "PRICE_INCREASE_REQUIRES_AUTHORIZATION"
+  "CURRENCY_CHANGED"
 ]);
 
 function canonicalFailureCode(result = {}) {
@@ -84,6 +80,8 @@ function proposeActionLifecycle(action = {}, observation = {}) {
     dispatched: false,
     observed: false,
     verified: false,
+    closed: false,
+    awaitingClarification: false,
     resultCode: "",
     transitionStatus: ""
   };
@@ -101,6 +99,8 @@ function rejectActionLifecycle(lifecycle = {}, result = {}) {
     dispatched: false,
     observed: false,
     verified: false,
+    closed: true,
+    awaitingClarification: false,
     resultCode: canonicalFailureCode(result) || "GOVERNOR_REJECTED"
   };
 }
@@ -120,6 +120,7 @@ function recoveryStateFor(state = {}) {
     lastCode: String(existing.lastCode || ""),
     lastRevealSample: existing.lastRevealSample || null,
     outcomeId: String(existing.outcomeId || ""),
+    decisionInstanceId: String(existing.decisionInstanceId || ""),
     transitionTrail: [...(existing.transitionTrail || [])].slice(-12),
     updatedAt: existing.updatedAt || ""
   };
@@ -200,6 +201,7 @@ function updateRecoveryState(state = {}, event = {}) {
     next.failedStrategySignatures = [];
     next.lastCode = code;
     next.lastRevealSample = null;
+    next.decisionInstanceId = "";
     classification = kind;
   } else if (["grounding_rejection", "planner_rejection"].includes(kind)) {
     next.phase = kind;
@@ -218,12 +220,19 @@ function updateRecoveryState(state = {}, event = {}) {
     classification = event.measurableProgress === true ? "reveal_progress" : "reveal_no_effect";
   } else if (kind === "execution_no_effect") {
     const stateHash = String(event.stateHash || "");
-    const signatures = stateHash && stateHash !== previous.stateHash
+    const decisionInstanceId = String(event.decisionInstanceId || "");
+    const sameDecisionInstance = Boolean(
+      decisionInstanceId
+      && previous.decisionInstanceId
+      && decisionInstanceId === previous.decisionInstanceId
+    );
+    const signatures = !sameDecisionInstance || (stateHash && stateHash !== previous.stateHash)
       ? []
       : [...previous.failedStrategySignatures];
     if (event.strategySignature && !signatures.includes(event.strategySignature)) signatures.push(event.strategySignature);
     next.phase = "execution_no_effect";
     next.stateHash = stateHash || previous.stateHash;
+    next.decisionInstanceId = decisionInstanceId;
     next.failedStrategySignatures = signatures;
     next.attempts = signatures.length || previous.attempts + 1;
     next.lastCode = code || "TRANSITION_NO_EFFECT";
@@ -286,6 +295,8 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
     dispatched: sameAction ? previous.dispatched === true : false,
     observed: sameAction ? previous.observed === true : false,
     verified: sameAction ? previous.verified === true : false,
+    closed: sameAction ? previous.closed === true : false,
+    awaitingClarification: sameAction ? previous.awaitingClarification === true : false,
     resultCode: canonicalFailureCode(result),
     transitionStatus: sameAction ? previous.transitionStatus || "" : "",
     resultObservationId: observation.observationId || ""
@@ -294,9 +305,12 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
 
 function transitionResult(result = {}, transition = null) {
   if (!transition) return { ...result, failureCode: canonicalFailureCode(result) };
+  const interveningMutation = transition.causality?.classification === "intervening_external_mutation";
   return {
     ...result,
-    failureCode: transition.status === "no_effect"
+    failureCode: interveningMutation
+      ? "INTERVENING_EXTERNAL_MUTATION"
+      : transition.status === "no_effect"
       ? "TRANSITION_NO_EFFECT"
       : canonicalFailureCode(result),
     transitionStatus: transition.status,
@@ -327,6 +341,68 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
     return { state, observation, lifecycle: null, transition: null, directive: "continue" };
   }
 
+  const previousLifecycle = state.actionLifecycle || {};
+  const samePreviouslyObservedAction = Boolean(
+    previousLifecycle.actionId
+    && previousLifecycle.actionId === (result.actionId || action.id)
+  );
+  // An action owns exactly one immediate result window. A repeated action
+  // token on a later observation cannot make that already-closed action
+  // succeed or fail retroactively; the latest page is consumed as fresh
+  // TaskState input instead.
+  if (samePreviouslyObservedAction && previousLifecycle.closed === true) {
+    return {
+      state,
+      observation: {
+        ...observation,
+        lastActionResult: {
+          ...result,
+          causalWindowClosed: true,
+          causality: {
+            classification: "external_or_current_state",
+            code: "ACTION_CAUSAL_WINDOW_CLOSED",
+            actionId: result.actionId || action.id || ""
+          }
+        }
+      },
+      lifecycle: null,
+      transition: null,
+      directive: "continue"
+    };
+  }
+  // An unclear immediate result gets one fresh read. That read rebuilds the
+  // current state, but is not attributed to the old action because another
+  // site/user mutation may have happened after dispatch.
+  if (samePreviouslyObservedAction && previousLifecycle.awaitingClarification === true) {
+    const lifecycle = {
+      ...previousLifecycle,
+      status: "observed",
+      observed: true,
+      verified: false,
+      closed: true,
+      awaitingClarification: false,
+      resultObservationId: observation.observationId || "",
+      resultCode: "ACTION_RESULT_UNCLEAR_AFTER_REOBSERVE",
+      transitionStatus: "uncertain"
+    };
+    return {
+      state: { ...state, actionLifecycle: lifecycle },
+      observation: {
+        ...observation,
+        lastActionResult: {
+          ...result,
+          verified: false,
+          failureCode: "ACTION_RESULT_UNCLEAR_AFTER_REOBSERVE",
+          causalWindowClosed: true
+        }
+      },
+      lifecycle,
+      transition: null,
+      directive: "rebuild_candidates",
+      exhausted: false
+    };
+  }
+
   const dispatched = wasDispatched(result);
   const code = canonicalFailureCode(result);
   let recovery = { state, recoveryState: recoveryStateFor(state), exhausted: false };
@@ -337,15 +413,22 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
   if (!dispatched) {
     const unsafe = UNSAFE_FAILURE_CODES.has(code);
     if (unsafe) {
-      lifecycle = { ...lifecycle, status: "unsafe", resultCode: code };
+      lifecycle = { ...lifecycle, status: "unsafe", closed: true, awaitingClarification: false, resultCode: code };
       directive = "stop_for_safety";
     } else {
       recovery = updateRecoveryState(state, { kind: "grounding_rejection", code: code || "PRE_DISPATCH_REJECTION" });
-      lifecycle = { ...lifecycle, status: "rejected_before_dispatch", resultCode: code || "PRE_DISPATCH_REJECTION" };
+      lifecycle = { ...lifecycle, status: "rejected_before_dispatch", closed: true, awaitingClarification: false, resultCode: code || "PRE_DISPATCH_REJECTION" };
       directive = "rebuild_candidates";
     }
   } else if (!previousObservation?.observationId || !observation.observationId) {
-    lifecycle = { ...lifecycle, status: "dispatched", dispatched: true, resultCode: code };
+    lifecycle = {
+      ...lifecycle,
+      status: "dispatched",
+      dispatched: true,
+      closed: false,
+      awaitingClarification: true,
+      resultCode: code
+    };
     directive = "reobserve_rebind";
   } else {
     transition = evaluateTransition({
@@ -357,20 +440,37 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
     const observed = true;
     if (transition.status === "achieved") {
       recovery = updateRecoveryState(state, { kind: "verified", code });
-      lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, transitionStatus: "achieved", resultCode: code };
+      lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, transitionStatus: "achieved", resultCode: code };
       directive = "advance_goal";
     } else if (transition.status === "progressed") {
       recovery = updateRecoveryState(state, { kind: "meaningful_progress", code });
-      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, transitionStatus: "progressed", resultCode: code };
+      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "progressed", resultCode: code };
       directive = "rebuild_candidates";
     } else if (transition.status === "blocked") {
-      recovery = updateRecoveryState(state, { kind: "meaningful_progress", code });
-      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, transitionStatus: "blocked", resultCode: code };
-      directive = "resolve_blocker";
+      const rebuildFromCurrentState = transition.nextDirective === "rebuild_task_state";
+      const reconciliationCode = rebuildFromCurrentState
+        ? (transition.causality?.code || "FRESH_STATE_RECONCILIATION_REQUIRED")
+        : code;
+      recovery = updateRecoveryState(state, {
+        kind: "meaningful_progress",
+        code: reconciliationCode
+      });
+      lifecycle = {
+        ...lifecycle,
+        status: "observed",
+        dispatched: true,
+        observed,
+        verified: false,
+        closed: true,
+        awaitingClarification: false,
+        transitionStatus: "blocked",
+        resultCode: reconciliationCode
+      };
+      directive = rebuildFromCurrentState ? "rebuild_candidates" : "resolve_blocker";
     } else if (transition.status === "no_effect") {
       const revealAction = action.type === "scroll" || action.intent === "recover_target_viewport";
       if (revealAction) {
-        lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
+        lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
         directive = "reobserve_rebind";
       } else {
       const stateHash = String(
@@ -381,23 +481,26 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
         || ""
       );
       const signature = actuatorSignature(action);
+      const decisionInstanceId = action.decisionInstanceId
+        || decisionInstanceKey(action, previousObservation || observation);
       recovery = updateRecoveryState(state, {
         kind: "execution_no_effect",
         code: "TRANSITION_NO_EFFECT",
         stateHash,
-        strategySignature: signature
+        strategySignature: signature,
+        decisionInstanceId
       });
-      lifecycle = { ...lifecycle, status: "failed", dispatched: true, observed, verified: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
+      lifecycle = { ...lifecycle, status: "failed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
       // A finite no-effect budget suppresses repeated strategies, but it does
       // not justify a handoff while another safe grounded capability exists.
       directive = "try_distinct_capability";
       }
     } else if (transition.status === "unsafe") {
-      lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, transitionStatus: "unsafe", resultCode: code };
+      lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "unsafe", resultCode: code };
       directive = "stop_for_safety";
     } else {
       recovery = updateRecoveryState(state, { kind: "uncertain", code });
-      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, transitionStatus: "uncertain", resultCode: code };
+      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: false, awaitingClarification: true, transitionStatus: "uncertain", resultCode: code };
       directive = "reobserve_rebind";
     }
   }

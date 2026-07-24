@@ -13,7 +13,8 @@ const {
   deriveProfileGoal,
   profileGoalSatisfied,
   candidatesForProfileGoal,
-  actionForProfileCandidate
+  actionForProfileCandidate,
+  normalizeProfileFieldType
 } = require("../../apps/web/agent/skill-expander");
 const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
@@ -337,17 +338,20 @@ test("P0.2/P0.6 persists a failed actuator and forbids the identical retry acros
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
+  const failedDecisionInstanceId = "surface_1|flight_1|trav_1|dg_baggage_confirm";
   store.recordActionResult(state.id, {
     at: new Date().toISOString(),
     actionId: "act_failed",
     observationId: "obs_1",
     executed: true,
     verified: false,
+    decisionInstanceId: failedDecisionInstanceId,
     action: {
       id: "act_failed",
       action: "click",
       targetId: "el_decline",
       targetLabel: "I'll go without",
+      decisionInstanceId: failedDecisionInstanceId,
       value: ""
     },
     targetSnapshot: {
@@ -377,6 +381,7 @@ test("P0.2/P0.6 persists a failed actuator and forbids the identical retry acros
     intent: "decline_optional_extra",
     controlId: "ctrl_decline",
     decisionGroupId: "dg_baggage_confirm",
+    decisionInstanceId: failedDecisionInstanceId,
     targetId: "el_decline",
     targetLabel: "I'll go without",
     targetSnapshot: {
@@ -406,6 +411,20 @@ test("P0.2/P0.6 persists a failed actuator and forbids the identical retry acros
   });
   assert.equal(blocked.allow, false);
   assert.equal(blocked.code, "FAILED_ACTUATOR_REUSE");
+
+  const differentDecisionInstance = governAction({
+    action: {
+      ...repeatedAction,
+      id: "act_same_control_next_leg",
+      decisionInstanceId: "surface_1|flight_2|trav_1|dg_baggage_confirm"
+    },
+    state: failedState,
+    observation,
+    traveler: { id: "trav_1", booking_rules: "no extras" },
+    store,
+    turnId: "turn_same_control_next_leg"
+  });
+  assert.equal(differentDecisionInstance.allow, true);
 
   const alternateAction = {
     ...repeatedAction,
@@ -726,6 +745,7 @@ function completeProfileObservation({ observationId = "obs_complete_profile", fi
       id: `el_${suffix}`,
       controlId: `ctrl_${suffix}`,
       field: definition.semantic,
+      fieldType: definition.semantic,
       semantic: definition.semantic,
       label: definition.label,
       placeholder: definition.placeholder || "",
@@ -736,11 +756,16 @@ function completeProfileObservation({ observationId = "obs_complete_profile", fi
       hasValue: selected,
       controlState: {
         valuePresent: selected,
-        normalizedValue: selected ? normalizedValues[definition.semantic] || "filled" : "",
+        normalizedValue: definition.semantic === "title"
+          ? (selected ? (definition.option === "Mr" ? "mr" : "mrs/ms") : "")
+          : (selected ? normalizedValues[definition.semantic] || "filled" : ""),
+        optionValue: definition.semantic === "title" ? (definition.option === "Mr" ? "mr" : "mrs/ms") : "",
+        selectedValue: definition.semantic === "title" && selected ? (definition.option === "Mr" ? "mr" : "mrs/ms") : "",
         checked: definition.kind === "radio" && selected,
         selected: definition.kind === "radio" && selected
       },
-      sectionType: definition.sectionType
+      sectionType: definition.sectionType,
+      decisionGroupId: definition.semantic === "title" ? `dg_title_${observationId}` : `dg_${suffix}`
     };
   });
   const controls = fields.map((field) => ({
@@ -750,13 +775,17 @@ function completeProfileObservation({ observationId = "obs_complete_profile", fi
     kind: field.kind,
     role: field.role,
     semantic: field.semantic,
+    fieldType: field.fieldType,
     risk: "safe",
     sectionType: field.sectionType,
+    decisionGroupId: field.decisionGroupId,
     surfaceId: "",
     state: {
       disabled: false,
       valuePresent: field.hasValue,
       normalizedValue: field.controlState.normalizedValue,
+      optionValue: field.controlState.optionValue,
+      selectedValue: field.controlState.selectedValue,
       checked: field.controlState.checked,
       selected: field.controlState.selected
     },
@@ -819,6 +848,82 @@ test("P0.4 normalizes phone parts and field-specific dates", () => {
     label: "Month",
     options: [{ value: "05", label: "May" }]
   }), "05");
+});
+
+test("profile field aliases normalize without loose substring matches", () => {
+  assert.equal(normalizeProfileFieldType("traveler_title"), "title");
+  assert.equal(normalizeProfileFieldType("salutation"), "title");
+  assert.equal(normalizeProfileFieldType("mobile_number"), "phone");
+  assert.equal(normalizeProfileFieldType("birth_date"), "date_of_birth");
+  assert.equal(normalizeProfileFieldType("passport_issuing_country"), "issuing_country");
+  assert.equal(normalizeProfileFieldType("sms"), "");
+  assert.equal(normalizeProfileFieldType("mobile_travel_plan"), "");
+});
+
+test("exact profile reconciliation fills, preserves, and corrects traveler title deterministically", () => {
+  const common = new Set(["email", "confirm_email", "phone_country_code", "phone", "first_name", "last_name", "date_of_birth"]);
+  const male = {
+    first_name: "Ali", last_name: "SIFRAR", email: "ali@example.test", phone: "+38670328922",
+    gender: "male", date_of_birth: "2003-05-31"
+  };
+  const female = { ...male, gender: "female" };
+
+  const empty = completeProfileObservation({ observationId: "obs_title_empty", filled: common });
+  const emptyGoal = deriveProfileGoal(empty, male);
+  assert.equal(emptyGoal.semanticType, "title");
+  assert.equal(emptyGoal.desiredValue, "mr");
+  assert.match(candidatesForProfileGoal(emptyGoal, empty, male)[0]?.summary || "", /^choose/);
+
+  const wrongMale = completeProfileObservation({
+    observationId: "obs_title_wrong_male",
+    filled: new Set([...common, "title:Mrs/Ms"])
+  });
+  const maleGoal = deriveProfileGoal(wrongMale, male);
+  assert.equal(maleGoal.semanticType, "title");
+  assert.equal(maleGoal.desiredValue, "mr");
+  assert.equal(candidatesForProfileGoal(maleGoal, wrongMale, male)[0]?.controlId.includes("title_0"), true);
+
+  const wrongFemale = completeProfileObservation({
+    observationId: "obs_title_wrong_female",
+    filled: new Set([...common, "title:Mr"])
+  });
+  const femaleGoal = deriveProfileGoal(wrongFemale, female);
+  assert.equal(femaleGoal.semanticType, "title");
+  assert.equal(femaleGoal.desiredValue, "mrs/ms");
+  assert.equal(candidatesForProfileGoal(femaleGoal, wrongFemale, female)[0]?.controlId.includes("title_1"), true);
+
+  const correct = completeProfileObservation({
+    observationId: "obs_title_correct",
+    filled: new Set([...common, "title:Mr"])
+  });
+  assert.equal(deriveProfileGoal(correct, male), null);
+});
+
+test("missing title identity data asks instead of accepting or guessing a selected option", () => {
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "title:Mr", "first_name", "last_name", "date_of_birth"]);
+  const observation = completeProfileObservation({ observationId: "obs_title_missing_profile", filled });
+  const traveler = {
+    first_name: "Ali", last_name: "SIFRAR", email: "ali@example.test", phone: "+38670328922", date_of_birth: "2003-05-31"
+  };
+  const readiness = profileStageReadiness(observation, traveler);
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.shouldOwn, false);
+  assert.deepEqual(readiness.missingUserData.map((item) => item.semanticType), ["title"]);
+});
+
+test("generic planning cannot own a recognized mismatched profile field", () => {
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "title:Mrs/Ms", "first_name", "last_name", "date_of_birth"]);
+  const observation = completeProfileObservation({ observationId: "obs_profile_owned_title", filled });
+  const traveler = {
+    first_name: "Ali", last_name: "SIFRAR", email: "ali@example.test", phone: "+38670328922",
+    gender: "male", date_of_birth: "2003-05-31"
+  };
+  const goal = deriveProfileGoal(observation, traveler);
+  const candidates = buildCurrentCandidateSet({ goal, observation, traveler }).candidates;
+  assert.equal(goal.kind, "profile_field");
+  assert.equal(goal.semanticType, "title");
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].controlId.includes("title_0"), true);
 });
 
 test("profile DOB candidate carries formatted input and canonical verification", () => {
@@ -1733,6 +1838,126 @@ test("authoritative lifecycle waits for browser evidence before deriving or plan
   assert.equal(result.state.pendingAction.originalAction.id, "act_pending_click");
   assert.equal(result.debug.resumedBeforePlanning, true);
   assert.deepEqual(result.debug.modelUsage.calls, []);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("fresh paid conflict preempts a pending navigation action and dispatches the exact safe reversal", async () => {
+  const { dir, dbPath } = tempDb();
+  const { state, observation } = fixture();
+  const traveler = { id: "trav_1", booking_rules: "decline all paid extras" };
+  observation.page.controls = [
+    {
+      controlId: "ctrl_bundle_paid",
+      decisionGroupId: "dg_bundle",
+      label: "All passengers",
+      kind: "radio",
+      semantic: "add_paid_extra",
+      risk: "money",
+      selected: true,
+      state: { selected: true, disabled: false },
+      structuredPrice: { amount: 29, currency: "EUR" },
+      surfaceId: "surface_1",
+      surfaceType: "modal",
+      stateElementId: "el_bundle_paid",
+      preferredActivationElementId: "el_bundle_paid",
+      operations: { choose: actionableCapability("choose", "el_bundle_paid") },
+      visualRegion: { x: 100, y: 100, width: 180, height: 40, inViewport: true }
+    },
+    {
+      controlId: "ctrl_bundle_free",
+      decisionGroupId: "dg_bundle",
+      label: "None",
+      kind: "radio",
+      semantic: "decline_paid_extra",
+      risk: "safe_decline",
+      selected: false,
+      state: { selected: false, disabled: false },
+      structuredPrice: { amount: 0, currency: "EUR" },
+      surfaceId: "surface_1",
+      surfaceType: "modal",
+      stateElementId: "el_bundle_free",
+      preferredActivationElementId: "el_bundle_free",
+      operations: { choose: actionableCapability("choose", "el_bundle_free") },
+      visualRegion: { x: 100, y: 160, width: 180, height: 40, inViewport: true }
+    },
+    {
+      controlId: "ctrl_continue",
+      label: "Proceed",
+      kind: "button",
+      semantic: "navigation",
+      physicalEffect: "advance_surface",
+      risk: "safe",
+      state: { disabled: false },
+      surfaceId: "surface_1",
+      surfaceType: "modal",
+      stateElementId: "el_continue",
+      preferredActivationElementId: "el_continue",
+      operations: { activate: actionableCapability("activate", "el_continue", { inViewport: false }) },
+      visualRegion: { x: 100, y: 1200, width: 180, height: 40, inViewport: false }
+    }
+  ];
+  observation.page.decisionGroups = [{
+    decisionGroupId: "dg_bundle",
+    requirementId: "extras:bundle",
+    sectionType: "bundle",
+    sectionLabel: "Bundle",
+    status: "satisfied",
+    required: false,
+    surfaceId: "surface_1",
+    surfaceType: "modal",
+    selectedControlId: "ctrl_bundle_paid",
+    selectedLabel: "All passengers",
+    selectedSemantic: "add_paid_extra",
+    selectedEvidence: {
+      selected: true,
+      disposition: "paid",
+      selectedControlId: "ctrl_bundle_paid",
+      structuredPrice: { amount: 29, currency: "EUR" }
+    },
+    alternativeControlIds: ["ctrl_bundle_paid", "ctrl_bundle_free"],
+    alternatives: [
+      { controlId: "ctrl_bundle_paid", label: "All passengers", semantic: "add_paid_extra", risk: "money" },
+      { controlId: "ctrl_bundle_free", label: "None", semantic: "decline_paid_extra", risk: "safe_decline" }
+    ]
+  }];
+  state.pendingAction = pendingActionRecord({
+    status: "ready",
+    action: {
+      id: "act_pending_continue",
+      type: "click",
+      observationId: "obs_before_manual_change",
+      observationHash: "hash_before_manual_change",
+      intent: "navigate_stage",
+      semanticIntent: "continue_checkout",
+      mechanicalEffect: "advance_surface",
+      controlId: "ctrl_continue",
+      targetId: "el_continue",
+      risk: "safe"
+    },
+    goal: { goalId: "goal_continue", semanticType: "navigation" }
+  });
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_policy_conflict_preempts_navigation"
+  });
+
+  assert.equal(result.clientDecision.action, "click");
+  assert.equal(result.clientDecision.controlId, "ctrl_bundle_free");
+  assert.equal(result.clientDecision.intent, "decline_optional_extra");
+  assert.notEqual(result.state.pendingAction.originalAction.id, "act_pending_continue");
+  assert.equal(result.state.taskState.activeDecisions[0].status, "conflicted");
+  assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

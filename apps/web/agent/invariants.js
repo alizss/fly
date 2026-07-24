@@ -1,5 +1,6 @@
 const { withUpdate } = require("../../../packages/shared/agent-state");
 const { factsFromObservation, normalizeFacts } = require("./transaction-facts");
+const { controlBelongsToCurrentSurface } = require("./surface-contract");
 
 function text(value, limit = 180) {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
@@ -63,7 +64,8 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
     state: nextEnvelope === existing ? state : withUpdate(state, { transactionInvariants: nextEnvelope }),
     baseline: nextEnvelope.baseline,
     observed,
-    envelope: nextEnvelope
+    envelope: nextEnvelope,
+    observation
   };
 }
 
@@ -115,11 +117,121 @@ function explicitItineraryConflict(baseline = {}, observed = {}) {
   return null;
 }
 
+function observedPaidExtraForDecision(observed = {}, decisionGroupId = "") {
+  return (observed.selectedExtras || []).find((extra) => {
+    if (!decisionGroupId || extra.decisionGroupId !== decisionGroupId) return false;
+    const disposition = normalizedText(extra.disposition);
+    return number(extra.priceAmount) > 0
+      || (/paid|money/.test(disposition) && !/decline|free|remove|skip|without|none/.test(disposition));
+  }) || null;
+}
+
+function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
+  const decisionGroupId = action.decisionGroupId
+    || action.targetSnapshot?.decisionGroupId
+    || action.expectedOutcome?.decisionGroupId
+    || action.affordance?.task?.decisionGroupId
+    || "";
+  const targetControlId = action.controlId || action.targetSnapshot?.controlId || "";
+  const effect = action.mechanicalEffect
+    || action.physicalEffect
+    || action.affordance?.mechanicalEffect
+    || action.affordance?.physicalEffect
+    || action.affordance?.effect
+    || "";
+  const currentGoal = state.taskState?.currentGoal || {};
+  const conflict = (state.taskState?.activeDecisions || []).find((decision) => (
+    decision.decisionGroupId === decisionGroupId
+    && decision.status === "conflicted"
+    && /SELECTED_OPTION_(?:PRICE_EXCEEDS|CONTRADICTS)_POLICY/.test(String(decision.reopenEvidence?.code || ""))
+  ));
+  const paidSelection = observedPaidExtraForDecision(observed, decisionGroupId);
+  const exactGoal = Boolean(currentGoal.decisionGroupId && currentGoal.decisionGroupId === decisionGroupId);
+  const exactTarget = Boolean(
+    decisionGroupId
+    && targetControlId
+    && action.targetSnapshot?.controlId === targetControlId
+    && (
+      action.targetSnapshot?.decisionGroupId === decisionGroupId
+      || (
+        action.targetSnapshot?.policyCorrectionForDecisionGroupId === decisionGroupId
+        && action.targetSnapshot?.semanticOwnershipLinkId
+      )
+    )
+  );
+  const expected = action.expectedOutcome || {};
+  const safeMeaning = normalizedText(`${action.intent || ""} ${action.semanticIntent || ""} ${action.targetSnapshot?.semantic || ""} ${action.targetSnapshot?.risk || ""}`);
+  const exactFreeReversal = effect === "select_free_option"
+    && expected.type === "exact_free_option_selected"
+    && expected.decisionGroupId === decisionGroupId
+    && (expected.expectedSelectedControlId || expected.controlId) === targetControlId
+    && expected.prohibitPaidAlternative !== false
+    && /decline|free|remove|skip|without|none|safe/.test(safeMeaning);
+  const exactSelectorOpen = effect === "open_surface"
+    && expected.type === "options_surface_appeared"
+    && expected.decisionGroupId === decisionGroupId
+    && /open choice|open selector|open dropdown/.test(safeMeaning);
+  const linkedOutcomeMatchesObservedMechanics = expected.intendedOutcome === "open_correction_surface"
+    ? expected.type === "options_surface_appeared"
+      && !["advance_checkout_stage", "submit_purchase", "enter_payment_credentials", "accept_legal_terms"].includes(effect)
+    : expected.type === "policy_conflict_resolved"
+      && !["advance_surface", "advance_checkout_stage", "submit_purchase", "enter_payment_credentials", "accept_legal_terms"].includes(effect);
+  const linkedSemanticCorrection = Boolean(
+    action.semanticOwnershipLinkId
+    && action.policyCorrectionForDecisionGroupId === decisionGroupId
+    && linkedOutcomeMatchesObservedMechanics
+    && expected.semanticOwnershipLinkId === action.semanticOwnershipLinkId
+    && expected.decisionGroupId === decisionGroupId
+    && expected.controlId === targetControlId
+    && expected.intendedOutcome
+    && expected.intendedOutcome !== "unknown"
+  );
+  return Boolean(conflict && paidSelection && exactGoal && exactTarget && (exactFreeReversal || exactSelectorOpen || linkedSemanticCorrection));
+}
+
+function groundedSafeReversalForExtra(extra = {}, observation = {}) {
+  const page = observation.page || {};
+  const decisionGroupId = text(extra.decisionGroupId, 140);
+  const group = (page.decisionGroups || []).find((item) => text(item.decisionGroupId, 140) === decisionGroupId);
+  if (!group) return null;
+  const semanticLink = (page.semanticOwnershipLinks || []).find((link) => (
+    link.status === "resolved"
+    && link.sourceDecisionGroupId === decisionGroupId
+    && link.intendedOutcome
+    && link.intendedOutcome !== "unknown"
+  )) || null;
+  const ids = new Set([
+    group.removalControlId,
+    ...(group.alternativeControlIds || []),
+    ...(group.semanticCorrectionControlIds || []),
+    semanticLink?.correctionControlId,
+    ...(group.alternatives || []).map((alternative) => alternative.controlId)
+  ].map((id) => text(id, 140)).filter(Boolean));
+  const control = (page.controls || []).find((item) => {
+    if (!ids.has(text(item.controlId, 140))) return false;
+    if (!controlBelongsToCurrentSurface(item, page)) return false;
+    const meaning = normalizedText(`${item.semantic || ""} ${item.physicalEffect || ""} ${item.risk || ""}`);
+    const exactLinkedHypothesis = semanticLink?.correctionControlId === text(item.controlId, 140);
+    if (!exactLinkedHypothesis && !/remove|decline|free|skip|without|none|deselect|clear|safe decline|select free/.test(meaning)) return false;
+    if (/advance checkout stage|payment|purchase|legal|select paid|add paid/.test(meaning)) return false;
+    return Object.values(item.operations || {}).some((operation) => (
+      operation?.actionability?.executable === true || operation?.actionability?.revealable === true
+    ));
+  });
+  return control ? {
+    decisionGroupId,
+    controlId: text(control.controlId, 140),
+    effect: text(control.physicalEffect || "unknown", 80),
+    ...(semanticLink?.intendedOutcome ? { intendedOutcome: semanticLink.intendedOutcome } : {}),
+    ...(semanticLink?.linkId ? { semanticOwnershipLinkId: semanticLink.linkId } : {})
+  } : null;
+}
+
 function invariantDecision(prepared = {}, action = {}, state = prepared.state || {}) {
   const baseline = prepared.baseline || normalizeFacts({});
   const observed = prepared.observed || normalizeFacts({});
   const checks = [];
-  const deny = (code, reason, details = {}) => ({ allow: false, decision: "blocked_by_safety", code, reason, details, checks: [...checks, { code, ok: false }] });
+  const deny = (code, reason, details = {}, decision = "blocked_by_safety") => ({ allow: false, decision, code, reason, details, checks: [...checks, { code, ok: false }] });
   const pass = (code, detail = "") => checks.push({ code, ok: true, detail });
 
   const travelerConflict = explicitTravelerConflict(baseline.travelers, observed.travelers);
@@ -135,16 +247,88 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
   }
   pass("CURRENCY_STABLE", baseline.currency && observed.currency ? observed.currency : "current evidence absent or baseline unknown");
 
+  const actionEffect = action.mechanicalEffect
+    || action.physicalEffect
+    || action.affordance?.mechanicalEffect
+    || action.affordance?.physicalEffect
+    || action.affordance?.effect
+    || "";
+  const actionMeaning = normalizedText(`${action.intent || ""} ${action.semanticIntent || ""} ${action.risk || ""} ${action.targetSnapshot?.semantic || ""}`);
+  const exactCostReducingCorrection = exactPolicyCorrectionStep(action, state, observed);
+  // A grounded observation-scoped correction may still have an unknown
+  // browser semantic. Its safety comes from the exact conflict/control link
+  // and fresh postcondition, not from rewriting the observed effect.
+  const correctsPaidSelection = exactCostReducingCorrection;
+  const actionAddsCost = actionEffect === "select_paid_option"
+    || action.risk === "money"
+    || action.targetSnapshot?.risk === "money"
+    || number(action.affordance?.structuredPrice?.amount) > 0;
+  const finalTransactionBoundary = actionEffect === "submit_purchase"
+    || action.risk === "payment"
+    || action.targetSnapshot?.risk === "payment"
+    || /submit payment|submit purchase|confirm purchase|finalize booking|book now/.test(actionMeaning);
+
   const beforePrice = number(baseline.totalPrice?.amount);
   const currentPrice = number(observed.totalPrice?.amount);
   if (beforePrice != null && currentPrice != null && currentPrice > beforePrice) {
-    const authorization = state.approvals?.priceAuthorization;
-    const maximum = number(authorization?.maximumAmount);
-    if (!authorization?.authorizationId || maximum == null || currentPrice > maximum) {
-      return deny("UNAPPROVED_PRICE_CHANGE", `Price increased from ${beforePrice} to ${currentPrice} without a bound price authorization.`, { before: beforePrice, after: currentPrice });
+    if (exactCostReducingCorrection) {
+      pass("ELEVATED_PRICE_EXACT_CORRECTION", `${beforePrice} -> ${currentPrice}`);
+    } else if (actionAddsCost || finalTransactionBoundary) {
+      const authorization = state.approvals?.priceAuthorization;
+      const maximum = number(authorization?.maximumAmount);
+      if (!authorization?.authorizationId || maximum == null || currentPrice > maximum) {
+        return deny("UNAPPROVED_PRICE_CHANGE", `A cost-adding or final transaction action requires price authorization for the current total (${beforePrice} -> ${currentPrice}).`, { before: beforePrice, after: currentPrice });
+      }
+    } else {
+      pass("PRICE_CHANGE_REQUIRES_RECONCILIATION_NOT_APPROVAL", `${beforePrice} -> ${currentPrice}`);
     }
   }
-  pass("PRICE_WITHIN_AUTHORIZATION");
+  pass("PRICE_OBSERVED_OR_BOUNDARY_AUTHORIZED");
+  const advancesCheckout = !correctsPaidSelection && (
+    ["advance_surface", "advance_checkout_stage"].includes(actionEffect)
+    || action.intent === "navigate_stage"
+  );
+  if (advancesCheckout) {
+    const paidSelections = (observed.selectedExtras || []).filter((extra) => (
+      number(extra.priceAmount) > 0
+      || (
+        /paid|money/.test(normalizedText(extra.disposition))
+        && !/decline|free|remove|skip|without|none/.test(normalizedText(extra.disposition))
+      )
+    ));
+    const authorizations = Array.isArray(state.approvals?.paidExtraAuthorizations)
+      ? state.approvals.paidExtraAuthorizations
+      : [];
+    const unapproved = paidSelections.filter((extra) => !authorizations.some((authorization) => (
+      authorization?.authorizationId
+      && authorization.decisionGroupId
+      && authorization.decisionGroupId === extra.decisionGroupId
+    )));
+    if (unapproved.length) {
+      const groundedReversal = unapproved
+        .map((extra) => groundedSafeReversalForExtra(extra, prepared.observation || {}))
+        .find(Boolean);
+      if (groundedReversal) {
+        return deny(
+          "UNAPPROVED_SELECTED_EXTRA",
+          "An unrequested paid option has an exact safe reversal. Reconcile it before continuing.",
+          {
+            decisionGroupIds: unapproved.map((extra) => extra.decisionGroupId),
+            selectedExtras: unapproved,
+            groundedReversal,
+            recoveryDirective: "reconcile_selected_extra"
+          },
+          "recoverable"
+        );
+      }
+      return deny(
+        "UNAPPROVED_SELECTED_EXTRA",
+        "The current checkout contains a paid optional item without an explicit item authorization.",
+        { decisionGroupIds: unapproved.map((extra) => extra.decisionGroupId), selectedExtras: unapproved }
+      );
+    }
+  }
+  pass("SELECTED_EXTRAS_EXPLICITLY_AUTHORIZED");
 
   const paymentLike = action.risk === "payment" || action.type === "final_review" || /payment|purchase|book_now/.test(`${action.intent || ""} ${action.targetSnapshot?.semantic || ""}`);
   if (paymentLike) {

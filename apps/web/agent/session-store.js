@@ -276,6 +276,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       affordance: reportedAction.affordance || null,
       semanticEffect: reportedAction.semanticEffect || "",
       goalId: reportedAction.goalId || "",
+      decisionInstanceId: result.decisionInstanceId || reportedAction.decisionInstanceId || "",
       requirementId: reportedAction.requirementId || ""
     });
   }
@@ -283,6 +284,11 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
   function failureFromResult(result = {}, state = {}) {
     if (result.verified === true) return null;
     const code = String(result.outcome?.code || result.code || "");
+    const provenNoEffectCodes = new Set([
+      "NO_OBSERVABLE_CHANGE",
+      "NO_OBSERVABLE_STAGE_CHANGE",
+      "TRANSITION_NO_EFFECT"
+    ]);
     const staleCodes = new Set([
       "OBSERVATION_HASH_MISMATCH",
       "STALE_OBSERVATION",
@@ -292,7 +298,9 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     if (staleCodes.has(code)) return null;
     const attempted = result.dispatched === true || result.executed === true;
     if (!attempted) return null;
+    if (!provenNoEffectCodes.has(code)) return null;
     const action = actionAttemptFromResult(result);
+    if (!action.decisionInstanceId) return null;
     if (!["click", "type", "select", "click_xy", "keypress"].includes(action.type)) return null;
     const signature = actuatorSignature(action);
     return {
@@ -300,6 +308,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       actionSignature: actionSignature(action),
       actuatorSignature: signature,
       goalKey: semanticGoalKey(action.affordance?.task ? action : (state.taskState?.currentGoal || action)),
+      decisionInstanceId: action.decisionInstanceId,
       actionId: String(result.actionId || action.id || ""),
       observationId: String(result.observationId || ""),
       controlId: String(action.controlId || ""),
@@ -318,6 +327,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     if (failure && !failures.some((item) => (
       item.actuatorSignature === failure.actuatorSignature
       && item.goalKey === failure.goalKey
+      && item.decisionInstanceId === failure.decisionInstanceId
     ))) {
       failures.push(failure);
     }

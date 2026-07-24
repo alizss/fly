@@ -283,7 +283,7 @@ const verifyAndPlanSchema = {
 const candidateSelectionSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["candidateId", "semanticOutcome"],
+  required: ["candidateId", "semanticOutcome", "confidence"],
   properties: {
     candidateId: { type: "string" },
     semanticOutcome: {
@@ -295,7 +295,8 @@ const candidateSelectionSchema = {
         "request_user_input",
         "stop_for_payment_review"
       ]
-    }
+    },
+    confidence: { type: "string", enum: ["high", "medium", "low"] }
   }
 };
 

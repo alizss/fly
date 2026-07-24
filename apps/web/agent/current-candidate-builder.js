@@ -61,7 +61,10 @@ function candidatePolicyAction(goal = {}, candidate = {}, control = {}, observat
       kind: control.kind || "",
       role: control.role || "",
       surfaceId: candidate.surfaceId || control.surfaceId || "",
-      surfaceType: candidate.surfaceType || control.surfaceType || "page"
+      surfaceType: candidate.surfaceType || control.surfaceType || "page",
+      intendedOutcome: candidate.intendedOutcome || "",
+      semanticOwnershipLinkId: candidate.semanticOwnershipLinkId || "",
+      policyCorrectionForDecisionGroupId: candidate.policyCorrectionForDecisionGroupId || ""
     }
   };
 }
@@ -189,9 +192,11 @@ function buildCurrentCandidateSet({
       // A visible foreground surface owns the next click. TaskState remains
       // useful planning context, but it cannot hide a grounded safe control
       // merely because its predicted semantic effect is incomplete/unknown.
-      goalRelevant: foregroundOwnsSelection
-        ? relevantToVisibleSurface(goal, bound, allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)))
-        : allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)),
+      goalRelevant: goal.kind === "profile_field"
+        ? allCapabilities.goalCandidateKeys.has(capabilityKey(candidate))
+        : foregroundOwnsSelection
+          ? relevantToVisibleSurface(goal, bound, allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)))
+          : allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)),
       risk: bound.risk || (goal.kind === "profile_field" ? "safe" : "uncertain"),
       requiresApproval: Boolean(bound.requiresApproval),
       expectedOutcome,

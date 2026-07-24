@@ -6,26 +6,28 @@
   const AGENT_SINGLE_BRAIN = true;
   const BAGGAGE_TERMS = ["no cabin bag", "baggage not included", "personal item only", "without baggage", "checked baggage not included"];
   const MULTI_AIRPORT_CODES = new Set(["LHR", "LGW", "LTN", "STN", "LCY", "CDG", "ORY", "BVA", "IST", "SAW"]);
-  const FIELD_MATCHERS = {
-    confirm_email: ["confirm email", "confirm e-mail", "repeat email", "repeat e-mail"],
-    first_name: ["first", "given", "forename"],
-    last_name: ["last", "surname", "family"],
-    date_of_birth: ["birth", "date of birth", "dob"],
-    title: ["title", "salutation", "mr", "mrs", "ms"],
+  const PROFILE_FIELD_ALIASES = new Map(Object.entries({
+    title: ["title", "traveler_title", "traveller_title", "salutation", "gender_title", "honorific"],
+    gender: ["gender", "sex"],
+    first_name: ["first_name", "firstname", "given_name", "given_names", "forename"],
+    middle_name: ["middle_name", "middlename"],
+    last_name: ["last_name", "lastname", "surname", "family_name"],
+    full_name: ["full_name", "fullname", "passenger_name", "traveler_name", "traveller_name"],
+    email: ["email", "email_address", "e_mail"],
+    confirm_email: ["confirm_email", "email_confirmation", "repeat_email", "confirm_email_address"],
+    phone: ["phone", "phone_number", "mobile", "mobile_number", "telephone", "tel"],
+    phone_country_code: ["phone_country_code", "country_dial_code", "dial_code", "calling_code", "country_calling_code"],
+    date_of_birth: ["date_of_birth", "birth_date", "birthdate", "dob", "bday"],
     nationality: ["nationality", "citizenship"],
-    passport_number: ["passport", "document number", "travel document"],
-    passport_expiry: ["expiry", "expiration"],
-    billing_company: ["billing company", "invoice company", "company name", "legal name"],
-    billing_tax_id: ["tax id", "vat", "tax number"],
-    billing_email: ["billing email", "invoice email"],
-    billing_address: ["billing address", "invoice address"],
-    email: ["email"],
-    phone_country_code: ["country code", "country dial", "dial code", "calling code", "phone country"],
-    phone: ["phone", "mobile", "telephone"]
-  };
+    passport_number: ["passport_number", "passport_no"],
+    document_number: ["document_number", "travel_document_number", "identity_document_number"],
+    issuing_country: ["issuing_country", "document_issuing_country", "passport_issuing_country"],
+    passport_expiry: ["passport_expiry", "passport_expiration", "passport_expiry_date"],
+    document_expiry: ["document_expiry", "document_expiration", "document_expiry_date"]
+  }).flatMap(([canonical, aliases]) => aliases.map((alias) => [alias, canonical])));
   const PAYMENT_TERMS = ["card", "cvc", "cvv", "security code", "payment", "cc-number", "cc-csc"];
-  const SLOW_STEP_MS = 2200;
-  const VERIFY_STEP_MS = 1400;
+  const SLOW_STEP_MS = 160;
+  const VERIFY_STEP_MS = 120;
   const VALIDATION_TERMS = [
     "required",
     "must enter",
@@ -111,8 +113,12 @@
     activeLoopRunId: 0,
     loopBusy: false,
     loopRerunQueued: false,
-    activePlannerRequest: null
+    activePlannerRequest: null,
+    lastSentMaterialHash: "",
+    lastSentFeedbackKey: "",
+    screenshotCache: new Map()
   };
+  let pageStateStore = null;
   let activeObservationElementRegistry = null;
   let activeObservationControlRegistry = null;
 
@@ -285,7 +291,7 @@
     pushReasoningLog(loopStep, stage, action, reason);
     logAgentEvent("visible_step", { loopStep, stage, action, reason });
     renderSidebar("agent");
-    await sleep(pause);
+    await sleep(Math.min(Math.max(0, pause), 180));
   }
 
   async function verifyAgentStep(anchor, stage, message, ok = true, pause = VERIFY_STEP_MS) {
@@ -300,7 +306,7 @@
     pushReasoningLog(loopStep, stage, message, "", ok);
     logAgentEvent("visible_verify", { stage, message, ok });
     renderSidebar("agent");
-    await sleep(pause);
+    await sleep(Math.min(Math.max(0, pause), 150));
   }
 
   function labelText(input) {
@@ -339,6 +345,112 @@
     ].filter(Boolean).join(" ").replace(/\s+/g, " ").toLowerCase();
   }
 
+  function normalizedFieldAlias(value = "") {
+    return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  }
+
+  function canonicalProfileFieldType(value = "") {
+    return PROFILE_FIELD_ALIASES.get(normalizedFieldAlias(value)) || "";
+  }
+
+  function boundedPhrase(text = "", phrase = "") {
+    const source = String(text || "").toLowerCase().replace(/[^a-z0-9+]+/g, " ").replace(/\s+/g, " ").trim();
+    const wanted = String(phrase || "").toLowerCase().replace(/[^a-z0-9+]+/g, " ").replace(/\s+/g, " ").trim();
+    if (!source || !wanted) return false;
+    return new RegExp(`(?:^|\\s)${wanted.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\ /g, "\\s+")}(?:$|\\s)`).test(source);
+  }
+
+  function profileFieldGroupEvidence(input) {
+    let group = input?.closest?.("fieldset, [role='radiogroup'], [role='group']") || null;
+    if (!group && (input?.type === "radio" || implicitRole(input) === "radio")) {
+      const name = input.getAttribute?.("name") || "";
+      const peers = name
+        ? queryAllDeep(`input[type='radio'][name="${CSS.escape(name)}"], [role='radio'][name="${CSS.escape(name)}"]`)
+        : [];
+      for (let current = input.parentElement, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
+        if (peers.length > 1 && peers.every((peer) => current.contains(peer))) {
+          group = current;
+          break;
+        }
+      }
+    }
+    const labelledBy = String(group?.getAttribute?.("aria-labelledby") || "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id)?.textContent || "")
+      .join(" ");
+    const label = [
+      group?.querySelector?.("legend")?.textContent,
+      group?.querySelector?.(":scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > label")?.textContent,
+      group?.getAttribute?.("aria-label"),
+      labelledBy
+    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    const optionLabels = group
+      ? queryAllDeep("input[type='radio'], [role='radio'], option, [role='option']", group)
+        .map((option) => choiceLabel(option))
+        .filter(Boolean)
+        .slice(0, 12)
+      : [];
+    return { group, label, optionLabels };
+  }
+
+  function classifyProfileField(input, hintedField = "") {
+    const hinted = canonicalProfileFieldType(hintedField);
+    if (hinted) return { fieldType: hinted, source: "canonical_hint", confidence: 1, evidence: [hintedField] };
+    if (!input) return { fieldType: "", source: "none", confidence: 0, evidence: [] };
+    const type = String(input.getAttribute?.("type") || input.type || "").toLowerCase();
+    const role = String(implicitRole(input) || "").toLowerCase();
+    const autocomplete = String(input.getAttribute?.("autocomplete") || "").toLowerCase();
+    const direct = localLabelText(input);
+    const group = profileFieldGroupEvidence(input);
+    const evidence = `${direct} ${group.label} ${autocomplete}`.replace(/\s+/g, " ").trim();
+    const editable = !["radio", "checkbox", "button", "submit", "reset"].includes(type)
+      && !["radio", "checkbox", "button", "option"].includes(role);
+    const result = (fieldType, source, confidence, used = evidence) => ({ fieldType, source, confidence, evidence: [used].filter(Boolean).slice(0, 4) });
+
+    const autocompleteAliases = {
+      "given-name": "first_name", "additional-name": "middle_name", "family-name": "last_name", name: "full_name",
+      email: "email", tel: "phone", "tel-national": "phone", "tel-country-code": "phone_country_code",
+      bday: "date_of_birth", "bday-day": "date_of_birth", "bday-month": "date_of_birth", "bday-year": "date_of_birth",
+      country: "nationality", "country-name": "nationality"
+    };
+    if (autocompleteAliases[autocomplete]) return result(autocompleteAliases[autocomplete], "autocomplete", 0.99, autocomplete);
+    const directAliases = [input.name, input.id, input.getAttribute?.("data-testid"), input.getAttribute?.("aria-label")]
+      .map(canonicalProfileFieldType).filter(Boolean);
+    if (directAliases.length) return result(directAliases[0], "control_attribute", 0.98, direct);
+    if (/confirm.*e[ -]?mail|repeat.*e[ -]?mail/.test(evidence)) return result("confirm_email", "associated_label", 0.96);
+    if (boundedPhrase(evidence, "surname") || /family[ _-]?name|last[ _-]?name/.test(evidence)) return result("last_name", "associated_label", 0.95);
+    if (/first[ _-]?name|given[ _-]?name|forename/.test(evidence)) return result("first_name", "associated_label", 0.95);
+    if (/middle[ _-]?name/.test(evidence)) return result("middle_name", "associated_label", 0.95);
+    if (editable && (type === "tel" || /(?:^|\s)(?:phone|telephone|mobile)(?:\s|$)/.test(evidence))
+      && !/(?:plan|bundle|package|insurance|addon|add on)/.test(evidence)) {
+      return result(/country.*code|dial.*code|calling.*code/.test(evidence) ? "phone_country_code" : "phone", type === "tel" ? "input_type" : "associated_label", 0.94);
+    }
+    if (editable && /country.*code|dial.*code|calling.*code/.test(evidence)) return result("phone_country_code", "associated_label", 0.93);
+    if (editable && /(?:^|\s)e[ -]?mail(?:\s|$)/.test(evidence)) return result("email", "associated_label", 0.94);
+    if (editable && /(?:^|\s)(?:birth|dob|bday)(?:\s|$)/.test(evidence)) return result("date_of_birth", "associated_label", 0.94);
+    if (editable && /(?:^|\s)(?:nationality|citizenship)(?:\s|$)/.test(evidence)) return result("nationality", "associated_label", 0.93);
+    if (editable && /passport.*(?:number|no)|(?:number|no).*passport/.test(evidence)) return result("passport_number", "associated_label", 0.93);
+    if (editable && /(?:travel|identity)?.*document.*(?:number|no)|(?:number|no).*document/.test(evidence)) return result("document_number", "associated_label", 0.91);
+    if (editable && /(?:issuing|issue).*(?:country|nation)|(?:country|nation).*(?:issuing|issue)/.test(evidence)) return result("issuing_country", "associated_label", 0.91);
+    if (editable && /passport.*(?:expiry|expiration)|(?:expiry|expiration).*passport/.test(evidence)) return result("passport_expiry", "associated_label", 0.92);
+    if (editable && /document.*(?:expiry|expiration)|(?:expiry|expiration).*document/.test(evidence)) return result("document_expiry", "associated_label", 0.9);
+    const titleGroup = /(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(group.label.toLowerCase());
+    const normalizedTitleOptions = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "title"));
+    const titleOptions = normalizedTitleOptions.includes("mr") && normalizedTitleOptions.includes("mrs/ms");
+    if ((type === "radio" || role === "radio") && (titleGroup || titleOptions)) {
+      return result("title", titleGroup ? "radio_group_label" : "radio_group_options", titleGroup ? 0.98 : 0.9, `${group.label} ${group.optionLabels.join(" ")}`);
+    }
+    const genderGroup = /(?:^|\s)(?:gender|sex)(?:\s|$)/.test(group.label.toLowerCase());
+    const normalizedGenderOptions = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "gender"));
+    const genderOptions = normalizedGenderOptions.includes("male") && normalizedGenderOptions.includes("female");
+    if ((type === "radio" || role === "radio") && (genderGroup || genderOptions)) {
+      return result("gender", genderGroup ? "radio_group_label" : "radio_group_options", genderGroup ? 0.98 : 0.9, `${group.label} ${group.optionLabels.join(" ")}`);
+    }
+    if (editable && /(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(evidence)) return result("title", "associated_label", 0.94);
+    return { fieldType: "", source: "none", confidence: 0, evidence: [] };
+  }
+
   function inferCheckoutSite() {
     const host = location.hostname.toLowerCase();
     if (host.includes("gotogate")) return "gotogate";
@@ -362,30 +474,8 @@
   }
 
   function detectField(input) {
-    const text = labelText(input);
-    const dateGroup = input.closest?.("fieldset, [role='group']");
-    const dateGroupLabel = [
-      dateGroup?.querySelector?.("legend")?.textContent,
-      dateGroup?.getAttribute?.("aria-label"),
-      dateGroup?.getAttribute?.("aria-labelledby")
-        ? document.getElementById(dateGroup.getAttribute("aria-labelledby"))?.textContent
-        : ""
-    ].filter(Boolean).join(" ");
-    const localText = `${localLabelText(input)} ${dateGroupLabel}`.replace(/\s+/g, " ").toLowerCase();
-    if (/confirm.*e-?mail|repeat.*e-?mail/.test(localText)) return { field: "confirm_email", confidence: 0.95 };
-    if (/\bsurname\b|family.?name|last.?name/.test(localText)) return { field: "last_name", confidence: 0.93 };
-    if (/first.*middle|first.?name|given.?name|forename/.test(localText)) return { field: "first_name", confidence: 0.93 };
-    if (/mobile|phone|telephone/.test(localText) && !/country|dial|calling/.test(localText)) return { field: "phone", confidence: 0.92 };
-    if (/country.*code|dial.*code|calling.*code/.test(localText)) return { field: "phone_country_code", confidence: 0.9 };
-    if (/\be-?mail\b/.test(localText)) return { field: "email", confidence: 0.9 };
-    if (/birth|dob|bday-(?:day|month|year)/.test(`${localText} ${input.getAttribute?.("autocomplete") || ""}`)) return { field: "date_of_birth", confidence: 0.9 };
-    if (/nationality|citizenship/.test(localText)) return { field: "nationality", confidence: 0.9 };
-    let best = null;
-    for (const [field, terms] of Object.entries(FIELD_MATCHERS)) {
-      const score = terms.reduce((total, term) => total + (text.includes(term) ? 1 : 0), 0);
-      if (score && (!best || score > best.score)) best = { field, score };
-    }
-    return best ? { field: best.field, confidence: Math.min(0.95, 0.55 + best.score * 0.18) } : null;
+    const classification = classifyProfileField(input);
+    return classification.fieldType ? { field: classification.fieldType, ...classification } : null;
   }
 
   function bookingDetected() {
@@ -993,7 +1083,7 @@
     filledFields = [];
     const used = new Set();
     fillTitleRadio();
-    await fillPhoneFieldsFromMap(rememberPagePlan(buildPageMap()));
+    await fillPhoneFieldsFromMap(pageStateStore?.observe({ reason: "phone_field_refresh" }).map || rememberPagePlan(buildPageMap()));
     for (const input of candidateInputs()) {
       const detected = detectField(input);
       if (!detected || used.has(detected.field)) continue;
@@ -1224,7 +1314,23 @@
     const liveControlId = live.controlId || element?.dataset?.atwControlId || "";
     const expectedDecisionGroupId = expected.decisionGroupId || decision.decisionGroupId || "";
     if (expectedDecisionGroupId && live.decisionGroupId && expectedDecisionGroupId !== live.decisionGroupId) {
-      return { ok: false, code: "TARGET_DECISION_GROUP_MISMATCH", expected, live };
+      const observationScopedOwnershipLink = Boolean(
+        expected.semanticOwnershipLinkId
+        && expected.policyCorrectionForDecisionGroupId
+        && expected.policyCorrectionForDecisionGroupId === decision.decisionGroupId
+        && expectedControlId
+        && liveControlId
+        && expectedControlId === liveControlId
+      );
+      if (!observationScopedOwnershipLink) {
+        return { ok: false, code: "TARGET_DECISION_GROUP_MISMATCH", expected, live };
+      }
+      warnings.push({
+        code: "TARGET_DECISION_GROUP_LINKED_ACROSS_SURFACES",
+        expectedDecisionGroupId,
+        liveDecisionGroupId: live.decisionGroupId,
+        semanticOwnershipLinkId: expected.semanticOwnershipLinkId
+      });
     }
     // The canonical registry is the semantic authority. By execution time the
     // governor has already approved this control's intent and risk; the browser
@@ -1602,7 +1708,10 @@
   function observationChangedSince(map) {
     if (!map) return false;
     const before = observationHashForMap(map);
-    const current = observationHashForMap(rememberPagePlan(buildPageMap()));
+    const currentMap = pageStateStore
+      ? pageStateStore.observe({ reason: "stale_action_check" }).map
+      : rememberPagePlan(buildPageMap());
+    const current = observationHashForMap(currentMap);
     return Boolean(before && current && before !== current);
   }
 
@@ -1649,6 +1758,7 @@
       expectedPostconditions: Array.isArray(decision.expectedPostconditions) ? decision.expectedPostconditions : [],
       operation: decision.operation || "",
       goalId: decision.goalId || "",
+      decisionInstanceId: decision.decisionInstanceId || "",
       candidateId: decision.candidateId || "",
       controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
       skillPlanId: decision.skillPlanId || "",
@@ -1678,7 +1788,8 @@
         targetLabel: decision.targetLabel || "",
         value: decision.value || "",
         risk: decision.risk || "",
-        reason: decision.reason || ""
+        reason: decision.reason || "",
+        decisionInstanceId: decision.decisionInstanceId || ""
       },
       targetSnapshot: decision.targetSnapshot || null,
       expectedOutcome,
@@ -1876,7 +1987,7 @@
           goal: agent.userGoal || "Complete this flight checkout safely with one-click assistance.",
           userIntent: userIntentText(),
           traveler: traveler(),
-          page: compactPageMap(agent.pageMap || rememberPagePlan(buildPageMap()))
+          page: compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
         })
       });
       if (!response.ok) throw new Error(`session returned ${response.status}`);
@@ -1915,7 +2026,7 @@
     });
     try {
       const settings = await storageGet(["apiBase"]);
-      const map = rememberPagePlan(buildPageMap());
+      const map = pageStateStore.observe({ reason: "action_report" }).map;
       const authoritativeResult = {
         ...(agent.lastActionResult || {}),
         ...result,
@@ -2157,9 +2268,9 @@
       .map((group) => ({
         decisionGroupId: group.decisionGroupId || "",
         label: group.selectedLabel || "",
-        disposition: group.selectedSemantic || "",
-        priceAmount: null,
-        currency: price?.currency || ""
+        disposition: group.selectedEvidence?.disposition || group.selectedSemantic || "",
+        priceAmount: group.selectedEvidence?.structuredPrice?.amount ?? null,
+        currency: group.selectedEvidence?.structuredPrice?.currency || price?.currency || ""
       }))
       .slice(0, 40);
     return {
@@ -2262,7 +2373,10 @@
         instanceId: group.instanceId || "",
         status: group.status || "",
         selectedControlId: group.selectedControlId || group.selected?.controlId || "",
-        selectedValue: group.selectedValue || group.selected?.value || ""
+        selectedValue: group.selectedValue || group.selected?.value || "",
+        selectedDisposition: group.selectedEvidence?.disposition || "",
+        selectedPrice: group.selectedEvidence?.structuredPrice || null,
+        removalControlId: group.removalControlId || ""
       }))
       .sort((a, b) => a.decisionGroupId.localeCompare(b.decisionGroupId));
     const fields = (map.fields || [])
@@ -2626,6 +2740,7 @@
     );
     return [
       { aliasId: control.controlId, kind: "control" },
+      { aliasId: control.stableKey, kind: "stable_key" },
       { aliasId: control.stateElementId, kind: "state" },
       { aliasId: control.preferredActivationElementId, kind: "activation" },
       { aliasId: control.visualRef, kind: "visual" },
@@ -2721,9 +2836,11 @@
     const target = decision.targetSnapshot || {};
     return [
       decision.controlId,
+      decision.stableKey,
       decision.targetId,
       decision.visualRef,
       target.controlId,
+      target.stableKey,
       target.id,
       target.visualRef,
       target.stateElementId,
@@ -2747,12 +2864,23 @@
     const resolvedControlIds = [...new Set(requestedAliases
       .map((aliasId) => aliasIndex.resolve(aliasId)?.controlId || "")
       .filter(Boolean))];
+    const stableIdentityAliases = [
+      requestedControlId,
+      decision.stableKey,
+      decision.targetSnapshot?.stableKey
+    ].map((value) => String(value || "").trim()).filter(Boolean);
+    const stableIdentityControlIds = [...new Set(stableIdentityAliases
+      .map((aliasId) => aliasIndex.resolve(aliasId)?.controlId || "")
+      .filter(Boolean))];
     const visualAnnotation = requestedVisualRef
       ? (map.screenshotAnnotations || []).find((item) => item.visualRef === requestedVisualRef) || null
       : null;
-    const control = requestedAliases.length && !unresolvedAliases.length && resolvedControlIds.length === 1
-      ? aliasIndex.byControlId.get(resolvedControlIds[0]) || null
-      : null;
+    const boundedStableRebind = stableIdentityControlIds.length === 1;
+    const control = boundedStableRebind
+      ? aliasIndex.byControlId.get(stableIdentityControlIds[0]) || null
+      : requestedAliases.length && !unresolvedAliases.length && resolvedControlIds.length === 1
+        ? aliasIndex.byControlId.get(resolvedControlIds[0]) || null
+        : null;
     if (!control?.controlId) {
       logFlow("target.resolve_failed", {
         code: unresolvedAliases.length
@@ -2839,7 +2967,7 @@
 
     if (controlTarget) {
       logFlow("target.resolve", {
-        method: requestedElementId ? "exact-canonical-member" : "canonical-control",
+        method: requestedElementId ? "exact-canonical-member" : boundedStableRebind && unresolvedAliases.length ? "bounded-stable-rebind" : "canonical-control",
         requested: { controlId: control.controlId, visualRef: requestedVisualRef, targetId: decision.targetId },
         resolved: elementDescriptor(controlTarget)
       });
@@ -3250,7 +3378,9 @@
         return {
           id: field.id,
           label: field.label,
-          field: field.field,
+          field: field.fieldType || field.field,
+          fieldType: field.fieldType || field.field || "",
+          fieldClassification: field.fieldClassification || null,
           kind: field.kind,
           semantic: semanticFieldType(field),
           role: field.role || field.accessibility?.role || "",
@@ -3265,13 +3395,10 @@
   }
 
   function semanticFieldType(field) {
+    const canonical = canonicalProfileFieldType(field.fieldType || field.field || field.semantic || "");
+    if (canonical) return canonical;
     const text = `${field.label || ""} ${field.kind || ""} ${field.value || ""}`.toLowerCase();
-    if (field.field && field.field !== "unknown") return field.field;
     if (/choose|select an option|select one option/.test(text)) return "required_dropdown_choice";
-    if (/email/.test(text)) return "email";
-    if (/phone|mobile/.test(text)) return "phone";
-    if (/first|given/.test(text)) return "first_name";
-    if (/surname|last|family/.test(text)) return "last_name";
     return "unknown";
   }
 
@@ -3367,7 +3494,6 @@
     if ((structuredPrice && structuredPrice.amount > 0)
       || /add to cart|add to my trip|premium|bundle|checked baggage|\b\d+\s*x\s*\d+\s*kg/.test(text)) return "add_paid_extra";
     if (/continue|next|proceed/.test(text)) return "continue";
-    if (/mr|mrs|ms|title/.test(text)) return "traveler_title";
     return "choice";
   }
 
@@ -3424,6 +3550,19 @@
     return /^(choose|select|please select|select one|select one option|please choose)$/i.test(String(value || "").replace(/\s+/g, " ").trim());
   }
 
+  function normalizedProfileChoiceValue(value = "", semantic = "") {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    const type = canonicalProfileFieldType(semantic) || String(semantic || "").toLowerCase();
+    if (!text) return "";
+    if (type === "title" || type === "gender") {
+      if (/mrs\.?\s*\/\s*ms\.?/i.test(text) || /(?:^|\s)(?:mrs\.?|ms\.?|miss)(?:\s|$)/i.test(text)) return "mrs/ms";
+      if (/(?:^|\s)mr\.?(?:\s|$)/i.test(text)) return "mr";
+      if (type === "gender" && /(?:^|\s)female(?:\s|$)/i.test(text)) return "female";
+      if (type === "gender" && /(?:^|\s)male(?:\s|$)/i.test(text)) return "male";
+    }
+    return text.toLowerCase();
+  }
+
   function stateElementForControl(element) {
     if (!element) return null;
     if (element.matches?.("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], [role='button'], button")) return element;
@@ -3445,7 +3584,19 @@
     }
     if (type === "phone") return text.replace(/[^0-9]/g, "").replace(/^0+/, "");
     if (type === "email" || type === "confirm_email") return text.toLowerCase();
-    if (element?.type === "radio" || element?.type === "checkbox") return element.checked ? "selected" : "";
+    if (type === "title") {
+      if (/mrs\.?\s*\/\s*ms\.?/i.test(text) || /(?:^|\s)(?:mrs\.?|ms\.?|miss)(?:\s|$)/i.test(text)) return "mrs/ms";
+      if (/(?:^|\s)mr\.?(?:\s|$)/i.test(text)) return "mr";
+    }
+    if (type === "gender") {
+      if (/(?:^|\s)female(?:\s|$)/i.test(text)) return "female";
+      if (/(?:^|\s)male(?:\s|$)/i.test(text)) return "male";
+    }
+    if (element?.type === "radio" || element?.type === "checkbox" || ["radio", "checkbox"].includes(implicitRole(element))) {
+      if (!isChoiceSelected(element)) return "";
+      const optionText = choiceLabel(element) || element?.getAttribute?.("value") || value;
+      return normalizedProfileChoiceValue(optionText || "selected", type);
+    }
     return text.toLowerCase();
   }
 
@@ -3604,21 +3755,30 @@
     const valueText = exposesChoiceValue && value && !isPlaceholderChoiceValue(value)
       ? compactText(value, 180)
       : "";
+    const choiceLike = element?.type === "radio" || element?.type === "checkbox" || ["radio", "checkbox", "option"].includes(implicitRole(element));
+    const optionValue = choiceLike
+      ? normalizedProfileChoiceValue(choiceLabel(element) || element?.getAttribute?.("value") || "", semantic)
+      : "";
+    const normalizedValue = semantic === "date_of_birth"
+      ? (decodedDate.canonicalDateValue || decodedDate.componentValue || "")
+      : normalizedControlValue(value, semantic, element);
     return {
       checked: Boolean(element?.checked === true || element?.getAttribute?.("aria-checked") === "true"),
       selected: Boolean(element?.selected === true || element?.getAttribute?.("aria-selected") === "true" || isChoiceSelected(element)),
       valuePresent: Boolean(value && String(value).trim()),
       value: value ? "[filled]" : "",
       valueText,
-      normalizedValue: semantic === "date_of_birth"
-        ? (decodedDate.canonicalDateValue || decodedDate.componentValue || "")
-        : normalizedControlValue(value, semantic, element),
+      normalizedValue,
+      optionValue,
+      selectedValue: choiceLike && isChoiceSelected(element) ? (optionValue || normalizedValue) : "",
       canonicalDateValue: decodedDate.canonicalDateValue || "",
       dateComponent: decodedDate.component || "",
       dateComponentValue: decodedDate.componentValue || "",
       normalizationMode: semantic === "phone_country_code" ? "country_code" : semantic === "phone" ? "phone" : semantic === "date_of_birth" ? "date_codec" : "text",
       disabled: isDisabledLike(element),
       required: Boolean(element?.required === true || element?.getAttribute?.("aria-required") === "true"),
+      invalid: Boolean(element?.getAttribute?.("aria-invalid") === "true" || element?.matches?.(":invalid") === true),
+      validationMessage: compactText(element?.validationMessage || describedText(element), 240),
       expanded: element?.getAttribute?.("aria-expanded") === "true",
       pressable: element?.hasAttribute?.("aria-pressed") === true,
       pressed: element?.getAttribute?.("aria-pressed") === "true",
@@ -4031,14 +4191,16 @@
           || controlText(stateElement)),
       220
     );
-    const fieldSemantic = semanticFieldType({ label, kind, field: context.field || "" });
+    const fieldClassification = classifyProfileField(stateElement, context.fieldType || context.field || "");
+    const fieldType = fieldClassification.fieldType || "";
+    const fieldSemantic = semanticFieldType({ label, kind, fieldType, field: context.field || "" });
     const sectionType = context.sectionType || context.section?.type || "";
     const sectionLabel = context.sectionLabel || context.section?.label || "";
     const sectionId = context.sectionId || context.section?.id || "";
     const surface = context.surface || {};
-    const fallbackSemantic = /radio|checkbox|option/.test(kind)
+    const fallbackSemantic = fieldType || (/radio|checkbox|option/.test(kind)
       ? semanticChoiceType(label)
-      : (fieldSemantic !== "unknown" ? fieldSemantic : semanticChoiceType(label));
+      : (fieldSemantic !== "unknown" ? fieldSemantic : semanticChoiceType(label)));
     const ownedMeaning = resolveOwnedControlMeaning(ownedEvidence, fallbackSemantic, surface.type || "page");
     const structuredPrice = structuredPriceFromText(label);
     const choiceControl = /radio|checkbox|option|choice/.test(`${kind || ""} ${ownedEvidence.role || ""} ${ownedEvidence.type || ""} ${fallbackSemantic || ""}`.toLowerCase());
@@ -4052,11 +4214,11 @@
       && /^(continue|next|proceed|go without|continue without)\b/i.test(label)) {
       physicalEffect = "dismiss_surface";
     }
-    const semantic = ownedMeaning.semantic || fallbackSemantic || "unknown";
+    const semantic = fieldType || ownedMeaning.semantic || fallbackSemantic || "unknown";
     const surfaceDecisionGroupId = surface?.type && surface.type !== "page"
       ? (surface.decisionGroupId || decisionGroupIdForContext({ sectionType: surface.taskHint || surface.type || "", sectionLabel: surface.parentSectionLabel || surface.label || surface.taskHint || "" }))
       : "";
-    const decisionGroupId = context.decisionGroupId || decisionGroupIdForContext({ sectionType, sectionLabel, field: context.field || "" }) || surfaceDecisionGroupId;
+    const decisionGroupId = context.decisionGroupId || decisionGroupIdForContext({ sectionType, sectionLabel, field: fieldType || context.field || "" }) || surfaceDecisionGroupId;
     const members = [
       { element: stateElement, relation: "state" },
       { element: labelElement, relation: "label" },
@@ -4165,6 +4327,8 @@
       title: ownedEvidence.title,
       iconOnly: ownedEvidence.iconOnly,
       kind,
+      fieldType,
+      fieldClassification,
       role: perceptionRole,
       domRole,
       semantic,
@@ -4175,7 +4339,7 @@
       structuredPrice,
       dateField,
       state,
-      currentValue: state.normalizedValue || state.valueText || "",
+      currentValue: state.selectedValue || state.normalizedValue || state.valueText || "",
       capabilities: observedCapabilities(operations, perceptionRole),
       operations,
       actionability: Object.fromEntries(Object.entries(operations)
@@ -4210,6 +4374,11 @@
     model.controlKind = control.kind;
     model.controlState = control.state;
     model.currentValue = control.currentValue || "";
+    model.fieldType = control.fieldType || model.fieldType || canonicalProfileFieldType(model.field || model.semantic || "");
+    model.fieldClassification = control.fieldClassification?.fieldType
+      ? control.fieldClassification
+      : (model.fieldClassification || null);
+    if (model.fieldType) model.field = model.fieldType;
     model.capabilities = control.capabilities || [];
     model.operations = control.operations;
     model.actionability = control.actionability || {};
@@ -4235,6 +4404,25 @@
       );
     }
     return model;
+  }
+
+  function syncRequiredProfileChoiceGroups(fields = [], controls = [], sections = []) {
+    const byId = new Map(controls.map((control) => [control.controlId, control]));
+    const sync = (items = []) => {
+      for (const item of items) {
+        const control = byId.get(item.controlId || item.id);
+        const fieldType = canonicalProfileFieldType(item.fieldType || item.field || control?.fieldType || "");
+        const choiceLike = /radio|checkbox/.test(`${item.kind || ""} ${item.role || ""} ${control?.kind || ""} ${control?.role || ""}`.toLowerCase());
+        if (!choiceLike || !["title", "gender"].includes(fieldType) || !item.required || !control?.decisionGroupId) continue;
+        item.hasValue = controls.some((peer) => (
+          peer.decisionGroupId === control.decisionGroupId
+          && canonicalProfileFieldType(peer.fieldType || peer.field || peer.semantic || "") === fieldType
+          && Boolean(peer.selected || peer.state?.checked || peer.state?.selected)
+        ));
+      }
+    };
+    sync(fields);
+    for (const section of sections) sync(section.fields || []);
   }
 
   function decisionGroupIdForContext({ sectionType = "", sectionLabel = "", field = "", surfaceId = "", surfaceType = "", stage = "", instance = "" } = {}) {
@@ -4319,6 +4507,330 @@
       state: control.state || null,
       priceText: selectedLabel.match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
     };
+  }
+
+  function structuredPricesFromText(value = "") {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    const matches = [
+      ...text.matchAll(/(-?\d+(?:[.,]\d{1,2})?)\s*(EUR|USD|GBP|CHF|€|\$|£)/gi),
+      ...text.matchAll(/(EUR|USD|GBP|CHF|€|\$|£)\s*(-?\d+(?:[.,]\d{1,2})?)/gi)
+    ].map((match) => {
+      const amountText = /^-?\d/.test(match[1] || "") ? match[1] : match[2];
+      const currencyText = /^-?\d/.test(match[1] || "") ? match[2] : match[1];
+      const amount = Number(String(amountText || "").replace(",", "."));
+      const normalizedCurrency = String(currencyText || "").toUpperCase();
+      const currency = normalizedCurrency === "€" ? "EUR" : normalizedCurrency === "$" ? "USD" : normalizedCurrency === "£" ? "GBP" : normalizedCurrency;
+      return Number.isFinite(amount) ? { amount, currency } : null;
+    }).filter(Boolean);
+    return matches.filter((price, index, list) => (
+      list.findIndex((other) => other.amount === price.amount && other.currency === price.currency) === index
+    ));
+  }
+
+  function decisionChoiceElement(choice = {}, byControlId = new Map()) {
+    const control = byControlId.get(choice.controlId) || {};
+    return elementById(
+      choice.targetId
+      || control.stateElementId
+      || control.preferredActivationElementId
+      || ""
+    );
+  }
+
+  function ownedDecisionElement(section = {}, choices = [], byControlId = new Map()) {
+    const nodes = choices.map((choice) => decisionChoiceElement(choice, byControlId)).filter(Boolean);
+    const selected = choices.find((choice) => choice.selected) || choices[0] || null;
+    const source = selected ? decisionChoiceElement(selected, byControlId) : nodes[0];
+    const sectionElement = elementById(section.id || "") || section.element || null;
+    if (!source || !sectionElement) return null;
+    for (let current = source.parentElement; current; current = current.parentElement) {
+      if (!sectionElement.contains(current) && current !== sectionElement) break;
+      const ownsEveryChoice = nodes.every((node) => current.contains(node));
+      const prices = structuredPricesFromText(current.innerText || current.textContent || "");
+      if (ownsEveryChoice && prices.length) return current;
+      if (current === sectionElement) break;
+    }
+    return null;
+  }
+
+  function selectedDisposition({ selected = null, selectedControl = {}, structuredPrice = null } = {}) {
+    if (!selected) return "unknown";
+    if (Number(structuredPrice?.amount) > 0) return "paid";
+    if (Number(structuredPrice?.amount) === 0) return "free";
+    const selectedLabel = normalizeMatchText(selected.label || selectedControl.ownText || "");
+    const exactSelectedMeaning = normalizeMatchText(`${selected.risk || ""} ${selected.semantic || ""}`);
+    const broadControlMeaning = normalizeMatchText(`${selectedControl.risk || ""} ${selectedControl.semantic || ""}`);
+    // Exact selected-choice evidence outranks broad semantics inferred from a
+    // surrounding choice set. A free/decline choice must not inherit the paid
+    // meaning of one of its siblings.
+    if (/safe decline|decline|free|\bno\b|no extra|no thanks|none|without|skip|remove|not included/.test(`${selectedLabel} ${exactSelectedMeaning}`)) return "free";
+    if (/money|paid|purchase|upgrade|premium|add paid|select paid/.test(`${selectedLabel} ${exactSelectedMeaning}`)) return "paid";
+    if (/safe decline|decline|free|no extra|no thanks|none|without|skip|remove|not included/.test(broadControlMeaning)) return "free";
+    if (/money|paid|purchase|upgrade|add paid|select paid/.test(broadControlMeaning)) return "paid";
+    return "unknown";
+  }
+
+  function withOwnedSelectedEvidence(group = {}, section = {}, choices = [], byControlId = new Map()) {
+    const selected = choices.find((choice) => choice.selected) || null;
+    if (!selected) return group;
+    const selectedControl = byControlId.get(selected.controlId) || {};
+    const directPrice = selectedControl.structuredPrice
+      || structuredPriceFromText(selected.priceText || "")
+      || structuredPriceFromText(selected.label || "");
+    const exactDisposition = selectedDisposition({ selected, selectedControl, structuredPrice: directPrice });
+    const owner = directPrice ? null : ownedDecisionElement(section, choices, byControlId);
+    const ownedPrices = owner ? structuredPricesFromText(owner.innerText || owner.textContent || "") : [];
+    const eligibleOwnedPrices = exactDisposition === "free"
+      ? ownedPrices.filter((price) => Number(price.amount) === 0)
+      : ownedPrices;
+    const ownedPrice = eligibleOwnedPrices.length === 1 ? eligibleOwnedPrices[0] : null;
+    const structuredPrice = directPrice || ownedPrice || null;
+    const disposition = selectedDisposition({ selected, selectedControl, structuredPrice });
+    return {
+      ...group,
+      selectedEvidence: {
+        selected: true,
+        disposition,
+        structuredPrice,
+        source: directPrice ? "selected_control" : (ownedPrice ? "owned_decision_section" : "selected_control_state"),
+        ownerElementId: owner ? elementId(owner) : "",
+        selectedControlId: selected.controlId || "",
+        selectedLabel: selected.label || "",
+        semantic: selected.semantic || selectedControl.semantic || "",
+        risk: selected.risk || selectedControl.risk || ""
+      }
+    };
+  }
+
+  function ownedRemovalDecisionGroups(sections = [], controls = [], existingGroups = [], activeSurface = {}) {
+    const alreadyOwned = new Set(existingGroups.flatMap((group) => group.alternatives || []).map((choice) => choice.controlId).filter(Boolean));
+    return controls.flatMap((control) => {
+      if (!control?.controlId || alreadyOwned.has(control.controlId)) return [];
+      const removalMeaning = normalizeMatchText(`${control.semantic || ""} ${control.physicalEffect || ""} ${control.testId || ""} ${control.formAction || ""} ${control.ownText || ""} ${control.ariaLabel || ""} ${control.title || ""} ${control.label || ""}`);
+      if (!/remove|delete|deselect|unassign|clear selection/.test(removalMeaning)) return [];
+      const source = elementById(control.preferredActivationElementId || control.stateElementId || "");
+      const section = sections.find((item) => item.id === control.sectionId)
+        || sections.find((item) => (elementById(item.id || "") || item.element)?.contains?.(source));
+      if (!source) return [];
+      const sectionElement = elementById(section?.id || "")
+        || section?.element
+        || source.closest?.("section, [role='region'], main")
+        || document.body;
+      let owner = null;
+      let ownedPrice = null;
+      for (let current = source.parentElement; current; current = current.parentElement) {
+        if (!sectionElement.contains(current) && current !== sectionElement) break;
+        const prices = structuredPricesFromText(current.innerText || current.textContent || "").filter((price) => price.amount > 0);
+        const removalControls = [...current.querySelectorAll("button, [role='button'], input[type='button']")]
+          .filter((element) => {
+            const owned = controlOwnedEvidence(element);
+            const localMeaning = normalizeMatchText([
+              owned.ownText,
+              owned.ariaLabel,
+              owned.title,
+              owned.testId,
+              element.getAttribute?.("data-action"),
+              directControlName(element)
+            ].filter(Boolean).join(" "));
+            return /remove|delete|deselect|unassign|clear selection/.test(localMeaning);
+          });
+        if (prices.length === 1 && removalControls.length === 1 && current.contains(source)) {
+          owner = current;
+          ownedPrice = prices[0];
+          break;
+        }
+        if (current === sectionElement) break;
+      }
+      if (!owner || !ownedPrice) return [];
+      const inferredSectionLabel = compactText(
+        sectionElement?.getAttribute?.("aria-label")
+        || sectionElement?.querySelector?.("h1, h2, h3, h4, h5, h6, [role='heading']")?.textContent
+        || "",
+        140
+      );
+      const localOwnerLabel = decisionChoiceOwnerLabel(owner, source);
+      const localOwnerText = compactText(owner.innerText || owner.textContent || "", 500);
+      const sectionType = sectionTypeFor(localOwnerLabel, localOwnerText);
+      const nearbySectionType = section?.type || sectionTypeFor(inferredSectionLabel, "");
+      const sectionLabel = localOwnerLabel || inferredSectionLabel || "Selected item";
+      const progressMarkers = activeSurface.visualState?.progressMarkers || surfaceProgressMarkers(activeSurface.label || "");
+      const surfaceInstance = [progressMarkers.flightOrdinal, progressMarkers.route].filter(Boolean).join(":");
+      const decisionGroupId = decisionGroupIdForContext({
+        sectionType,
+        sectionLabel,
+        instance: `selected-item:${surfaceInstance || "current-surface"}:${stableControlKeyForElement(owner, owner, "selected")}`
+      });
+      control.decisionGroupId = decisionGroupId;
+      control.sectionId = section?.id || elementId(sectionElement);
+      control.sectionType = sectionType;
+      control.sectionLabel = sectionLabel;
+      control.semantic = "remove_paid_extra";
+      control.physicalEffect = "select_free_option";
+      control.risk = "safe_decline";
+      return [{
+        decisionGroupId,
+        surfaceId: control.surfaceId || "surface-page",
+        sectionId: control.sectionId || "",
+        sectionType,
+        sectionLabel,
+        requirementId: `${sectionType}:selected-item`,
+        required: false,
+        status: "satisfied",
+        selectedControlId: "",
+        selectedLabel: compactText(owner.innerText || owner.textContent || "", 180),
+        selectedSemantic: "selected_paid_item",
+        semanticOwnership: {
+          status: sectionType === "unknown" ? "unknown" : "observed",
+          family: sectionType === "unknown" ? "" : sectionType,
+          source: sectionType === "unknown" ? "local_evidence_insufficient" : "local_owner_evidence",
+          nearbySectionType: nearbySectionType || "unknown",
+          nearbySectionLabel: section?.label || inferredSectionLabel || "",
+          ownerElementId: elementId(owner),
+          controlId: control.controlId
+        },
+        selectedEvidence: {
+          selected: true,
+          disposition: "paid",
+          structuredPrice: ownedPrice,
+          source: "owned_selected_item_summary",
+          ownerElementId: elementId(owner),
+          selectedControlId: "",
+          selectedLabel: compactText(owner.innerText || owner.textContent || "", 180),
+          semantic: "selected_paid_item",
+          risk: "money"
+        },
+        removalControlId: control.controlId,
+        alternatives: [{
+          controlId: control.controlId,
+          targetId: control.preferredActivationElementId || control.stateElementId || "",
+          label: control.label || "",
+          semantic: control.semantic,
+          physicalEffect: control.physicalEffect,
+          risk: control.risk,
+          selected: false,
+          ownership: { ownerElementId: elementId(owner), relation: "remove_selected_item" }
+        }],
+        evidence: [`Selected paid item in ${sectionLabel}`, `Owned removal control: ${control.controlId}`]
+      }];
+    }).slice(0, 40);
+  }
+
+  function ownedCollapsedSelectorDecisionGroups(sections = [], controls = [], existingGroups = []) {
+    return controls.flatMap((control) => {
+      if (!control?.controlId || !control.operations?.open) return [];
+      const existingGroup = existingGroups.find((group) => (group.alternatives || []).some((choice) => choice.controlId === control.controlId));
+      if (existingGroup?.selectedEvidence?.selected === true) return [];
+      if (control.state?.expanded === true) return [];
+      const displayedValue = compactText(
+        control.currentValue
+        || control.state?.valueText
+        || control.ownText
+        || "",
+        180
+      );
+      if (!displayedValue || isPlaceholderChoiceValue(displayedValue)) return [];
+      const source = elementById(control.stateElementId || control.preferredActivationElementId || "");
+      if (!source) return [];
+      const section = sections.find((item) => item.id === control.sectionId)
+        || sections.find((item) => (elementById(item.id || "") || item.element)?.contains?.(source));
+      const boundary = elementById(section?.id || "")
+        || section?.element
+        || source.closest?.("section, fieldset, [role='group'], [role='region'], main")
+        || document.body;
+      let owner = null;
+      let ownedPrice = control.structuredPrice || null;
+      for (let current = source; current; current = current.parentElement) {
+        if (!boundary.contains(current) && current !== boundary) break;
+        const prices = structuredPricesFromText(current.innerText || current.textContent || "");
+        const selectorCount = queryAllDeep("select, [role='combobox'], [aria-haspopup='listbox']", current)
+          .filter((element) => isVisible(element)).length;
+        if (current.contains(source) && selectorCount === 1 && prices.length === 1) {
+          owner = current;
+          ownedPrice = ownedPrice || prices[0];
+          break;
+        }
+        if (current === boundary) break;
+      }
+      if (!owner || !ownedPrice) return [];
+      const inferredSectionLabel = compactText(
+        boundary.getAttribute?.("aria-label")
+        || boundary.querySelector?.("legend, h1, h2, h3, h4, h5, h6, [role='heading']")?.textContent
+        || "",
+        140
+      );
+      const localOwnerLabel = decisionChoiceOwnerLabel(owner, source);
+      const localOwnerText = compactText(owner.innerText || owner.textContent || "", 500);
+      const sectionType = sectionTypeFor(localOwnerLabel, `${displayedValue} ${localOwnerText}`);
+      const nearbySectionType = section?.type || sectionTypeFor(inferredSectionLabel, "");
+      const sectionLabel = localOwnerLabel || inferredSectionLabel || "Selected choice";
+      const decisionGroupId = existingGroup?.decisionGroupId || decisionGroupIdForContext({
+        sectionType,
+        sectionLabel,
+        instance: `collapsed-selector:${control.stableKey || stableControlKeyForElement(source, source, "selector")}`
+      });
+      const disposition = Number(ownedPrice.amount) > 0 ? "paid" : (Number(ownedPrice.amount) === 0 ? "free" : "unknown");
+      control.decisionGroupId = decisionGroupId;
+      control.sectionId = section?.id || elementId(boundary);
+      control.sectionType = sectionType;
+      control.sectionLabel = sectionLabel;
+      control.structuredPrice = ownedPrice;
+      const group = {
+        decisionGroupId,
+        surfaceId: control.surfaceId || "surface-page",
+        surfaceType: control.surfaceType || "page",
+        sectionId: control.sectionId,
+        sectionType,
+        sectionLabel,
+        requirementId: `${sectionType}:collapsed-selector`,
+        required: Boolean(control.required || control.state?.required),
+        status: "satisfied",
+        selectedControlId: control.controlId,
+        selectedLabel: displayedValue,
+        selectedSemantic: disposition === "paid" ? "selected_paid_item" : "selected_current_value",
+        semanticOwnership: {
+          status: sectionType === "unknown" ? "unknown" : "observed",
+          family: sectionType === "unknown" ? "" : sectionType,
+          source: sectionType === "unknown" ? "local_evidence_insufficient" : "local_owner_evidence",
+          nearbySectionType: nearbySectionType || "unknown",
+          nearbySectionLabel: section?.label || inferredSectionLabel || "",
+          ownerElementId: elementId(owner),
+          controlId: control.controlId
+        },
+        selectedEvidence: {
+          selected: true,
+          disposition,
+          structuredPrice: ownedPrice,
+          source: "owned_decision_section",
+          ownerElementId: elementId(owner),
+          selectedControlId: control.controlId,
+          selectedLabel: displayedValue,
+          semantic: disposition === "paid" ? "selected_paid_item" : "selected_current_value",
+          risk: disposition === "paid" ? "money" : (disposition === "free" ? "safe_decline" : "uncertain")
+        },
+        alternatives: [{
+          controlId: control.controlId,
+          targetId: control.preferredActivationElementId || control.stateElementId || "",
+          label: displayedValue,
+          semantic: "open_choice_control",
+          physicalEffect: "open_surface",
+          risk: "safe",
+          selected: true,
+          ownership: { ownerElementId: elementId(owner), relation: "collapsed_current_value" }
+        }],
+        evidence: [`Current displayed value: ${displayedValue}`, `Owned structured price: ${ownedPrice.amount} ${ownedPrice.currency || ""}`.trim()]
+      };
+      if (existingGroup) {
+        Object.assign(existingGroup, group, {
+          alternatives: (existingGroup.alternatives || []).map((alternative) => (
+            alternative.controlId === control.controlId
+              ? { ...alternative, ...group.alternatives[0] }
+              : alternative
+          ))
+        });
+        return [];
+      }
+      return [group];
+    }).slice(0, 40);
   }
 
   function sectionDecisionControls(section = {}, controls = []) {
@@ -4483,7 +4995,7 @@
             choices.some((choice) => choice.decisionRequired || choice.state?.required)
             || (buckets.size === 1 && (section.required || section.paidChoice))
           );
-          return {
+          const group = {
             decisionGroupId,
             surfaceId: choices.map((choice) => byControlId.get(choice.controlId)?.surfaceId).find(Boolean) || "surface-page",
             sectionId: section.id || "",
@@ -4506,6 +5018,7 @@
             })),
             evidence: selected ? [`Selected: ${selected.label}`] : [`No selected option for ${groupLabel}`]
           };
+          return withOwnedSelectedEvidence(group, section, choices, byControlId);
         });
         // Some custom widgets render the affirmative products as one native
         // choice set and the free decline as a separate checkbox even though
@@ -4612,7 +5125,10 @@
     const unrepresentedSurfaceGroups = surfaceGroups.filter((group) => (
       !(group.alternatives || []).some((choice) => choice.controlId && ownedControlIds.has(choice.controlId))
     ));
-    return [...sectionGroups, ...unrepresentedSurfaceGroups].slice(0, 80);
+    const representedGroups = [...sectionGroups, ...unrepresentedSurfaceGroups];
+    const collapsedSelectorGroups = ownedCollapsedSelectorDecisionGroups(sections, controls, representedGroups);
+    const removalGroups = ownedRemovalDecisionGroups(sections, controls, [...representedGroups, ...collapsedSelectorGroups], activeSurface);
+    return [...representedGroups, ...collapsedSelectorGroups, ...removalGroups].slice(0, 80);
   }
 
   function controlsAreCompatibleAliases(a = {}, b = {}) {
@@ -4907,7 +5423,8 @@
         sectionId: section?.id || "",
         sectionType: section?.type || "",
         sectionLabel: section?.label || "",
-        field: field.field,
+        field: field.fieldType || field.field,
+        fieldType: field.fieldType || field.field,
         required: field.required
       }, section ? 50 : 10);
       applyControlToModel(field, control);
@@ -5515,6 +6032,9 @@
     };
     const expectedControlId = expected.controlId || expected.targetSnapshot?.controlId || "";
     const expectedDecisionGroupId = expected.decisionGroupId || expected.targetSnapshot?.decisionGroupId || "";
+    const beforeDecisionGroup = expectedDecisionGroupId
+      ? (beforeMap.decisionGroups || []).find((group) => group.decisionGroupId === expectedDecisionGroupId)
+      : null;
     const afterControl = expectedControlId
       ? (afterMap.controls || []).find((control) => control.controlId === expectedControlId)
       : null;
@@ -5655,12 +6175,34 @@
       };
     }
     if (expected.type === "control_selected") {
-      const ok = Boolean(afterControl && (afterControl.selected || afterControlState?.checked || afterControlState?.selected));
+      const expectedSelectedControlId = expected.expectedSelectedControlId || expectedControlId;
+      const selectedControlId = afterDecisionGroup?.selectedControlId
+        || (afterControl && (afterControl.selected || afterControlState?.checked || afterControlState?.selected) ? afterControl.controlId : "");
+      const conflictingSelected = (expected.conflictingControlIds || []).filter((controlId) => {
+        const control = (afterMap.controls || []).find((candidate) => candidate.controlId === controlId);
+        return Boolean(control && (control.selected || control.state?.checked || control.state?.selected));
+      });
+      const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
+        issue.stageWide === true || (expectedControlId && issue.controlId === expectedControlId)
+      ));
+      const ok = Boolean(
+        expectedSelectedControlId
+        && selectedControlId === expectedSelectedControlId
+        && conflictingSelected.length === 0
+        && ownedValidationErrors.length === 0
+      );
       return {
         ok,
         code: ok ? "CONTROL_SELECTED" : "CONTROL_NOT_SELECTED",
-        message: ok ? "The canonical choice control is selected." : "The canonical choice control was not selected.",
-        evidence: { ...evidence, control: afterControl || null }
+        message: ok ? "The exact canonical choice is selected and conflicting peers are clear." : "The exact desired choice was not selected, a conflicting peer remains selected, or validation is still visible.",
+        evidence: {
+          ...evidence,
+          control: afterControl || null,
+          expectedSelectedControlId,
+          selectedControlId,
+          conflictingSelected,
+          ownedValidationErrors
+        }
       };
     }
     if (expected.type === "section_choice_verified") {
@@ -5673,6 +6215,97 @@
         code: ok ? "DECISION_GROUP_SATISFIED" : "DECISION_GROUP_NOT_SATISFIED",
         message: ok ? `${expected.sectionLabel || expected.sectionType} is satisfied.` : `${expected.sectionLabel || expected.sectionType || "Decision"} is still unresolved.`,
         evidence: { ...evidence, decisionGroup: group }
+      };
+    }
+    if (expected.type === "policy_conflict_resolved") {
+      const selectedPaid = (map = {}) => {
+        const transaction = (map.transactionFacts?.selectedExtras || []).find((extra) => (
+          String(extra.decisionGroupId || "") === expectedDecisionGroupId
+          && (Number(extra.priceAmount) > 0 || /paid|money|selected paid/.test(normalizeMatchText(extra.disposition || "")))
+          && !/decline|free|remove|skip|without|none|no extra/.test(normalizeMatchText(extra.disposition || ""))
+        ));
+        const group = (map.decisionGroups || []).find((item) => item.decisionGroupId === expectedDecisionGroupId);
+        const groupAmount = Number(group?.selectedEvidence?.structuredPrice?.amount);
+        const groupPaid = Boolean(group?.selectedEvidence?.selected === true && (
+          group.selectedEvidence.disposition === "paid"
+          || (Number.isFinite(groupAmount) && groupAmount > 0)
+          || /selected paid|add paid|money|purchase/.test(normalizeMatchText(`${group?.selectedSemantic || ""} ${group?.selectedEvidence?.semantic || ""} ${group?.selectedEvidence?.risk || ""}`))
+        ));
+        return { transaction: transaction || null, groupPaid };
+      };
+      const beforePaid = selectedPaid(beforeMap);
+      const afterPaid = selectedPaid(afterMap);
+      const beforeConflict = Boolean(beforePaid.transaction || beforePaid.groupPaid);
+      const beforeGroup = (beforeMap.decisionGroups || []).find((item) => item.decisionGroupId === expectedDecisionGroupId);
+      const afterGroup = (afterMap.decisionGroups || []).find((item) => item.decisionGroupId === expectedDecisionGroupId);
+      const selectedControlId = String(
+        beforeGroup?.selectedEvidence?.selectedControlId
+        || beforeGroup?.selectedControlId
+        || ""
+      );
+      const afterSelectedControl = (afterMap.controls || []).find((control) => control.controlId === selectedControlId);
+      const afterSelectedText = normalizeMatchText(
+        afterMap.foreground?.progressMarkers?.selectedText
+        || afterMap.visualState?.foreground?.progressMarkers?.selectedText
+        || ""
+      );
+      const exactControlUnselected = Boolean(
+        selectedControlId
+        && (!afterSelectedControl
+          || !(afterSelectedControl.selected || afterSelectedControl.state?.checked || afterSelectedControl.state?.selected))
+      );
+      const explicitUnselectedState = /not selected|unselected|no selection|none selected/.test(afterSelectedText);
+      const groupSelectionCleared = Boolean(
+        !afterGroup
+        || (afterGroup.selectedEvidence?.selected !== true && !afterGroup.selectedControlId)
+      );
+      const selectedItemCleared = Boolean(
+        beforeConflict
+        && (exactControlUnselected || explicitUnselectedState || groupSelectionCleared)
+      );
+      const afterConflictMetadata = Boolean(afterPaid.transaction || afterPaid.groupPaid);
+      const afterConflict = Boolean(afterPaid.transaction || (afterPaid.groupPaid && !selectedItemCleared));
+      const chargeCleared = beforePaid.transaction ? !afterPaid.transaction : !afterConflict;
+      const beforePriceAmount = expected.beforePriceAmount == null ? null : Number(expected.beforePriceAmount);
+      const afterPriceAmount = afterMap.price?.amount == null ? null : Number(afterMap.price.amount);
+      const priceDidNotIncrease = Number.isFinite(beforePriceAmount) && Number.isFinite(afterPriceAmount)
+        ? afterPriceAmount <= beforePriceAmount
+        : afterConflict === false;
+      const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
+        issue.stageWide === true || (expectedControlId && issue.controlId === expectedControlId)
+      ));
+      const ok = Boolean(
+        expected.semanticOwnershipLinkId
+        && beforeConflict
+        && selectedItemCleared
+        && !afterConflict
+        && chargeCleared
+        && priceDidNotIncrease
+        && ownedValidationErrors.length === 0
+      );
+      return {
+        ok,
+        code: ok ? "POLICY_CONFLICT_RESOLVED" : "POLICY_CONFLICT_STILL_PRESENT",
+        message: ok
+          ? "Fresh browser facts prove the selected paid item and its charge are gone."
+          : "Fresh browser facts do not yet prove the selected paid item and charge are gone.",
+        evidence: {
+          ...evidence,
+          semanticOwnershipLinkId: expected.semanticOwnershipLinkId || "",
+          intendedOutcome: expected.intendedOutcome || "unknown",
+          beforeConflict,
+          afterConflict,
+          afterConflictMetadata,
+          selectedItemCleared,
+          exactControlUnselected,
+          explicitUnselectedState,
+          groupSelectionCleared,
+          chargeCleared,
+          beforePriceAmount: Number.isFinite(beforePriceAmount) ? beforePriceAmount : null,
+          afterPriceAmount: Number.isFinite(afterPriceAmount) ? afterPriceAmount : null,
+          priceDidNotIncrease,
+          ownedValidationErrors
+        }
       };
     }
     if (expected.type === "exact_free_option_selected") {
@@ -5700,18 +6333,95 @@
       const selectedOption = (group?.alternatives || []).find((option) => (
         option.selected === true || (groupSelectedControlId && option.controlId === groupSelectedControlId)
       )) || null;
+      const ownedRemovalVerified = Boolean(
+        beforeDecisionGroup?.removalControlId
+        && beforeDecisionGroup.removalControlId === expectedControlId
+        && beforeDecisionGroup.selectedEvidence?.selected === true
+        && beforeDecisionGroup.selectedEvidence?.disposition === "paid"
+        && !afterControl
+        && (!group || group.selectedEvidence?.disposition !== "paid")
+      );
+      const paidTransactionForGroup = (map = {}) => (map.transactionFacts?.selectedExtras || []).find((extra) => (
+        String(extra.decisionGroupId || "") === expectedDecisionGroupId
+        && (
+          Number(extra.priceAmount) > 0
+          || /paid|money|selected paid/.test(normalizeMatchText(extra.disposition || ""))
+        )
+        && !/decline|free|remove|skip|without|none|no extra/.test(normalizeMatchText(extra.disposition || ""))
+      )) || null;
+      const linkedPaidSelectionCleared = Boolean(
+        expected.semanticOwnershipLinkId
+        && paidTransactionForGroup(beforeMap)
+        && !paidTransactionForGroup(afterMap)
+      );
+      const beforeLinkedPaidSelection = Boolean(
+        beforeDecisionGroup?.selectedEvidence?.selected === true
+        && (
+          beforeDecisionGroup.selectedEvidence.disposition === "paid"
+          || Number(beforeDecisionGroup.selectedEvidence.structuredPrice?.amount) > 0
+        )
+      );
+      const afterLinkedPaidSelection = Boolean(
+        afterDecisionGroup?.selectedEvidence?.selected === true
+        && (
+          afterDecisionGroup.selectedEvidence.disposition === "paid"
+          || Number(afterDecisionGroup.selectedEvidence.structuredPrice?.amount) > 0
+        )
+      );
+      const linkedSourceSelectionCleared = Boolean(
+        expected.semanticOwnershipLinkId
+        && beforeLinkedPaidSelection
+        && !afterLinkedPaidSelection
+      );
+      const exactReversalVerified = ownedRemovalVerified || linkedPaidSelectionCleared || linkedSourceSelectionCleared;
       const selectedText = normalizeMatchText(`${exactCommitment?.semantic || ""} ${exactCommitment?.risk || ""} ${exactCommitment?.label || ""} ${selectedOption?.semantic || ""} ${selectedOption?.risk || ""} ${selectedOption?.label || group?.selectedSemantic || ""} ${group?.selectedLabel || ""}`);
-      const semanticDispositionVerified = /decline|safe decline|free|no extra|no thanks|none|without|skip/.test(selectedText);
+      const semanticDispositionVerified = exactReversalVerified || /decline|safe decline|free|no extra|no thanks|none|without|skip|remove/.test(selectedText);
       const paidAlternativesSelected = (group?.alternatives || []).filter((option) => {
         if (!(option.selected === true || (groupSelectedControlId && option.controlId === groupSelectedControlId))) return false;
         const risk = normalizeMatchText(option.risk || "");
         const semantic = normalizeMatchText(option.semantic || "");
         return /money|payment/.test(risk) || /add paid extra|add extra|purchase|upgrade/.test(semantic);
       });
-      const exactControlSelected = Boolean(expectedControlId && selectedControlId === expectedControlId);
+      const exactControlSelected = exactReversalVerified || Boolean(expectedControlId && selectedControlId === expectedControlId);
+      const selectedChargeAmount = Number(group?.selectedEvidence?.structuredPrice?.amount ?? selectedOption?.structuredPrice?.amount);
+      const selectedChargeRemoved = expected.requireChargeRemoved !== true || Boolean(
+        exactReversalVerified
+        || (
+          group?.selectedEvidence?.disposition === "free"
+          && (!Number.isFinite(selectedChargeAmount) || selectedChargeAmount <= 0)
+        )
+        || (Number.isFinite(selectedChargeAmount) && selectedChargeAmount === 0)
+      );
+      const selectedTruth = (item = {}) => {
+        const selectedEvidence = item.selectedEvidence || {};
+        const controlId = String(item.selectedControlId || selectedEvidence.selectedControlId || "");
+        if (selectedEvidence.selected !== true && !controlId) return null;
+        const amount = Number(selectedEvidence.structuredPrice?.amount);
+        return {
+          controlId,
+          disposition: normalizeMatchText(selectedEvidence.disposition || item.selectedSemantic || "unknown"),
+          priceAmount: Number.isFinite(amount) ? amount : null
+        };
+      };
+      const beforeSelections = new Map((beforeMap.decisionGroups || []).map((item) => [
+        String(item.decisionGroupId || item.requirementId || ""),
+        selectedTruth(item)
+      ]).filter(([decisionGroupId, truth]) => decisionGroupId && truth));
+      const unrelatedSelectionChanges = (afterMap.decisionGroups || []).flatMap((item) => {
+        const decisionGroupId = String(item.decisionGroupId || item.requirementId || "");
+        if (!decisionGroupId || decisionGroupId === expectedDecisionGroupId || decisionGroupId === expected.correctionDecisionGroupId) return [];
+        const afterSelection = selectedTruth(item);
+        if (!afterSelection) return [];
+        const beforeSelection = beforeSelections.get(decisionGroupId) || null;
+        if (!beforeSelection) return [];
+        if (beforeSelection && JSON.stringify(beforeSelection) === JSON.stringify(afterSelection)) return [];
+        return [{ decisionGroupId, before: beforeSelection, after: afterSelection }];
+      });
       const beforePriceAmount = expected.beforePriceAmount == null ? null : Number(expected.beforePriceAmount);
       const afterPriceAmount = afterMap.price?.amount == null ? null : Number(afterMap.price.amount);
-      const priceDidNotIncrease = Number.isFinite(beforePriceAmount) && Number.isFinite(afterPriceAmount)
+      const priceDidNotIncrease = exactReversalVerified && Number.isFinite(beforePriceAmount) && !Number.isFinite(afterPriceAmount)
+        ? true
+        : Number.isFinite(beforePriceAmount) && Number.isFinite(afterPriceAmount)
         ? afterPriceAmount <= beforePriceAmount
         : String(afterMap.priceText || "") === String(expected.beforePriceText || "");
       const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
@@ -5725,9 +6435,11 @@
         || !expected.expectedSurfaceId
         || currentSurface.id !== expected.expectedSurfaceId;
       const ok = Boolean(
-        group?.status === "satisfied"
+        (group?.status === "satisfied" || exactReversalVerified)
         && exactControlSelected
         && semanticDispositionVerified
+        && selectedChargeRemoved
+        && unrelatedSelectionChanges.length === 0
         && paidAlternativesSelected.length === 0
         && priceDidNotIncrease
         && ownedValidationErrors.length === 0
@@ -5756,7 +6468,14 @@
           groupSelectedControlId,
           exactCommitment,
           exactControlSelected,
+          ownedRemovalVerified,
+          linkedPaidSelectionCleared,
+          linkedSourceSelectionCleared,
+          semanticOwnershipLinkId: expected.semanticOwnershipLinkId || "",
           semanticDispositionVerified,
+          selectedChargeRemoved,
+          selectedChargeAmount: Number.isFinite(selectedChargeAmount) ? selectedChargeAmount : null,
+          unrelatedSelectionChanges,
           paidAlternativesSelected,
           beforePriceAmount: Number.isFinite(beforePriceAmount) ? beforePriceAmount : null,
           afterPriceAmount: Number.isFinite(afterPriceAmount) ? afterPriceAmount : null,
@@ -5807,11 +6526,18 @@
       const sameSurfaceLabel = normalizeMatchText(afterSurface.label || "") && normalizeMatchText(afterSurface.label || "") === normalizeMatchText(expected.surfaceLabel || "");
       const foregroundGone = !afterSurface.type || afterSurface.type === "page";
       const stepAdvanced = beforeMap.step !== afterMap.step || location.href !== (beforeMap.url || location.href);
-      const ok = Boolean(stepAdvanced || foregroundGone || (!sameSurfaceId && !sameSurfaceLabel && (foregroundChanged || visualChanged || changed)));
+      const advancedInPlace = Boolean(progressMarkerChanged);
+      const ok = Boolean(stepAdvanced || advancedInPlace || foregroundGone || (!sameSurfaceId && !sameSurfaceLabel && (foregroundChanged || visualChanged || changed)));
       return {
         ok,
-        code: ok ? "ACTIVE_SURFACE_DISMISSED" : "ACTIVE_SURFACE_STILL_PRESENT",
-        message: ok ? "Foreground surface was dismissed or advanced." : "Foreground surface is still present after the action.",
+        code: ok
+          ? (advancedInPlace && !foregroundGone ? "ACTIVE_SURFACE_ADVANCED" : "ACTIVE_SURFACE_DISMISSED")
+          : "ACTIVE_SURFACE_STILL_PRESENT",
+        message: ok
+          ? (advancedInPlace && !foregroundGone
+              ? "Foreground surface advanced to a fresh internal step."
+              : "Foreground surface was dismissed or advanced.")
+          : "Foreground surface is still present after the action.",
         evidence: {
           ...evidence,
           expectedSurface: {
@@ -5823,7 +6549,9 @@
             id: afterSurface.id || "",
             type: afterSurface.type || "page",
             label: afterSurface.label || ""
-          }
+          },
+          advancedInPlace,
+          progressMarkerChanged
         }
       };
     }
@@ -6079,11 +6807,16 @@
 
   async function waitForUiSettle(ms = 650) {
     const startedAt = performance.now();
-    await showAgentThought(null, "Wait", "Watching page update", "Waiting for popups, dropdowns, validation, price/order changes, or URL changes.", 600);
-    await waitForPaint(ms);
+    setAgentActivity("Wait -> Watching page update", "Waiting for a material popup, selection, validation, price, progress, or route change.");
+    const settled = await pageStateStore.waitForQuiet({
+      maxWaitMs: ms,
+      minQuietMs: 80,
+      awaitMutationMs: Math.min(180, Math.max(60, Math.round(ms * 0.25)))
+    });
     logFlow("latency.span", {
       page_settle_ms: Math.round(performance.now() - startedAt),
-      requested_settle_ms: ms
+      requested_settle_ms: ms,
+      mutation_settled: settled.settled
     });
   }
 
@@ -6143,6 +6876,9 @@
 
   function classifyStep(text) {
     const lower = text.toLowerCase();
+    const route = String(location.pathname || "").toLowerCase();
+    const newSearchRoute = /(?:^|\/)rf\/start\/?$/.test(route)
+      || /(?:^|\/)(?:flight-)?search\/?$/.test(route);
     const extrasEvidence = /select baggage|configure your trip|upgrade your trip|checked baggage|bundle|premium support|airhelp|cancellation guarantee|voucher refund|add to cart|no thanks|add baggage|choose your bundle/.test(lower);
     const travelerEvidence = /traveller information|traveler information|contact information|provide your contact details|passport|date of birth|surname|first name|first and middle names|mobile number|confirm e-?mail/.test(lower);
     const seatEvidence = /seat selection|select seat|choose seat/.test(lower);
@@ -6153,6 +6889,7 @@
 
     if (/booking confirmed|confirmation|booking reference|reservation number|pnr/.test(lower)) return "confirmation";
     if (paymentFormEvidence) return "payment";
+    if (newSearchRoute) return "flight_selection";
     if (strongSeatEvidence) return "seats";
     if (travelerRouteEvidence) return "traveler_information";
     if (paymentRouteEvidence && extrasEvidence) return "extras";
@@ -6170,6 +6907,9 @@
   // by the Observer Mode page-understanding output.
   function classifyStepDetailed(text) {
     const lower = text.toLowerCase();
+    const route = String(location.pathname || "").toLowerCase();
+    const newSearchRoute = /(?:^|\/)rf\/start\/?$/.test(route)
+      || /(?:^|\/)(?:flight-)?search\/?$/.test(route);
     const extrasEvidence = /select baggage|configure your trip|upgrade your trip|checked baggage|bundle|premium support|airhelp|cancellation guarantee|voucher refund|add to cart|no thanks|add baggage|choose your bundle/.test(lower);
     const travelerEvidence = /traveller information|traveler information|contact information|provide your contact details|passport|date of birth|surname|first name|first and middle names|mobile number|confirm e-?mail/.test(lower);
     const seatEvidence = /seat selection|select seat|choose seat/.test(lower);
@@ -6182,6 +6922,7 @@
 
     if (confirmationEvidence) return { step: "confirmation", confidence: 0.95 };
     if (paymentFormEvidence) return { step: "payment", confidence: 0.95 };
+    if (newSearchRoute) return { step: "flight_selection", confidence: 0.98 };
     if (strongSeatEvidence) return { step: "seats", confidence: 0.9 };
     if (travelerRouteEvidence) return { step: "traveler_information", confidence: 0.9 };
     if (paymentRouteEvidence && extrasEvidence) return { step: "extras", confidence: 0.75 };
@@ -7070,7 +7811,7 @@
     const step = classifyStep(`${location.href} ${text} ${fullText.slice(0, 2500)}`);
     const fields = candidateInputs().map((input) => {
       const detected = detectField(input);
-      const semantic = detected?.field || "unknown";
+      const semantic = detected?.fieldType || detected?.field || "unknown";
       const value = fieldValue(input);
       return {
         element: input,
@@ -7093,9 +7834,20 @@
         kind: input.type || input.tagName.toLowerCase(),
         role: implicitRole(input),
         field: semantic,
+        fieldType: semantic === "unknown" ? "" : semantic,
+        fieldClassification: detected ? {
+          fieldType: detected.fieldType || detected.field || "",
+          source: detected.source || "observer",
+          confidence: Number(detected.confidence || 0),
+          evidence: [...(detected.evidence || [])]
+        } : null,
         semantic,
         dateField: semantic === "date_of_birth" ? dateFieldEvidenceForElement(input) : null,
-        required: input.required || /\*/.test(labelText(input)),
+        required: Boolean(
+          input.required
+          || input.getAttribute?.("aria-required") === "true"
+          || /\*|\brequired\b/i.test(`${labelText(input)} ${profileFieldGroupEvidence(input).label}`)
+        ),
         value,
         hasValue: Boolean(value),
         confidence: detected?.confidence || 0,
@@ -7126,6 +7878,7 @@
     const taskQueue = buildTaskQueue(sections);
     const activeSurface = buildActiveSurface(activeOverlayElements(), sections, taskQueue);
     const controls = buildCanonicalControlGraph(sections, fields, buttons, activeSurface);
+    syncRequiredProfileChoiceGroups(fields, controls, sections);
     const validationIssues = collectValidationIssues(text, fields, controls, sections, activeSurface);
     const errors = validationIssues.map((issue) => issue.message);
     const registryConflicts = activeObservationControlRegistry?.conflicts || [];
@@ -7226,6 +7979,367 @@
     map.foreground = foregroundSurfaceState(map.currentSurface || {});
     map.visualState = visualPageState(map);
     return map;
+  }
+
+  function emptyPageStateDiff() {
+    return {
+      addedControls: [],
+      removedControls: [],
+      stateChanges: [],
+      textChanges: [],
+      validationChanges: [],
+      priceChanges: [],
+      surfaceChanges: []
+    };
+  }
+
+  function canonicalPageStateDiff(before = null, after = null) {
+    if (!before || !after) return emptyPageStateDiff();
+    const diff = emptyPageStateDiff();
+    const beforeControls = new Map((before.controls || []).map((control) => [control.controlId, control]));
+    const afterControls = new Map((after.controls || []).map((control) => [control.controlId, control]));
+    const stateFor = (control = {}) => ({
+      checked: Boolean(control.state?.checked),
+      selected: Boolean(control.state?.selected || control.selected),
+      disabled: Boolean(control.state?.disabled),
+      expanded: Boolean(control.state?.expanded),
+      valuePresent: Boolean(control.state?.valuePresent),
+      normalizedValue: String(control.state?.normalizedValue || control.currentValue || ""),
+      selectedValue: String(control.state?.selectedValue || ""),
+      fieldType: String(control.fieldType || ""),
+      executable: Object.values(control.operations || {}).some((operation) => operation?.actionability?.executable === true)
+    });
+    for (const [controlId, control] of afterControls) {
+      const prior = beforeControls.get(controlId);
+      if (!prior) {
+        diff.addedControls.push({ controlId, stableKey: control.stableKey || "", surfaceId: control.surfaceId || "" });
+        continue;
+      }
+      const beforeState = stateFor(prior);
+      const afterState = stateFor(control);
+      if (JSON.stringify(beforeState) !== JSON.stringify(afterState)) {
+        diff.stateChanges.push({ controlId, before: beforeState, after: afterState });
+      }
+      const beforeText = compactText([prior.ownText, prior.ariaLabel, prior.title, prior.label].filter(Boolean).join(" "), 240);
+      const afterText = compactText([control.ownText, control.ariaLabel, control.title, control.label].filter(Boolean).join(" "), 240);
+      if (beforeText !== afterText) diff.textChanges.push({ controlId, before: beforeText, after: afterText });
+    }
+    for (const [controlId, control] of beforeControls) {
+      if (!afterControls.has(controlId)) {
+        diff.removedControls.push({ controlId, stableKey: control.stableKey || "", surfaceId: control.surfaceId || "" });
+      }
+    }
+    const validationKey = (issue = {}) => `${issue.issueId || issue.controlId || ""}:${issue.message || issue}`;
+    const beforeValidation = new Set([...(before.validationIssues || []).map(validationKey), ...(before.errors || []).map(String)]);
+    const afterValidation = new Set([...(after.validationIssues || []).map(validationKey), ...(after.errors || []).map(String)]);
+    const appeared = [...afterValidation].filter((value) => !beforeValidation.has(value));
+    const cleared = [...beforeValidation].filter((value) => !afterValidation.has(value));
+    if (appeared.length || cleared.length) diff.validationChanges.push({ appeared, cleared });
+    if (JSON.stringify(before.price || null) !== JSON.stringify(after.price || null)
+      || JSON.stringify(before.transactionFacts?.selectedExtras || []) !== JSON.stringify(after.transactionFacts?.selectedExtras || [])) {
+      diff.priceChanges.push({
+        before: before.price || null,
+        after: after.price || null,
+        selectedExtrasBefore: before.transactionFacts?.selectedExtras || [],
+        selectedExtrasAfter: after.transactionFacts?.selectedExtras || []
+      });
+    }
+    const surfaceFor = (map = {}) => ({
+      id: map.currentSurface?.id || "surface-page",
+      type: map.currentSurface?.type || "page",
+      label: map.currentSurface?.label || "",
+      progressMarkers: map.foreground?.progressMarkers || map.currentSurface?.foreground?.progressMarkers || null
+    });
+    const beforeSurface = surfaceFor(before);
+    const afterSurface = surfaceFor(after);
+    if (JSON.stringify(beforeSurface) !== JSON.stringify(afterSurface)) {
+      diff.surfaceChanges.push({ before: beforeSurface, after: afterSurface });
+    }
+    return Object.fromEntries(Object.entries(diff).map(([key, value]) => [key, value.slice(0, 40)]));
+  }
+
+  function pageStateDiffIsMaterial(diff = emptyPageStateDiff()) {
+    return Object.values(diff).some((entries) => Array.isArray(entries) && entries.length > 0);
+  }
+
+  function mutationOwnedControlId(target) {
+    if (!target || target.nodeType !== Node.ELEMENT_NODE) target = target?.parentElement || null;
+    return target?.closest?.("[data-atw-control-id]")?.dataset?.atwControlId
+      || target?.dataset?.atwControlId
+      || "";
+  }
+
+  function mutationMayBeMaterial(mutation) {
+    const target = mutation?.target?.nodeType === Node.ELEMENT_NODE
+      ? mutation.target
+      : mutation?.target?.parentElement;
+    if (!target || target.closest?.("#atw-sidebar, #atw-screenshot-annotation-overlay")) return false;
+    if (mutation.type === "viewport") return true;
+    if (mutation.type === "attributes") {
+      if (/^data-atw-/.test(mutation.attributeName || "")) return false;
+      const materialAttributes = new Set([
+        "checked", "selected", "value", "disabled", "required", "hidden", "open",
+        "aria-checked", "aria-selected", "aria-expanded", "aria-disabled", "aria-invalid",
+        "aria-hidden", "aria-valuenow", "data-price", "data-selected", "data-value"
+      ]);
+      if (materialAttributes.has(mutation.attributeName)) return true;
+      if (["class", "style"].includes(mutation.attributeName)) {
+        return Boolean(mutationOwnedControlId(target)
+          || target.matches?.("[role='dialog'], [aria-modal='true'], .modal, .popover, [role='listbox'], [role='menu'], [role='alert'], progress"));
+      }
+      return false;
+    }
+    if (mutation.type === "characterData") {
+      return Boolean(mutationOwnedControlId(target)
+        || target.closest?.("[role='dialog'], [aria-modal='true'], [role='alert'], [aria-live], h1, h2, [data-checkout-step], [class*='step'], [class*='progress'], [data-price], [class*='price'], [class*='total'], progress"));
+    }
+    if (mutation.type === "childList") {
+      const nodes = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
+      const selector = "button, input, select, textarea, [role='button'], [role='option'], [role='radio'], [role='checkbox'], [role='dialog'], [aria-modal='true'], .modal, .popover, [role='listbox'], [role='menu'], [role='alert'], [aria-live], [data-price], [class*='price'], [class*='total'], progress";
+      return nodes.some((node) => {
+        if (node.nodeType === Node.TEXT_NODE) return Boolean(mutationOwnedControlId(target)
+          || target.matches?.("h1, h2, [data-checkout-step], [class*='step'], [class*='progress'], [role='alert'], [aria-live], [data-price], [class*='price'], [class*='total'], progress")
+          || target.closest?.("[role='dialog'], [aria-modal='true']"));
+        return Boolean(node.matches?.(selector) || node.querySelector?.(selector));
+      });
+    }
+    return mutation.type === "input" || mutation.type === "change";
+  }
+
+  function syncIncrementalControlModels(map, controlsById) {
+    const sync = (items = []) => items.map((item) => {
+      const control = controlsById.get(item.controlId || item.id);
+      return control ? applyControlToModel({ ...item }, control) : item;
+    });
+    map.fields = sync(map.fields || []);
+    map.buttons = sync(map.buttons || []);
+    map.sections = (map.sections || []).map((section) => ({
+      ...section,
+      fields: sync(section.fields || []),
+      choices: sync(section.choices || []),
+      buttons: sync(section.buttons || [])
+    }));
+    if (map.currentSurface?.type && map.currentSurface.type !== "page") {
+      map.currentSurface = {
+        ...map.currentSurface,
+        options: sync(map.currentSurface.options || []),
+        buttons: sync(map.currentSurface.buttons || [])
+      };
+    }
+    return map;
+  }
+
+  function createPageStateStore() {
+    let canonical = null;
+    let canonicalUrl = "";
+    let dirty = true;
+    let pendingMutations = [];
+    let lastMaterialMutationAt = 0;
+    let incrementalUpdates = 0;
+    let update = {
+      mode: "uninitialized",
+      reason: "initial",
+      baseSnapshotHash: "",
+      snapshotHash: "",
+      diff: emptyPageStateDiff(),
+      material: true,
+      timings: {}
+    };
+
+    const recordMutation = (mutation) => {
+      if (!mutationMayBeMaterial(mutation)) return false;
+      pendingMutations.push(mutation);
+      pendingMutations = pendingMutations.slice(-240);
+      lastMaterialMutationAt = performance.now();
+      dirty = true;
+      agent.lastPageMutationAt = Date.now();
+      return true;
+    };
+
+    const noteMutations = (mutations = []) => {
+      let material = false;
+      for (const mutation of mutations) material = recordMutation(mutation) || material;
+      return material;
+    };
+    const noteEvent = (event) => recordMutation({ type: event.type, target: event.target });
+
+    const mutationTargets = () => [...new Set(pendingMutations.map((mutation) => (
+      mutation.target?.nodeType === Node.ELEMENT_NODE ? mutation.target : mutation.target?.parentElement
+    )).filter(Boolean))];
+
+    const canRefreshIncrementally = () => {
+      if (!canonical || !pendingMutations.length || incrementalUpdates >= 24) return false;
+      if (pendingMutations.some((mutation) => mutation.type === "childList" || mutation.type === "characterData")) return false;
+      const ids = mutationTargets().map(mutationOwnedControlId).filter(Boolean);
+      return ids.length > 0 && ids.length === mutationTargets().length;
+    };
+
+    const refreshControls = () => {
+      const next = {
+        ...canonical,
+        controls: [...(canonical.controls || [])],
+        transactionFacts: canonical.transactionFacts ? { ...canonical.transactionFacts } : null
+      };
+      const controlsById = new Map(next.controls.map((control) => [control.controlId, control]));
+      const dirtyIds = [...new Set(mutationTargets().map(mutationOwnedControlId).filter(Boolean))];
+      for (const controlId of dirtyIds) {
+        const prior = controlsById.get(controlId);
+        if (!prior) return null;
+        const live = elementById(prior.stateElementId)
+          || document.querySelector(`[data-atw-control-id="${CSS.escape(controlId)}"]`);
+        if (!live || !live.isConnected) return null;
+        const surface = prior.surfaceId === canonical.currentSurface?.id ? canonical.currentSurface : {
+          id: prior.surfaceId || "surface-page",
+          type: prior.surfaceType || "page",
+          label: prior.surfaceLabel || ""
+        };
+        const refreshed = canonicalControlForElement(live, {
+          field: prior.fieldType || prior.field || "",
+          fieldType: prior.fieldType || "",
+          required: prior.required,
+          decisionGroupId: prior.decisionGroupId || "",
+          sectionId: prior.sectionId || "",
+          sectionType: prior.sectionType || "",
+          sectionLabel: prior.sectionLabel || "",
+          surface
+        });
+        if (!refreshed || refreshed.controlId !== controlId) return null;
+        const fieldType = refreshed.fieldType || prior.fieldType || "";
+        controlsById.set(controlId, {
+          ...refreshed,
+          fieldType,
+          fieldClassification: refreshed.fieldClassification?.fieldType
+            ? refreshed.fieldClassification
+            : (prior.fieldClassification || null),
+          semantic: fieldType || (refreshed.semantic && refreshed.semantic !== "unknown" ? refreshed.semantic : prior.semantic),
+          semanticIntent: fieldType || (refreshed.semanticIntent && refreshed.semanticIntent !== "unknown" ? refreshed.semanticIntent : prior.semanticIntent),
+          meaning: fieldType || refreshed.meaning || prior.meaning
+        });
+      }
+      next.controls = next.controls.map((control) => controlsById.get(control.controlId) || control);
+      syncIncrementalControlModels(next, controlsById);
+      syncRequiredProfileChoiceGroups(next.fields || [], next.controls || [], next.sections || []);
+      next.decisionGroups = buildCanonicalDecisionGroups(next.sections || [], next.controls, next.currentSurface || {});
+      if (next.transactionFacts) {
+        next.transactionFacts.selectedExtras = next.decisionGroups
+          .filter((group) => group.status === "satisfied" && group.selectedLabel)
+          .map((group) => ({
+            decisionGroupId: group.decisionGroupId || "",
+            label: group.selectedLabel || "",
+            disposition: group.selectedEvidence?.disposition || group.selectedSemantic || "",
+            priceAmount: group.selectedEvidence?.structuredPrice?.amount ?? null,
+            currency: group.selectedEvidence?.structuredPrice?.currency || next.price?.currency || ""
+          })).slice(0, 40);
+      }
+      next.stageExit = buildStageExit(next.decisionGroups, next.fields, next.buttons, next.overlays, next.errors, next.step);
+      next.summary = {
+        ...(next.summary || {}),
+        fields: next.fields.length,
+        knownFields: next.fields.filter((field) => field.field !== "unknown").length,
+        buttons: next.buttons.length,
+        controls: next.controls.length,
+        decisionGroups: next.decisionGroups.length,
+        continueAllowed: next.stageExit.continueAllowed
+      };
+      return next;
+    };
+
+    const observe = ({ forceFull = false, reason = "observe" } = {}) => {
+      const startedAt = performance.now();
+      const urlChanged = Boolean(canonicalUrl && canonicalUrl !== location.href);
+      if (canonical && !dirty && !forceFull && !urlChanged) {
+        update = {
+          ...update,
+          mode: "cached",
+          reason,
+          diff: emptyPageStateDiff(),
+          material: false,
+          timings: { observationBuildMs: Math.round(performance.now() - startedAt) }
+        };
+        return { map: canonical, ...update };
+      }
+      const before = canonical;
+      const baseSnapshotHash = before ? observationHashForMap(before) : "";
+      let next = null;
+      let mode = "full_snapshot";
+      if (!forceFull && !urlChanged && canRefreshIncrementally()) {
+        next = refreshControls();
+        if (next) {
+          mode = "incremental";
+          incrementalUpdates += 1;
+        }
+      }
+      if (!next) {
+        next = rememberPagePlan(buildPageMap());
+        incrementalUpdates = 0;
+        mode = before && !urlChanged && !forceFull ? "material_rescan" : "full_snapshot";
+      }
+      const diff = canonicalPageStateDiff(before, next);
+      canonical = next;
+      canonicalUrl = location.href;
+      dirty = false;
+      pendingMutations = [];
+      update = {
+        mode,
+        reason,
+        baseSnapshotHash,
+        snapshotHash: observationHashForMap(next),
+        diff,
+        material: !before || pageStateDiffIsMaterial(diff),
+        timings: { observationBuildMs: Math.round(performance.now() - startedAt) }
+      };
+      logFlow("page_state.updated", {
+        mode,
+        reason,
+        material: update.material,
+        baseSnapshotHash,
+        snapshotHash: update.snapshotHash,
+        counts: Object.fromEntries(Object.entries(diff).map(([key, entries]) => [key, entries.length])),
+        observation_build_ms: update.timings.observationBuildMs
+      });
+      return { map: canonical, ...update };
+    };
+
+    const waitForQuiet = async ({ maxWaitMs = 650, minQuietMs = 70, awaitMutationMs = 0 } = {}) => {
+      const startedAt = performance.now();
+      while (!dirty && awaitMutationMs > 0 && performance.now() - startedAt < Math.min(awaitMutationMs, maxWaitMs)) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+      while (dirty && performance.now() - startedAt < maxWaitMs) {
+        const dynamicQuietMs = Math.min(240, minQuietMs + pendingMutations.length * 3);
+        const elapsedQuiet = performance.now() - lastMaterialMutationAt;
+        if (elapsedQuiet >= dynamicQuietMs) break;
+        await sleep(Math.min(40, Math.max(8, dynamicQuietMs - elapsedQuiet)));
+      }
+      return { waitedMs: Math.round(performance.now() - startedAt), settled: !dirty || performance.now() - lastMaterialMutationAt >= minQuietMs };
+    };
+
+    const invalidate = (reason = "integrity_recovery") => {
+      dirty = true;
+      pendingMutations.push({ type: "integrity", target: document.documentElement, reason });
+      lastMaterialMutationAt = performance.now();
+    };
+
+    return {
+      observe,
+      waitForQuiet,
+      noteMutations,
+      noteEvent,
+      invalidate,
+      current: () => canonical,
+      lastUpdate: () => update,
+      isDirty: () => dirty,
+      pendingCount: () => pendingMutations.length
+    };
+  }
+
+  pageStateStore = createPageStateStore();
+
+  async function observePageStateAfterMutation(reason = "post_action_verification", maxWaitMs = 800) {
+    await pageStateStore.waitForQuiet({ maxWaitMs });
+    const observed = pageStateStore.observe({ reason });
+    agent.pageMap = rememberPagePlan(observed.map);
+    return observed;
   }
 
   function collectValidationIssues(pageText, fields = [], controls = [], sections = [], activeSurface = {}) {
@@ -7583,6 +8697,8 @@
         iconOnly: Boolean(control.iconOnly),
         kind: control.kind,
         field: control.field || "",
+        fieldType: control.fieldType || "",
+        fieldClassification: control.fieldClassification || null,
         role: control.role,
         domRole: control.domRole || "",
         semantic: control.semantic,
@@ -7630,6 +8746,9 @@
         selectedControlId: group.selectedControlId,
         selectedLabel: group.selectedLabel,
         selectedSemantic: group.selectedSemantic,
+        semanticOwnership: group.semanticOwnership || null,
+        selectedEvidence: group.selectedEvidence || null,
+        removalControlId: group.removalControlId || "",
         alternativeControlIds: uniqueControlIds(group.alternatives || []),
         evidence: (group.evidence || []).slice(0, 5)
       })),
@@ -7928,6 +9047,28 @@
     }
   }
 
+  function observationNeedsScreenshot(map = {}) {
+    const graph = map.graphIntegrity || {};
+    if (graph.ok === false && Number(graph.actionableConflictCount || graph.aliasConflictCount || 0) > 0) return true;
+    const surfaceId = map.currentSurface?.id || map.currentSurface?.surfaceId || "surface-page";
+    return (map.controls || []).some((control) => {
+      if (control.surfaceId && control.surfaceId !== surfaceId) return false;
+      const executable = Object.values(control.operations || {}).some((operation) => (
+        operation?.actionability?.executable === true || operation?.actionability?.revealable === true
+      ));
+      if (!executable || !control.visualRegion) return false;
+      const localIdentity = compactText([
+        control.ownText,
+        control.ariaLabel,
+        control.title,
+        control.testId,
+        control.label,
+        control.accessibleName
+      ].filter(Boolean).join(" "), 240);
+      return !localIdentity;
+    });
+  }
+
   function observationTransportBytes(payload = {}) {
     return new Blob([JSON.stringify(payload)]).size;
   }
@@ -7958,6 +9099,51 @@
     };
   }
 
+  function incrementalObservationTransport(payload = {}) {
+    const update = payload.observationUpdate || {};
+    const page = payload.page || {};
+    if (update.mode !== "incremental" || !update.baseSnapshotHash) return payload;
+    const diff = update.diff || emptyPageStateDiff();
+    const changedControlIds = new Set([
+      ...(diff.addedControls || []).map((entry) => entry.controlId),
+      ...(diff.stateChanges || []).map((entry) => entry.controlId),
+      ...(diff.textChanges || []).map((entry) => entry.controlId)
+    ].filter(Boolean));
+    const currentSurfaceId = page.currentSurface?.id || "surface-page";
+    for (const control of page.controls || []) {
+      if ((control.surfaceId || "surface-page") === currentSurfaceId) changedControlIds.add(control.controlId);
+    }
+    const controls = (page.controls || []).filter((control) => changedControlIds.has(control.controlId));
+    const controlIds = new Set(controls.map((control) => control.controlId));
+    const decisionGroups = (page.decisionGroups || []).filter((group) => (
+      group.surfaceId === currentSurfaceId
+      || controlIds.has(group.selectedControlId)
+      || controlIds.has(group.removalControlId)
+      || (group.alternativeControlIds || []).some((controlId) => controlIds.has(controlId))
+    ));
+    const decisionGroupIds = new Set(decisionGroups.map((group) => group.decisionGroupId));
+    const sections = (page.sections || []).filter((section) => (
+      (section.controlIds || []).some((controlId) => controlIds.has(controlId))
+    ));
+    return {
+      ...payload,
+      transportMode: "incremental_diff",
+      page: {
+        ...page,
+        incremental: true,
+        controls,
+        controlAliases: (page.controlAliases || []).filter((entry) => controlIds.has(entry.controlId)),
+        decisionGroups,
+        sections,
+        surfaceStack: page.surfaceStack || [],
+        currentSurface: page.currentSurface || null,
+        screenshotAnnotations: (page.screenshotAnnotations || []).filter((entry) => (
+          controlIds.has(entry.controlId) || decisionGroupIds.has(entry.decisionGroupId)
+        ))
+      }
+    };
+  }
+
   async function uploadObservationScreenshot(apiBase, { sessionId, observationId, screenshotDataUrl, signal }) {
     if (!screenshotDataUrl) return "";
     const response = await fetch(`${apiBase}/agent/screenshot`, {
@@ -7977,13 +9163,14 @@
   }
 
   async function postObservationWithSizeRecovery(apiBase, payload, signal) {
-    let outgoing = payload;
+    const fullPayload = payload;
+    let outgoing = incrementalObservationTransport(payload);
     let bytes = observationTransportBytes(outgoing);
     if (bytes > MAX_OBSERVATION_TRANSPORT_BYTES) {
       outgoing = smallerObservationTransport(outgoing);
       bytes = observationTransportBytes(outgoing);
     }
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       const response = await fetch(`${apiBase}/agent/next-action`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -7992,6 +9179,19 @@
       });
       if (response.ok) return { response, bytes, transportMode: outgoing.transportMode || "canonical" };
       const body = await response.json().catch(() => ({}));
+      if (body.code === "OBSERVATION_RESYNC_REQUIRED" && body.retryable === true && outgoing !== fullPayload) {
+        outgoing = {
+          ...fullPayload,
+          transportMode: "full_resynchronization",
+          observationUpdate: {
+            ...(fullPayload.observationUpdate || {}),
+            mode: "full_snapshot",
+            baseSnapshotHash: ""
+          }
+        };
+        bytes = observationTransportBytes(outgoing);
+        continue;
+      }
       if (body.code === "OBSERVATION_TOO_LARGE" && body.retryable === true && attempt === 0) {
         outgoing = smallerObservationTransport(outgoing);
         bytes = observationTransportBytes(outgoing);
@@ -8011,6 +9211,21 @@
   async function requestAgentDecision(map, userMessage = "", clientLatency = {}, loopToken = {}) {
     const turnId = nextFlowId("turn");
     const observationId = nextFlowId("obs");
+    const materialHash = observationHashForMap(map);
+    const feedbackKey = stableHash(JSON.stringify({
+      actionId: agent.lastActionResult?.actionId || "",
+      code: agent.lastActionResult?.code || agent.lastActionResult?.failureCode || "",
+      verified: agent.lastActionResult?.verified,
+      postconditionSatisfied: agent.lastActionResult?.postconditionSatisfied
+    }));
+    if (!userMessage && agent.lastSentMaterialHash === materialHash && agent.lastSentFeedbackKey === feedbackKey) {
+      logFlow("backend.request.unchanged_material_suppressed", {
+        materialHash,
+        feedbackKey,
+        mutationDiff: clientLatency.observation_diff || emptyPageStateDiff()
+      });
+      return null;
+    }
     if (agent.activePlannerRequest) {
       logFlow("backend.request.duplicate_suppressed", {
         turnId,
@@ -8051,9 +9266,19 @@
     });
     try {
       const settings = await storageGet(["apiBase"]);
-      const screenshotAnnotations = prepareScreenshotAnnotations(map, observationId);
+      const screenshotRequired = observationNeedsScreenshot(map);
+      const screenshotAnnotations = screenshotRequired ? prepareScreenshotAnnotations(map, observationId) : [];
       const screenshotStartedAt = performance.now();
-      const screenshotDataUrl = await captureVisibleScreenshot(screenshotAnnotations);
+      const screenshotCacheKey = `${map.currentSurface?.id || "surface-page"}:${materialHash}`;
+      let screenshotDataUrl = screenshotRequired ? agent.screenshotCache.get(screenshotCacheKey) || "" : "";
+      const screenshotCacheHit = Boolean(screenshotDataUrl);
+      if (screenshotRequired && !screenshotDataUrl) {
+        screenshotDataUrl = await captureVisibleScreenshot(screenshotAnnotations);
+        if (screenshotDataUrl) {
+          agent.screenshotCache.set(screenshotCacheKey, screenshotDataUrl);
+          while (agent.screenshotCache.size > 3) agent.screenshotCache.delete(agent.screenshotCache.keys().next().value);
+        }
+      }
       const screenshotCaptureMs = Math.round(performance.now() - screenshotStartedAt);
       const apiBase = settings.apiBase || DEFAULT_API;
       const screenshotId = await uploadObservationScreenshot(apiBase, {
@@ -8066,8 +9291,11 @@
         turnId,
         api: `${settings.apiBase || DEFAULT_API}/agent/next-action`,
         screenshotBytes: screenshotDataUrl.length,
+        screenshotRequired,
+        screenshotCacheHit,
         screenshotAnnotations: screenshotAnnotations.length,
         observation_build_ms: clientLatency.observation_build_ms ?? null,
+        observationMode: clientLatency.observation_mode || "full_snapshot",
         screenshot_capture_ms: screenshotCaptureMs,
         currentSurface: map.currentSurface ? {
           type: map.currentSurface.type,
@@ -8089,6 +9317,12 @@
         clientTurnId: turnId,
         observationId,
         observationSnapshot,
+        observationUpdate: {
+          mode: clientLatency.observation_mode || "full_snapshot",
+          baseSnapshotHash: clientLatency.base_snapshot_hash || "",
+          snapshotHash: materialHash,
+          diff: clientLatency.observation_diff || emptyPageStateDiff()
+        },
         userIntent: userIntentText(),
         userMessage,
         traveler: traveler(),
@@ -8130,6 +9364,8 @@
         });
         return null;
       }
+      agent.lastSentMaterialHash = materialHash;
+      agent.lastSentFeedbackKey = feedbackKey;
       const requestUploadMs = Math.round(performance.now() - requestStartedAt);
       logFlow("backend.request.transport", {
         turnId,
@@ -8299,7 +9535,7 @@
     });
     clearExecutionContext();
     renderSidebar("agent");
-    await sleep(delay);
+    await sleep(Math.min(Math.max(0, delay), 80));
     processCheckoutAgent();
   }
 
@@ -8318,7 +9554,7 @@
 
   async function clickAndVerifyAdvance(element, label = "Continue", delay = 1200, options = {}) {
     if (!guardedHelperAllowed("clickAndVerifyAdvance", ["click"])) return false;
-    const beforeMap = options.beforeMap || rememberPagePlan(buildPageMap());
+    const beforeMap = options.beforeMap || pageStateStore.observe({ reason: "before_advance" }).map;
     const governedDecision = options.decision || { action: "stop", reason: "Missing governed navigation decision." };
     const expectedOutcome = options.expectedOutcome || expectedOutcomeForDecision(governedDecision, beforeMap, element);
     addAgentMessage("assistant", `Clicking: ${label}.`);
@@ -8333,8 +9569,8 @@
     });
     userLikeClick(element);
     await waitForUiSettle(700);
-    await sleep(delay);
-    let afterMap = rememberPagePlan(buildPageMap());
+    const postActionObservation = await observePageStateAfterMutation("verify_advance", 900);
+    let afterMap = postActionObservation.map;
     const verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, element);
     let advanced = verification.ok;
     agent.pageMap = afterMap;
@@ -8427,7 +9663,8 @@
       risk: decision.risk,
       source: decision.source
     });
-    const currentObservation = mapObservationSnapshot(rememberPagePlan(buildPageMap()));
+    await pageStateStore.waitForQuiet({ maxWaitMs: 260 });
+    const currentObservation = mapObservationSnapshot(pageStateStore.observe({ reason: "pre_execution" }).map);
     if ((decision.observationHash && decision.observationHash !== currentObservation.snapshotHash) || observationChangedSince(map)) {
       const staleOutcome = {
         ok: false,
@@ -8636,7 +9873,7 @@
       dispatchKey(target, key);
       recordAction("keypress", { key, targetId: decision.targetId || "" });
       await waitForUiSettle(500);
-      const afterMap = rememberPagePlan(buildPageMap());
+      const afterMap = (await observePageStateAfterMutation("verify_keypress", 650)).map;
       const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
       const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
       await pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
@@ -8725,7 +9962,7 @@
       recordAction("click_xy", { x: Math.round(x), y: Math.round(y), label: targetLabel });
       await waitForUiSettle(700);
       {
-        const afterMap = rememberPagePlan(buildPageMap());
+        const afterMap = (await observePageStateAfterMutation("verify_coordinate_click", 750)).map;
         const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
         const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
         await pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
@@ -8842,7 +10079,7 @@
       userLikeClick(target);
       if (surfaceWasActive) {
         const progress = await waitForOverlayProgress(beforeOverlay, beforeOverlaySignature, 2200);
-        const afterMap = rememberPagePlan(buildPageMap());
+        const afterMap = (await observePageStateAfterMutation("verify_foreground_action", 650)).map;
         const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
         const verifiedResult = withOverlayProgressEvidence(verification, progress);
         await pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verifiedResult);
@@ -8862,7 +10099,7 @@
         return;
       }
       await waitForUiSettle(800);
-      const afterMap = rememberPagePlan(buildPageMap());
+      const afterMap = (await observePageStateAfterMutation("verify_click", 750)).map;
       const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
       await pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
       await continueAfterAction(900);
@@ -8928,7 +10165,7 @@
         return;
       }
       const resolveLiveElement = () => {
-        const freshMap = rememberPagePlan(buildPageMap());
+        const freshMap = pageStateStore.observe({ reason: "field_rebind" }).map;
         return resolveDecisionTarget({
           action: decision.action,
           operation: decision.operation,
@@ -8960,7 +10197,7 @@
         return;
       }
       {
-        const afterMap = rememberPagePlan(buildPageMap());
+        const afterMap = (await observePageStateAfterMutation("verify_field_change", 650)).map;
         const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
         const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
         await pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verification);
@@ -9204,7 +10441,7 @@
     agent.actionHistory = [];
     agent.observerTab = agent.observerTab || "summary";
     setAgentActivity("Observing page (no actions will be taken)", travelerRules() || "Using saved traveler profile");
-    agent.pageMap = rememberPagePlan(buildPageMap());
+    agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "observe_only" }).map;
     const map = agent.pageMap;
     const started = Date.now();
     agent.pageUnderstanding = buildPageUnderstanding(map);
@@ -9247,7 +10484,7 @@
     agent.actionHistory = [];
     resetFieldProgress();
     setAgentActivity("Starting checkout agent", travelerRules() || "Using saved traveler profile");
-    agent.pageMap = rememberPagePlan(buildPageMap());
+    agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "agent_start" }).map;
     const session = await startAgentSession();
     if (!session || !agent.sessionId) {
       agent.running = false;
@@ -9279,7 +10516,7 @@
     agent.actionHistory = [];
     resetFieldProgress();
     setAgentActivity("Continuing checkout agent after page change", travelerRules() || "Using saved traveler profile");
-    agent.pageMap = rememberPagePlan(buildPageMap());
+    agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "navigation_resume" }).map;
     const resumeSessionId = String(marker.sessionId || "");
     const session = resumeSessionId ? await startAgentSession(resumeSessionId) : null;
     if (!session || agent.sessionId !== resumeSessionId) {
@@ -9312,26 +10549,24 @@
     let shouldRerun = false;
     try {
       warnings = runRiskChecks();
-      let observationBuildMs = 0;
-      let observationStartedAt = performance.now();
-      agent.pageMap = rememberPagePlan(buildPageMap());
-      observationBuildMs += performance.now() - observationStartedAt;
+      const quiet = await pageStateStore.waitForQuiet({ maxWaitMs: 650 });
       await showAgentThought(
         null,
         "Observe",
         "Backend planner",
         "Reading the current page and sending it to the backend before taking any checkout action.",
-        450
+        120
       );
-      await waitForPaint(450);
       if (loopToken.lifecycleId !== agent.lifecycleId || !agent.running) return;
-      observationStartedAt = performance.now();
-      const stableMap = rememberPagePlan(buildPageMap());
-      observationBuildMs += performance.now() - observationStartedAt;
+      const observed = pageStateStore.observe({ reason: "planning_turn" });
+      const stableMap = rememberPagePlan(observed.map);
       agent.pageMap = stableMap;
-      observationBuildMs = Math.round(observationBuildMs);
+      const observationBuildMs = observed.timings.observationBuildMs;
       logFlow("latency.span", {
         observation_build_ms: observationBuildMs,
+        observation_mode: observed.mode,
+        mutation_quiet_wait_ms: quiet.waitedMs,
+        material: observed.material,
         step: stableMap.step,
         controls: stableMap.controls?.length || 0,
         fields: stableMap.fields?.length || 0,
@@ -9350,7 +10585,12 @@
       const decision = await requestAgentDecision(
         stableMap,
         userMessage,
-        { observation_build_ms: observationBuildMs },
+        {
+          observation_build_ms: observationBuildMs,
+          observation_mode: observed.mode,
+          observation_diff: observed.diff,
+          base_snapshot_hash: observed.baseSnapshotHash
+        },
         loopToken
       );
       if (!decision || loopToken.lifecycleId !== agent.lifecycleId || !agent.running) return;
@@ -9698,7 +10938,7 @@
   // (section checklist, reasoning log). Anything that needs the user's input is
   // asked on the page itself, next to the AI cursor — see cursorPromptHtml().
   function agentChatHtml() {
-    const map = agent.pageMap || rememberPagePlan(buildPageMap());
+    const map = agent.pageMap || pageStateStore.observe({ reason: "sidebar_render" }).map;
     return `
       ${agentStatusHtml(map)}
       <div class="atw-map-line">Reading ${map.site}: ${map.step.replace(/_/g, " ")} · ${map.summary.knownFields}/${map.summary.fields} fields · ${map.summary.paidChoices} paid areas</div>
@@ -10010,8 +11250,7 @@
 
   function watchForCheckoutChanges() {
     const observer = new MutationObserver((mutations) => {
-      const pageChanged = mutations.some((mutation) => !mutation.target.closest?.("#atw-sidebar"));
-      if (pageChanged) agent.lastPageMutationAt = Date.now();
+      const pageChanged = pageStateStore.noteMutations(mutations);
       if (!pageChanged || renderTimer) return;
       renderTimer = setTimeout(() => {
         renderTimer = null;
@@ -10019,9 +11258,27 @@
           warnings = runRiskChecks();
           renderSidebar();
         }
-      }, 600);
+      }, 180);
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeOldValue: true,
+      attributeFilter: [
+        "checked", "selected", "value", "disabled", "required", "hidden", "open", "class", "style",
+        "aria-checked", "aria-selected", "aria-expanded", "aria-disabled", "aria-invalid", "aria-hidden", "aria-valuenow",
+        "data-price", "data-selected", "data-value"
+      ]
+    });
+    document.addEventListener("input", pageStateStore.noteEvent, true);
+    document.addEventListener("change", pageStateStore.noteEvent, true);
+    document.addEventListener("scroll", (event) => pageStateStore.noteEvent({
+      type: "viewport",
+      target: event.target === document ? document.documentElement : event.target
+    }), true);
+    window.addEventListener("resize", () => pageStateStore.noteEvent({ type: "viewport", target: document.documentElement }), { passive: true });
   }
 
   window.addEventListener("pagehide", () => { saveResumeMarker(); });
@@ -10058,13 +11315,26 @@
       compactPageMap,
       compactSurfaceReference,
       observationTransportBytes,
+      observationNeedsScreenshot,
       smallerObservationTransport,
+      incrementalObservationTransport,
       uploadObservationScreenshot,
       postObservationWithSizeRecovery,
       prepareScreenshotAnnotations,
       mapObservationSnapshot,
       materialObservationSignature,
       observationHashForMap,
+      canonicalPageStateDiff,
+      pageStateDiffIsMaterial,
+      mutationMayBeMaterial,
+      observePageState: (options = {}) => pageStateStore.observe(options),
+      notePageMutations: (mutations = []) => pageStateStore.noteMutations(mutations),
+      notePageEvent: (event = {}) => pageStateStore.noteEvent(event),
+      pageStateStoreState: () => ({
+        dirty: pageStateStore.isDirty(),
+        pendingMutations: pageStateStore.pendingCount(),
+        lastUpdate: pageStateStore.lastUpdate()
+      }),
       meaningfulActionBox,
       liveTargetSnapshot,
       validateResolvedTarget,

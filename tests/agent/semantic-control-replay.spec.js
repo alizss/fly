@@ -4,7 +4,9 @@ const { test, expect } = require("@playwright/test");
 const { governAction } = require("../../apps/web/agent/action-governor");
 const {
   deriveProfileGoal,
-  profileGoalSatisfied
+  profileGoalSatisfied,
+  profileStageReadiness,
+  candidatesForProfileGoal
 } = require("../../apps/web/agent/skill-expander");
 const { runLoopTurn, toClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const {
@@ -18,6 +20,7 @@ const { resolvePlannerSelection } = require("../../apps/web/agent/verify-and-pla
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
 const { classifyObservationReadiness, READINESS } = require("../../apps/web/agent/observation-readiness");
+const { resolveSemanticOwnership } = require("../../apps/web/agent/select-candidate");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 
 const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "seat-baggage.html");
@@ -1118,6 +1121,110 @@ test("P0.4 browser replay fills the complete profile and chooses the exact count
   expect(result.graphIntegrity.ok).toBe(true);
 });
 
+test("profile field meaning and exact radio value survive compact transport and incremental caching", async ({ page }) => {
+  await loadProducer(page, profileFixturePath);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const form = document.getElementById("traveler-form");
+    form.insertAdjacentHTML("beforeend", `
+      <label><input id="sms-offer" name="sms_updates" type="checkbox"> SMS alerts</label>
+      <fieldset><legend>Mobile travel plan</legend>
+        <label><input id="mobile-plan" name="mobile_travel_plan" type="radio"> Add plan</label>
+      </fieldset>
+    `);
+    const mr = document.getElementById("title-mr");
+    const mrs = document.getElementById("title-ms");
+    mrs.checked = true;
+    const beforeObserved = hooks.observePageState({ forceFull: true, reason: "profile_wrong_title" });
+    const before = beforeObserved.map;
+    const compactBefore = hooks.compactPageMap(before);
+    const beforeMr = before.controls.find((control) => control.stateElementId === mr.dataset.atwElementId);
+    const beforeMrs = before.controls.find((control) => control.stateElementId === mrs.dataset.atwElementId);
+    mr.click();
+    hooks.notePageEvent({ type: "change", target: mr });
+    hooks.notePageEvent({ type: "change", target: mrs });
+    const afterObserved = hooks.observePageState({ reason: "profile_title_corrected" });
+    const after = afterObserved.map;
+    const afterMr = after.controls.find((control) => control.controlId === beforeMr.controlId);
+    const afterMrs = after.controls.find((control) => control.controlId === beforeMrs.controlId);
+    const compact = hooks.compactPageMap(after);
+    const compactMr = compact.controls.find((control) => control.controlId === beforeMr.controlId);
+    const verification = hooks.verifyExpectedOutcome({
+      type: "control_selected",
+      controlId: beforeMr.controlId,
+      decisionGroupId: beforeMr.decisionGroupId,
+      expectedSelectedControlId: beforeMr.controlId,
+      conflictingControlIds: [beforeMrs.controlId]
+    }, before, after, mr);
+    const sms = after.controls.find((control) => control.stateElementId === document.getElementById("sms-offer").dataset.atwElementId);
+    const mobilePlan = after.controls.find((control) => control.stateElementId === document.getElementById("mobile-plan").dataset.atwElementId);
+    mr.checked = false;
+    mrs.checked = false;
+    hooks.notePageEvent({ type: "change", target: mr });
+    hooks.notePageEvent({ type: "change", target: mrs });
+    const emptyObserved = hooks.observePageState({ reason: "profile_title_empty" });
+    const compactEmpty = hooks.compactPageMap(emptyObserved.map);
+    const profileSlice = (page) => ({
+      ...page,
+      controls: page.controls.filter((control) => control.fieldType === "title"),
+      decisionGroups: page.decisionGroups.filter((group) => (
+        group.alternativeControlIds || []
+      ).some((controlId) => page.controls.some((control) => control.controlId === controlId && control.fieldType === "title")))
+    });
+    return {
+      beforeValues: [beforeMr.state.optionValue, beforeMrs.state.selectedValue],
+      incrementalMode: afterObserved.mode,
+      fieldType: afterMr.fieldType,
+      classificationSource: afterMr.fieldClassification?.source || "",
+      selectedValue: afterMr.state.selectedValue,
+      conflictingSelectedValue: afterMrs.state.selectedValue,
+      compactFieldType: compactMr.fieldType,
+      compactSelectedValue: compactMr.state.selectedValue,
+      verified: verification.ok,
+      smsFieldType: sms?.fieldType || "",
+      mobilePlanFieldType: mobilePlan?.fieldType || "",
+      compactWrongMrs: profileSlice(compactBefore),
+      compactCorrectMr: profileSlice(compact),
+      compactNoTitle: profileSlice(compactEmpty)
+    };
+  });
+
+  expect(result.beforeValues).toEqual(["mr", "mrs/ms"]);
+  expect(result.incrementalMode).toBe("incremental");
+  expect(result.fieldType).toBe("title");
+  expect(result.classificationSource).toBeTruthy();
+  expect(result.selectedValue).toBe("mr");
+  expect(result.conflictingSelectedValue).toBe("");
+  expect(result.compactFieldType).toBe("title");
+  expect(result.compactSelectedValue).toBe("mr");
+  expect(result.verified).toBe(true);
+  expect(result.smsFieldType).toBe("");
+  expect(result.mobilePlanFieldType).toBe("");
+
+  const observation = (page, observationId) => ({
+    observationId,
+    observationSnapshot: { snapshotHash: page.snapshotHash || observationId },
+    page: { ...page, step: "traveler_information" }
+  });
+  const profile = {
+    first_name: "Ali", last_name: "SIFRAR", email: "ali@example.test", phone: "+38670328922",
+    date_of_birth: "2003-05-31"
+  };
+  const wrongMale = observation(result.compactWrongMrs, "obs_compact_wrong_male");
+  const wrongFemale = observation(result.compactCorrectMr, "obs_compact_wrong_female");
+  const emptyMale = observation(result.compactNoTitle, "obs_compact_empty_male");
+  const maleGoal = deriveProfileGoal(wrongMale, { ...profile, gender: "male" });
+  const femaleGoal = deriveProfileGoal(wrongFemale, { ...profile, gender: "female" });
+  const emptyGoal = deriveProfileGoal(emptyMale, { ...profile, gender: "male" });
+  expect(maleGoal).toMatchObject({ semanticType: "title", desiredValue: "mr" });
+  expect(femaleGoal).toMatchObject({ semanticType: "title", desiredValue: "mrs/ms" });
+  expect(emptyGoal).toMatchObject({ semanticType: "title", desiredValue: "mr" });
+  expect(candidatesForProfileGoal(maleGoal, wrongMale, { ...profile, gender: "male" })).toHaveLength(1);
+  expect(candidatesForProfileGoal(femaleGoal, wrongFemale, { ...profile, gender: "female" })).toHaveLength(1);
+  expect(deriveProfileGoal(wrongFemale, { ...profile, gender: "male" })).toBeNull();
+  expect(profileStageReadiness(wrongFemale, profile).missingUserData.map((item) => item.semanticType)).toEqual(["title"]);
+});
+
 test("cross-site DOB fields expose a codec and verify the live value canonically", async ({ page }) => {
   await loadProducer(page, profileFixturePath);
   const results = await page.evaluate(async () => {
@@ -2050,6 +2157,246 @@ test("P1.4 Next treats an unexpected popup as verified intermediate progress wit
   });
 });
 
+test("a persistent modal verifies internal marker advancement instead of requiring disappearance", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <section id="persistent-flow" role="dialog" aria-modal="true" aria-labelledby="persistent-title">
+      <h2 id="persistent-title">Journey configuration</h2>
+      <p id="persistent-marker">Flight 1 of 3</p>
+      <button id="persistent-advance" type="button">Proceed</button>
+    </section>
+    <script>
+      document.getElementById("persistent-advance").addEventListener("click", () => {
+        document.getElementById("persistent-marker").textContent = "Flight 2 of 3";
+      });
+    </script>
+  `);
+
+  const result = await page.evaluate(async () => {
+    const hooks = window.__ATW_TEST__;
+    const before = hooks.buildPageMap();
+    const target = document.getElementById("persistent-advance");
+    const control = before.controls.find((item) => /proceed/i.test(item.ownText || item.label || ""));
+    hooks.userLikeClick(target);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    const after = hooks.buildPageMap();
+    const verification = hooks.verifyExpectedOutcome({
+      type: "active_surface_dismissed",
+      surfaceId: before.currentSurface.id,
+      controlId: control.controlId
+    }, before, after, target);
+    return {
+      verification,
+      beforeSurfaceId: before.currentSurface.id,
+      afterSurfaceId: after.currentSurface.id,
+      marker: after.foreground?.progressMarkers?.flightOrdinal || ""
+    };
+  });
+
+  expect(result.beforeSurfaceId).toBe(result.afterSurfaceId);
+  expect(result.marker).toContain("Flight 2 of 3");
+  expect(result.verification.ok).toBe(true);
+  expect(result.verification.code).toBe("ACTIVE_SURFACE_ADVANCED");
+});
+
+test("browser verifier accepts a removed paid item despite stale cached conflict metadata", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main><h1>Journey configuration</h1></main>
+    <section role="dialog" aria-modal="true"><h2>Current selection</h2></section>
+  `);
+
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const base = hooks.buildPageMap();
+    const group = {
+      decisionGroupId: "dg_paid_item",
+      selectedControlId: "ctrl_selected_item",
+      selectedEvidence: {
+        selected: true,
+        selectedControlId: "ctrl_selected_item",
+        disposition: "paid",
+        structuredPrice: { amount: 40, currency: "EUR" }
+      }
+    };
+    const before = {
+      ...base,
+      controls: [{
+        controlId: "ctrl_selected_item",
+        decisionGroupId: "dg_paid_item",
+        selected: true,
+        state: { selected: true }
+      }],
+      decisionGroups: [group],
+      transactionFacts: {
+        selectedExtras: [{
+          decisionGroupId: "dg_paid_item",
+          disposition: "paid",
+          priceAmount: 40,
+          currency: "EUR"
+        }]
+      },
+      foreground: { progressMarkers: { flightOrdinal: "1/2", selectedText: "5E" } },
+      price: { amount: 410, currency: "EUR" },
+      validationIssues: []
+    };
+    const after = {
+      ...base,
+      controls: [{
+        controlId: "ctrl_selected_item",
+        decisionGroupId: "dg_paid_item",
+        selected: false,
+        state: { selected: false }
+      }],
+      // This intentionally reproduces the stale incremental group snapshot
+      // from the live trace. Fresh control and transaction truth wins.
+      decisionGroups: [group],
+      transactionFacts: { selectedExtras: [] },
+      foreground: { progressMarkers: { flightOrdinal: "1/2", selectedText: "Not selected" } },
+      price: { amount: 370, currency: "EUR" },
+      validationIssues: []
+    };
+    return hooks.verifyExpectedOutcome({
+      type: "policy_conflict_resolved",
+      decisionGroupId: "dg_paid_item",
+      controlId: "ctrl_owned_correction",
+      semanticOwnershipLinkId: "ownership_paid_to_correction",
+      intendedOutcome: "remove_unapproved_paid_item",
+      beforePriceAmount: 410
+    }, before, after, null);
+  });
+
+  expect(result.ok).toBe(true);
+  expect(result.code).toBe("POLICY_CONFLICT_RESOLVED");
+  expect(result.evidence.afterConflictMetadata).toBe(true);
+  expect(result.evidence.afterConflict).toBe(false);
+  expect(result.evidence.selectedItemCleared).toBe(true);
+  expect(result.evidence.chargeCleared).toBe(true);
+  expect(result.evidence.afterPriceAmount).toBe(370);
+});
+
+test("reused modal progress plus a manual paid selection is reconciled and checkout continues without handoff", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Configure journey</h1>
+      <p>Total <span id="total">200 EUR</span></p>
+      <p id="after-stage" hidden>Configuration completed</p>
+    </main>
+    <section id="workflow-modal" role="dialog" aria-modal="true" aria-labelledby="workflow-title">
+      <h2 id="workflow-title">Journey configuration</h2>
+      <p id="workflow-progress">Flight 1 of 2</p>
+      <div id="workflow-first">
+        <p>Review the first part of this configuration.</p>
+        <button id="advance-internal" type="button">Proceed</button>
+      </div>
+      <form id="workflow-second" hidden>
+        <fieldset aria-label="Optional service">
+          <legend>Optional service</legend>
+          <label><input id="service-paid" type="radio" name="service" required> Enhanced option — 25 EUR</label>
+          <label><input id="service-free" type="radio" name="service" checked required> Basic option — 0 EUR</label>
+        </fieldset>
+        <button id="complete-surface" type="submit">Finish configuration</button>
+      </form>
+    </section>
+    <script>
+      window.__genericFlow = { paidSelections: 0, corrections: 0, completions: 0 };
+      document.getElementById("advance-internal").addEventListener("click", () => {
+        document.getElementById("workflow-progress").textContent = "Flight 2 of 2";
+        document.getElementById("workflow-first").hidden = true;
+        document.getElementById("workflow-second").hidden = false;
+      });
+      document.getElementById("service-paid").addEventListener("change", (event) => {
+        if (!event.target.checked) return;
+        window.__genericFlow.paidSelections += 1;
+        document.getElementById("total").textContent = "225 EUR";
+      });
+      document.getElementById("service-free").addEventListener("change", (event) => {
+        if (!event.target.checked) return;
+        window.__genericFlow.corrections += 1;
+        document.getElementById("total").textContent = "200 EUR";
+      });
+      document.getElementById("workflow-second").addEventListener("submit", (event) => {
+        event.preventDefault();
+        if (!document.getElementById("service-free").checked) return;
+        window.__genericFlow.completions += 1;
+        document.getElementById("workflow-modal").hidden = true;
+        document.getElementById("after-stage").hidden = false;
+      });
+    </script>
+  `);
+
+  const traveler = { id: "trav_reconcile_modal", booking_rules: "Decline all paid extras" };
+  let state = createCheckoutSessionState({
+    goal: "Continue checkout without paid extras",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: page.url() }
+  });
+  state.id = "txn_reconcile_reused_modal";
+  state.approvals.skipPaidExtrasApproved = true;
+  const store = inMemoryGovernorStore();
+  const decisions = [];
+  const nextTurn = async (observation, turnId) => {
+    store.remember(state.id, observation);
+    const turn = await runLoopTurn({
+      apiKey: "",
+      model: "must-not-be-called",
+      dataDir: "",
+      state,
+      observation,
+      traveler,
+      transactionStore: store,
+      clientTurnId: turnId
+    });
+    state = turn.state;
+    decisions.push(turn.clientDecision);
+    return turn;
+  };
+
+  const initial = await browserObservation(page, "obs_reused_modal_1");
+  const firstTurn = await nextTurn(initial, "turn_reused_modal_1");
+  expect(firstTurn.clientDecision.action).toBe("click");
+  const firstExecution = await executeAtomicBrowserDecision(page, firstTurn.clientDecision, "obs_reused_modal_2");
+  expect(firstExecution.verification.ok, firstExecution.verification.code).toBe(true);
+  expect(await page.locator("#workflow-modal").getAttribute("id")).toBe("workflow-modal");
+  expect(await page.locator("#workflow-progress").textContent()).toContain("2 of 2");
+
+  // This mutation is intentionally outside the dispatched action. The next
+  // fresh observation, not the old prediction, must become authoritative.
+  await page.evaluate(() => {
+    const paid = document.getElementById("service-paid");
+    paid.checked = true;
+    paid.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  const interfered = await browserObservation(page, "obs_reused_modal_manual_paid");
+  interfered.previousObservation = initial;
+  interfered.lastActionResult = firstExecution.result;
+  const correctionTurn = await nextTurn(interfered, "turn_reused_modal_correction");
+  expect(correctionTurn.clientDecision.action).toBe("click");
+  expect(correctionTurn.clientDecision.controlId).not.toBe(firstTurn.clientDecision.controlId);
+  expect(correctionTurn.state.taskState.activeDecisions[0]).toMatchObject({ status: "conflicted" });
+  const correction = await executeAtomicBrowserDecision(page, correctionTurn.clientDecision, "obs_reused_modal_corrected");
+  expect(correction.verification.ok, correction.verification.code).toBe(true);
+  expect(await page.locator("#service-free").isChecked()).toBe(true);
+  expect(await page.locator("#total").textContent()).toContain("200 EUR");
+
+  correction.observation.previousObservation = interfered;
+  const continueTurn = await nextTurn(correction.observation, "turn_reused_modal_continue");
+  expect(continueTurn.clientDecision.action, JSON.stringify({
+    decision: continueTurn.clientDecision,
+    taskState: continueTurn.state.taskState,
+    debug: continueTurn.debug,
+    groups: correction.observation.page.decisionGroups,
+    controls: correction.observation.page.controls
+  }, null, 2)).toBe("click");
+  const completed = await executeAtomicBrowserDecision(page, continueTurn.clientDecision, "obs_reused_modal_completed");
+  expect(completed.verification.ok, completed.verification.code).toBe(true);
+  expect(await page.locator("#workflow-modal").isHidden()).toBe(true);
+  expect(await page.evaluate(() => window.__genericFlow)).toEqual({
+    paidSelections: 1,
+    corrections: 1,
+    completions: 1
+  });
+  expect(decisions.some((decision) => decision.action === "ask_user")).toBe(false);
+});
+
 test("stale modal history cannot target the new flexible-ticket dropdown", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>
@@ -2316,6 +2663,98 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   expect(history.some((entry) => entry.type === "ask_user")).toBe(false);
 });
 
+test("DOM-grounded observations do not request a screenshot", async ({ page }) => {
+  await loadHtmlProducer(page, `<main><button id="continue" type="button">Continue</button></main>`);
+  const result = await page.evaluate(() => {
+    const map = window.__ATW_TEST__.buildPageMap();
+    return {
+      screenshotRequired: window.__ATW_TEST__.observationNeedsScreenshot(map),
+      controlCount: map.controls.length
+    };
+  });
+  expect(result.controlCount).toBeGreaterThan(0);
+  expect(result.screenshotRequired).toBe(false);
+});
+
+test("persistent page state incrementally refreshes an owned selection and ignores unrelated layout churn", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Optional extras</h1>
+      <div id="animation-layer">decorative</div>
+      <label><input id="free" type="radio" name="extra"> No thanks</label>
+      <label><input id="paid" type="radio" name="extra"> Upgrade — 30 EUR</label>
+      <button id="continue" type="button">Continue</button>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const initial = hooks.observePageState({ forceFull: true, reason: "test_initial" });
+    const free = document.getElementById("free");
+    free.checked = true;
+    hooks.notePageEvent({ type: "change", target: free });
+    const incremental = hooks.observePageState({ reason: "test_selection" });
+    const selected = incremental.map.controls.find((control) => control.stateElementId === free.dataset.atwElementId);
+    const decorative = document.getElementById("animation-layer");
+    decorative.style.transform = "translateX(1px)";
+    const irrelevant = hooks.mutationMayBeMaterial({ type: "attributes", target: decorative, attributeName: "style" });
+    const cached = hooks.observePageState({ reason: "test_animation" });
+    return {
+      initialMode: initial.mode,
+      incrementalMode: incremental.mode,
+      selected: Boolean(selected?.selected || selected?.state?.checked),
+      stateChanges: incremental.diff.stateChanges.length,
+      irrelevant,
+      cachedMode: cached.mode,
+      snapshotStable: incremental.snapshotHash === cached.snapshotHash
+    };
+  });
+  expect(result).toEqual({
+    initialMode: "full_snapshot",
+    incrementalMode: "incremental",
+    selected: true,
+    stateChanges: 1,
+    irrelevant: false,
+    cachedMode: "cached",
+    snapshotStable: true
+  });
+});
+
+test("a harmless rerender safely rebinds the same stable control without label search", async ({ page }) => {
+  await loadHtmlProducer(page, `<main><button id="continue" data-testid="primary-advance" type="button">Continue</button></main>`);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const before = hooks.observePageState({ forceFull: true, reason: "test_before_rerender" }).map;
+    const control = before.controls.find((item) => item.testId === "primary-advance");
+    const oldElementId = control.stateElementId;
+    const oldButton = document.getElementById("continue");
+    const replacement = oldButton.cloneNode(true);
+    replacement.removeAttribute("data-atw-element-id");
+    replacement.removeAttribute("data-atw-control-id");
+    oldButton.replaceWith(replacement);
+    hooks.notePageMutations([{ type: "childList", target: replacement.parentElement, addedNodes: [replacement], removedNodes: [oldButton] }]);
+    const after = hooks.observePageState({ reason: "test_after_rerender" });
+    const rebound = hooks.resolveDecisionTarget({
+      action: "click",
+      operation: "activate",
+      controlId: control.controlId,
+      stableKey: control.stableKey,
+      targetId: oldElementId,
+      targetSnapshot: control
+    }, after.map);
+    return {
+      mode: after.mode,
+      sameControlId: after.map.controls.some((item) => item.controlId === control.controlId),
+      reboundIsReplacement: rebound === replacement,
+      newElementId: rebound?.dataset?.atwElementId || "",
+      oldElementId
+    };
+  });
+  expect(result.mode).toBe("material_rescan");
+  expect(result.sameControlId).toBe(true);
+  expect(result.reboundIsReplacement).toBe(true);
+  expect(result.newElementId).not.toBe(result.oldElementId);
+});
+
 test("oversized canonical transport automatically rebuilds smaller without dropping controls", async ({ page }) => {
   await loadHtmlProducer(page, `<main><h1>Seats</h1><button type="button">No thanks</button></main>`);
   let received = null;
@@ -2365,6 +2804,59 @@ test("oversized canonical transport automatically rebuilds smaller without dropp
   expect(received.page.sections[0].controlIds).toHaveLength(350);
   expect(received.page.currentSurface.memberControlIds).toHaveLength(350);
   expect(received.page.summary.title).toHaveLength(200);
+});
+
+test("incremental transport automatically falls back to one full resynchronization on a stale base", async ({ page }) => {
+  await loadHtmlProducer(page, `<main><button type="button">Continue</button></main>`);
+  const received = [];
+  await page.route("**/api/agent/next-action", async (route) => {
+    const body = route.request().postDataJSON();
+    received.push(body);
+    if (received.length === 1) {
+      await route.fulfill({
+        status: 409,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "OBSERVATION_RESYNC_REQUIRED", retryable: true })
+      });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ok: true }) });
+  });
+  const result = await page.evaluate(async (apiBase) => {
+    const hooks = window.__ATW_TEST__;
+    const payload = {
+      sessionId: "session_incremental_resync",
+      observationId: "obs_incremental_resync",
+      observationSnapshot: { snapshotHash: "hash_incremental_resync" },
+      observationUpdate: {
+        mode: "incremental",
+        baseSnapshotHash: "hash_previous",
+        snapshotHash: "hash_incremental_resync",
+        diff: { stateChanges: [{ controlId: "ctrl_foreground" }] }
+      },
+      page: {
+        currentSurface: { id: "surface_modal", type: "modal" },
+        controls: [
+          { controlId: "ctrl_background", surfaceId: "surface-page", label: "Background" },
+          { controlId: "ctrl_foreground", surfaceId: "surface_modal", label: "Continue" }
+        ],
+        controlAliases: [
+          { aliasId: "ctrl_background", controlId: "ctrl_background" },
+          { aliasId: "ctrl_foreground", controlId: "ctrl_foreground" }
+        ],
+        decisionGroups: [],
+        sections: []
+      }
+    };
+    const posted = await hooks.postObservationWithSizeRecovery(apiBase, payload);
+    return { transportMode: posted.transportMode, response: await posted.response.json() };
+  }, TEST_API);
+  expect(result).toEqual({ transportMode: "full_resynchronization", response: { ok: true } });
+  expect(received).toHaveLength(2);
+  expect(received[0].transportMode).toBe("incremental_diff");
+  expect(received[0].page.controls.map((control) => control.controlId)).toEqual(["ctrl_foreground"]);
+  expect(received[1].transportMode).toBe("full_resynchronization");
+  expect(received[1].page.controls).toHaveLength(2);
 });
 
 test("large canonical observation uploads screenshot separately and reaches a grounded backend action", async ({ page, request }) => {
@@ -2613,6 +3105,8 @@ test("final safe checkout replay advances completed traveler through both seat l
     expect(candidate, JSON.stringify({
       goal,
       candidates: candidateSet.candidates,
+      decisionGroups: observation.page.decisionGroups,
+      transactionFacts: observation.page.transactionFacts,
       controls: (observation.page.controls || []).map((control) => ({
         label: control.label,
         controlId: control.controlId,
@@ -2986,6 +3480,883 @@ test("checkpoint checkout reaches payment through review without paid, close, ca
   expect(actionLabels[5]).toMatch(/continue to payment/i);
 });
 
+test("dirty checkout repairs exact paid selections before continuing to payment", async ({ page }) => {
+  await page.goto("http://127.0.0.1:4273/checkout/extras");
+  await loadHtmlProducer(page, `
+    <style>
+      [hidden] { display: none !important; }
+      fieldset, [role="dialog"] { margin: 12px; padding: 12px; border: 1px solid #aaa; }
+      #review { position: fixed; inset: 50px 100px auto; background: white; z-index: 20; }
+    </style>
+    <main>
+      <h1 id="stage-title">Optional extras</h1>
+      <p id="total-price">Total 340 EUR</p>
+      <section id="extras" aria-label="Optional extras">
+        <fieldset>
+          <legend>Travel bundle</legend>
+          <label><input id="bundle-paid" type="radio" name="bundle" checked> Premium bundle</label>
+          <label><input id="bundle-free" type="radio" name="bundle"> No bundle</label>
+        </fieldset>
+        <fieldset>
+          <legend>Flexible ticket</legend>
+          <label><input id="flex-paid" type="radio" name="flex" checked> Premium flexible ticket</label>
+          <label><input id="flex-free" type="radio" name="flex"> No flexible ticket</label>
+        </fieldset>
+        <fieldset>
+          <legend>Seat selection</legend>
+          <label><input id="seat-paid" type="radio" name="seat" checked> Premium seat</label>
+          <label><input id="seat-free" type="radio" name="seat"> No seat</label>
+        </fieldset>
+        <fieldset>
+          <legend>Trip add-on</legend>
+          <label><input id="addon-paid" type="radio" name="addon" checked> Premium add-on</label>
+          <label><input id="addon-free" type="radio" name="addon"> Remove add-on</label>
+        </fieldset>
+        <button id="extras-continue" type="button">Continue</button>
+      </section>
+      <section id="review" role="dialog" aria-modal="true" aria-label="Review your booking" hidden>
+        <h2>Review your booking</h2>
+        <button id="review-close" type="button" data-testid="dialog-close" aria-label="Close">×</button>
+        <form id="review-form" action="/checkout/payment" method="post">
+          <button id="review-submit" type="submit" data-testid="info-review-submit-button">Continue to Payment</button>
+        </form>
+      </section>
+      <section id="payment" hidden>
+        <h1>Payment</h1>
+        <h2>Payment method</h2>
+        <p>Order amount: 200 EUR</p>
+        <label>Card number <input id="card-number" autocomplete="cc-number"></label>
+        <label>Expiry <input id="card-expiry" autocomplete="cc-exp"></label>
+        <label>CVC <input id="card-cvc" autocomplete="cc-csc"></label>
+        <button id="purchase" type="button">Pay now</button>
+      </section>
+    </main>
+    <script>
+      (() => {
+        const paidIds = ["bundle-paid", "flex-paid", "seat-paid", "addon-paid"];
+        const freeIds = ["bundle-free", "flex-free", "seat-free", "addon-free"];
+        const counters = window.__dirtyCounters = {
+          paidSelections: 0,
+          repairs: 0,
+          continuedWhileDirty: 0,
+          reviewCloseClicks: 0,
+          cardFieldInputs: 0,
+          purchaseClicks: 0
+        };
+        for (const id of paidIds) {
+          document.getElementById(id).addEventListener("click", () => { counters.paidSelections += 1; });
+        }
+        for (const id of freeIds) {
+          document.getElementById(id).addEventListener("change", (event) => {
+            if (event.target.checked) {
+              counters.repairs += 1;
+              document.getElementById("total-price").textContent = "Total " + (340 - (counters.repairs * 35)) + " EUR";
+            }
+          });
+        }
+        document.getElementById("extras-continue").addEventListener("click", () => {
+          const clean = freeIds.every((id) => document.getElementById(id).checked);
+          if (!clean) counters.continuedWhileDirty += 1;
+          document.getElementById("extras").hidden = true;
+          document.getElementById("review").hidden = false;
+          document.getElementById("stage-title").textContent = "Review";
+        });
+        document.getElementById("review-close").addEventListener("click", () => {
+          counters.reviewCloseClicks += 1;
+          document.getElementById("review").hidden = true;
+        });
+        document.getElementById("review-form").addEventListener("submit", (event) => {
+          event.preventDefault();
+          document.getElementById("review").hidden = true;
+          document.getElementById("payment").hidden = false;
+          document.getElementById("stage-title").textContent = "Payment";
+          document.body.dataset.stage = "payment-review";
+          history.pushState({}, "", "/checkout/payment");
+        });
+        for (const id of ["card-number", "card-expiry", "card-cvc"]) {
+          document.getElementById(id).addEventListener("input", () => { counters.cardFieldInputs += 1; });
+        }
+        document.getElementById("purchase").addEventListener("click", () => { counters.purchaseClicks += 1; });
+      })();
+    </script>
+  `);
+
+  const store = inMemoryGovernorStore();
+  const traveler = {
+    id: "trav_dirty_checkout",
+    booking_rules: "decline all paid extras and paid seats"
+  };
+  let state = createCheckoutSessionState({
+    goal: "Reach payment review without paid extras",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: page.url() }
+  });
+  state.id = "txn_dirty_checkout";
+  state.approvals.skipPaidExtrasApproved = true;
+
+  let observation = await browserObservation(page, "obs_dirty_initial");
+  const dirtyGroups = observation.page.decisionGroups.filter((group) => group.selectedControlId);
+  expect(dirtyGroups).toHaveLength(4);
+  const controlsById = new Map(observation.page.controls.map((control) => [control.controlId, control]));
+  expect(dirtyGroups.every((group) => controlsById.get(group.selectedControlId)?.risk === "money")).toBe(true);
+
+  // These persisted outcomes represent the previously clean state. The user
+  // manually changed each exact control before the fresh observation.
+  state.taskState = {
+    completedOutcomes: dirtyGroups.map((group) => {
+      const free = observation.page.controls.find((control) => (
+        control.decisionGroupId === group.decisionGroupId
+        && /no |remove/i.test(control.label)
+      ));
+      expect(free).toBeTruthy();
+      return {
+        decisionGroupId: group.decisionGroupId,
+        requirementId: group.requirementId,
+        surfaceId: group.surfaceId,
+        status: "satisfied",
+        selectedControlId: free.controlId,
+        completionReason: "exact_browser_selection",
+        observationId: "obs_before_manual_change"
+      };
+    })
+  };
+
+  const selectedLabels = [];
+  for (let turn = 0; turn < 8; turn += 1) {
+    const taskState = reduceTaskState({
+      previousTaskState: state.taskState || {},
+      observation,
+      previousActionResult: observation.lastActionResult || null,
+      userPolicy: state.approvals,
+      traveler
+    });
+    state = { ...state, taskState };
+    if (taskState.terminalStatus === "payment_review_reached") break;
+    expect(taskState.currentGoal).toBeTruthy();
+    const candidateSet = loopPrivate.groundedObservationCandidateSet(taskState.currentGoal, observation, [], {
+      state, traveler, approvals: state.approvals
+    });
+    const authoritativeGoal = { ...taskState.currentGoal, candidateSet, candidates: candidateSet.candidates };
+    state = {
+      ...state,
+      taskState: { ...taskState, currentGoal: authoritativeGoal },
+      currentGoal: authoritativeGoal,
+      currentObservation: {
+        observationId: observation.observationId,
+        observationHash: observation.observationSnapshot.snapshotHash
+      }
+    };
+    const candidate = candidateSet.candidates[0];
+    expect(candidate, JSON.stringify(candidateSet.contextCapabilities.map((item) => ({
+      label: item.targetLabel,
+      selectable: item.selectable,
+      risk: item.risk,
+      policy: item.policyDecision
+    })), null, 2)).toBeTruthy();
+    expect(candidate.risk).toBe("safe");
+    const action = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(authoritativeGoal, candidate, observation), observation);
+    store.remember(state.id, observation);
+    const governed = governAction({ action, state, observation, traveler, store, turnId: `turn_dirty_${turn}` });
+    expect(governed.allow, `${governed.code}: ${governed.reason}`).toBe(true);
+    state = { ...(governed.state || state), taskState, lastAction: action };
+    const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), `obs_dirty_${turn + 1}`);
+    expect(executed.validation.ok, executed.validation.code).toBe(true);
+    expect(executed.result.dispatched).toBe(true);
+    selectedLabels.push(candidate.targetLabel);
+    observation = executed.observation;
+  }
+
+  const finalTaskState = reduceTaskState({
+    previousTaskState: state.taskState || {},
+    observation,
+    previousActionResult: observation.lastActionResult || null,
+    userPolicy: state.approvals,
+    traveler
+  });
+  expect(finalTaskState.terminalStatus, JSON.stringify({
+    selectedLabels,
+    stage: finalTaskState.stage,
+    goal: finalTaskState.currentGoal,
+    observedDecisions: finalTaskState.observedDecisions,
+    counters: await page.evaluate(() => window.__dirtyCounters)
+  }, null, 2)).toBe("payment_review_reached");
+  expect(finalTaskState.currentGoal).toBeNull();
+  expect(await page.locator("#total-price").textContent()).toContain("200 EUR");
+  expect(selectedLabels.slice(0, 4)).toEqual(expect.arrayContaining([
+    expect.stringMatching(/no bundle/i),
+    expect.stringMatching(/no flexible ticket/i),
+    expect.stringMatching(/no seat/i),
+    expect.stringMatching(/remove add-on/i)
+  ]));
+  expect(selectedLabels).toContain("Continue");
+  expect(selectedLabels).toContain("Continue to Payment");
+  expect(await page.evaluate(() => window.__dirtyCounters)).toEqual({
+    paidSelections: 0,
+    repairs: 4,
+    continuedWhileDirty: 0,
+    reviewCloseClicks: 0,
+    cardFieldInputs: 0,
+    purchaseClicks: 0
+  });
+});
+
+test("live-shaped selected bundle inherits paid evidence only from its owned decision section", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Optional extras</h1>
+      <section aria-label="Travel bundle">
+        <fieldset id="bundle-owner">
+          <legend>Travel bundle</legend>
+          <label><input id="bundle-selected" type="radio" name="bundle" checked> Package for all travelers</label>
+          <label><input id="bundle-none" type="radio" name="bundle"> No bundle</label>
+          <p id="bundle-cost">Cost: 29 EUR</p>
+        </fieldset>
+        <button id="bundle-continue" type="button">Continue</button>
+      </section>
+    </main>
+    <script>
+      document.getElementById("bundle-none").addEventListener("change", (event) => {
+        if (event.target.checked) document.getElementById("bundle-cost").textContent = "Cost: 0 EUR";
+      });
+    </script>
+  `);
+
+  const traveler = { booking_rules: "No bundles" };
+  let observation = await browserObservation(page, "obs_owned_bundle_paid");
+  const group = observation.page.decisionGroups.find((item) => /bundle/i.test(item.sectionLabel));
+  expect(group).toBeTruthy();
+  expect(group.selectedEvidence).toMatchObject({
+    disposition: "paid",
+    structuredPrice: { amount: 29, currency: "EUR" },
+    source: "owned_decision_section"
+  });
+  const selectedControl = observation.page.controls.find((control) => control.controlId === group.selectedControlId);
+  expect(selectedControl.structuredPrice).toBeNull();
+
+  let taskState = reduceTaskState({ observation, traveler });
+  expect(taskState.activeDecisions[0].status).toBe("conflicted");
+  const candidateSet = buildCurrentCandidateSet({
+    goal: taskState.currentGoal,
+    observation,
+    traveler,
+    state: { taskState, approvals: {} }
+  });
+  const correction = candidateSet.candidates.find((candidate) => /no bundle/i.test(candidate.targetLabel));
+  expect(correction).toBeTruthy();
+  const action = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(taskState.currentGoal, correction, observation), observation);
+  const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_owned_bundle_repaired");
+  expect(executed.validation.ok, executed.validation.code).toBe(true);
+  expect(executed.verification.ok, executed.verification.code).toBe(true);
+  observation = executed.observation;
+  taskState = reduceTaskState({ previousTaskState: taskState, observation, traveler });
+  expect(taskState.activeDecisions).toHaveLength(0);
+  expect(observation.page.decisionGroups.find((item) => item.decisionGroupId === group.decisionGroupId).selectedEvidence).toMatchObject({
+    disposition: "free",
+    structuredPrice: { amount: 0, currency: "EUR" }
+  });
+});
+
+test("live-shaped flexible-ticket dropdown publishes selected price, exact none alternative, and verifies correction", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>[hidden] { display: none !important; } #flex-options { position: fixed; inset: 120px auto auto 120px; background: white; border: 1px solid #222; padding: 8px; z-index: 20; }</style>
+    <main>
+      <h1>Optional extras</h1>
+      <section aria-label="Flexible ticket">
+        <fieldset id="flex-owner">
+          <legend>Flexible ticket</legend>
+          <label for="flex-select">Passengers</label>
+          <input id="flex-select" name="flexible_ticket" role="combobox" readonly aria-expanded="false" aria-controls="flex-options" value="All passengers">
+          <p id="flex-cost">Cost: 29 EUR</p>
+        </fieldset>
+        <button id="flex-continue" type="button">Continue</button>
+      </section>
+    </main>
+    <div id="flex-options" role="listbox" aria-label="Flexible ticket passengers" hidden>
+      <button id="flex-all" type="button" role="option" aria-selected="true">All passengers — 29 EUR</button>
+      <button id="flex-none" type="button" role="option" aria-selected="false">None of the passengers — 0 EUR</button>
+    </div>
+    <script>
+      (() => {
+        const select = document.getElementById("flex-select");
+        const options = document.getElementById("flex-options");
+        const show = () => { options.hidden = false; select.setAttribute("aria-expanded", "true"); };
+        select.addEventListener("click", show);
+        select.addEventListener("keydown", (event) => { if (event.key === "ArrowDown" || event.key === "Enter") show(); });
+        document.getElementById("flex-none").addEventListener("click", () => {
+          select.value = "None of the passengers";
+          select.setAttribute("aria-expanded", "false");
+          document.getElementById("flex-all").setAttribute("aria-selected", "false");
+          document.getElementById("flex-none").setAttribute("aria-selected", "true");
+          document.getElementById("flex-cost").textContent = "Cost: 0 EUR";
+          options.hidden = true;
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        });
+      })();
+    </script>
+  `);
+
+  const traveler = { booking_rules: "No flexible ticket" };
+  let observation = await browserObservation(page, "obs_flex_paid_closed");
+  let group = observation.page.decisionGroups.find((item) => /flexible/i.test(`${item.sectionLabel} ${item.requirementId}`));
+  expect(group).toBeTruthy();
+  expect(group.selectedLabel).toMatch(/all passengers/i);
+  expect(group.selectedEvidence).toMatchObject({ disposition: "paid", structuredPrice: { amount: 29, currency: "EUR" } });
+
+  let taskState = reduceTaskState({ observation, traveler });
+  expect(taskState.activeDecisions[0].status).toBe("conflicted");
+  let candidateSet = buildCurrentCandidateSet({ goal: taskState.currentGoal, observation, traveler, state: { taskState, approvals: {} } });
+  const opener = candidateSet.candidates.find((candidate) => candidate.operation === "open" || /passengers/i.test(candidate.targetLabel));
+  expect(opener).toBeTruthy();
+  let action = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(taskState.currentGoal, opener, observation), observation);
+  let executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_flex_options_open");
+  expect(executed.validation.ok, executed.validation.code).toBe(true);
+  observation = executed.observation;
+
+  taskState = reduceTaskState({ previousTaskState: taskState, observation, traveler });
+  candidateSet = buildCurrentCandidateSet({ goal: taskState.currentGoal, observation, traveler, state: { taskState, approvals: {} } });
+  const none = candidateSet.candidates.find((candidate) => /none of the passengers/i.test(candidate.targetLabel));
+  expect(none).toBeTruthy();
+  action = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(taskState.currentGoal, none, observation), observation);
+  executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_flex_none_selected");
+  expect(executed.validation.ok, executed.validation.code).toBe(true);
+  expect(executed.verification.ok, executed.verification.code).toBe(true);
+  observation = executed.observation;
+  taskState = reduceTaskState({ previousTaskState: taskState, observation, traveler });
+  group = observation.page.decisionGroups.find((item) => /flexible/i.test(`${item.sectionLabel} ${item.requirementId}`));
+  expect(group.selectedLabel).toMatch(/none of the passengers/i);
+  expect(group.selectedEvidence).toMatchObject({ disposition: "free", structuredPrice: { amount: 0, currency: "EUR" } });
+  expect(taskState.activeDecisions).toHaveLength(0);
+});
+
+test("collapsed custom selector publishes its displayed paid value without checked option state", async ({ page }) => {
+  await page.goto("http://127.0.0.1:4273/checkout/extras");
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Optional extras</h1>
+      <section aria-label="Flexible ticket">
+        <div class="owned-product">
+          <h2>Flexible ticket</h2>
+          <button id="flex-selector" type="button" aria-haspopup="listbox" aria-controls="flex-options" aria-expanded="false">
+            <span class="displayed-value">All passengers</span><span aria-hidden="true">⌄</span>
+          </button>
+          <span class="owned-price">29 EUR</span>
+        </div>
+        <button id="continue" type="button">Continue</button>
+      </section>
+      <div id="flex-options" role="listbox" aria-label="Flexible ticket options" hidden>
+        <button id="flex-all" type="button" role="option">All passengers — 29 EUR</button>
+        <button id="flex-none" type="button" role="option">None of the passengers — 0 EUR</button>
+      </div>
+    </main>
+    <script>
+      document.getElementById("flex-selector").addEventListener("click", () => {
+        document.getElementById("flex-options").hidden = false;
+        document.getElementById("flex-selector").setAttribute("aria-expanded", "true");
+      });
+    </script>
+  `);
+
+  const observation = await browserObservation(page, "obs_collapsed_paid_selector");
+  const selector = observation.page.controls.find((control) => control.preferredActivationElementId === "flex-selector" || /all passengers/i.test(control.currentValue));
+  expect(selector).toBeTruthy();
+  const group = observation.page.decisionGroups.find((item) => item.selectedEvidence?.selectedControlId === selector.controlId);
+  expect(group, JSON.stringify(observation.page.decisionGroups, null, 2)).toBeTruthy();
+  expect(group.selectedLabel).toMatch(/all passengers/i);
+  expect(group.selectedEvidence).toMatchObject({
+    selected: true,
+    disposition: "paid",
+    structuredPrice: { amount: 29, currency: "EUR" },
+    source: "owned_decision_section"
+  });
+  const taskState = reduceTaskState({
+    observation,
+    traveler: { booking_rules: "decline all paid extras" }
+  });
+  expect(taskState.activeDecisions).toHaveLength(1);
+  expect(taskState.activeDecisions[0]).toMatchObject({
+    decisionGroupId: group.decisionGroupId,
+    status: "conflicted"
+  });
+});
+
+test("live-shaped selected seat summary exposes only its structurally owned Remove correction", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Seat selection</h1>
+      <section aria-label="Selected seats">
+        <h2>Selected seats</h2>
+        <article id="seat-summary" data-selected-item="seat">
+          <span>Seat 7C</span>
+          <span id="seat-price">19 EUR</span>
+          <button id="seat-remove" type="button" data-action="remove">Remove</button>
+        </article>
+        <button id="seat-next" type="button">Next</button>
+      </section>
+    </main>
+    <script>
+      document.getElementById("seat-remove").addEventListener("click", () => document.getElementById("seat-summary").remove());
+    </script>
+  `);
+
+  const traveler = { booking_rules: "No paid seats" };
+  let observation = await browserObservation(page, "obs_seat_summary_paid");
+  const group = observation.page.decisionGroups.find((item) => item.removalControlId);
+  expect(group, JSON.stringify({
+    controls: observation.page.controls.map((control) => ({
+      label: control.label,
+      semantic: control.semantic,
+      risk: control.risk,
+      sectionId: control.sectionId,
+      sectionType: control.sectionType,
+      ownText: control.ownText,
+      testId: control.testId
+    })),
+    sections: observation.page.sections,
+    decisionGroups: observation.page.decisionGroups
+  }, null, 2)).toBeTruthy();
+  expect(group.selectedEvidence).toMatchObject({
+    disposition: "paid",
+    structuredPrice: { amount: 19, currency: "EUR" }
+  });
+  const removeControl = observation.page.controls.find((control) => control.controlId === group.removalControlId);
+  expect(removeControl).toMatchObject({
+    decisionGroupId: group.decisionGroupId,
+    physicalEffect: "select_free_option",
+    risk: "safe_decline"
+  });
+  expect(group.alternativeControlIds).toEqual([group.removalControlId]);
+  const ownershipFastPath = await resolveSemanticOwnership({
+    apiKey: "",
+    model: "must-not-be-called",
+    observation,
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+  expect(ownershipFastPath.resolution).toBeNull();
+
+  let taskState = reduceTaskState({ observation, traveler });
+  expect(taskState.activeDecisions[0].status).toBe("conflicted");
+  const candidateSet = buildCurrentCandidateSet({ goal: taskState.currentGoal, observation, traveler, state: { taskState, approvals: {} } });
+  expect(candidateSet.candidates).toHaveLength(1);
+  expect(candidateSet.candidates[0].controlId).toBe(group.removalControlId);
+  const action = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(taskState.currentGoal, candidateSet.candidates[0], observation), observation);
+  const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_seat_summary_removed");
+  expect(executed.validation.ok, executed.validation.code).toBe(true);
+  expect(executed.verification.ok, executed.verification.code).toBe(true);
+  observation = executed.observation;
+  expect(observation.page.decisionGroups.some((item) => item.decisionGroupId === group.decisionGroupId)).toBe(false);
+  taskState = reduceTaskState({ previousTaskState: taskState, observation, traveler });
+  expect(taskState.activeDecisions).toHaveLength(0);
+  expect(taskState.currentGoal.semanticType).toBe("navigation");
+});
+
+test("text-only paid summaries on separate surface instances are independently reversed before navigation", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Optional selections</h1>
+      <p id="total-price">Total 119 EUR</p>
+    </main>
+    <section id="selection-surface" role="dialog" aria-modal="true" aria-label="Current optional selection">
+      <h2>Current optional selection</h2>
+      <p id="surface-progress">Flight 1 of 2</p>
+      <div id="selected-slot"></div>
+      <button id="surface-advance" type="button">Proceed</button>
+    </section>
+    <section id="payment" hidden>
+      <h1>Payment</h1>
+      <h2>Payment method</h2>
+      <p>Order amount: 100 EUR</p>
+      <label>Card number <input autocomplete="cc-number"></label>
+    </section>
+    <script>
+      (() => {
+        const charges = [19, 27];
+        let surfaceInstance = 0;
+        let selected = true;
+        const counters = window.__multiSurfaceCorrection = { reversals: [0, 0], advances: 0 };
+        const render = () => {
+          const charge = charges[surfaceInstance];
+          document.getElementById("surface-progress").textContent = "Flight " + (surfaceInstance + 1) + " of 2";
+          document.getElementById("total-price").textContent = "Total " + (100 + (selected ? charge : 0)) + " EUR";
+          document.getElementById("selected-slot").innerHTML = selected
+            ? '<article data-selected-item="true"><span>Chosen item ' + (surfaceInstance === 0 ? 'A' : 'B') + '</span> <span>' + charge + ' EUR</span> <button type="button" aria-label="Deselect current choice">Undo</button></article>'
+            : '<p>No current selection</p>';
+        };
+        document.getElementById("selection-surface").addEventListener("click", (event) => {
+          if (event.target.closest("[aria-label='Deselect current choice']")) {
+            counters.reversals[surfaceInstance] += 1;
+            selected = false;
+            render();
+            return;
+          }
+          if (event.target.closest("#surface-advance")) {
+            counters.advances += 1;
+            if (selected) return;
+            if (surfaceInstance === 0) {
+              surfaceInstance = 1;
+              selected = true;
+              render();
+              return;
+            }
+            document.getElementById("selection-surface").hidden = true;
+            document.getElementById("payment").hidden = false;
+            document.body.dataset.stage = "payment-review";
+            history.pushState({}, "", "/checkout/payment");
+          }
+        });
+        render();
+      })();
+    </script>
+  `);
+
+  const traveler = { booking_rules: "Decline all paid extras" };
+  const observedGroupIds = [];
+  const previousFetch = global.fetch;
+  let modelCalls = 0;
+  global.fetch = async () => {
+    modelCalls += 1;
+    throw new Error("Semantic ownership AI must not run for one exact structurally owned reversal.");
+  };
+  try {
+    let observation = await browserObservation(page, "obs_multi_surface_paid_1");
+    let previousTaskState = {};
+    for (let index = 0; index < 2; index += 1) {
+      const paidGroup = observation.page.decisionGroups.find((group) => (
+        group.selectedControlId === ""
+        && group.removalControlId
+        && Number(group.selectedEvidence?.structuredPrice?.amount) === [19, 27][index]
+      ));
+      expect(paidGroup, JSON.stringify(observation.page.decisionGroups, null, 2)).toBeTruthy();
+      expect(paidGroup.selectedEvidence.selected).toBe(true);
+      expect(paidGroup.selectedEvidence.disposition).toBe("paid");
+      observedGroupIds.push(paidGroup.decisionGroupId);
+
+      const ownershipFastPath = await resolveSemanticOwnership({
+        apiKey: "must-not-be-used",
+        model: "must-not-be-called",
+        observation,
+        userPolicy: { bookingRules: traveler.booking_rules },
+        traveler
+      });
+      expect(ownershipFastPath.resolution).toBeNull();
+
+      const conflictedState = reduceTaskState({ previousTaskState, observation, traveler });
+      expect(conflictedState.currentGoal.decisionGroupId).toBe(paidGroup.decisionGroupId);
+      expect(conflictedState.activeDecisions.find((decision) => decision.decisionGroupId === paidGroup.decisionGroupId)?.status).toBe("conflicted");
+      const correctionSet = buildCurrentCandidateSet({
+        goal: conflictedState.currentGoal,
+        observation,
+        traveler,
+        state: { taskState: conflictedState, approvals: {} }
+      });
+      expect(correctionSet.candidates.map((candidate) => candidate.controlId)).toEqual([paidGroup.removalControlId]);
+      const correctionAction = loopPrivate.bindTargetSnapshot(
+        actionForCurrentCandidate(conflictedState.currentGoal, correctionSet.candidates[0], observation),
+        observation
+      );
+      const corrected = await executeAtomicBrowserDecision(
+        page,
+        toClientDecision(correctionAction),
+        `obs_multi_surface_reversed_${index + 1}`
+      );
+      expect(corrected.validation.ok, corrected.validation.code).toBe(true);
+      expect(corrected.verification.ok, JSON.stringify(corrected.verification)).toBe(true);
+      expect(corrected.verification.evidence.ownedRemovalVerified).toBe(true);
+      expect(corrected.verification.evidence.selectedChargeRemoved).toBe(true);
+      expect(corrected.verification.evidence.afterPriceAmount).toBeLessThan(corrected.verification.evidence.beforePriceAmount);
+      expect(corrected.observation.page.transactionFacts.selectedExtras).toEqual([]);
+      expect(await page.locator("#selected-slot [data-selected-item]").count()).toBe(0);
+
+      const cleanState = reduceTaskState({
+        previousTaskState: conflictedState,
+        observation: corrected.observation,
+        previousActionResult: corrected.observation.lastActionResult,
+        traveler
+      });
+      expect(cleanState.activeDecisions).toHaveLength(0);
+      expect(cleanState.currentGoal.semanticType).toBe("navigation");
+      const navigationSet = buildCurrentCandidateSet({
+        goal: cleanState.currentGoal,
+        observation: corrected.observation,
+        traveler,
+        state: { taskState: cleanState, approvals: {} }
+      });
+      const navigationCandidate = navigationSet.candidates.find((candidate) => candidate.controlId !== paidGroup.removalControlId);
+      expect(navigationCandidate).toBeTruthy();
+      const navigationAction = loopPrivate.bindTargetSnapshot(
+        actionForCurrentCandidate(cleanState.currentGoal, navigationCandidate, corrected.observation),
+        corrected.observation
+      );
+      const advanced = await executeAtomicBrowserDecision(
+        page,
+        toClientDecision(navigationAction),
+        `obs_multi_surface_advanced_${index + 1}`
+      );
+      expect(advanced.validation.ok, advanced.validation.code).toBe(true);
+      expect(advanced.verification.ok, JSON.stringify(advanced.verification)).toBe(true);
+      previousTaskState = cleanState;
+      observation = advanced.observation;
+    }
+
+    expect(new Set(observedGroupIds).size).toBe(2);
+    expect(modelCalls).toBe(0);
+    expect(await page.evaluate(() => window.__multiSurfaceCorrection)).toEqual({ reversals: [1, 1], advances: 2 });
+    expect(await page.locator("body").getAttribute("data-stage")).toBe("payment-review");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("cross-surface paid ownership resolves an unknown foreground correction and executes it before navigation", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <aside aria-label="Order summary">
+      <article id="paid-line" data-selected-item="optional-extra">Selected option <span>36 EUR</span></article>
+    </aside>
+    <div role="dialog" aria-modal="true" aria-label="Current selection">
+      <h1>Current selection</h1>
+      <p id="selected-summary">5E</p>
+      <button id="cross-remove" data-testid="cross-remove" type="button">Remove</button>
+      <button id="cross-next" data-testid="cross-next" type="button">Next</button>
+    </div>
+    <script>
+      document.getElementById("cross-remove").addEventListener("click", () => {
+        document.getElementById("paid-line")?.remove();
+        document.getElementById("selected-summary").textContent = "Not selected";
+      });
+    </script>
+  `);
+  const traveler = { booking_rules: "No paid seats" };
+  let observation = await browserObservation(page, "obs_cross_surface_live_paid");
+  const removeId = observation.page.controls.find((control) => control.testId === "cross-remove").controlId;
+  const nextId = observation.page.controls.find((control) => control.testId === "cross-next").controlId;
+  const observedPaidGroup = observation.page.decisionGroups.find((group) => Number(group.selectedEvidence?.structuredPrice?.amount) === 36);
+  expect(observedPaidGroup, JSON.stringify(observation.page.decisionGroups, null, 2)).toBeTruthy();
+  const sourceGroupId = observedPaidGroup.decisionGroupId;
+  observation.page.controls = observation.page.controls.map((control) => {
+    if (control.controlId === removeId) {
+      return {
+        ...control,
+        decisionGroupId: "dg_B",
+        semantic: "unknown",
+        physicalEffect: "unknown",
+        risk: "uncertain",
+        structuredPrice: null,
+        selected: false,
+        state: { ...(control.state || {}), selected: false, checked: false }
+      };
+    }
+    if (control.controlId === nextId) {
+      return { ...control, decisionGroupId: "dg_B", semantic: "navigation", physicalEffect: "advance_surface", risk: "safe_continue" };
+    }
+    return control;
+  });
+  observation.page.decisionGroups = [{
+    ...observedPaidGroup,
+    decisionGroupId: sourceGroupId,
+    requirementId: sourceGroupId,
+    sectionType: "unknown",
+    sectionLabel: "Order summary",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    required: false,
+    status: "satisfied",
+    selectedLabel: "Selected option 36 EUR",
+    selectedSemantic: "selected_paid_item",
+    selectedEvidence: { selected: true, disposition: "paid", structuredPrice: { amount: 36, currency: "EUR" } },
+    semanticOwnership: { status: "unknown" },
+    removalControlId: "",
+    alternativeControlIds: []
+  }, {
+    decisionGroupId: "dg_B",
+    requirementId: "dg_B",
+    sectionType: "unknown",
+    sectionLabel: "Selected summary",
+    surfaceId: observation.page.currentSurface.id,
+    surfaceType: "modal",
+    required: false,
+    status: "stale",
+    selectedLabel: "5E",
+    selectedEvidence: { selected: true, disposition: "unknown" },
+    alternativeControlIds: [removeId, nextId]
+  }];
+  observation.page.transactionFacts = {
+    ...(observation.page.transactionFacts || {}),
+    selectedExtras: [{ decisionGroupId: sourceGroupId, label: "Selected option", disposition: "paid", priceAmount: 36, currency: "EUR" }]
+  };
+  const previousFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      status: "completed",
+      model: "test-model",
+      output_text: JSON.stringify({
+        decisionGroupId: sourceGroupId,
+        controlId: removeId,
+        family: "seat",
+        requirement: "optional",
+        priceDisposition: "paid",
+        policyCompatibility: "conflict",
+        intendedOutcome: "remove_paid_selection",
+        confidence: "high",
+        rationale: "The foreground summary and grounded correction map to the selected paid transaction item."
+      }),
+      usage: { input_tokens: 30, output_tokens: 12, total_tokens: 42 }
+    })
+  });
+  try {
+    const resolved = await resolveSemanticOwnership({
+      apiKey: "test-key",
+      model: "test-model",
+      observation,
+      userPolicy: { bookingRules: traveler.booking_rules },
+      traveler
+    });
+    observation = resolved.observation;
+    let taskState = reduceTaskState({ observation, traveler });
+    const candidateSet = buildCurrentCandidateSet({
+      goal: taskState.currentGoal,
+      observation,
+      traveler,
+      state: { taskState, approvals: {} }
+    });
+    expect(taskState.currentGoal.decisionGroupId).toBe(sourceGroupId);
+    expect(candidateSet.candidates.map((candidate) => candidate.controlId)).toEqual([removeId]);
+    expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === nextId).selectable).toBe(false);
+
+    const action = loopPrivate.bindTargetSnapshot(
+      actionForCurrentCandidate(taskState.currentGoal, candidateSet.candidates[0], observation),
+      observation
+    );
+    expect(action.decisionGroupId).toBe(sourceGroupId);
+    expect(action.targetSnapshot.decisionGroupId).toBe("dg_B");
+    const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_cross_surface_live_repaired");
+    expect(executed.validation.ok, executed.validation.code).toBe(true);
+    expect(executed.verification.ok, JSON.stringify(executed.verification)).toBe(true);
+    expect(executed.verification.evidence.beforeConflict).toBe(true);
+    expect(executed.verification.evidence.afterConflict).toBe(false);
+    expect(executed.verification.evidence.chargeCleared).toBe(true);
+    expect(executed.observation.page.transactionFacts.selectedExtras).toEqual([]);
+    expect(await page.locator("#paid-line").count()).toBe(0);
+
+    taskState = reduceTaskState({ previousTaskState: taskState, observation: executed.observation, traveler });
+    const navigation = buildCurrentCandidateSet({
+      goal: taskState.currentGoal,
+      observation: executed.observation,
+      traveler,
+      state: { taskState, approvals: {} }
+    });
+    expect(taskState.currentGoal.semanticType).toBe("navigation");
+    expect(navigation.candidates.map((candidate) => candidate.controlId)).toEqual([nextId]);
+    expect(navigation.candidates.some((candidate) => candidate.type === "ask_user")).toBe(false);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("a paid summary inside a broad traveler section preserves unknown semantic ownership", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Reserve seating</h1>
+      <section aria-label="Traveller information">
+        <h2>Traveller information</h2>
+        <article id="selected-item">
+          <span>Selected item</span>
+          <span>26 EUR</span>
+          <button id="remove-item" type="button" data-action="remove">Remove</button>
+        </article>
+        <button id="advance" type="button">Proceed</button>
+      </section>
+    </main>
+  `);
+
+  const observation = await browserObservation(page, "obs_ambiguous_paid_summary");
+  const group = observation.page.decisionGroups.find((item) => item.removalControlId);
+  expect(group, JSON.stringify(observation.page.decisionGroups, null, 2)).toBeTruthy();
+  expect(group.selectedEvidence).toMatchObject({
+    selected: true,
+    disposition: "paid",
+    structuredPrice: { amount: 26, currency: "EUR" }
+  });
+  expect(group.sectionType).toBe("unknown");
+  expect(group.semanticOwnership).toMatchObject({
+    status: "unknown",
+    nearbySectionType: "passenger"
+  });
+  const remove = observation.page.controls.find((control) => control.controlId === group.removalControlId);
+  expect(remove).toMatchObject({
+    decisionGroupId: group.decisionGroupId,
+    physicalEffect: "select_free_option",
+    risk: "safe_decline"
+  });
+});
+
+test("an exact paid correction is not verified when it changes an unrelated selection", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      section { width: 520px; min-height: 110px; padding: 12px; }
+      label { display: block; padding: 6px; }
+    </style>
+    <main>
+      <h1>Trip options</h1>
+      <section aria-label="Protection">
+        <fieldset role="radiogroup" aria-label="Protection">
+          <legend>Protection</legend>
+          <label><input id="protection-paid" type="radio" name="protection" checked required> Coverage 20 EUR</label>
+          <label><input id="protection-free" type="radio" name="protection" required> No coverage</label>
+        </fieldset>
+      </section>
+      <section aria-label="Meal preference">
+        <fieldset role="radiogroup" aria-label="Meal preference">
+          <legend>Meal preference</legend>
+          <label><input id="meal-none" type="radio" name="meal" checked required> No meal</label>
+          <label><input id="meal-other" type="radio" name="meal" required> Different free meal</label>
+        </fieldset>
+      </section>
+      <button id="advance" type="button">Proceed</button>
+    </main>
+    <script>
+      document.getElementById("protection-free").addEventListener("click", () => {
+        document.getElementById("meal-other").checked = true;
+      });
+    </script>
+  `);
+
+  const traveler = { booking_rules: "Decline all paid extras" };
+  const observation = await browserObservation(page, "obs_unrelated_selection_before");
+  const paidGroup = observation.page.decisionGroups.find((group) => (
+    group.selectedEvidence?.disposition === "paid"
+    && group.selectedEvidence?.structuredPrice?.amount === 20
+  ));
+  expect(paidGroup, JSON.stringify({
+    sections: observation.page.sections,
+    controls: observation.page.controls.map((control) => ({
+      label: control.label,
+      semantic: control.semantic,
+      risk: control.risk,
+      sectionId: control.sectionId,
+      sectionType: control.sectionType,
+      selected: control.selected
+    })),
+    decisionGroups: observation.page.decisionGroups
+  }, null, 2)).toBeTruthy();
+  const taskState = reduceTaskState({ observation, traveler });
+  const candidateSet = buildCurrentCandidateSet({
+    goal: taskState.currentGoal,
+    observation,
+    traveler,
+    state: { taskState, approvals: {} }
+  });
+  expect(candidateSet.candidates).toHaveLength(1);
+  const action = loopPrivate.bindTargetSnapshot(
+    actionForCurrentCandidate(taskState.currentGoal, candidateSet.candidates[0], observation),
+    observation
+  );
+  const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_unrelated_selection_after");
+  expect(executed.validation.ok, executed.validation.code).toBe(true);
+  expect(executed.verification.ok).toBe(false);
+  expect(executed.verification.evidence.unrelatedSelectionChanges).toHaveLength(1);
+});
+
 test("authoritative actionability excludes an occluded ghost and completes popup-to-summary navigation", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>
@@ -3111,7 +4482,7 @@ test("authoritative actionability excludes an occluded ghost and completes popup
 
 test("task-scoped no-effect memory survives rerender while useful progress resets only the consecutive budget", async ({ page }) => {
   await loadHtmlProducer(page, `
-    <main><h1>Optional choice</h1><div id="actions"><button name="dead-next" type="button">Next</button><button id="continue-stage" type="button">Continue</button></div></main>
+    <main><h1>Optional choice</h1><p id="decision-instance">Flight 1 of 2</p><div id="actions"><button name="dead-next" type="button">Next</button><button id="continue-stage" type="button">Continue</button></div></main>
     <div id="confirm" role="dialog" aria-modal="true" aria-label="Confirm" hidden><button id="continue" type="button">Continue</button></div>
     <script>document.getElementById("continue-stage").addEventListener("click", () => { document.getElementById("confirm").hidden = false; });</script>
   `);
@@ -3150,25 +4521,63 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     previousActionResult: rerendered.lastActionResult || null
   });
   const rerenderedGoal = rerenderedTaskState.currentGoal;
-  const failedSignatures = loopPrivate.failedStrategySignaturesForGoal(failed.state, rerenderedGoal);
-  const retrySet = loopPrivate.groundedObservationCandidateSet(rerenderedGoal, rerendered, failedSignatures, {
+  const firstFailureSignatures = loopPrivate.failedStrategySignaturesForGoal(failed.state, rerenderedGoal, rerendered);
+  expect(firstFailureSignatures).toEqual([]);
+  const firstRetrySet = loopPrivate.groundedObservationCandidateSet(rerenderedGoal, rerendered, firstFailureSignatures, {
+    state: { taskState: rerenderedTaskState }
+  });
+  const retryDead = firstRetrySet.candidates.find((candidate) => candidate.targetLabel === "Next");
+  expect(retryDead).toBeTruthy();
+  const retryDeadAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(rerenderedGoal, retryDead, rerendered), rerendered);
+  const retryDeadExecution = await executeAtomicBrowserDecision(page, toClientDecision(retryDeadAction), "obs_memory_no_effect_twice");
+  const failedTwice = loopPrivate.applyTransitionStatus({
+    ...failed.state,
+    taskState: { ...rerenderedTaskState, currentGoal: rerenderedGoal },
+    currentGoal: rerenderedGoal,
+    lastAction: retryDeadAction
+  }, retryDeadExecution.observation, rerendered);
+  expect(failedTwice.transition.status).toBe("no_effect");
+  expect(failedTwice.state.failedStrategyMemory[0].failureCount).toBe(2);
+
+  const failedSignatures = loopPrivate.failedStrategySignaturesForGoal(
+    failedTwice.state,
+    rerenderedGoal,
+    retryDeadExecution.observation
+  );
+  const retrySet = loopPrivate.groundedObservationCandidateSet(rerenderedGoal, retryDeadExecution.observation, failedSignatures, {
     state: { taskState: rerenderedTaskState }
   });
   expect(retrySet.candidates.some((candidate) => candidate.targetLabel === "Next")).toBe(false);
   const next = retrySet.candidates.find((candidate) => candidate.targetLabel === "Continue");
   expect(next).toBeTruthy();
 
-  const nextAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(rerenderedGoal, next, rerendered), rerendered);
+  const nextAction = loopPrivate.bindTargetSnapshot(
+    actionForCurrentCandidate(rerenderedGoal, next, retryDeadExecution.observation),
+    retryDeadExecution.observation
+  );
   const nextExecution = await executeAtomicBrowserDecision(page, toClientDecision(nextAction), "obs_memory_progress");
   const progressed = loopPrivate.applyTransitionStatus({
-    ...failed.state,
+    ...failedTwice.state,
     taskState: { ...rerenderedTaskState, currentGoal: rerenderedGoal },
     currentGoal: rerenderedGoal,
     lastAction: nextAction
-  }, nextExecution.observation, rerendered);
+  }, nextExecution.observation, retryDeadExecution.observation);
   expect(progressed.transition.status).toBe("progressed");
   expect(progressed.state.recoveryState.attempts).toBe(0);
   expect(progressed.state.failedStrategyMemory).toHaveLength(1);
+
+  await page.locator("#decision-instance").evaluate((node) => { node.textContent = "Flight 2 of 2"; });
+  const nextInstanceObservation = await browserObservation(page, "obs_memory_next_instance");
+  const nextInstanceTaskState = reduceTaskState({
+    previousTaskState: rerenderedTaskState,
+    observation: nextInstanceObservation
+  });
+  const nextInstanceFailures = loopPrivate.failedStrategySignaturesForGoal(
+    progressed.state,
+    nextInstanceTaskState.currentGoal,
+    nextInstanceObservation
+  );
+  expect(nextInstanceFailures).toEqual([]);
 });
 
 test("live-shaped review modal keeps grounded safe controls selectable and submit reaches payment", async ({ page }) => {
@@ -3337,4 +4746,18 @@ test("post-navigation page shell is transient until traveler controls hydrate", 
   const ready = classifyObservationReadiness({ observation: hydrated, previousReadiness: transient });
   expect(hydrated.page.summary.fields).toBeGreaterThan(0);
   expect(ready.classification).toBe(READINESS.READY);
+});
+
+test("/rf/start is classified as a new flight-search page despite stale extras copy", async ({ page }) => {
+  await page.goto("http://127.0.0.1:4273/rf/start");
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Start a new flight search</h1>
+      <p>Configure your trip and choose your bundle after selecting flights.</p>
+      <button type="button">Search flights</button>
+    </main>
+  `);
+  const map = await page.evaluate(() => window.__ATW_TEST__.buildPageMap());
+  expect(page.url()).toContain("/rf/start");
+  expect(map.step).toBe("flight_selection");
 });

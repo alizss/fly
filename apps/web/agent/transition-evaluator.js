@@ -10,11 +10,13 @@ const UNSAFE_CODES = new Set([
   "ITINERARY_FLIGHT_CHANGED",
   "TRAVELER_CHANGED",
   "CURRENCY_CHANGED",
-  "PRICE_INCREASE_REQUIRES_AUTHORIZATION",
   "PAYMENT_AUTHORIZATION_REQUIRED",
-  "DUPLICATE_PAYMENT_ATTEMPT",
-  "BLOCKED_BY_POLICY",
-  "BLOCKED_BY_SAFETY"
+  "DUPLICATE_PAYMENT_ATTEMPT"
+]);
+
+const RECONCILABLE_CHANGE_CODES = new Set([
+  "PRICE_INCREASE_REQUIRES_AUTHORIZATION",
+  "UNAPPROVED_PRICE_CHANGE"
 ]);
 
 function text(value = "") {
@@ -58,6 +60,137 @@ function priceIncreased(beforePage = {}, afterPage = {}) {
   return before != null && after != null && after > before + 0.0001;
 }
 
+function actionEffect(action = {}) {
+  return action.mechanicalEffect
+    || action.physicalEffect
+    || action.affordance?.mechanicalEffect
+    || action.affordance?.physicalEffect
+    || action.affordance?.effect
+    || "unknown";
+}
+
+function crossesIrreversibleBoundary(action = {}) {
+  const effect = actionEffect(action);
+  const meaning = text(`${action.type || ""} ${action.intent || ""} ${action.semanticIntent || ""} ${action.risk || ""}`);
+  const risk = text(action.risk || "");
+  return ["select_paid_option", "enter_payment_credentials", "submit_purchase"].includes(effect)
+    || ["payment", "purchase", "irreversible"].includes(risk)
+    || /submit payment|submit purchase|purchase booking|book now|submit booking|confirm booking|cancel booking|final confirmation|irreversible/.test(meaning);
+}
+
+function reversibleUnexpectedChange(action = {}, code = "", beforePage = {}, afterPage = {}) {
+  const priceAlarm = RECONCILABLE_CHANGE_CODES.has(code) || priceIncreased(beforePage, afterPage);
+  if (!priceAlarm || crossesIrreversibleBoundary(action)) return null;
+  return Object.freeze({
+    classification: "unexpected_reversible_change",
+    code: code || "UNEXPECTED_PRICE_INCREASE",
+    actionId: action.id || "",
+    actionControlId: action.controlId || action.targetSnapshot?.controlId || "",
+    predictedEffect: actionEffect(action),
+    beforePrice: priceAmount(beforePage),
+    afterPrice: priceAmount(afterPage)
+  });
+}
+
+function groupHasPaidSelection(group = {}, page = {}) {
+  const evidence = group.selectedEvidence || {};
+  if (evidence.disposition === "free") return false;
+  if (evidence.disposition === "paid" || Number(evidence.structuredPrice?.amount) > 0) return true;
+  const selectedControlId = group.selectedControlId || evidence.selectedControlId || "";
+  const selectedControl = controlById(page, selectedControlId) || {};
+  const meaning = text(`${evidence.semantic || ""} ${evidence.risk || ""} ${selectedControl.semantic || ""} ${selectedControl.risk || ""}`);
+  return /paid|money|purchase|premium|upgrade/.test(meaning)
+    && !/decline|free|remove|skip|without|none/.test(meaning);
+}
+
+function selectedTruth(group = {}) {
+  const evidence = group.selectedEvidence || {};
+  const controlId = group.selectedControlId || evidence.selectedControlId || "";
+  if (evidence.selected !== true && !controlId) return null;
+  const amount = Number(evidence.structuredPrice?.amount);
+  return {
+    controlId,
+    disposition: text(evidence.disposition || group.selectedSemantic || "unknown"),
+    priceAmount: Number.isFinite(amount) ? amount : null
+  };
+}
+
+function unrelatedSelectionChanges(beforePage = {}, afterPage = {}, ownedGroupId = "") {
+  const beforeById = new Map((beforePage.decisionGroups || []).map((group) => [
+    group.decisionGroupId || group.requirementId || "",
+    selectedTruth(group)
+  ]).filter(([id, truth]) => id && truth));
+  return (afterPage.decisionGroups || []).flatMap((group) => {
+    const decisionGroupId = group.decisionGroupId || group.requirementId || "";
+    if (!decisionGroupId || decisionGroupId === ownedGroupId) return [];
+    const after = selectedTruth(group);
+    if (!after) return [];
+    const before = beforeById.get(decisionGroupId) || null;
+    // A newly visible group can be another representation exposed by the
+    // correction (for example a dropdown value after its overlay closes).
+    // Only the same stable unrelated group proves an external selection
+    // change. Newly paid groups are still handled by the paid-mutation guard.
+    if (!before) return [];
+    if (before && JSON.stringify(before) === JSON.stringify(after)) return [];
+    return [{ decisionGroupId, before, after }];
+  });
+}
+
+function interveningPaidMutation(beforePage = {}, afterPage = {}, action = {}) {
+  const ownedGroupId = action.decisionGroupId
+    || action.targetSnapshot?.decisionGroupId
+    || action.affordance?.task?.decisionGroupId
+    || "";
+  const effect = action.mechanicalEffect
+    || action.physicalEffect
+    || action.affordance?.mechanicalEffect
+    || action.affordance?.physicalEffect
+    || action.affordance?.effect
+    || "unknown";
+  const exactCorrection = effect === "select_free_option"
+    && action.expectedOutcome?.type === "exact_free_option_selected"
+    && ownedGroupId;
+  const unrelatedChanges = exactCorrection
+    ? unrelatedSelectionChanges(beforePage, afterPage, ownedGroupId)
+    : [];
+  if (unrelatedChanges.length) {
+    return Object.freeze({
+      classification: "intervening_external_mutation",
+      code: "INTERVENING_EXTERNAL_SELECTION_MUTATION",
+      actionId: action.id || "",
+      actionControlId: action.controlId || action.targetSnapshot?.controlId || "",
+      actionDecisionGroupId: ownedGroupId,
+      predictedEffect: effect,
+      decisionGroupIds: Object.freeze(unrelatedChanges.map((change) => change.decisionGroupId)),
+      selectionChanges: Object.freeze(unrelatedChanges)
+    });
+  }
+  const beforePaid = new Set((beforePage.decisionGroups || [])
+    .filter((group) => groupHasPaidSelection(group, beforePage))
+    .map((group) => group.decisionGroupId || group.requirementId)
+    .filter(Boolean));
+  const newlyPaid = (afterPage.decisionGroups || []).filter((group) => {
+    const id = group.decisionGroupId || group.requirementId || "";
+    return id && !beforePaid.has(id) && groupHasPaidSelection(group, afterPage);
+  });
+  if (!newlyPaid.length) return null;
+  const externallyOwned = newlyPaid.filter((group) => (
+    effect !== "select_paid_option"
+    || !ownedGroupId
+    || (group.decisionGroupId || group.requirementId) !== ownedGroupId
+  ));
+  if (!externallyOwned.length) return null;
+  return Object.freeze({
+    classification: "intervening_external_mutation",
+    code: "INTERVENING_EXTERNAL_MUTATION",
+    actionId: action.id || "",
+    actionControlId: action.controlId || action.targetSnapshot?.controlId || "",
+    actionDecisionGroupId: ownedGroupId,
+    predictedEffect: effect,
+    decisionGroupIds: Object.freeze(externallyOwned.map((group) => group.decisionGroupId || group.requirementId).filter(Boolean))
+  });
+}
+
 function meaningfulDiff(diff = {}) {
   return Boolean(
     diff.appeared?.length
@@ -76,6 +209,36 @@ function meaningfulDiff(diff = {}) {
     || diff.progressChanged
     || diff.surfaceChanged
     || diff.targetReacted
+  );
+}
+
+function materialObservationHash(observation = {}) {
+  return String(
+    observation.observationSnapshot?.materialHash
+    || observation.observationSnapshot?.snapshotHash
+    || observation.page?.materialHash
+    || observation.page?.snapshotHash
+    || ""
+  );
+}
+
+function materialStateChanged(diff = {}) {
+  return Boolean(
+    diff.appeared?.length
+    || diff.disappeared?.length
+    || diff.changed?.length
+    || diff.decisionChanges?.length
+    || diff.becameEnabled?.length
+    || diff.becameDisabled?.length
+    || diff.modalOpened
+    || diff.modalClosed
+    || diff.errorsAppeared?.length
+    || diff.errorsCleared?.length
+    || diff.priceChanged
+    || diff.stageChanged
+    || diff.urlChanged
+    || diff.progressChanged
+    || diff.surfaceChanged
   );
 }
 
@@ -103,9 +266,147 @@ function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPa
     || issue.controlId === expectedControlId
     || (group?.sectionId && issue.sectionId === group.sectionId)
   ));
+  const selectedEvidence = group?.selectedEvidence || {};
+  const selectedChargeAmount = Number(selectedEvidence.structuredPrice?.amount ?? chosen?.structuredPrice?.amount);
+  const paidTransactionForGroup = (page = {}) => (page.transactionFacts?.selectedExtras || []).find((extra) => (
+    String(extra.decisionGroupId || "") === groupId
+    && (
+      Number(extra.priceAmount) > 0
+      || /paid|money|selected_paid/.test(text(extra.disposition || ""))
+    )
+    && !/decline|free|remove|skip|without|none|no extra/.test(text(extra.disposition || ""))
+  )) || null;
+  const beforePaidTransaction = paidTransactionForGroup(beforePage);
+  const afterPaidTransaction = paidTransactionForGroup(afterPage);
+  const semanticOwnershipLink = (beforePage.semanticOwnershipLinks || []).find((link) => (
+    link.linkId === expected.semanticOwnershipLinkId
+    && link.sourceDecisionGroupId === groupId
+    && link.correctionControlId === expectedControlId
+    && link.status === "resolved"
+  )) || null;
+  const linkedPaidSelectionCleared = Boolean(
+    semanticOwnershipLink
+    && beforePaidTransaction
+    && !afterPaidTransaction
+  );
+  const selectedChargeRemoved = expected.requireChargeRemoved !== true || Boolean(
+    linkedPaidSelectionCleared
+    ||
+    !group
+    || (
+      selectedEvidence.disposition === "free"
+      && (!Number.isFinite(selectedChargeAmount) || selectedChargeAmount <= 0)
+    )
+    || (Number.isFinite(selectedChargeAmount) && selectedChargeAmount === 0)
+  );
+  const unrelatedSelectionChangesObserved = unrelatedSelectionChanges(beforePage, afterPage, groupId)
+    .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
+  const exactOrLinkedCorrection = (exact && freeDisposition) || linkedPaidSelectionCleared;
   return {
-    satisfied: exact && freeDisposition && !paidSelected && !priceIncreased(beforePage, afterPage) && !validation,
-    evidence: { groupId, expectedControlId, selectedControlId: group?.selectedControlId || "", freeDisposition, paidSelected, validation }
+    satisfied: exactOrLinkedCorrection
+      && selectedChargeRemoved
+      && unrelatedSelectionChangesObserved.length === 0
+      && !paidSelected
+      && !priceIncreased(beforePage, afterPage)
+      && !validation,
+    evidence: {
+      groupId,
+      expectedControlId,
+      selectedControlId: group?.selectedControlId || "",
+      freeDisposition,
+      semanticOwnershipLinkId: semanticOwnershipLink?.linkId || "",
+      linkedPaidSelectionCleared,
+      selectedChargeRemoved,
+      selectedChargeAmount: Number.isFinite(selectedChargeAmount) ? selectedChargeAmount : null,
+      unrelatedSelectionChanges: unrelatedSelectionChangesObserved,
+      paidSelected,
+      validation
+    }
+  };
+}
+
+function policyConflictResolution(expected = {}, action = {}, beforePage = {}, afterPage = {}) {
+  const groupId = expected.decisionGroupId || action.decisionGroupId || "";
+  const paidTransaction = (page = {}) => (page.transactionFacts?.selectedExtras || []).find((extra) => (
+    String(extra.decisionGroupId || "") === groupId
+    && (
+      Number(extra.priceAmount) > 0
+      || /paid|money|selected_paid/.test(text(extra.disposition || ""))
+    )
+    && !/decline|free|remove|skip|without|none|no extra/.test(text(extra.disposition || ""))
+  )) || null;
+  const paidGroup = (page = {}) => {
+    const group = groupById(page, groupId);
+    const evidence = group?.selectedEvidence || {};
+    const amount = Number(evidence.structuredPrice?.amount);
+    return Boolean(group && evidence.selected === true && (
+      evidence.disposition === "paid"
+      || (Number.isFinite(amount) && amount > 0)
+      || /selected_paid|add_paid|money|purchase/.test(text(`${group.selectedSemantic || ""} ${evidence.semantic || ""} ${evidence.risk || ""}`))
+    ));
+  };
+  const beforeTransaction = paidTransaction(beforePage);
+  const afterTransaction = paidTransaction(afterPage);
+  const beforeGroup = groupById(beforePage, groupId);
+  const afterGroup = groupById(afterPage, groupId);
+  const selectedControlId = String(
+    beforeGroup?.selectedEvidence?.selectedControlId
+    || beforeGroup?.selectedControlId
+    || ""
+  );
+  const afterSelectedControl = controlById(afterPage, selectedControlId);
+  const afterSelectedText = text(
+    afterPage.foreground?.progressMarkers?.selectedText
+    || afterPage.visualState?.foreground?.progressMarkers?.selectedText
+    || ""
+  );
+  const exactControlUnselected = Boolean(
+    selectedControlId && (!afterSelectedControl || !selected(afterSelectedControl))
+  );
+  const explicitUnselectedState = /not selected|unselected|no selection|none selected/.test(afterSelectedText);
+  const groupSelectionCleared = Boolean(
+    !afterGroup
+    || (afterGroup.selectedEvidence?.selected !== true && !afterGroup.selectedControlId)
+  );
+  const beforePaid = Boolean(beforeTransaction || paidGroup(beforePage));
+  const selectedItemCleared = Boolean(
+    beforePaid && (exactControlUnselected || explicitUnselectedState || groupSelectionCleared)
+  );
+  const afterPaidMetadata = Boolean(afterTransaction || paidGroup(afterPage));
+  const afterPaid = Boolean(afterTransaction || (paidGroup(afterPage) && !selectedItemCleared));
+  const chargeCleared = beforeTransaction ? !afterTransaction : !afterPaid;
+  const unrelated = unrelatedSelectionChanges(beforePage, afterPage, groupId)
+    .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
+  const validation = (afterPage.validationIssues || []).some((issue) => (
+    issue.stageWide === true
+    || issue.controlId === (expected.controlId || action.controlId)
+  ));
+  return {
+    satisfied: Boolean(
+      expected.semanticOwnershipLinkId
+      && beforePaid
+      && selectedItemCleared
+      && !afterPaid
+      && chargeCleared
+      && unrelated.length === 0
+      && !priceIncreased(beforePage, afterPage)
+      && !validation
+    ),
+    evidence: {
+      groupId,
+      semanticOwnershipLinkId: expected.semanticOwnershipLinkId || "",
+      intendedOutcome: expected.intendedOutcome || "unknown",
+      beforePaid,
+      afterPaid,
+      afterPaidMetadata,
+      selectedItemCleared,
+      exactControlUnselected,
+      explicitUnselectedState,
+      groupSelectionCleared,
+      chargeCleared,
+      unrelatedSelectionChanges: unrelated,
+      validation
+    }
   };
 }
 
@@ -118,6 +419,10 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
   const type = expected.type || "observable_change";
   const semantics = normalizedActionSemantics(action, { expectedOutcome: expected });
 
+  if (type === "policy_conflict_resolved") {
+    const resolved = policyConflictResolution(expected, action, beforePage, afterPage);
+    return { type, ...resolved };
+  }
   if (type === "exact_free_option_selected") {
     const exact = exactFreeSelection(expected, action, beforePage, afterPage);
     const browserVerifiedBeforeDismissal = Boolean(
@@ -170,7 +475,18 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
     const group = groupById(afterPage, groupId);
     const wanted = expected.expectedSelectedControlId || expected.controlId || action.controlId || "";
     const actual = group?.selectedControlId || (selected(afterControl || {}) ? afterControl?.controlId : "");
-    return { type, satisfied: Boolean(wanted && actual === wanted), evidence: { groupId, wanted, actual } };
+    const conflictingSelected = (expected.conflictingControlIds || []).filter((controlId) => {
+      const control = controlById(afterPage, controlId);
+      return selected(control || {});
+    });
+    const validation = (afterPage.validationIssues || []).filter((issue) => (
+      issue.stageWide === true || issue.controlId === wanted
+    ));
+    return {
+      type,
+      satisfied: Boolean(wanted && actual === wanted && !conflictingSelected.length && !validation.length),
+      evidence: { groupId, wanted, actual, conflictingSelected, validation }
+    };
   }
   if (["options_surface_appeared", "active_surface_change", "semantic_progress"].includes(type)) {
     const expanded = afterControl?.state?.expanded === true && beforeControl?.state?.expanded !== true;
@@ -181,7 +497,20 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
     const expectedSurfaceId = expected.surfaceId || action.targetSnapshot?.surfaceId || surfaceOf(beforePage).id || "";
     const afterSurface = surfaceOf(afterPage);
     const gone = Boolean(diff.modalClosed || (expectedSurfaceId && afterSurface.id !== expectedSurfaceId));
-    return { type, satisfied: gone, evidence: { expectedSurfaceId, currentSurfaceId: afterSurface.id || "", modalClosed: diff.modalClosed } };
+    const advancedInPlace = Boolean(diff.progressChanged || diff.stageChanged || diff.urlChanged);
+    return {
+      type,
+      satisfied: gone || advancedInPlace,
+      evidence: {
+        expectedSurfaceId,
+        currentSurfaceId: afterSurface.id || "",
+        modalClosed: diff.modalClosed,
+        advancedInPlace,
+        progressChanged: diff.progressChanged,
+        stageChanged: diff.stageChanged,
+        urlChanged: diff.urlChanged
+      }
+    };
   }
   if (type === "requirement_status") {
     const groupId = expected.requirementId || expected.decisionGroupId || action.decisionGroupId || "";
@@ -338,9 +667,27 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
   const currentObligationResult = currentObligationResultFor(governedAction, postcondition, localMechanicalResult, diff);
   const durableObjectiveProgress = parentProgressFor(governedAction, afterObservation, localMechanicalResult, diff);
   const dispatched = browserResult.dispatched === true || browserResult.executed === true;
+  const beforeMaterialHash = materialObservationHash(beforeObservation || {});
+  const afterMaterialHash = materialObservationHash(afterObservation);
+  const sameMaterialObservation = Boolean(
+    beforeMaterialHash
+    && afterMaterialHash
+    && beforeMaterialHash === afterMaterialHash
+  );
+  const unchangedMaterialState = sameMaterialObservation || !materialStateChanged(diff);
+  let causality = interveningPaidMutation(beforePage, afterPage, governedAction);
+  const recoverableChange = reversibleUnexpectedChange(governedAction, code, beforePage, afterPage);
   let status;
   let nextDirective;
-  if (UNSAFE_CODES.has(code) || (priceIncreased(beforePage, afterPage) && expected.mustNotIncreasePrice === true)) {
+  if (causality) {
+    status = "blocked";
+    nextDirective = "rebuild_task_state";
+  } else if (recoverableChange) {
+    causality = recoverableChange;
+    status = "blocked";
+    nextDirective = "rebuild_task_state";
+  } else if (UNSAFE_CODES.has(code)
+    || (priceIncreased(beforePage, afterPage) && expected.mustNotIncreasePrice === true)) {
     status = "unsafe";
     nextDirective = "stop_or_request_approval";
   } else if (!beforeObservation?.observationId || !afterObservation?.observationId || !dispatched) {
@@ -349,6 +696,17 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
   } else if (durableObjectiveProgress.completed) {
     status = "achieved";
     nextDirective = "advance_goal";
+  } else if (dispatched && postcondition.satisfied !== true && unchangedMaterialState) {
+    // A new observation id or browser acknowledgement is not progress. The
+    // expected user-visible result must exist in a materially changed state.
+    status = "no_effect";
+    nextDirective = "try_distinct_capability";
+  } else if (expected.semanticOwnershipLinkId && postcondition.satisfied !== true) {
+    // AI ownership is only a hypothesis. If the fresh page does not prove its
+    // exact intended outcome, retain the conflict and suppress this precise
+    // action strategy even when some unrelated visible change occurred.
+    status = "no_effect";
+    nextDirective = "try_distinct_capability";
   } else if (meaningfulDiff(diff)) {
     status = "progressed";
     nextDirective = "rebuild_from_fresh_observation";
@@ -365,7 +723,10 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
     diff,
     postcondition,
     nextDirective,
-    blocker: status === "blocked" ? blockerFrom(afterObservation, diff) : null,
+    blocker: status === "blocked"
+      ? (causality || blockerFrom(afterObservation, diff))
+      : null,
+    causality,
     authoritative: "browser_observation",
     beforeObservationId: beforeObservation?.observationId || "",
     afterObservationId: afterObservation?.observationId || "",
@@ -388,4 +749,14 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
   };
 }
 
-module.exports = { currentObligationResultFor, evaluatePostcondition, evaluateTransition, meaningfulDiff, parentProgressFor, verifiedPhysicalResult };
+module.exports = {
+  crossesIrreversibleBoundary,
+  currentObligationResultFor,
+  evaluatePostcondition,
+  evaluateTransition,
+  meaningfulDiff,
+  materialStateChanged,
+  parentProgressFor,
+  reversibleUnexpectedChange,
+  verifiedPhysicalResult
+};

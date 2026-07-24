@@ -189,6 +189,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   const raw = [];
   const freeAlternativeIds = new Set((goal.freeAlternativeControlIds || []).filter(Boolean));
   const paidAlternativeIds = new Set((goal.paidAlternativeControlIds || []).filter(Boolean));
+  const semanticCorrectionIds = new Set((goal.semanticCorrectionControlIds || []).filter(Boolean));
 
   for (const control of controls) {
     const operations = Object.entries(control.operations || {}).filter(([, capability]) => (
@@ -206,7 +207,19 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       const interpretedFree = freeAlternativeIds.has(control.controlId)
         && goal.desiredPolicyOutcome === "selected_free_option";
       const interpretedPaid = paidAlternativeIds.has(control.controlId);
-      const risk = interpretedFree
+      const semanticCorrection = semanticCorrectionIds.has(control.controlId)
+        ? (page.semanticOwnershipLinks || []).find((link) => (
+            link.status === "resolved"
+            && link.sourceDecisionGroupId === goal.decisionGroupId
+            && link.correctionControlId === control.controlId
+          )) || null
+        : null;
+      const opensChoiceControl = operation === "open";
+      const risk = opensChoiceControl
+        ? "safe"
+        : semanticCorrection
+        ? "safe"
+        : interpretedFree
         ? "safe"
         : interpretedPaid
           ? "money"
@@ -214,7 +227,9 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       const rawChoiceLike = /choice|option|radio|checkbox/.test(
         `${control.kind || ""} ${control.role || ""} ${control.semantic || ""}`.toLowerCase()
       );
-      const semantics = (interpretedFree || interpretedPaid) && rawChoiceLike
+      const semantics = semanticCorrection
+        ? deriveActionSemantics({ control, operation, type: actionType, goal })
+        : !opensChoiceControl && (interpretedFree || interpretedPaid) && rawChoiceLike
         ? { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" }
         : interpretedFree && foreground && operation === "activate"
           ? { interactionRole: "command", semanticEffect: "waive", expectedEvidence: "dismissed" }
@@ -222,13 +237,23 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       raw.push({
         candidateId: "",
         semanticGoal: goal.semanticGoal,
-        semantic: interpretedFree ? "select_free_option" : (control.semantic || operation),
-        physicalEffect: interpretedFree
+        semantic: opensChoiceControl ? "open_choice_control" : (interpretedFree ? "select_free_option" : (control.semantic || operation)),
+        physicalEffect: opensChoiceControl
+          ? "open_surface"
+          : semanticCorrection
+          ? (control.physicalEffect || "unknown")
+          : interpretedFree
           ? "select_free_option"
           : interpretedPaid
             ? "select_paid_option"
             : (control.physicalEffect || ""),
-        policyOutcome: interpretedFree ? "selected_free_option" : (interpretedPaid ? "selected_paid_option" : "selected_policy_allowed_option"),
+        policyOutcome: semanticCorrection ? "proposed_policy_correction" : (interpretedFree ? "selected_free_option" : (interpretedPaid ? "selected_paid_option" : "selected_policy_allowed_option")),
+        intendedOutcome: semanticCorrection?.intendedOutcome || "",
+        semanticOwnershipLinkId: semanticCorrection?.linkId || "",
+        policyCorrectionForDecisionGroupId: semanticCorrection?.sourceDecisionGroupId || "",
+        observedSemantic: control.semantic || "unknown",
+        observedPhysicalEffect: control.physicalEffect || "unknown",
+        observedRisk: control.risk || "uncertain",
         stableKey: control.stableKey || `control:${control.controlId}`,
         meaning: control.meaning || control.semantic || control.accessibleName || control.label || operation,
         structuredPrice: control.structuredPrice || null,
@@ -242,8 +267,20 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         targetId,
         targetLabel: control.label || control.accessibleName || control.semantic || operation,
         requirementId: goal.requirementId || "",
-        intent: interpretedFree ? "decline_optional_extra" : intentFor(control, operation, goal),
-        expectedOutcome: null,
+        intent: semanticCorrection ? "reconcile_policy_conflict" : (interpretedFree ? "decline_optional_extra" : intentFor(control, operation, goal)),
+        expectedOutcome: semanticCorrection ? {
+          type: semanticCorrection.intendedOutcome === "open_correction_surface"
+            ? "options_surface_appeared"
+            : "policy_conflict_resolved",
+          decisionGroupId: goal.decisionGroupId,
+          controlId: control.controlId,
+          semanticOwnershipLinkId: semanticCorrection.linkId,
+          correctionDecisionGroupId: semanticCorrection.correctionDecisionGroupId || control.decisionGroupId || "",
+          intendedOutcome: semanticCorrection.intendedOutcome || "unknown",
+          beforePriceAmount: Number.isFinite(Number(page.price?.amount)) ? Number(page.price.amount) : null,
+          beforePriceText: page.priceText || "",
+          mustNotIncreasePrice: true
+        } : null,
         risk,
         requiresApproval: ["money", "payment", "legal"].includes(risk),
         visible,
@@ -314,6 +351,9 @@ function actionForObservationCandidate(goal = {}, candidate = {}, observation = 
     interactionRole: candidate.interactionRole,
     semanticEffect: candidate.semanticEffect,
     expectedEvidence: candidate.expectedEvidence,
+    intendedOutcome: candidate.intendedOutcome || "",
+    semanticOwnershipLinkId: candidate.semanticOwnershipLinkId || "",
+    policyCorrectionForDecisionGroupId: candidate.policyCorrectionForDecisionGroupId || "",
     affordance: candidate.affordance || null,
     risk: candidate.risk,
     requiresApproval: candidate.requiresApproval,

@@ -131,10 +131,6 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
   if (looksLikeLegalAcceptance(action) && !merged.legalApproved) {
     return { allow: false, decision: "ask_user", reason: "This looks like accepting legal terms/fare rules and needs your explicit confirmation." };
   }
-  if (state && require("../agent-state").priceIncreasedSincePrevious(state) && !merged.priceIncreaseApproved) {
-    return { allow: false, decision: "ask_user", reason: "The price increased since it was last checked; confirm before continuing." };
-  }
-
   // Paid extras: allow declining freely; allow *selecting* only with explicit approval.
   if (looksLikePaidExtraSelection(action)) {
     if (merged.skipPaidExtrasApproved || profileWantsNoExtras(profile)) {

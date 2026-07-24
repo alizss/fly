@@ -25,6 +25,33 @@ const {
 } = require("../../apps/web/agent/observation-candidates");
 const { canonicalizePageSurface, currentSurface, surfaceBinding } = require("../../apps/web/agent/surface-contract");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { decisionInstanceKey } = require("../../packages/shared/agent-actions");
+
+test("decision instance identity follows fresh surface, leg, passenger, group, and selected item facts", () => {
+  const observationFor = ({ leg = "Flight 1 of 2", passengerId = "traveler_1", selectedLabel = "Choice A" } = {}) => ({
+    page: {
+      step: "extras",
+      currentSurface: { id: "shared_modal", type: "modal", label: "Current choice" },
+      foreground: { progressMarkers: { flightOrdinal: leg } },
+      decisionGroups: [{
+        decisionGroupId: "dg_optional",
+        surfaceId: "shared_modal",
+        passengerId,
+        selectedEvidence: {
+          selected: true,
+          selectedLabel,
+          ownerElementId: "selected_summary"
+        }
+      }]
+    }
+  });
+  const goal = { semanticType: "decision", decisionGroupId: "dg_optional" };
+  const first = decisionInstanceKey(goal, observationFor());
+  assert.equal(first, decisionInstanceKey(goal, observationFor()));
+  assert.notEqual(first, decisionInstanceKey(goal, observationFor({ leg: "Flight 2 of 2" })));
+  assert.notEqual(first, decisionInstanceKey(goal, observationFor({ passengerId: "traveler_2" })));
+  assert.notEqual(first, decisionInstanceKey(goal, observationFor({ selectedLabel: "Choice B" })));
+});
 
 function actionableCapability(operation, actuatorId, { inViewport = true } = {}) {
   const actionability = {
@@ -830,6 +857,41 @@ test("P0.10 fails closed when a choice requirement has no canonical decision gro
   }, requirement, observation), false);
 });
 
+test("a fresh exact zero-price decline remains satisfied when legacy canonical metadata is absent", () => {
+  const observation = {
+    observationId: "obs_fresh_free_legacy_diagnostic",
+    page: {
+      decisionGroups: [],
+      controls: [],
+      transactionFacts: {
+        selectedExtras: [{
+          decisionGroupId: "dg_optional_ticket",
+          label: "No optional ticket",
+          disposition: "free",
+          priceAmount: 0,
+          currency: "EUR"
+        }]
+      }
+    }
+  };
+  const [requirement] = __private.requirementsWithDecisionGroups([{
+    id: "dg_optional_ticket",
+    decisionGroupId: "dg_optional_ticket",
+    type: "paid_extra_decision",
+    label: "Optional ticket",
+    status: "satisfied",
+    required: false,
+    risk: "safe",
+    evidence: ["Fresh browser selection"],
+    confidence: 0.9
+  }], observation);
+
+  assert.equal(requirement.status, "satisfied");
+  assert.equal(requirement.required, false);
+  assert.doesNotMatch(requirement.evidence.join(" "), /CANONICAL_DECISION_GROUP_MISSING/);
+  assert.match(requirement.evidence.join(" "), /FRESH_FREE_SELECTION_OBSERVED/);
+});
+
 test("Continue policy treats TaskState and legacy requirements as guidance, not click authority", () => {
   const observation = observationWithGroups();
   const requirements = __private.requirementsWithDecisionGroups([], observation);
@@ -865,6 +927,60 @@ test("Continue policy treats TaskState and legacy requirements as guidance, not 
     priceHistory: []
   }, { booking_rules: "no extras no seats" }, {});
   assert.equal(validationBlocked.allow, true);
+});
+
+test("price history is observation evidence and approval is checked only at cost-adding or final boundaries", () => {
+  const ordinaryAdvance = {
+    type: "click",
+    intent: "navigate_stage",
+    mechanicalEffect: "advance_surface",
+    targetSnapshot: {
+      controlId: "ctrl_advance_after_price_change",
+      kind: "button",
+      semantic: "navigation",
+      risk: "safe"
+    },
+    risk: "safe"
+  };
+  const state = {
+    priceHistory: [
+      { amount: 200, currency: "EUR" },
+      { amount: 226, currency: "EUR" }
+    ],
+    approvals: {}
+  };
+  const advance = evaluateActionPolicy(ordinaryAdvance, state, { booking_rules: "Decline all paid extras" }, {});
+  assert.equal(advance.allow, true);
+  assert.notEqual(advance.decision, "ask_user");
+
+  const costAdding = evaluateActionPolicy({
+    ...ordinaryAdvance,
+    intent: "choose_option",
+    mechanicalEffect: "select_paid_option",
+    risk: "money",
+    targetSnapshot: {
+      ...ordinaryAdvance.targetSnapshot,
+      controlId: "ctrl_paid_option",
+      semantic: "add_paid_extra",
+      risk: "money"
+    }
+  }, state, { booking_rules: "Decline all paid extras" }, {});
+  assert.equal(costAdding.allow, false);
+
+  const finalPayment = evaluateActionPolicy({
+    ...ordinaryAdvance,
+    intent: "submit_payment",
+    mechanicalEffect: "submit_purchase",
+    risk: "payment",
+    targetSnapshot: {
+      ...ordinaryAdvance.targetSnapshot,
+      controlId: "ctrl_submit_purchase",
+      semantic: "submit_payment",
+      risk: "payment"
+    }
+  }, state, {}, {});
+  assert.equal(finalPayment.allow, false);
+  assert.equal(finalPayment.decision, "ask_user");
 });
 
 test("navigation candidates remain unpublished until every required current-surface decision group is exact-resolved", () => {

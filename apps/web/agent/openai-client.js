@@ -26,11 +26,25 @@ function extractResponseText(response) {
  * @param {boolean} [args.returnMeta] when true, returns { data, meta }
  * @returns {Promise<Object>} parsed structured output
  */
-async function callStructured({ apiKey, model, instructions, payload, screenshotDataUrl = "", schema, schemaName, maxOutputTokens = 900, returnMeta = false }) {
+const MAX_MODEL_PACKET_BYTES = 32_768;
+
+function serializedBytes(value) {
+  return Buffer.byteLength(JSON.stringify(value ?? null), "utf8");
+}
+
+async function callStructured({ apiKey, model, instructions, payload, screenshotDataUrl = "", schema, schemaName, maxOutputTokens = 900, returnMeta = false, maxPayloadBytes = MAX_MODEL_PACKET_BYTES }) {
   if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
   const promptPayload = payload && payload.page
     ? { ...payload, page: { ...payload.page, screenshotDataUrl: screenshotDataUrl ? "[attached separately]" : "" } }
     : payload;
+  const packetBytes = serializedBytes(promptPayload);
+  if (packetBytes > Math.min(Number(maxPayloadBytes || MAX_MODEL_PACKET_BYTES), MAX_MODEL_PACKET_BYTES)) {
+    const error = new Error(`Model packet exceeds the hard serialized budget (${packetBytes} bytes).`);
+    error.code = "MODEL_PACKET_TOO_LARGE";
+    error.packetBytes = packetBytes;
+    error.maxPayloadBytes = Math.min(Number(maxPayloadBytes || MAX_MODEL_PACKET_BYTES), MAX_MODEL_PACKET_BYTES);
+    throw error;
+  }
 
   let lastParseError = null;
   const startedAt = Date.now();
@@ -88,7 +102,8 @@ async function callStructured({ apiKey, model, instructions, payload, screenshot
         attempts: attempt + 1,
         input_tokens: Number(data.usage?.input_tokens || 0),
         output_tokens: Number(data.usage?.output_tokens || 0),
-        total_tokens: Number(data.usage?.total_tokens || 0)
+        total_tokens: Number(data.usage?.total_tokens || 0),
+        packetBytes
       };
       return returnMeta ? { data: parsed, meta } : parsed;
     } catch (error) {
@@ -99,4 +114,4 @@ async function callStructured({ apiKey, model, instructions, payload, screenshot
   throw new Error(`OpenAI ${schemaName} returned invalid JSON after retry: ${lastParseError?.message || "parse failed"}`);
 }
 
-module.exports = { callStructured, extractResponseText };
+module.exports = { callStructured, extractResponseText, MAX_MODEL_PACKET_BYTES, serializedBytes };
