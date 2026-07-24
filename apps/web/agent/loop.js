@@ -905,6 +905,9 @@ function toClientDecision(action) {
     visualRegion: action.visualRegion || null,
     scrollY: action.scrollY,
     keys: action.keys || "",
+    readinessStartedAt: Number(action.readinessStartedAt || 0),
+    readinessDeadlineAt: Number(action.readinessDeadlineAt || 0),
+    readinessAttempts: Number(action.readinessAttempts || 0),
     message: action.reason || "Working on the next step.",
     needsApproval: action.requiresApproval,
     risk: action.risk,
@@ -1163,8 +1166,18 @@ function deterministicTransitionVerification(transition = null) {
   };
 }
 
-function applyTransitionStatus(state = {}, observation = {}, previousObservation = null) {
-  const advanced = advanceActionLifecycle({ state, observation, previousObservation });
+function applyTransitionStatus(
+  state = {},
+  observation = {},
+  previousObservation = null,
+  observationReadiness = null
+) {
+  const advanced = advanceActionLifecycle({
+    state,
+    observation,
+    previousObservation,
+    observationReadiness
+  });
   const transition = advanced.transition;
   if (!advanced.lifecycle) return { ...advanced, transition: null };
   const pending = normalizePendingAction(state.pendingAction);
@@ -1641,10 +1654,24 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       }, latency, modelUsageFromMetas(model, []))
     };
   }
+  // Readiness is evaluated before transition closure. A URL change or an
+  // incomplete destination shell cannot close the navigation action that
+  // produced it.
+  const observationReadiness = classifyObservationReadiness({
+    observation,
+    previousReadiness: state.observationReadiness || {},
+    readinessDeadlineAt: Number(
+      observation.destinationReadiness?.deadlineAt
+      || state.actionLifecycle?.destinationReadiness?.deadlineAt
+      || state.observationReadiness?.deadlineAt
+      || 0
+    )
+  });
   const authoritativeTransition = applyTransitionStatus(
     state,
     observation,
-    observation.previousObservation || null
+    observation.previousObservation || null,
+    observationReadiness
   );
   state = authoritativeTransition.state;
   observation = authoritativeTransition.observation;
@@ -1737,11 +1764,6 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
   // Readiness owns the boundary between browser reaction and semantic
   // reasoning. A post-navigation shell is not a checkout state, so it cannot
   // create TaskState goals, candidates, recovery failures, or a user handoff.
-  const observationReadiness = classifyObservationReadiness({
-    observation,
-    previousReadiness: state.observationReadiness || {},
-    maxTransientAttempts: 3
-  });
   state = withUpdate(state, { observationReadiness });
   if (observationReadiness.classification === READINESS.TRANSIENT) {
     const action = normalizeAction({
@@ -1752,7 +1774,10 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
       semanticIntent: "wait_for_ready_observation",
       mechanicalEffect: "unknown",
       expectedPostconditions: [{ type: "observation_readiness", status: READINESS.READY }],
-      reason: `The page is still settling (${observationReadiness.reason}, attempt ${observationReadiness.attempts}/${observationReadiness.maxAttempts}). Reobserve before planning.`,
+      readinessStartedAt: observationReadiness.startedAt,
+      readinessDeadlineAt: observationReadiness.deadlineAt,
+      readinessAttempts: observationReadiness.attempts,
+      reason: `The page is still settling (${observationReadiness.reason}, observation ${observationReadiness.attempts}). Reobserve before the readiness deadline.`,
       risk: "safe",
       requiresApproval: false
     });
@@ -1773,8 +1798,37 @@ async function runLoopTurn({ apiKey, model, recoveryModel = "", dataDir, state, 
     };
   }
   if (observationReadiness.classification === READINESS.DEGRADED) {
+    if (observationReadiness.handoffEligible !== true) {
+      const action = normalizeAction({
+        observationId: observation.observationId || "",
+        observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+        type: "wait",
+        intent: "reobserve_degraded_loading_destination",
+        semanticIntent: "wait_for_ready_observation",
+        mechanicalEffect: "unknown",
+        expectedPostconditions: [{ type: "observation_readiness", status: READINESS.READY }],
+        readinessStartedAt: observationReadiness.startedAt,
+        readinessDeadlineAt: observationReadiness.deadlineAt,
+        readinessAttempts: observationReadiness.attempts,
+        reason: "The destination is still loading. Keep the navigation pending and reobserve without planning or asking the user.",
+        risk: "safe",
+        requiresApproval: false
+      });
+      const waitingState = withUpdate(state, { lastAction: action, status: "running" });
+      transactionStore?.saveSession?.(waitingState);
+      return {
+        state: waitingState,
+        clientDecision: toClientDecision(action),
+        debug: withLatencyDebug({
+          observationReadiness,
+          finalAction: action,
+          modelCalled: false,
+          navigationStillPending: true
+        }, latency, modelUsageFromMetas(model, []))
+      };
+    }
     const action = finalHandoffAction(
-      "The checkout page remained incomplete after three fresh observations. I stopped without guessing from the page shell.",
+      "The checkout destination did not expose usable semantic controls before the shared readiness deadline. I stopped without guessing from the page shell.",
       observation,
       {
         semanticIntent: "report_degraded_observation",

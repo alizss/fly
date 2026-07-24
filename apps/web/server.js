@@ -911,6 +911,14 @@ function compactAgentPayload(rawBody) {
         ? body.observationUpdate.diff
         : null
     } : null,
+    destinationReadiness: body.destinationReadiness && typeof body.destinationReadiness === "object" ? {
+      status: clampText(body.destinationReadiness.status, 60),
+      startedAt: Number(body.destinationReadiness.startedAt || 0),
+      deadlineAt: Number(body.destinationReadiness.deadlineAt || 0),
+      attempts: Number(body.destinationReadiness.attempts || 0),
+      backendWaits: Number(body.destinationReadiness.backendWaits || 0),
+      deadlineObservationSent: Boolean(body.destinationReadiness.deadlineObservationSent)
+    } : null,
     userIntent: clampText(body.userIntent || "Complete checkout safely for the selected traveler.", 800),
     userMessage: clampText(body.userMessage || "", 800),
     approvalState: {
@@ -1127,6 +1135,7 @@ async function decideAgentNextActionViaLoop(body) {
     observationId: payload.observationId,
     observationSnapshot: payload.observationSnapshot,
     observationUpdate: payload.observationUpdate,
+    destinationReadiness: payload.destinationReadiness,
     userIntent: payload.userIntent,
     page: payload.page,
     lastActionResult: payload.lastActionResult || null

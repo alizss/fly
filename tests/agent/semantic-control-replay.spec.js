@@ -1740,6 +1740,298 @@ test("P0.3 client loop is single-flight and coalesces duplicate triggers", async
   expect(result.nextState.loopBusy).toBe(true);
 });
 
+test("slow destination hydration wakes the durable client wait and fills email without another Start", async ({ page }) => {
+  await page.goto("http://127.0.0.1:4273/checkout/extras");
+  await loadHtmlProducer(page, `
+    <main id="checkout">
+      <h1>Optional extras</h1>
+      <button id="continue" type="button">Continue</button>
+    </main>
+    <script>
+      window.__destinationLifecycle = { continueClicks: 0, hydrated: false };
+      document.getElementById("continue").addEventListener("click", () => {
+        window.__destinationLifecycle.continueClicks += 1;
+        history.pushState({}, "", "/checkout/traveler");
+        document.getElementById("checkout").innerHTML =
+          '<section id="traveler-shell" aria-busy="true"><h1>Traveller information</h1><p>Loading traveler form…</p></section>';
+        setTimeout(() => {
+          const shell = document.getElementById("traveler-shell");
+          shell.setAttribute("aria-busy", "false");
+          shell.innerHTML =
+            '<h1>Traveller information</h1><label>Email <input id="traveler-email" name="email" type="email" required></label>';
+          window.__destinationLifecycle.hydrated = true;
+        }, 1_650);
+      });
+    </script>
+  `);
+
+  const sessionId = "session_slow_destination";
+  let requestCount = 0;
+  let activeRequests = 0;
+  let maxConcurrentRequests = 0;
+  let shellWaitRequests = 0;
+  const shellHashes = [];
+  const actions = [];
+
+  await page.route("**/api/agent/report", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ id: sessionId })
+    });
+  });
+  await page.route("**/api/agent/next-action", async (route) => {
+    requestCount += 1;
+    activeRequests += 1;
+    maxConcurrentRequests = Math.max(maxConcurrentRequests, activeRequests);
+    const body = route.request().postDataJSON();
+    const controls = body.page?.controls || [];
+    const continueControl = controls.find((control) => /continue/i.test(control.ownText || control.label || ""));
+    const emailControl = controls.find((control) => (
+      control.fieldType === "email"
+      || control.semantic === "email"
+      || /\bemail\b/i.test(control.stableKey || "")
+    ));
+    let decision;
+    if (emailControl?.state?.valuePresent === true) {
+      decision = {
+        sessionId,
+        observationId: body.observationId,
+        observationHash: body.observationSnapshot.snapshotHash,
+        actionId: `act_stop_after_email_${requestCount}`,
+        action: "stop",
+        intent: "test_complete",
+        risk: "safe",
+        needsApproval: false,
+        message: "Traveler email is complete."
+      };
+    } else if (emailControl) {
+      const typeOperation = emailControl.operations?.type;
+      decision = {
+        sessionId,
+        observationId: body.observationId,
+        observationHash: body.observationSnapshot.snapshotHash,
+        actionId: `act_fill_email_${requestCount}`,
+        action: "type",
+        operation: "type",
+        intent: "satisfy_semantic_goal",
+        semanticIntent: "set_profile_field",
+        mechanicalEffect: "set_field_value",
+        controlId: emailControl.controlId,
+        targetId: typeOperation?.actuatorId || "",
+        targetLabel: emailControl.label || "Email",
+        targetSnapshot: emailControl,
+        value: "ali@example.test",
+        expectedOutcome: {
+          type: "normalized_value_changed",
+          controlId: emailControl.controlId,
+          expectedNormalizedValue: "ali@example.test"
+        },
+        risk: "safe",
+        needsApproval: false,
+        message: "Fill the saved email."
+      };
+    } else if (continueControl && actions.length === 0) {
+      const activate = continueControl.operations?.activate;
+      decision = {
+        sessionId,
+        observationId: body.observationId,
+        observationHash: body.observationSnapshot.snapshotHash,
+        actionId: "act_continue_to_slow_destination",
+        action: "click",
+        operation: "activate",
+        intent: "advance_checkout_stage",
+        semanticIntent: "advance_checkout_stage",
+        mechanicalEffect: "advance_checkout_stage",
+        controlId: continueControl.controlId,
+        targetId: activate?.actuatorId || "",
+        targetLabel: continueControl.label || "Continue",
+        targetSnapshot: continueControl,
+        expectedOutcome: { type: "checkout_stage_advanced" },
+        risk: "safe",
+        needsApproval: false,
+        message: "Continue to traveler information."
+      };
+    } else {
+      shellWaitRequests += 1;
+      shellHashes.push(body.observationSnapshot.snapshotHash);
+      decision = {
+        sessionId,
+        observationId: body.observationId,
+        observationHash: body.observationSnapshot.snapshotHash,
+        actionId: `act_wait_destination_${requestCount}`,
+        action: "wait",
+        intent: "reobserve_after_transient_observation",
+        semanticIntent: "wait_for_ready_observation",
+        mechanicalEffect: "unknown",
+        expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
+        risk: "safe",
+        needsApproval: false,
+        message: "The traveler destination is still hydrating."
+      };
+    }
+    actions.push(decision.action);
+    await new Promise((resolve) => setTimeout(resolve, 45));
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(decision)
+    });
+    activeRequests -= 1;
+  });
+
+  await page.evaluate(({ sessionId, apiBase }) => {
+    window.chrome = {
+      storage: {
+        local: {
+          get: async () => ({ apiBase }),
+          set: async () => undefined,
+          remove: async () => undefined
+        }
+      },
+      runtime: {
+        sendMessage: async () => ({ ok: false, error: "not needed for DOM-grounded test" })
+      }
+    };
+    const hooks = window.__ATW_TEST__;
+    hooks.setAppDataForTest({
+      travelers: [{
+        id: "trav_slow_destination",
+        email: "ali@example.test",
+        first_name: "Ali",
+        last_name: "Sifrar",
+        booking_rules: "No paid extras"
+      }],
+      preferences: {}
+    }, "trav_slow_destination");
+    hooks.resetAgentLoopLifecycle("slow_destination_test");
+    hooks.setAgentSessionForTest(sessionId);
+    hooks.setAgentRunningForTest(true);
+    hooks.watchForCheckoutChanges();
+    hooks.processCheckoutAgent();
+  }, { sessionId, apiBase: TEST_API });
+
+  await expect(page.locator("#traveler-email")).toHaveValue("ali@example.test", { timeout: 10_000 });
+  const state = await page.evaluate(() => ({
+    lifecycle: window.__destinationLifecycle,
+    loop: window.__ATW_TEST__.agentLoopState(),
+    sidebarText: document.getElementById("atw-sidebar")?.innerText || ""
+  }));
+  expect(state.lifecycle.continueClicks).toBe(1);
+  expect(state.lifecycle.hydrated).toBe(true);
+  expect(shellWaitRequests).toBeGreaterThanOrEqual(2);
+  expect(new Set(shellHashes).size).toBe(1);
+  expect(maxConcurrentRequests).toBe(1);
+  expect(actions.filter((action) => action === "click")).toHaveLength(1);
+  expect(actions.filter((action) => action === "type")).toHaveLength(1);
+  expect(state.loop.destinationWait).toBeNull();
+  expect(state.loop.destinationWaitTimerActive).toBe(false);
+  expect(state.sidebarText).not.toContain("Waiting for you");
+});
+
+test("real backend waits beyond three unchanged destination observations until traveler controls hydrate", async ({ page, request }) => {
+  await page.goto("http://127.0.0.1:4273/checkout/extras");
+  await loadHtmlProducer(page, `
+    <main id="checkout">
+      <h1>Optional extras</h1>
+      <button id="continue" type="button">Continue</button>
+    </main>
+    <script>
+      window.__realDestinationLifecycle = { continueClicks: 0, hydrated: false, hydratedAt: 0 };
+      document.getElementById("continue").addEventListener("click", () => {
+        window.__realDestinationLifecycle.continueClicks += 1;
+        history.pushState({}, "", "/checkout/traveler");
+        document.getElementById("checkout").innerHTML =
+          '<section id="traveler-shell" aria-busy="true"><h1>Traveller information</h1><p>Loading traveler form…</p></section>';
+        setTimeout(() => {
+          const shell = document.getElementById("traveler-shell");
+          shell.setAttribute("aria-busy", "false");
+          shell.innerHTML =
+            '<h1>Traveller information</h1><label>Email <input id="traveler-email" name="email" type="email" required></label>';
+          window.__realDestinationLifecycle.hydrated = true;
+          window.__realDestinationLifecycle.hydratedAt = Date.now();
+        }, 2_600);
+      });
+    </script>
+  `);
+
+  const traveler = {
+    id: `trav_real_slow_destination_${Date.now()}`,
+    email: "ali@example.test",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    booking_rules: "No paid extras"
+  };
+  const started = await request.post(`${TEST_API}/agent/session`, {
+    data: {
+      goal: "Continue checkout safely to payment review",
+      traveler,
+      page: { site: "example.test", url: page.url(), step: "extras" }
+    }
+  });
+  expect(started.status()).toBe(201);
+  const session = await started.json();
+
+  const backendRequests = [];
+  page.on("request", (outgoing) => {
+    if (!outgoing.url().endsWith("/api/agent/next-action")) return;
+    try {
+      backendRequests.push({
+        at: Date.now(),
+        body: outgoing.postDataJSON()
+      });
+    } catch {
+      // The assertion below reports a missing request if the payload was not JSON.
+    }
+  });
+
+  await page.evaluate(({ apiBase, sessionId, travelerProfile }) => {
+    window.chrome = {
+      storage: {
+        local: {
+          get: async () => ({ apiBase }),
+          set: async () => undefined,
+          remove: async () => undefined
+        }
+      },
+      runtime: {
+        sendMessage: async () => ({ ok: false, error: "not needed for DOM-grounded test" })
+      }
+    };
+    const hooks = window.__ATW_TEST__;
+    hooks.setAppDataForTest({ travelers: [travelerProfile], preferences: {} }, travelerProfile.id);
+    hooks.resetAgentLoopLifecycle("real_backend_slow_destination_test");
+    hooks.setAgentSessionForTest(sessionId);
+    hooks.setAgentRunningForTest(true);
+    hooks.watchForCheckoutChanges();
+    hooks.processCheckoutAgent();
+  }, { apiBase: TEST_API, sessionId: session.id, travelerProfile: traveler });
+
+  await expect(page.locator("#traveler-email")).toHaveValue("ali@example.test", { timeout: 15_000 });
+  const state = await page.evaluate(() => ({
+    lifecycle: window.__realDestinationLifecycle,
+    loop: window.__ATW_TEST__.agentLoopState(),
+    flow: window.__ATW_TEST__.agentLoopState().flowLog || []
+  }));
+  const shellRequests = backendRequests.filter(({ at, body }) => (
+    state.lifecycle.hydratedAt > 0
+    && at < state.lifecycle.hydratedAt
+    && body.page?.readiness?.ariaBusy === true
+  ));
+
+  expect(state.lifecycle.continueClicks).toBe(1);
+  expect(state.lifecycle.hydrated).toBe(true);
+  expect(shellRequests.length).toBeGreaterThan(3);
+  expect(new Set(shellRequests.map(({ body }) => body.observationSnapshot?.snapshotHash)).size).toBe(1);
+  // The first shell observation creates the backend-owned deadline; every
+  // subsequent client retry must carry that exact deadline back.
+  const retryDeadlines = shellRequests.slice(1).map(({ body }) => Number(body.destinationReadiness?.deadlineAt || 0));
+  expect(retryDeadlines.every((deadline) => deadline > 0)).toBe(true);
+  expect(new Set(retryDeadlines).size).toBe(1);
+  expect(state.loop.destinationWait).toBeNull();
+  expect(state.loop.destinationWaitTimerActive).toBe(false);
+});
+
 test("P0.9 registry replacement updates ownership without rekeying the physical actuator", async ({ page }) => {
   await loadProducer(page);
   const result = await page.evaluate(() => {
@@ -4746,6 +5038,112 @@ test("post-navigation page shell is transient until traveler controls hydrate", 
   const ready = classifyObservationReadiness({ observation: hydrated, previousReadiness: transient });
   expect(hydrated.page.summary.fields).toBeGreaterThan(0);
   expect(ready.classification).toBe(READINESS.READY);
+});
+
+test("semantic readiness follows shell to partial to usable content across checkout stages", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main id="destination"><h1>Checkout</h1></main>
+  `);
+
+  const scenarios = [
+    {
+      stage: "traveler_information",
+      heading: "Traveller information",
+      complete: `
+        <label>Email <input name="email" type="email" required></label>
+        <label>First name <input name="firstName" required></label>
+        <button type="button">Continue</button>
+      `
+    },
+    {
+      stage: "extras",
+      heading: "Optional extras",
+      complete: `
+        <fieldset><legend>Trip protection</legend>
+          <label><input type="radio" name="protection" value="none" data-price="0">Without protection</label>
+          <label><input type="radio" name="protection" value="premium" data-price="25">Protection 25 EUR</label>
+        </fieldset>
+        <button type="button">Continue</button>
+      `
+    },
+    {
+      stage: "seats",
+      heading: "Seat selection",
+      complete: `
+        <div role="dialog" aria-modal="true" aria-label="Seat selection">
+          <button type="button" data-price="19" aria-label="Seat 5A, 19 EUR">5A</button>
+          <button type="button">Next</button>
+        </div>
+      `
+    },
+    {
+      stage: "payment",
+      heading: "Payment details",
+      complete: `
+        <label>Card number <input name="cardNumber" autocomplete="cc-number"></label>
+        <label>Expiry <input name="expiry" autocomplete="cc-exp"></label>
+        <button type="button">Pay now</button>
+      `
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    await page.evaluate(({ heading }) => {
+      document.getElementById("destination").innerHTML = `
+        <h1>${heading}</h1>
+        <nav>
+          ${Array.from({ length: 8 }, (_, index) => `<button type="button">Header ${index + 1}</button>`).join("")}
+        </nav>
+        <aside><h2>Your order</h2><p>Payment options</p><p>Amount to pay 420 EUR</p></aside>
+      `;
+    }, scenario);
+    const shell = await browserObservation(page, `obs_${scenario.stage}_shell`);
+    shell.page.step = scenario.stage;
+    shell.lastActionResult = {
+      feedback: { navigationOccurred: true, pageChanged: true },
+      action: { semanticIntent: "advance_checkout_stage", mechanicalEffect: "advance_checkout_stage" }
+    };
+    const shellReadiness = classifyObservationReadiness({ observation: shell });
+    expect(await page.locator("#destination button").count()).toBeGreaterThan(4);
+    expect(shellReadiness.classification).toBe(READINESS.TRANSIENT);
+
+    await page.evaluate(({ heading }) => {
+      document.getElementById("destination").innerHTML = `
+        <h1>${heading}</h1>
+        <section><p>The destination layout is visible, but its interactive checkout content is still hydrating.</p></section>
+        <aside><p>Payment options</p><p>Amount to pay 420 EUR</p></aside>
+      `;
+    }, scenario);
+    const partial = await browserObservation(page, `obs_${scenario.stage}_partial`);
+    partial.page.step = scenario.stage;
+    partial.lastActionResult = shell.lastActionResult;
+    const partialReadiness = classifyObservationReadiness({
+      observation: partial,
+      previousReadiness: shellReadiness
+    });
+    expect(partialReadiness.classification).toBe(READINESS.TRANSIENT);
+
+    await page.evaluate(({ heading, complete }) => {
+      document.getElementById("destination").innerHTML = `<h1>${heading}</h1>${complete}`;
+    }, scenario);
+    const complete = await browserObservation(page, `obs_${scenario.stage}_complete`);
+    complete.page.step = scenario.stage;
+    complete.lastActionResult = shell.lastActionResult;
+    if (scenario.stage === "payment") {
+      complete.page.url = "https://example.test/checkout/payment";
+    }
+    const ready = classifyObservationReadiness({
+      observation: complete,
+      previousReadiness: partialReadiness
+    });
+    expect(
+      ready.classification,
+      `${scenario.stage}: ${JSON.stringify({ evidence: ready.evidence, controls: complete.page.controls })}`
+    ).toBe(READINESS.READY);
+    expect(ready.evidence.expectedStage).toBe(
+      scenario.stage === "traveler_information" ? "traveler" : scenario.stage
+    );
+  }
 });
 
 test("/rf/start is classified as a new flight-search page despite stale extras copy", async ({ page }) => {

@@ -377,40 +377,110 @@ function stageEvidence(observation = {}) {
   const fields = page.fields || [];
   const surface = currentSurface(page);
   const url = lower(page.url || observation.url);
-  const text = lower([
-    page.text,
+  const controlText = (control = {}) => lower(
+    `${control.fieldType || ""} ${control.field || ""} ${control.semanticType || ""} ${control.semantic || ""} ${control.inputType || ""} ${control.autocomplete || ""} ${control.name || ""} ${control.testId || ""} ${control.stableKey || ""}`
+  );
+  const directControlText = controls.concat(fields).map(controlText).join(" ");
+  const primarySections = (page.sections || []).filter((section) => (
+    !/order|summary|price|total|itinerary/.test(lower(`${section.type || ""} ${section.sectionType || ""}`))
+  ));
+  const headingText = lower([
+    page.heading,
     page.summary?.title,
     page.foreground?.heading,
     surface.label,
+    ...primarySections.map((section) => `${section.label || ""} ${section.heading || ""}`)
+  ].filter(Boolean).join(" "));
+  const text = lower([
+    page.text,
+    headingText,
     ...(page.sections || []).map((section) => `${section.type || ""} ${section.label || ""}`),
     ...(page.decisionGroups || []).map((group) => `${group.sectionType || ""} ${group.sectionLabel || ""}`),
     ...controls.slice(0, 180).map((control) => `${control.field || ""} ${control.semantic || ""} ${control.label || ""} ${control.inputType || ""}`)
   ].filter(Boolean).join(" "));
-  const progress = lower(JSON.stringify(page.foreground?.progressMarkers || page.visualState?.foreground?.progressMarkers || {}));
+  const progressFacts = page.checkoutProgress
+    || page.progress
+    || page.activeProgress
+    || page.foreground?.progressMarkers
+    || page.visualState?.foreground?.progressMarkers
+    || {};
+  const explicitlyActiveProgressEntries = Object.entries(progressFacts || {}).flatMap(([key, value]) => {
+    if (typeof value === "string" && /^(?:active|current|selected)$/i.test(value.trim())) return [key];
+    if (value && typeof value === "object" && (
+      value.active === true
+      || value.current === true
+      || value.selected === true
+      || value["aria-current"] === "step"
+    )) {
+      return [`${key} ${value.label || value.name || ""}`];
+    }
+    return [];
+  });
+  const activeProgressText = lower([
+    progressFacts.activeStep,
+    progressFacts.currentStep,
+    progressFacts.selectedStep,
+    progressFacts.activeLabel,
+    ...explicitlyActiveProgressEntries,
+    ...(Array.isArray(progressFacts.steps)
+      ? progressFacts.steps.filter((step) => (
+        step?.active === true || step?.current === true || step?.selected === true || step?.["aria-current"] === "step"
+      )).map((step) => `${step.label || ""} ${step.name || ""}`)
+      : [])
+  ].filter(Boolean).join(" "));
   const newSearchRoute = /(?:^|\/)rf\/start\/?$/.test(url)
     || /(?:^|\/)(?:flight-)?search\/?$/.test(url);
   const payment = {
     route: /(?:^|[\/#?&_-])payment(?:[\/#?&=_-]|$)/.test(url),
-    progress: /payment|pay/.test(progress),
-    fields: controls.concat(fields).some((control) => /card_number|cardholder|security_code|cvc|cvv|expiry/.test(lower(`${control.field || ""} ${control.semantic || ""} ${control.autocomplete || ""}`))),
-    heading: /payment|pay securely|payment details/.test(text),
-    orderSection: /payment method|order amount|amount due|total to pay/.test(text)
+    progress: /payment|pay/.test(activeProgressText),
+    fields: /card_number|cardholder|security_code|card_cvc|\bcvc\b|\bcvv\b|card_expiry|cc-number|cc-exp|cc-csc/.test(directControlText),
+    method: /payment_method|billing_address|payment_option/.test(directControlText),
+    heading: /payment|pay securely|payment details|choose payment method/.test(headingText),
+    orderSection: /payment method|payment options|order amount|amount due|amount to pay|total to pay/.test(text)
   };
-  const paymentSignals = Object.values(payment).filter(Boolean).length;
-  const confirmation = /booking confirmed|booking reference|reservation number|confirmation number|\bpnr\b/.test(text);
-  const seat = /seat|seating|seat map/.test(text);
-  const traveler = controls.concat(fields).some((control) => /first_name|last_name|full_name|email|phone|date_of_birth|passport/.test(lower(`${control.field || ""} ${control.semantic || ""}`)))
-    || /travell?er information|passenger details|contact information/.test(text);
+  // Order-summary copy is context only. It cannot increase the strong signal
+  // count used to classify the whole page as payment.
+  const paymentSignals = ["route", "progress", "fields", "method", "heading"]
+    .filter((key) => payment[key]).length;
+  const confirmation = /booking confirmed|booking reference|reservation number|confirmation number|\bpnr\b/.test(headingText)
+    || /confirmation|booking-confirmed/.test(url);
+  const seat = /(?:^|[\/#?&_-])seats?(?:[\/#?&=_-]|$)/.test(url)
+    || /seat_option|seat_map|seat_selection/.test(directControlText)
+    || /seat selection|reserve seating|seat map/.test(headingText)
+    || (surface.type !== "page" && /seat|seating/.test(lower(surface.label)));
+  const traveler = /(?:^|[\/#?&_-])(?:travell?er|passenger|contact)(?:[\/#?&=_-]|$)/.test(url)
+    || /first_name|last_name|surname|full_name|email|phone|date_of_birth|dob|passport|nationality|traveler_title/.test(directControlText)
+    || /travell?er information|passenger details|contact information/.test(headingText);
   const extras = (page.decisionGroups || []).some((group) => ["seat", "baggage", "insurance", "extras"].includes(decisionFamily(group)))
-    || /baggage|insurance|bundle|flexible ticket|add.?on|upgrade your trip/.test(text);
-  const flight = /select flight|choose flight|flight selection|fare selection/.test(text);
-  return { payment, paymentSignals, confirmation, seat, traveler, extras, flight, newSearchRoute, text, url };
+    || /(?:^|[\/#?&_-])(?:extras?|ancillar(?:y|ies)?|baggage|bundle|insurance)(?:[\/#?&=_-]|$)/.test(url)
+    || /baggage|insurance|bundle|flexible ticket|add.?on|upgrade your trip/.test(headingText);
+  const flight = /(?:^|[\/#?&_-])(?:flights?|search)(?:[\/#?&=_-]|$)/.test(url)
+    || /select flight|choose flight|flight selection|fare selection/.test(headingText);
+  return {
+    payment,
+    paymentSignals,
+    confirmation,
+    seat,
+    traveler,
+    extras,
+    flight,
+    newSearchRoute,
+    activeProgressText,
+    headingText,
+    text,
+    url
+  };
 }
 
 function decideStage(observation = {}) {
   const evidence = stageEvidence(observation);
   const surface = currentSurface(observation.page || {});
-  if (evidence.paymentSignals >= 3 || (evidence.payment.route && evidence.paymentSignals >= 2)) return { stage: "payment", evidence };
+  const paymentDestination = Boolean(
+    (evidence.payment.route && evidence.paymentSignals >= 2)
+    || (evidence.payment.fields && (evidence.payment.heading || evidence.payment.progress || evidence.payment.method))
+    || (evidence.payment.progress && (evidence.payment.heading || evidence.payment.method))
+  );
+  if (paymentDestination) return { stage: "payment", evidence };
   if (evidence.confirmation) return { stage: "confirmation", evidence };
   // Search/start routes are outside an active checkout. Route structure is
   // stronger than stale extras copy retained in a rerendered shell.

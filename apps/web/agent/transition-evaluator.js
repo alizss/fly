@@ -410,7 +410,58 @@ function policyConflictResolution(expected = {}, action = {}, beforePage = {}, a
   };
 }
 
-function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {}, afterObservation = {}, diff = {}, browserResult = {}) {
+function observationProgressFingerprint(observation = {}) {
+  const page = observation.page || {};
+  return JSON.stringify(
+    page.foreground?.progressMarkers
+      || page.visualState?.foreground?.progressMarkers
+      || page.progressMarkers
+      || {}
+  );
+}
+
+function destinationProgressFromOrigin(afterObservation = {}, navigationContext = null) {
+  if (!navigationContext?.destinationReady || !navigationContext.origin) {
+    return { ready: false, progressed: false };
+  }
+  const origin = navigationContext.origin;
+  const afterPage = pageOf(afterObservation);
+  const afterStage = decideStage(afterObservation).stage;
+  const afterUrl = afterPage.url || afterObservation.url || "";
+  const afterSurfaceId = surfaceOf(afterPage).id || "";
+  const afterProgress = observationProgressFingerprint(afterObservation);
+  const progressed = Boolean(
+    (origin.stage && afterStage && origin.stage !== "unknown" && afterStage !== origin.stage)
+    || (origin.url && afterUrl && afterUrl !== origin.url)
+    || (origin.surfaceId && afterSurfaceId && afterSurfaceId !== origin.surfaceId)
+    || (
+      origin.progressFingerprint
+      && afterProgress
+      && afterProgress !== "{}"
+      && afterProgress !== origin.progressFingerprint
+    )
+  );
+  return {
+    ready: true,
+    progressed,
+    originStage: origin.stage || "unknown",
+    afterStage,
+    originUrl: origin.url || "",
+    afterUrl,
+    originSurfaceId: origin.surfaceId || "",
+    afterSurfaceId
+  };
+}
+
+function evaluatePostcondition(
+  expected = {},
+  action = {},
+  beforeObservation = {},
+  afterObservation = {},
+  diff = {},
+  browserResult = {},
+  navigationContext = null
+) {
   const beforePage = pageOf(beforeObservation);
   const afterPage = pageOf(afterObservation);
   const controlId = expected.controlId || action.controlId || action.targetSnapshot?.controlId || "";
@@ -526,11 +577,13 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
     return { type, satisfied, evidence: { stageChanged: diff.stageChanged, progressChanged: diff.progressChanged, modalOpened: diff.modalOpened, errorsAppeared: diff.errorsAppeared } };
   }
   if (type === "current_surface_advanced") {
+    const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
     const advanced = Boolean(
       diff.progressChanged
       || diff.stageChanged
       || diff.urlChanged
       || (diff.surfaceChanged && !diff.modalOpened && !diff.modalClosed)
+      || (destination.ready && destination.progressed)
     );
     return {
       type,
@@ -541,12 +594,19 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
         progressChanged: diff.progressChanged,
         surfaceChanged: diff.surfaceChanged,
         modalOpened: diff.modalOpened,
-        modalClosed: diff.modalClosed
+        modalClosed: diff.modalClosed,
+        destination
       }
     };
   }
   if (type === "checkout_stage_advanced") {
-    const advanced = Boolean(diff.stageChanged || diff.urlChanged || diff.progressChanged);
+    const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
+    const advanced = Boolean(
+      diff.stageChanged
+      || diff.urlChanged
+      || diff.progressChanged
+      || (destination.ready && destination.progressed)
+    );
     return {
       type,
       satisfied: advanced,
@@ -555,7 +615,8 @@ function evaluatePostcondition(expected = {}, action = {}, beforeObservation = {
         urlChanged: diff.urlChanged,
         progressChanged: diff.progressChanged,
         modalOpened: diff.modalOpened,
-        modalClosed: diff.modalClosed
+        modalClosed: diff.modalClosed,
+        destination
       }
     };
   }
@@ -653,13 +714,27 @@ function parentProgressFor(action = {}, afterObservation = {}, localEffect = {},
   });
 }
 
-function evaluateTransition({ beforeObservation = null, governedAction = {}, browserResult = {}, afterObservation = {} } = {}) {
+function evaluateTransition({
+  beforeObservation = null,
+  governedAction = {},
+  browserResult = {},
+  afterObservation = {},
+  navigationContext = null
+} = {}) {
   const diff = diffObservations(beforeObservation, afterObservation);
   const expected = expectedFor(governedAction, browserResult);
   const code = String(browserResult.outcome?.code || browserResult.failureCode || browserResult.code || "");
   const beforePage = pageOf(beforeObservation || {});
   const afterPage = pageOf(afterObservation);
-  const postcondition = evaluatePostcondition(expected, governedAction, beforeObservation || {}, afterObservation, diff, browserResult);
+  const postcondition = evaluatePostcondition(
+    expected,
+    governedAction,
+    beforeObservation || {},
+    afterObservation,
+    diff,
+    browserResult,
+    navigationContext
+  );
   const actionSemantics = normalizedActionSemantics(governedAction, { expectedOutcome: expected });
   const outcomeContract = governedAction.affordance?.task?.outcomeContract
     || outcomeContractForGoal(governedAction.goal || {}, beforeObservation || {});
@@ -693,7 +768,14 @@ function evaluateTransition({ beforeObservation = null, governedAction = {}, bro
   } else if (!beforeObservation?.observationId || !afterObservation?.observationId || !dispatched) {
     status = "uncertain";
     nextDirective = "reobserve_rebind";
-  } else if (durableObjectiveProgress.completed) {
+  } else if (
+    durableObjectiveProgress.completed
+    || (
+      navigationContext?.destinationReady === true
+      && postcondition.satisfied === true
+      && ["current_surface_advanced", "checkout_stage_advanced", "stage_exit_or_feedback"].includes(postcondition.type)
+    )
+  ) {
     status = "achieved";
     nextDirective = "advance_goal";
   } else if (dispatched && postcondition.satisfied !== true && unchangedMaterialState) {

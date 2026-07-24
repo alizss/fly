@@ -114,6 +114,8 @@
     loopBusy: false,
     loopRerunQueued: false,
     activePlannerRequest: null,
+    destinationWait: null,
+    destinationWaitTimer: null,
     lastSentMaterialHash: "",
     lastSentFeedbackKey: "",
     screenshotCache: new Map()
@@ -128,6 +130,8 @@
 
   const RESUME_KEY = "atwAgentResume";
   const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
+  const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
+  const DESTINATION_RETRY_INTERVAL_MS = 300;
 
   async function saveResumeMarker() {
     try {
@@ -1612,9 +1616,126 @@
     return true;
   }
 
+  function isDestinationReadinessDecision(decision = {}) {
+    if (decision.action !== "wait") return false;
+    const intent = `${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase();
+    return /wait_for_ready_observation|reobserve_after_transient_observation|reobserve_degraded_loading_destination/.test(intent)
+      || (decision.expectedPostconditions || []).some((postcondition) => (
+        postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
+      ));
+  }
+
+  function clearDestinationWait(reason = "cleared") {
+    if (agent.destinationWaitTimer) {
+      clearTimeout(agent.destinationWaitTimer);
+      agent.destinationWaitTimer = null;
+    }
+    if (agent.destinationWait) {
+      logFlow("destination_wait.exit", {
+        reason,
+        startedAt: agent.destinationWait.startedAt,
+        attempts: agent.destinationWait.attempts,
+        backendWaits: agent.destinationWait.backendWaits
+      });
+    }
+    agent.destinationWait = null;
+  }
+
+  function expireDestinationWait(reason = "timeout") {
+    const wait = agent.destinationWait;
+    clearDestinationWait(reason);
+    if (!agent.running) return;
+    agent.running = false;
+    agent.awaiting = "manual";
+    setAgentActivity(
+      "Destination did not become ready",
+      "The page did not expose usable checkout controls before the bounded readiness timeout."
+    );
+    addAgentMessage(
+      "assistant",
+      "The destination stayed incomplete for too long. I stopped without guessing; please check whether the site is still loading."
+    );
+    renderSidebar("agent");
+  }
+
+  function beginDestinationWait(decision = {}) {
+    const now = Date.now();
+    const existing = agent.destinationWait;
+    const backendStartedAt = Number(decision.readinessStartedAt || 0);
+    const backendDeadlineAt = Number(decision.readinessDeadlineAt || 0);
+    agent.destinationWait = {
+      status: "WAITING_FOR_DESTINATION",
+      startedAt: backendStartedAt > 0 ? backendStartedAt : (existing?.startedAt || now),
+      deadlineAt: backendDeadlineAt > 0 ? backendDeadlineAt : (existing?.deadlineAt || (now + DESTINATION_WAIT_TIMEOUT_MS)),
+      attempts: Number(existing?.attempts || 0),
+      backendWaits: Number(existing?.backendWaits || 0) + 1,
+      wakeRequested: true,
+      lastWakeReason: "backend_wait",
+      lastMutationAt: Number(existing?.lastMutationAt || 0),
+      deadlineObservationSent: Boolean(existing?.deadlineObservationSent),
+      observationId: decision.observationId || existing?.observationId || "",
+      actionId: decision.actionId || decision.id || existing?.actionId || ""
+    };
+    agent.loopRerunQueued = true;
+    setAgentActivity(
+      "Waiting for destination",
+      "Navigation completed, but the destination controls are still hydrating. I will continue automatically."
+    );
+    renderSidebar("agent");
+    logFlow("destination_wait.enter", {
+      observationId: agent.destinationWait.observationId,
+      backendWaits: agent.destinationWait.backendWaits,
+      deadlineAt: new Date(agent.destinationWait.deadlineAt).toISOString()
+    });
+    return agent.destinationWait;
+  }
+
+  function scheduleDestinationObservation(reason = "scheduled", delay = DESTINATION_RETRY_INTERVAL_MS) {
+    const wait = agent.destinationWait;
+    if (!wait || !agent.running) return false;
+    wait.wakeRequested = true;
+    wait.lastWakeReason = reason;
+    if (reason === "dom_mutation") wait.lastMutationAt = Date.now();
+    if (Date.now() >= wait.deadlineAt) {
+      if (wait.deadlineObservationSent) {
+        expireDestinationWait("backend_deadline_confirmed");
+        return false;
+      }
+      wait.deadlineObservationSent = true;
+      delay = 0;
+    }
+    // A loop/request already in progress owns the next observation. Its
+    // finally block will consume the durable wake request.
+    if (agent.loopBusy || agent.activePlannerRequest || agent.destinationWaitTimer) return false;
+    const remaining = Math.max(0, wait.deadlineAt - Date.now());
+    const boundedDelay = Math.min(Math.max(0, delay), remaining);
+    agent.destinationWaitTimer = setTimeout(() => {
+      agent.destinationWaitTimer = null;
+      const current = agent.destinationWait;
+      if (!current || !agent.running) return;
+      if (Date.now() >= current.deadlineAt && !current.deadlineObservationSent) {
+        current.deadlineObservationSent = true;
+      }
+      if (agent.loopBusy || agent.activePlannerRequest) {
+        scheduleDestinationObservation("request_still_active", DESTINATION_RETRY_INTERVAL_MS);
+        return;
+      }
+      current.wakeRequested = false;
+      current.attempts += 1;
+      logFlow("destination_wait.reobserve", {
+        reason: current.lastWakeReason || reason,
+        attempts: current.attempts,
+        elapsedMs: Date.now() - current.startedAt
+      });
+      processCheckoutAgent();
+    }, boundedDelay);
+    return true;
+  }
+
   function resetAgentLoopLifecycle(reason = "reset") {
     agent.lifecycleId += 1;
     agent.loopRerunQueued = false;
+    clearDestinationWait(reason);
     abortActivePlannerRequest(reason);
     return agent.lifecycleId;
   }
@@ -9218,13 +9339,34 @@
       verified: agent.lastActionResult?.verified,
       postconditionSatisfied: agent.lastActionResult?.postconditionSatisfied
     }));
-    if (!userMessage && agent.lastSentMaterialHash === materialHash && agent.lastSentFeedbackKey === feedbackKey) {
+    const destinationReadinessRetry = Boolean(
+      agent.destinationWait?.status === "WAITING_FOR_DESTINATION"
+    );
+    if (
+      !userMessage
+      && !destinationReadinessRetry
+      && agent.lastSentMaterialHash === materialHash
+      && agent.lastSentFeedbackKey === feedbackKey
+    ) {
       logFlow("backend.request.unchanged_material_suppressed", {
         materialHash,
         feedbackKey,
         mutationDiff: clientLatency.observation_diff || emptyPageStateDiff()
       });
       return null;
+    }
+    if (
+      destinationReadinessRetry
+      && !userMessage
+      && agent.lastSentMaterialHash === materialHash
+      && agent.lastSentFeedbackKey === feedbackKey
+    ) {
+      logFlow("backend.request.unchanged_readiness_retry_allowed", {
+        materialHash,
+        feedbackKey,
+        attempts: agent.destinationWait.attempts,
+        elapsedMs: Date.now() - agent.destinationWait.startedAt
+      });
     }
     if (agent.activePlannerRequest) {
       logFlow("backend.request.duplicate_suppressed", {
@@ -9326,6 +9468,14 @@
         userIntent: userIntentText(),
         userMessage,
         traveler: traveler(),
+        destinationReadiness: agent.destinationWait ? {
+          status: agent.destinationWait.status,
+          startedAt: agent.destinationWait.startedAt,
+          deadlineAt: agent.destinationWait.deadlineAt,
+          attempts: agent.destinationWait.attempts,
+          backendWaits: agent.destinationWait.backendWaits,
+          deadlineObservationSent: agent.destinationWait.deadlineObservationSent
+        } : null,
 	      approvalState: {
 	        skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
 	        paymentApproved: false
@@ -9443,6 +9593,9 @@
         },
         backendDebug: decision.debug || null
       });
+      if (agent.destinationWait && !isDestinationReadinessDecision(decision)) {
+        clearDestinationWait("semantic_destination_ready");
+      }
       return decision;
     } catch (error) {
       if (error?.name === "AbortError" || request.controller.signal.aborted) {
@@ -9748,6 +9901,10 @@
     }
 
     if (decision.action === "wait") {
+      if (isDestinationReadinessDecision(decision)) {
+        beginDestinationWait(decision);
+        return;
+      }
       await continueAfterAction(900);
       return;
     }
@@ -10597,7 +10754,11 @@
       await executeAgentDecision(decision, stableMap);
     } finally {
       shouldRerun = finishAgentLoop(loopToken);
-      if (shouldRerun) {
+      if (agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
+        if (shouldRerun || agent.destinationWait.wakeRequested) {
+          scheduleDestinationObservation("active_loop_closed", DESTINATION_RETRY_INTERVAL_MS);
+        }
+      } else if (shouldRerun) {
         setTimeout(() => processCheckoutAgent(), 0);
       }
     }
@@ -11251,6 +11412,9 @@
   function watchForCheckoutChanges() {
     const observer = new MutationObserver((mutations) => {
       const pageChanged = pageStateStore.noteMutations(mutations);
+      if (pageChanged && agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
+        scheduleDestinationObservation("dom_mutation", 0);
+      }
       if (!pageChanged || renderTimer) return;
       renderTimer = setTimeout(() => {
         renderTimer = null;
@@ -11299,11 +11463,14 @@
         selectedTravelerId = travelerId || data?.travelers?.[0]?.id || null;
       },
       setAgentRunningForTest: (running) => { agent.running = Boolean(running); },
+      setAgentSessionForTest: (sessionId) => { agent.sessionId = String(sessionId || ""); },
       agentLoopState: () => ({
         lifecycleId: agent.lifecycleId,
         loopBusy: agent.loopBusy,
         loopRerunQueued: agent.loopRerunQueued,
         activeLoopRunId: agent.activeLoopRunId,
+        destinationWait: agent.destinationWait ? { ...agent.destinationWait } : null,
+        destinationWaitTimerActive: Boolean(agent.destinationWaitTimer),
         activePlannerRequest: agent.activePlannerRequest ? {
           turnId: agent.activePlannerRequest.turnId,
           observationId: agent.activePlannerRequest.observationId,
@@ -11311,6 +11478,12 @@
           lifecycleId: agent.activePlannerRequest.lifecycleId
         } : null
       }),
+      processCheckoutAgent,
+      watchForCheckoutChanges,
+      beginDestinationWait,
+      scheduleDestinationObservation,
+      clearDestinationWait,
+      isDestinationReadinessDecision,
       createObservationControlRegistry,
       compactPageMap,
       compactSurfaceReference,

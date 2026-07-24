@@ -1,4 +1,5 @@
 const { evaluateTransition } = require("./transition-evaluator");
+const { decideStage } = require("./task-state-reducer");
 const { actuatorSignature, decisionInstanceKey } = require("../../../packages/shared/agent-actions");
 
 const MAX_RECOVERY_ATTEMPTS = 3;
@@ -70,7 +71,46 @@ function pendingActionNeedsResult(state = {}, observation = {}) {
   return String(observation.lastActionResult?.actionId || "") !== actionId;
 }
 
+function navigationAction(action = {}) {
+  const effect = String(
+    action.mechanicalEffect
+      || action.physicalEffect
+      || action.affordance?.mechanicalEffect
+      || action.affordance?.physicalEffect
+      || action.affordance?.effect
+      || ""
+  ).toLowerCase();
+  const expected = String(action.expectedOutcome?.type || "").toLowerCase();
+  const intent = String(`${action.intent || ""} ${action.semanticIntent || ""}`).toLowerCase();
+  return /advance_surface|advance_checkout_stage/.test(effect)
+    || /current_surface_advanced|checkout_stage_advanced|stage_exit/.test(expected)
+    || /navigate|advance|continue|next/.test(intent);
+}
+
+function progressFingerprint(observation = {}) {
+  const page = observation.page || {};
+  return JSON.stringify(
+    page.foreground?.progressMarkers
+      || page.visualState?.foreground?.progressMarkers
+      || page.progressMarkers
+      || {}
+  );
+}
+
+function navigationOrigin(observation = {}) {
+  const page = observation.page || {};
+  return Object.freeze({
+    observationId: observation.observationId || "",
+    stage: decideStage(observation).stage,
+    step: page.step || page.pageStep || "unknown",
+    url: page.url || observation.url || "",
+    surfaceId: (page.currentSurface || page.activeSurface || {}).id || "",
+    progressFingerprint: progressFingerprint(observation)
+  });
+}
+
 function proposeActionLifecycle(action = {}, observation = {}) {
+  const isNavigation = navigationAction(action);
   return {
     actionId: action.id || "",
     observationId: action.observationId || observation.observationId || "",
@@ -82,6 +122,10 @@ function proposeActionLifecycle(action = {}, observation = {}) {
     verified: false,
     closed: false,
     awaitingClarification: false,
+    awaitingDestination: false,
+    navigation: isNavigation,
+    origin: isNavigation ? navigationOrigin(observation) : null,
+    destinationReadiness: null,
     resultCode: "",
     transitionStatus: ""
   };
@@ -297,6 +341,12 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
     verified: sameAction ? previous.verified === true : false,
     closed: sameAction ? previous.closed === true : false,
     awaitingClarification: sameAction ? previous.awaitingClarification === true : false,
+    awaitingDestination: sameAction ? previous.awaitingDestination === true : false,
+    navigation: sameAction ? previous.navigation === true : navigationAction(action),
+    origin: sameAction && previous.origin
+      ? previous.origin
+      : (navigationAction(action) ? navigationOrigin({ page: result.beforePage || {}, observationId: action.observationId || "" }) : null),
+    destinationReadiness: sameAction ? previous.destinationReadiness || null : null,
     resultCode: canonicalFailureCode(result),
     transitionStatus: sameAction ? previous.transitionStatus || "" : "",
     resultObservationId: observation.observationId || ""
@@ -332,7 +382,12 @@ function transitionResult(result = {}, transition = null) {
   };
 }
 
-function advanceActionLifecycle({ state = {}, observation = {}, previousObservation = null } = {}) {
+function advanceActionLifecycle({
+  state = {},
+  observation = {},
+  previousObservation = null,
+  observationReadiness = null
+} = {}) {
   const result = observation.lastActionResult || {};
   if (!result.actionId) return { state, observation, lifecycle: null, transition: null, directive: "continue" };
 
@@ -346,6 +401,47 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
     previousLifecycle.actionId
     && previousLifecycle.actionId === (result.actionId || action.id)
   );
+  const dispatched = wasDispatched(result);
+  const isNavigation = previousLifecycle.navigation === true || navigationAction(action);
+  const destinationPending = isNavigation
+    && dispatched
+    && previousLifecycle.closed !== true
+    && ["TRANSIENT", "DEGRADED"].includes(String(observationReadiness?.classification || ""))
+    && observationReadiness?.handoffEligible !== true;
+  if (destinationPending) {
+    const lifecycle = {
+      ...baseLifecycle(state, observation, action, result),
+      status: "waiting_for_destination",
+      approved: true,
+      dispatched: true,
+      observed: true,
+      verified: false,
+      closed: false,
+      awaitingClarification: false,
+      awaitingDestination: true,
+      navigation: true,
+      origin: previousLifecycle.origin
+        || navigationOrigin(previousObservation || { page: result.beforePage || {}, observationId: action.observationId || "" }),
+      destinationReadiness: observationReadiness,
+      resultObservationId: observation.observationId || "",
+      resultCode: canonicalFailureCode(result)
+    };
+    return {
+      state: { ...state, actionLifecycle: lifecycle },
+      observation: {
+        ...observation,
+        lastActionResult: {
+          ...result,
+          transitionStatus: "waiting_for_destination",
+          destinationReadiness: observationReadiness
+        }
+      },
+      lifecycle,
+      transition: null,
+      directive: "reobserve_destination",
+      exhausted: false
+    };
+  }
   // An action owns exactly one immediate result window. A repeated action
   // token on a later observation cannot make that already-closed action
   // succeed or fail retroactively; the latest page is consumed as fresh
@@ -373,7 +469,11 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
   // An unclear immediate result gets one fresh read. That read rebuilds the
   // current state, but is not attributed to the old action because another
   // site/user mutation may have happened after dispatch.
-  if (samePreviouslyObservedAction && previousLifecycle.awaitingClarification === true) {
+  if (
+    samePreviouslyObservedAction
+    && previousLifecycle.awaitingClarification === true
+    && previousLifecycle.awaitingDestination !== true
+  ) {
     const lifecycle = {
       ...previousLifecycle,
       status: "observed",
@@ -403,7 +503,6 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
     };
   }
 
-  const dispatched = wasDispatched(result);
   const code = canonicalFailureCode(result);
   let recovery = { state, recoveryState: recoveryStateFor(state), exhausted: false };
   let lifecycle = baseLifecycle(state, observation, action, result);
@@ -435,16 +534,25 @@ function advanceActionLifecycle({ state = {}, observation = {}, previousObservat
       beforeObservation: previousObservation,
       governedAction: action,
       browserResult: { ...result, failureCode: code },
-      afterObservation: observation
+      afterObservation: observation,
+      navigationContext: isNavigation
+        ? {
+          destinationReady: observationReadiness?.classification === "READY",
+          readiness: observationReadiness,
+          origin: previousLifecycle.origin
+            || lifecycle.origin
+            || navigationOrigin(previousObservation)
+        }
+        : null
     });
     const observed = true;
     if (transition.status === "achieved") {
       recovery = updateRecoveryState(state, { kind: "verified", code });
-      lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, transitionStatus: "achieved", resultCode: code };
+      lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, awaitingDestination: false, destinationReadiness: observationReadiness, transitionStatus: "achieved", resultCode: code };
       directive = "advance_goal";
     } else if (transition.status === "progressed") {
       recovery = updateRecoveryState(state, { kind: "meaningful_progress", code });
-      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "progressed", resultCode: code };
+      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, awaitingDestination: false, destinationReadiness: observationReadiness, transitionStatus: "progressed", resultCode: code };
       directive = "rebuild_candidates";
     } else if (transition.status === "blocked") {
       const rebuildFromCurrentState = transition.nextDirective === "rebuild_task_state";
