@@ -1,5 +1,6 @@
-// The single place safety/preference rules live. Called once, right before any
-// action is dispatched, regardless of which site or detector proposed it.
+// The single place checkout safety boundaries are enforced. Preference
+// resolution happens earlier in the profile-to-decision resolver; this layer
+// validates its exact authorization immediately before dispatch.
 // Browser and future iOS executors enforce live actionability and verify the
 // postcondition; they do not reinterpret this semantic policy.
 
@@ -87,6 +88,31 @@ function profileWantsNoExtras(profile = {}) {
   return /no paid|no extras|no add-?ons|no seat|no insurance|no bundle|personal item only|avoid paid/.test(rules);
 }
 
+function boundedPaidAuthorization(action = {}, merged = {}) {
+  const decisionGroupId = String(
+    action.decisionGroupId
+    || action.affordance?.task?.decisionGroupId
+    || action.targetSnapshot?.decisionGroupId
+    || ""
+  );
+  const price = action.affordance?.structuredPrice || null;
+  const amount = Number(price?.amount);
+  const currency = String(price?.currency || "").toUpperCase();
+  const embedded = action.affordance?.authorization || null;
+  const stored = (merged.paidExtraAuthorizations || []).find((authorization) => (
+    authorization?.authorizationId
+    && (!authorization.decisionGroupId || authorization.decisionGroupId === decisionGroupId)
+  )) || null;
+  const authorization = embedded?.authorizationId ? embedded : stored;
+  if (!authorization?.authorizationId) return null;
+  if (authorization.decisionGroupId && decisionGroupId && authorization.decisionGroupId !== decisionGroupId) return null;
+  const maximum = Number(authorization.maximumAmount ?? authorization.maxAmount);
+  if (Number.isFinite(maximum) && Number.isFinite(amount) && amount > maximum) return null;
+  const authorizedCurrency = String(authorization.currency || "").toUpperCase();
+  if (authorizedCurrency && currency && authorizedCurrency !== currency) return null;
+  return authorization;
+}
+
 /**
  * @param {import("../agent-actions").AgentAction} action
  * @param {import("../agent-state").CheckoutSessionState} state
@@ -133,6 +159,18 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
   }
   // Paid extras: allow declining freely; allow *selecting* only with explicit approval.
   if (looksLikePaidExtraSelection(action)) {
+    const authorization = boundedPaidAuthorization(action, merged);
+    if (authorization) {
+      return {
+        allow: true,
+        decision: "allow",
+        reason: `Paid option is covered by bounded authorization ${authorization.authorizationId}.`,
+        authorization
+      };
+    }
+    if (["constraint", "ambiguous", "unavailable"].includes(action.affordance?.profileResolution?.match)) {
+      return { allow: false, decision: "deny", reason: "The paid selection is not the exact authorized result of the profile resolver." };
+    }
     if (merged.skipPaidExtrasApproved || profileWantsNoExtras(profile)) {
       // "Skip paid extras" directly contradicts a selection-shaped action — this
       // isn't ambiguous, it's a straight no, not something worth another round-trip.
@@ -155,6 +193,7 @@ module.exports = {
   looksLikeLegalAcceptance,
   looksLikePaidExtraSelection,
   profileWantsNoExtras,
+  boundedPaidAuthorization,
   isDeclineOrSkipAction,
   isNonMutatingAction,
   isOpenChoiceControlAction

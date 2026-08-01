@@ -1,7 +1,15 @@
-const { profileStageReadiness, deriveProfileGoal } = require("./skill-expander");
+const { profileStageReadiness, selectExecutableProfileGoal } = require("./skill-expander");
 const { currentSurface, controlBelongsToCurrentSurface } = require("./surface-contract");
 const { outcomeContractForGoal } = require("./action-semantics");
 const { decisionInstanceKey } = require("../../../packages/shared/agent-actions");
+const {
+  CONTROL_TYPES,
+  buildCanonicalDecisions,
+  canonicalDecisionForGroup,
+  isTypedNavigationControl
+} = require("./canonical-decision");
+const { normalizeProfilePolicy, seatPolicyFrom } = require("./policy-profile");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 const COMPLETED = new Set(["satisfied", "waived", "waived_by_policy"]);
 const GOAL_CREATING = new Set(["active", "conflicted", "blocked"]);
@@ -22,142 +30,6 @@ function groupKey(group = {}) {
   return groupId(group);
 }
 
-function controlForGroup(group = {}, page = {}) {
-  const selectedId = clean(group.selectedControlId);
-  if (!selectedId) return null;
-  return (page.controls || []).find((control) => control.controlId === selectedId)
-    || (group.alternatives || []).find((control) => control.controlId === selectedId)
-    || null;
-}
-
-function positiveStructuredPrice(value = {}) {
-  const amount = Number(value.structuredPrice?.amount);
-  return Number.isFinite(amount) && amount > 0;
-}
-
-function transactionSelectionForGroup(group = {}, page = {}) {
-  const exactId = groupId(group);
-  return (page.transactionFacts?.selectedExtras || []).find((item) => (
-    clean(item?.decisionGroupId) === exactId
-  )) || null;
-}
-
-function paidSelectionEvidence(group = {}, page = {}) {
-  const selected = controlForGroup(group, page);
-  const selectedEvidence = group.selectedEvidence || {};
-  const transactionSelection = transactionSelectionForGroup(group, page);
-  const selectedControlId = clean(group.selectedControlId || selectedEvidence.selectedControlId);
-  const selectedControl = selectedControlId
-    ? (page.controls || []).find((control) => clean(control.controlId) === selectedControlId) || null
-    : null;
-  const currentSelected = Boolean(
-    selectedControl?.selected
-    || selectedControl?.state?.checked
-    || selectedControl?.state?.selected
-  );
-  const currentSelectedText = lower(
-    page.foreground?.progressMarkers?.selectedText
-    || page.visualState?.foreground?.progressMarkers?.selectedText
-    || ""
-  );
-  const explicitUnselectedState = /not selected|unselected|no selection|none selected/.test(currentSelectedText);
-  const ownedRemovalGone = Boolean(
-    group.removalControlId
-    && !(page.controls || []).some((control) => clean(control.controlId) === clean(group.removalControlId))
-  );
-  if (!transactionSelection
-    && explicitUnselectedState
-    && ((selectedControlId && !currentSelected) || ownedRemovalGone)) {
-    return null;
-  }
-  const transactionDisposition = lower(transactionSelection?.disposition);
-  const transactionPaid = Boolean(transactionSelection && (
-    Number(transactionSelection.priceAmount) > 0
-    || (
-      /paid|money|selected_paid/.test(transactionDisposition)
-      && !/decline|free|remove|skip|without|none|not selected|no extra/.test(transactionDisposition)
-    )
-  ));
-  const evidencePaid = selectedEvidence.selected === true
-    && selectedEvidence.disposition !== "free"
-    && (
-      selectedEvidence.disposition === "paid"
-      || positiveStructuredPrice(selectedEvidence)
-      || /money|paid|purchase|upgrade|select_paid/.test(lower(`${selectedEvidence.risk || ""} ${selectedEvidence.semantic || ""}`))
-    );
-  if (!transactionPaid && !evidencePaid && (!selected || !optionLooksPaid(selected))) return null;
-  const structuredPrice = selectedEvidence.structuredPrice
-    || selected?.structuredPrice
-    || (transactionSelection && Number.isFinite(Number(transactionSelection.priceAmount))
-      ? { amount: Number(transactionSelection.priceAmount), currency: clean(transactionSelection.currency) }
-      : null);
-  return {
-    code: Number(structuredPrice?.amount) > 0
-      ? "EXACT_SELECTED_OPTION_PRICE_EXCEEDS_POLICY"
-      : "EXACT_SELECTED_OPTION_CONTRADICTS_POLICY",
-    decisionGroupId: groupId(group),
-    controlId: clean(group.selectedControlId || selectedEvidence.selectedControlId),
-    ownerElementId: clean(selectedEvidence.ownerElementId),
-    structuredPrice,
-    semantic: clean(selectedEvidence.semantic || selected?.semantic || group.selectedSemantic),
-    risk: clean(selectedEvidence.risk || selected?.risk || (transactionPaid ? "money" : ""))
-  };
-}
-
-function validationForGroup(group = {}, page = {}) {
-  const ids = new Set([
-    groupId(group),
-    clean(group.requirementId),
-    clean(group.sectionId),
-    clean(group.selectedControlId)
-  ].filter(Boolean));
-  return (page.validationIssues || []).find((issue) => (
-    issue.stageWide === true
-    || ids.has(clean(issue.decisionGroupId))
-    || ids.has(clean(issue.requirementId))
-    || ids.has(clean(issue.sectionId))
-    || ids.has(clean(issue.controlId))
-  )) || null;
-}
-
-function policyDeclinesPaidExtras(userPolicy = {}, traveler = {}, family = "extras") {
-  if (userPolicy.skipPaidExtrasApproved === true) return true;
-  const bookingRules = lower([
-    userPolicy.bookingRules,
-    traveler.booking_rules,
-  ].filter(Boolean).join(" "));
-  const appliesToEveryOptionalFamily = /decline all paid|skip all paid|avoid all paid|nothing paid|\bno paid extras?\b|\bno extras?\b|nothing extra/.test(bookingRules);
-  if (appliesToEveryOptionalFamily) return true;
-  if (family === "seat") {
-    const text = lower(`${bookingRules} ${userPolicy.seats || ""} ${traveler.seat_preference || ""}`);
-    return /no paid seat|no seat|skip seat|without seat/.test(text);
-  }
-  if (family === "baggage") {
-    const text = lower(`${bookingRules} ${userPolicy.baggage || ""} ${traveler.baggage_preference || ""}`);
-    return /no paid (?:bag|baggage)|no checked (?:bag|baggage)|no (?:bag|baggage)|personal item only|without baggage/.test(text);
-  }
-  if (family === "insurance") {
-    const text = lower(`${bookingRules} ${userPolicy.insurance || ""}`);
-    return /no insurance|no protection|skip insurance|without protection/.test(text);
-  }
-  if (family === "extras") {
-    const text = lower(`${bookingRules} ${userPolicy.extras || ""}`);
-    return /no paid extras?|no extras?|no add.?ons?|no bundles?|no flexible ticket|skip extras?|without extras?/.test(text);
-  }
-  return false;
-}
-
-function paidAuthorizationForDecision(userPolicy = {}, decisionGroupId = "") {
-  if (!decisionGroupId) return null;
-  const authorizations = Array.isArray(userPolicy.paidExtraAuthorizations)
-    ? userPolicy.paidExtraAuthorizations
-    : [];
-  return authorizations.find((authorization) => (
-    authorization?.authorizationId
-    && authorization.decisionGroupId === decisionGroupId
-  )) || null;
-}
-
 function decisionFamily(group = {}) {
   const resolvedOwnership = group.semanticOwnership || {};
   if (["resolved", "hypothesis"].includes(resolvedOwnership.status)
@@ -174,201 +46,6 @@ function decisionFamily(group = {}) {
   if (/legal|terms|consent/.test(text)) return "legal";
   if (/payment|card|pay/.test(text)) return "payment";
   return "decision";
-}
-
-function decisionRequestText(group = {}) {
-  return lower([
-    group.sectionType,
-    group.sectionLabel,
-    group.requirementId,
-    group.label,
-    group.semantic,
-    ...(group.alternatives || []).map((alternative) => (
-      `${alternative.label || ""} ${alternative.semantic || ""} ${alternative.meaning || ""}`
-    ))
-  ].filter(Boolean).join(" "));
-}
-
-function decisionExplicitlyRequested(group = {}, userPolicy = {}, traveler = {}) {
-  if (group.explicitlyRequested === true || group.policyRequested === true) return true;
-  const request = lower([
-    userPolicy.bookingRules,
-    userPolicy.extras,
-    userPolicy.seats,
-    userPolicy.baggage,
-    userPolicy.insurance,
-    traveler.booking_rules,
-    traveler.baggage_preference,
-    traveler.seat_preference
-  ].filter(Boolean).join(" "));
-  if (!request) return false;
-
-  const family = decisionFamily(group);
-  const subject = decisionRequestText(group);
-  if (family === "seat") return /seat|seating/.test(request);
-  if (family === "baggage") return /bag|baggage|luggage|personal item|carry.?on|hand baggage/.test(request);
-  if (family === "insurance") return /insurance|protection|coverage|cancellation/.test(request);
-  if (family === "extras") return /extra|add.?on|bundle|support|sms|flexible/.test(request);
-  if (family === "legal") return /legal|terms|consent/.test(request);
-  if (family === "payment") return /payment|card|pay/.test(request);
-
-  // Generic optional controls (for example a newsletter opt-out) are only an
-  // obligation when the user request names that subject. Broad checkout or
-  // no-paid-extra preferences must not make every untouched checkbox active.
-  if (/newsletter|marketing|email offers|promotional/.test(subject)) {
-    return /newsletter|marketing|email offers|promotional/.test(request);
-  }
-  return false;
-}
-
-function policyRequestIsConstraintOnly(group = {}, userPolicy = {}, traveler = {}) {
-  const request = lower([
-    userPolicy.bookingRules,
-    userPolicy.extras,
-    userPolicy.seats,
-    userPolicy.baggage,
-    userPolicy.insurance,
-    traveler.booking_rules,
-    traveler.baggage_preference,
-    traveler.seat_preference
-  ].filter(Boolean).join(" "));
-  const family = decisionFamily(group);
-  if (!request) return false;
-  if (family === "seat") {
-    return /no paid seat|no seat|skip seat|avoid paid/.test(request)
-      && !/window|aisle|together|adjacent|specific seat|select (?:a )?seat/.test(request);
-  }
-  if (family === "baggage") return /no paid (?:bag|baggage)|no (?:bag|baggage)|personal item only|avoid paid/.test(request);
-  if (family === "insurance") return /no insurance|no protection|avoid paid/.test(request);
-  if (family === "extras") return /no paid|no extra|no add.?on|avoid paid/.test(request);
-  return false;
-}
-
-function controlsForObservedGroup(group = {}, page = {}) {
-  const ids = new Set([
-    ...(group.alternativeControlIds || []),
-    ...(group.semanticCorrectionControlIds || []),
-    ...(group.alternatives || []).map((item) => item.controlId)
-  ].filter(Boolean));
-  return (page.controls || []).filter((control) => ids.has(control.controlId));
-}
-
-function safeForwardExistsForGroup(group = {}, page = {}) {
-  const surfaceId = clean(group.surfaceId || "surface-page");
-  return (page.controls || []).some((control) => {
-    if (surfaceId && clean(control.surfaceId || "surface-page") !== surfaceId) return false;
-    if (!controlHasExecutableCapability(control)) return false;
-    return /continue|next|proceed|advance|done|finish/.test(lower(`${control.semantic || ""} ${control.label || ""}`));
-  });
-}
-
-function normalizeObservedDecision(group = {}, page = {}, previousCompletion = null, userPolicy = {}, traveler = {}) {
-  const exactId = groupId(group);
-  const validation = validationForGroup(group, page);
-  const paidEvidence = paidSelectionEvidence(group, page);
-  const paidAuthorization = paidAuthorizationForDecision(userPolicy, exactId);
-  const observedStatus = lower(group.status);
-  const selected = controlForGroup(group, page);
-  const selectedEvidence = group.selectedEvidence || {};
-  const transactionSelection = transactionSelectionForGroup(group, page);
-  const freshTransactionFree = Boolean(transactionSelection
-    && Number(transactionSelection.priceAmount) === 0
-    && /free|decline|remove|skip|without|none|not selected|no extra/.test(lower(transactionSelection.disposition)));
-  const selectedSafe = Boolean(
-    selectedEvidence.selected === true && selectedEvidence.disposition === "free"
-  ) || freshTransactionFree || Boolean(selected
-    && !positiveStructuredPrice(selected)
-    && (
-      optionLooksExplicitlyFree(selected)
-      || /(?:^|\b)safe(?:_|\b)|traveler_title/.test(lower(`${selected.risk || ""} ${selected.semantic || ""}`))
-    ));
-
-  const alternatives = controlsForObservedGroup(group, page);
-  const actionableAlternatives = alternatives.filter(controlHasExecutableCapability);
-  const hasExplicitFreeAlternative = actionableAlternatives.some(optionLooksExplicitlyFree);
-  const paidOnlyWithSafeForward = actionableAlternatives.length > 0
-    && actionableAlternatives.every(optionLooksPaid)
-    && safeForwardExistsForGroup(group, page);
-  const constraintOnly = policyRequestIsConstraintOnly(group, userPolicy, traveler);
-  const exactSelectionChanged = Boolean(
-    previousCompletion?.selectedControlId
-    && group.selectedControlId
-    && clean(previousCompletion.selectedControlId) !== clean(group.selectedControlId)
-  );
-  const createsObligation = group.required === true
-    || (decisionExplicitlyRequested(group, userPolicy, traveler)
-      && (!constraintOnly || hasExplicitFreeAlternative));
-  let status = createsObligation ? "active" : "stale";
-  let completionReason = "";
-  let reopenEvidence = null;
-  if (validation) {
-    status = "blocked";
-    reopenEvidence = { code: "FRESH_VALIDATION_REQUIRES_DECISION", issue: validation };
-  } else if (paidEvidence && (
-    policyDeclinesPaidExtras(userPolicy, traveler, decisionFamily(group))
-    || group.semanticOwnership?.policyCompatibility === "conflict"
-  )) {
-    status = paidAuthorization ? "blocked" : "conflicted";
-    reopenEvidence = paidAuthorization
-      ? {
-          ...paidEvidence,
-          code: "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT",
-          authorizationId: clean(paidAuthorization.authorizationId)
-        }
-      : paidEvidence;
-  } else if (selectedSafe) {
-    status = "satisfied";
-    completionReason = "exact_browser_selection";
-  } else if (exactSelectionChanged) {
-    // A fresh exact selection supersedes the stored outcome. If the new
-    // option is not proven unsafe, optional ambiguity stays non-blocking; a
-    // required decision can still become active through its own requiredness.
-    status = group.required === true ? "active" : "stale";
-    reopenEvidence = {
-      code: "EXACT_SELECTED_CONTROL_CHANGED",
-      decisionGroupId: exactId,
-      previousControlId: clean(previousCompletion.selectedControlId),
-      selectedControlId: clean(group.selectedControlId)
-    };
-  } else if (COMPLETED.has(observedStatus)) {
-    status = observedStatus === "waived_by_policy" || observedStatus === "waived" ? "waived" : "satisfied";
-    completionReason = "fresh_browser_status";
-  } else if (previousCompletion) {
-    // Missing controls, labels, alternatives and general section prose cannot
-    // reopen an exact browser-completed decision.
-    status = previousCompletion.status;
-    completionReason = "preserved_exact_outcome";
-  } else if (constraintOnly && paidOnlyWithSafeForward && !selected) {
-    // A negative policy is a restriction, not an instruction to manufacture
-    // a free selection. If every observed alternative is paid and the site
-    // exposes safe forward navigation, selecting nothing satisfies policy.
-    status = "waived";
-    completionReason = "policy_constraint_satisfied_without_selection";
-  } else if (policyDeclinesPaidExtras(userPolicy, traveler, decisionFamily(group))
-    && ["seat", "baggage", "insurance", "extras"].includes(decisionFamily(group))
-    && observedStatus === "not_applicable") {
-    status = "waived";
-    completionReason = "policy_and_fresh_not_applicable_evidence";
-  } else if (group.required === false && observedStatus === "not_applicable") {
-    status = "waived";
-    completionReason = "fresh_not_applicable_evidence";
-  }
-
-  return Object.freeze({
-    decisionId: exactId,
-    decisionGroupId: exactId,
-    requirementId: clean(group.requirementId || exactId),
-    family: decisionFamily(group),
-    status,
-    surfaceId: clean(group.surfaceId || "surface-page"),
-    surfaceType: clean(group.surfaceType || "page"),
-    required: group.required === true,
-    selectedControlId: clean(group.selectedControlId),
-    selectedLabel: clean(group.selectedLabel),
-    completionReason,
-    reopenEvidence,
-    observed: group
-  });
 }
 
 function stageEvidence(observation = {}) {
@@ -516,12 +193,17 @@ function completedMap(previousTaskState = {}) {
 
 function forwardControlIds(observation = {}) {
   const page = observation.page || {};
+  const explicitStageExitIds = new Set([
+    page.stageExit?.continueControlId,
+    page.stageExit?.continueTargetId
+  ].filter(Boolean));
   return (page.controls || []).filter((control) => {
     if (!controlBelongsToCurrentSurface(control, page)) return false;
     if (!controlHasExecutableCapability(control)) return false;
-    const text = lower(`${control.semantic || ""} ${control.meaning || ""} ${control.label || ""} ${control.risk || ""}`);
-    if (/back|previous|edit|change|learn more|details/.test(text)) return false;
-    return /navigation|safe_continue|continue|next|proceed|advance|done|close|dismiss|finish/.test(text);
+    const explicitStageExit = explicitStageExitIds.has(control.controlId)
+      || explicitStageExitIds.has(control.stateElementId)
+      || explicitStageExitIds.has(control.preferredActivationElementId);
+    return isTypedNavigationControl(control, { explicitStageExit });
   }).map((control) => control.controlId).filter(Boolean);
 }
 
@@ -534,6 +216,14 @@ function controlHasExecutableCapability(control = {}) {
 
 function capabilitiesForDecision(decision = {}, observation = {}) {
   const page = observation.page || {};
+  if (Array.isArray(decision.availableTransitions)) {
+    const ids = new Set(decision.availableTransitions.map((transition) => transition.controlId).filter(Boolean));
+    return (page.controls || []).filter((control) => (
+      ids.has(control.controlId)
+      && controlBelongsToCurrentSurface(control, page)
+      && controlHasExecutableCapability(control)
+    ));
+  }
   const group = (page.decisionGroups || []).find((item) => groupId(item) === decision.decisionGroupId) || {};
   const ids = new Set([
     ...(group.alternativeControlIds || []),
@@ -561,7 +251,9 @@ function optionLooksPaid(control = {}) {
 
 function optionLooksExplicitlyFree(control = {}) {
   return optionPrice(control) === 0
-    || /safe_decline|decline|free|no[_ -]?extra|without|none|skip|remove|opt[_ -]?out|not included/.test(lower(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`));
+    || /safe_decline|decline|free|\bincluded\b|no[_ -]?extra|no (?:checked|hand|cabin|hold) (?:bag|baggage)|without|none|skip|remove|opt[_ -]?out|not included/.test(
+      lower(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`)
+    );
 }
 
 function optionIsBoundedChoice(control = {}) {
@@ -569,6 +261,47 @@ function optionIsBoundedChoice(control = {}) {
 }
 
 function decisionOptionContract(decision = {}, observation = {}) {
+  if (Array.isArray(decision.availableTransitions)) {
+    const transitions = decision.availableTransitions.filter((transition) => transition.executable);
+    const linkedCorrectionIds = new Set((observation.page?.semanticOwnershipLinks || [])
+      .filter((link) => (
+        link.status === "resolved"
+        && link.sourceDecisionGroupId === decision.decisionGroupId
+        && link.intendedOutcome
+        && link.intendedOutcome !== "unknown"
+      ))
+      .map((link) => link.correctionControlId));
+    const paidIds = transitions.filter((transition) => transition.paid).map((transition) => transition.controlId);
+    const generallyFreeIds = transitions.filter((transition) => (
+      !transition.paid && optionLooksExplicitlyFree(transition)
+    )).map((transition) => transition.controlId);
+    const desiredIds = new Set(decision.userIntent?.desiredControlIds || []);
+    const eligibleIntentIds = new Set(decision.userIntent?.eligibleOptionIds || []);
+    const exactFreeIds = generallyFreeIds.filter((controlId) => desiredIds.has(controlId));
+    const policyChoiceBounded = ["constraint", "exact", "ambiguous", "unavailable"].includes(decision.userIntent?.match);
+    const constrainedFreeIds = generallyFreeIds.filter((controlId) => eligibleIntentIds.has(controlId));
+    const freeIds = policyChoiceBounded
+      ? (exactFreeIds.length ? exactFreeIds : constrainedFreeIds)
+      : generallyFreeIds;
+    const correctionIds = transitions.filter((transition) => (
+      linkedCorrectionIds.has(transition.controlId)
+      || (decision.status === "conflicted" && desiredIds.has(transition.controlId))
+    ))
+      .map((transition) => transition.controlId);
+    const policyAllowedIds = transitions.filter((transition) => (
+      desiredIds.has(transition.controlId)
+      || (decision.userIntent?.match === "constraint" && eligibleIntentIds.has(transition.controlId))
+      || linkedCorrectionIds.has(transition.controlId)
+    )).map((transition) => transition.controlId);
+    return {
+      eligibleControlIds: transitions.map((transition) => transition.controlId),
+      freeControlIds: freeIds,
+      paidControlIds: paidIds,
+      correctionControlIds: correctionIds,
+      policyAllowedControlIds: policyAllowedIds,
+      policyChoiceBounded
+    };
+  }
   const eligible = capabilitiesForDecision(decision, observation);
   const linkedCorrectionIds = new Set((observation.page?.semanticOwnershipLinks || [])
     .filter((link) => (
@@ -594,7 +327,9 @@ function decisionOptionContract(decision = {}, observation = {}) {
     eligibleControlIds: eligible.map((control) => control.controlId),
     freeControlIds: freeIds,
     paidControlIds: [...paidIds],
-    correctionControlIds: eligible.filter((control) => linkedCorrectionIds.has(control.controlId)).map((control) => control.controlId)
+    correctionControlIds: eligible.filter((control) => linkedCorrectionIds.has(control.controlId)).map((control) => control.controlId),
+    policyAllowedControlIds: [],
+    policyChoiceBounded: false
   };
 }
 
@@ -617,21 +352,29 @@ function ambiguityGoal(observation = {}, reason = "unknown_surface") {
 
 function goalForDecision(decision = {}, observation = {}, userPolicy = {}, traveler = {}) {
   const options = decisionOptionContract(decision, observation);
-  const preferFree = policyDeclinesPaidExtras(userPolicy, traveler, decision.family)
-    && ["seat", "baggage", "insurance", "extras"].includes(decision.family);
-  const desiredPolicyOutcome = preferFree ? "selected_free_option" : "selected_policy_allowed_option";
+  const desiredSemanticOutcome = decision.userIntent?.desiredOutcome || "";
+  const desiredPolicyOutcome = desiredSemanticOutcome || "selected_policy_allowed_option";
   const observationId = observation.observationId || "observation";
   return Object.freeze({
     goalId: `${observationId}:goal:${decision.decisionGroupId}`,
-    semanticGoal: `resolve the exact current ${decision.family || "checkout"} decision`,
-    semanticType: decision.family || "decision",
+    semanticGoal: `resolve ${decision.subject?.label || `the exact current ${decision.family || "checkout"} decision`}`,
+    semanticType: decision.subject?.key || decision.family || "decision",
     desiredValue: desiredPolicyOutcome,
     desiredPolicyOutcome,
+    desiredSemanticOutcome,
+    canonicalDecisionId: decision.decisionId,
+    canonicalSubject: decision.subject || null,
+    controlType: decision.controlType || "",
+    userIntentMatch: decision.userIntent?.match || "none",
+    profileResolutionReason: decision.userIntent?.reason || "",
+    authorization: decision.userIntent?.authorization || null,
     decisionGroupId: decision.decisionGroupId,
     requirementId: decision.requirementId,
     surfaceId: decision.surfaceId,
     observationId,
     eligibleAlternativeControlIds: Object.freeze(options.eligibleControlIds),
+    policyAllowedControlIds: Object.freeze(options.policyAllowedControlIds),
+    policyChoiceBounded: options.policyChoiceBounded === true,
     freeAlternativeControlIds: Object.freeze(options.freeControlIds),
     paidAlternativeControlIds: Object.freeze(options.paidControlIds),
     semanticCorrectionControlIds: Object.freeze(options.correctionControlIds),
@@ -641,6 +384,7 @@ function goalForDecision(decision = {}, observation = {}, userPolicy = {}, trave
       type: "decision_group_resolved",
       decisionGroupId: decision.decisionGroupId,
       desiredPolicyOutcome,
+      desiredSemanticOutcome,
       eligibleAlternativeControlIds: options.eligibleControlIds
     })
   });
@@ -662,16 +406,134 @@ function navigationGoal(observation = {}, controlIds = []) {
   });
 }
 
+function blockedNavigationGoal(observation = {}, decision = null) {
+  const surface = currentSurface(observation.page || {});
+  const controlId = clean(decision?.physicalControlIds?.[0]);
+  const control = (observation.page?.controls || []).find((item) => item.controlId === controlId) || {};
+  const blockers = [
+    ...(observation.page?.stageExit?.blockers || []),
+    ...(observation.page?.validationIssues || []).map((issue) => issue.message || issue.label || issue.code)
+  ].map(clean).filter(Boolean);
+  return Object.freeze({
+    goalId: `${observation.observationId || "observation"}:goal:diagnose_blocked_navigation`,
+    semanticGoal: `diagnose why ${clean(control.label || decision?.subject?.label || "Continue")} is unavailable`,
+    semanticType: "blocked_navigation",
+    desiredValue: "identify_and_resolve_blocker",
+    decisionGroupId: "",
+    requirementId: "",
+    surfaceId: surface.id || "surface-page",
+    observationId: observation.observationId || "",
+    diagnosticControlId: controlId,
+    actionableControlIds: controlId ? [controlId] : [],
+    blockerEvidence: Object.freeze(blockers),
+    postcondition: Object.freeze({
+      type: "navigation_enabled_or_blocker_identified",
+      controlId,
+      previousDisabled: control.disabled === true || control.state?.disabled === true
+    })
+  });
+}
+
 function terminalForStage(stage = "unknown") {
   if (stage === "payment") return "payment_review_reached";
   if (stage === "confirmation") return "confirmation_reached";
   return "active";
 }
 
+function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence = {}, transactionReview = null, traveler = {}) {
+  const page = observation.page || {};
+  const controls = (page.controls || []).filter((control) => (
+    controlBelongsToCurrentSurface(control, page)
+    && controlHasExecutableCapability(control)
+  ));
+  const semanticText = (control = {}) => lower([
+    control.fieldType,
+    control.field,
+    control.semanticType,
+    control.semantic,
+    control.name,
+    control.autocomplete,
+    control.testId,
+    control.label,
+    control.stableKey
+  ].filter(Boolean).join(" "));
+  const paymentMethodControlIds = controls
+    .filter((control) => /payment.?method|apple.?pay|credit.?card|debit.?card/.test(semanticText(control)))
+    .map((control) => control.controlId);
+  const paymentCredentialControlIds = controls
+    .filter((control) => /card.?number|card.?expiry|security.?code|card.?cvc|\bcvc\b|\bcvv\b|cc-number|cc-exp|cc-csc/.test(semanticText(control)))
+    .map((control) => control.controlId);
+  const payControlIds = controls
+    .filter((control) => /(?:^|[^a-z0-9])(?:pay(?:\s+(?:now|securely|with)\b|\s+\d)|confirm\s+and\s+pay\b|submit\s+payment\b|complete\s+purchase\b)/.test(semanticText(control)))
+    .map((control) => control.controlId);
+  const pendingContactControlIds = controls
+    .filter((control) => {
+      const semantics = semanticText(control);
+      const email = /(?:^|[^a-z])email(?:[^a-z]|$)/.test(semantics) && !/confirm.?email/.test(semantics);
+      const phone = /(?:^|[^a-z])(?:phone|mobile|tel-national)(?:[^a-z]|$)/.test(semantics)
+        && !/country|prefix|calling.?code/.test(semantics);
+      if (!email && !phone) return false;
+      const expectedValue = email
+        ? clean(traveler.email || traveler.contact_email || traveler.billing_email)
+        : clean(traveler.phone || traveler.mobile || traveler.phone_number);
+      const state = control.state || {};
+      const missingValue = !state.valuePresent && !clean(state.normalizedValue || state.valueText || state.value);
+      return state.invalid === true || ((expectedValue || state.required === true || control.required === true) && missingValue);
+    })
+    .map((control) => control.controlId);
+  const step = lower(page.step || page.pageStep);
+  const transactionFacts = page.transactionFacts
+    || transactionReview?.current
+    || transactionReview?.baseline
+    || {};
+  const hasReviewEnvelope = transactionReview?.ready === true || Boolean(
+    transactionFacts.currency
+    && transactionFacts.totalPrice?.amount != null
+    && (transactionFacts.travelers || []).length
+  );
+  const reviewContext = /payment|confirmation|review/.test(step)
+    || (transactionFacts.provenance || []).some((entry) => entry?.source === "payment_summary")
+    || stageDecisionEvidence.payment?.progress === true
+    || stageDecisionEvidence.payment?.heading === true;
+  const strongStageEvidence = stageDecisionEvidence.paymentSignals >= 3
+    || (
+      stageDecisionEvidence.paymentSignals >= 2
+      && (paymentMethodControlIds.length || paymentCredentialControlIds.length)
+    );
+  const verifiedPaymentStage = transactionReview?.ready === true
+    && stageDecisionEvidence.paymentSignals >= 2
+    && Boolean(
+      stageDecisionEvidence.payment?.route
+      || stageDecisionEvidence.payment?.progress
+      || stageDecisionEvidence.payment?.heading
+    );
+  // A lone hidden CVV/card field is not a payment-review boundary. Require
+  // either mutually reinforcing payment-stage evidence or an owned final
+  // envelope together with the actual commit and payment-method controls.
+  const observed = Boolean(
+    verifiedPaymentStage
+    || strongStageEvidence
+    || (
+      hasReviewEnvelope
+      && payControlIds.length
+      && (paymentMethodControlIds.length || paymentCredentialControlIds.length)
+    )
+  );
+  return Object.freeze({
+    observed,
+    reviewContext,
+    hasReviewEnvelope,
+    payControlIds: Object.freeze(payControlIds),
+    paymentMethodControlIds: Object.freeze(paymentMethodControlIds),
+    paymentCredentialControlIds: Object.freeze(paymentCredentialControlIds),
+    pendingContactControlIds: Object.freeze(pendingContactControlIds)
+  });
+}
+
 function surfaceClassFrom(page = {}) {
   const surface = currentSurface(page);
   if (surface.type === "page") return "navigation";
-  if (["choice_set", "form", "review_confirmation", "warning", "navigation", "information", "unknown"].includes(surface.surfaceClass)) {
+  if (["choice_set", "form", "review_confirmation", "site_failure", "warning", "navigation", "information", "unknown"].includes(surface.surfaceClass)) {
     return surface.surfaceClass;
   }
   const controls = (page.controls || []).filter((control) => controlBelongsToCurrentSurface(control, page));
@@ -706,7 +568,7 @@ function durableOutcomeHierarchy(previousTaskState = {}, stage = "unknown", term
     "stage_outcome:reach_payment_review",
     "reach_payment_review"
   );
-  const completed = terminalStatus === "payment_review_reached" || stage === "payment";
+  const completed = terminalStatus === "payment_review_reached";
   const stageOutcome = Object.freeze({
     ...stageBase,
     parentOutcomeId: transactionBase.outcomeId,
@@ -797,15 +659,87 @@ function reduceTaskState({
   previousActionResult = null,
   userPolicy = {},
   traveler = {},
-  parentObjective = null
+  transactionReview = null,
+  parentObjective = null,
+  blockedProfileGoalKeys = []
 } = {}) {
-  const page = observation.page || {};
+  const rawPage = observation.page || {};
+  const semanticCompilation = agentContract.compileSemanticCheckout(rawPage);
+  const page = {
+    ...rawPage,
+    controls: semanticCompilation.controls,
+    decisionGroups: semanticCompilation.decisionGroups,
+    decisionContracts: semanticCompilation.decisionContracts,
+    semanticReadiness: semanticCompilation.semanticReadiness,
+    semanticCompilation
+  };
+  observation = { ...observation, page };
+  const normalizedProfilePolicy = userPolicy.profilePolicy || normalizeProfilePolicy({ userPolicy, traveler });
   const surface = currentSurface(page);
   const { stage, evidence: stageDecisionEvidence } = decideStage(observation);
+  const paymentReviewBoundary = paymentReviewBoundaryEvidence(observation, stageDecisionEvidence, transactionReview, traveler);
   const fingerprint = surfaceFingerprint(stage, surface, observation);
   const meaningfulSurfaceChange = Boolean(previousTaskState.surfaceFingerprint
     && previousTaskState.surfaceFingerprint !== fingerprint);
   const completions = completedMap(previousTaskState);
+  const authoritativeActionResult = previousActionResult || observation.lastActionResult || null;
+  const verifiedExpectedOutcome = authoritativeActionResult?.expectedOutcome || {};
+  const verifiedAction = authoritativeActionResult?.action || {};
+  const verifiedDecisionGroupId = clean(
+    verifiedExpectedOutcome.decisionGroupId
+    || authoritativeActionResult?.decisionGroupId
+    || verifiedAction.decisionGroupId
+    || authoritativeActionResult?.targetSnapshot?.decisionGroupId
+  );
+  const verifiedFreeSelection = Boolean(
+    authoritativeActionResult?.verified === true
+    && authoritativeActionResult?.expectedOutcomeObserved === true
+    && authoritativeActionResult?.postconditionSatisfied === true
+    && verifiedExpectedOutcome.type === "exact_free_option_selected"
+    && verifiedDecisionGroupId
+    && (
+      authoritativeActionResult?.mechanicalEffect === "select_free_option"
+      || verifiedAction.mechanicalEffect === "select_free_option"
+      || verifiedAction.affordance?.physicalEffect === "select_free_option"
+      || verifiedAction.affordance?.effect === "select_free_option"
+      || verifiedExpectedOutcome.expectedDisposition === "decline_free_no_extra"
+    )
+  );
+  if (verifiedFreeSelection) {
+    const instanceId = clean(
+      authoritativeActionResult.decisionInstanceId
+      || verifiedAction.decisionInstanceId
+      || (
+        previousTaskState.currentGoal?.decisionGroupId === verifiedDecisionGroupId
+          ? previousTaskState.currentGoal.decisionInstanceId
+          : ""
+      )
+      || verifiedDecisionGroupId
+    );
+    completions.set(instanceId, {
+      decisionGroupId: verifiedDecisionGroupId,
+      instanceId,
+      requirementId: clean(
+        authoritativeActionResult.requirementId
+        || verifiedExpectedOutcome.requirementId
+        || previousTaskState.currentGoal?.requirementId
+      ),
+      surfaceId: clean(
+        verifiedExpectedOutcome.surfaceId
+        || authoritativeActionResult.targetSnapshot?.surfaceId
+        || previousTaskState.currentGoal?.surfaceId
+      ),
+      status: "satisfied",
+      selectedControlId: clean(
+        verifiedExpectedOutcome.expectedSelectedControlId
+        || verifiedExpectedOutcome.controlId
+        || authoritativeActionResult.controlId
+        || verifiedAction.controlId
+      ),
+      completionReason: "verified_exact_free_option",
+      observationId: observation.observationId || ""
+    });
+  }
   const observedDecisions = (page.decisionGroups || []).filter((group) => groupId(group)).map((group) => {
     const instanceId = decisionInstanceKey(group, observation);
     const previousGroupCompletion = [...(previousTaskState.completedOutcomes || [])]
@@ -828,13 +762,13 @@ function reduceTaskState({
       ? previousGroupCompletion
       : null;
     const previousCompletion = completions.get(instanceId) || sameSurfaceCompletion;
-    const normalizedDecision = normalizeObservedDecision(
+    const normalizedDecision = canonicalDecisionForGroup({
       group,
       page,
       previousCompletion,
       userPolicy,
       traveler
-    );
+    });
     const decision = Object.freeze({
       ...normalizedDecision,
       instanceId
@@ -861,9 +795,23 @@ function reduceTaskState({
     }
     return decision;
   });
+  const observedPhysicalControlIds = new Set(observedDecisions.flatMap((decision) => (
+    decision.physicalControlIds || []
+  )));
+  const canonicalControlDecisions = buildCanonicalDecisions({
+    page: { ...page, decisionGroups: [] },
+    userPolicy,
+    traveler
+  }).filter((decision) => (
+    !(decision.physicalControlIds || []).some((controlId) => observedPhysicalControlIds.has(controlId))
+  ));
+  const canonicalDecisions = Object.freeze([
+    ...observedDecisions,
+    ...canonicalControlDecisions
+  ]);
 
   const foreground = surface.type !== "page";
-  const owned = observedDecisions.filter((decision) => {
+  const owned = canonicalDecisions.filter((decision) => {
     if (!foreground) return decision.surfaceId === "surface-page" || decision.surfaceType === "page";
     if (decision.surfaceId === surface.id || decision.decisionGroupId === surface.decisionGroupId) return true;
     // Surface metadata can lag behind a portal/rerender. Exact current-surface
@@ -886,22 +834,71 @@ function reduceTaskState({
       return priority(left) - priority(right);
     });
   const suspendedDecisions = foreground
-    ? observedDecisions.filter((decision) => decision.surfaceId !== surface.id && GOAL_CREATING.has(decision.status))
+    ? canonicalDecisions.filter((decision) => decision.surfaceId !== surface.id && GOAL_CREATING.has(decision.status))
     : [];
   const validationBlockers = (page.validationIssues || []).filter((issue) => issue.stageWide === true || !issue.controlId || (page.controls || []).some((control) => (
     control.controlId === issue.controlId && controlBelongsToCurrentSurface(control, page)
   )));
   const controlIds = forwardControlIds(observation);
-  const profileReadiness = profileStageReadiness({
+  const blockedNavigationDecision = owned.find((decision) => (
+    decision.controlType === CONTROL_TYPES.NAVIGATION_ACTION
+    && decision.currentState?.available !== true
+    && (decision.physicalControlIds || []).some(Boolean)
+  )) || null;
+  const profileEvaluationStage = paymentReviewBoundary.observed ? "traveler_information" : stage;
+  const baseProfileReadiness = profileStageReadiness({
     ...observation,
-    page: { ...page, step: stage }
+    page: { ...page, step: profileEvaluationStage }
   }, traveler);
-  const profileGoal = stage === "traveler_information" && profileReadiness.profileStage && !profileReadiness.ready
-    ? deriveProfileGoal({ ...observation, page: { ...page, step: stage } }, traveler, previousTaskState.currentGoal)
+  const profileSelection = profileEvaluationStage === "traveler_information"
+    && baseProfileReadiness.profileStage
+    && !baseProfileReadiness.ready
+    ? selectExecutableProfileGoal(
+        { ...observation, page: { ...page, step: profileEvaluationStage } },
+        traveler,
+        previousTaskState.currentGoal,
+        { blockedGoalKeys: blockedProfileGoalKeys }
+      )
+    : { goal: null, blockedFields: [], failureCode: "" };
+  const profileReadiness = Object.freeze({
+    ...baseProfileReadiness,
+    temporarilyBlockedFields: Object.freeze(profileSelection.blockedFields || []),
+    blockedReasonCode: baseProfileReadiness.missingUserData?.length
+      ? "MISSING_PROFILE_DATA"
+      : profileSelection.failureCode || ""
+  });
+  const selectedProfileGoal = profileSelection.goal;
+  const profileGoal = paymentReviewBoundary.observed
+    && selectedProfileGoal
+    && !/email|phone|contact/.test(lower(`${selectedProfileGoal.semanticType || ""} ${selectedProfileGoal.logicalFieldId || ""}`))
+      ? null
+      : selectedProfileGoal;
+  const surfaceClass = surfaceClassFrom(page);
+  const siteFailure = surfaceClass === "site_failure" && foreground
+    ? Object.freeze({
+        active: true,
+        surfaceId: surface.id || "",
+        message: clean(surface.label || surface.text || "The checkout site reported an unrecoverable error.").slice(0, 600),
+        observedControlIds: Object.freeze((page.controls || [])
+          .filter((control) => controlBelongsToCurrentSurface(control, page))
+          .map((control) => control.controlId)
+          .filter(Boolean))
+      })
     : null;
   const observedTerminalStatus = terminalForStage(stage);
   const previousTerminalLatch = previousTaskState.terminalGoalLatch || {};
-  const paymentCompletionObserved = observedTerminalStatus === "payment_review_reached";
+  const pendingPaymentReviewContact = Boolean(
+    paymentReviewBoundary.observed
+    && paymentReviewBoundary.pendingContactControlIds.length
+  );
+  const paymentCompletionObserved = !siteFailure
+    && paymentReviewBoundary.observed
+    && !pendingPaymentReviewContact
+    && transactionReview?.ready === true;
+  const transactionReviewBlocked = !siteFailure
+    && paymentReviewBoundary.observed
+    && !pendingPaymentReviewContact
+    && transactionReview?.ready !== true;
   const terminalGoalLatch = Object.freeze(paymentCompletionObserved || previousTerminalLatch.locked === true
     ? {
         locked: true,
@@ -924,22 +921,39 @@ function reduceTaskState({
     && !["unknown", "flight_selection"].includes(previousStage)
     && previousTaskState.terminalStatus === "active"
   );
+  // Payment-looking UI is evidence of the stage, not proof that the requested
+  // transaction reached review intact. Only the verified transaction envelope
+  // may complete and latch the task.
+  const effectiveObservedTerminalStatus = (siteFailure
+    || transactionReviewBlocked
+    || observedTerminalStatus === "payment_review_reached")
+    ? "active"
+    : observedTerminalStatus;
   const terminalStatus = terminalGoalLatch.locked
     ? "payment_review_reached"
-    : (leftActiveCheckout ? "checkout_left" : observedTerminalStatus);
-  const { transactionOutcome, stageOutcome } = durableOutcomeHierarchy(previousTaskState, stage, terminalStatus);
+    : (leftActiveCheckout ? "checkout_left" : effectiveObservedTerminalStatus);
+  const { transactionOutcome, stageOutcome } = durableOutcomeHierarchy(
+    previousTaskState,
+    siteFailure ? "unknown" : stage,
+    terminalStatus
+  );
   const paymentEvidence = Object.freeze({
     ...stageDecisionEvidence.payment,
     signalCount: stageDecisionEvidence.paymentSignals,
+    boundaryObserved: paymentReviewBoundary.observed,
+    pendingContact: pendingPaymentReviewContact,
+    boundary: paymentReviewBoundary,
     currentlyObserved: paymentCompletionObserved,
-    observed: terminalGoalLatch.locked
+    observed: terminalGoalLatch.locked,
+    transactionVerified: transactionReview?.ready === true,
+    missingTransactionFacts: Object.freeze(transactionReview?.missingFacts || []),
+    transactionContradictions: Object.freeze(transactionReview?.contradictions || [])
   });
   const checkoutBoundary = Object.freeze({
     status: stageDecisionEvidence.newSearchRoute ? "new_search_page" : "checkout",
     leftActiveCheckout,
     route: stageDecisionEvidence.url
   });
-  const surfaceClass = surfaceClassFrom(page);
   const foregroundOwnsProfileGoal = Boolean(profileGoal && (page.controls || []).some((control) => (
     controlBelongsToCurrentSurface(control, page)
     && String(control.fieldType || control.field || "") === String(profileGoal.semanticType || "")
@@ -947,14 +961,49 @@ function reduceTaskState({
   let currentGoal = null;
   let ambiguityReason = "";
   if (terminalStatus === "active") {
-    if (profileGoal && (!foreground || foregroundOwnsProfileGoal)) {
+    if (siteFailure) {
+      // The foreground failure owns the page. Background traveler fields and
+      // decisions remain durable facts, but they cannot create an action goal
+      // until the failure surface is gone.
+      currentGoal = null;
+    } else if (paymentReviewBoundary.observed && !profileGoal) {
+      currentGoal = null;
+      ambiguityReason = pendingPaymentReviewContact
+        ? "payment_review_contact_incomplete"
+        : transactionReviewBlocked
+          ? "transaction_review_incomplete"
+          : "payment_review_boundary";
+    } else if (profileGoal && (!foreground || foregroundOwnsProfileGoal)) {
       currentGoal = Object.freeze(profileGoal);
+    } else if (profileReadiness.profileStage && !profileReadiness.ready && !profileGoal) {
+      // An unresolved profile field with no executable actuator must not be
+      // replaced by a navigation or unrelated surface goal. A fresh
+      // observation will re-evaluate every temporarily blocked field.
+      currentGoal = null;
     } else if (activeDecisions.length) {
       const decision = activeDecisions[0];
       const surfaceCapabilities = (page.controls || []).filter((control) => (
         controlBelongsToCurrentSurface(control, page) && controlHasExecutableCapability(control)
       ));
-      if (!capabilitiesForDecision(decision, observation).length && surfaceCapabilities.length) {
+      const decisionCapabilities = capabilitiesForDecision(decision, observation);
+      const optionContract = decisionOptionContract(decision, observation);
+      const viableControlIds = optionContract.policyChoiceBounded
+        ? optionContract.policyAllowedControlIds
+        : optionContract.eligibleControlIds;
+      const viableDecisionCapabilities = decisionCapabilities.filter((control) => (
+        viableControlIds.includes(control.controlId)
+      ));
+      if (!viableDecisionCapabilities.length && decisionCapabilities.length) {
+        const blockedGoal = goalForDecision(decision, observation, userPolicy, traveler);
+        currentGoal = Object.freeze({
+          ...blockedGoal,
+          ambiguity: Object.freeze({
+            code: "NO_POLICY_ALLOWED_CANDIDATE",
+            reason: "The current decision has executable options, but none matches the selected profile and safety policy."
+          })
+        });
+        ambiguityReason = "no_policy_allowed_candidate";
+      } else if (!decisionCapabilities.length && surfaceCapabilities.length) {
         currentGoal = ambiguityGoal(observation, "no_goal_relevant_candidate");
         ambiguityReason = currentGoal.ambiguityReason;
       } else {
@@ -970,6 +1019,8 @@ function reduceTaskState({
       ambiguityReason = currentGoal.ambiguityReason;
     } else if (controlIds.length) {
       currentGoal = navigationGoal(observation, controlIds);
+    } else if (blockedNavigationDecision) {
+      currentGoal = blockedNavigationGoal(observation, blockedNavigationDecision);
     } else {
       const currentCapabilities = (page.controls || []).filter((control) => controlBelongsToCurrentSurface(control, page));
       if (foreground || currentCapabilities.length) {
@@ -999,13 +1050,18 @@ function reduceTaskState({
     userPreferences: Object.freeze({
       bookingRules: clean(userPolicy.bookingRules || traveler.booking_rules),
       extras: clean(userPolicy.extras),
-      seats: clean(userPolicy.seats),
+      seatPolicy: seatPolicyFrom({ userPolicy, traveler }),
       baggage: clean(userPolicy.baggage)
     }),
     safetyRestrictions: Object.freeze({
-      declinePaidExtras: ["seat", "baggage", "insurance", "extras"].some((family) => policyDeclinesPaidExtras(userPolicy, traveler, family)),
+      declinePaidExtras: normalizedProfilePolicy.constraints.noPaidExtras === true
+        || Object.values(normalizedProfilePolicy.constraints.noPaidByFamily || {}).some(Boolean),
       declinePaidExtrasByFamily: Object.freeze(Object.fromEntries(
-        ["seat", "baggage", "insurance", "extras"].map((family) => [family, policyDeclinesPaidExtras(userPolicy, traveler, family)])
+        ["seat", "baggage", "insurance", "extras"].map((family) => [
+          family,
+          normalizedProfilePolicy.constraints.noPaidExtras === true
+            || normalizedProfilePolicy.constraints.noPaidByFamily?.[family] === true
+        ])
       )),
       paymentSubmissionRequiresApproval: true,
       paymentCredentialsBlocked: true
@@ -1016,11 +1072,13 @@ function reduceTaskState({
     stage,
     foregroundSurface: Object.freeze(surface),
     surfaceClass,
+    siteFailure,
     transactionOutcome,
     stageOutcome,
     surfaceSubgoal,
     activeDecisions: Object.freeze(activeDecisions),
     observedDecisions: Object.freeze(observedDecisions),
+    canonicalDecisions,
     completedOutcomes: Object.freeze([...completions.values()].slice(-160)),
     currentGoal,
     terminalStatus,
@@ -1040,7 +1098,14 @@ function reduceTaskState({
     previousActionResult: previousActionResult || null,
     ambiguityReason,
     semanticOwnershipResolutions: Object.freeze(page.semanticOwnershipResolutions || []),
+    semanticReadiness: semanticCompilation.semanticReadiness,
+    semanticCompilation: Object.freeze({
+      unownedMaterialControls: Object.freeze(semanticCompilation.unownedMaterialControls || []),
+      unresolvedDecisions: Object.freeze(semanticCompilation.unresolvedDecisions || []),
+      currentExecutableObligations: Object.freeze(semanticCompilation.currentExecutableObligations || [])
+    }),
     profileReadiness,
+    transactionReview: transactionReview ? Object.freeze(transactionReview) : null,
     parentObjective: parentObjective || previousTaskState.parentObjective || null
   });
 }

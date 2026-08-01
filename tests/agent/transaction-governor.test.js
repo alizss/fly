@@ -5,22 +5,26 @@ const os = require("os");
 const path = require("path");
 
 const { createStore } = require("../../apps/web/agent/session-store");
+const { listTraces } = require("../../apps/web/agent/trace-store");
 const { governAction } = require("../../apps/web/agent/action-governor");
 const {
-  dateValueForField,
-  normalizedPhoneParts,
   profileStageReadiness,
   deriveProfileGoal,
+  selectExecutableProfileGoal,
   profileGoalSatisfied,
   candidatesForProfileGoal,
   actionForProfileCandidate,
   normalizeProfileFieldType
 } = require("../../apps/web/agent/skill-expander");
+const { desiredProfileValue } = require("../../apps/web/agent/logical-field");
+const { encodeDateForField } = require("../../apps/web/agent/date-field-codec");
 const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
 const { deriveObservationGoal } = require("../../apps/web/agent/observation-candidates");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
+const { semanticGoalKey } = require("../../packages/shared/agent-actions");
 
 function actionableCapability(operation, actuatorId, { inViewport = true, actuatorIds = [actuatorId] } = {}) {
   const actionability = {
@@ -31,7 +35,9 @@ function actionableCapability(operation, actuatorId, { inViewport = true, actuat
     inCurrentSurface: true,
     hitTested: inViewport,
     notOccluded: inViewport,
+    targetable: inViewport,
     operationAuthorized: true,
+    operationProven: true,
     executable: inViewport,
     revealable: !inViewport,
     code: inViewport ? "ACTIONABLE" : "ACTUATOR_OUT_OF_VIEW",
@@ -332,7 +338,7 @@ test("risk-scoped governor preserves unrelated conflicts but blocks selected own
   fs.rmSync(selectedDb.dir, { recursive: true, force: true });
 });
 
-test("P0.2/P0.6 persists a failed actuator and forbids the identical retry across observations", () => {
+test("persisted failed-actuator diagnostics do not veto backend-scheduled retries", () => {
   const { dir, dbPath } = tempDb();
   const { state, observation } = fixture();
   const store = createStore({ dbPath });
@@ -401,7 +407,7 @@ test("P0.2/P0.6 persists a failed actuator and forbids the identical retry acros
     risk: "safe",
     reason: "Try the same actuator again."
   };
-  const blocked = governAction({
+  const samePageRetry = governAction({
     action: repeatedAction,
     state: failedState,
     observation,
@@ -409,42 +415,33 @@ test("P0.2/P0.6 persists a failed actuator and forbids the identical retry acros
     store,
     turnId: "turn_repeat_failed"
   });
-  assert.equal(blocked.allow, false);
-  assert.equal(blocked.code, "FAILED_ACTUATOR_REUSE");
+  assert.equal(samePageRetry.allow, true);
 
-  const differentDecisionInstance = governAction({
+  const changedObservation = {
+    ...observation,
+    observationId: "obs_2",
+    observationSnapshot: { snapshotHash: "hash_2" },
+    page: {
+      ...observation.page,
+      snapshotHash: "hash_2"
+    }
+  };
+  store.recordObservation(state.id, changedObservation);
+  const changedPageRetry = governAction({
     action: {
       ...repeatedAction,
-      id: "act_same_control_next_leg",
-      decisionInstanceId: "surface_1|flight_2|trav_1|dg_baggage_confirm"
+      id: "act_same_actuator_changed_page",
+      observationId: changedObservation.observationId,
+      observationHash: changedObservation.observationSnapshot.snapshotHash
     },
     state: failedState,
-    observation,
+    observation: changedObservation,
     traveler: { id: "trav_1", booking_rules: "no extras" },
     store,
-    turnId: "turn_same_control_next_leg"
+    turnId: "turn_same_actuator_changed_page"
   });
-  assert.equal(differentDecisionInstance.allow, true);
+  assert.equal(changedPageRetry.allow, true);
 
-  const alternateAction = {
-    ...repeatedAction,
-    id: "act_alternate",
-    targetId: "el_decline_label",
-    targetSnapshot: {
-      ...repeatedAction.targetSnapshot,
-      id: "el_decline_label"
-    },
-    reason: "Use another canonical actuator."
-  };
-  const alternate = governAction({
-    action: alternateAction,
-    state: failedState,
-    observation,
-    traveler: { id: "trav_1", booking_rules: "no extras" },
-    store,
-    turnId: "turn_alternate"
-  });
-  assert.equal(alternate.allow, true);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -837,17 +834,16 @@ function completeProfileObservation({ observationId = "obs_complete_profile", fi
 }
 
 test("P0.4 normalizes phone parts and field-specific dates", () => {
-  assert.deepEqual(normalizedPhoneParts({ phone: "+386 70 328 922", nationality: "Slovenia" }), {
-    countryCode: "+386",
-    localNumber: "70328922"
-  });
-  assert.equal(dateValueForField("2003-05-31", { kind: "text", placeholder: "DD-MM-YYYY" }), "31-05-2003");
-  assert.equal(dateValueForField("2003-05-31", { kind: "date" }), "2003-05-31");
-  assert.equal(dateValueForField("2003-05-31", {
+  const traveler = { phone: "+386 70 328 922", nationality: "Slovenia" };
+  assert.equal(desiredProfileValue("phone_country_code", traveler), "+386");
+  assert.equal(desiredProfileValue("phone", traveler), "70328922");
+  assert.equal(encodeDateForField("2003-05-31", { kind: "text", placeholder: "DD-MM-YYYY" }).value, "31-05-2003");
+  assert.equal(encodeDateForField("2003-05-31", { kind: "date" }).value, "2003-05-31");
+  assert.equal(encodeDateForField("2003-05-31", {
     kind: "select",
     label: "Month",
     options: [{ value: "05", label: "May" }]
-  }), "05");
+  }).value, "05");
 });
 
 test("profile field aliases normalize without loose substring matches", () => {
@@ -926,6 +922,370 @@ test("generic planning cannot own a recognized mismatched profile field", () => 
   assert.equal(candidates[0].controlId.includes("title_0"), true);
 });
 
+test("profile candidate actionability follows the enabled operation actuator, not a disabled state element", () => {
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "first_name", "last_name", "date_of_birth"]);
+  const observation = completeProfileObservation({
+    observationId: "obs_title_custom_actuator",
+    filled
+  });
+  observation.page.fields = observation.page.fields.filter((field) => field.semantic !== "title");
+  observation.page.controls = observation.page.controls.filter((control) => control.semantic !== "title");
+
+  const open = actionableCapability("open", "el_title_visible_wrapper");
+  observation.page.fields.push({
+    id: "el_title_hidden_state",
+    controlId: "ctrl_title_custom",
+    field: "title",
+    fieldType: "title",
+    semantic: "title",
+    label: "Title",
+    kind: "select",
+    role: "combobox",
+    required: true,
+    hasValue: false,
+    controlState: { disabled: true, normalizedValue: "", valuePresent: false },
+    sectionType: "passenger",
+    decisionGroupId: "dg_title_custom"
+  });
+  observation.page.controls.push({
+    controlId: "ctrl_title_custom",
+    label: "Title",
+    kind: "select",
+    role: "combobox",
+    semantic: "title",
+    fieldType: "title",
+    risk: "safe",
+    sectionType: "passenger",
+    decisionGroupId: "dg_title_custom",
+    surfaceId: "",
+    state: { disabled: true, normalizedValue: "", valuePresent: false },
+    stateElementId: "el_title_hidden_state",
+    preferredActivationElementId: "el_title_visible_wrapper",
+    actuators: [
+      { nodeId: "el_title_hidden_state", relation: "state" },
+      { nodeId: "el_title_visible_wrapper", relation: "activation" }
+    ],
+    operations: {
+      activate: null,
+      open: { ...open, expectedOutcome: "options_surface_appeared" },
+      choose: null,
+      type: null,
+      select: null
+    }
+  });
+
+  const traveler = {
+    first_name: "Ali",
+    last_name: "SIFRAR",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    gender: "male",
+    date_of_birth: "2003-05-31"
+  };
+  const goal = deriveProfileGoal(observation, traveler);
+  const candidateSet = buildCurrentCandidateSet({ goal, observation, traveler });
+
+  assert.equal(goal.semanticType, "title");
+  assert.equal(candidateSet.candidates.length, 1);
+  assert.equal(candidateSet.candidates[0].operation, "open");
+  assert.equal(candidateSet.candidates[0].targetId, "el_title_visible_wrapper");
+  assert.equal(candidateSet.candidates[0].exclusionReason, "");
+
+  const blockedCandidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+    state: { approvals: {} },
+    traveler,
+    approvals: {},
+    blockedProfileGoalKeys: [semanticGoalKey(goal)]
+  });
+  assert.equal(blockedCandidateSet.candidates.length, 0);
+  assert.equal(
+    blockedCandidateSet.excludedCandidates.some((candidate) => (
+      candidate.controlId === "ctrl_title_custom"
+      && candidate.exclusionReason === "PROFILE_GOAL_BLOCKED_ON_UNCHANGED_PAGE"
+    )),
+    true
+  );
+});
+
+test("profile scheduler exhausts the unchanged Title actuator then dispatches actionable Nationality", async () => {
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "first_name", "last_name", "date_of_birth"]);
+  const observation = completeProfileObservation({
+    observationId: "obs_reschedule_title_to_nationality",
+    filled
+  });
+  const nationalityField = {
+    id: "el_rescheduled_nationality",
+    controlId: "ctrl_rescheduled_nationality",
+    field: "nationality",
+    fieldType: "nationality",
+    semantic: "nationality",
+    label: "Nationality",
+    kind: "select",
+    role: "combobox",
+    options: [{ value: "Slovenia", label: "Slovenia" }],
+    required: true,
+    hasValue: false,
+    controlState: { disabled: false, normalizedValue: "", valuePresent: false },
+    sectionType: "passenger",
+    decisionGroupId: "dg_rescheduled_nationality"
+  };
+  const nationalityControl = {
+    controlId: nationalityField.controlId,
+    label: nationalityField.label,
+    kind: nationalityField.kind,
+    role: nationalityField.role,
+    semantic: nationalityField.semantic,
+    fieldType: nationalityField.fieldType,
+    risk: "safe",
+    sectionType: "passenger",
+    decisionGroupId: nationalityField.decisionGroupId,
+    surfaceId: "",
+    state: { disabled: false, normalizedValue: "", valuePresent: false },
+    stateElementId: nationalityField.id,
+    preferredActivationElementId: nationalityField.id,
+    actuators: [{ nodeId: nationalityField.id, relation: "state" }],
+    operations: {
+      activate: null,
+      open: null,
+      choose: null,
+      type: null,
+      select: actionableCapability("select", nationalityField.id)
+    }
+  };
+  const titleControlIndex = observation.page.controls.findIndex((control) => control.semantic === "title");
+  observation.page.fields.splice(titleControlIndex + 2, 0, nationalityField);
+  observation.page.controls.splice(titleControlIndex + 2, 0, nationalityControl);
+
+  const traveler = {
+    id: "trav_reschedule_profile",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    gender: "male",
+    nationality: "Slovenia",
+    date_of_birth: "2003-05-31"
+  };
+  const initialTaskState = reduceTaskState({ observation, traveler });
+  const titleGoal = initialTaskState.currentGoal;
+  const titleCandidate = loopPrivate.groundedObservationCandidateSet(titleGoal, observation, [], {
+    state: { taskState: initialTaskState, approvals: {} },
+    traveler,
+    approvals: {}
+  }).candidates[0];
+  assert.equal(titleGoal.semanticType, "title");
+  assert.equal(titleCandidate.controlId.includes("title_0"), true);
+
+  const { dir, dbPath } = tempDb();
+  const state = createCheckoutSessionState({
+    goal: "Complete traveler information",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: observation.page.url }
+  });
+  state.id = "txn_reschedule_title_to_nationality";
+  state.taskState = initialTaskState;
+  state.currentGoal = titleGoal;
+  state.failedStrategyMemory = [{
+    goalKey: loopPrivate.semanticGoalRecoveryKey(titleGoal, observation),
+    semanticGoalKey: semanticGoalKey(titleGoal),
+    strategySignature: loopPrivate.candidateStrategySignature(titleGoal, titleCandidate),
+    pageStateHash: observation.observationSnapshot.snapshotHash,
+    failureCount: 1
+  }];
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+
+  const loopResult = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_reschedule_title_to_nationality"
+  });
+
+  assert.equal(loopResult.clientDecision.action, "select", JSON.stringify({
+    action: loopResult.clientDecision.action,
+    controlId: loopResult.clientDecision.controlId,
+    semanticType: loopResult.state.taskState.currentGoal?.semanticType,
+    blockedProfileGoalKeys: loopResult.state.blockedProfileGoalKeys
+  }));
+  assert.equal(loopResult.clientDecision.controlId, nationalityField.controlId);
+  assert.equal(loopResult.clientDecision.targetId, nationalityField.id);
+  assert.equal(loopResult.state.taskState.currentGoal.semanticType, "nationality");
+  assert.deepEqual(loopResult.state.blockedProfileGoalKeys, [semanticGoalKey(titleGoal)]);
+  assert.equal(
+    loopResult.state.blockedProfilePageStateHash,
+    observation.observationSnapshot.snapshotHash
+  );
+  assert.equal(loopResult.debug.modelUsage.calls.length, 0);
+
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("profile goal selection skips a blocked custom dropdown and keeps scanning in DOM order", async () => {
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "first_name", "last_name", "date_of_birth"]);
+  const observation = completeProfileObservation({
+    observationId: "obs_skip_blocked_title",
+    filled
+  });
+  const titleField = observation.page.fields.find((field) => field.semantic === "title" && field.label === "Mr");
+  const titleControl = observation.page.controls.find((control) => control.controlId === titleField.controlId);
+  observation.page.fields = observation.page.fields.filter((field) => (
+    field.semantic !== "title" || field.controlId === titleField.controlId
+  ));
+  observation.page.controls = observation.page.controls.filter((control) => (
+    control.semantic !== "title" || control.controlId === titleControl.controlId
+  ));
+  titleField.kind = "select";
+  titleField.role = "combobox";
+  titleField.controlState.disabled = true;
+  titleField.controlState.optionValue = "";
+  titleField.controlState.selectedValue = "";
+  titleControl.kind = "select";
+  titleControl.role = "combobox";
+  titleControl.state.disabled = true;
+  titleControl.state.optionValue = "";
+  titleControl.state.selectedValue = "";
+  titleControl.stateElementId = titleField.id;
+  titleControl.operations = {
+    activate: null,
+    open: {
+      ...actionableCapability("open", titleField.id),
+      actionability: {
+        ...actionableCapability("open", titleField.id).actionability,
+        enabled: false,
+        hitTested: false,
+        executable: false,
+        code: "ACTUATOR_DISABLED"
+      },
+      actionabilityByActuator: {
+        [titleField.id]: {
+          ...actionableCapability("open", titleField.id).actionability,
+          enabled: false,
+          hitTested: false,
+          executable: false,
+          code: "ACTUATOR_DISABLED"
+        }
+      }
+    },
+    choose: null,
+    type: null,
+    select: null
+  };
+
+  const nationalityField = {
+    id: "el_nationality_after_title",
+    controlId: "ctrl_nationality_after_title",
+    field: "nationality",
+    fieldType: "nationality",
+    semantic: "nationality",
+    label: "Nationality",
+    kind: "select",
+    role: "combobox",
+    options: [{ value: "Slovenia", label: "Slovenia" }],
+    required: true,
+    hasValue: false,
+    controlState: { disabled: false, normalizedValue: "", valuePresent: false },
+    sectionType: "passenger"
+  };
+  const nationalityControl = {
+    controlId: nationalityField.controlId,
+    label: nationalityField.label,
+    kind: nationalityField.kind,
+    role: nationalityField.role,
+    semantic: nationalityField.semantic,
+    fieldType: nationalityField.fieldType,
+    risk: "safe",
+    sectionType: "passenger",
+    surfaceId: "",
+    state: { disabled: false, normalizedValue: "", valuePresent: false },
+    stateElementId: nationalityField.id,
+    actuators: [{ nodeId: nationalityField.id, relation: "state" }],
+    operations: {
+      activate: null,
+      open: null,
+      choose: null,
+      type: null,
+      select: actionableCapability("select", nationalityField.id)
+    }
+  };
+  const titleIndex = observation.page.controls.indexOf(titleControl);
+  observation.page.fields.splice(titleIndex + 1, 0, nationalityField);
+  observation.page.controls.splice(titleIndex + 1, 0, nationalityControl);
+
+  const traveler = {
+    email: "ali@example.test",
+    phone: "+38670328922",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    gender: "male",
+    nationality: "Slovenia",
+    date_of_birth: "2003-05-31"
+  };
+  const selection = selectExecutableProfileGoal(observation, traveler);
+
+  assert.equal(selection.goal.semanticType, "nationality");
+  assert.equal(selection.candidates.length, 1);
+  assert.equal(selection.candidates[0].targetId, nationalityField.id);
+  assert.deepEqual(selection.blockedFields.map((field) => field.semanticType), ["title"]);
+  assert.notEqual(selection.candidates[0].targetId, titleField.id);
+  const taskState = reduceTaskState({ observation, traveler });
+  assert.equal(taskState.currentGoal.semanticType, "nationality");
+  assert.deepEqual(
+    taskState.profileReadiness.temporarilyBlockedFields.map((field) => field.semanticType),
+    ["title"]
+  );
+
+  nationalityField.hasValue = true;
+  nationalityField.controlState.valuePresent = true;
+  nationalityField.controlState.normalizedValue = "slovenia";
+  nationalityControl.state.valuePresent = true;
+  nationalityControl.state.normalizedValue = "slovenia";
+  const blocked = selectExecutableProfileGoal(observation, traveler);
+  assert.equal(blocked.goal, null);
+  assert.equal(blocked.failureCode, "MISSING_EXECUTABLE_ACTUATOR");
+  const blockedTaskState = reduceTaskState({
+    previousTaskState: taskState,
+    observation: {
+      ...observation,
+      observationId: "obs_all_profile_fields_blocked"
+    },
+    traveler
+  });
+  assert.equal(blockedTaskState.currentGoal, null);
+  assert.equal(blockedTaskState.profileReadiness.blockedReasonCode, "MISSING_EXECUTABLE_ACTUATOR");
+
+  const { dir, dbPath } = tempDb();
+  const state = createCheckoutSessionState({
+    goal: "Complete traveler information",
+    site: { host: "example.test", url: observation.page.url }
+  });
+  state.id = "txn_all_profile_actuators_blocked";
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+  const loopResult = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_all_profile_actuators_blocked"
+  });
+  assert.equal(loopResult.clientDecision.action, "stop");
+  assert.match(loopResult.clientDecision.reason, /^MISSING_EXECUTABLE_ACTUATOR:/);
+  assert.equal(loopResult.debug.modelUsage.calls.length, 0);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test("profile DOB candidate carries formatted input and canonical verification", () => {
   const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "title", "first_name", "last_name"]);
   const observation = completeProfileObservation({ observationId: "obs_dob_codec", filled });
@@ -948,7 +1308,7 @@ test("profile DOB candidate carries formatted input and canonical verification",
   assert.equal(candidate.expectedOutcome.expectedCanonicalValue, "2003-05-31");
 });
 
-test("profile DOB goal publishes no executable candidate when format evidence is ambiguous", () => {
+test("profile DOB ambiguity publishes only three grounded bounded strategies before handoff", () => {
   const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "title", "first_name", "last_name"]);
   const observation = completeProfileObservation({ observationId: "obs_dob_ambiguous", filled });
   const field = observation.page.fields.find((item) => item.semantic === "date_of_birth");
@@ -968,7 +1328,18 @@ test("profile DOB goal publishes no executable candidate when format evidence is
   };
   const goal = deriveProfileGoal(observation, traveler);
   assert.equal(goal.codecError.code, "AMBIGUOUS_DATE_FORMAT");
-  assert.deepEqual(candidatesForProfileGoal(goal, observation, traveler), []);
+  const candidates = candidatesForProfileGoal(goal, observation, traveler);
+  assert.equal(candidates.length, 3);
+  assert.deepEqual(candidates.map((candidate) => candidate.value), [
+    "31/05/2003",
+    "05/31/2003",
+    "2003-05-31"
+  ]);
+  assert.equal(candidates.every((candidate) => candidate.requiresJudgment), true);
+  assert.equal(candidates.every((candidate) => candidate.controlId === control.controlId), true);
+  const selection = selectExecutableProfileGoal(observation, traveler);
+  assert.equal(selection.goal, null);
+  assert.equal(selection.failureCode, "SEMANTIC_AMBIGUITY");
 });
 
 test("P0 scoped validation blocks only its canonical profile owner or an explicit stage-wide issue", () => {
@@ -1122,7 +1493,7 @@ test("Unified profile loop asks only when required user data is genuinely missin
           activate: null,
           open: null,
           choose: null,
-          type: { operation: "type", actuatorId: "el_passport", actuatorIds: ["el_passport"] },
+          type: actionableCapability("type", "el_passport"),
           select: null
         }
       }]
@@ -1150,9 +1521,191 @@ test("Unified profile loop asks only when required user data is genuinely missin
   });
 
   assert.equal(result.clientDecision.action, "ask_user");
-  assert.match(result.clientDecision.reason, /Passport number/);
-  assert.match(result.clientDecision.reason, /not available/i);
+  assert.match(result.clientDecision.reason, /^MISSING_PROFILE_DATA:/);
+  assert.match(result.clientDecision.reason, /passport number/i);
+  assert.deepEqual(result.clientDecision.inputRequest, {
+    requestId: "profile_input_txn_missing_passport_passport_number",
+    field: "passport_number",
+    label: "passport number",
+    subjectId: traveler.id,
+    sensitive: true
+  });
+  assert.equal(result.state.pendingUserInput.field, "passport_number");
   assert.equal(result.debug.modelUsage.calls.length, 0);
+
+  const resumed = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: result.state,
+    observation,
+    traveler,
+    userMessage: "",
+    userResponse: {
+      requestId: result.clientDecision.inputRequest.requestId,
+      field: "passport_number",
+      valueRef: "profile://session/document_number",
+      hasValue: true
+    },
+    transactionStore: store,
+    clientTurnId: "turn_missing_passport_answered"
+  });
+
+  assert.equal(resumed.clientDecision.action, "type");
+  assert.equal(resumed.clientDecision.value, "profile://document_number");
+  assert.equal(resumed.state.pendingUserInput, null);
+  assert.equal(resumed.state.sessionProfileOverrides.passport_number, "profile://document_number");
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("completed form briefly settles disabled navigation, then reveals it for diagnosis", async () => {
+  const { dir, dbPath } = tempDb();
+  const traveler = { id: "trav_blocked_navigation", first_name: "Ali" };
+  const state = createCheckoutSessionState({
+    goal: "Complete traveler information",
+    travelerId: traveler.id,
+    site: { host: "example.test", url: "https://example.test/checkout/traveler" }
+  });
+  state.id = "txn_blocked_navigation";
+  state.currentObligation = {
+    obligationId: "stale_completed_profile_obligation",
+    remainingGoal: { semanticType: "date_of_birth", componentRole: "month" }
+  };
+  const disabledActionability = {
+    rendered: true,
+    visible: true,
+    enabled: false,
+    inViewport: false,
+    inCurrentSurface: true,
+    hitTested: false,
+    notOccluded: false,
+    targetable: false,
+    operationAuthorized: true,
+    operationProven: true,
+    executable: false,
+    revealable: false,
+    code: "ACTUATOR_DISABLED",
+    operation: "activate"
+  };
+  const observation = {
+    observationId: "obs_blocked_navigation",
+    observationSnapshot: { snapshotHash: "hash_blocked_navigation" },
+    page: {
+      site: "example.test",
+      url: "https://example.test/checkout/traveler",
+      step: "traveler_information",
+      snapshotHash: "hash_blocked_navigation",
+      viewport: { width: 1200, height: 800, scrollY: 0 },
+      graphIntegrity: { ok: true, conflicts: [] },
+      currentSurface: { id: "surface-page", type: "page", label: "Traveler information" },
+      controls: [{
+        controlId: "ctrl_first_name",
+        label: "First name",
+        kind: "text",
+        role: "textbox",
+        semantic: "first_name",
+        fieldType: "first_name",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        currentValue: "Ali",
+        state: { disabled: false, valuePresent: true, normalizedValue: "ali" },
+        stateElementId: "el_first_name",
+        preferredActivationElementId: "el_first_name",
+        operations: { type: actionableCapability("type", "el_first_name") },
+        visualRegion: { x: 100, y: 200, width: 240, height: 40, inViewport: true }
+      }, {
+        controlId: "ctrl_continue",
+        label: "Continue",
+        kind: "button",
+        role: "button",
+        semantic: "continue",
+        risk: "safe_continue",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        state: { disabled: true, valuePresent: true, normalizedValue: "continue" },
+        stateElementId: "el_continue",
+        preferredActivationElementId: "el_continue",
+        operations: {
+          activate: {
+            operation: "activate",
+            actuatorId: "el_continue",
+            actuatorIds: ["el_continue"],
+            actionability: disabledActionability,
+            actionabilityByActuator: { el_continue: disabledActionability },
+            strategies: []
+          }
+        },
+        visualRegion: { x: 100, y: 1800, width: 140, height: 48, inViewport: false }
+      }],
+      fields: [{
+        controlId: "ctrl_first_name",
+        field: "first_name",
+        fieldType: "first_name",
+        label: "First name",
+        value: "Ali",
+        hasValue: true,
+        required: true
+      }],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+  const store = createStore({ dbPath });
+  store.saveSession(state);
+  store.recordObservation(state.id, observation);
+
+  const waiting = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: store.getSession(state.id),
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_blocked_navigation"
+  });
+
+  assert.equal(waiting.clientDecision.action, "wait");
+  assert.equal(waiting.clientDecision.semanticIntent, "wait_for_navigation_enablement");
+  assert.equal(waiting.clientDecision.readinessStartedAt, waiting.state.navigationSettling.startedAt);
+  assert.equal(waiting.clientDecision.readinessDeadlineAt, waiting.state.navigationSettling.deadlineAt);
+  assert.equal(waiting.clientDecision.readinessAttempts, 1);
+  assert.equal(waiting.state.navigationSettling.attempts, 1);
+  assert.equal(waiting.state.currentObligation, null);
+  assert.equal(waiting.debug.modelUsage.calls.length, 0);
+  let traces = listTraces(dir, state.id);
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0].executionResult.endingAction, "wait");
+  assert.equal(traces[0].executionResult.endingIntent, "reobserve_blocked_navigation_settling");
+
+  const exhaustedState = {
+    ...waiting.state,
+    navigationSettling: {
+      ...waiting.state.navigationSettling,
+      attempts: 4
+    }
+  };
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: exhaustedState,
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_blocked_navigation_after_settling"
+  });
+
+  assert.equal(result.clientDecision.action, "scroll");
+  assert.equal(result.clientDecision.controlId, "ctrl_continue");
+  assert.match(result.clientDecision.reason, /Reveal the disabled Continue/i);
+  assert.equal(result.state.currentObligation, null);
+  assert.equal(result.debug.modelUsage.calls.length, 0);
+  traces = listTraces(dir, state.id);
+  assert.equal(traces.length, 2);
+  assert.equal(traces[1].executionResult.endingAction, "scroll");
+  assert.equal(traces[1].executionResult.blockedNavigationDiagnostic, true);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -1327,7 +1880,19 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
             operation: "open",
             status: "unproven",
             requiresVisualConfirmation: true,
-            regions: [{ x: 180, y: 100, width: 40, height: 40, viewportWidth: 1200, viewportHeight: 800, surfaceId: "" }]
+            regions: [{
+              x: 180,
+              y: 100,
+              width: 40,
+              height: 40,
+              viewportWidth: 1200,
+              viewportHeight: 800,
+              surfaceId: "",
+              observationId: "obs_visual_country",
+              controlId: "ctrl_visual_country",
+              operation: "open",
+              source: "control.recovery.open"
+            }]
           }
         }
       }]
@@ -1349,6 +1914,18 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
   };
   const candidate = state.currentGoal.candidates.find((item) => item.type === "click_xy");
   assert.ok(candidate);
+  const scheduled = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    traveler,
+    state: { taskState: state.taskState, approvals: {} }
+  });
+  assert.equal(scheduled.candidates.some((item) => item.type === "click_xy"), false);
+  assert.ok(scheduled.recoveryCandidates.some((item) => (
+    item.type === "click_xy"
+    && item.controlId === "ctrl_visual_country"
+    && item.targetId === ""
+  )));
 
   const store = createStore({ dbPath });
   store.saveSession(state);
@@ -1597,6 +2174,32 @@ test("P0.4 blank traveler stage deterministically starts profile ownership befor
   const { state } = fixture();
   const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222", booking_rules: "no extras" };
   const observation = profileFormObservation({ observationId: "obs_profile_owner" });
+  observation.page.controls.push(
+    {
+      controlId: "ctrl_back_obs_profile_owner",
+      label: "Back",
+      kind: "button",
+      role: "button",
+      semantic: "back",
+      state: { disabled: true, valuePresent: false },
+      operations: {}
+    },
+    {
+      controlId: "ctrl_continue_obs_profile_owner",
+      label: "Continue",
+      kind: "button",
+      role: "button",
+      semantic: "continue",
+      state: { disabled: true, valuePresent: false },
+      operations: {}
+    }
+  );
+  observation.page.stageExit = {
+    continueObserved: true,
+    continueDisabled: true,
+    navigationState: "disabled",
+    blockers: ["Continue is disabled"]
+  };
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -1749,6 +2352,82 @@ test("P0.4 profile readiness becomes eligible only after canonical fields and er
   assert.equal(ready.shouldOwn, false);
   assert.equal(invalid.ready, false);
   assert.deepEqual(invalid.visibleErrors, ["Phone invalid"]);
+});
+
+test("P0.4 hidden optional profile controls do not reopen a completed current form", () => {
+  const traveler = {
+    email: "ali@example.test",
+    phone: "+38670328922",
+    nationality: "Slovenia",
+    gender: "male",
+    first_name: "Ali",
+    last_name: "Sifrar",
+    date_of_birth: "2003-05-31"
+  };
+  const filled = new Set(["email", "confirm_email", "phone_country_code", "phone", "title", "first_name", "last_name", "date_of_birth"]);
+  const observation = completeProfileObservation({ observationId: "obs_hidden_billing", filled });
+  const hiddenActionability = {
+    rendered: false,
+    visible: false,
+    enabled: false,
+    inViewport: false,
+    inCurrentSurface: true,
+    executable: false,
+    revealable: false,
+    code: "NOT_RENDERED",
+    operation: "type"
+  };
+  for (const semanticType of ["first_name", "last_name"]) {
+    const controlId = `ctrl_hidden_billing_${semanticType}`;
+    const stateElementId = `el_hidden_billing_${semanticType}`;
+    observation.page.fields.push({
+      id: stateElementId,
+      controlId,
+      field: semanticType,
+      fieldType: semanticType,
+      label: `Billing ${semanticType}`,
+      kind: "text",
+      role: "textbox",
+      sectionType: "billing",
+      required: false,
+      hasValue: false,
+      controlState: { valuePresent: false, normalizedValue: "" }
+    });
+    observation.page.controls.push({
+      controlId,
+      stableKey: `field|billing|${semanticType}`,
+      label: `Billing ${semanticType}`,
+      kind: "text",
+      role: "textbox",
+      semantic: semanticType,
+      fieldType: semanticType,
+      sectionType: "billing",
+      required: false,
+      stateElementId,
+      actuators: [{ nodeId: stateElementId, relation: "state" }],
+      state: { disabled: false, valuePresent: false, normalizedValue: "" },
+      operations: {
+        activate: null,
+        open: null,
+        choose: null,
+        select: null,
+        type: {
+          operation: "type",
+          actuatorId: stateElementId,
+          actuatorIds: [stateElementId],
+          actionability: hiddenActionability,
+          actionabilityByActuator: { [stateElementId]: hiddenActionability }
+        }
+      }
+    });
+  }
+
+  const readiness = profileStageReadiness(observation, traveler);
+  const selection = selectExecutableProfileGoal(observation, traveler);
+  assert.equal(readiness.ready, true);
+  assert.deepEqual(readiness.unresolvedKnown, []);
+  assert.equal(selection.goal, null);
+  assert.deepEqual(selection.blockedFields, []);
 });
 
 test("P0.7 a pending ordinary action rebinds after viewport recovery without a model call", async () => {

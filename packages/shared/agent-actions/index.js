@@ -32,7 +32,13 @@
  * @property {Object} [targetSnapshot]
  * @property {Object} [expectedOutcome]
  * @property {Object} [affordance]
+ * @property {Object} [pipelineContract]
+ * @property {"proven_executable"|"recoverable"|"unproven_experiment"|"unavailable"} [capabilityStatus]
+ * @property {"normal"|"reveal"|"bounded_recovery"|"unavailable"} [executionChannel]
+ * @property {"direct_input"|"native_select"|"native_click"|"pointer_sequence"|"focus_enter"|"focus_space"|"focus_arrow_down"|"visual_coordinate"|"browser_trusted_input"|"browser_trusted_choice"} [interactionMethod]
+ * @property {boolean} [boundedRecovery]
  * @property {string} [value]
+ * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}} [inputRequest]
  * @property {number} [x]
  * @property {number} [y]
  * @property {VisualRegion} [visualRegion]
@@ -105,7 +111,7 @@ function normalizeVisualRegion(raw = {}, context = {}) {
     viewportWidth: Math.max(0, Math.round(finiteNumber(raw.viewportWidth, context.viewportWidth))),
     viewportHeight: Math.max(0, Math.round(finiteNumber(raw.viewportHeight, context.viewportHeight))),
     surfaceId: String(raw.surfaceId || context.surfaceId || "").slice(0, 120),
-    observationId: String(raw.observationId || context.observationId || "").slice(0, 120),
+    observationId: String(context.observationId || raw.observationId || "").slice(0, 120),
     controlId: String(raw.controlId || context.controlId || "").slice(0, 140),
     operation: String(raw.operation || context.operation || "").slice(0, 40),
     source: String(raw.source || context.source || "").slice(0, 120),
@@ -130,6 +136,23 @@ function normalizeTargetId(value) {
   const id = String(value || "").trim();
   if (!id || /^(false|true|null|undefined|\[object object\])$/i.test(id)) return "";
   return id.slice(0, 120);
+}
+
+function isCandidateGrounded(candidate = {}, observation = {}) {
+  if (normalizeTargetId(candidate.targetId)) return true;
+  const currentObservationId = String(
+    typeof observation === "string"
+      ? observation
+      : observation.observationId || candidate.observationId || ""
+  );
+  const region = normalizeVisualRegion(candidate.visualRegion);
+  return Boolean(
+    currentObservationId
+    && region
+    && region.width > 0
+    && region.height > 0
+    && region.observationId === currentObservationId
+  );
 }
 
 function normalizeAction(raw = {}) {
@@ -170,7 +193,30 @@ function normalizeAction(raw = {}) {
     targetSnapshot: raw.targetSnapshot && typeof raw.targetSnapshot === "object" ? raw.targetSnapshot : null,
     expectedOutcome: raw.expectedOutcome && typeof raw.expectedOutcome === "object" ? raw.expectedOutcome : null,
     affordance: raw.affordance && typeof raw.affordance === "object" ? raw.affordance : null,
+    pipelineContract: raw.pipelineContract && typeof raw.pipelineContract === "object" ? raw.pipelineContract : null,
+    capabilityStatus: raw.capabilityStatus ? String(raw.capabilityStatus).slice(0, 60) : "",
+    executionChannel: raw.executionChannel ? String(raw.executionChannel).slice(0, 60) : "",
+    interactionMethod: raw.interactionMethod ? String(raw.interactionMethod).slice(0, 80) : "",
+    boundedRecovery: raw.boundedRecovery === true,
+    exactOption: raw.exactOption && typeof raw.exactOption === "object"
+      ? {
+          canonicalValue: String(raw.exactOption.canonicalValue || "").slice(0, 600),
+          siteValue: String(raw.exactOption.siteValue || "").slice(0, 600),
+          label: String(raw.exactOption.label || "").slice(0, 600),
+          controlId: String(raw.exactOption.controlId || raw.controlId || "").slice(0, 160),
+          source: String(raw.exactOption.source || "").slice(0, 120)
+        }
+      : null,
     value: raw.value ? String(raw.value).slice(0, 600) : "",
+    inputRequest: raw.inputRequest && typeof raw.inputRequest === "object"
+      ? {
+          requestId: String(raw.inputRequest.requestId || "").slice(0, 160),
+          field: String(raw.inputRequest.field || "").slice(0, 120),
+          label: String(raw.inputRequest.label || "").slice(0, 160),
+          subjectId: String(raw.inputRequest.subjectId || "").slice(0, 160),
+          sensitive: raw.inputRequest.sensitive === true
+        }
+      : null,
     x: Number.isFinite(Number(raw.x)) ? Math.round(Number(raw.x)) : null,
     y: Number.isFinite(Number(raw.y)) ? Math.round(Number(raw.y)) : null,
     visualRegion: normalizeVisualRegion(region, {
@@ -191,22 +237,40 @@ function normalizeAction(raw = {}) {
   };
 }
 
-/** Stable identity for one physical actuator attempt within a checkout transaction. */
+/**
+ * Stable identity for one physical actuator attempt.
+ * Values and key payloads do not make a retry distinct; only its target,
+ * operation, or dispatch method does. Page-state identity is scoped by the
+ * caller because the same actuator may become valid after a material change.
+ */
 function actuatorSignature(action = {}) {
   const affordance = action.affordance || {};
-  if (affordance.stableKey && affordance.actuator?.stableKey && affordance.effect) {
+  const selectedStrategy = action.pipelineContract?.capability?.selectedStrategy || {};
+  const method = action.interactionMethod || action.type || action.action || "";
+  const operation = action.operation || affordance.capability || "";
+  if (selectedStrategy.actuatorStableKey) {
     return [
-      affordance.stableKey,
-      affordance.actuator.stableKey,
-      affordance.effect,
-      action.value || "",
-      action.keys || "",
-      action.scrollY || ""
+      method,
+      operation,
+      action.pipelineContract?.component?.componentIdentity || affordance.stableKey || action.controlId || "",
+      selectedStrategy.actuatorStableKey
     ].join(":");
   }
-  const type = action.type || action.action || "";
+  if (affordance.stableKey && affordance.actuator?.stableKey && affordance.effect) {
+    return [
+      method,
+      operation,
+      affordance.stableKey,
+      affordance.actuator.stableKey
+    ].join(":");
+  }
   const target = action.targetSnapshot || {};
-  return `${type}:${action.operation || ""}:${action.controlId || target.controlId || ""}:${action.targetId || target.id || `${action.x ?? ""},${action.y ?? ""}`}:${action.value || action.keys || action.scrollY || ""}`;
+  return [
+    method,
+    operation,
+    action.controlId || target.controlId || "",
+    action.targetId || target.id || `${action.x ?? ""},${action.y ?? ""}`
+  ].join(":");
 }
 
 function semanticGoalKey(source = {}) {
@@ -218,7 +282,14 @@ function semanticGoalKey(source = {}) {
     || goal.decisionGroupId
     || "current_goal";
   const normalize = (value) => String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
-  return [stableScope, goal.desiredValue || "", Number.isFinite(Number(goal.ordinal)) ? `ordinal:${Number(goal.ordinal)}` : ""]
+  return [
+    stableScope,
+    goal.logicalFieldId || "",
+    goal.subjectId || "",
+    goal.componentRole || "",
+    goal.desiredValue || "",
+    Number.isFinite(Number(goal.ordinal)) ? `ordinal:${Number(goal.ordinal)}` : ""
+  ]
     .map(normalize)
     .join("|");
 }
@@ -285,11 +356,13 @@ function decisionInstanceKey(source = {}, observation = {}) {
     ].filter(Boolean).join("|")),
     passenger: normalizedInstanceFact(passenger),
     decisionGroup: normalizedInstanceFact(decisionGroupId || group.requirementId || goal.requirementId),
+    logicalField: normalizedInstanceFact(goal.logicalFieldId || ""),
+    componentRole: normalizedInstanceFact(goal.componentRole || ""),
     selectedItem: normalizedInstanceFact(selected)
   });
 }
 
-/** Two actions are "the same attempt" if they'd resolve to the same target+value+type. */
+/** Two actions are the same attempt when method, operation, and target match. */
 function actionSignature(action) {
   return actuatorSignature(action);
 }
@@ -298,6 +371,7 @@ module.exports = {
   normalizeAction,
   normalizeVisualRegion,
   visualRegionsMatch,
+  isCandidateGrounded,
   actionSignature,
   actuatorSignature,
   decisionInstanceKey,

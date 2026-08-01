@@ -5,6 +5,24 @@
 ## 1. Goal
 
 Turn booking a flight from a ~20-field checkout into 1-3 clicks, on any airline/OTA site, using a stored user profile — without hardcoding per-site logic.
+## Ultimate goal
+
+From an already-selected flight, Fly should complete most airline and OTA checkouts using the selected traveler’s facts, preferences, constraints and booking-specific instructions:
+
+```
+understand unfamiliar checkout UI
+→ fill traveler facts
+→ identify required decisions
+→ choose according to this user’s criteria
+→ handle validation and unexpected surfaces
+→ verify every result
+→ reach payment review
+→ stop before payment/legal/purchase
+```
+
+The goal is not “always choose free” or “always decline extras.” The correct choice depends on the user profile. If the profile provides no applicable rule and the choice may change price or important itinerary properties, Fly should ask rather than invent a preference.
+
+Long term has to work as iOS app and so on.
 
 ## 2. Vision
 

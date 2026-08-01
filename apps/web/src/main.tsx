@@ -26,6 +26,7 @@ type Workspace = {
 type TravelerDocument = {
   document_type: string;
   issuing_country: string;
+  issue_date?: string;
   masked_document_number: string;
   expiry_date: string;
 };
@@ -36,11 +37,30 @@ type Traveler = {
   first_name: string;
   middle_name?: string;
   last_name: string;
+  second_last_name?: string;
   date_of_birth: string;
+  place_of_birth?: string;
   gender: string;
   nationality: string;
+  country_of_residence?: string;
   email: string;
   phone: string;
+  address_line1?: string;
+  address_line2?: string;
+  city?: string;
+  state?: string;
+  postal_code?: string;
+  country?: string;
+  frequent_flyer_program?: string;
+  frequent_flyer_number?: string;
+  known_traveler_number?: string;
+  redress_number?: string;
+  emergency_contact_name?: string;
+  emergency_contact_relationship?: string;
+  emergency_contact_phone?: string;
+  emergency_contact_email?: string;
+  meal_preference?: string;
+  special_assistance?: string;
   preferred_seat: string;
   baggage_preference: string;
   default_cabin: string;
@@ -498,7 +518,9 @@ function TravelerForm({ data, id, onSave }: { data: Bootstrap; id?: string; onSa
         <Label title="First name"><input name="first_name" defaultValue={traveler?.first_name || ""} required /></Label>
         <Label title="Middle name"><input name="middle_name" defaultValue={traveler?.middle_name || ""} /></Label>
         <Label title="Last name"><input name="last_name" defaultValue={traveler?.last_name || ""} required /></Label>
+        <Label title="Second surname"><input name="second_last_name" defaultValue={traveler?.second_last_name || ""} /></Label>
         <Label title="Date of birth"><input name="date_of_birth" type="date" defaultValue={traveler?.date_of_birth || ""} required /></Label>
+        <Label title="Place of birth"><input name="place_of_birth" defaultValue={traveler?.place_of_birth || ""} /></Label>
         <Label title="Title / gender">
           <select name="gender" defaultValue={traveler?.gender || ""}>
             <option value="">Not set</option>
@@ -507,8 +529,17 @@ function TravelerForm({ data, id, onSave }: { data: Bootstrap; id?: string; onSa
           </select>
         </Label>
         <Label title="Nationality"><input name="nationality" defaultValue={traveler?.nationality || ""} required /></Label>
+        <Label title="Country of residence"><input name="country_of_residence" defaultValue={traveler?.country_of_residence || traveler?.country || ""} /></Label>
         <Label title="Email"><input name="email" type="email" defaultValue={traveler?.email || ""} required /></Label>
         <Label title="Phone"><input name="phone" defaultValue={traveler?.phone || ""} /></Label>
+        <div className="md:col-span-2 mt-2 border-t border-white/10 pt-4 text-sm font-black uppercase tracking-wide text-slate-300">Home address</div>
+        <Label title="Address line 1"><input name="address_line1" defaultValue={traveler?.address_line1 || ""} /></Label>
+        <Label title="Address line 2"><input name="address_line2" defaultValue={traveler?.address_line2 || ""} /></Label>
+        <Label title="City"><input name="city" defaultValue={traveler?.city || ""} /></Label>
+        <Label title="State / province"><input name="state" defaultValue={traveler?.state || ""} /></Label>
+        <Label title="Postal code"><input name="postal_code" defaultValue={traveler?.postal_code || ""} /></Label>
+        <Label title="Address country"><input name="country" defaultValue={traveler?.country || traveler?.country_of_residence || ""} /></Label>
+        <div className="md:col-span-2 mt-2 border-t border-white/10 pt-4 text-sm font-black uppercase tracking-wide text-slate-300">Travel document</div>
         <Label title="Document type">
           <select name="document_type" defaultValue={traveler?.document?.document_type || "passport"}>
             <option>passport</option>
@@ -517,7 +548,21 @@ function TravelerForm({ data, id, onSave }: { data: Bootstrap; id?: string; onSa
         </Label>
         <Label title="Passport number"><input name="document_number" placeholder={traveler?.document?.masked_document_number ? `Current: ${traveler.document.masked_document_number}` : ""} required={!isEdit} /></Label>
         <Label title="Issuing country"><input name="issuing_country" defaultValue={traveler?.document?.issuing_country || traveler?.nationality || ""} /></Label>
+        <Label title="Document issue date"><input name="issue_date" type="date" defaultValue={traveler?.document?.issue_date || ""} /></Label>
         <Label title="Passport expiry"><input name="expiry_date" type="date" defaultValue={traveler?.document?.expiry_date || ""} required /></Label>
+        <div className="md:col-span-2 mt-2 border-t border-white/10 pt-4 text-sm font-black uppercase tracking-wide text-slate-300">Airline programs and screening</div>
+        <Label title="Frequent-flyer program"><input name="frequent_flyer_program" defaultValue={traveler?.frequent_flyer_program || ""} /></Label>
+        <Label title="Frequent-flyer number"><input name="frequent_flyer_number" defaultValue={traveler?.frequent_flyer_number || ""} /></Label>
+        <Label title="Known Traveler Number"><input name="known_traveler_number" defaultValue={traveler?.known_traveler_number || ""} /></Label>
+        <Label title="Redress number"><input name="redress_number" defaultValue={traveler?.redress_number || ""} /></Label>
+        <div className="md:col-span-2 mt-2 border-t border-white/10 pt-4 text-sm font-black uppercase tracking-wide text-slate-300">Emergency contact and assistance</div>
+        <Label title="Emergency contact name"><input name="emergency_contact_name" defaultValue={traveler?.emergency_contact_name || ""} /></Label>
+        <Label title="Relationship"><input name="emergency_contact_relationship" defaultValue={traveler?.emergency_contact_relationship || ""} /></Label>
+        <Label title="Emergency contact phone"><input name="emergency_contact_phone" defaultValue={traveler?.emergency_contact_phone || ""} /></Label>
+        <Label title="Emergency contact email"><input name="emergency_contact_email" type="email" defaultValue={traveler?.emergency_contact_email || ""} /></Label>
+        <Label title="Meal preference"><input name="meal_preference" defaultValue={traveler?.meal_preference || ""} /></Label>
+        <Label title="Special assistance"><input name="special_assistance" defaultValue={traveler?.special_assistance || ""} /></Label>
+        <div className="md:col-span-2 mt-2 border-t border-white/10 pt-4 text-sm font-black uppercase tracking-wide text-slate-300">Booking preferences</div>
         <Label title="Seat preference">
           <select name="preferred_seat" defaultValue={traveler?.preferred_seat || "no preference"}>
             <option>aisle</option>
@@ -571,11 +616,22 @@ function TravelerDetail({ data, id }: { data: Bootstrap; id: string }) {
     ["Nationality", traveler.nationality],
     ["Title / gender", traveler.gender || "Not set"],
     ["Date of birth", fmtDate(traveler.date_of_birth)],
+    ["Place of birth", traveler.place_of_birth || "Not set"],
+    ["Country of residence", traveler.country_of_residence || traveler.country || "Not set"],
     ["Passport", traveler.document?.masked_document_number || "Not added"],
+    ["Document issuing country", traveler.document?.issuing_country || "Not set"],
+    ["Document issue date", fmtDate(traveler.document?.issue_date)],
     ["Passport expiry", fmtDate(traveler.document?.expiry_date)],
     ["Email", traveler.email],
     ["Phone", traveler.phone],
     ["Default baggage", traveler.baggage_preference],
+    ["Frequent-flyer program", traveler.frequent_flyer_program || "Not set"],
+    ["Frequent-flyer number", traveler.frequent_flyer_number || "Not set"],
+    ["Known Traveler Number", traveler.known_traveler_number || "Not set"],
+    ["Redress number", traveler.redress_number || "Not set"],
+    ["Emergency contact", traveler.emergency_contact_name || "Not set"],
+    ["Meal preference", traveler.meal_preference || "Not set"],
+    ["Special assistance", traveler.special_assistance || "Not set"],
     ["Booking rules", traveler.booking_rules || "Not set"],
     ["Invoice company", traveler.invoice_company || "Not set"],
     ["Billing email", traveler.billing_email || "Not set"],

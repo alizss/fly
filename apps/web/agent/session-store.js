@@ -267,6 +267,8 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     const target = result.targetSnapshot || {};
     return normalizeAction({
       id: result.actionId || reportedAction.id || "",
+      observationId: result.observationId || reportedAction.observationId || "",
+      observationHash: result.observationHash || reportedAction.observationHash || "",
       type: reportedAction.action || reportedAction.type || "",
       operation: result.operation || reportedAction.operation || "",
       controlId: reportedAction.controlId || target.controlId || "",
@@ -303,6 +305,15 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     if (!action.decisionInstanceId) return null;
     if (!["click", "type", "select", "click_xy", "keypress"].includes(action.type)) return null;
     const signature = actuatorSignature(action);
+    const failedObservation = getObservation(state.id, result.observationId || action.observationId);
+    const pageStateHash = String(
+      result.pageStateHash
+      || result.observationHash
+      || action.observationHash
+      || failedObservation?.observationSnapshot?.snapshotHash
+      || failedObservation?.page?.snapshotHash
+      || ""
+    );
     return {
       at: String(result.at || nowIso()),
       actionSignature: actionSignature(action),
@@ -311,6 +322,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       decisionInstanceId: action.decisionInstanceId,
       actionId: String(result.actionId || action.id || ""),
       observationId: String(result.observationId || ""),
+      pageStateHash,
       controlId: String(action.controlId || ""),
       targetId: String(action.targetId || ""),
       operation: String(action.operation || ""),
@@ -328,6 +340,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       item.actuatorSignature === failure.actuatorSignature
       && item.goalKey === failure.goalKey
       && item.decisionInstanceId === failure.decisionInstanceId
+      && item.pageStateHash === failure.pageStateHash
     ))) {
       failures.push(failure);
     }

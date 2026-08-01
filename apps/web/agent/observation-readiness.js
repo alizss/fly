@@ -1,10 +1,15 @@
 const READINESS = Object.freeze({
   READY: "READY",
   TRANSIENT: "TRANSIENT",
+  UNRESOLVED: "UNRESOLVED",
   DEGRADED: "DEGRADED"
 });
 const DESTINATION_READINESS_TIMEOUT_MS = 20_000;
 const { decideStage, stageEvidence } = require("./task-state-reducer");
+const {
+  controlBelongsToCurrentSurface,
+  currentSurface
+} = require("./surface-contract");
 
 function lower(value = "") {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -16,18 +21,20 @@ function operationExecutable(control = {}) {
   ));
 }
 
+function executableControlsForCurrentSurface(page = {}) {
+  const controls = (page.controls || []).filter(operationExecutable);
+  const surface = currentSurface(page);
+  if (surface.type === "page" || surface.blocksBackground !== true) return controls;
+  return controls.filter((control) => controlBelongsToCurrentSurface(control, page));
+}
+
 function actionableControlCount(page = {}) {
-  return (page.controls || []).filter(operationExecutable).length;
+  return executableControlsForCurrentSurface(page).length;
 }
 
 function foregroundReady(page = {}) {
-  const surface = page.currentSurface || page.activeSurface || {};
-  if (!surface.type || surface.type === "page") return false;
-  const members = new Set(surface.memberControlIds || []);
-  return (page.controls || []).some((control) => (
-    (members.has(control.controlId) || control.surfaceId === surface.id)
-    && operationExecutable(control)
-  ));
+  const surface = currentSurface(page);
+  return surface.type !== "page" && executableControlsForCurrentSurface(page).length > 0;
 }
 
 function navigationShaped(observation = {}, previousReadiness = {}) {
@@ -63,17 +70,57 @@ function canonicalSemantic(control = {}) {
   ].filter(Boolean).join(" "));
 }
 
+function routePath(url = "") {
+  try {
+    return lower(new URL(String(url || ""), "https://fly.invalid").pathname);
+  } catch (error) {
+    return lower(String(url || "").split(/[?#]/, 1)[0]);
+  }
+}
+
 function routeStage(url = "") {
-  const value = lower(url);
-  if (/payment|checkout\/pay|\/pay(?:\/|$|\?)/.test(value)) return "payment";
+  const value = routePath(url);
+  if (/payment|checkout\/pay|\/pay(?:\/|$)/.test(value)) return "payment";
   if (/travell?er|passenger|contact/.test(value)) return "traveler";
   if (/seat/.test(value)) return "seats";
   if (/extra|ancillar|baggage|bundle|insurance/.test(value)) return "extras";
   return "";
 }
 
+function visibleStage(page = {}) {
+  const surface = currentSurface(page);
+  const surfaceLabel = surface.type === "page" ? "" : surface.label;
+  const visible = lower([
+    surfaceLabel,
+    page.heading,
+    page.title,
+    page.text
+  ].filter(Boolean).join(" "));
+  if (/card details|payment details|choose payment method|pay now|confirm and pay/.test(visible)) return "payment";
+  if (/travell?er information|traveler information|passenger details|contact details/.test(visible)) return "traveler";
+  if (/seat selection|select (?:your )?seats?\b|choose (?:your )?seats?\b|select a seat|seat map/.test(visible)) return "seats";
+  if (/optional extras|customi[sz]e your trip|configure your trip|select baggage|trip protection|travel insurance/.test(visible)) return "extras";
+  return "";
+}
+
 function expectedDestinationStage(page = {}) {
-  const executableControls = (page.controls || []).filter(operationExecutable);
+  const surface = currentSurface(page);
+  const foregroundLabel = surface.type === "page" ? "" : lower(surface.label);
+  if (/payment|billing|card details|pay now/.test(foregroundLabel)) return "payment";
+  if (/travell?er|passenger|contact details|passport/.test(foregroundLabel)) return "traveler";
+  if (/seat|seating/.test(foregroundLabel)) return "seats";
+  if (/extra|ancillar|baggage|bundle|insurance|protection/.test(foregroundLabel)) return "extras";
+
+  const routed = routeStage(page.url || "");
+  const checkoutEvidence = stageEvidence({ page });
+  const strongPaymentEvidence = checkoutEvidence.paymentSignals >= 3
+    || (checkoutEvidence.payment.route && checkoutEvidence.paymentSignals >= 2);
+  if (routed === "payment" && strongPaymentEvidence) return "payment";
+
+  const visible = visibleStage(page);
+  if (visible) return visible;
+
+  const executableControls = executableControlsForCurrentSurface(page);
   const semantics = executableControls.map(canonicalSemantic);
   const has = (pattern) => semantics.some((value) => pattern.test(value));
 
@@ -83,14 +130,10 @@ function expectedDestinationStage(page = {}) {
     return "traveler";
   }
   if (has(/seat_option|seat_map|seat_selection/)) return "seats";
-  if (
-    (page.decisionGroups || []).length > 0
-    || has(/select_free_option|select_paid_option|optional_extra|baggage|bundle|insurance/)
-  ) {
+  if (has(/select_free_option|select_paid_option|optional_extra|baggage|bundle|insurance/)) {
     return "extras";
   }
 
-  const routed = routeStage(page.url || "");
   if (routed) return routed;
 
   const decided = decideStage({ page });
@@ -105,8 +148,7 @@ function expectedDestinationStage(page = {}) {
 }
 
 function expectedStageContentMissing(page = {}) {
-  const controls = (page.controls || []).filter(operationExecutable);
-  const groups = page.decisionGroups || [];
+  const controls = executableControlsForCurrentSurface(page);
   const semantics = controls.map(canonicalSemantic);
   const has = (pattern) => semantics.some((value) => pattern.test(value));
   const effects = controls.map((control) => lower(
@@ -114,6 +156,7 @@ function expectedStageContentMissing(page = {}) {
   ));
   const hasEffect = (pattern) => effects.some((value) => pattern.test(value));
   const stage = expectedDestinationStage(page);
+  const visible = visibleStage(page);
   const hasAdvancingControl = controls.some((control) => (
     /advance_surface|advance_checkout_stage|submit_form|navigation/.test(
       lower(control.physicalEffect || control.mechanicalEffect || control.semanticType || control.semantic || "")
@@ -129,12 +172,13 @@ function expectedStageContentMissing(page = {}) {
       !has(/seat_option|seat_map|seat_selection/)
       && !(hasEffect(/select_free_option|select_paid_option/) && hasAdvancingControl)
       && !(/seat/.test(foreground) && hasAdvancingControl)
+      && !(visible === "seats" && hasAdvancingControl)
     );
   }
   if (stage === "extras") {
     return (
-      groups.length === 0
-      && !has(/select_free_option|select_paid_option|optional_extra|baggage|bundle|insurance/)
+      !has(/select_free_option|select_paid_option|optional_extra|baggage|bundle|insurance/)
+      && !hasEffect(/select_free_option|select_paid_option/)
       && !hasAdvancingControl
     );
   }
@@ -170,7 +214,7 @@ function classifyObservationReadiness({
   const facts = page.readiness || {};
   const key = readinessKey(observation);
   const samePendingDestination = previousReadiness.key === key
-    && [READINESS.TRANSIENT, READINESS.DEGRADED].includes(previousReadiness.classification);
+    && [READINESS.TRANSIENT, READINESS.UNRESOLVED, READINESS.DEGRADED].includes(previousReadiness.classification);
   const attempts = samePendingDestination ? Number(previousReadiness.attempts || 0) + 1 : 1;
   const startedAt = samePendingDestination
     ? Number(previousReadiness.startedAt || nowMs)
@@ -184,17 +228,22 @@ function classifyObservationReadiness({
   const controls = actionableControlCount(page);
   const explicitLoading = facts.documentReadyState === "loading"
     || facts.ariaBusy === true
-    || Number(facts.loadingIndicatorCount || 0) > 0;
+    || Number(facts.loadingIndicatorCount || 0) > 0
+    || facts.loadingTextEvidence === true
+    || /\bplease\s+wait\b|\b(?:loading|fetching|preparing)\b.{0,80}\b(?:option|seat|fare|checkout|payment|travell?er|passenger|detail|trip)\b/.test(lower(`${page.heading || ""} ${page.text || ""}`));
   const incompleteStage = expectedStageContentMissing(page);
+  const semanticReadiness = page.semanticReadiness || page.semanticCompilation?.semanticReadiness || "";
+  const semanticUnresolved = semanticReadiness === "unresolved";
+  const usableForeground = foregroundReady(page) && !explicitLoading && !semanticUnresolved;
   const expectedStage = expectedDestinationStage(page);
   const checkoutEvidence = stageEvidence(observation);
   const strongPaymentEvidence = checkoutEvidence.paymentSignals >= 3
     || (checkoutEvidence.payment.route && checkoutEvidence.paymentSignals >= 2);
   const afterNavigation = navigationShaped(observation, previousReadiness);
   const shellAfterNavigation = afterNavigation
+    && !usableForeground
     && (incompleteStage || (
       !expectedStage
-      && !foregroundReady(page)
       && Number(page.summary?.fields || 0) === 0
       && Number(page.summary?.decisionGroups || 0) === 0
     ));
@@ -213,6 +262,10 @@ function classifyObservationReadiness({
     expectedStage,
     explicitLoading,
     strongPaymentEvidence,
+    semanticReadiness,
+    semanticUnresolved,
+    unownedMaterialControls: page.semanticCompilation?.unownedMaterialControls || [],
+    unresolvedDecisions: page.semanticCompilation?.unresolvedDecisions || [],
     stable,
     facts
   });
@@ -227,7 +280,9 @@ function classifyObservationReadiness({
       elapsedMs: Math.max(0, Number(nowMs) - startedAt),
       remainingMs: Math.max(0, deadlineAt - Number(nowMs)),
       deadlineExpired: false,
-      reason: explicitLoading ? "PAGE_LOADING" : "POST_NAVIGATION_DESTINATION_NOT_READY",
+      reason: explicitLoading
+        ? "PAGE_LOADING"
+        : "POST_NAVIGATION_DESTINATION_NOT_READY",
       handoffEligible: false,
       evidence
     });
@@ -243,9 +298,24 @@ function classifyObservationReadiness({
       remainingMs: 0,
       deadlineExpired: true,
       reason: explicitLoading || !stable
-        ? "DESTINATION_READINESS_DEADLINE_EXPIRED_WHILE_LOADING"
-        : "DESTINATION_CONTENT_MISSING_AT_READINESS_DEADLINE",
+          ? "DESTINATION_READINESS_DEADLINE_EXPIRED_WHILE_LOADING"
+          : "DESTINATION_CONTENT_MISSING_AT_READINESS_DEADLINE",
       handoffEligible: true,
+      evidence
+    });
+  }
+  if (semanticUnresolved) {
+    return Object.freeze({
+      classification: READINESS.UNRESOLVED,
+      key,
+      attempts,
+      startedAt,
+      deadlineAt,
+      elapsedMs: Math.max(0, Number(nowMs) - startedAt),
+      remainingMs: Math.max(0, deadlineAt - Number(nowMs)),
+      deadlineExpired,
+      reason: "SEMANTIC_COMPILATION_INCOMPLETE",
+      handoffEligible: deadlineExpired,
       evidence
     });
   }
@@ -258,7 +328,7 @@ function classifyObservationReadiness({
     elapsedMs: 0,
     remainingMs: 0,
     deadlineExpired: false,
-    reason: foregroundReady(page) ? "FOREGROUND_ACTIONABLE" : "OBSERVATION_SEMANTICALLY_READY",
+    reason: usableForeground ? "FOREGROUND_ACTIONABLE" : "OBSERVATION_SEMANTICALLY_READY",
     handoffEligible: false,
     evidence: Object.freeze({ ...evidence, incompleteStage: false, explicitLoading: false })
   });

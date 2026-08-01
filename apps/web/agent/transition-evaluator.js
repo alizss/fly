@@ -2,6 +2,9 @@ const { diffObservations } = require("./observation-diff");
 const { currentSurface } = require("./surface-contract");
 const { normalizedActionSemantics, outcomeContractForGoal } = require("./action-semantics");
 const { decideStage } = require("./task-state-reducer");
+const { resolveLogicalFields, verifyLogicalField } = require("./logical-field");
+const { decodeDateFromField } = require("./date-field-codec");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 const UNSAFE_CODES = new Set([
   "ITINERARY_ROUTE_CHANGED",
@@ -243,7 +246,12 @@ function materialStateChanged(diff = {}) {
 }
 
 function expectedFor(governedAction = {}, browserResult = {}) {
-  return governedAction.expectedOutcome || browserResult.expectedOutcome || {};
+  // The adapter-owned contract is authoritative. Browser acknowledgements
+  // are evidence only and cannot replace the semantic outcome definition.
+  return governedAction.pipelineContract?.expectedOutcome
+    || governedAction.expectedOutcome
+    || browserResult.expectedOutcome
+    || {};
 }
 
 function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPage = {}) {
@@ -321,6 +329,94 @@ function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPa
       unrelatedSelectionChanges: unrelatedSelectionChangesObserved,
       paidSelected,
       validation
+    }
+  };
+}
+
+function policyAuthorized(action = {}, expected = {}) {
+  return expected.policyAuthorized === true
+    || action.policy?.allow === true
+    || action.policyDecision?.allow === true
+    || action.affordance?.policy?.allow === true;
+}
+
+function policySafeChoiceTransition(expected = {}, action = {}, beforePage = {}, afterPage = {}, diff = {}) {
+  const groupId = expected.decisionGroupId || action.decisionGroupId || action.targetSnapshot?.decisionGroupId || "";
+  const controlId = expected.expectedSelectedControlId || expected.controlId || action.controlId || "";
+  const beforeControl = controlById(beforePage, controlId) || action.targetSnapshot || {};
+  const afterControl = controlById(afterPage, controlId);
+  const afterGroup = groupById(afterPage, groupId);
+  const afterControlAvailability = afterControl
+    ? agentContract.controlAvailability(afterControl)
+    : agentContract.DECISION_AVAILABILITY.INACTIVE;
+  const afterGroupAvailability = afterGroup
+    ? agentContract.decisionAvailability(afterGroup, afterPage.controls || [])
+    : agentContract.DECISION_AVAILABILITY.INACTIVE;
+  const sourceRetired = Boolean(
+    controlId
+    && afterControlAvailability === agentContract.DECISION_AVAILABILITY.INACTIVE
+    && afterGroupAvailability === agentContract.DECISION_AVAILABILITY.INACTIVE
+  );
+  const activeSuccessorDecision = (afterPage.decisionGroups || []).some((group) => (
+    (group.decisionGroupId || group.requirementId) !== groupId
+    && agentContract.decisionAvailability(group, afterPage.controls || []) === agentContract.DECISION_AVAILABILITY.ACTIVE
+  ));
+  const advanced = Boolean(
+    diff.stageChanged
+    || diff.urlChanged
+    || diff.progressChanged
+    || (sourceRetired && activeSuccessorDecision && meaningfulDiff(diff))
+  );
+  const meaning = text([
+    expected.expectedDisposition,
+    action.semanticIntent,
+    action.mechanicalEffect,
+    beforeControl.physicalEffect,
+    beforeControl.semantic,
+    beforeControl.risk,
+    beforeControl.label
+  ].filter(Boolean).join(" "));
+  const amount = Number(beforeControl.structuredPrice?.amount);
+  const explicitlySafe = (Number.isFinite(amount) && amount === 0)
+    || /decline|safe decline|free|included|without|skip|no thanks|no extra|none/.test(meaning);
+  const ownedValidation = (afterPage.validationIssues || []).some((issue) => (
+    issue.stageWide === true
+    || (controlId && issue.controlId === controlId)
+  ));
+  const unrelated = unrelatedSelectionChanges(beforePage, afterPage, groupId)
+    .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
+  const paidMutation = interveningPaidMutation(beforePage, afterPage, action);
+  const satisfied = Boolean(
+    policyAuthorized(action, expected)
+    && explicitlySafe
+    && sourceRetired
+    && advanced
+    && !priceIncreased(beforePage, afterPage)
+    && !ownedValidation
+    && unrelated.length === 0
+    && !paidMutation
+  );
+  return {
+    satisfied,
+    evidence: {
+      completionMode: satisfied ? "safe_stage_transition" : "unproven_transition",
+      groupId,
+      controlId,
+      policyAuthorized: policyAuthorized(action, expected),
+      explicitlySafe,
+      sourceDisappeared: sourceRetired,
+      sourceRetired,
+      afterControlAvailability,
+      afterGroupAvailability,
+      activeSuccessorDecision,
+      advanced,
+      stageChanged: Boolean(diff.stageChanged),
+      urlChanged: Boolean(diff.urlChanged),
+      progressChanged: Boolean(diff.progressChanged),
+      priceIncreased: priceIncreased(beforePage, afterPage),
+      ownedValidation,
+      unrelatedSelectionChanges: unrelated,
+      paidMutation
     }
   };
 }
@@ -466,7 +562,7 @@ function evaluatePostcondition(
   const afterPage = pageOf(afterObservation);
   const controlId = expected.controlId || action.controlId || action.targetSnapshot?.controlId || "";
   const beforeControl = controlById(beforePage, controlId);
-  const afterControl = controlById(afterPage, controlId);
+  let afterControl = controlById(afterPage, controlId);
   const type = expected.type || "observable_change";
   const semantics = normalizedActionSemantics(action, { expectedOutcome: expected });
 
@@ -476,8 +572,10 @@ function evaluatePostcondition(
   }
   if (type === "exact_free_option_selected") {
     const exact = exactFreeSelection(expected, action, beforePage, afterPage);
+    const safeTransition = policySafeChoiceTransition(expected, action, beforePage, afterPage, diff);
     const browserVerifiedBeforeDismissal = Boolean(
       !exact.satisfied
+      && !safeTransition.satisfied
       && browserResult.verified === true
       && browserResult.expectedOutcome?.type === "exact_free_option_selected"
       && (diff.modalClosed || (diff.disappeared || []).some((item) => item.controlId === (expected.controlId || action.controlId)))
@@ -486,42 +584,100 @@ function evaluatePostcondition(
     );
     return {
       type,
-      satisfied: exact.satisfied || browserVerifiedBeforeDismissal,
-      evidence: { ...exact.evidence, browserVerifiedBeforeDismissal }
+      satisfied: exact.satisfied || safeTransition.satisfied || browserVerifiedBeforeDismissal,
+      evidence: {
+        ...exact.evidence,
+        ...safeTransition.evidence,
+        completionMode: exact.satisfied
+          ? "same_surface_selection"
+          : (safeTransition.satisfied ? "safe_stage_transition" : "unproven"),
+        browserVerifiedBeforeDismissal
+      }
     };
   }
   if (type === "date_value_committed") {
+    const hierarchical = expected.logicalFieldId
+      ? verifyLogicalField(afterPage, { ...expected, controlId }, {})
+      : null;
+    if (!afterControl && expected.logicalFieldId) {
+      const reboundField = resolveLogicalFields(afterPage, {}).find((field) => (
+        field.logicalFieldId === expected.logicalFieldId
+      ));
+      const reboundComponent = reboundField?.components.find((component) => (
+        component.role === (expected.componentRole || "value")
+      ));
+      afterControl = reboundComponent?.control || null;
+    }
     const codec = expected.dateCodec || afterControl?.dateField || {};
     const wantedCanonicalValue = String(expected.expectedCanonicalValue || "");
     const wantedComponentValue = String(expected.expectedNormalizedValue || "");
-    const actualCanonicalValue = String(afterControl?.state?.canonicalDateValue || "");
+    const rawDateValue = String(
+      afterControl?.state?.rawValue
+      || afterControl?.state?.normalizedValue
+      || afterControl?.currentValue
+      || ""
+    );
+    const decodedWithExpectedCodec = codec?.kind === "full" && rawDateValue
+      ? decodeDateFromField(rawDateValue, codec)
+      : null;
+    const actualCanonicalValue = String(
+      afterControl?.state?.canonicalDateValue
+      || decodedWithExpectedCodec?.canonicalValue
+      || ""
+    );
     const actualComponentValue = String(afterControl?.state?.dateComponentValue || "");
+    const verifiedControlId = afterControl?.controlId || controlId;
     const validation = (afterPage.validationIssues || []).some((issue) => (
-      issue.stageWide === true || (controlId && issue.controlId === controlId)
+      Boolean(verifiedControlId && issue.controlId === verifiedControlId)
+      || Boolean(
+        expected.logicalFieldId
+        && issue.logicalFieldId === expected.logicalFieldId
+        && issue.componentRole === (expected.componentRole || "value")
+      )
     ));
     const exact = codec.kind === "component"
-      ? Boolean(wantedComponentValue && actualComponentValue === wantedComponentValue)
+      ? Boolean(
+          hierarchical?.componentResult?.satisfied
+          || (wantedComponentValue && actualComponentValue === wantedComponentValue)
+        )
       : Boolean(wantedCanonicalValue && actualCanonicalValue === wantedCanonicalValue);
     return {
       type,
       satisfied: exact && !validation,
       evidence: {
-        controlId,
+        controlId: verifiedControlId,
         codec,
         wantedCanonicalValue,
         actualCanonicalValue,
         wantedComponentValue,
         actualComponentValue,
-        validation
+        validation,
+        componentResult: hierarchical?.componentResult || null,
+        logicalFieldResult: hierarchical?.logicalFieldResult || null
       }
     };
   }
   if (["normalized_value_changed", "field_value_changed"].includes(type)) {
+    if (expected.logicalFieldId) {
+      const hierarchical = verifyLogicalField(afterPage, { ...expected, controlId }, {});
+      return {
+        type,
+        satisfied: hierarchical.componentResult.satisfied,
+        evidence: {
+          controlId: hierarchical.component?.controlId || controlId,
+          componentResult: hierarchical.componentResult,
+          logicalFieldResult: hierarchical.logicalFieldResult
+        }
+      };
+    }
     const wanted = text(expected.expectedNormalizedValue || expected.expectedValue || action.value || "").replace(/\s+/g, "");
     const actual = controlValue(afterControl || {});
     return { type, satisfied: Boolean(afterControl && wanted && actual === wanted), evidence: { controlId, wanted, actual } };
   }
   if (type === "control_selected") {
+    const hierarchical = expected.logicalFieldId
+      ? verifyLogicalField(afterPage, { ...expected, controlId }, {})
+      : null;
     const groupId = expected.decisionGroupId || action.decisionGroupId || afterControl?.decisionGroupId || "";
     const group = groupById(afterPage, groupId);
     const wanted = expected.expectedSelectedControlId || expected.controlId || action.controlId || "";
@@ -535,8 +691,23 @@ function evaluatePostcondition(
     ));
     return {
       type,
-      satisfied: Boolean(wanted && actual === wanted && !conflictingSelected.length && !validation.length),
-      evidence: { groupId, wanted, actual, conflictingSelected, validation }
+      satisfied: Boolean(
+        (
+          hierarchical?.componentResult?.satisfied
+          || (wanted && actual === wanted)
+        )
+        && !conflictingSelected.length
+        && !validation.length
+      ),
+      evidence: {
+        groupId,
+        wanted,
+        actual,
+        conflictingSelected,
+        validation,
+        componentResult: hierarchical?.componentResult || null,
+        logicalFieldResult: hierarchical?.logicalFieldResult || null
+      }
     };
   }
   if (["options_surface_appeared", "active_surface_change", "semantic_progress"].includes(type)) {

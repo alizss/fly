@@ -1,6 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { classifyObservationReadiness, READINESS } = require("../../apps/web/agent/observation-readiness");
+const {
+  classifyObservationReadiness,
+  expectedDestinationStage,
+  READINESS
+} = require("../../apps/web/agent/observation-readiness");
 const {
   advanceActionLifecycle,
   approveActionLifecycle,
@@ -90,6 +94,141 @@ test("hydrated traveler controls make the next observation ready", () => {
   const ready = classifyObservationReadiness({ observation: readyObservation, previousReadiness: transient });
   assert.equal(ready.classification, READINESS.READY);
   assert.equal(ready.attempts, 0);
+});
+
+test("seat loading copy outranks baggage and insurance query parameters until seat controls hydrate", () => {
+  const shell = shellObservation("obs_kiwi_seat_loading_shell");
+  shell.page = {
+    ...shell.page,
+    step: "seats",
+    url: "https://www.kiwi.com/en/booking/?activeStep=2&holdBags=15kg&insurance=0",
+    heading: "Select your seats",
+    text: "Select your seats. Please wait for the seating options to load.",
+    controls: [
+      { controlId: "currency", label: "TRY", semantic: "unknown", surfaceId: "surface-page", operations: operation("el_currency") },
+      { controlId: "price", label: "View price breakdown", semantic: "open_surface", surfaceId: "surface-page", operations: operation("el_price") }
+    ],
+    decisionGroups: [{
+      decisionGroupId: "summary_baggage",
+      semanticType: "baggage",
+      surfaceId: "surface-page",
+      status: "satisfied"
+    }],
+    summary: { fields: 0, controls: 2, decisionGroups: 1 },
+    readiness: {
+      documentReadyState: "complete",
+      ariaBusy: false,
+      loadingIndicatorCount: 0,
+      loadingTextEvidence: true,
+      mainTextLength: 68,
+      stableForMs: 348
+    }
+  };
+
+  assert.equal(expectedDestinationStage(shell.page), "seats");
+  const transient = classifyObservationReadiness({ observation: shell });
+  assert.equal(transient.classification, READINESS.TRANSIENT);
+  assert.equal(transient.reason, "PAGE_LOADING");
+  assert.equal(transient.handoffEligible, false);
+
+  const hydrated = {
+    ...shell,
+    observationId: "obs_kiwi_seat_hydrated",
+    observationSnapshot: { snapshotHash: "hash_kiwi_seat_hydrated" },
+    page: {
+      ...shell.page,
+      text: "Select your seats. Select a seat on the map. Continue.",
+      controls: [{
+        controlId: "continue",
+        label: "Continue",
+        semantic: "continue",
+        physicalEffect: "advance_checkout_stage",
+        surfaceId: "surface-page",
+        operations: operation("el_continue")
+      }],
+      decisionGroups: [],
+      summary: { fields: 0, controls: 1, decisionGroups: 0 },
+      readiness: {
+        documentReadyState: "complete",
+        ariaBusy: false,
+        loadingIndicatorCount: 0,
+        loadingTextEvidence: false,
+        mainTextLength: 55,
+        stableForMs: 900
+      }
+    }
+  };
+  const ready = classifyObservationReadiness({ observation: hydrated, previousReadiness: transient });
+  assert.equal(ready.classification, READINESS.READY);
+  assert.equal(ready.evidence.expectedStage, "seats");
+});
+
+test("actionable seat confirmation owns readiness over executable background traveler controls", () => {
+  const observation = shellObservation("obs_kiwi_seat_confirmation");
+  observation.page = {
+    ...observation.page,
+    step: "confirmation",
+    url: "https://www.kiwi.com/en/booking/?activeStep=2",
+    semanticReadiness: "ready",
+    currentSurface: {
+      id: "seat-confirmation",
+      type: "modal",
+      label: "Are you sure that you don't want to select seats for your flights?",
+      blocksBackground: true,
+      memberControlIds: ["skip-seats", "continue-seats"]
+    },
+    controls: [
+      {
+        controlId: "background-first-name",
+        fieldType: "first_name",
+        semantic: "first_name",
+        label: "First name",
+        surfaceId: "surface-page",
+        operations: {
+          type: {
+            actuatorId: "el-first-name",
+            actionability: { executable: true }
+          }
+        }
+      },
+      {
+        controlId: "skip-seats",
+        semantic: "decline_paid_extra",
+        risk: "safe_decline",
+        label: "Skip seat selection",
+        surfaceId: "seat-confirmation",
+        operations: operation("el-skip-seats")
+      },
+      {
+        controlId: "continue-seats",
+        semantic: "choice",
+        label: "Continue with seat selection",
+        surfaceId: "seat-confirmation",
+        operations: operation("el-continue-seats")
+      }
+    ],
+    decisionGroups: [],
+    summary: { fields: 1, controls: 3, decisionGroups: 0 },
+    readiness: {
+      documentReadyState: "complete",
+      ariaBusy: false,
+      loadingIndicatorCount: 0,
+      mainTextLength: 240,
+      visibleMainCount: 1,
+      stableForMs: 16_000
+    }
+  };
+  observation.lastActionResult = {
+    feedback: { navigationOccurred: true, pageChanged: true, surfaceChanged: true },
+    action: { semanticIntent: "advance_checkout_stage", mechanicalEffect: "advance_checkout_stage" }
+  };
+
+  assert.equal(expectedDestinationStage(observation.page), "seats");
+  const readiness = classifyObservationReadiness({ observation });
+  assert.equal(readiness.classification, READINESS.READY);
+  assert.equal(readiness.reason, "FOREGROUND_ACTIONABLE");
+  assert.equal(readiness.evidence.expectedStage, "seats");
+  assert.equal(readiness.evidence.controls, 2);
 });
 
 test("strong payment evidence is ready even when ordinary payment actions are suppressed", () => {

@@ -1,12 +1,10 @@
 const { evaluateActionPolicy, isNonMutatingAction } = require("../../../packages/shared/policy");
 const { isDeepStrictEqual } = require("node:util");
 const {
+  actuatorSignature,
   normalizeAction,
   normalizeVisualRegion,
-  visualRegionsMatch,
-  actuatorSignature,
-  decisionInstanceKey,
-  semanticGoalKey
+  visualRegionsMatch
 } = require("../../../packages/shared/agent-actions");
 const { classifyGraphConflicts, resolveActionControl, selectedActionGraphConflicts } = require("./control-alias-index");
 const { profileStageReadiness } = require("./skill-expander");
@@ -21,6 +19,7 @@ const {
   predictPhysicalEffect,
   semanticIntentForAction
 } = require("./action-semantics");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 const DOM_MUTATIONS = new Set(["click", "type", "select", "keypress"]);
 const COMPOUND_MUTATIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
@@ -73,6 +72,50 @@ function canonicalControlForAction(action, page = {}) {
   return resolveActionControl(action, page).control || null;
 }
 
+function executionLaneForAction(action = {}, control = {}, observation = {}, strategyAlreadyFailed = false) {
+  let pipelineContract = action.pipelineContract || null;
+  if (!pipelineContract && action.operation) {
+    const observed = agentContract.observedComponentContract(control, {
+      surfaceId: action.surfaceId || control.surfaceId || currentSurfaceId(observation.page || {})
+    });
+    const baseCapability = observed.capabilities.find((capability) => capability.operation === action.operation) || {};
+    const selectedStrategy = (baseCapability.strategies || []).find((strategy) => (
+      strategy.actuatorId === action.targetId
+      && (!action.interactionMethod || strategy.method === action.interactionMethod)
+    )) || null;
+    const exactActuator = (baseCapability.exactActuators || [])
+      .find((actuator) => actuator.actuatorId === action.targetId);
+    pipelineContract = agentContract.canonicalPipelineContract({
+      requirement: {
+        requirementId: action.requirementId || action.goalId || action.decisionGroupId || "",
+        semanticType: action.targetSnapshot?.semantic || action.intent || ""
+      },
+      component: {
+        componentIdentity: control.componentContract?.componentIdentity || control.stableKey || control.controlId,
+        componentRole: control.componentRole || "value",
+        controlId: control.controlId || action.controlId || "",
+        controlRole: control.role || control.kind || ""
+      },
+      capability: {
+        ...baseCapability,
+        actuatorId: action.targetId || baseCapability.actuatorId || "",
+        selectedStrategy,
+        status: exactActuator?.status || baseCapability.status,
+        proof: exactActuator?.proof || baseCapability.proof || null
+      },
+      expectedOutcome: action.expectedOutcome || {},
+      validationOwnership: control.validationOwnership || {}
+    });
+  }
+  return agentContract.classifyExecutionLane({
+    action: { ...action, pipelineContract },
+    pipelineContract,
+    control,
+    observation,
+    strategyAlreadyFailed
+  });
+}
+
 function currentObservationSurfaceId(observation = {}) {
   return currentSurfaceId(observation.page || {});
 }
@@ -123,7 +166,8 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
     && action.expectedEvidence === candidate.expectedEvidence
     && affordanceExact
     && action.expectedOutcome?.type === candidate.expectedOutcome?.type
-    && String(action.expectedOutcome?.controlId || "") === String(candidate.expectedOutcome?.controlId || "");
+    && String(action.expectedOutcome?.controlId || "") === String(candidate.expectedOutcome?.controlId || "")
+    && isDeepStrictEqual(action.pipelineContract || null, candidate.pipelineContract || null);
   if (!exact) {
     return recoverable(
       "CURRENT_GOAL_CANDIDATE_MISMATCH",
@@ -173,7 +217,7 @@ function incompleteProfileStageBlocks(action = {}, observation = {}, traveler = 
     : null;
 }
 
-function validateCanonicalTarget(action, observation, checks) {
+function validateCanonicalTarget(action, observation, checks, executionLane = "") {
   if (!DOM_MUTATIONS.has(action.type)) return null;
   const target = action.targetSnapshot || {};
   const resolution = resolveActionControl(action, observation.page || {});
@@ -181,6 +225,7 @@ function validateCanonicalTarget(action, observation, checks) {
     return fail(resolution.code, "Every supplied target identity must resolve to the same canonical control in the stored observation.", checks);
   }
   const control = resolution.control;
+  const authoritativeLane = executionLane || executionLaneForAction(action, control, observation);
   if (!control?.controlId || !target.controlId) {
     return fail("CANONICAL_TARGET_REQUIRED", "DOM mutations require one canonical control from the stored current observation.", checks);
   }
@@ -197,35 +242,42 @@ function validateCanonicalTarget(action, observation, checks) {
   if (target.risk && control.risk && target.risk !== control.risk) {
     return fail("TARGET_RISK_MISMATCH", "The target risk classification changed after observation.", checks);
   }
+  if (
+    control.ownershipIntegrity?.ok === false
+    && (control.ownershipIntegrity.conflictingNodeIds || []).includes(target.id)
+  ) {
+    return fail(
+      "SELECTED_ACTUATOR_OWNERSHIP_CONFLICT",
+      "The selected actuator is claimed by incompatible logical controls in the current observation.",
+      checks
+    );
+  }
+  let operationUsesExecutableActuator = false;
   if (action.operation) {
     const capability = control.operations?.[action.operation];
-    const operationIds = new Set(capability?.actuatorIds || []);
-    if (!capability || !operationIds.has(target.id)) {
-      return fail("ACTION_OPERATION_ACTUATOR_MISMATCH", `The canonical control does not authorize ${action.operation} through the governed actuator.`, checks);
-    }
-    pass(checks, "CANONICAL_OPERATION_BOUND", `${action.operation}:${target.id}`);
-    const actionability = capability.actionabilityByActuator?.[target.id] || capability.actionability || null;
-    if (!actionability || actionability.executable !== true) {
-      if (actionability?.revealable === true && actionability.inViewport === false) {
-        return recoverable(
-          "TARGET_OUT_OF_VIEW",
-          "The exact canonical actuator is rendered, enabled, surface-owned, and revealable, but must be brought into view before live hit-testing and dispatch.",
-          checks
-        );
-      }
+    if (authoritativeLane === agentContract.EXECUTION_LANE.BOUNDED_RECOVERY) {
+      operationUsesExecutableActuator = true;
+      pass(checks, "CANONICAL_BOUNDED_RECOVERY_BOUND", `${action.operation}:${target.id}:${action.interactionMethod || ""}`);
+    } else if (authoritativeLane === agentContract.EXECUTION_LANE.REVEAL) {
       return recoverable(
-        "TARGET_ACTIONABILITY_UNPROVEN",
-        "The exact canonical actuator was not proven rendered, visible, enabled, current-surface owned, hit-tested, and unoccluded in this observation.",
+        "TARGET_OUT_OF_VIEW",
+        "The exact canonical actuator is recoverable but must be revealed before dispatch.",
         checks
       );
-    }
-    pass(checks, "CANONICAL_ACTUATOR_ACTIONABLE", `${action.operation}:${target.id}`);
-    const precondition = capability.precondition || {};
-    if (precondition.expanded === false && control.state?.expanded === true) {
-      return fail("OPERATION_PRECONDITION_FAILED", "The canonical control is already expanded, so its open operation is no longer valid.", checks);
-    }
-    if (precondition.disabled === false && control.state?.disabled === true) {
-      return fail("OPERATION_PRECONDITION_FAILED", "The canonical operation requires an enabled control.", checks);
+    } else if (authoritativeLane === agentContract.EXECUTION_LANE.NORMAL) {
+      operationUsesExecutableActuator = true;
+      pass(checks, "CANONICAL_OPERATION_BOUND", `${action.operation}:${target.id}`);
+      pass(checks, "CANONICAL_ACTUATOR_ACTIONABLE", `${action.operation}:${target.id}`);
+      const precondition = capability?.precondition || {};
+      if (precondition.expanded === false && control.state?.expanded === true) {
+        return fail("OPERATION_PRECONDITION_FAILED", "The canonical control is already expanded, so its open operation is no longer valid.", checks);
+      }
+    } else {
+      return fail(
+        "ACTION_OPERATION_ACTUATOR_MISMATCH",
+        `The canonical contract does not authorize ${action.operation} through this execution lane.`,
+        checks
+      );
     }
   }
   if (["type", "select"].includes(action.type)) {
@@ -250,7 +302,12 @@ function validateCanonicalTarget(action, observation, checks) {
     }
   }
   const state = control.state || {};
-  if (state.disabled === true || control.disabled === true) return fail("TARGET_DISABLED", "The canonical target was observed as disabled.", checks);
+  if (
+    (state.disabled === true || control.disabled === true)
+    && !operationUsesExecutableActuator
+  ) {
+    return fail("TARGET_DISABLED", "The canonical target was observed as disabled.", checks);
+  }
   const region = control.visualRegion || target.visualRegion || target.box;
   if (region?.inViewport === false) return recoverable("TARGET_OUT_OF_VIEW", "The canonical target is outside the observed viewport and can be recovered by governed scrolling.", checks);
   if (!controlBelongsToCurrentSurface(control, observation.page || {})) {
@@ -401,6 +458,57 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   }
   pass(checks, "SEMANTIC_GOAL_SEQUENCE_VALID");
 
+  let executionLane = "";
+  if ((DOM_MUTATIONS.has(action.type) || action.type === "click_xy") && action.candidateId) {
+    const pipeline = action.pipelineContract || null;
+    if (!pipeline || pipeline.contractVersion !== agentContract.CONTRACT_VERSION) {
+      return denied({
+        ...recoverable(
+          "CANONICAL_PIPELINE_CONTRACT_MISSING",
+          "The selected candidate lost its authoritative requirement/component/capability contract before governance.",
+          checks
+        ),
+        action,
+        state
+      });
+    }
+    const control = canonicalControlForAction(action, observation.page || {}) || {};
+    const strategyAlreadyFailed = new Set(state.attemptedStrategySignatures || [])
+      .has(actuatorSignature(action));
+    executionLane = agentContract.classifyExecutionLane({
+      action,
+      pipelineContract: pipeline,
+      control,
+      observation,
+      strategyAlreadyFailed
+    });
+    if (executionLane === agentContract.EXECUTION_LANE.REVEAL) {
+      return denied({
+        ...recoverable(
+          "TARGET_OUT_OF_VIEW",
+          "The bound capability is revealable but is not yet proven executable in the current viewport.",
+          checks
+        ),
+        action,
+        state
+      });
+    }
+    if (executionLane === agentContract.EXECUTION_LANE.DENY) {
+      return denied({
+        ...recoverable(
+          strategyAlreadyFailed ? "FAILED_STRATEGY_REUSE" : "CAPABILITY_EXECUTION_LANE_DENIED",
+          strategyAlreadyFailed
+            ? "The exact strategy already failed on the unchanged target-local state."
+            : "The action is neither a proven exact capability nor a current bounded-recovery strategy.",
+          checks
+        ),
+        action,
+        state
+      });
+    }
+    pass(checks, "EXECUTION_LANE_CLASSIFIED", executionLane);
+  }
+
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
     const goal = state.taskState?.currentGoal || {};
     const contract = goal.outcomeContract || outcomeContractForGoal(goal, observation);
@@ -459,36 +567,13 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   }
   pass(checks, "PROFILE_STAGE_READY_OR_ACTION_SCOPED");
 
-  const targetFailure = validateCanonicalTarget(action, observation, checks) || validateVisualFallback(action, observation, checks);
+  const targetFailure = validateCanonicalTarget(action, observation, checks, executionLane)
+    || validateVisualFallback(action, observation, checks);
   if (targetFailure) {
     const routedFailure = RECOVERABLE_GROUNDING_CODES.has(targetFailure.code)
       ? { ...targetFailure, decision: "recoverable" }
       : targetFailure;
     return denied({ ...routedFailure, action, state });
-  }
-  if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
-    const signature = actuatorSignature(action);
-    const goalKey = semanticGoalKey(action);
-    const currentDecisionInstanceId = action.decisionInstanceId || decisionInstanceKey(action, observation);
-    const previousFailure = (state.failures || []).find((failure) => (
-      failure.actuatorSignature === signature
-      && (!failure.goalKey || failure.goalKey === goalKey)
-      && Boolean(failure.decisionInstanceId)
-      && failure.decisionInstanceId === currentDecisionInstanceId
-    ));
-    if (previousFailure) {
-      return denied({
-        ...fail(
-          "FAILED_ACTUATOR_REUSE",
-          `This exact actuator already failed verification in the current checkout session (${previousFailure.code || "OUTCOME_NOT_VERIFIED"}). Reobserve and choose another canonical actuator or stop.`,
-          checks
-        ),
-        action,
-        state,
-        previousFailure
-      });
-    }
-    pass(checks, "ACTUATOR_NOT_PREVIOUSLY_FAILED", signature);
   }
   if (COMPOUND_MUTATIONS.has(action.type)) {
     return denied({ ...fail("UNEXPANDED_COMPOUND_ACTION", "Mutating skills must expand to one canonical atomic action before governance.", checks), action, state });

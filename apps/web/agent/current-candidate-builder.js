@@ -21,32 +21,99 @@ const {
   normalizedActionSemantics
 } = require("./action-semantics");
 const { evaluateActionPolicy } = require("../../../packages/shared/policy");
-const { actuatorSignature } = require("../../../packages/shared/agent-actions");
+const {
+  actuatorSignature,
+  isCandidateGrounded,
+  normalizeVisualRegion
+} = require("../../../packages/shared/agent-actions");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
-function controlUnavailable(control = {}) {
-  return control.disabled === true
-    || control.state?.disabled === true
+function candidateOperation(candidate = {}) {
+  return candidate.authorizedOperation
+    || (candidate.operation === "scroll_to" ? "" : candidate.operation)
+    || "";
+}
+
+function operationUsesExecutableActuator(control = {}, candidate = {}) {
+  return [
+    agentContract.EXECUTION_LANE.NORMAL,
+    agentContract.EXECUTION_LANE.BOUNDED_RECOVERY
+  ].includes(candidate.executionChannel);
+}
+
+function controlUnavailable(control = {}, candidate = {}) {
+  const underlyingStateDisabled = control.disabled === true || control.state?.disabled === true;
+  return (underlyingStateDisabled && !operationUsesExecutableActuator(control, candidate))
     || control.state?.available === false
     || /(?:^|\b)(?:not available|unavailable|sold out|disabled)(?:\b|$)/i.test(
       `${control.semantic || ""} ${control.risk || ""} ${control.label || ""}`
     );
 }
 
-function candidateActionabilityFailure(candidate = {}, control = {}) {
+function candidateActionabilityFailure(candidate = {}, control = {}, observation = {}, strategyAlreadyFailed = false) {
   if (!["click", "type", "select", "keypress", "scroll", "click_xy"].includes(candidate.type)) return "";
-  if (candidate.type === "click_xy") return candidate.visualRegion ? "" : "ACTIONABILITY_UNPROVEN";
-  const operation = candidate.authorizedOperation
-    || (candidate.operation === "scroll_to" ? "" : candidate.operation)
-    || "";
-  const capability = operation ? control.operations?.[operation] : null;
-  const actionability = candidate.actionability || capability?.actionability || null;
-  if (!capability || !actionability) return "ACTIONABILITY_UNPROVEN";
-  if (candidate.type === "scroll") {
-    return actionability.revealable === true ? "" : (actionability.code || "TARGET_NOT_REVEALABLE");
-  }
-  return actionability.executable === true || actionability.revealable === true
-    ? ""
-    : (actionability.code || "TARGET_NOT_ACTIONABLE");
+  if (!isCandidateGrounded(candidate, observation)) return "ACTIONABILITY_UNPROVEN";
+  const lane = agentContract.classifyExecutionLane({
+    action: candidate,
+    pipelineContract: candidate.pipelineContract,
+    control,
+    observation,
+    strategyAlreadyFailed
+  });
+  if (lane === agentContract.EXECUTION_LANE.NORMAL) return "";
+  if (lane === agentContract.EXECUTION_LANE.REVEAL) return "TARGET_NOT_REVEALED";
+  if (lane === agentContract.EXECUTION_LANE.BOUNDED_RECOVERY) return "ACTIONABILITY_UNPROVEN";
+  return strategyAlreadyFailed ? "FAILED_STRATEGY_REUSE" : "TARGET_NOT_ACTIONABLE";
+}
+
+function pipelineContractForCandidate(goal = {}, candidate = {}, control = {}, expectedOutcome = {}) {
+  const observed = agentContract.observedComponentContract(control, {
+    surfaceId: candidate.surfaceId || control.surfaceId || ""
+  });
+  const operation = candidateOperation(candidate);
+  const existing = candidate.pipelineContract || null;
+  let capability = existing?.capability || observed.capabilities.find((item) => (
+    item.operation === operation
+    && (
+      candidate.type === "click_xy" || candidate.boundedRecovery === true
+        ? item.status === agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+        : !candidate.targetId || item.actuatorIds?.includes(candidate.targetId)
+    )
+  )) || observed.capabilities.find((item) => item.operation === operation) || {};
+  const exact = (capability.exactActuators || []).find((item) => item.actuatorId === candidate.targetId);
+  capability = {
+    ...capability,
+    actuatorId: candidate.targetId || capability.actuatorId || "",
+    selectedStrategy: (capability.strategies || []).find((strategy) => (
+      strategy.actuatorId === candidate.targetId
+      && (!candidate.interactionMethod || strategy.method === candidate.interactionMethod)
+    )) || null,
+    status: candidate.type === "click_xy" || candidate.boundedRecovery === true
+      ? agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+      : exact?.status || capability.status || agentContract.CAPABILITY_STATUS.UNAVAILABLE,
+    proof: exact?.proof || capability.proof || capability.actionability || null
+  };
+  return agentContract.canonicalPipelineContract({
+    requirement: existing?.requirement || goal.requirementContract || {
+      requirementId: goal.requirementId || goal.goalId || goal.decisionGroupId || "",
+      subjectId: goal.subjectId || "",
+      semanticType: goal.semanticType || goal.sectionType || "",
+      desiredCanonicalValue: goal.canonicalValue || goal.desiredValue || ""
+    },
+    component: existing?.component || goal.componentBinding || {
+      logicalFieldId: goal.logicalFieldId || "",
+      componentIdentity: `${goal.logicalFieldId || control.stableKey || control.controlId}:${goal.componentRole || "value"}`,
+      componentRole: goal.componentRole || "value",
+      controlId: control.controlId || candidate.controlId || "",
+      controlRole: control.role || control.kind || "",
+      currentCanonicalValue: observed.currentCanonicalValue || "",
+      desiredCanonicalValue: goal.desiredValue || goal.canonicalValue || "",
+      observedOptions: observed.observedOptions || []
+    },
+    capability,
+    expectedOutcome,
+    validationOwnership: existing?.validationOwnership || goal.validationOwnership || observed.validationOwnership || {}
+  });
 }
 
 function candidatePolicyAction(goal = {}, candidate = {}, control = {}, observation = {}) {
@@ -74,7 +141,7 @@ function observationHash(observation = {}) {
 }
 
 function capabilityKey(candidate = {}) {
-  return [candidate.controlId, candidate.operation, candidate.targetId, candidate.type, candidate.value, candidate.keys]
+  return [candidate.controlId, candidate.operation, candidate.targetId, candidate.type, candidate.interactionMethod, candidate.value, candidate.keys]
     .map(String)
     .join("::");
 }
@@ -92,7 +159,7 @@ function relevantToVisibleSurface(goal = {}, candidate = {}, isGoalCandidate = f
 
 function allCurrentCapabilityCandidates(goal = {}, observation = {}, traveler = {}) {
   const goalCandidates = goal.kind === "profile_field"
-    ? candidatesForProfileGoal(goal, observation, traveler, [])
+    ? candidatesForProfileGoal(goal, observation, traveler, [], { includeAlternates: true })
     : buildObservationCandidateSet(goal, observation).candidates;
   const contextGoal = {
     ...goal,
@@ -119,6 +186,14 @@ function allCurrentCapabilityCandidates(goal = {}, observation = {}, traveler = 
 function bindCandidateEnvelope(candidate = {}, index, observation = {}, binding = {}) {
   return {
     ...candidate,
+    visualRegion: candidate.visualRegion
+      ? normalizeVisualRegion(candidate.visualRegion, {
+          observationId: binding.observationId || observation.observationId || "",
+          controlId: candidate.controlId || "",
+          operation: candidate.operation || "",
+          surfaceId: binding.surfaceId || ""
+        })
+      : null,
     strategyId: candidate.strategyId || candidate.candidateId || "",
     candidateId: `${binding.observationId || "observation"}:candidate_${index + 1}`,
     observationId: binding.observationId || "",
@@ -157,6 +232,7 @@ function buildCurrentCandidateSet({
     const semantics = normalizedActionSemantics(bound, { control, goal, expectedOutcome: bound.expectedOutcome });
     const physicalEffect = predictPhysicalEffect({ semantics, control, candidate: bound, goal: { ...goal, outcomeContract } });
     const expectedOutcome = compileTypedExpectedOutcome({ ...bound, physicalEffect, goal: { ...goal, outcomeContract } }, page);
+    const pipelineContract = pipelineContractForCandidate(goal, bound, control, expectedOutcome);
     const semanticIntent = semanticIntentForAction({
       mechanicalEffect: physicalEffect,
       control,
@@ -186,8 +262,8 @@ function buildCurrentCandidateSet({
       goal: { ...goal, outcomeContract },
       postcondition: expectedOutcome
     });
-    const actionabilityFailure = candidateActionabilityFailure(bound, control);
-    const grounded = {
+    const strategyAlreadyFailed = attemptedStrategies.has(actuatorSignature(bound));
+    const laneInput = {
       ...bound,
       // A visible foreground surface owns the next click. TaskState remains
       // useful planning context, but it cannot hide a grounded safe control
@@ -200,6 +276,8 @@ function buildCurrentCandidateSet({
       risk: bound.risk || (goal.kind === "profile_field" ? "safe" : "uncertain"),
       requiresApproval: Boolean(bound.requiresApproval),
       expectedOutcome,
+      pipelineContract,
+      capabilityStatus: pipelineContract.capability.status,
       expectedPostconditions,
       physicalEffect,
       mechanicalEffect: physicalEffect,
@@ -211,11 +289,36 @@ function buildCurrentCandidateSet({
       affordance,
       requiresJudgment: Boolean(bound.requiresJudgment || bound.risk === "uncertain")
     };
+    const executionChannel = agentContract.classifyExecutionLane({
+      action: laneInput,
+      pipelineContract,
+      control,
+      observation,
+      strategyAlreadyFailed
+    });
+    const grounded = {
+      ...laneInput,
+      executionChannel
+    };
+    const actionabilityFailure = candidateActionabilityFailure(
+      grounded,
+      control,
+      observation,
+      strategyAlreadyFailed
+    );
     const policyState = state && Object.keys(state).length
       ? {
           taskState: state.taskState || null,
           approvals: state.approvals || {},
-          priceHistory: Array.isArray(state.priceHistory) ? state.priceHistory : []
+          priceHistory: Array.isArray(state.transactionInvariants?.evidence)
+            ? state.transactionInvariants.evidence
+              .map((entry) => ({
+                amount: entry.facts?.totalPrice?.amount,
+                currency: entry.facts?.totalPrice?.currency || entry.facts?.currency || "",
+                capturedAt: entry.observedAt || ""
+              }))
+              .filter((entry) => entry.amount !== null && Number.isFinite(Number(entry.amount)))
+            : []
         }
       : null;
     const policyDecision = evaluateActionPolicy(
@@ -235,7 +338,7 @@ function buildCurrentCandidateSet({
           reason: String(policyDecision.reason || "")
         })
       }),
-      exclusionReason: controlUnavailable(control)
+      exclusionReason: controlUnavailable(control, grounded)
         ? "CONTROL_UNAVAILABLE"
         : actionabilityFailure
           ? actionabilityFailure
@@ -250,19 +353,56 @@ function buildCurrentCandidateSet({
       || attempted.has(candidate.strategyId)
       || attemptedStrategies.has(actuatorSignature(candidate))
   ));
-  const selectable = current.filter((candidate) => {
+  const policySelectable = (candidate) => {
     if (!candidate.goalRelevant) return false;
-    const hardExclusion = controlUnavailable((page.controls || []).find((item) => item.controlId === candidate.controlId) || {})
-      || ["CONTROL_UNAVAILABLE", "ACTIONABILITY_UNPROVEN", "TARGET_NOT_ACTIONABLE", "TARGET_NOT_REVEALABLE"].includes(candidate.exclusionReason);
-    if (hardExclusion) return false;
-    if (candidate.exclusionReason) return false;
     const nonMutating = ["ask_user", "wait"].includes(candidate.type);
-    if (!nonMutating && (candidate.risk !== "safe" || candidate.requiresApproval)) return false;
+    if (!nonMutating && candidate.policyDecision?.allow !== true) return false;
+    if (!nonMutating && candidate.requiresApproval && !candidate.affordance?.authorization?.authorizationId) return false;
     return !attempted.has(candidate.candidateId)
       && !attempted.has(candidate.strategyId)
       && !attemptedStrategies.has(actuatorSignature(candidate));
-  });
+  };
+  const selectablePool = current.filter((candidate) => (
+    policySelectable(candidate)
+    && !controlUnavailable(
+      (page.controls || []).find((item) => item.controlId === candidate.controlId) || {},
+      candidate
+    )
+    && !candidate.exclusionReason
+    && (
+      !["click", "type", "select", "keypress", "scroll", "click_xy"].includes(candidate.type)
+      || candidate.executionChannel === agentContract.EXECUTION_LANE.NORMAL
+    )
+  ));
+  const oneCurrentStrategyPerOperation = (items = []) => {
+    const selected = new Set();
+    return items.filter((candidate) => {
+      if (!["click", "keypress"].includes(candidate.type)) return true;
+      const key = [
+        candidate.controlId,
+        candidate.operation
+      ].join("::");
+      if (selected.has(key)) return false;
+      selected.add(key);
+      return true;
+    });
+  };
+  const selectable = oneCurrentStrategyPerOperation(selectablePool);
+  const recoveryCandidates = oneCurrentStrategyPerOperation(current.filter((candidate) => (
+    policySelectable(candidate)
+    && candidate.policyDecision?.allow === true
+    && !controlUnavailable(
+      (page.controls || []).find((item) => item.controlId === candidate.controlId) || {},
+      candidate
+    )
+    && [
+      agentContract.EXECUTION_LANE.REVEAL,
+      agentContract.EXECUTION_LANE.BOUNDED_RECOVERY
+    ].includes(candidate.executionChannel)
+    && !candidate.requiresJudgment
+  )));
   const selectableIds = new Set(selectable.map((candidate) => candidate.candidateId));
+  const recoveryIds = new Set(recoveryCandidates.map((candidate) => candidate.candidateId));
   return {
     ...binding,
     // Context is complete; selection is policy-safe. The model can understand
@@ -273,10 +413,12 @@ function buildCurrentCandidateSet({
       policyStatus: candidate.policyDecision?.allow === true
         ? (candidate.goalRelevant ? "allowed" : "context_only")
         : String(candidate.policyDecision?.decision || "denied"),
-      selectable: selectableIds.has(candidate.candidateId)
+      selectable: selectableIds.has(candidate.candidateId),
+      recoverySelectable: recoveryIds.has(candidate.candidateId)
     })),
     excludedCandidates,
-    candidates: selectable
+    candidates: selectable,
+    recoveryCandidates
   };
 }
 
@@ -298,7 +440,16 @@ function actionForCurrentCandidate(goal = {}, candidate = {}, observation = {}) 
     semanticIntent: candidate.semanticIntent || action.semanticIntent || action.intent || "",
     expectedPostconditions: candidate.expectedPostconditions || action.expectedPostconditions || (candidate.expectedOutcome ? [candidate.expectedOutcome] : []),
     outcomeCompatibility: candidate.outcomeCompatibility || "unknown",
-    affordance: candidate.affordance || action.affordance || null
+    affordance: candidate.affordance || action.affordance || null,
+    pipelineContract: candidate.pipelineContract || action.pipelineContract || null,
+    capabilityStatus: candidate.capabilityStatus || action.capabilityStatus || "",
+    executionChannel: candidate.executionChannel || action.executionChannel || "",
+    interactionMethod: candidate.interactionMethod || action.interactionMethod || "",
+    boundedRecovery: candidate.boundedRecovery === true || action.boundedRecovery === true,
+    exactOption: candidate.exactOption
+      || candidate.pipelineContract?.component?.exactOption
+      || action.exactOption
+      || null
   };
 }
 

@@ -7,11 +7,28 @@ const { governAction } = require("../../apps/web/agent/action-governor");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 
 function capability(operation, actuatorId) {
+  const actionability = {
+    rendered: true,
+    visible: true,
+    enabled: true,
+    inViewport: true,
+    inCurrentSurface: true,
+    hitTested: true,
+    notOccluded: true,
+    targetable: true,
+    operationAuthorized: true,
+    operationProven: true,
+    executable: true,
+    revealable: false,
+    code: "ACTIONABLE",
+    operation
+  };
   return {
     operation,
     actuatorId,
     actuatorIds: [actuatorId],
-    actionability: { executable: true, revealable: false, code: "ACTIONABLE" }
+    actionability,
+    actionabilityByActuator: { [actuatorId]: actionability }
   };
 }
 
@@ -21,6 +38,28 @@ function observation(id, page, lastActionResult = null) {
     observationSnapshot: { snapshotHash: `hash_${id}` },
     page: { url: "https://example.test/checkout", controls: [], decisionGroups: [], validationIssues: [], ...page },
     lastActionResult
+  };
+}
+
+function readyTransactionReview() {
+  const transaction = {
+    itinerary: {
+      completeness: "complete",
+      segments: [{ segmentId: "segment_1", origin: "LHR", destination: "LJU", departureDate: "2026-08-10" }]
+    },
+    travelers: [{ travelerId: "trav_1", name: "Alex Example" }],
+    currency: "EUR",
+    totalPrice: { amount: 208, currency: "EUR" },
+    selectedExtras: []
+  };
+  return {
+    ready: true,
+    baselineStatus: "approved",
+    missingFacts: [],
+    contradictions: [],
+    unauthorizedPaidExtras: [],
+    baseline: transaction,
+    current: transaction
   };
 }
 
@@ -254,6 +293,88 @@ test("a verified free choice resolves its decision but TaskState still publishes
   assert.equal(taskState.terminalStatus, "active");
 });
 
+test("a profile-authorized free choice may complete by safely advancing to the next stage", () => {
+  const before = observation("before_auto_advance", {
+    step: "extras",
+    price: { amount: 120, currency: "EUR" },
+    currentSurface: { id: "surface-page", type: "page", label: "Insurance" },
+    controls: [{
+      controlId: "no_insurance",
+      label: "No insurance — 0 EUR",
+      semantic: "safe_decline",
+      physicalEffect: "select_free_option",
+      structuredPrice: { amount: 0, currency: "EUR" },
+      risk: "safe",
+      decisionGroupId: "insurance",
+      surfaceId: "surface-page"
+    }],
+    decisionGroups: [{
+      decisionGroupId: "insurance",
+      requirementId: "insurance",
+      sectionType: "insurance",
+      status: "missing",
+      alternatives: [{ controlId: "no_insurance" }]
+    }]
+  });
+  const after = observation("after_auto_advance", {
+    url: "https://example.test/checkout/seats",
+    step: "seats",
+    price: { amount: 120, currency: "EUR" },
+    currentSurface: { id: "surface-page", type: "page", label: "Seating" },
+    controls: [{
+      controlId: "continue",
+      label: "Continue",
+      semantic: "continue",
+      surfaceId: "surface-page",
+      operations: { activate: capability("activate", "el_continue") }
+    }],
+    decisionGroups: []
+  }, { actionId: "act_no_insurance", dispatched: true, executed: true });
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: {
+      id: "act_no_insurance",
+      controlId: "no_insurance",
+      decisionGroupId: "insurance",
+      semanticIntent: "select_policy_safe_option",
+      mechanicalEffect: "select_free_option",
+      expectedOutcome: {
+        type: "exact_free_option_selected",
+        controlId: "no_insurance",
+        expectedSelectedControlId: "no_insurance",
+        decisionGroupId: "insurance",
+        expectedDisposition: "decline_free_no_extra",
+        mustNotIncreasePrice: true
+      },
+      affordance: {
+        policy: { allow: true },
+        physicalEffect: "select_free_option",
+        task: {
+          outcomeContract: {
+            taskOutcome: "optional_extra_declined",
+            acceptablePhysicalEffects: ["select_free_option", "advance_checkout_stage"],
+            completionEvidence: ["exact_option_selected", "fresh_stage"]
+          }
+        }
+      }
+    },
+    browserResult: {
+      actionId: "act_no_insurance",
+      dispatched: true,
+      executed: true,
+      verified: false,
+      outcome: { code: "EXACT_FREE_OPTION_NOT_VERIFIED" }
+    },
+    afterObservation: after
+  });
+
+  assert.equal(transition.status, "progressed");
+  assert.equal(transition.postcondition.satisfied, true);
+  assert.equal(transition.postcondition.evidence.completionMode, "safe_stage_transition");
+  assert.equal(transition.physicalResult.effect, "select_free_option");
+  assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
+});
+
 test("durable payment outcome survives base page and review-modal subgoals", () => {
   const base = observation("hierarchy_base", {
     step: "extras",
@@ -297,7 +418,11 @@ test("durable payment outcome survives base page and review-modal subgoals", () 
     controls: [{ controlId: "card", semantic: "card_number", label: "Card number", surfaceId: "surface-page" }],
     sections: [{ type: "payment", label: "Payment method and order amount" }]
   });
-  const completed = reduceTaskState({ previousTaskState: second, observation: payment });
+  const completed = reduceTaskState({
+    previousTaskState: second,
+    observation: payment,
+    transactionReview: readyTransactionReview()
+  });
   assert.equal(completed.stageOutcome.outcomeId, second.stageOutcome.outcomeId);
   assert.equal(completed.stageOutcome.status, "completed");
   assert.equal(completed.terminalStatus, "payment_review_reached");

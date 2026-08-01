@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { governAction } = require("../../apps/web/agent/action-governor");
-const { factsFromObservation, normalizeFacts } = require("../../apps/web/agent/transaction-facts");
+const { factsFromObservation, mergeCommerceSelections, normalizeFacts } = require("../../apps/web/agent/transaction-facts");
 const { explicitItineraryConflict, invariantDecision, prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
 
 function facts({
@@ -72,6 +72,94 @@ test("P0.5 normalizes structured transaction facts without visible-text fingerpr
   assert.equal(Object.hasOwn(observed, "itineraryFingerprint"), false);
 });
 
+test("transaction facts retain only explicitly typed commerce selections", () => {
+  const raw = facts();
+  raw.selectedExtras = [{
+    decisionGroupId: "profile_nationality",
+    label: "Slovenia",
+    disposition: "selected",
+    priceAmount: null,
+    currency: "EUR"
+  }, {
+    family: "insurance",
+    subjectKey: "travel_insurance",
+    decisionGroupId: "insurance_choice",
+    label: "No insurance",
+    disposition: "decline",
+    priceAmount: 0,
+    currency: "EUR"
+  }];
+
+  const normalized = normalizeFacts(raw);
+  assert.deepEqual(normalized.selectedExtras.map((extra) => extra.decisionGroupId), ["insurance_choice"]);
+});
+
+test("generic checkout prose cannot become canonical route endpoints", () => {
+  const normalized = normalizeFacts({
+    itinerary: {
+      completeness: "partial",
+      segments: [
+        { segmentId: "fake_direct", origin: "DIRECT", destination: "FLIGHT" },
+        { segmentId: "fake_summary", origin: "TRIP", destination: "SUMMARY" }
+      ]
+    }
+  });
+
+  assert.equal(normalized.itinerary.completeness, "partial");
+  assert.deepEqual(normalized.itinerary.segments.map(({ origin, destination }) => ({ origin, destination })), [
+    { origin: "", destination: "" },
+    { origin: "", destination: "" }
+  ]);
+});
+
+test("current canonical decisions enrich transaction outcomes without erasing review rows", () => {
+  const raw = facts();
+  raw.selectedExtras = [{
+    family: "seat",
+    subjectKey: "seat_assignment",
+    decisionGroupId: "review_seat",
+    label: "Random seat",
+    outcome: "random_assignment",
+    disposition: "included",
+    currency: "EUR"
+  }];
+  const observed = factsFromObservation({ travelerIds: ["trav_1"], userPolicy: {} }, {
+    observationId: "obs_outcome_enrichment",
+    page: {
+      step: "confirmation",
+      transactionFacts: raw,
+      decisionGroups: []
+    }
+  }, { id: "trav_1" });
+
+  assert.equal(observed.selectedExtras.length, 1);
+  assert.equal(observed.selectedExtras.find((extra) => extra.family === "seat").outcome, "random_assignment");
+});
+
+test("durable commerce outcomes use semantic identity across rerendered decision ids", () => {
+  const merged = mergeCommerceSelections([{
+    family: "fare",
+    subjectKey: "fare_card_old",
+    decisionGroupId: "dg_fare_old",
+    label: "Continue with Saver",
+    outcome: "selected",
+    priceAmount: 0,
+    currency: "EUR"
+  }], [{
+    family: "fare",
+    subjectKey: "ticket_type_summary",
+    decisionGroupId: "dg_fare_review",
+    label: "Basic Saver",
+    outcome: "selected",
+    currency: "EUR"
+  }]);
+
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].outcomeKey, "fare:ticket");
+  assert.equal(merged[0].decisionGroupId, "dg_fare_review");
+  assert.equal(merged[0].priceAmount, 0);
+});
+
 test("P0.5 immutable baseline treats absence and matching partial itinerary evidence as stable", () => {
   let state = createCheckoutSessionState({ travelerId: "trav_1" });
   state.id = "txn_partial_stable";
@@ -120,21 +208,114 @@ test("P0.5 blocks only explicit route, date, traveler, and currency contradictio
   assert.equal(invariantDecision({ baseline, observed: unrelatedPartial }, { type: "wait" }, { approvals: {}, paymentState: {} }).allow, true);
 });
 
-test("P0.5 records later facts as evidence without silently completing an unknown baseline", () => {
+test("the final transaction review compares fresh identity instead of a retained stale current route", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_fresh_review_identity";
+  state = prepareTransactionInvariants(state, observation("obs_baseline_review", facts()), { id: "trav_1" }).state;
+
+  const changed = prepareTransactionInvariants(
+    state,
+    observation("obs_changed_review", facts({ destination: "CDG" })),
+    { id: "trav_1" }
+  );
+
+  assert.equal(changed.envelope.current.itinerary.segments[0].destination, "CDG");
+  assert.equal(changed.review.ready, false);
+  assert.deepEqual(changed.review.contradictions, ["ITINERARY_ROUTE_CHANGED"]);
+});
+
+test("P0.5 progressively promotes an unknown baseline once complete transaction facts arrive", () => {
   let state = createCheckoutSessionState({ travelerId: "trav_1" });
   state.id = "txn_unknown_baseline";
   const unknown = prepareTransactionInvariants(state, observation("obs_unknown", null), { id: "trav_1" });
   const completed = prepareTransactionInvariants(unknown.state, observation("obs_later_complete", facts()), { id: "trav_1" });
 
-  assert.equal(completed.envelope.baseline.itinerary.completeness, "unknown");
-  assert.equal(completed.envelope.baseline.itinerary.segments.length, 0);
+  assert.equal(unknown.envelope.baselineStatus, "collecting");
+  assert.equal(completed.envelope.baselineStatus, "approved");
+  assert.equal(completed.envelope.baseline.itinerary.completeness, "complete");
+  assert.equal(completed.envelope.baseline.itinerary.segments[0].origin, "LHR");
   assert.equal(completed.envelope.evidence.at(-1).facts.itinerary.completeness, "complete");
   assert.equal(completed.envelope.evidence.at(-1).facts.itinerary.segments[0].origin, "LHR");
+});
+
+test("a final payment review cannot establish its own missing itinerary baseline", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_review_cannot_seed_baseline";
+  const unknown = prepareTransactionInvariants(state, observation("obs_unknown_before_review", null), { id: "trav_1" });
+  const reviewFacts = facts();
+  reviewFacts.provenance = [{ source: "payment_summary", observationId: "obs_final_review", confidence: 0.95 }];
+  const reviewed = prepareTransactionInvariants(unknown.state, observation("obs_final_review", reviewFacts), { id: "trav_1" });
+
+  assert.equal(reviewed.envelope.baselineStatus, "collecting");
+  assert.equal(reviewed.envelope.baseline.itinerary.segments.length, 0);
+  assert.equal(reviewed.envelope.reviewFacts.itinerary.segments[0].origin, "LHR");
+  assert.equal(reviewed.review.ready, false);
+  assert.ok(reviewed.review.missingFacts.includes("itinerary_route"));
+});
+
+test("final review reconciles the immutable trip and durable semantic outcomes", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_semantic_review";
+  const baselineFacts = facts();
+  baselineFacts.selectedExtras = [{
+    family: "fare",
+    subjectKey: "fare_choice",
+    decisionGroupId: "dg_fare_checkout",
+    label: "Continue with Basic Saver",
+    outcome: "selected",
+    priceAmount: 0,
+    currency: "EUR"
+  }, {
+    family: "seat",
+    subjectKey: "seat_assignment",
+    decisionGroupId: "dg_seat_checkout",
+    label: "Skip seat selection",
+    outcome: "random_assignment",
+    priceAmount: 0,
+    currency: "EUR"
+  }];
+  state = prepareTransactionInvariants(state, observation("obs_checkout_baseline", baselineFacts), { id: "trav_1" }).state;
+  assert.equal(state.transactionInvariants.review.ready, false);
+  assert.ok(state.transactionInvariants.review.missingFacts.includes("payment_review"));
+
+  const reviewFacts = facts();
+  reviewFacts.provenance = [{ source: "payment_summary", observationId: "obs_payment_review", confidence: 0.95 }];
+  reviewFacts.selectedExtras = [{
+    family: "fare",
+    subjectKey: "ticket",
+    decisionGroupId: "review_fare",
+    label: "Basic Saver",
+    outcome: "selected",
+    currency: "EUR"
+  }, {
+    family: "seat",
+    subjectKey: "seat_assignment",
+    decisionGroupId: "review_seat",
+    label: "Random seat",
+    outcome: "random_assignment",
+    currency: "EUR"
+  }];
+  const reviewed = prepareTransactionInvariants(state, observation("obs_payment_review", reviewFacts), { id: "trav_1" });
+
+  assert.equal(reviewed.review.ready, true);
+  assert.deepEqual(reviewed.review.contradictions, []);
+  assert.equal(reviewed.envelope.outcomeLedger.length, 2);
+
+  const changedSeat = facts();
+  changedSeat.provenance = [{ source: "payment_summary", observationId: "obs_payment_changed", confidence: 0.95 }];
+  changedSeat.selectedExtras = reviewFacts.selectedExtras.map((extra) => (
+    extra.family === "seat" ? { ...extra, label: "12A selected", outcome: "assigned" } : extra
+  ));
+  const changed = prepareTransactionInvariants(state, observation("obs_payment_changed", changedSeat), { id: "trav_1" });
+  assert.equal(changed.review.ready, false);
+  assert.ok(changed.review.contradictions.includes("REVIEW_OUTCOME_CHANGED:seat:seat_assignment"));
 });
 
 test("an inflated starting total is evidence, never approval for an existing paid optional item", () => {
   const raw = facts({ totalPrice: 237 });
   raw.selectedExtras = [{
+    family: "extras",
+    subjectKey: "bundle",
     decisionGroupId: "dg_bundle",
     label: "Selected bundle",
     disposition: "paid",
@@ -174,6 +355,8 @@ test("price evidence allows reconciliation while selected-extra policy still blo
   const baseline = normalizeFacts(facts({ totalPrice: 200 }));
   const currentRaw = facts({ totalPrice: 229 });
   currentRaw.selectedExtras = [{
+    family: "extras",
+    subjectKey: "bundle",
     decisionGroupId: "dg_bundle",
     label: "All passengers",
     disposition: "paid",
@@ -271,6 +454,8 @@ test("unapproved selected extra is recoverable when its exact current-surface re
   const baseline = normalizeFacts(facts({ totalPrice: 200 }));
   const currentRaw = facts({ totalPrice: 223 });
   currentRaw.selectedExtras = [{
+    family: "extras",
+    subjectKey: "current_paid_item",
     decisionGroupId: "dg_current_paid_item",
     label: "Current paid item",
     disposition: "paid",

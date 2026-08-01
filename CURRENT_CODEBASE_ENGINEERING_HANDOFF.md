@@ -1,1118 +1,558 @@
 # Fly Current Codebase: Engineering Handoff
 
-**Snapshot date:** 2026-07-20
-**Code snapshot reviewed:** `041a8a7` (`dev`) plus the current uncommitted TaskState/grounded-ambiguity consolidation
-**Primary roadmap:** [`AGENT_ARCHITECTURE_PLAN.md`](./AGENT_ARCHITECTURE_PLAN.md)
-**Empirical progress tracker:** [`P_AGENT_ARCHITECTURE_TRACKER.md`](./P_AGENT_ARCHITECTURE_TRACKER.md)
-**Ordered execution TODO:** [`FLY_EXECUTION_TODO.md`](./FLY_EXECUTION_TODO.md)
+**Snapshot date:** 2026-07-26
 
-**Working-tree note:** the architecture described here includes substantial uncommitted work. On 2026-07-20, the current tree passed `npm run check`, **110/110** unit tests, and **37/37** browser/cross-layer tests. `TaskState` now controls production goal selection and navigation eligibility, legacy requirements are diagnostic-only, and policy-denied controls are model context rather than selectable candidate IDs. The newest live trace proves that consolidation is incomplete in one important way: `TaskState` owns a flat observation-scoped `currentGoal`, so an intermediate foreground surface can replace the unfinished checkout outcome. The physical-effect layer now correctly recognizes the modal close control as `dismiss_surface`, but the replacement modal goal still permits dismissal and the loop reports local success without reaching payment.
+**Branch:** `dev`
 
-This document explains the current Fly codebase from product intent through browser execution, persistence, safety, testing, present limitations, and recommended next work. It is written for an engineer taking over the system.
+**Committed baseline:** `1b3d3d0 Fix destination readiness lifecycle`
 
-If this document, the roadmap, and the tracker disagree:
+**Working tree:** contains the uncommitted Logical Field Adapter and airline/OTA coverage work described below
 
-1. Running code and fresh traces are the truth about behavior.
-2. The tracker is the truth about what has been empirically proven.
-3. The architecture plan is the desired direction and acceptance contract.
+**Backup:** `stash@{0}: backup before reverting to 1b3d3d0 on 2026-07-25`
 
----
+Related planning documents:
 
-## 1. Executive Summary
+- [`AGENT_ARCHITECTURE_PLAN.md`](./AGENT_ARCHITECTURE_PLAN.md)
+- [`P_AGENT_ARCHITECTURE_TRACKER.md`](./P_AGENT_ARCHITECTURE_TRACKER.md)
+- [`FLY_EXECUTION_TODO.md`](./FLY_EXECUTION_TODO.md)
 
-Fly is currently a Chrome extension plus a local Node backend that attempts to take an already-selected flight checkout from traveler details to the payment-review page using a saved traveler profile and booking rules.
-
-The long-term product vision is broader: a user states or saves preferences once, and Fly completes most airline/OTA checkouts with roughly 1–3 user interactions, despite different layouts, custom controls, popups, rerenders, add-on offers, seat flows, and other ambiguity. The same agent kernel should later support other clients, including iOS.
-
-The present architecture is deliberately hybrid:
-
-- Deterministic code owns observations, identity, current state, safety policy, action authorization, execution, verification, recovery limits, and the transaction ledger.
-- AI is used only when the current observation contains multiple safe, grounded ways to advance and semantic judgment is genuinely needed.
-- The model selects an existing current candidate ID. It does not invent selectors, arbitrary JavaScript, page-specific procedures, or transaction facts.
-- The browser executor performs one small mechanical action at a time and then observes again.
-
-The current working tree makes `task-state-reducer.js` the production semantic authority. It reduces prior durable state, fresh browser facts, the last action result, traveler data, and policy into one stage, foreground surface, decision state, completed outcomes, current goal, ambiguity state, and terminal status. The extension reports browser facts, the old requirement lifecycle is stored only as `legacyRequirementsDiagnostic`, and forward-navigation policy reads `TaskState` rather than legacy requirements. This single-authority direction is correct, but the authority currently models only one flat goal recreated from each observation. It does not yet preserve a durable transaction/stage outcome above temporary surface and action subgoals.
-
-Ambiguous planning is also split correctly: AI can inspect all current-surface capabilities, including denied or contextual controls, but its closed output schema contains only current policy-allowed candidate IDs. The governor independently validates the chosen action afterward.
-
-The code has reached the Gotogate payment page in a live run without a paid extra or final payment attempt. Newer runs traverse traveler details, baggage, bundle/flexible-ticket choices, both seat legs, multiple extras, offscreen recovery, and the final review surface. The newest session still loops at that surface, but it narrows the root cause: the observer continues to assign the CTA's label to the icon-only close control, while the newer physical-effect layer nevertheless identifies that actuator correctly as `dismiss_surface`. The loop persists because the reducer replaces `reach payment review` with a generic modal decision whose broad contract permits dismissal; `command_acknowledged` then accepts the local surface change and the base Continue reopens the modal.
-
-The highest-leverage next work is therefore not payment automation, detailed seat preferences, more requirements, or an airline-specific modal handler. It is a durable hierarchical outcome model inside the existing single TaskState authority: preserve the transaction/stage outcome across intermediate surfaces, create temporary surface subgoals without replacing it, allow only effects compatible with both levels, and evaluate net progress toward the parent outcome. Command-local evidence remains a required supporting correction, but it is no longer the whole root problem.
+This file is the current engineering handoff. Running code and fresh traces remain the final truth when this document disagrees with an older plan or tracker.
 
 ---
 
-## 2. Product Goal and Current Release Boundary
+## 0. Engineering Brief
 
-### Product goal
+### Immediate objective
 
-Given:
+Restore one generic invariant:
 
-- a selected itinerary,
-- a saved traveler profile,
-- saved booking policies such as “no paid extras,”
-- and current page evidence,
+> If the fresh browser observation exposes an unresolved logical component with a canonical executable operation, that component must remain executable through the backend and must be attempted before the agent hands off or stops.
 
-Fly should complete the checkout safely and quickly, handling unexpected page structures by observing and replanning rather than following hardcoded airline scripts.
-
-The intended user experience is:
-
-```text
-Choose flight
-→ start Fly
-→ Fly completes traveler data and safe choices
-→ user reviews/authorizes at meaningful risk boundaries
-→ payment/booking is completed safely
-```
-
-### Current scope freeze
-
-The current roadmap intentionally limits the first reliable vertical slice to:
-
-- one adult traveler,
-- economy travel,
-- guest checkout,
-- one-way or return itineraries,
-- saved traveler data,
-- predefined baggage policy,
-- skip paid seats and paid extras by default,
-- stop at payment review.
-
-Complex multi-city trips, infants, group identity ambiguity, loyalty redemption, irregular operations, and autonomous payment are not current release requirements.
-
-### Current terminal boundary
-
-The current product is supposed to reach the payment page and stop. It must not autonomously:
-
-- enter raw card credentials,
-- accept legal terms,
-- authorize a changed amount,
-- submit the final purchase,
-- or claim a booking is complete.
-
-Those capabilities require the unfinished P0.8/P3 payment architecture: tokenized credentials, explicit offer/amount/itinerary-bound authorization, legal approval, 3-D Secure handoff, idempotency, and confirmation reconciliation.
-
----
-
-## 3. Current Proven State
-
-### What is implemented
-
-- A Chrome Manifest V3 extension injected into supported checkout sites.
-- A local web application for traveler/profile data and agent APIs.
-- Durable agent sessions and an SQLite transaction ledger.
-- Whole-page semantic observation, including current surfaces, controls, capabilities, validation, decision groups, pricing, and itinerary facts.
-- Open shadow-root and same-origin iframe traversal; cross-origin frames remain opaque.
-- Observation-bound action candidates.
-- Strict model selection from current candidate IDs.
-- A central action governor.
-- One authoritative action lifecycle with pending-action recovery.
-- One-action-at-a-time atomic browser execution.
-- Fresh observation and exact post-action transition evaluation.
-- Bounded recovery and user handoff.
-- Static, unit, browser, and cross-layer replay coverage.
-- One live Gotogate run that reached payment review.
-- Newer live runs that repeatedly complete the difficult path up to the final review modal.
-
-### What is not proven or not built
-
-- Five consecutive Gotogate checkout-to-payment runs have not passed; there is no current consecutive acceptance streak.
-- Cross-airline/OTA portability has not passed on three structurally different checkout engines.
-- Backend payment-page classification and ordinary-planning suppression are implemented, but durable/sticky payment-terminal behavior has not passed repeated live acceptance.
-- TaskState currently exposes one flat observation-scoped goal rather than a durable transaction/stage goal with temporary surface/action subgoals.
-- Foreground surfaces can be converted into generic decision groups even when they are navigation or review surfaces rather than real mutually exclusive decisions.
-- Command-local labels are not yet trustworthy. Surface/nearby text can contaminate a control's local label, although the typed physical-effect layer now recovers the close control as `dismiss_surface` in the newest run.
-- Generic command verification can treat dismissal or any observable change as success even when the durable parent goal requires a specific stage transition.
-- Recovery is keyed to changing current goals and does not yet detect a semantic `base → modal → base` cycle with no net parent progress.
-- Production authentication, tenant isolation, and a production-grade credential vault do not exist.
-- Autonomous payment, legal authorization, 3DS, final booking submission, and confirmation reconciliation are not implemented.
-- iOS integration is future work; only portable shared contracts exist today.
-- Latency has not yet been systematically optimized against p50/p95 targets.
-
-### Roadmap status in plain language
-
-- **P0 — reliable execution foundation:** materially implemented, still partial until durable parent-goal continuity, exact transition verification, cycle recovery, and repeated live acceptance pass.
-- **P1 — perception/environment model:** materially implemented, still partial because decision-group evidence and control-local labels can still be polluted by surrounding surface context, and cross-engine proof is missing.
-- **P2 — reusable skills/site knowledge/replay:** partial. Replay infrastructure exists; reusable knowledge and multi-engine acceptance are incomplete.
-- **P3 — real transactions/payment:** not started as a production-safe capability.
-- **P4 — shared kernel/iOS adapters:** architectural direction exists; product work is not started.
-- **P5 — airline expansion:** not started as an accepted coverage program.
-
----
-
-## 4. System Architecture
-
-```mermaid
-flowchart LR
-    U["User profile and booking rules"] --> W["Node web app and agent API"]
-    E["Chrome extension on checkout page"] -->|"canonical observation + screenshot ref"| W
-    W --> S["SQLite transaction state"]
-    W --> R["Authoritative TaskState reducer"]
-    R --> G["Current goal and candidate builder"]
-    G --> M["AI candidate selector when ambiguous"]
-    G --> V["Governor and invariants"]
-    M --> V
-    V -->|"one approved atomic action"| E
-    E -->|"fresh observation + action result"| W
-    W --> T["Mechanical diff and transition evaluator"]
-    T -->|"fresh facts and action result"| R
-```
-
-The main runtime boundaries are:
-
-1. **Browser extension:** observes the live page and mechanically executes an approved action.
-2. **Backend agent kernel:** owns semantic interpretation, action lifecycle, safety, recovery, and transaction truth.
-3. **AI model:** chooses among grounded candidates when deterministic selection is insufficient.
-4. **Persistence:** stores profile data separately from authoritative checkout transaction state.
-
-### 4.1 Core components at a glance
-
-| Component | Question it answers | What it owns |
-|---|---|---|
-| **Traveler profile and policy** | What does the user want? | Identity data, contact details, baggage/seat/extra preferences, price constraints, and explicit approvals. |
-| **Browser observer** | What is true on the page now? | Current controls, values, validation, capabilities, surfaces, decision groups, itinerary, price, and screenshot evidence. It currently emits several overlapping name/semantic fields; command-local effect is the remaining weak boundary. |
-| **TaskState reducer** | What does the current checkout mean and what remains? | Currently owns one stage, foreground surface, decisions, completions, flat current goal, ambiguity, and terminal status. It must be extended—not replaced—to preserve a durable transaction/stage outcome above temporary surface and action subgoals. |
-| **Current candidate builder** | Which currently observed actions could achieve that goal? | Observation-bound candidate IDs connected to current controls, capabilities, surfaces, and expected outcomes. It correctly separates all context capabilities from policy-allowed selectable candidates. |
-| **Decision selector** | Which safe candidate is best? | Deterministic selection when there is one exact answer; AI interpretation of all grounded current-surface capabilities with selection restricted to policy-allowed current candidate IDs when genuine ambiguity remains. |
-| **Governor and invariants** | Is this action allowed right now? | Grounding, current-surface ownership, actionability, profile prerequisites, price/itinerary/traveler invariants, payment policy, and duplicate prevention. |
-| **Reveal and rebind controller** | Can the approved target be reached after scrolling or rerendering? | Preserving the semantic action, governed scrolling, fresh observation, and binding to the equivalent current control. |
-| **Atomic browser executor** | How is the approved action physically performed? | One mechanical click, type, select, keypress, or scroll. It does not decide user intent. |
-| **Diff and transition evaluator** | Did the intended outcome actually happen? | Fresh before/after comparison and classification as achieved, progressed, blocked, no effect, unsafe, or uncertain. It must report both the local physical effect and net progress toward the durable parent outcome; generic command acknowledgement is still too permissive. |
-| **Lifecycle and recovery controller** | What happens next? | Proposed → approved → dispatched → observed → verified state, pending work, distinct recovery strategies, budgets, continuation, or handoff. |
-| **Transaction ledger** | What evidence and state survive every turn? | Immutable observations, action lifecycle, verified facts, approvals, events, and current transaction state in SQLite. |
-| **User handoff boundary** | When must automation stop? | Missing user data, genuine unresolved ambiguity, exhausted safe recovery, price/itinerary conflict, payment, legal consent, or final purchase authority. |
-
-### 4.2 Missing semantic hierarchy
-
-TaskState should remain the single semantic authority, but it must distinguish four scopes instead of replacing one flat goal on every observation:
-
-```text
-transaction outcome: complete checkout safely
-→ stage outcome: reach payment review
-→ temporary surface subgoal: resolve the current review/seat/warning surface
-→ atomic action: execute one grounded current capability
-```
-
-The parent outcome has a stable ID and exact postcondition that survive popups, rerenders, scrolling, and intermediate pages. A new foreground surface may add or replace the temporary surface subgoal; it may not silently complete or replace the parent outcome. Every result therefore reports two facts:
-
-```text
-local physical effect: modal dismissed
-net parent progress: payment review not reached
-```
-
-AI remains useful for interpreting an unfamiliar surface and choosing among grounded policy-safe candidates. It does not own the durable transaction truth. The mechanical executor still owns only the approved click/type/select/scroll operation.
-
-### 4.3 Authoritative agent decision loop
-
-```mermaid
-flowchart TD
-    A["Start or resume durable checkout session"] --> B["Observe fresh page and foreground surface"]
-    B --> T{"Payment review reached?"}
-    T -->|"No"| C["Store canonical observation in transaction ledger"]
-    T -->|"Yes"| O["Stop and hand off"]
-    C --> D{"Previous dispatched or pending action?"}
-    D -->|"Yes"| E["Verify it or resume reveal/rebind"]
-    D -->|"No"| F["Derive one current semantic goal"]
-    E --> G{"Goal already achieved?"}
-    G -->|"Yes"| F
-    G -->|"No, pending"| H["Build candidates from current observation"]
-    F --> H
-    H --> I{"How many safe exact candidates?"}
-    I -->|"One"| J["Select deterministically"]
-    I -->|"Several"| K["AI selects one grounded candidate ID"]
-    I -->|"None"| L["Recover from fresh evidence or ask user"]
-    J --> M["Governor checks current grounding, policy, and invariants"]
-    K --> M
-    M -->|"Recoverable stale/offscreen"| N["Reveal or rebuild current binding"]
-    N --> B
-    M -->|"Unsafe or unauthorized"| O["Stop and hand off"]
-    M -->|"Approved"| P["Execute one atomic browser action"]
-    P --> Q["Capture fresh observation"]
-    Q --> R["Diff and verify exact semantic outcome"]
-    R -->|"Achieved or useful progress"| B
-    R -->|"No effect"| S["Suppress failed strategy; try another capability"]
-    S --> H
-    R -->|"Unsafe, exhausted, or terminal"| O
-```
-
-The loop has three non-negotiable properties:
-
-1. **Fresh evidence before decisions.** The agent never assumes the next page will resemble the previous one.
-2. **One governed action at a time.** The browser cannot run a hidden sequence that escapes verification.
-3. **Semantic success, not action success.** A click only succeeds when the fresh page proves the requested outcome.
-
-The third property is fully enforced for exact value/choice goals, but not yet for every generic command. The current final-review failure exists because modal dismissal is accepted as command acknowledgement even though the requested outcome is advancement to payment.
-
-### 4.4 Example: navigating an airline checkout
-
-The following is an example of how the generic loop should handle a return-flight checkout. It is an illustration, not a hardcoded airline procedure.
-
-```mermaid
-flowchart TD
-    A["Traveler page"] --> B["Fill and verify contact and passenger fields"]
-    B --> C["Resolve each required baggage or extra decision group"]
-    C --> D["Reveal and click current Continue control"]
-    D --> E{"Unexpected popup or seat surface?"}
-    E -->|"Popup"| F["Observe popup as foreground surface and choose grounded decline/continue action"]
-    E -->|"Seat flow"| G["Apply seat policy to current leg"]
-    F --> G
-    G --> H{"Another leg or intermediate seat screen?"}
-    H -->|"Yes"| G
-    H -->|"No"| I["Continue from completed seat surface"]
-    I --> J["Fresh page classification"]
-    J -->|"More required checkout decisions"| C
-    J -->|"Payment review"| K["Stop ordinary automation and hand off"]
-```
-
-#### Example turn sequence
-
-1. **Traveler form appears.**
-   - Observer finds email already correct, country code wrong, phone empty, and passenger name missing.
-   - Goal resolver chooses one unresolved outcome, for example `country code = +386`.
-   - Candidate builder exposes the capabilities the current custom control actually supports.
-   - The selector may choose type, open-and-choose, or keyboard interaction.
-   - Executor performs one operation, then the fresh observation must prove `+386` and no validation error.
-   - The loop advances through the remaining traveler fields without rewriting fields that are already verified.
-
-2. **Several paid-extra cards appear.**
-   - Observer groups each “No thanks / Add to cart” pair as an independent decision group.
-   - User policy says no paid extras.
-   - Each group gets its own semantic goal and exact free-decline verification.
-   - Selecting “No thanks” for one card does not falsely complete the other cards.
-
-3. **Continue is below the viewport.**
-   - The approved semantic action is preserved.
-   - The lifecycle reveals the target using the correct page or nested scroll container.
-   - A fresh observation rebinds the same current Continue control.
-   - Only then is Continue clicked and its page/surface transition verified.
-
-4. **A seat modal unexpectedly opens.**
-   - The modal becomes the authoritative foreground surface.
-   - Background controls are temporarily ineligible.
-   - Policy says no paid seats, so the candidate set favors currently observed free decline, random-free, Next, or Continue-without-seat choices.
-   - The model is used only if several grounded choices remain semantically plausible.
-
-5. **The first flight has no seat map.**
-   - Observer sees aisle for 6 EUR, window for 6 EUR, and random seating for 0 EUR.
-   - Policy selects the grounded 0 EUR choice.
-   - Fresh evidence verifies that exact choice before Next becomes eligible.
-
-6. **The second flight has a seat map and a warning popup.**
-   - The agent does not assume the first-leg interaction applies.
-   - It observes the second leg as fresh state and advances without selecting a paid seat.
-   - If “Are you sure you want to continue without a seat?” appears, the popup becomes the current surface and the grounded Continue option implements the existing policy.
-
-7. **The page rerenders or changes route.**
-   - Old physical candidates are discarded.
-   - Verified user outcomes remain in the ledger.
-   - Current requirements and candidates are rebuilt from the fresh page.
-
-8. **Payment page appears.**
-   - URL, progress marker, heading, and sensitive payment-field evidence classify `payment_review_reached`.
-   - Ordinary checkout planning stops.
-   - Card entry, legal acceptance, amount authorization, and final purchase remain blocked until the future payment architecture provides explicit authority.
-
-The same flow is intended to handle another airline with different HTML because it depends on semantic goals, current observed capabilities, fresh candidate binding, and postcondition verification—not remembered coordinates or airline step numbers.
-
----
-
-## 5. Complete Runtime Flow
-
-### 5.1 Start and session creation
-
-The user opens a supported checkout page and presses **Start agent** in the extension sidebar.
-
-The extension creates one durable backend session through:
-
-```text
-POST /api/agent/session
-```
-
-That session is intended to survive multiple browser actions and page transitions. The backend returns the current transaction state and uses the session ID to associate all later observations, actions, reports, screenshots, events, and ledger entries.
-
-### 5.2 Browser observation
-
-The extension builds a canonical observation of the current checkout state. It does not send only what is visibly on screen. It attempts to model the relevant whole page and foreground surface.
-
-An observation includes, at minimum:
-
-- URL and inferred checkout stage,
-- page/progress headings,
-- current foreground surface or modal,
-- semantic controls and canonical identities,
-- accessible names, roles, labels, current values, selected/disabled state,
-- observed capabilities such as click, type, open, choose, keypress, or scroll,
-- actionable browser actuators,
-- viewport and geometry evidence,
-- sections and independent decision groups,
-- validation errors,
-- price, currency, itinerary, and traveler evidence,
-- screenshot references when visual evidence is needed.
-
-The content script traverses normal DOM, open shadow roots, and same-origin iframes. Cross-origin iframes cannot be deeply inspected by the content script and must eventually be handled through explicit adapters or safe user handoff.
-
-Screenshots are uploaded separately:
-
-```text
-POST /api/agent/screenshot
-```
-
-The compact structured observation is sent to:
-
-```text
-POST /api/agent/next-action
-```
-
-### 5.3 Durable recording
-
-Before planning, the backend records the observation as immutable transaction evidence in SQLite. The current observation ID and hash become part of the action’s grounding envelope.
-
-This distinction is important:
-
-- **Semantic truth** persists: “decline this paid extra,” “country code must equal +386,” or “advance to payment review.”
-- **Physical browser binding** is temporary: a DOM node, selector, bounding box, or candidate ID may be replaced after a rerender and must be rebound from a fresh observation.
-
-### 5.4 Resolve previous work first
-
-At the beginning of each turn, the loop resolves any previous dispatched or pending work before creating an unrelated plan:
-
-```text
-verify prior dispatch
-→ resume pending reveal/rebind action if one exists
-→ otherwise derive the next semantic goal
-```
-
-This prevents scrolling, rerendering, and modal changes from silently abandoning the original task.
-
-### 5.5 Derive one current semantic goal
-
-The backend derives the current obligation from:
-
-- verified transaction state,
-- user profile and booking rules,
-- the current surface,
-- unresolved required fields or decision groups,
-- the most recent transition.
-
-Examples:
-
-```text
-country code observed as +386
-decline the current paid-extra decision group
-continue from the completed seat surface
-reach payment review without purchasing
-```
-
-Specialized profile or checkout helpers are meant to publish semantic goals and desired outcomes. They should not independently own scrolling, candidate selection, execution, recovery, or user handoff.
-
-### 5.6 Build current grounded candidates
-
-The candidate builder uses only the current stored observation. Every candidate binds:
-
-- the semantic goal,
-- a current canonical control,
-- a current capability/operation,
-- the current surface,
-- current actionability evidence,
-- an expected semantic outcome,
-- and the source observation identity.
-
-Old candidate IDs are not executable after the observation changes. If the page rerenders, the semantic goal remains but candidates must be rebuilt.
-
-### 5.7 Select deterministically or with AI
-
-If there is one obvious, safe, exact candidate, the backend can choose it without a model call.
-
-If multiple current candidates could satisfy the goal, the model receives a compact semantic view and a strict set of candidate IDs. It returns a candidate ID, not arbitrary browser instructions.
-
-Examples of appropriate AI judgment:
-
-- deciding whether “No thanks,” “Continue without seats,” or a close button best implements “decline paid seats,”
-- selecting the correct current decision group among several visually similar offers,
-- choosing a grounded capability for an unusual combobox,
-- interpreting a newly appeared modal or unexpected intermediate state.
-
-AI is not supposed to:
-
-- invent a CSS selector,
-- execute page JavaScript,
-- assert that an action succeeded,
-- bypass price/payment policy,
-- or use remembered controls from an old observation.
-
-### 5.8 Govern the selected action
-
-The central governor verifies the proposed action against:
-
-- schema and action type,
-- current observation ID/hash,
-- current surface membership,
-- canonical control and alias identity,
-- observed actionability and actuator evidence,
-- current semantic goal,
-- traveler/profile prerequisites,
-- shared booking policy,
-- price, itinerary, and traveler invariants,
-- payment and legal authorization,
-- duplicate-action reservation.
-
-The result is one of:
-
-- approved,
-- recoverable rejection requiring fresh binding/reselection,
-- blocked by safety or missing authority,
-- requires user input.
-
-Pre-dispatch rejection is not an execution failure because the browser has not yet acted.
-
-### 5.9 Reveal, rebind, and execute
-
-If the target is outside the viewport or inside a scrollable container, reveal is a lifecycle substep:
-
-```text
-preserve original semantic action
-→ perform governed scroll
-→ observe fresh state
-→ rebind by stable semantic/control identity
-→ dispatch original action
-```
-
-No unrelated planner decision should occur between reveal and rebind unless the target disappeared or the page meaningfully changed.
-
-The extension then executes exactly one mechanical operation, such as:
-
-- `click`,
-- `type`,
-- `select`,
-- `keypress`,
-- `scroll`,
-- or bounded coordinate click when explicitly grounded.
-
-Atomic actions are not airline-specific skills. They are the universal actuator vocabulary, comparable to mouse and keyboard primitives. The intelligence lies in selecting and verifying the right primitive against the current semantic goal.
-
-### 5.10 Fresh observation and verification
-
-After a meaningful interaction, the extension observes again and reports browser facts through:
-
-```text
-POST /api/agent/report
-```
-
-The backend compares observation N with observation N+1. The typed diff can include:
-
-- controls appearing, disappearing, or changing,
-- selected/value changes,
-- validation changes,
-- modal/surface changes,
-- URL/stage/progress changes,
-- price or itinerary changes.
-
-The transition evaluator classifies the action as:
-
-- achieved,
-- progressed,
-- blocked,
-- no effect,
-- unsafe,
-- uncertain.
-
-Clicking or typing is never success by itself. Success is the expected semantic postcondition in fresh evidence, such as:
-
-```text
-observed country code = +386
-and no phone validation error
-```
-
-or:
-
-```text
-the exact paid-extra decision group is now set to its free decline option
-```
-
-### 5.11 Continue, recover, or hand off
-
-The loop repeats until the current release terminal boundary is reached.
-
-Recovery is bounded:
-
-- stale/pre-dispatch candidate: rebuild from current observation without consuming an execution attempt,
-- offscreen control: reveal and resume,
-- dispatched action with no effect: suppress that exact strategy and try another observed capability,
-- useful unexpected page change: accept progress and continue from fresh state,
-- changed surface/stage: reconcile requirements from the fresh surface,
-- no safe grounded option or exhausted recovery: ask the user.
-
-The intended full loop is:
+The intended behavior is deliberately simple:
 
 ```text
 observe
-→ derive current semantic goal
-→ build current grounded candidates
-→ select deterministically or with AI
+→ identify unresolved logical requirements
+→ preserve their control and operation contracts
+→ choose one executable requirement
+→ execute one action
+→ verify from a fresh observation
+→ preserve successful progress
+→ continue
+```
+
+This is a cross-site forms-engine requirement. It must not be implemented with Kiwi selectors, airline branches, fixed coordinates, or a hardcoded field sequence.
+
+### Current production failure
+
+The latest live Kiwi session, `chk_ms1zeif8wxokn5`, did not fail because the scheduler stopped at the first unavailable field. That earlier scheduling defect is no longer the first blocker.
+
+The latest sequence was:
+
+```text
+names already filled and verified
+→ try Title visual wrapper
+→ OPTIONS_SURFACE_NOT_APPEARED
+→ continue to another requirement
+→ try DOB Month visual wrapper
+→ OPTIONS_SURFACE_NOT_APPEARED
+→ inspect the remaining DOB Day and Year controls
+→ incorrectly classify Day and Year as SEMANTIC_AMBIGUITY
+→ STRATEGIES_EXHAUSTED
+→ stop
+```
+
+The final reason was:
+
+```text
+title.value=STRATEGIES_EXHAUSTED
+date_of_birth.day=SEMANTIC_AMBIGUITY
+date_of_birth.month=STRATEGIES_EXHAUSTED
+date_of_birth.year=SEMANTIC_AMBIGUITY
+```
+
+However, the stored fresh observation says:
+
+```text
+DOB Day:
+  component intended by the browser observer: day
+  operation: type
+  actuator: enabled, visible, in viewport, hit-tested
+  actionability code: ACTIONABLE
+
+DOB Year:
+  component intended by the browser observer: year
+  operation: type
+  actuator: enabled, visible, in viewport, hit-tested
+  actionability code: ACTIONABLE
+```
+
+The agent should therefore have typed `31` into Day and `2003` into Year. A blocked Title or Month widget must not prevent those actions.
+
+### Verified root problem
+
+The same control is being reinterpreted by multiple layers, and those layers disagree.
+
+1. The browser observer creates the correct date-component contract, including `dateField.component` and date options.
+2. `compactPageMap` preserves `dateField`.
+3. The backend's `compactLogicalControl` compacts the control a second time but drops `dateField` and `options`.
+4. `skill-expander` then calls the full-date codec again for each already-split date component.
+5. Without the component metadata, Day and Year are treated as ambiguous full-date inputs instead of deterministic component inputs.
+
+There is a second actionability contradiction:
+
+1. The browser observer publishes a nearby disabled-select recovery region with `status: "unproven"`.
+2. Candidate construction accepts the bounded region as executable.
+3. The runtime affordance records the same actuator as `proven: true`.
+4. Dispatch sends synthetic pointer/mouse events to the wrapper.
+5. Kiwi exposes no option surface, so verification correctly fails.
+
+The trace cannot prove whether the wrapper node is wrong, the synthetic event mechanism is insufficient, or both. It does prove that the region was never a proven executable actuator and must not have been represented as one.
+
+### Minimal root fix
+
+Do not add another controller. Repair the existing contract:
+
+1. Preserve `dateField` and `options` through `compactLogicalControl`, ideally using one shared control serializer rather than two drifting whitelists.
+2. For a logical date with `componentRole` equal to `day`, `month`, or `year`, use that component's desired value directly. Only run full-date order inference for one scalar full-date input.
+3. Never promote `recovery.status !== "proven"` to a proven executable actuator.
+4. For a custom dropdown, dispatch only through an observed executable activation member. If only an unproven visual region exists, it may be treated as a bounded experiment once, but a failure must not block other canonical fields.
+5. Keep the current actionable-requirement scheduler. It now continues past failed fields; rewriting it again would not address the latest failure.
+
+### Definition of done
+
+- The exact latest Kiwi observation produces deterministic actions for DOB Day `31` and DOB Year `2003`.
+- The agent never reports `STRATEGIES_EXHAUSTED` while any unresolved requirement has a fresh executable operation.
+- A blocked Title or Month does not stop Day, Year, or any other actionable field.
+- `dateField.component`, date options, and operation actionability survive extension → backend → planner round trips.
+- Split date components never receive full-date values or full-date-order ambiguity.
+- An `unproven` recovery is never recorded as `proven: true`.
+- A failed custom-widget activation is bounded, remembered on the unchanged page, and does not erase verified component progress.
+- A server-compaction regression test covers the real request boundary.
+- A production-shaped browser test does not use a document-level listener that opens on any descendant click.
+- Raw Kiwi advances beyond traveler information.
+- Existing GoToGate behavior and all payment, purchase, legal, and paid-extra boundaries remain unchanged.
+
+---
+
+## 1. Current Status
+
+Fly is a Chrome extension plus a local Node backend that operates an already-open airline or OTA checkout. It uses a saved traveler profile and user policy to complete traveler information, decline unwanted paid extras, navigate checkout surfaces, and stop at payment review.
+
+The committed baseline already contains the main safety and lifecycle foundation:
+
+- canonical browser observations;
+- one-action-at-a-time execution;
+- fresh post-action observation and verification;
+- authoritative TaskState progression;
+- grounded candidate IDs;
+- action governor and transaction safeguards;
+- paid-extra reconciliation;
+- destination-readiness lifecycle after navigation;
+- terminal payment boundary;
+- bounded recovery and user handoff.
+
+The current uncommitted work adds two focused capabilities:
+
+1. A generic authoritative Logical Field Adapter for scalar and composite traveler requirements, including stable rerender identity and hierarchical verification.
+2. Sidebar injection on a broader allowlist of airline and OTA domains, including Kiwi.
+
+The current code is not yet committed or pushed.
+
+### Latest validation and live result
+
+An earlier full automated validation of this working tree reported:
+
+- `175/175` unit tests;
+- `64/64` browser regression tests;
+- `npm run check`;
+- `git diff --check`;
+- existing clean and dirty GoToGate regressions;
+- seat, review-modal, navigation-readiness, and payment-safety regressions;
+- a sanitized production-shaped Kiwi split-DOB replay.
+
+That result is no longer sufficient evidence of production correctness. The latest real Kiwi run failed at the traveler-information stage for the contract reasons documented in Section 0.
+
+During the current diagnosis, these focused tests passed:
+
+- the scheduler test that moves from an exhausted Title strategy to actionable Nationality;
+- the bounded ambiguous-date unit test;
+- the browser `Title visual recovery remains grounded` fixture.
+
+These passes help locate the coverage gap:
+
+- unit observations bypass the backend's second control compaction;
+- the Title browser fixture opens from a document-level listener on any descendant of its wrapper;
+- the fixture therefore does not prove that a real framework widget exposes the same actuator or accepts the same synthetic event sequence.
+
+Do not describe the current tree as live-accepted on Kiwi. The latest live evidence is a failure with two specific shared-contract defects.
+
+One browser stress test with 320 controls is functionally green but now takes roughly three minutes. Its timeout is currently `210_000 ms`. Treat this as a performance signal, not a correctness failure.
+
+---
+
+## 2. Product and Safety Boundary
+
+The active release goal is:
+
+```text
+Open checkout
+→ fill known traveler information
+→ resolve required decisions
+→ decline or remove policy-conflicting paid extras
+→ navigate checkout
+→ verify payment-review evidence
+→ stop
+```
+
+The agent must not autonomously:
+
+- enter or submit payment credentials;
+- submit the final purchase;
+- accept legal terms without authorization;
+- add a paid product against policy;
+- perform an irreversible cancellation or booking action;
+- bypass OTP, CAPTCHA, bank approval, or explicit user authorization.
+
+Fresh page facts are authoritative. TaskState is verified memory and progression state; it must not override a contradictory fresh observation.
+
+---
+
+## 3. Authoritative Runtime Loop
+
+The intended production loop remains:
+
+```text
+observe
+→ classify readiness
+→ reconcile TaskState with fresh facts and policy
+→ derive the current requirement
+→ build grounded current candidates
+→ select deterministically or use bounded AI for genuine ambiguity
 → govern
-→ reveal/rebind if necessary
-→ execute one atomic action
-→ capture fresh observation
-→ verify exact semantic transition
-→ continue, recover, or hand off
+→ execute one action
+→ reobserve
+→ verify the semantic result
+→ continue, recover, hand off, or stop
 ```
+
+Important invariants:
+
+- Candidate generation does not invent browser controls.
+- AI may interpret ambiguity but may select only observed, grounded candidate IDs.
+- A single safe grounded candidate should execute without a model call.
+- Known profile values are deterministic and are never guessed by AI.
+- A reversible policy conflict outranks checkout navigation.
+- Payment, purchase, legal, and irreversible boundaries remain hard stops.
+- Successful payment-review detection latches terminal completion for the current request.
+- Failed strategies are scoped to the exact current decision or logical component.
+- Navigation remains pending while the destination is only a shell or is hydrating.
 
 ---
 
-## 6. Authoritative State and Identity
+## 4. Logical Field Adapter
 
-Fly’s reliability depends on separating several types of identity that older versions mixed together.
+### Purpose
 
-### Transaction truth
-
-The SQLite transaction store is authoritative for:
-
-- immutable observations,
-- current observation identity,
-- proposed/approved/dispatched/observed/verified actions,
-- transaction facts,
-- price/itinerary/traveler evidence,
-- pending lifecycle state,
-- recovery attempts,
-- safety approvals,
-- event history.
-
-### Semantic identity
-
-A semantic obligation survives browser churn. For example, the obligation “decline decision group X” remains even if the radio button’s DOM node is replaced.
-
-### Control identity
-
-Canonical control aliases and stable keys connect equivalent controls across observations. A control must still belong to the current surface and expose the required capability before it can be used.
-
-### Observation identity
-
-Candidate IDs and physical actuators are scoped to one observation. They cannot be trusted after the page changes.
-
-### Surface identity
-
-The current foreground surface—page, modal, popup, portal, or nested flow—must be shared consistently by candidate construction, the governor, executor, and transition evaluator. A background page control must not be treated as the active target while a blocking modal is in front.
-
----
-
-## 7. Component and File Map
-
-### Browser extension
-
-| File | Responsibility |
-|---|---|
-| [`apps/extension/manifest.json`](./apps/extension/manifest.json) | Manifest V3 permissions, supported URL matches, service worker, content script, and sidebar CSS. |
-| [`apps/extension/src/content/content.js`](./apps/extension/src/content/content.js) | Live DOM observer, semantic registry, surface/decision-group discovery, screenshot references, sidebar UI, target binding, atomic executor, and browser action feedback. This is currently a very large monolith and a major maintainability risk. |
-| [`apps/extension/src/background/service-worker.js`](./apps/extension/src/background/service-worker.js) | Visible-tab screenshot capture and extension background coordination. |
-| [`apps/extension/src/content/sidebar.css`](./apps/extension/src/content/sidebar.css) | Agent sidebar and cursor/debug presentation. Observation/debug UI must remain side-effect free. |
-
-The manifest currently injects the content script into the local demo plus selected Skyscanner, Croatia Airlines, and Gotogate domains. `<all_urls>` host permission exists, but injection coverage is still explicitly enumerated.
-
-### Backend and agent kernel
-
-| File | Responsibility |
-|---|---|
-| [`apps/web/server.js`](./apps/web/server.js) | Local HTTP server, profile/trip APIs, agent routes, observation transport compaction, model configuration, and loop entry. |
-| [`apps/web/agent/loop.js`](./apps/web/agent/loop.js) | Authoritative turn orchestration: previous transition, pending action, goal, candidate selection, governance, dispatch, recovery, and handoff. |
-| [`apps/web/agent/action-lifecycle.js`](./apps/web/agent/action-lifecycle.js) | Action lifecycle and pending/recovery state. |
-| [`apps/web/agent/task-state-reducer.js`](./apps/web/agent/task-state-reducer.js) | Production semantic authority for stage, foreground surface, active decisions, preserved exact outcomes, current goal, validation blockers, ambiguity, and terminal status. Untouched optional decisions remain stale unless required or explicitly requested. |
-| [`apps/web/agent/task-action-context.js`](./apps/web/agent/task-action-context.js) | Publishes the current goal/action context from authoritative TaskState/profile outcomes; it does not replace TaskState ownership. |
-| [`apps/web/agent/current-candidate-builder.js`](./apps/web/agent/current-candidate-builder.js) | Builds candidates from the current observation and current task context. |
-| [`apps/web/agent/observation-candidates.js`](./apps/web/agent/observation-candidates.js) | Converts current observed controls/capabilities into actionable candidate records. |
-| [`apps/web/agent/select-candidate.js`](./apps/web/agent/select-candidate.js) | Chooses the deterministic fast path or asks the model to select a current candidate ID. |
-| [`apps/web/agent/openai-client.js`](./apps/web/agent/openai-client.js) | OpenAI Responses API integration with structured output and optional screenshot input. |
-| [`apps/web/agent/action-semantics.js`](./apps/web/agent/action-semantics.js) | Normalizes interaction role, semantic effect, expected evidence, affordance, and postcondition. Its generic command acknowledgement is part of the current dismiss-versus-advance defect. |
-| [`apps/web/agent/action-governor.js`](./apps/web/agent/action-governor.js) | Central allow/recover/block boundary for current grounding, surface, policy, actionability, and safety. |
-| [`apps/web/agent/transition-evaluator.js`](./apps/web/agent/transition-evaluator.js) | Evaluates exact semantic postconditions from before/action/after evidence. |
-| [`apps/web/agent/observation-diff.js`](./apps/web/agent/observation-diff.js) | Produces typed changes between observations. |
-| [`apps/web/agent/date-field-codec.js`](./apps/web/agent/date-field-codec.js) | Active uncommitted work that maps canonical saved dates to explicitly observed page formats/components, decodes live values back to canonical dates, and refuses ambiguous day/month ordering. |
-| [`apps/web/agent/surface-contract.js`](./apps/web/agent/surface-contract.js) | Normalizes foreground/current surface ownership. |
-| [`apps/web/agent/control-alias-index.js`](./apps/web/agent/control-alias-index.js) | Canonical control identity and alias resolution across observations. |
-| [`apps/web/agent/invariants.js`](./apps/web/agent/invariants.js) | Traveler, itinerary, currency, price, and transaction contradiction checks. |
-| [`apps/web/agent/transaction-facts.js`](./apps/web/agent/transaction-facts.js) | Derives transaction facts from browser evidence. |
-| [`apps/web/agent/skill-expander.js`](./apps/web/agent/skill-expander.js) | Expands semantic profile/choice goals into current strategies. Older compound-action authority should continue to be reduced rather than expanded. |
-| [`apps/web/agent/session-store.js`](./apps/web/agent/session-store.js) | SQLite durable sessions, observations, actions, events, and transaction state. |
-| [`apps/web/agent/trace-store.js`](./apps/web/agent/trace-store.js) | Diagnostic trace and screenshot files. Traces are evidence, not authoritative state. |
-
-### Shared portable contracts
-
-| Path | Responsibility |
-|---|---|
-| [`packages/shared/agent-actions`](./packages/shared/agent-actions) | Cross-client action schema and atomic operations. |
-| [`packages/shared/agent-state`](./packages/shared/agent-state) | Shared transaction/session state shape and approval flags. |
-| [`packages/shared/page-state`](./packages/shared/page-state) | Shared page/observation concepts. |
-| [`packages/shared/policy`](./packages/shared/policy) | Booking policy and safety decisions. |
-| [`packages/shared/requirements`](./packages/shared/requirements) | Legacy/diagnostic requirement and decision-group contracts. Production progression is governed by TaskState, not this legacy lifecycle. |
-
-These packages are the beginning of the future client-independent kernel. The current Chrome content script is still browser-specific; an iOS client would need a different observer and actuator adapter while reusing semantic state, policy, lifecycle, and transaction contracts.
-
----
-
-## 8. Data and Persistence
-
-### Traveler/profile storage
-
-The dashboard/profile store defaults to:
+The browser exposes physical controls, while the profile and planner reason about traveler requirements. The new adapter connects those layers:
 
 ```text
-work/air-travel-wallet-db.json
-```
-
-The path can be overridden with `ATW_PROFILE_DB`.
-
-Document identifiers are encrypted with AES-256-GCM using `ATW_ENCRYPTION_KEY`, but the repository still supports a local-development default. This is not a production credential vault or production multi-tenant security model.
-
-### Checkout transaction storage
-
-The authoritative transaction database defaults to:
-
-```text
-work/agent-transactions.sqlite
-```
-
-It uses SQLite WAL mode and stores durable session/observation/action/event state. This store, not UI cards or JSON trace files, should determine transaction truth.
-
-### Diagnostics
-
-JSON traces, client logs, ledgers, and screenshots under `work/` support debugging and replay. They are currently large and need retention/rotation policy before long-running use.
-
-### Privacy and security reality
-
-The current system is a local engineering prototype. Before production it needs, at minimum:
-
-- real authentication and tenant isolation,
-- secrets management,
-- data retention/deletion policy,
-- encryption-key rotation,
-- screenshot/trace redaction guarantees,
-- tokenized payment credentials,
-- auditable authorization objects,
-- and production threat modeling.
-
----
-
-## 9. AI Model Contract
-
-The backend model defaults to:
-
-```text
-ATW_AGENT_MODEL=gpt-4.1-mini
-ATW_AGENT_RECOVERY_MODEL=<same unless overridden>
-```
-
-The model receives a compact semantic representation, not unrestricted browser control. The current code includes:
-
-- bounded whole-page Markdown/semantic context,
-- typed observation diffs,
-- sanitized semantic history,
-- current candidate IDs in a strict structured-output schema,
-- optional screenshot evidence when required.
-
-The raw control registry remains server-side for binding and governance.
-
-The model API path still needs a clear request deadline/abort policy and latency instrumentation. A model outage is not proof the page is impossible; the system should use a deterministic path only when there is one uniquely safe candidate, otherwise hand off rather than guess.
-
----
-
-## 10. How the System Handles Surprises
-
-Fly should not encode “Gotogate step 7: click selector X.” Instead it should reuse the same lifecycle against new evidence.
-
-### Popup or modal appears
-
-```text
-fresh observation detects a new foreground surface
-→ reconcile active requirements to that surface
-→ build candidates only from current surface controls
-→ select safe dismiss/decline/continue behavior
-→ execute and verify surface transition
-```
-
-### Custom country-code combobox
-
-```text
-semantic goal remains country code = +386
-→ observe current capabilities: type/open/choose/keyboard
-→ choose one grounded strategy
-→ execute
-→ reobserve suggestions/value/validation
-→ verify +386 or try another supported strategy
-```
-
-The requirement is the outcome, not `operation=open`. Open, type, choose, and keyboard are replaceable strategies.
-
-### Offscreen or nested control
-
-```text
-preserve pending semantic action
-→ identify scroll owner/container
-→ governed reveal
+observed controls and field evidence
++ canonical traveler profile
+→ logical field
+→ next unresolved component
+→ grounded operation
 → fresh observation
-→ rebind the same action
-→ dispatch and verify
+→ canonical verification
 ```
 
-### DOM node is replaced
+Primary file:
+
+- [`apps/web/agent/logical-field.js`](./apps/web/agent/logical-field.js)
+
+### Contract
+
+A resolved logical field carries:
+
+- stable `logicalFieldId`;
+- traveler `subjectId`;
+- canonical `semanticType`;
+- one `controls` graph with component roles and grounded operations;
+- desired canonical value from the profile;
+- current reconstructed canonical value;
+- `scalar` or `composite` structure;
+- ordered components;
+- field instructions and observed options;
+- temporary current `controlId`;
+- stable component identity based on the logical field and role;
+- supported observed operations;
+- component status;
+- component-level and logical-field validation ownership;
+- ambiguity and confidence.
+
+Physical control IDs may change after a rerender. Logical progress rebinds using:
 
 ```text
-old physical candidate becomes stale
-→ semantic goal persists
-→ rebuild current candidates
-→ rebind using canonical control/capability identity
+subjectId + semanticType + componentRole
 ```
 
-### Action had no effect
+In production, profile planning now derives directly from this graph. The old
+parallel field-descriptor completion path has been removed. Machine names and
+autocomplete contracts are preferred for ownership; otherwise a stable tight
+owner key is used. Generated DOM owner IDs, placeholders, entered values,
+validation text, and dropdown open state do not define logical identity.
+
+### Authoritative semantic evidence
+
+Profile-field meaning is now resolved before logical grouping, using this precedence:
 
 ```text
-prove it was dispatched
-→ record no-effect evidence
-→ suppress that exact stable strategy
-→ choose a different observed capability
-→ stop after bounded distinct attempts
+raw name, id, and autocomplete
+→ explicit associated label and ARIA
+→ proven tight local owner
+→ broad section context as non-authoritative support
 ```
 
-### Price, itinerary, or traveler changes
+Evidence channels remain separate. A broad passenger group cannot overwrite direct machine evidence. Current regressions prove:
 
-These are transaction-level changes, not ordinary UI progress. The invariant layer must stop or request explicit authority rather than allowing the planner to continue.
+```text
+passengers.0.nationality → nationality
+passengers.0.title       → title
+passengers.0.idNumber    → document number
+passengers.0.birthDay    → DOB day
+```
+
+Composite grouping requires the same traveler, semantic type, tight owner, and compatible component roles. A passenger `sectionId` alone is never a composite-field owner. Phone country code and local number may share a proven contact/phone owner.
+
+### Supported traveler semantics
+
+The current alias and profile resolution layer supports:
+
+- title and gender;
+- first, middle, last, and full name;
+- email and confirmation email;
+- phone country code and local number;
+- date of birth;
+- nationality;
+- passport or document number;
+- document issuing country;
+- passport or document expiry date.
+
+The schema is intentionally small and extensible. It is not a worldwide airline-field ontology.
+
+### Scalar and composite behavior
+
+The adapter supports:
+
+- a single native date input;
+- split day/month/year controls;
+- three date dropdowns;
+- phone country code plus local number;
+- segmented passport expiry;
+- ordinary text, select, choice, and custom-control operations already exposed by the observer.
+
+For a composite DOB:
+
+```text
+day = 31
+→ day component resolved
+→ month remains current
+→ year remains unresolved
+→ whole DOB remains incomplete
+```
+
+A whole-group “complete the date” validation message does not cause an already-correct child component to be repeated. Exact component validation still blocks that component.
+
+### Integration
+
+The adapter is integrated into the existing architecture rather than introducing another planner:
+
+- [`apps/web/agent/skill-expander.js`](./apps/web/agent/skill-expander.js) consumes the logical-field graph directly, derives component-aware profile goals, and builds grounded strategies.
+- [`apps/web/agent/transition-evaluator.js`](./apps/web/agent/transition-evaluator.js) uses the shared logical-field verifier and reports component success separately from complete-field success.
+- [`apps/web/agent/loop.js`](./apps/web/agent/loop.js) keeps ambiguity inside the grounded candidate lifecycle and hands off only after bounded safe strategies are exhausted.
+- [`apps/extension/src/content/content.js`](./apps/extension/src/content/content.js) preserves direct field evidence, stable owner keys, instructions, validation ownership, disabled semantic state elements, and structurally related visible actuators.
+- [`packages/shared/agent-actions/index.js`](./packages/shared/agent-actions/index.js) scopes retry and failed-strategy memory to the stable logical field plus exact component.
+- [`package.json`](./package.json) includes the adapter in static syntax checks.
+
+The existing planner, action lifecycle, date codec, executor, governor, and TaskState remain in place.
+
+### Current contract defects
+
+The intended Logical Field design is sound, but the current end-to-end implementation violates its own contract in two places.
+
+#### 1. Date metadata is lost at the server boundary
+
+The extension preserves:
+
+```js
+dateField: control.dateField || null
+```
+
+The server's `compactLogicalControl` preserves `name`, `autocomplete`, `placeholder`, operations, recovery, and actuators, but currently omits `dateField` and `options`.
+
+The result is:
+
+```text
+browser: birthDay is a known day component with a type actuator
+backend: dateField is missing
+planner: date order is ambiguous
+candidate set: empty
+```
+
+This is a serializer/schema drift problem. It should be fixed at the shared contract boundary, not by adding more label regexes.
+
+#### 2. Component-aware planning reruns scalar-date inference
+
+`logical-field.js` already resolves split DOB roles and desired component values. `skill-expander.js` nevertheless calls `encodeDateForField` on the full canonical date for every component.
+
+Correct behavior:
+
+```text
+componentRole=day   → inputValue=31
+componentRole=month → inputValue=05 or the matching observed option
+componentRole=year  → inputValue=2003
+componentRole=value → infer and encode one full-date representation
+```
+
+Current failure behavior attempts to treat an individual Day or Year input as if it might require `31/05/2003`, `05/31/2003`, or `2003-05-31`. Those full-date hypotheses are valid only for an ambiguous scalar full-date input.
+
+#### 3. Unproven visual recovery is promoted to proven execution
+
+For a disabled semantic select, the observer can publish a bounded nearby region as visual recovery. That is useful evidence, but geometry alone does not prove that the region owns an executable click handler.
+
+The current code allows:
+
+```text
+recovery.status = unproven
+→ bounded region matches
+→ candidate considered grounded and executable
+→ affordance.proven = true
+```
+
+That status transition is invalid. Bounded and observation-owned means safe to reason about; it does not mean mechanically proven.
+
+### Bounded strategy behavior
+
+For each unresolved component:
+
+1. Choose one observed, grounded strategy.
+2. Execute one action.
+3. Reobserve.
+4. Rebind after rerender.
+5. Decode and compare the current canonical component value.
+6. Continue to the next component only after verification.
+
+The system does not repeat an already-correct component merely because the overall logical field remains incomplete. Distinct strategy attempts are bounded to three.
+
+For an ambiguous scalar date representation, the planner publishes at most three grounded format hypotheses bound to the exact observed control. They require semantic judgment, execute one at a time, and verify the canonical date from a fresh observation. Failed strategies are not repeated. If no bounded strategy verifies, the agent asks the user.
+
+This bounded scalar-date behavior must never be applied to a split component whose role is already known.
 
 ---
 
-## 11. Latest Live Evidence: What It Proved and What It Exposed
+## 5. Browser Observation and Airline/OTA Coverage
 
-### Prior successful vertical slice
+The extension content script now runs on a curated airline/OTA allowlist rather than every website.
 
-A prior live run reached:
+Current coverage includes:
 
-```text
-https://en-en.gotogate.com/rf/payment
-```
+- GoToGate;
+- Kiwi;
+- Skyscanner;
+- Expedia, Kayak, Momondo, Priceline, Trip.com, Opodo, eDreams, Lastminute, Mytrip, Flightnetwork, Booking.com, Agoda, and other OTA families;
+- major North American, European, Middle Eastern, Asian, Australian, and New Zealand airline domains.
 
-It completed one adult traveler, preserved the itinerary, declined paid extras/seats under policy, reached the payment form, and did not attempt final payment. The current backend now also has multi-signal payment classification and suppresses ordinary candidate generation when `TaskState.terminalStatus` is `payment_review_reached`.
+Primary configuration:
 
-### Newest reviewed run
+- [`apps/extension/manifest.json`](./apps/extension/manifest.json)
 
-The newest fully reviewed stored session is:
+The content-script allowlist contains 63 match patterns, including the local demo checkout. It does not inject the sidebar into unrestricted sites such as social media.
 
-```text
-chk_mrtds157i3oqo5
-```
-
-It successfully completed:
-
-- contact, passenger, DOB, and baggage choices,
-- bundle and flexible-ticket decline paths,
-- governed scroll → fresh observation → rebind recovery,
-- both seat legs and the seat warning popup,
-- five independent paid-extra decisions,
-- the base-page Continue action into the final review modal.
-
-It then entered a repeatable loop:
-
-```text
-base Continue
-→ Review Your Details modal
-→ candidate labeled Continue to Payment
-→ modal closes
-→ base Continue becomes current again
-→ modal reopens
-```
-
-The stored action proves the selected actuator was actually the close button:
-
-```text
-button | type:button | testid:dialog-close | meaning:continue to payment
-```
-
-The observer had copied the surface CTA text onto the 50×50 icon-only close control. The newer action-semantics layer still recovered its true physical effect:
-
-```text
-physicalEffect = dismiss_surface
-```
-
-The failure moved upward into task semantics. The reducer converted the whole review modal into an active `contact` decision group, replaced the unfinished `reach payment review` goal with `resolve the exact current decision`, and generated a broad decision outcome contract that permits `dismiss_surface`. Because the close actuator carried that decision-group ID, expected-outcome compilation produced `command_acknowledged`; modal disappearance was treated as local success even though no payment-stage evidence appeared.
-
-Recovery did not stop the cycle because its memory is keyed to the observation-scoped current goal. The goal alternates between base-page navigation and modal decision, so `base → modal → base` never accumulates as one no-progress failure under the durable payment outcome.
-
-This is therefore not primarily an AI, scrolling, target-binding, click-execution, or Gotogate-procedure failure. It is a missing goal-hierarchy and net-progress contract. Local control-label contamination remains real, but fixing the label alone would not make checkout outcomes durable across arbitrary intermediate surfaces.
-
-### Root correction
-
-The generic correction is:
-
-```text
-durable transaction/stage outcome
-→ temporary surface subgoal from fresh evidence
-→ one authoritative physical effect per current capability
-→ effects compatible with parent outcome + subgoal remain selectable
-→ local transition proof + net parent-progress proof
-→ continue, replan, detect a cycle, or complete
-```
-
-At minimum, commands need effects such as:
-
-```text
-dismiss_surface
-advance_stage
-open_surface
-select_option
-set_value
-```
-
-For `parent outcome = reach payment review`, a `dismiss_surface` control may remain useful context but cannot be selected as the advancing action unless dismissal is a proven temporary prerequisite. Success requires fresh payment-stage evidence; modal disappearance alone is only a local surface result.
-
-Do not fix this by hardcoding one Gotogate selector. The faithful cross-layer regression must run the reducer and lifecycle over the complete sequence: base Continue → modal decision-group production → current candidates → action → fresh observation → net-progress evaluation. It must cover an icon-only close control and a primary advance CTA on the same foreground surface, including misleading accessibility text, portal rendering, rerendering, and the `base → modal → base` cycle.
+The manifest still contains broad `<all_urls>` host permission inherited from the existing extension. Sidebar injection itself is restricted by `content_scripts.matches`. Permission minimization remains separate cleanup work.
 
 ---
 
-## 12. Current Strengths
+## 6. Destination Readiness Baseline
 
-- The system no longer depends on one giant model prompt inventing arbitrary actions.
-- Candidate selection, governance, dispatch, observation, and verification are separated.
-- Semantic goals can survive DOM replacement and scrolling.
-- Current candidates are bound to fresh observations and surfaces.
-- Pre-dispatch and post-dispatch failures are distinguished.
-- The extension reports browser facts; backend state owns semantic truth.
-- Payment and transaction invariants exist as explicit code boundaries.
-- Replay tests cover many difficult browser interactions.
-- The current architecture is directionally aligned with a reusable cross-site agent rather than page-by-page scripts.
+Commit `1b3d3d0` is the known committed baseline for destination readiness.
+
+After an advancing action:
+
+```text
+action dispatched
+→ navigation or surface transition observed
+→ destination lifecycle remains open
+→ incomplete shell is classified as not ready
+→ client reobserves on cadence and relevant DOM mutation
+→ semantic destination controls appear
+→ transition completes
+```
+
+Readiness uses a shared wall-clock deadline. Observation attempts are telemetry and rate limiting; a fixed count of unchanged observations does not terminate waiting.
+
+This prevents:
+
+- a second Start click after slow navigation;
+- indefinite “Observing” when the page later hydrates;
+- planning from a partial header-only shell;
+- premature user handoff after three quick observations.
+
+Do not replace this with a larger fixed sleep or a site-specific delay.
 
 ---
 
-## 13. Current Root Gaps and Technical Debt
+## 7. Current Test Coverage
 
-Ordered by expected impact on the product goal:
+### Logical Field unit tests
 
-### 13.1 TaskState lacks a durable goal hierarchy
+Primary file:
 
-The single-authority consolidation is directionally correct, but `currentGoal` is recreated from the latest observation and its ID is observation-scoped. When a foreground surface appears, its local decision can replace an unfinished stage outcome such as `reach payment review`.
+- [`tests/agent/logical-field.test.js`](./tests/agent/logical-field.test.js)
 
-TaskState must preserve stable transaction and stage outcomes while deriving temporary surface/action subgoals underneath them. Only exact parent postconditions may complete parent outcomes. This is the highest-leverage missing component.
+Important regressions:
 
-### 13.2 Decision-group creation is too broad
+- `dob_partial_group_validation_does_not_retry_completed_component`;
+- `dob_rerender_rebinds_component_without_losing_progress`;
+- `dob_complete_value_verifies_canonically`;
+- native date input resolves as one scalar logical requirement;
+- three-dropdown date selects only the next unresolved component;
+- ambiguous full date publishes only three grounded bounded strategies;
+- raw machine semantics outrank broad passenger-group text;
+- DOB owns only its day, month, and year components;
+- component success survives unresolved whole-group validation;
+- phone and passport expiry reuse the same adapter contract;
+- logical and component identity survive DOM recreation, value/placeholder changes, validation changes, and generated owner-ID changes;
+- the graph publishes controls, instructions, options, current/desired canonical values, and hierarchical validation;
+- transition verification reports component progress without inventing whole-field completion;
+- retry memory is scoped to the exact stable logical component.
 
-The live review modal was represented as one generic active `contact` decision even though its controls were Edit, close, and Continue to Payment—not mutually exclusive product alternatives. The broad decision contract consequently admitted dismissal as a valid resolution.
+### Production-shaped browser replay
 
-Create blocking decision groups only from observed mutually exclusive alternatives, required metadata, scoped validation, explicit user policy, or a proven progression constraint. Navigation/review surfaces should publish typed commands and temporary subgoals rather than fabricated choice obligations.
+Primary file:
 
-### 13.3 Command-local evidence and semantic effect are not fully authoritative
+- [`tests/agent/semantic-control-replay.spec.js`](./tests/agent/semantic-control-replay.spec.js)
 
-The browser currently publishes overlapping `label`, `accessibleName`, `semantic`, `meaning`, structural identity, and nearby/surface text. Candidate and action layers then derive `interactionRole`, `semanticEffect`, `expectedEvidence`, intent, and expected outcome again. If the original local label is wrong, every later field can agree with the same false premise.
+The Kiwi-shaped replay includes:
 
-This is the main remaining overengineering: too many representations of one physical fact. Replace the correctness path with three values:
+- a broad passenger container;
+- DOB, title, nationality, and passport siblings;
+- a disabled native month state control;
+- a separate anonymous visible month wrapper;
+- rerender after the month interaction;
+- year completion;
+- canonical reconstruction to `2003-05-31`.
 
-```text
-raw local evidence
-+ one authoritative effect
-+ one exact postcondition
-```
+The broad passenger container deliberately contains competing DOB, nationality, title, and passport context. The replay asserts that nationality, title, and document number are not grouped into DOB.
 
-Nearby text and visual grouping remain evidence for interpretation, but must not overwrite direct control identity. When local evidence is genuinely ambiguous, publish `unknown` rather than a confident borrowed label.
+The test exercises the real observer, profile goal derivation, grounded candidate construction, existing browser action execution, fresh observation, portal option selection, rerender rebinding, and canonical logical verification. It no longer manually clicks the month option or fills the year through Playwright shortcuts.
 
-### 13.4 Goal compatibility, exact verification, and cycle recovery are incomplete
+Important limitation discovered by the live trace:
 
-The physical-effect layer now distinguishes the live close actuator as `dismiss_surface`, but the replacement modal decision still permits that effect. Candidate publication must enforce compatibility against both the durable parent outcome and the current surface subgoal:
+- the browser replay calls the extension's `compactPageMap`, but it does not pass that result through the backend's `compactLogicalControl`, so it cannot detect server-side loss of `dateField` or `options`;
+- the Title recovery fixture uses a document-level click listener that opens whenever the click target is inside the test wrapper, which is more permissive than the live Kiwi component;
+- therefore the replay proves the fixture contract, not the real custom-widget actuator.
 
-Candidate publication must enforce compatibility before deterministic or AI selection:
-
-```text
-advance-stage goal → advance_stage candidates selectable
-dismiss_surface candidates → context-only unless dismissal is the goal
-```
-
-AI should interpret unfamiliar surfaces from complete context, but it must choose only from parent-compatible, subgoal-compatible, policy-allowed current candidates. Exact field values and exact free choices already have strong postconditions; generic commands can still succeed through `command_acknowledged` when a surface disappears or any observable change occurs. That is insufficient for navigation.
-
-Verification must be typed by intended effect:
-
-- `dismiss_surface` succeeds when the exact foreground surface is gone.
-- `advance_stage` succeeds only when fresh stage/progress/route evidence advances or a specifically modeled intermediate surface appears.
-- An unexpected useful change is progress, not completion; the same semantic goal remains active.
-- A repeated semantic state cycle with no parent progress suppresses that strategy and consumes one bounded recovery attempt.
-
-### 13.5 Repeatability and cross-engine proof are missing
-
-One successful Gotogate run and several runs to the final review modal are not sufficient evidence. The largest remaining product risk is whether the same kernel generalizes across rerenders, different profiles, different live states, and different checkout engines.
-
-### 13.6 Terminal-stage and high-risk acceptance remain incomplete
-
-Backend payment classification and planning suppression exist, but payment terminal durability and live acceptance have not passed repeatedly. Payment, legal consent, final purchase, and confirmation must remain impossible to confuse with ordinary form controls.
-
-### 13.7 Perception acceptance is broader than unit coverage
-
-The observer is sophisticated, but real pages can still contain:
-
-- closed shadow roots,
-- cross-origin iframes,
-- canvas seat maps,
-- portal popups,
-- nested scrolling,
-- virtualized lists,
-- controls whose semantics require visual grouping.
-
-Each failure should improve the generic evidence/capability model and replay matrix, not add an airline procedure.
-
-### 13.8 The browser content script is too large
-
-`content.js` is roughly ten thousand lines and owns observation, UI, surfaces, candidates, execution feedback, and diagnostics. This increases the chance that debug UI or old control logic mutates page behavior or creates parallel authorities. It should be decomposed only along stable boundaries after acceptance is protected by replay tests.
-
-### 13.9 Some legacy skill/compound-action concepts remain
-
-Reusable skills are useful as semantic goal templates or capability strategies. They become harmful if they own their own lifecycle, current state, scrolling, governance, or handoff. Continue reducing specialized handlers to goal/policy producers.
-
-### 13.10 Model availability and latency need operational controls
-
-The OpenAI request path needs explicit timeouts/abort behavior, structured failure telemetry, and measured p50/p95 latency. Speed optimization should follow correctness acceptance, not precede it.
-
-### 13.11 Prototype storage and security are not production-ready
-
-The profile JSON store, local encryption defaults, local server, broad extension permissions, and trace retention are acceptable for controlled development only.
-
----
-
-## 14. Recommended Work Order
-
-The guiding principle is: fix the smallest number of reusable failure points that cause many page-specific symptoms to disappear.
-
-### Gate 0 — make TaskState a durable hierarchical outcome authority
-
-1. Keep TaskState as the sole production semantic authority; do not restore legacy or extension-side progression controllers.
-2. Replace the flat observation-scoped goal with stable scopes:
-   - transaction outcome,
-   - stage outcome,
-   - temporary surface subgoal,
-   - current atomic action.
-3. A fresh observation may update the surface/action subgoal but may not replace or complete the parent outcome without its exact postcondition.
-4. Create blocking decision groups only from real alternatives or proven obligations. Review/navigation surfaces publish typed commands rather than a generic decision group.
-5. Preserve direct/local browser evidence separately from inferred surface context and keep one authoritative physical effect per capability.
-6. Publish as selectable only candidates compatible with both the parent outcome and temporary subgoal. Keep other current controls in `contextCapabilities` for AI understanding.
-7. Make the transition evaluator report local physical effect separately from net parent progress. Remove generic `command_acknowledged` as proof of stage advancement.
-8. Key recovery to the durable parent outcome and detect repeated semantic cycles with no net progress.
-9. Add the exact final-review regression:
-
-```text
-modal with icon-only close + primary Continue to Payment
-→ parent outcome remains reach payment review
-→ modal creates only a temporary navigation/review subgoal
-→ close is dismiss_surface
-→ CTA is advance_stage
-→ exact CTA is dispatched
-→ payment stage is freshly observed
-→ base Continue does not reopen the modal
-```
-
-Also cover misleading/missing accessible names, an incorrectly proposed modal decision group, portal modals, rerendered controls, an intermediate confirmation surface, and explicit `base → modal → base` cycle detection.
-
-**Outcome:** unfamiliar popups, confirmation pages, warnings, seat surfaces, and rerenders can change the local plan without erasing the checkout objective. The planner, governor, executor, and verifier share one durable outcome hierarchy and one truthful command contract.
-
-### Gate 1 — close payment-review terminal correctness and durability
-
-- Classify payment from multiple fresh evidence sources: URL, progress marker, heading, form roles, and sensitive fields.
-- Make `payment_review_reached` an explicit transaction terminal state for the current release.
-- Stop ordinary candidate generation immediately at this boundary.
-- Type legal consent, credential entry, amount approval, final purchase, and confirmation as separate high-risk semantics.
-- Fix loose substring classification and add negative tests such as `terms` not matching `Ms`/title.
-- Replay payment, legal checkbox, business-receipt, voucher, and purchase-button variants.
-
-**Outcome:** reaching payment becomes an unambiguous successful handoff, and Fly cannot accidentally interact with legal/payment controls as ordinary checkout fields.
-
-### Gate 2 — prove repeated live reliability on the existing engine
-
-Pass five consecutive Gotogate checkout-to-payment runs using a matrix of:
-
-- blank and partially filled profiles,
-- wrong default country code,
-- native and custom controls,
-- rerendered DOM nodes,
-- offscreen and nested-scroll targets,
-- popup/portal transitions,
-- multiple independent paid-extra groups,
-- both seat legs,
-- no-seat-map and seat-map variants,
-- model ambiguity and deterministic fast paths.
-
-Every failure must become a generic cross-layer replay before the code change is accepted.
-
-**Outcome:** the current vertical slice is repeatable rather than accidental.
-
-### Gate 3 — prove structural portability
-
-Run the same acceptance contract against at least three structurally different checkout systems:
-
-1. full-service airline,
-2. low-cost airline,
-3. OTA or a checkout built on a materially different frontend engine.
-
-Site/engine knowledge packs may contribute labels, semantic hints, or known risk patterns. They must not own the action lifecycle, execution, verification, safety truth, or hardcoded step sequence.
-
-**Outcome:** credible evidence that Fly solves checkout classes rather than one website.
-
-### Gate 4 — optimize speed after reliability
-
-- Reuse verified semantic state.
-- Send typed observation diffs rather than redundant history.
-- Keep deterministic zero-model actions for uniquely safe candidates.
-- Call the model only for genuine ambiguity.
-- Add observation and token budgets without truncating correctness-critical controls.
-- Add request deadlines, caching, and p50/p95 measurements by step type.
-
-**Outcome:** faster completion without trading away correctness.
-
-### Gate 5 — add richer user preferences
-
-Represent preferences such as “window seat if free” as semantic policy with price and risk constraints:
-
-```text
-preference: window seat
-constraint: no additional charge
-fallback: no seat selection
-```
-
-The current observation and AI map that policy to grounded options. Do not encode airline-specific seat procedures.
-
-### Gate 6 — begin production payment architecture
-
-Only after the earlier gates pass:
-
-- tokenized credential vault,
-- explicit offer/amount/itinerary-bound payment authorization,
-- separate legal approval,
-- 3DS/user-presence handoff,
-- idempotent purchase submission,
-- booking confirmation reconciliation,
-- receipt/trip persistence,
-- audit and recovery for uncertain outcomes.
-
----
-
-## 15. Acceptance Criteria Before Payment Automation
-
-### Existing-engine acceptance
-
-- 5/5 consecutive live Gotogate runs reach payment review.
-- No manual checkout correction.
-- No paid extra selected when policy declines paid extras.
-- No traveler, itinerary, currency, or total contradiction.
-- No stale candidate executes.
-- No debug/observation UI changes page state.
-- Every dispatched action has fresh observed verification.
-- Recovery is bounded and tries distinct supported strategies.
-- Payment review produces an explicit safe handoff.
-
-### Cross-engine acceptance
-
-- The same contract passes on three structurally different live checkout engines.
-- No airline-specific action sequence is required for correctness.
-- Every new live failure has a generic fixture/replay.
-- Site knowledge is optional evidence/hints, never the source of transaction truth.
-
-### Operational acceptance
-
-- p50/p95 action and model latency measured.
-- Model timeout/failure behavior is explicit.
-- Trace size/retention is controlled.
-- Session recovery after extension/backend restart is tested.
-
----
-
-## 16. Testing and Verification
+Add an end-to-end request-compaction test and make the widget fixture require the exact activation mechanism expected in production.
 
 ### Commands
 
@@ -1121,130 +561,269 @@ npm run check
 npm run test:agent:unit
 npm run test:agent:browser
 npm run test:agent
+```
+
+The live demo suite remains:
+
+```bash
 npm run test:agent:live
 ```
 
-### Current verification evidence for this snapshot
+---
 
-- `npm run check` passed.
-- Unit suite passed: **110/110**.
-- Browser/cross-layer suite passed: **37/37**.
-- The browser suite initially could not bind its local test server inside the filesystem sandbox; rerunning it with localhost permission passed completely.
-- No new live checkout was started as part of this documentation update. The newest stored live session reviewed was `chk_mrtds157i3oqo5`.
-- One prior live run reached payment review. The newest run completed the difficult checkout path to the final review modal, correctly typed its close actuator as `dismiss_surface`, then looped because the flat TaskState goal was replaced by a generic modal decision that permitted dismissal. Therefore no current consecutive live acceptance streak is claimed.
+## 8. Current Working-Tree Scope
 
-Passing unit/browser replay tests is necessary but not enough to close a roadmap phase. The tracker should only mark live acceptance complete when the required real-site matrix passes.
+Modified files:
 
-### Test locations
+```text
+CURRENT_CODEBASE_ENGINEERING_HANDOFF.md
+apps/extension/manifest.json
+apps/extension/src/content/content.js
+apps/web/agent/action-governor.js
+apps/web/agent/action-semantics.js
+apps/web/agent/current-candidate-builder.js
+apps/web/agent/loop.js
+apps/web/agent/session-store.js
+apps/web/agent/skill-expander.js
+apps/web/agent/task-state-reducer.js
+apps/web/agent/transition-evaluator.js
+apps/web/server.js
+package.json
+packages/shared/agent-actions/index.js
+packages/shared/agent-state/index.js
+tests/agent/semantic-control-replay.spec.js
+tests/agent/transaction-governor.test.js
+tests/agent/transition-evaluator.test.js
+```
 
-- [`tests/agent`](./tests/agent) — unit, durable-session, semantic-control, and cross-layer replay coverage.
-- [`tests/fixtures`](./tests/fixtures) — browser fixtures for control/surface variants.
-- `work/agent-traces` — diagnostic run traces and screenshots.
-- `work/agent-ledger` — action ledger diagnostics.
-- `work/agent-client-logs` — extension-side flow logs.
+New files:
+
+```text
+apps/web/agent/logical-field.js
+tests/agent/logical-field.test.js
+```
+
+These changes are local and uncommitted. The latest committed code remains `1b3d3d0`.
+
+The prior post-baseline work is recoverable from:
+
+```text
+stash@{0}: backup before reverting to 1b3d3d0 on 2026-07-25
+```
+
+Do not apply that stash blindly. It contains the broader work that was intentionally set aside before returning to the destination-readiness baseline.
 
 ---
 
-## 17. Local Development and Debugging
+## 9. What Is Proven
 
-### Requirements
+The current automated evidence proves:
 
-- Node.js `>=22.5`
-- Chrome/Chromium for the extension
-- OpenAI API key for ambiguous model-selected actions
+- existing GoToGate clean checkout behavior remains green;
+- known preselected paid extras are repaired before navigation in dirty regressions;
+- payment and purchase safeguards remain active;
+- destination hydration is handled by the committed lifecycle;
+- scalar and composite logical traveler fields use one adapter;
+- profile planning consumes that graph directly; the parallel legacy completion path is no longer active;
+- direct machine semantics outrank broad passenger-section text;
+- composite fields are not grouped by passenger section alone;
+- logical and component IDs survive DOM recreation and mutable presentation changes;
+- DOB partial progress survives rerenders and retry history is reset for the next component;
+- completed DOB components are not repeated because of group validation;
+- complete DOB is verified canonically;
+- transition evidence distinguishes local component success from complete logical-field success;
+- phone and passport expiry reuse the same logical-field abstraction;
+- the sanitized Kiwi fixture can execute its modeled open, choose, type, reobserve, and split-DOB verification path without site-specific code;
+- the live scheduler continues from a failed Title strategy to another unresolved requirement instead of stopping immediately;
+- plain name inputs still fill and verify successfully on the current live Kiwi page;
+- broader airline/OTA sidebar injection does not use unrestricted content-script matching.
 
-### Start the backend/web app
+The automated Kiwi fixture does not prove the backend control-compaction boundary or the live Kiwi custom-widget actuator.
+
+---
+
+## 10. What Is Not Yet Proven
+
+Do not claim the following as complete:
+
+- a real live Kiwi checkout reaching payment with no manual correction;
+- correct split-DOB planning after the server compacts the browser observation;
+- Kiwi title/gender custom-widget completion in live production;
+- that a bounded visible wrapper is an executable actuator merely because it geometrically owns a disabled semantic select;
+- nationality, document, and address behavior across several live engines;
+- repeated 5/5 live GoToGate acceptance on the current uncommitted tree;
+- three structurally different airline/OTA engines reaching payment consecutively;
+- performance targets for very large observed pages;
+- production authentication, tenant isolation, or credential-vault security;
+- autonomous payment or purchase submission.
+
+The Logical Field Adapter currently depends on the browser observer exposing a real grounded operation and the backend preserving that operation's semantic metadata. If a site has a hidden or disabled semantic state element whose visible actuator cannot be mechanically proven, the correct result is to continue other actionable requirements and eventually produce a precise bounded handoff—not to relabel an arbitrary nearby region as proven.
+
+---
+
+## 11. Recommended Next Work
+
+Work in this order and change only the component demonstrated to be responsible by a trace or replay.
+
+### 1. Repair the control round-trip
+
+Preserve at least:
+
+```text
+dateField.component
+dateField.format
+dateField.options
+control.options
+canonical operations
+operation actionability
+recovery status
+```
+
+Prefer one shared schema/serializer used by both the extension and backend. At minimum, update `compactLogicalControl` and add a regression that sends a split date control through the real backend compaction boundary.
+
+### 2. Make split components deterministic
+
+When `logical-field.js` has already published `componentRole=day|month|year`, use `component.desiredValue` directly. Do not call scalar full-date inference again.
+
+The first expected decisions for the latest stored observation are:
+
+```text
+type DOB Day = 31
+type DOB Year = 2003
+```
+
+Ordering between those two is not important. Executing both before terminal handoff is important.
+
+### 3. Correct custom-widget actionability
+
+Maintain a strict distinction:
+
+```text
+proven executable operation
+≠
+observation-owned unproven recovery region
+```
+
+Use an observed activation member only when its operation-level actionability is executable. If an unproven recovery is attempted as a bounded experiment, do not mark it proven, do not repeat it on the unchanged page, and do not let its failure block other executable fields.
+
+Determine separately whether production needs:
+
+- a different observed activation node;
+- a browser-level trusted click mechanism;
+- or a more faithful custom-widget operation contract.
+
+Do not answer that question with a Kiwi selector or a permanent coordinate.
+
+### 4. Re-run live Kiwi traveler-information acceptance
+
+Verify:
+
+- title/gender;
+- DOB day, month, and year;
+- nationality;
+- any requested document fields;
+- no repeated completed component;
+- no site-specific selector or wording rule;
+- no unsafe fallback.
+
+Convert each reproduced failure into a sanitized production-shaped replay before changing architecture.
+
+### 5. Re-run clean and dirty GoToGate acceptance
+
+Confirm:
+
+- clean checkout reaches payment unchanged;
+- manually selected paid bundle, ticket, seat, baggage, or add-on is removed before navigation;
+- no paid extra is added;
+- no card field is filled;
+- no purchase action occurs;
+- terminal payment completion remains latched.
+
+### 6. Test one airline and one structurally different OTA
+
+Use failures to expand shared observation or logical-field evidence only when the production trace proves a generic gap.
+
+### 7. Measure and reduce large-page latency
+
+Profile the 320-control stress replay. Preserve:
+
+- bounded model packets;
+- deterministic single-candidate fast paths;
+- screenshot skipping when DOM evidence is sufficient;
+- fresh verification and safety checks.
+
+---
+
+## 12. Engineering Rules
+
+Keep:
+
+- fresh browser truth;
+- one control contract preserved end to end;
+- one authoritative TaskState;
+- canonical observations;
+- grounded control and candidate IDs;
+- deterministic profile values;
+- the existing action lifecycle and executor;
+- the governor;
+- transaction ledger;
+- destination readiness;
+- post-action reobservation and semantic verification;
+- payment, legal, purchase, and irreversible boundaries.
+
+Do not add:
+
+- airline-specific workflows;
+- site-specific selectors or button wording;
+- fixed coordinate procedures;
+- a second control serializer with a different field whitelist;
+- another planner, TaskState, or lifecycle controller;
+- AI-generated selectors, JavaScript, controls, or profile data;
+- completion based only on a click or DOM event;
+- a retry of an already-correct logical component;
+- a blanket wait increase to hide hydration races.
+
+Core principle:
+
+> Observe the current page, understand the logical traveler requirement, execute one grounded operation, and verify the complete canonical result from a fresh observation.
+
+For split components, “understand once” is important: after the logical layer has resolved `day`, `month`, or `year`, no later layer should reinterpret that component as an ambiguous full-date field.
+
+---
+
+## 13. Local Development
+
+Start the app:
 
 ```bash
 npm run dev
 ```
 
-The local app runs at:
-
-```text
-http://localhost:4173
-```
-
-### Load the extension
-
-Load the unpacked extension from:
+Load the extension from:
 
 ```text
 apps/extension
 ```
 
-Reload the extension after changing content-script or manifest code, and reload the checkout tab so the new content script is injected. A stale extension runtime can make deployed backend changes appear ineffective.
+After changing `manifest.json` or the content script:
 
-### Useful environment variables
+1. Reload the extension from `chrome://extensions`.
+2. Reload the checkout tab.
+3. Confirm the backend is running.
+4. Start a new agent session.
 
-```text
-OPENAI_API_KEY
-ATW_AGENT_MODEL
-ATW_AGENT_RECOVERY_MODEL
-ATW_PROFILE_DB
-ATW_ENCRYPTION_KEY
-```
+For a failed run, preserve:
 
-### Debugging a failed run
-
-Use this order:
-
-1. Identify the exact session ID and latest observation ID.
-2. Prove whether the action was proposed, approved, dispatched, observed, and verified.
-3. Inspect the fresh observation and typed diff—not only the screenshot.
-4. Determine whether the failure was perception, semantic goal, candidate construction, model selection, governor rejection, browser execution, or transition verification.
-5. Check whether the foreground surface/stage changed.
-6. Confirm whether the target was stale, offscreen, replaced, or inside a different root/container.
-7. Reproduce with a generic fixture.
-8. Fix the shared contract at the failing layer.
-9. Add the regression before marking the live issue resolved.
-
-Do not diagnose an “unchanged observation” until proving whether a browser action was actually dispatched. A pre-dispatch rejection and a dispatched no-effect action require different recovery.
+- the agent ledger;
+- client logs;
+- before/after observations;
+- action ID and candidate ID;
+- current TaskState;
+- validation and price facts;
+- screenshot only when DOM evidence is insufficient.
 
 ---
 
-## 18. Engineering Rules: What Not to Do
+## 14. One-Paragraph Handoff
 
-- Do not hardcode complete airline checkout procedures.
-- Do not make “clicked” or “typed” equal success.
-- Do not let model text become transaction truth.
-- Do not execute candidate IDs from an older observation.
-- Do not let more than one layer own current surface, pending action, recovery, or user handoff.
-- Do not let observer, cursor, logging, or annotation UI scroll, focus, click, or mutate the page.
-- Do not count pre-dispatch rejection as a browser execution attempt.
-- Do not let a verified choice on one surface satisfy a different decision group.
-- Do not truncate correctness-critical controls to reduce model tokens.
-- Do not add payment automation before the payment-review terminal contract and live portability gates pass.
-- Do not close roadmap items from unit tests alone when the acceptance criterion is live behavior.
-
----
-
-## 19. Architectural Principle for Future iOS Support
-
-The reusable product is not the Chrome DOM code. It is the agent kernel:
-
-```text
-semantic goals
-+ user policy
-+ canonical observations
-+ current grounded candidates
-+ governor
-+ action lifecycle
-+ exact transition verification
-+ durable transaction ledger
-```
-
-Chrome, iOS, and future clients should provide adapters for:
-
-- observing their environment,
-- exposing current capabilities,
-- executing approved atomic actions,
-- returning fresh evidence.
-
-They should not fork transaction truth, safety policy, lifecycle semantics, or payment authorization rules.
-
----
-
-## 20. One-Paragraph Handoff
-
-Fly currently has the right mechanical foundation for a general checkout agent: a browser observer/executor around backend-owned `TaskState`, observation-bound candidates, policy-safe AI selection when ambiguous, a central governor, one action lifecycle, bounded recovery, and a durable SQLite ledger. The former TaskState/legacy-policy conflict and context-versus-selectable ambiguity conflict are corrected in the production path. One live run reached payment review, and newer runs repeatedly complete almost the entire difficult flow. The newest trace exposes the missing core component: TaskState is authoritative but flat, so an intermediate foreground surface can replace the unfinished checkout outcome. Keep TaskState as the single authority, extend it with stable transaction/stage outcomes and temporary surface/action subgoals, create decision groups only from proven alternatives or obligations, compare every local effect with net parent progress, and detect no-progress semantic cycles. Then make payment terminal state durable, pass five consecutive varied Gotogate runs, and prove the same contract on three structurally different airline/OTA engines. Only after those gates should the team optimize latency, add richer preferences, or implement production payment and iOS adapters.
+Fly is on `dev` at committed baseline `1b3d3d0`, with a large uncommitted Logical Field Adapter, scheduler, recovery, actionability, and airline/OTA coverage change set. The existing safety, paid-extra, destination-readiness, and payment boundaries remain in scope and must not be weakened. The latest live Kiwi trace proves that the scheduler now continues past a failed field and that plain name inputs still fill, but it exposes two shared-contract defects: the extension observes split-DOB metadata that `compactLogicalControl` drops before planning, causing actionable Day and Year inputs to be misclassified as ambiguous full-date fields; and an `unproven` disabled-select recovery region is later represented as a `proven` executable actuator even though its synthetic click exposes no options. Earlier unit and browser suites passed because they bypass the server compaction loss and use a permissive custom-widget fixture, so those passes are not live acceptance. The immediate work is to preserve one control contract end to end, use deterministic component values for split dates, keep unproven recovery distinct from proven execution, and add a real request-round-trip regression. Do not rewrite the scheduler or add Kiwi selectors, field sequences, controllers, or coordinate procedures. Completion requires the latest Kiwi observation to type Day `31` and Year `2003`, continue around blocked widgets, advance past traveler information, preserve GoToGate behavior, and leave payment/purchase safeguards unchanged.

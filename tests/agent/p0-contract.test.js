@@ -26,6 +26,26 @@ const {
 const { canonicalizePageSurface, currentSurface, surfaceBinding } = require("../../apps/web/agent/surface-contract");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
 const { decisionInstanceKey } = require("../../packages/shared/agent-actions");
+const {
+  SEAT_POLICIES,
+  canonicalizeUserPolicy,
+  seatPolicyFrom
+} = require("../../apps/web/agent/policy-profile");
+
+test("seat preference aliases normalize once into canonical seatPolicy", () => {
+  const canonical = canonicalizeUserPolicy({
+    bookingRules: "No paid seats or extras",
+    preferredSeat: "no preference",
+    seats: "legacy value"
+  });
+  assert.equal(canonical.seatPolicy, SEAT_POLICIES.RANDOM_ASSIGNMENT);
+  assert.equal(Object.hasOwn(canonical, "preferredSeat"), false);
+  assert.equal(Object.hasOwn(canonical, "seats"), false);
+  assert.equal(seatPolicyFrom({
+    userPolicy: { seatPolicy: "window" },
+    traveler: { seat_preference: "no preference" }
+  }), SEAT_POLICIES.WINDOW);
+});
 
 test("decision instance identity follows fresh surface, leg, passenger, group, and selected item facts", () => {
   const observationFor = ({ leg = "Flight 1 of 2", passengerId = "traveler_1", selectedLabel = "Choice A" } = {}) => ({
@@ -62,7 +82,9 @@ function actionableCapability(operation, actuatorId, { inViewport = true } = {})
     inCurrentSurface: true,
     hitTested: inViewport,
     notOccluded: inViewport,
+    targetable: inViewport,
     operationAuthorized: true,
+    operationProven: true,
     executable: inViewport,
     revealable: !inViewport,
     code: inViewport ? "ACTIONABLE" : "ACTUATOR_OUT_OF_VIEW",
@@ -76,6 +98,97 @@ function actionableCapability(operation, actuatorId, { inViewport = true } = {})
     actionabilityByActuator: { [actuatorId]: actionability }
   };
 }
+
+test("viewport recovery never rebinds a stale fare action to the sole control on a new decision", () => {
+  const oldCandidate = {
+    candidateId: "candidate_saver",
+    stableKey: "fare-options:saver:0",
+    operation: "activate",
+    controlId: "ctrl_saver",
+    targetId: "el_saver",
+    targetLabel: "Saver — included — Continue with Saver",
+    affordance: { stableKey: "fare-options:saver:0" }
+  };
+  const pending = {
+    originalAction: {
+      id: "act_saver",
+      type: "click",
+      operation: "activate",
+      intent: "decline_optional_extra",
+      controlId: "ctrl_saver",
+      targetId: "el_saver",
+      targetLabel: oldCandidate.targetLabel,
+      reason: "Select the included Saver fare."
+    },
+    candidate: oldCandidate
+  };
+  const observation = {
+    observationId: "obs_insurance_after_fare",
+    observationSnapshot: { snapshotHash: "hash_insurance_after_fare" },
+    page: {
+      step: "extras",
+      url: "https://example.test/checkout/extras",
+      currentSurface: { id: "surface-page", type: "page", label: "Cancellation protection" },
+      activeSurface: { id: "surface-page", type: "page", label: "Cancellation protection" },
+      controls: [{
+        controlId: "ctrl_no_thanks",
+        stableKey: "insurance:no-thanks:0",
+        decisionGroupId: "dg_insurance",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        label: "No thanks, I’ll take the risk",
+        semantic: "decline_paid_extra",
+        physicalEffect: "select_free_option",
+        risk: "safe_decline",
+        kind: "button",
+        role: "button",
+        preferredActivationElementId: "el_no_thanks",
+        stateElementId: "el_no_thanks",
+        visualRegion: { x: 20, y: 20, width: 220, height: 44, inViewport: true },
+        operations: { activate: actionableCapability("activate", "el_no_thanks") }
+      }],
+      decisionGroups: [{
+        decisionGroupId: "dg_insurance",
+        surfaceId: "surface-page",
+        sectionLabel: "Cancellation protection",
+        required: true,
+        status: "missing",
+        alternatives: [{
+          controlId: "ctrl_no_thanks",
+          label: "No thanks, I’ll take the risk",
+          semantic: "decline_paid_extra",
+          risk: "safe_decline"
+        }]
+      }],
+      sections: [],
+      fields: [],
+      validationIssues: [],
+      graphIntegrity: { ok: true, conflicts: [] }
+    }
+  };
+  const state = {
+    taskState: {
+      currentGoal: {
+        goalId: "goal_saver",
+        semanticGoal: "resolve fare package",
+        semanticType: "fare_package",
+        desiredPolicyOutcome: "selected_free_option",
+        decisionGroupId: "dg_fare",
+        requirementId: "dg_fare",
+        eligibleAlternativeControlIds: ["ctrl_saver", "ctrl_standard", "ctrl_flexi"],
+        freeAlternativeControlIds: ["ctrl_saver"],
+        paidAlternativeControlIds: ["ctrl_standard", "ctrl_flexi"],
+        observationId: "obs_fare"
+      }
+    },
+    approvals: {}
+  };
+
+  const rebound = __private.rebindPendingRecoveryAction(pending, observation, state, {});
+  assert.equal(rebound.candidate, null);
+  assert.equal(rebound.action.controlId, "ctrl_saver");
+  assert.notEqual(rebound.action.controlId, "ctrl_no_thanks");
+});
 
 function observationWithGroups() {
   return {
@@ -272,7 +385,7 @@ test("fresh observation candidates expose only current canonical flexible-ticket
   const candidates = rawObservationCandidates(closed, goal);
   const candidateSet = __private.groundedObservationCandidateSet(goal, closed);
 
-  assert.equal(goal.semanticGoal, "decline flexible ticket");
+  assert.equal(goal.semanticGoal, "resolve Flexible Ticket");
   assert.equal(candidates.length, 1);
   assert.equal(candidates[0].candidateId, "obs_136:candidate_1");
   assert.equal(candidates[0].controlId, "ctrl_flexible_current");
@@ -476,6 +589,54 @@ test("the server-owned semantic affordance is unchanged from candidate through a
   });
   assert.deepEqual(action.affordance, candidate.affordance);
   assert.equal(action.affordance.postcondition.type, "exact_free_option_selected");
+});
+
+test("surface ambiguity excludes global site chrome but retains checkout controls", () => {
+  const observation = {
+    observationId: "obs_checkout_relevance",
+    observationSnapshot: { snapshotHash: "hash_checkout_relevance" },
+    page: {
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: ["ctrl_sidebar", "ctrl_continue"] },
+      controls: [
+        {
+          controlId: "ctrl_sidebar",
+          stableKey: "site.header.sidebar",
+          label: "Open sidebar",
+          semantic: "open_surface",
+          physicalEffect: "open_surface",
+          globalChrome: true,
+          risk: "safe",
+          kind: "button",
+          surfaceId: "surface-page",
+          operations: { activate: actionableCapability("activate", "el_sidebar") }
+        },
+        {
+          controlId: "ctrl_continue",
+          stableKey: "checkout.seats.continue",
+          label: "Continue",
+          semantic: "continue",
+          physicalEffect: "advance_checkout_stage",
+          risk: "safe_continue",
+          kind: "button",
+          surfaceId: "surface-page",
+          operations: { activate: actionableCapability("activate", "el_continue") }
+        }
+      ],
+      decisionGroups: []
+    }
+  };
+  const goal = {
+    goalId: "goal_interpret_surface",
+    semanticType: "surface_ambiguity",
+    selectionMode: "ai_ambiguity",
+    desiredValue: "safe_progress",
+    surfaceId: "surface-page",
+    observationId: observation.observationId
+  };
+
+  const candidateSet = buildCurrentCandidateSet({ goal, observation });
+  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["ctrl_continue"]);
+  assert.equal(candidateSet.contextCapabilities.some((candidate) => candidate.controlId === "ctrl_sidebar"), false);
 });
 
 test("P1.2 compact whole-page Markdown aggregates seat cells and preserves critical controls", () => {
@@ -1025,6 +1186,119 @@ test("navigation candidates remain unpublished until every required current-surf
   observation.page.decisionGroups = observation.page.decisionGroups.map((group) => ({ ...group, status: "satisfied" }));
   assert.equal(allRequiredDecisionGroupsResolved(observation.page), true);
   assert.equal(rawObservationCandidates(observation, navigationGoal)[0].controlId, continueControl.controlId);
+});
+
+test("global utility identity outranks accidental checkout section ownership", () => {
+  const control = (overrides) => ({
+    stableKey: `control.${overrides.controlId}`,
+    risk: "safe",
+    kind: "button",
+    role: "button",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    sectionId: "section_passenger",
+    sectionType: "passenger",
+    decisionGroupId: "dg_passenger_geometry",
+    stateElementId: `el_${overrides.controlId}`,
+    preferredActivationElementId: `el_${overrides.controlId}`,
+    operations: { activate: actionableCapability("activate", `el_${overrides.controlId}`) },
+    ...overrides
+  });
+  const feedback = control({
+    controlId: "feedback",
+    label: "Feedback",
+    semantic: "choice",
+    physicalEffect: "unknown"
+  });
+  const continueControl = control({
+    controlId: "continue",
+    label: "Continue",
+    semantic: "continue",
+    physicalEffect: "advance_checkout_stage",
+    decisionGroupId: ""
+  });
+  const observation = {
+    observationId: "obs_utility_geometry",
+    observationSnapshot: { snapshotHash: "hash_utility_geometry" },
+    page: {
+      snapshotHash: "hash_utility_geometry",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [feedback, continueControl],
+      decisionGroups: []
+    }
+  };
+  const goal = {
+    goalId: "goal_continue_without_utility",
+    semanticGoal: "continue checkout",
+    semanticType: "navigation",
+    desiredValue: "next_stage"
+  };
+
+  assert.deepEqual(rawObservationCandidates(observation, goal).map((candidate) => candidate.controlId), ["continue"]);
+});
+
+test("policy cannot reinterpret a directly priced actuator as a free option", () => {
+  const lockPriceMisclassifiedAsFree = {
+    controlId: "lock_price_misclassified_free",
+    stableKey: "summary.lock_price",
+    label: "Cabin baggage Included Basic Saver Included",
+    semantic: "select_free_option",
+    physicalEffect: "select_free_option",
+    risk: "safe",
+    structuredPrice: { amount: 0, currency: "TRY" },
+    kind: "button",
+    role: "button",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_false_summary",
+    stateElementId: "el_lock_price",
+    preferredActivationElementId: "el_lock_price",
+    actuators: [
+      { nodeId: "el_lock_price", relation: "state", label: "Lock price for 546.84 TL" },
+      { nodeId: "el_lock_price", relation: "activation", label: "Lock price for 546.84 TL" }
+    ],
+    operations: { activate: actionableCapability("activate", "el_lock_price") }
+  };
+  const observation = {
+    observationId: "obs_false_free_summary",
+    observationSnapshot: { snapshotHash: "hash_false_free_summary" },
+    page: {
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [lockPriceMisclassifiedAsFree],
+      decisionGroups: [{
+        decisionGroupId: "dg_false_summary",
+        surfaceId: "surface-page",
+        alternatives: [{ controlId: lockPriceMisclassifiedAsFree.controlId }]
+      }]
+    }
+  };
+  const goal = {
+    goalId: "goal_false_free_summary",
+    semanticGoal: "resolve optional checkout product",
+    semanticType: "extras",
+    desiredPolicyOutcome: "selected_free_option",
+    policyChoiceBounded: true,
+    decisionGroupId: "dg_false_summary",
+    policyAllowedControlIds: [lockPriceMisclassifiedAsFree.controlId],
+    freeAlternativeControlIds: [lockPriceMisclassifiedAsFree.controlId],
+    paidAlternativeControlIds: []
+  };
+
+  const contradictoryCandidates = rawObservationCandidates(observation, goal);
+  assert.equal(contradictoryCandidates.some((candidate) => (
+    candidate.controlId === lockPriceMisclassifiedAsFree.controlId
+  )), false);
+  assert.deepEqual(contradictoryCandidates.map((candidate) => candidate.type), ["ask_user"]);
+
+  const unprovenFreeGoal = {
+    ...goal,
+    freeAlternativeControlIds: []
+  };
+  const unprovenCandidates = rawObservationCandidates(observation, unprovenFreeGoal);
+  assert.equal(unprovenCandidates.some((candidate) => (
+    candidate.controlId === lockPriceMisclassifiedAsFree.controlId
+  )), false);
+  assert.deepEqual(unprovenCandidates.map((candidate) => candidate.type), ["ask_user"]);
 });
 
 test("P0.6 typed policy trusts canonical semantic risk instead of button wording", () => {

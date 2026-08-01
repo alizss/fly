@@ -26,7 +26,9 @@ function actionableCapability(operation, actuatorId, { inViewport = true } = {})
     inCurrentSurface: true,
     hitTested: inViewport,
     notOccluded: inViewport,
+    targetable: inViewport,
     operationAuthorized: true,
+    operationProven: true,
     executable: inViewport,
     revealable: !inViewport,
     code: inViewport ? "ACTIONABLE" : "ACTUATOR_OUT_OF_VIEW",
@@ -728,7 +730,7 @@ test("typed diff reports validation clearing from fresh browser evidence", () =>
   assert.equal(diff.targetReacted, true);
 });
 
-test("loop recovery counts dispatched no-effect and excludes that exact strategy", () => {
+test("loop recovery excludes an identical no-effect strategy after its first dispatch", () => {
   const before = observation("before", {
     controls: [{ controlId: "ctrl_flex", label: "Flexible ticket", state: { expanded: false } }]
   });
@@ -736,6 +738,9 @@ test("loop recovery counts dispatched no-effect and excludes that exact strategy
   const after = observation("after", before.page, browserResult);
   const state = {
     currentGoal: { goalId: "goal_flex", semanticType: "flexible_ticket" },
+    taskState: {
+      currentGoal: { goalId: "goal_flex", semanticType: "flexible_ticket" }
+    },
     lastAction: {
       id: "act_open",
       type: "click",
@@ -750,23 +755,142 @@ test("loop recovery counts dispatched no-effect and excludes that exact strategy
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.observation.lastActionResult.verified, false);
   assert.equal(applied.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
-  assert.deepEqual(applied.state.attemptedStrategySignatures, []);
+  assert.deepEqual(applied.state.attemptedStrategySignatures, ["click:open:ctrl_flex:,"]);
   assert.equal(applied.state.failedStrategyMemory[0].failureCount, 1);
   assert.equal(applied.directive, "try_distinct_capability");
   assert.equal(applied.state.recoveryState.attempts, 1);
   assert.equal(applied.state.recoveryState.phase, "execution_no_effect");
   assert.equal(applied.state.aiDecisionCache, null);
 
-  const retryAction = { ...state.lastAction, id: "act_open_retry" };
-  const retryBefore = { ...after, lastActionResult: null };
-  const retryAfter = observation("after_retry", before.page, result(retryAction.id));
-  const repeated = loopPrivate.applyTransitionStatus({
-    ...applied.state,
-    lastAction: retryAction
-  }, retryAfter, retryBefore);
-  assert.equal(repeated.transition.status, "no_effect");
-  assert.equal(repeated.state.failedStrategyMemory[0].failureCount, 2);
-  assert.deepEqual(repeated.state.attemptedStrategySignatures, ["click:open:ctrl_flex:,:"]);
+  assert.deepEqual(
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, after),
+    ["click:open:ctrl_flex:,"]
+  );
+  const changedPage = {
+    ...after,
+    observationId: "after_changed",
+    observationSnapshot: { snapshotHash: "hash_after_changed" }
+  };
+  assert.deepEqual(
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, changedPage),
+    ["click:open:ctrl_flex:,"]
+  );
+  const changedTarget = observation("after_target_changed", {
+    ...before.page,
+    controls: [{ controlId: "ctrl_flex", label: "Flexible ticket", state: { expanded: true } }]
+  });
+  assert.deepEqual(
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, changedTarget),
+    []
+  );
+});
+
+test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchanged target state", () => {
+  const before = observation("reuse_before", {
+    controls: [{ controlId: "ctrl_title", label: "Title", state: { expanded: false, disabled: true } }]
+  });
+  const action = {
+    id: "act_title_native",
+    type: "click",
+    controlId: "ctrl_title",
+    operation: "open",
+    interactionMethod: "native_click",
+    expectedOutcome: { type: "options_surface_appeared", controlId: "ctrl_title" }
+  };
+  const rejected = {
+    actionId: action.id,
+    dispatched: false,
+    executed: false,
+    verified: false,
+    failureCode: "FAILED_STRATEGY_REUSE",
+    outcome: { code: "FAILED_STRATEGY_REUSE" },
+    action
+  };
+  const after = observation("reuse_after", before.page, rejected);
+  const state = {
+    currentGoal: { goalId: "goal_title", semanticType: "title" },
+    taskState: {
+      currentGoal: { goalId: "goal_title", semanticType: "title" }
+    },
+    lastAction: action,
+    attemptedStrategySignatures: [],
+    failedStrategyMemory: [],
+    aiDecisionCache: { candidateSelection: { candidateId: "stale_reused_candidate" } }
+  };
+
+  const applied = loopPrivate.applyTransitionStatus(state, after, before);
+  const signature = "native_click:open:ctrl_title:,";
+  assert.equal(applied.transition, null);
+  assert.equal(applied.directive, "rebuild_candidates");
+  assert.deepEqual(applied.state.attemptedStrategySignatures, [signature]);
+  assert.equal(applied.state.failedStrategyMemory[0].strategySignature, signature);
+  assert.equal(applied.state.failedStrategyMemory[0].failureCount, 1);
+  assert.equal(applied.state.aiDecisionCache, null);
+  assert.deepEqual(
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, after),
+    [signature]
+  );
+
+  const unrelatedProgress = observation("reuse_unrelated_progress", {
+    ...before.page,
+    controls: [
+      ...before.page.controls,
+      { controlId: "ctrl_dob_day", state: { normalizedValue: "31" } }
+    ]
+  });
+  assert.deepEqual(
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, unrelatedProgress),
+    [signature]
+  );
+});
+
+test("profile blocked-goal memory persists across observation ids only while the page state is unchanged", () => {
+  const goalKey = "profile:title:value:traveler_1";
+  const state = {
+    blockedProfileGoalKeys: [goalKey],
+    blockedProfilePageStateHash: "traveler_form_state"
+  };
+  assert.deepEqual(
+    loopPrivate.persistentBlockedProfileGoalKeys(state, {
+      observationId: "obs_rerendered",
+      observationSnapshot: { snapshotHash: "traveler_form_state" }
+    }),
+    [goalKey]
+  );
+  assert.deepEqual(
+    loopPrivate.persistentBlockedProfileGoalKeys(state, {
+      observationId: "obs_page_changed",
+      observationSnapshot: { snapshotHash: "traveler_form_advanced" }
+    }),
+    []
+  );
+});
+
+test("a retry is distinct only when its target, operation, or dispatch method changes", () => {
+  const base = {
+    type: "type",
+    operation: "type",
+    controlId: "ctrl_profile",
+    targetId: "el_profile",
+    value: "Ali"
+  };
+  const signature = loopPrivate.candidateStrategySignature({}, base);
+  assert.equal(
+    loopPrivate.candidateStrategySignature({}, { ...base, value: "Different value" }),
+    signature
+  );
+  assert.notEqual(
+    loopPrivate.candidateStrategySignature({}, { ...base, targetId: "el_profile_alternate" }),
+    signature
+  );
+  assert.notEqual(
+    loopPrivate.candidateStrategySignature({}, { ...base, operation: "choose" }),
+    signature
+  );
+  assert.notEqual(
+    loopPrivate.candidateStrategySignature({}, { ...base, type: "keypress" }),
+    signature
+  );
 });
 
 test("a browser acknowledgement on the same material observation is no effect", () => {
@@ -797,7 +921,7 @@ test("a browser acknowledgement on the same material observation is no effect", 
   assert.equal(transition.nextDirective, "try_distinct_capability");
 });
 
-test("after one strategy fails twice, one failed alternative exhausts the surface", () => {
+test("every failed strategy is excluded on the same unchanged page state", () => {
   const observationForSurface = observation("retry_surface", {
     currentSurface: { id: "origin_picker", type: "modal", label: "Choose origin" },
     foreground: { progressMarkers: { step: "origin" } }
@@ -812,10 +936,12 @@ test("after one strategy fails twice, one failed alternative exhausts the surfac
     failedStrategyMemory: [{
       goalKey,
       strategySignature: "keypress:open:origin::ArrowDown",
-      failureCount: 2
+      pageStateHash: observationForSurface.observationSnapshot.snapshotHash,
+      failureCount: 1
     }, {
       goalKey,
       strategySignature: "click:open:origin_button::",
+      pageStateHash: observationForSurface.observationSnapshot.snapshotHash,
       failureCount: 1
     }]
   };
@@ -1070,20 +1196,12 @@ test("typed seat choices keep safe navigation selectable even when compatibility
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.directive, "try_distinct_capability");
 
-  const firstRetrySet = loopPrivate.groundedObservationCandidateSet(goal, unchanged, applied.state.attemptedStrategySignatures, taskStateContext);
-  assert.equal(firstRetrySet.candidates.some((candidate) => candidate.controlId === "ctrl_skip"), true);
-  const retriedSkip = { ...skip, id: "act_skip_retry" };
-  const retryBefore = { ...unchanged, lastActionResult: null };
-  const unchangedAgain = observation("typed_unchanged_again", before.page, result(retriedSkip.id));
-  const failedTwice = loopPrivate.applyTransitionStatus({
-    ...applied.state,
-    currentGoal: goal,
-    lastAction: retriedSkip
-  }, unchangedAgain, retryBefore);
-  assert.equal(failedTwice.transition.status, "no_effect");
-  assert.deepEqual(failedTwice.state.attemptedStrategySignatures, [loopPrivate.candidateStrategySignature(goal, skip)]);
-
-  const retrySet = loopPrivate.groundedObservationCandidateSet(goal, unchangedAgain, failedTwice.state.attemptedStrategySignatures, taskStateContext);
+  const retrySet = loopPrivate.groundedObservationCandidateSet(
+    goal,
+    unchanged,
+    applied.state.attemptedStrategySignatures,
+    taskStateContext
+  );
   assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_skip"), false);
   assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_next"), true);
 });
@@ -1586,7 +1704,7 @@ test("invalid planner output retries the immutable candidate set without browser
       memberControlIds: ["ctrl_free_a", "ctrl_free_b"],
       memberActuatorIds: ["el_free_a", "el_free_b"]
     },
-    controls: ["a", "b"].map((suffix) => ({
+    controls: ["a", "b"].map((suffix, index) => ({
       controlId: `ctrl_free_${suffix}`,
       stableKey: `seat.free.${suffix}`,
       decisionGroupId: "dg_seat",
@@ -1594,7 +1712,7 @@ test("invalid planner output retries the immutable candidate set without browser
       sectionType: "seats",
       surfaceId: "seat_modal",
       surfaceType: "modal",
-      label: `Free seating ${suffix.toUpperCase()}`,
+      label: index === 0 ? "Random seat assignment" : "Skip seat selection",
       semantic: "decline_paid_extra",
       risk: "safe_decline",
       kind: "button",
@@ -1615,8 +1733,8 @@ test("invalid planner output retries the immutable candidate set without browser
       required: true,
       status: "missing",
       alternatives: [
-        { controlId: "ctrl_free_a", label: "Free seating A", risk: "safe_decline" },
-        { controlId: "ctrl_free_b", label: "Free seating B", risk: "safe_decline" }
+        { controlId: "ctrl_free_a", label: "Random seat assignment", risk: "safe_decline" },
+        { controlId: "ctrl_free_b", label: "Skip seat selection", risk: "safe_decline" }
       ]
     }]
   });

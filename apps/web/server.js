@@ -22,6 +22,8 @@ const agentTraceStore = require("./agent/trace-store");
 const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
 const { PAGE_SURFACE_ID, normalizeSurface } = require("./agent/surface-contract");
 const { normalizeCanonicalDate } = require("./agent/date-field-codec");
+const { canonicalizeUserPolicy, seatPolicyFrom } = require("./agent/policy-profile");
+const agentContract = require("../extension/src/shared/agent-contract");
 
 function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
@@ -29,6 +31,12 @@ function uid(prefix) {
 
 function now() {
   return new Date().toISOString();
+}
+
+function finiteNumberOrNull(value) {
+  if (value === null || value === undefined || value === "" || typeof value === "object") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function summarizeAgentSession(session) {
@@ -72,12 +80,11 @@ function createAgentSession(body = {}) {
     status: "running",
     userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
     travelerIds: [traveler.id || body.travelerId || state.travelerId].filter(Boolean),
-    userPolicy: {
+    userPolicy: canonicalizeUserPolicy({
       bookingRules: clampText(traveler.booking_rules, 800),
       baggagePreference: clampText(traveler.baggage_preference, 120),
-      preferredSeat: clampText(traveler.preferred_seat, 120),
       paymentPreference: clampText(traveler.payment_preference, 120)
-    },
+    }, traveler),
     currentStep: normalizeStep(body.page?.step || state.currentStep || "unknown"),
     approvals: {
       ...state.approvals,
@@ -166,11 +173,30 @@ function seedDb() {
         first_name: "Maya",
         middle_name: "",
         last_name: "Patel",
+        second_last_name: "",
         date_of_birth: "1990-04-12",
+        place_of_birth: "San Francisco",
         gender: "female",
         nationality: "US",
-        email: "maya@example.com",
-        phone: "+1 415 555 0199",
+        country_of_residence: "US",
+        email: "maya.patel@example.test",
+        phone: "+1 202 555 0147",
+        address_line1: "100 Test Avenue",
+        address_line2: "Suite 4",
+        city: "San Francisco",
+        state: "CA",
+        postal_code: "94105",
+        country: "US",
+        frequent_flyer_program: "Demo Miles",
+        frequent_flyer_number: "DM123456789",
+        known_traveler_number: "999999999",
+        redress_number: "9999999",
+        emergency_contact_name: "Jordan Example",
+        emergency_contact_relationship: "Friend",
+        emergency_contact_phone: "+1 202 555 0188",
+        emergency_contact_email: "jordan.example@example.test",
+        meal_preference: "standard meal",
+        special_assistance: "none",
         preferred_seat: "aisle",
         baggage_preference: "cabin bag",
         default_cabin: "economy",
@@ -190,6 +216,7 @@ function seedDb() {
         traveler_profile_id: travelerId,
         document_type: "passport",
         issuing_country: "US",
+        issue_date: "2024-10-21",
         encrypted_document_number: encryptSensitive("P1234567"),
         document_number_last4: "4567",
         expiry_date: "2026-10-20",
@@ -287,6 +314,7 @@ function publicTraveler(db, traveler) {
           id: document.id,
           document_type: document.document_type,
           issuing_country: document.issuing_country,
+          issue_date: document.issue_date || "",
           document_number_last4: document.document_number_last4,
           masked_document_number: maskDocument("P", document.document_number_last4),
           expiry_date: document.expiry_date
@@ -304,6 +332,7 @@ function extensionTraveler(db, traveler) {
           id: document.id,
           document_type: document.document_type,
           issuing_country: document.issuing_country,
+          issue_date: document.issue_date || "",
           document_number: decryptSensitive(document.encrypted_document_number),
           document_number_last4: document.document_number_last4,
           masked_document_number: maskDocument("P", document.document_number_last4),
@@ -546,6 +575,18 @@ function compactControlFields(item = {}) {
     controlState: item.controlState || item.state || null,
     stateElementId: clampText(item.stateElementId, 80),
     preferredActivationElementId: clampText(item.preferredActivationElementId, 80),
+    fieldClassification: item.fieldClassification?.fieldType ? {
+      fieldType: clampText(item.fieldClassification.fieldType, 80),
+      source: clampText(item.fieldClassification.source, 80),
+      confidence: Number(item.fieldClassification.confidence || 0),
+      evidence: Array.isArray(item.fieldClassification.evidence)
+        ? item.fieldClassification.evidence.map((value) => clampText(value, 180)).filter(Boolean).slice(0, 4)
+        : [],
+      evidenceByChannel: item.fieldClassification.evidenceByChannel || null,
+      tightOwnerId: clampText(item.fieldClassification.tightOwnerId, 100),
+      tightOwnerKey: clampText(item.fieldClassification.tightOwnerKey, 240),
+      ambiguity: item.fieldClassification.ambiguity || null
+    } : null,
     operations: compactControlOperations(item.operations),
     recovery: compactControlRecovery(item.recovery),
     actuators: compactActuators(item.actuators),
@@ -623,60 +664,10 @@ function compactControlRecovery(recovery = {}) {
 }
 
 function compactLogicalControl(control = {}) {
-  return {
-    controlId: clampText(control.controlId, 140),
-    stableKey: clampText(control.stableKey, 240),
-    meaning: clampText(control.meaning, 220),
-    structuredPrice: control.structuredPrice && Number.isFinite(Number(control.structuredPrice.amount)) ? {
-      amount: Number(control.structuredPrice.amount),
-      currency: clampText(control.structuredPrice.currency, 12)
-    } : null,
-    visualRef: clampText(control.visualRef, 40),
-    decisionGroupId: clampText(control.decisionGroupId, 140),
-    label: clampText(control.label, 220),
-    accessibleName: clampText(control.accessibleName, 220),
-    testId: clampText(control.testId, 160),
-    formAction: clampText(control.formAction, 300),
-    formMethod: clampText(control.formMethod, 40),
-    formId: clampText(control.formId, 160),
-    ownText: clampText(control.ownText, 220),
-    ariaLabel: clampText(control.ariaLabel, 220),
-    title: clampText(control.title, 220),
-    iconOnly: Boolean(control.iconOnly),
-    kind: clampText(control.kind, 80),
-    field: clampText(control.field, 80),
-    fieldType: clampText(control.fieldType, 80),
-    fieldClassification: control.fieldClassification?.fieldType ? {
-      fieldType: clampText(control.fieldClassification.fieldType, 80),
-      source: clampText(control.fieldClassification.source, 80),
-      confidence: Number(control.fieldClassification.confidence || 0),
-      evidence: Array.isArray(control.fieldClassification.evidence)
-        ? control.fieldClassification.evidence.map((item) => clampText(item, 180)).filter(Boolean).slice(0, 4)
-        : []
-    } : null,
-    role: clampText(control.role, 80),
-    semantic: clampText(control.semantic, 80),
-    physicalEffect: clampText(control.physicalEffect, 80),
-    semanticConflict: Boolean(control.semanticConflict),
-    risk: clampText(control.risk, 80),
-    state: control.state || null,
-    currentValue: clampText(control.currentValue || control.state?.selectedValue || control.state?.normalizedValue, 240),
-    selected: Boolean(control.selected),
-    required: Boolean(control.required),
-    hasValue: Boolean(control.hasValue || control.state?.valuePresent || control.controlState?.valuePresent),
-    sectionId: clampText(control.sectionId, 80),
-    sectionType: clampText(control.sectionType, 80),
-    sectionLabel: clampText(control.sectionLabel, 160),
-    surfaceId: clampText(control.surfaceId, 80),
-    surfaceType: clampText(control.surfaceType, 80),
-    surfaceLabel: clampText(control.surfaceLabel, 220),
-    stateElementId: clampText(control.stateElementId, 80),
-    preferredActivationElementId: clampText(control.preferredActivationElementId, 80),
-    operations: compactControlOperations(control.operations),
-    recovery: compactControlRecovery(control.recovery),
-    actuators: compactActuators(control.actuators),
-    visualRegion: control.visualRegion || null
-  };
+  // The request is already bounded and JSON-decoded. Preserve every observed
+  // semantic/capability property and normalize the shared contract in place;
+  // do not reconstruct a second, lossy control schema here.
+  return agentContract.serializeObservedControl(control);
 }
 
 function compactStructuredPrice(price = null) {
@@ -746,6 +737,7 @@ function compactDecisionGroup(group = {}, controlsById = new Map(), selectedExtr
       }
     : null;
   return {
+    ...agentContract.cloneSerializable(group),
     decisionGroupId,
     surfaceId: clampText(group.surfaceId, 80),
     sectionId: clampText(group.sectionId, 80),
@@ -921,6 +913,15 @@ function compactAgentPayload(rawBody) {
     } : null,
     userIntent: clampText(body.userIntent || "Complete checkout safely for the selected traveler.", 800),
     userMessage: clampText(body.userMessage || "", 800),
+    userResponse: body.userResponse && typeof body.userResponse === "object"
+      ? {
+          requestId: clampText(body.userResponse.requestId, 160),
+          field: clampText(body.userResponse.field, 120),
+          value: clampText(body.userResponse.value, 600),
+          valueRef: clampText(body.userResponse.valueRef, 160),
+          hasValue: body.userResponse.hasValue === true
+        }
+      : null,
     approvalState: {
       skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved),
       paymentApproved: Boolean(body.approvalState?.paymentApproved),
@@ -949,19 +950,40 @@ function compactAgentPayload(rawBody) {
       first_name: clampText(traveler.first_name, 80),
       middle_name: clampText(traveler.middle_name, 80),
       last_name: clampText(traveler.last_name, 80),
-      name: clampText([traveler.first_name, traveler.middle_name, traveler.last_name].filter(Boolean).join(" "), 120),
+      second_last_name: clampText(traveler.second_last_name, 80),
+      name: clampText([traveler.first_name, traveler.middle_name, traveler.last_name, traveler.second_last_name].filter(Boolean).join(" "), 160),
       email: clampText(traveler.email, 160),
       phone: clampText(traveler.phone, 80),
       gender: clampText(traveler.gender, 40),
       date_of_birth: clampText(traveler.date_of_birth, 40),
+      place_of_birth: clampText(traveler.place_of_birth, 120),
       nationality: clampText(traveler.nationality, 80),
+      country_of_residence: clampText(traveler.country_of_residence, 80),
+      address_line1: clampText(traveler.address?.line1 || traveler.address_line1 || traveler.billing_address, 240),
+      address_line2: clampText(traveler.address?.line2 || traveler.address_line2, 240),
+      city: clampText(traveler.address?.city || traveler.city || traveler.billing_city, 120),
+      state: clampText(traveler.address?.state || traveler.address?.province || traveler.state || traveler.province, 120),
+      postal_code: clampText(traveler.address?.postal_code || traveler.address?.postcode || traveler.postal_code || traveler.billing_postal_code, 40),
+      country: clampText(traveler.address?.country || traveler.address_country || traveler.country, 80),
+      frequent_flyer_program: clampText(traveler.frequent_flyer_program, 120),
+      frequent_flyer_number: clampText(traveler.frequent_flyer_number, 120),
+      known_traveler_number: clampText(traveler.known_traveler_number, 120),
+      redress_number: clampText(traveler.redress_number, 120),
+      emergency_contact_name: clampText(traveler.emergency_contact_name, 160),
+      emergency_contact_relationship: clampText(traveler.emergency_contact_relationship, 80),
+      emergency_contact_phone: clampText(traveler.emergency_contact_phone, 80),
+      emergency_contact_email: clampText(traveler.emergency_contact_email, 160),
+      meal_preference: clampText(traveler.meal_preference, 120),
+      special_assistance: clampText(traveler.special_assistance, 500),
       payment_preference: clampText(traveler.payment_preference, 120),
       baggage_preference: clampText(traveler.baggage_preference, 120),
       preferred_seat: clampText(traveler.preferred_seat, 120),
+      seat_policy: seatPolicyFrom({ traveler }),
       booking_rules: clampText(traveler.booking_rules, 800),
       document: traveler.document ? {
         document_type: clampText(traveler.document.document_type, 60),
         issuing_country: clampText(traveler.document.issuing_country, 80),
+        issue_date: clampText(traveler.document.issue_date, 40),
         expiry_date: clampText(traveler.document.expiry_date, 40),
         document_number_last4: clampText(traveler.document.document_number_last4, 20),
         has_document_number: Boolean(traveler.document.document_number)
@@ -981,16 +1003,14 @@ function compactAgentPayload(rawBody) {
         aliasConflictCount: Number(page.graphIntegrity.aliasConflictCount || 0),
         aliasConflicts: Array.isArray(page.graphIntegrity.aliasConflicts) ? page.graphIntegrity.aliasConflicts.slice(0, 20) : []
       } : null,
-      itineraryFingerprint: clampText(page.itineraryFingerprint || page.summary?.itineraryFingerprint, 160),
-      offerFingerprint: clampText(page.offerFingerprint || page.summary?.offerFingerprint, 160),
       transactionFacts: page.transactionFacts && typeof page.transactionFacts === "object" ? {
         itinerary: {
           completeness: clampText(page.transactionFacts.itinerary?.completeness || "unknown", 20),
           segments: Array.isArray(page.transactionFacts.itinerary?.segments)
             ? page.transactionFacts.itinerary.segments.map((segment) => ({
                 segmentId: clampText(segment.segmentId, 120),
-                origin: clampText(segment.origin, 12),
-                destination: clampText(segment.destination, 12),
+                origin: clampText(segment.origin, 80),
+                destination: clampText(segment.destination, 80),
                 departureDate: clampText(segment.departureDate, 40),
                 departureTime: clampText(segment.departureTime, 20),
                 arrivalTime: clampText(segment.arrivalTime, 20),
@@ -1006,20 +1026,22 @@ function compactAgentPayload(rawBody) {
           : [],
         currency: clampText(page.transactionFacts.currency, 20),
         basePrice: page.transactionFacts.basePrice && typeof page.transactionFacts.basePrice === "object" ? {
-          amount: Number.isFinite(Number(page.transactionFacts.basePrice.amount)) ? Number(page.transactionFacts.basePrice.amount) : null,
+          amount: finiteNumberOrNull(page.transactionFacts.basePrice.amount),
           currency: clampText(page.transactionFacts.basePrice.currency, 20)
         } : null,
         totalPrice: page.transactionFacts.totalPrice && typeof page.transactionFacts.totalPrice === "object" ? {
-          amount: Number.isFinite(Number(page.transactionFacts.totalPrice.amount)) ? Number(page.transactionFacts.totalPrice.amount) : null,
+          amount: finiteNumberOrNull(page.transactionFacts.totalPrice.amount),
           currency: clampText(page.transactionFacts.totalPrice.currency, 20)
         } : null,
         fareBrand: clampText(page.transactionFacts.fareBrand, 120),
         selectedExtras: Array.isArray(page.transactionFacts.selectedExtras)
           ? page.transactionFacts.selectedExtras.map((extra) => ({
               decisionGroupId: clampText(extra.decisionGroupId, 140),
+              family: clampText(extra.family || extra.subjectFamily, 40),
+              subjectKey: clampText(extra.subjectKey || extra.subject, 120),
               label: clampText(extra.label, 180),
               disposition: clampText(extra.disposition, 80),
-              priceAmount: Number.isFinite(Number(extra.priceAmount)) ? Number(extra.priceAmount) : null,
+              priceAmount: finiteNumberOrNull(extra.priceAmount),
               currency: clampText(extra.currency, 20)
             })).slice(0, 40)
           : [],
@@ -1078,6 +1100,9 @@ function compactAgentPayload(rawBody) {
             issueId: clampText(issue.issueId, 140),
             message: clampText(issue.message, 220),
             controlId: clampText(issue.controlId, 140),
+            logicalFieldId: clampText(issue.logicalFieldId, 180),
+            logicalOwnerKey: clampText(issue.logicalOwnerKey, 240),
+            componentRole: clampText(issue.componentRole, 40),
             semanticType: clampText(issue.semanticType, 80),
             sectionId: clampText(issue.sectionId, 80),
             sectionType: clampText(issue.sectionType, 80),
@@ -1089,6 +1114,32 @@ function compactAgentPayload(rawBody) {
       completedFields: page.completedFields && typeof page.completedFields === "object" ? page.completedFields : {},
       sections,
       controls: canonicalControls,
+      controlCollections: Array.isArray(page.controlCollections)
+        ? page.controlCollections.map((collection) => ({
+            collectionId: clampText(collection.collectionId, 140),
+            type: clampText(collection.type, 80),
+            decisionGroupId: clampText(collection.decisionGroupId, 140),
+            sectionId: clampText(collection.sectionId, 100),
+            sectionType: clampText(collection.sectionType, 80),
+            surfaceId: clampText(collection.surfaceId, 100),
+            totalCount: Math.max(0, Number(collection.totalCount || 0)),
+            retainedCount: Math.max(0, Number(collection.retainedCount || 0)),
+            omittedCount: Math.max(0, Number(collection.omittedCount || 0)),
+            availableCount: Math.max(0, Number(collection.availableCount || 0)),
+            disabledCount: Math.max(0, Number(collection.disabledCount || 0)),
+            selectedCount: Math.max(0, Number(collection.selectedCount || 0)),
+            paidCount: Math.max(0, Number(collection.paidCount || 0)),
+            freeCount: Math.max(0, Number(collection.freeCount || 0)),
+            priceRange: collection.priceRange && typeof collection.priceRange === "object" ? {
+              minimum: Number.isFinite(Number(collection.priceRange.minimum)) ? Number(collection.priceRange.minimum) : null,
+              maximum: Number.isFinite(Number(collection.priceRange.maximum)) ? Number(collection.priceRange.maximum) : null,
+              currency: clampText(collection.priceRange.currency, 20)
+            } : null,
+            profileMode: clampText(collection.profileMode, 60),
+            requiresExpansion: collection.requiresExpansion === true
+          })).filter((collection) => collection.collectionId && collection.totalCount > 0).slice(0, 24)
+        : [],
+      transportCompleteness: clampText(page.transportCompleteness, 40),
       controlAliases: Array.isArray(page.controlAliases)
         ? page.controlAliases.map((entry) => ({
             aliasId: clampText(entry.aliasId, 140),
@@ -1149,12 +1200,19 @@ async function decideAgentNextActionViaLoop(body) {
   state = agentSessionStore.saveSession(withUpdate(state, {
     userIntent: payload.userIntent || state.userIntent || state.goal,
     travelerIds: [payload.traveler?.id || state.travelerId].filter(Boolean),
-    userPolicy: {
+    userPolicy: canonicalizeUserPolicy({
       bookingRules: payload.traveler?.booking_rules || state.userPolicy?.bookingRules || state.policySnapshot?.bookingRules || "",
       baggagePreference: payload.traveler?.baggage_preference || state.userPolicy?.baggagePreference || state.policySnapshot?.baggagePreference || "",
-      preferredSeat: payload.traveler?.preferred_seat || state.userPolicy?.preferredSeat || state.policySnapshot?.preferredSeat || "",
       paymentPreference: payload.traveler?.payment_preference || state.userPolicy?.paymentPreference || state.policySnapshot?.paymentPreference || ""
-    },
+    }, {
+      ...payload.traveler,
+      seatPolicy: payload.traveler?.seat_policy
+        || state.userPolicy?.seatPolicy
+        || state.policySnapshot?.seatPolicy,
+      preferred_seat: payload.traveler?.preferred_seat
+        || state.userPolicy?.preferredSeat
+        || state.policySnapshot?.preferredSeat
+    }),
     approvals: {
       ...(state.approvals || {}),
       skipPaidExtrasApproved: Boolean(payload.approvalState?.skipPaidExtrasApproved || state.approvals?.skipPaidExtrasApproved),
@@ -1174,6 +1232,8 @@ async function decideAgentNextActionViaLoop(body) {
       state,
       observation,
       traveler: payload.traveler,
+      userMessage: payload.userMessage,
+      userResponse: payload.userResponse,
       actionHistory: payload.actionHistory,
       transactionStore: agentSessionStore,
       clientTurnId: payload.clientTurnId
@@ -1357,11 +1417,30 @@ function travelerFromBody(body, existing = {}) {
     first_name: String(body.first_name || "").trim(),
     middle_name: String(body.middle_name || "").trim(),
     last_name: String(body.last_name || "").trim(),
+    second_last_name: String(body.second_last_name || "").trim(),
     date_of_birth: dateOfBirth,
+    place_of_birth: body.place_of_birth || "",
     gender: body.gender || "",
     nationality: body.nationality || "",
+    country_of_residence: body.country_of_residence || body.country || "",
     email: body.email || "",
     phone: body.phone || "",
+    address_line1: body.address_line1 || "",
+    address_line2: body.address_line2 || "",
+    city: body.city || "",
+    state: body.state || "",
+    postal_code: body.postal_code || "",
+    country: body.country || "",
+    frequent_flyer_program: body.frequent_flyer_program || "",
+    frequent_flyer_number: body.frequent_flyer_number || "",
+    known_traveler_number: body.known_traveler_number || "",
+    redress_number: body.redress_number || "",
+    emergency_contact_name: body.emergency_contact_name || "",
+    emergency_contact_relationship: body.emergency_contact_relationship || "",
+    emergency_contact_phone: body.emergency_contact_phone || "",
+    emergency_contact_email: body.emergency_contact_email || "",
+    meal_preference: body.meal_preference || "",
+    special_assistance: body.special_assistance || "",
     preferred_seat: body.preferred_seat || "no preference",
     baggage_preference: body.baggage_preference || "personal item",
     default_cabin: body.default_cabin || "economy",
@@ -1376,7 +1455,7 @@ function travelerFromBody(body, existing = {}) {
 }
 
 function upsertTravelerDocument(db, travelerId, body) {
-  const hasDocumentInput = body.document_number || body.expiry_date || body.issuing_country || body.document_type;
+  const hasDocumentInput = body.document_number || body.issue_date || body.expiry_date || body.issuing_country || body.document_type;
   if (!hasDocumentInput) return;
   let document = db.traveler_documents.find((doc) => doc.traveler_profile_id === travelerId);
   if (!document) {
@@ -1389,6 +1468,7 @@ function upsertTravelerDocument(db, travelerId, body) {
   }
   document.document_type = body.document_type || document.document_type || "passport";
   document.issuing_country = body.issuing_country || body.nationality || document.issuing_country || "";
+  document.issue_date = body.issue_date || document.issue_date || "";
   if (body.document_number) {
     document.encrypted_document_number = encryptSensitive(body.document_number);
     document.document_number_last4 = last4(body.document_number);

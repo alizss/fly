@@ -291,7 +291,9 @@ test("semantic ambiguity can only resolve an observed decision group and its own
                 inCurrentSurface: true,
                 hitTested: true,
                 notOccluded: true,
+                targetable: true,
                 operationAuthorized: true,
+                operationProven: true,
                 code: "ACTIONABLE"
               }
             }
@@ -434,7 +436,9 @@ test("transaction facts trigger semantic ownership when live decision fields are
                   inCurrentSurface: true,
                   hitTested: true,
                   notOccluded: true,
+                  targetable: true,
                   operationAuthorized: true,
+                  operationProven: true,
                   code: "ACTIONABLE"
                 }
               }
@@ -464,7 +468,9 @@ test("transaction facts trigger semantic ownership when live decision fields are
                   inCurrentSurface: true,
                   hitTested: true,
                   notOccluded: true,
+                  targetable: true,
                   operationAuthorized: true,
+                  operationProven: true,
                   code: "ACTIONABLE"
                 }
               }
@@ -549,7 +555,9 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
         inCurrentSurface: true,
         hitTested: true,
         notOccluded: true,
+        targetable: true,
         operationAuthorized: true,
+        operationProven: true,
         code: "ACTIONABLE"
       }
     }
@@ -914,7 +922,9 @@ test("the existing ambiguity path resolves order summaries, custom dropdowns, an
                   inCurrentSurface: true,
                   hitTested: true,
                   notOccluded: true,
+                  targetable: true,
                   operationAuthorized: true,
+                  operationProven: true,
                   code: "ACTIONABLE"
                 }
               }

@@ -2,6 +2,7 @@ const { normalizeAction } = require("../../../packages/shared/agent-actions");
 const { conflictedControlIds } = require("./control-alias-index");
 const { controlBelongsToCurrentSurface, currentSurface, surfaceBinding } = require("./surface-contract");
 const { deriveActionSemantics } = require("./action-semantics");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 function slug(value = "") {
   return String(value || "")
@@ -24,12 +25,6 @@ function normalizedRisk(risk = "", operation = "", structuredPrice = null) {
 }
 
 function semanticGoalForGroup(group = {}) {
-  const text = `${group.requirementId || ""} ${group.sectionType || ""} ${group.sectionLabel || ""}`.toLowerCase();
-  if (/flexible|ticket/.test(text)) return "decline flexible ticket";
-  if (/bag|luggage/.test(text)) return "decline checked baggage";
-  if (/bundle|support|sms/.test(text)) return "decline bundle extras";
-  if (/seat/.test(text)) return "decline paid seat selection";
-  if (/insurance|cancellation|protection/.test(text)) return "decline cancellation insurance";
   return `resolve ${group.sectionLabel || group.sectionType || group.requirementId || "current decision"}`;
 }
 
@@ -76,7 +71,7 @@ function deriveObservationGoal(observation = {}, requirements = []) {
       goalId: `${observationId}:goal:${slug(group.decisionGroupId || semanticGoal)}`,
       semanticGoal,
       semanticType: group.sectionType || group.requirementId || "decision",
-      desiredValue: /decline/.test(semanticGoal) ? "free_or_no_extra" : "satisfied",
+      desiredValue: "satisfied",
       decisionGroupId: group.decisionGroupId || "",
       surfaceId: group.surfaceId || "",
       requirementId: group.decisionGroupId || group.requirementId || "",
@@ -127,12 +122,103 @@ function intentFor(control = {}, operation = "", goal = {}) {
   return "choose_option";
 }
 
+function opensChoiceControlFor(control = {}, operation = "") {
+  return operation === "open"
+    || /open_choice_control|open_surface/.test(
+      `${control.semantic || ""} ${control.physicalEffect || ""}`.toLowerCase()
+    )
+    || /combobox|listbox/.test(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`.toLowerCase())
+    || control.hasPopup === true
+    || Boolean(control.ariaHasPopup);
+}
+
+function isGlobalSiteChromeControl(control = {}) {
+  if (control.globalChrome === true) return true;
+  const meaning = `${control.label || ""} ${control.accessibleName || ""} ${control.semantic || ""} ${control.stableKey || ""}`.toLowerCase();
+  const utilityLabel = /\bopen sidebar\b|\bregional settings\b|\bcurrency (?:selector|switcher)\b|\bhelp(?:\s*&\s*| and )support\b|\bsign in\b|\bfeedback\b/.test(meaning);
+  const utilityEffect = /open_surface|choice|unknown/.test(`${control.semantic || ""} ${control.physicalEffect || ""}`.toLowerCase());
+  // Utility identity outranks accidental geometric section ownership. A
+  // fixed Feedback/Help control does not become checkout UI merely because a
+  // broad section band assigned it section and decision IDs.
+  return utilityLabel && utilityEffect;
+}
+
+function exactActuatorHasPositivePrice(control = {}) {
+  const labels = (control.actuators || [])
+    .filter((actuator) => (
+      ["state", "activation", "source"].includes(String(actuator.relation || ""))
+      || String(actuator.relation || "").startsWith("operation:")
+    ))
+    .map((actuator) => String(actuator.label || "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const currency = "(?:EUR|USD|GBP|TRY|TL|CAD|AUD|CHF|JPY|CNY|€|\\$|£|¥|₺)";
+  const amount = "(?:\\d[\\d\\s.,'’]*\\d|\\d)";
+  const patterns = [
+    new RegExp(`(${amount})\\s*${currency}`, "i"),
+    new RegExp(`${currency}\\s*(${amount})`, "i")
+  ];
+  return labels.some((label) => patterns.some((pattern) => {
+    const match = label.match(pattern);
+    if (!match) return false;
+    const numeric = String(match[1] || "").replace(/\D/g, "");
+    return Boolean(numeric && Number(numeric) > 0);
+  }));
+}
+
+function optionContractIsCoherent(control = {}) {
+  const contract = control.choiceContract || null;
+  if (contract?.ownershipComplete === false) return false;
+  const controlEffect = String(control.physicalEffect || "unknown");
+  const contractEffect = String(contract?.optionPhysicalEffect || controlEffect || "unknown");
+  if (contractEffect !== "unknown" && controlEffect !== "unknown" && contractEffect !== controlEffect) return false;
+  const price = contract?.structuredPrice || control.structuredPrice || null;
+  const amount = Number(price?.amount);
+  if (Number.isFinite(amount) && amount > 0 && controlEffect === "select_free_option") return false;
+  if (Number.isFinite(amount) && amount === 0 && controlEffect === "select_paid_option") return false;
+  const declaredFree = controlEffect === "select_free_option"
+    || contractEffect === "select_free_option"
+    || /select_free_option|decline_paid_extra|safe_decline/.test(
+      `${control.semantic || ""} ${control.risk || ""}`.toLowerCase()
+    )
+    || (Number.isFinite(amount) && amount === 0);
+  if (declaredFree && exactActuatorHasPositivePrice(control)) return false;
+  return true;
+}
+
+function isObservedSafeProgressControl(control = {}) {
+  if (Number(control.structuredPrice?.amount) > 0 || exactActuatorHasPositivePrice(control)) return false;
+  const meaning = `${control.semantic || ""} ${control.physicalEffect || ""} ${control.meaning || ""} ${control.risk || ""}`.toLowerCase();
+  if (/money|paid|purchase|payment|add_paid|select_paid/.test(meaning)) return false;
+  return /continue|navigation|advance|next|proceed|dismiss_surface|safe_continue/.test(meaning);
+}
+
 function controlsForGoal(page = {}, goal = {}) {
-  const controls = page.controls || [];
+  const controls = (page.controls || []).filter((control) => {
+    const meaning = `${control.semantic || ""} ${control.semanticType || ""} ${control.meaning || ""}`.toLowerCase();
+    return !isGlobalSiteChromeControl(control)
+      && optionContractIsCoherent(control)
+      && !(/selection[_ -]?cta/.test(meaning) && !control.choiceContract);
+  });
   if (goal.semanticType === "surface_ambiguity" || goal.selectionMode === "ai_ambiguity") {
     return controls;
   }
-  const exactEligibleIds = new Set((goal.eligibleAlternativeControlIds || []).filter(Boolean));
+  const policyAllowedIds = new Set((goal.policyAllowedControlIds || []).filter(Boolean));
+  const provenFreeIds = (goal.freeAlternativeControlIds || []).filter((controlId) => (
+    !policyAllowedIds.size || policyAllowedIds.has(controlId)
+  ));
+  const provenSafeProgressIds = controls.filter((control) => (
+    policyAllowedIds.has(control.controlId)
+    && isObservedSafeProgressControl(control)
+  )).map((control) => control.controlId);
+  const policyExactIds = goal.desiredPolicyOutcome === "selected_free_option"
+    ? [...new Set([...provenFreeIds, ...provenSafeProgressIds])]
+    : goal.policyChoiceBounded === true
+      ? goal.policyAllowedControlIds
+      : goal.eligibleAlternativeControlIds;
+  const exactEligibleIds = new Set((policyExactIds || []).filter(Boolean));
+  if (goal.decisionGroupId && goal.policyChoiceBounded === true && exactEligibleIds.size === 0) {
+    return [];
+  }
   if (goal.decisionGroupId && exactEligibleIds.size) {
     return controls.filter((control) => exactEligibleIds.has(control.controlId));
   }
@@ -150,6 +236,7 @@ function controlsForGoal(page = {}, goal = {}) {
     if (goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [completedDecisionGroupId])) return [];
     return controls.filter((control) => {
       const text = `${control.semantic || ""} ${control.risk || ""} ${control.meaning || ""} ${control.label || ""}`.toLowerCase();
+      if (/selection[_ -]?cta/.test(text) && !control.choiceContract) return false;
       if (/\bback\b|previous|go back|price|details|learn more|info(?:rmation)?|edit|change/.test(text)) return false;
       if (/choose|select|pick/.test(text) && /seat|bag|bundle|extra|upgrade/.test(text)) return false;
       if (Number(control.structuredPrice?.amount) > 0 || /add_paid|money|purchase|premium|upgrade/.test(text)) return false;
@@ -192,29 +279,48 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   const semanticCorrectionIds = new Set((goal.semanticCorrectionControlIds || []).filter(Boolean));
 
   for (const control of controls) {
-    const operations = Object.entries(control.operations || {}).filter(([, capability]) => (
-      (capability?.actuatorId || capability?.actuatorIds?.length)
-      && (capability?.actionability?.executable === true || capability?.actionability?.revealable === true)
-    ));
-    const usable = operations;
-    for (const [operation, capability] of usable) {
+    const usable = Object.entries(control.operations || {}).flatMap(([operation, rawCapability]) => {
+      const capability = agentContract.normalizeCapability(control, operation, rawCapability);
+      return (capability.strategies || [])
+        .filter((strategy) => (
+          strategy.actuatorId
+          && [
+            agentContract.CAPABILITY_STATUS.PROVEN_EXECUTABLE,
+            agentContract.CAPABILITY_STATUS.RECOVERABLE
+          ].includes(strategy.status)
+        ))
+        .map((strategy) => ({ operation, capability, strategy }));
+    });
+    for (const { operation, capability, strategy } of usable) {
       if (!["open", "choose", "activate", "keyboard"].includes(operation)) continue;
-      const actionability = capability.actionability || {};
+      const actionability = strategy.proof || capability.actionability || {};
       const visible = actionability.executable === true;
-      const actionType = operationActionType(operation);
-      const targetId = capability.actuatorId || capability.actuatorIds?.[0] || control.preferredActivationElementId || control.stateElementId;
+      const actionType = strategy.actionType || operationActionType(operation);
+      const targetId = strategy.actuatorId;
       if (!targetId) continue;
       const interpretedFree = freeAlternativeIds.has(control.controlId)
-        && goal.desiredPolicyOutcome === "selected_free_option";
+        && (
+          goal.desiredPolicyOutcome === "selected_free_option"
+          || goal.policyChoiceBounded === true
+        );
       const interpretedPaid = paidAlternativeIds.has(control.controlId);
+      const paidAuthorization = interpretedPaid && goal.authorization?.authorizationId
+        ? goal.authorization
+        : null;
       const semanticCorrection = semanticCorrectionIds.has(control.controlId)
-        ? (page.semanticOwnershipLinks || []).find((link) => (
+        ? ((page.semanticOwnershipLinks || []).find((link) => (
             link.status === "resolved"
             && link.sourceDecisionGroupId === goal.decisionGroupId
             && link.correctionControlId === control.controlId
-          )) || null
+          )) || (opensChoiceControlFor(control, operation) ? {
+            linkId: "",
+            sourceDecisionGroupId: goal.decisionGroupId,
+            correctionDecisionGroupId: control.decisionGroupId || goal.decisionGroupId,
+            correctionControlId: control.controlId,
+            intendedOutcome: "open_correction_surface"
+          } : null))
         : null;
-      const opensChoiceControl = operation === "open";
+      const opensChoiceControl = opensChoiceControlFor(control, operation);
       const risk = opensChoiceControl
         ? "safe"
         : semanticCorrection
@@ -248,7 +354,9 @@ function rawObservationCandidates(observation = {}, goal = {}) {
             ? "select_paid_option"
             : (control.physicalEffect || ""),
         policyOutcome: semanticCorrection ? "proposed_policy_correction" : (interpretedFree ? "selected_free_option" : (interpretedPaid ? "selected_paid_option" : "selected_policy_allowed_option")),
-        intendedOutcome: semanticCorrection?.intendedOutcome || "",
+        intendedOutcome: semanticCorrection?.intendedOutcome || (
+          interpretedFree ? (goal.desiredSemanticOutcome || "") : ""
+        ),
         semanticOwnershipLinkId: semanticCorrection?.linkId || "",
         policyCorrectionForDecisionGroupId: semanticCorrection?.sourceDecisionGroupId || "",
         observedSemantic: control.semantic || "unknown",
@@ -257,8 +365,11 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         stableKey: control.stableKey || `control:${control.controlId}`,
         meaning: control.meaning || control.semantic || control.accessibleName || control.label || operation,
         structuredPrice: control.structuredPrice || null,
+        authorization: paidAuthorization,
+        approvedPaidAction: Boolean(paidAuthorization),
         type: actionType,
         operation,
+        interactionMethod: strategy.method || "",
         authorizedOperation: operation,
         actionability,
         ...semantics,
@@ -282,10 +393,10 @@ function rawObservationCandidates(observation = {}, goal = {}) {
           mustNotIncreasePrice: true
         } : null,
         risk,
-        requiresApproval: ["money", "payment", "legal"].includes(risk),
+        requiresApproval: ["money", "payment", "legal"].includes(risk) && !paidAuthorization,
         visible,
         value: "",
-        keys: operation === "keyboard" ? "ArrowDown" : "",
+        keys: strategy.keys || (operation === "keyboard" ? "ArrowDown" : ""),
         needsReveal: !visible && actionability.revealable === true,
         summary: `${operation} the current ${control.label || control.semantic || "control"}${visible ? "." : " after revealing it."}`
       });
@@ -346,8 +457,12 @@ function actionForObservationCandidate(goal = {}, candidate = {}, observation = 
     targetLabel: candidate.targetLabel,
     value: candidate.value || "",
     keys: candidate.keys || "",
+    interactionMethod: candidate.interactionMethod || "",
     requirementId: candidate.requirementId || "",
     expectedOutcome: candidate.expectedOutcome || null,
+    pipelineContract: candidate.pipelineContract || null,
+    capabilityStatus: candidate.capabilityStatus || "",
+    executionChannel: candidate.executionChannel || "",
     interactionRole: candidate.interactionRole,
     semanticEffect: candidate.semanticEffect,
     expectedEvidence: candidate.expectedEvidence,

@@ -118,6 +118,14 @@ function compactWholePageMarkdown(observation = {}, { traveler = {} } = {}) {
     .map((item) => clean(item, 180)).filter(Boolean).join("; ");
   if (policy) lines.push(`[Policy] ${policy}`);
 
+  for (const collection of page.controlCollections || []) {
+    const availability = `${Number(collection.availableCount || 0)} available / ${Number(collection.disabledCount || 0)} disabled`;
+    const price = collection.priceRange
+      ? ` — ${collection.priceRange.minimum}-${collection.priceRange.maximum} ${clean(collection.priceRange.currency, 10)}`
+      : "";
+    lines.push(`[Collection ${clean(collection.collectionId || collection.type, 50)}] ${clean(collection.type || "repeated choices", 80)} — ${Number(collection.totalCount || 0)} total — ${availability}${price} — ${Number(collection.omittedCount || 0)} summarized`);
+  }
+
   for (const issue of page.validationIssues || []) {
     lines.push(`[Validation ${clean(issue.controlId || issue.sectionId || "stage", 50)}] ${clean(issue.message, 220)}`);
   }

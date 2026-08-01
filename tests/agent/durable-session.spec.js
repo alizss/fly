@@ -51,6 +51,149 @@ test("P0.2 one session handshake resumes the exact transaction and rejects repla
   expect(await missing.json()).toMatchObject({ code: "DURABLE_SESSION_NOT_FOUND" });
 });
 
+test("a structured missing traveler answer crosses HTTP and resumes the exact field", async ({ request }) => {
+  const traveler = {
+    id: `trav_missing_nationality_${Date.now()}`,
+    first_name: "Ali",
+    last_name: "Example",
+    nationality: "",
+    booking_rules: "No paid extras"
+  };
+  const started = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Complete traveler information",
+      traveler,
+      page: {
+        site: "example.test",
+        url: "https://example.test/checkout/traveler",
+        step: "traveler_information"
+      }
+    }
+  });
+  const session = await started.json();
+  expect(started.status(), JSON.stringify(session)).toBe(201);
+
+  const pageFor = (observationId) => ({
+    site: "example.test",
+    url: "https://example.test/checkout/traveler",
+    step: "traveler_information",
+    heading: "Traveler information",
+    snapshotHash: `hash_${observationId}`,
+    currentSurface: {
+      id: "surface-page",
+      type: "page",
+      blocksBackground: false,
+      memberControlIds: ["ctrl_nationality"],
+      memberActuatorIds: ["nationality_select"],
+      observationId
+    },
+    fields: [{
+      id: "nationality_select",
+      controlId: "ctrl_nationality",
+      field: "nationality",
+      fieldType: "nationality",
+      label: "Nationality",
+      kind: "select",
+      role: "combobox",
+      required: true,
+      hasValue: false,
+      controlState: { valuePresent: false, normalizedValue: "" },
+      sectionType: "passenger"
+    }],
+    controls: [{
+      controlId: "ctrl_nationality",
+      label: "Nationality",
+      kind: "select",
+      role: "combobox",
+      semantic: "nationality",
+      fieldType: "nationality",
+      risk: "safe",
+      surfaceId: "surface-page",
+      surfaceType: "page",
+      state: { disabled: false, required: true, valuePresent: false, normalizedValue: "" },
+      stateElementId: "nationality_select",
+      preferredActivationElementId: "nationality_select",
+      options: [
+        { value: "TR", label: "Türkiye" },
+        { value: "US", label: "United States" }
+      ],
+      operations: {
+        select: {
+          operation: "select",
+          actuatorId: "nationality_select",
+          actuatorIds: ["nationality_select"],
+          actionability: {
+            rendered: true,
+            visible: true,
+            enabled: true,
+            inViewport: true,
+            inCurrentSurface: true,
+            hitTested: true,
+            notOccluded: true,
+            targetable: true,
+            operationAuthorized: true,
+            operationProven: true,
+            executable: true,
+            revealable: false,
+            code: "ACTIONABLE",
+            operation: "select"
+          }
+        }
+      }
+    }],
+    decisionGroups: [],
+    validationIssues: []
+  });
+
+  const firstObservationId = `obs_missing_nationality_${Date.now()}`;
+  const first = await request.post(`${API}/agent/next-action`, {
+    data: {
+      sessionId: session.id,
+      observationId: firstObservationId,
+      observationSnapshot: { snapshotHash: `hash_${firstObservationId}` },
+      traveler,
+      page: pageFor(firstObservationId)
+    }
+  });
+  const ask = await first.json();
+  expect(first.status(), JSON.stringify(ask)).toBe(200);
+  expect(ask).toMatchObject({
+    action: "ask_user",
+    inputRequest: {
+      field: "nationality",
+      label: "nationality",
+      subjectId: traveler.id,
+      sensitive: false
+    }
+  });
+
+  const secondObservationId = `obs_answered_nationality_${Date.now()}`;
+  const second = await request.post(`${API}/agent/next-action`, {
+    data: {
+      sessionId: session.id,
+      observationId: secondObservationId,
+      observationSnapshot: { snapshotHash: `hash_${secondObservationId}` },
+      userMessage: "TR",
+      userResponse: {
+        requestId: ask.inputRequest.requestId,
+        field: "nationality",
+        value: "TR",
+        hasValue: true
+      },
+      traveler,
+      page: pageFor(secondObservationId)
+    }
+  });
+  const resumed = await second.json();
+  expect(second.status(), JSON.stringify(resumed)).toBe(200);
+  expect(resumed).toMatchObject({
+    action: "select",
+    controlId: "ctrl_nationality",
+    targetId: "nationality_select",
+    value: "TR"
+  });
+});
+
 test("oversized observations receive a typed retryable transport error", async ({ request }) => {
   const started = await request.post(`${API}/agent/session`, {
     data: {

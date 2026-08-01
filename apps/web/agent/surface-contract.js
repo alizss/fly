@@ -12,6 +12,11 @@ function normalizeSurface(surface = {}, observationId = "") {
     type,
     label: clean(surface.label || surface.accessibleName || (isPage ? "Page" : "")),
     role: clean(surface.role),
+    // Preserve the observer's typed semantic classification. Dropping this at
+    // the extension/backend boundary forces downstream code to reinterpret
+    // prose and was the reason foreground site failures became stale form
+    // goals again.
+    surfaceClass: clean(surface.surfaceClass),
     blocksBackground: isPage ? false : surface.blocksBackground !== false,
     ownership: isPage ? "page" : "exclusive",
     decisionGroupId: clean(surface.decisionGroupId),

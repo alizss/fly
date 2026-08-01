@@ -406,7 +406,7 @@ function advanceActionLifecycle({
   const destinationPending = isNavigation
     && dispatched
     && previousLifecycle.closed !== true
-    && ["TRANSIENT", "DEGRADED"].includes(String(observationReadiness?.classification || ""))
+    && ["TRANSIENT", "UNRESOLVED", "DEGRADED"].includes(String(observationReadiness?.classification || ""))
     && observationReadiness?.handoffEligible !== true;
   if (destinationPending) {
     const lifecycle = {

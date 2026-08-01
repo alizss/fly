@@ -1,3 +1,5 @@
+const { isCandidateGrounded } = require("../../../packages/shared/agent-actions");
+
 const INTERACTION_ROLES = new Set(["choice", "command", "opener", "navigation", "field"]);
 const SEMANTIC_EFFECTS = new Set(["select", "waive", "open", "advance", "set_value"]);
 const EXPECTED_EVIDENCE = new Set(["selected", "dismissed", "options_appeared", "progress_changed", "value_changed", "target_visible"]);
@@ -49,6 +51,7 @@ function normalizedOutcomeContract(contract = {}) {
 }
 
 function outcomeContractForGoal(goal = {}, observation = {}) {
+  goal = goal || {};
   if (goal.outcomeContract?.taskOutcome) return normalizedOutcomeContract(goal.outcomeContract);
   const semantic = normalized(`${goal.kind || ""} ${goal.semanticType || ""} ${goal.semanticGoal || ""} ${goal.desiredValue || ""}`);
   const surface = observation.page?.currentSurface || observation.page?.activeSurface || {};
@@ -211,7 +214,7 @@ function assessOutcomeCompatibility({
         : "unknown";
   const taskOutcome = outcomeContractForGoal(goal, observation).taskOutcome;
   const durableOutcome = (durableObjective.taskOutcome ? normalizedOutcomeContract(durableObjective) : outcomeContractForGoal(durableObjective, observation)).taskOutcome;
-  if (!candidate.controlId || !candidate.targetId || !control.controlId) {
+  if (!candidate.controlId || !control.controlId || !isCandidateGrounded(candidate, observation)) {
     return { status: OUTCOME_COMPATIBILITY.UNKNOWN, reason: "candidate_not_grounded" };
   }
   if (control.semanticConflict === true || candidate.semanticConflict === true || mechanicalEffect === "unknown") {
@@ -417,6 +420,7 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
       ...existing,
       ...base,
       type: exactFree ? "exact_free_option_selected" : "control_selected",
+      intendedOutcome: action.intendedOutcome || existing.intendedOutcome || "",
       expectedSelectedControlId: base.controlId,
       expectedSelectedLabel: action.targetLabel || target.label || control.label || existing.expectedSelectedLabel || "",
       expectedDisposition: exactFree ? "decline_free_no_extra" : "selected",
@@ -544,6 +548,18 @@ function buildSemanticAffordance({ candidate = {}, control = {}, goal = {}, post
       ? { amount: Number(structuredPrice.amount), currency: String(structuredPrice.currency || "") }
       : null,
     risk: String(candidate.risk || control.risk || "uncertain"),
+    ...((candidate.authorization || goal.authorization)
+      ? { authorization: candidate.authorization || goal.authorization }
+      : {}),
+    ...((goal.userIntentMatch || goal.profileResolutionReason)
+      ? {
+          profileResolution: Object.freeze({
+            match: String(goal.userIntentMatch || "none"),
+            reason: String(goal.profileResolutionReason || ""),
+            preferredControlId: String(goal.policyAllowedControlIds?.[0] || "")
+          })
+        }
+      : {}),
     task: Object.freeze({
       goalId: String(goal.goalId || ""),
       ...(goal.transactionOutcomeId ? { transactionOutcomeId: String(goal.transactionOutcomeId) } : {}),
@@ -561,7 +577,7 @@ function buildSemanticAffordance({ candidate = {}, control = {}, goal = {}, post
       stableKey: `${stableKey}:actuator:${capability}`,
       targetId: actuatorId,
       controlId: String(candidate.controlId || control.controlId || ""),
-      proven: Boolean(actuatorId || candidate.visualRegion),
+      proven: isCandidateGrounded(candidate, candidate.observationId || ""),
       source: candidate.visualRegion ? String(candidate.visualRegion.source || "visual_region") : "canonical_operation"
     }),
     effect: physicalEffect,

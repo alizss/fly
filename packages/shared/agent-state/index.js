@@ -42,8 +42,6 @@
  * @property {CheckoutStep} currentStep
  * @property {{diagnosticOnly: true, requirements: import("../requirements").CheckoutRequirement[]}} legacyRequirementsDiagnostic
  * @property {ApprovalState} approvals
- * @property {PriceSnapshot[]} priceHistory
- * @property {SelectedOption[]} selectedOptions
  * @property {import("../agent-actions").AgentAction|null} lastAction
  * @property {Object|null} lastVerification
  * @property {AgentFailure[]} failures
@@ -56,15 +54,20 @@
  * @property {Object|null} taskState
  * @property {Object|null} terminalGoalLatch
  * @property {Object} observationReadiness
+ * @property {Object|null} navigationSettling
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
  * @property {{semanticOwnership?: Object, candidateSelection?: Object}|null} aiDecisionCache
  * @property {Object|null} fastStaleRecovery
  * @property {string[]} attemptedCandidateIds
  * @property {Object[]} failedStrategyMemory
+ * @property {string[]} blockedProfileGoalKeys
+ * @property {string} blockedProfilePageStateHash
  * @property {Object} recoveryState
  * @property {Object[]} verifiedResults
  * @property {Object} userPolicy
+ * @property {Object} sessionProfileOverrides
+ * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}|null} pendingUserInput
  * @property {Object|null} transactionInvariants
  * @property {Object} paymentState
  * @property {Object} confirmationState
@@ -95,6 +98,8 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     travelerId: String(travelerId || ""),
     travelerIds: travelerId ? [String(travelerId)] : [],
     userPolicy: {},
+    sessionProfileOverrides: {},
+    pendingUserInput: null,
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
     currentStep: "unknown",
     legacyRequirementsDiagnostic: { diagnosticOnly: true, requirements: [] },
@@ -111,12 +116,15 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
       reason: "",
       evidence: null
     },
+    navigationSettling: null,
     pendingAction: null,
     actionLifecycle: null,
     aiDecisionCache: null,
     fastStaleRecovery: null,
     attemptedCandidateIds: [],
     failedStrategyMemory: [],
+    blockedProfileGoalKeys: [],
+    blockedProfilePageStateHash: "",
     recoveryState: {
       attempts: 0,
       phase: "idle",
@@ -128,16 +136,12 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     },
     verifiedResults: [],
     approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalApproved: false, priceIncreaseApproved: false },
-    priceHistory: [],
-    selectedOptions: [],
     lastAction: null,
     lastVerification: null,
     failures: [],
     traceIds: [],
     currentObservationId: "",
     currentObservationHash: "",
-    itineraryFingerprint: "",
-    offerFingerprint: "",
     transactionInvariants: null,
     paymentState: { status: "not_authorized", authorizationId: "", attempts: 0, lastAttemptAt: "" },
     confirmationState: { status: "not_confirmed", reference: "", confirmedAt: "" },
@@ -159,12 +163,30 @@ function normalizeStatus(status) {
 }
 
 function latestPrice(state) {
-  return state.priceHistory[state.priceHistory.length - 1] || null;
+  const current = state.transactionInvariants?.current?.totalPrice;
+  if (Number.isFinite(Number(current?.amount)) && current?.amount !== null) {
+    return {
+      amount: Number(current.amount),
+      currency: String(current.currency || state.transactionInvariants?.current?.currency || ""),
+      capturedAt: state.updatedAt || ""
+    };
+  }
+  const legacy = Array.isArray(state.priceHistory) ? state.priceHistory : [];
+  return legacy[legacy.length - 1] || null;
 }
 
 /** True if the newest price is meaningfully (>3%) higher than the previous one. */
 function priceIncreasedSincePrevious(state) {
-  const history = state.priceHistory;
+  const evidence = Array.isArray(state.transactionInvariants?.evidence)
+    ? state.transactionInvariants.evidence
+      .map((entry) => ({
+        amount: entry.facts?.totalPrice?.amount,
+        currency: entry.facts?.totalPrice?.currency || entry.facts?.currency || "",
+        capturedAt: entry.observedAt || ""
+      }))
+      .filter((entry) => Number.isFinite(Number(entry.amount)) && entry.amount !== null)
+    : [];
+  const history = evidence.length ? evidence : (Array.isArray(state.priceHistory) ? state.priceHistory : []);
   if (history.length < 2) return false;
   const prev = history[history.length - 2];
   const curr = history[history.length - 1];

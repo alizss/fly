@@ -6,8 +6,15 @@ function aliasRecordsForControl(control = {}) {
   const operationRecords = Object.entries(control.operations || {}).flatMap(([operation, capability]) =>
     (capability?.actuatorIds || []).map((aliasId) => ({ aliasId, kind: `operation:${operation}` }))
   );
+  const recoveryRecords = Object.entries(control.recovery || {}).flatMap(([operation, recovery]) =>
+    [
+      ...(recovery?.actuatorIds || []),
+      ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
+    ].map((aliasId) => ({ aliasId, kind: `recovery:${operation}` }))
+  );
   const records = [
     { aliasId: control.controlId, kind: "control" },
+    { aliasId: control.stableKey, kind: "stable_key" },
     { aliasId: control.stateElementId, kind: "state" },
     { aliasId: control.preferredActivationElementId, kind: "activation" },
     { aliasId: control.visualRef, kind: "visual" },
@@ -15,7 +22,8 @@ function aliasRecordsForControl(control = {}) {
       aliasId: actuator?.nodeId,
       kind: actuator?.relation || "actuator"
     })),
-    ...operationRecords
+    ...operationRecords,
+    ...recoveryRecords
   ];
   return records
     .map((record) => ({ ...record, aliasId: cleanId(record.aliasId) }))
@@ -119,15 +127,21 @@ function actionTargetAliases(action = {}) {
   const target = action.targetSnapshot || {};
   return [
     action.controlId,
+    action.stableKey,
     action.targetId,
     action.visualRef,
     target.controlId,
+    target.stableKey,
     target.id,
     target.visualRef,
     target.stateElementId,
     target.preferredActivationElementId,
     ...(target.actuators || []).map((actuator) => actuator?.nodeId),
-    ...Object.values(target.operations || {}).flatMap((capability) => capability?.actuatorIds || [])
+    ...Object.values(target.operations || {}).flatMap((capability) => capability?.actuatorIds || []),
+    ...Object.values(target.recovery || {}).flatMap((recovery) => [
+      ...(recovery?.actuatorIds || []),
+      ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
+    ])
   ].map(cleanId).filter((aliasId, index, list) => aliasId && list.indexOf(aliasId) === index);
 }
 

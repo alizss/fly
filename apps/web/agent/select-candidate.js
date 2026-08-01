@@ -1,6 +1,7 @@
 const { callStructured } = require("./openai-client");
 const { candidateSelectionSchemaFor } = require("./schemas");
 const { currentSurface, controlBelongsToCurrentSurface } = require("./surface-contract");
+const { seatPolicyFrom } = require("./policy-profile");
 
 const OWNERSHIP_FAMILIES = ["seat", "baggage", "bundle", "insurance", "extras", "unknown"];
 const OWNERSHIP_REQUIREMENTS = ["required", "optional", "unknown"];
@@ -251,7 +252,8 @@ function semanticOwnershipPayload(observation = {}, groups = [], userPolicy = {}
     semanticType: clean(taskState.currentGoal.semanticType),
     semanticGoal: clean(taskState.currentGoal.semanticGoal),
     decisionGroupId: clean(taskState.currentGoal.decisionGroupId),
-    desiredPolicyOutcome: clean(taskState.currentGoal.desiredPolicyOutcome)
+    desiredPolicyOutcome: clean(taskState.currentGoal.desiredPolicyOutcome),
+    desiredSemanticOutcome: clean(taskState.currentGoal.desiredSemanticOutcome)
   } : null;
   return {
     observationId: clean(observation.observationId),
@@ -288,7 +290,7 @@ function semanticOwnershipPayload(observation = {}, groups = [], userPolicy = {}
     },
     userPolicy: {
       bookingRules: clean(userPolicy.bookingRules || traveler.booking_rules),
-      seats: clean(userPolicy.seats || traveler.seat_preference),
+      seatPolicy: seatPolicyFrom({ userPolicy, traveler }),
       baggage: clean(userPolicy.baggage || traveler.baggage_preference),
       insurance: clean(userPolicy.insurance),
       extras: clean(userPolicy.extras)
