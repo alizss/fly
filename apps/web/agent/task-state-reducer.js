@@ -1041,6 +1041,56 @@ function reduceTaskState({
       outcomeContract: surfaceSubgoal?.outcomeContract || outcomeContractForGoal(currentGoal, observation)
     });
   }
+  const semanticAchievements = [...completions.values()].map((completion) => Object.freeze({
+    achievementId: clean(completion.instanceId || completion.decisionGroupId || completion.requirementId),
+    kind: completion.requirementId ? "requirement" : "decision",
+    status: "verified",
+    label: clean(completion.completionReason || completion.requirementId || completion.decisionGroupId),
+    observationId: clean(completion.observationId)
+  }));
+  const transactionAchievements = (transactionReview?.outcomeLedger || []).map((outcome) => Object.freeze({
+    achievementId: clean(outcome.outcomeKey || outcome.decisionGroupId),
+    kind: clean(outcome.family || "transaction"),
+    status: "verified",
+    label: clean(outcome.label || outcome.outcome || outcome.disposition),
+    observationId: ""
+  }));
+  const achievements = [...new Map([...semanticAchievements, ...transactionAchievements]
+    .filter((achievement) => achievement.achievementId)
+    .map((achievement) => [achievement.achievementId, achievement])).values()].slice(-160);
+  const unresolved = [
+    ...(profileReadiness.missingUserData || []).map((field) => `profile:${clean(field)}`),
+    ...activeDecisions.map((decision) => `decision:${clean(decision.decisionGroupId || decision.decisionId)}`),
+    ...(paymentReviewBoundary.observed ? (transactionReview?.missingFacts || []).map((fact) => `transaction:${clean(fact)}`) : []),
+    ...(paymentReviewBoundary.observed ? (transactionReview?.contradictions || []).map((fact) => `contradiction:${clean(fact)}`) : [])
+  ].filter(Boolean);
+  const processAwareness = Object.freeze({
+    status: terminalGoalLatch.locked
+      ? "goal_achieved"
+      : siteFailure
+        ? "blocked_by_site"
+        : transactionReviewBlocked
+          ? "verifying_final_transaction"
+          : "in_progress",
+    currentPosition: Object.freeze({
+      stage: paymentReviewBoundary.observed ? "payment_review" : stage,
+      surfaceId: clean(surface.id || "surface-page"),
+      surfaceType: clean(surface.type || "page"),
+      surfaceClass
+    }),
+    currentObjective: clean(
+      currentGoal?.semanticGoal
+      || (transactionReviewBlocked ? "verify the final transaction" : "reach verified payment review")
+    ),
+    achievements: Object.freeze(achievements),
+    unresolved: Object.freeze([...new Set(unresolved)].slice(0, 160)),
+    finalOutcome: Object.freeze({
+      achieved: terminalGoalLatch.locked === true,
+      status: terminalStatus,
+      transactionVerified: transactionReview?.ready === true,
+      evidence: clean(terminalGoalLatch.completionEvidence)
+    })
+  });
 
   return Object.freeze({
     // Durable guidance only. Foreground capability selection happens from the
@@ -1106,6 +1156,7 @@ function reduceTaskState({
     }),
     profileReadiness,
     transactionReview: transactionReview ? Object.freeze(transactionReview) : null,
+    processAwareness,
     parentObjective: parentObjective || previousTaskState.parentObjective || null
   });
 }

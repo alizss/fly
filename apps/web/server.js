@@ -844,6 +844,87 @@ function hydrateIncrementalAgentBody(body = {}) {
   };
 }
 
+function compactTransactionFactEvidence(entry = null) {
+  if (!entry || typeof entry !== "object") return null;
+  return {
+    source: clampText(entry.source || "unknown", 80),
+    ownerKey: clampText(entry.ownerKey, 180),
+    observationId: clampText(entry.observationId, 120),
+    confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0)),
+    authoritative: entry.authoritative === true
+  };
+}
+
+function compactTransactionFacts(facts = null) {
+  if (!facts || typeof facts !== "object") return null;
+  const compactItineraryEvidence = Array.isArray(facts.factEvidence?.itinerary)
+    ? facts.factEvidence.itinerary.map((entry) => ({
+        segmentId: clampText(entry?.segmentId, 120),
+        ...compactTransactionFactEvidence(entry)
+      })).filter((entry) => entry.segmentId && entry.ownerKey).slice(0, 12)
+    : [];
+  return {
+    evidenceMode: clampText(facts.evidenceMode, 20),
+    itinerary: {
+      completeness: clampText(facts.itinerary?.completeness || "unknown", 20),
+      segments: Array.isArray(facts.itinerary?.segments)
+        ? facts.itinerary.segments.map((segment) => ({
+            segmentId: clampText(segment.segmentId, 120),
+            origin: clampText(segment.origin, 80),
+            destination: clampText(segment.destination, 80),
+            departureDate: clampText(segment.departureDate, 40),
+            departureTime: clampText(segment.departureTime, 20),
+            arrivalTime: clampText(segment.arrivalTime, 20),
+            flightNumber: clampText(segment.flightNumber, 30),
+            evidence: compactTransactionFactEvidence(segment.evidence)
+          })).slice(0, 12)
+        : []
+    },
+    travelers: Array.isArray(facts.travelers)
+      ? facts.travelers.map((entry) => ({
+          travelerId: clampText(entry.travelerId || entry.id, 120),
+          name: clampText(entry.name, 160)
+        })).slice(0, 12)
+      : [],
+    currency: clampText(facts.currency, 20),
+    basePrice: facts.basePrice && typeof facts.basePrice === "object" ? {
+      amount: finiteNumberOrNull(facts.basePrice.amount),
+      currency: clampText(facts.basePrice.currency, 20)
+    } : null,
+    totalPrice: facts.totalPrice && typeof facts.totalPrice === "object" ? {
+      amount: finiteNumberOrNull(facts.totalPrice.amount),
+      currency: clampText(facts.totalPrice.currency, 20)
+    } : null,
+    fareBrand: clampText(facts.fareBrand, 120),
+    selectedExtras: Array.isArray(facts.selectedExtras)
+      ? facts.selectedExtras.map((extra) => ({
+          decisionGroupId: clampText(extra.decisionGroupId, 140),
+          outcomeKey: clampText(extra.outcomeKey, 180),
+          family: clampText(extra.family || extra.subjectFamily, 40),
+          subjectKey: clampText(extra.subjectKey || extra.subject, 120),
+          label: clampText(extra.label, 180),
+          disposition: clampText(extra.disposition, 80),
+          outcome: clampText(extra.outcome || extra.semanticOutcome, 80),
+          priceAmount: finiteNumberOrNull(extra.priceAmount),
+          currency: clampText(extra.currency, 20)
+        })).slice(0, 40)
+      : [],
+    factEvidence: {
+      itinerary: compactItineraryEvidence,
+      fareBrand: compactTransactionFactEvidence(facts.factEvidence?.fareBrand),
+      totalPrice: compactTransactionFactEvidence(facts.factEvidence?.totalPrice),
+      travelers: compactTransactionFactEvidence(facts.factEvidence?.travelers)
+    },
+    provenance: Array.isArray(facts.provenance)
+      ? facts.provenance.map((entry) => ({
+          source: clampText(entry.source, 80),
+          observationId: clampText(entry.observationId, 120),
+          confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0))
+        })).slice(0, 20)
+      : []
+  };
+}
+
 function compactAgentPayload(rawBody) {
   const body = hydrateIncrementalAgentBody(rawBody);
   const page = body.page || {};
@@ -1003,56 +1084,7 @@ function compactAgentPayload(rawBody) {
         aliasConflictCount: Number(page.graphIntegrity.aliasConflictCount || 0),
         aliasConflicts: Array.isArray(page.graphIntegrity.aliasConflicts) ? page.graphIntegrity.aliasConflicts.slice(0, 20) : []
       } : null,
-      transactionFacts: page.transactionFacts && typeof page.transactionFacts === "object" ? {
-        itinerary: {
-          completeness: clampText(page.transactionFacts.itinerary?.completeness || "unknown", 20),
-          segments: Array.isArray(page.transactionFacts.itinerary?.segments)
-            ? page.transactionFacts.itinerary.segments.map((segment) => ({
-                segmentId: clampText(segment.segmentId, 120),
-                origin: clampText(segment.origin, 80),
-                destination: clampText(segment.destination, 80),
-                departureDate: clampText(segment.departureDate, 40),
-                departureTime: clampText(segment.departureTime, 20),
-                arrivalTime: clampText(segment.arrivalTime, 20),
-                flightNumber: clampText(segment.flightNumber, 30)
-              })).slice(0, 12)
-            : []
-        },
-        travelers: Array.isArray(page.transactionFacts.travelers)
-          ? page.transactionFacts.travelers.map((entry) => ({
-              travelerId: clampText(entry.travelerId || entry.id, 120),
-              name: clampText(entry.name, 160)
-            })).slice(0, 12)
-          : [],
-        currency: clampText(page.transactionFacts.currency, 20),
-        basePrice: page.transactionFacts.basePrice && typeof page.transactionFacts.basePrice === "object" ? {
-          amount: finiteNumberOrNull(page.transactionFacts.basePrice.amount),
-          currency: clampText(page.transactionFacts.basePrice.currency, 20)
-        } : null,
-        totalPrice: page.transactionFacts.totalPrice && typeof page.transactionFacts.totalPrice === "object" ? {
-          amount: finiteNumberOrNull(page.transactionFacts.totalPrice.amount),
-          currency: clampText(page.transactionFacts.totalPrice.currency, 20)
-        } : null,
-        fareBrand: clampText(page.transactionFacts.fareBrand, 120),
-        selectedExtras: Array.isArray(page.transactionFacts.selectedExtras)
-          ? page.transactionFacts.selectedExtras.map((extra) => ({
-              decisionGroupId: clampText(extra.decisionGroupId, 140),
-              family: clampText(extra.family || extra.subjectFamily, 40),
-              subjectKey: clampText(extra.subjectKey || extra.subject, 120),
-              label: clampText(extra.label, 180),
-              disposition: clampText(extra.disposition, 80),
-              priceAmount: finiteNumberOrNull(extra.priceAmount),
-              currency: clampText(extra.currency, 20)
-            })).slice(0, 40)
-          : [],
-        provenance: Array.isArray(page.transactionFacts.provenance)
-          ? page.transactionFacts.provenance.map((entry) => ({
-              source: clampText(entry.source, 80),
-              observationId: clampText(entry.observationId, 120),
-              confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0))
-            })).slice(0, 20)
-          : []
-      } : null,
+      transactionFacts: compactTransactionFacts(page.transactionFacts),
       priceText: clampText(page.priceText, 80),
       price: page.price && typeof page.price === "object" ? page.price : null,
       screenshotId: screenshot.screenshotId,

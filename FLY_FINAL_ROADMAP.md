@@ -148,7 +148,7 @@ The order below follows technical dependencies. Each item should establish a rel
 
 ### 2. Stable logical control identity
 
-- **Implementation status (2026-08-01):** Stable keys cross browser observation, backend aliases, bound actions, and post-rerender relocation. Current values and value-derived input meaning have now been removed from identity; the controlled-input replay proves a filled replacement retains the pre-action stable key. Live Kiwi phone proof remains, followed by wider rerender coverage under Components 16–17.
+- **Implementation status (2026-08-01):** Stable keys cross browser observation, backend aliases, bound actions, and post-rerender relocation. Current values and value-derived input meaning have been removed from identity; controlled-input replays and live Kiwi contact entry prove the replacement field retains its logical identity and normalized phone value. Wider rerender coverage continues under Components 16–17.
 - **What it is:** A persistent semantic identity for each field, choice, and action control, separate from its temporary DOM node.
 - **How it works:** It combines logical ID, component role, decision ownership, foreground surface, state, actuators, and rerender fingerprints, then safely rebinds to fresh physical elements.
 - **Goal:** Always act on the intended logical control, even after dynamic page changes.
@@ -182,7 +182,7 @@ The order below follows technical dependencies. Each item should establish a rel
 
 ### 6. Durable task state and reconciliation
 
-- **Implementation status (2026-08-01):** Requirement reconciliation is lifecycle- and owner-scoped and verified choices survive to final review. Terminal task state is now dominant: mutually reinforcing owned review/payment evidence freezes payment, billing, legal, and generic work before planning; only unresolved contact email/phone may finish, after which verified transaction state latches completion. Clean, dirty, modal, and contact-boundary replays pass. Live Kiwi proof remains, followed by cross-airline expansion.
+- **Implementation status (2026-08-01):** Requirement reconciliation is lifecycle- and owner-scoped and verified choices survive to final review. Terminal task state is dominant: mutually reinforcing owned review/payment evidence freezes payment, billing, legal, and generic work before planning; only unresolved contact email/phone may finish, after which verified transaction state latches completion. A derived process-awareness view exposes current semantic position, verified achievements, unresolved obligations, current objective, and final outcome without becoming a parallel action authority. Clean, dirty, modal, contact-boundary, and process-state replays pass, and the contract is live-proven on Kiwi. Cross-airline expansion follows under Components 16–17.
 - **What it is:** Fly’s authoritative memory of verified progress across the full checkout.
 - **How it works:** It stores completed requirements, decisions, approvals, extras, prices, failures, and checkpoints, then reconciles them against every fresh observation.
 - **Goal:** Preserve real progress while immediately recognizing when the page contradicts previous state.
@@ -255,7 +255,7 @@ The order below follows technical dependencies. Each item should establish a rel
 
 ### 15. Safety and transaction governor
 
-- **Implementation status (2026-08-01):** Core checkout-to-review state, durable outcome ledger, terminal dominance, and strict route certification are implemented and regression-verified. A stage label is no longer the terminal authority; verified payment-review evidence latches before ordinary planning, while incomplete review freezes safely. Generic endpoints such as `DIRECT → FLIGHT` are rejected at perception and canonical normalization. The full clean/dirty checkout replays prove no card or purchase action occurs. One live Kiwi acceptance is next, then Components 16–17 cross-airline coverage.
+- **Implementation status (2026-08-01):** Core checkout-to-review state, durable outcome ledger, terminal dominance, pre-review transaction anchoring, and authoritative fact provenance are implemented, regression-verified, and live-proven on Kiwi. Trace `chk_msap7ph8zcet8r` preserved a pre-review Antalya → Istanbul anchor through transport, matched it with Basic Saver, traveler, currency, total, and authorized outcomes at final review, emitted `payment_review_reached`, and stopped before payment/billing/legal/card/purchase work. A stage label is no longer terminal authority; verified payment-review evidence latches before ordinary planning, while incomplete review freezes safely. Whole-page route/fare guessing, token-subset fare equivalence, and final-review self-seeding remain removed. **241 unit tests**, **116 browser replays**, and repository checks pass. Components 16–17 are now next: add the observed passenger-age route-noise replay, tighten endpoint evidence/deduplication, and prove the same contract on GoToGate plus a structurally different checkout.
 - **What it is:** The final authority that enforces user permission and irreversible-action boundaries across the whole transaction.
 - **How it works:** It checks paid extras, identity integrity, itinerary, airport, currency, price, legal acceptance, payment, purchase, action history, and duplicate-attempt risk before allowing actions.
 - **Goal:** Make dangerous or unauthorized outcomes structurally impossible.
@@ -314,25 +314,25 @@ The order below follows technical dependencies. Each item should establish a rel
 
 The next work in the current repository is therefore:
 
-1. Make verified payment-review evidence latch the terminal outcome before ordinary planning, independent of a site's stage label.
-2. Suppress payment-method, billing, legal, newsletter, Edit, and generic ambiguity candidates after that terminal boundary owns the task.
-3. Make stable logical identity independent of current field values and prove phone rebinding after a controlled rerender.
-4. Require explicitly owned origin/destination endpoints and reject generic route phrases before transaction certification.
-5. Add the exact Kiwi final-page replay, then prove the same terminal contract on GoToGate and structurally different checkout sites.
+1. Turn the live passenger-age false-route evidence into a permanent Component 16 regression.
+2. Tighten the existing bounded route compiler with travel-endpoint semantics and canonical segment deduplication while preserving the live Antalya → Istanbul anchor.
+3. Run the unchanged checkout-to-review contract on GoToGate and a structurally different airline/OTA.
+4. Convert each new-site miss into a universal semantic pattern and replay; do not introduce a site-owned workflow.
+5. Keep `payment_review_reached` as the current terminal product boundary and preserve the structural prohibition on payment, billing, legal, card, and purchase mutation.
 
 ### Current execution checklist
 
-- [ ] Latch `payment_review_reached` from strong owned evidence before ordinary planning.
-- [ ] Publish no payment, billing, legal, newsletter, Edit, or generic candidate after the terminal latch.
-- [ ] Remove mutable values from stable logical identity and verify phone rerender continuity.
-- [ ] Reject generic route pairs and certify only owned itinerary endpoints.
-- [ ] Fix foreground ownership and readiness with the Kiwi seat-modal replay.
-- [ ] Complete split-field handling and honest actuator actionability.
-- [ ] Reconcile verified task state and expose the exact next unresolved requirement.
-- [ ] Apply profile policy and produce only grounded, safe candidates.
-- [ ] Execute one fresh atomic action and verify its semantic postcondition.
-- [ ] Add bounded recovery and a precise user handoff for unresolved failures.
-- [ ] Pass Kiwi checkout-to-payment-review acceptance.
+- [x] Latch `payment_review_reached` from strong owned evidence before ordinary planning.
+- [x] Publish no payment, billing, legal, newsletter, Edit, or generic candidate after the terminal latch.
+- [x] Remove mutable values from stable logical identity and verify phone rerender continuity.
+- [x] Reject unowned generic route pairs and certify the owned Kiwi itinerary.
+- [x] Fix foreground ownership and readiness with the Kiwi seat-modal replay.
+- [x] Reconcile verified task state and expose the exact next unresolved requirement.
+- [x] Apply profile policy and produce only grounded, safe candidates.
+- [x] Execute fresh atomic actions and verify their semantic postconditions.
+- [x] Pass Kiwi checkout-to-payment-review acceptance.
+- [ ] Reject route-shaped passenger/age copy without losing legitimate untagged itinerary routes.
+- [ ] Prove the same terminal contract on GoToGate and a structurally different checkout.
 - [ ] Pass clean and dirty GoToGate regressions.
 - [ ] Pass one direct airline and one structurally different OTA.
 - [ ] Convert every new failure into a replay test and rerun the full suite.

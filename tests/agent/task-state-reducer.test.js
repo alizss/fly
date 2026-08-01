@@ -1409,6 +1409,10 @@ test("a confirmation-labeled final review latches from owned payment evidence", 
   assert.equal(state.terminalGoalLatch.locked, true);
   assert.equal(state.terminalStatus, "payment_review_reached");
   assert.equal(state.currentGoal, null);
+  assert.equal(state.processAwareness.status, "goal_achieved");
+  assert.equal(state.processAwareness.currentPosition.stage, "payment_review");
+  assert.equal(state.processAwareness.finalOutcome.achieved, true);
+  assert.equal(state.processAwareness.finalOutcome.transactionVerified, true);
 });
 
 test("an unverified final review freezes payment and billing work without claiming success", () => {
@@ -1444,6 +1448,10 @@ test("an unverified final review freezes payment and billing work without claimi
   assert.equal(state.terminalStatus, "active");
   assert.equal(state.currentGoal, null);
   assert.equal(state.ambiguityReason, "transaction_review_incomplete");
+  assert.equal(state.processAwareness.status, "verifying_final_transaction");
+  assert.equal(state.processAwareness.currentObjective, "verify the final transaction");
+  assert.deepEqual(state.processAwareness.unresolved, ["transaction:itinerary_route"]);
+  assert.equal(state.processAwareness.finalOutcome.achieved, false);
 });
 
 test("a lone card field outside review does not create a terminal boundary", () => {

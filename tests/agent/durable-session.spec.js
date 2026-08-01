@@ -225,6 +225,116 @@ test("oversized observations receive a typed retryable transport error", async (
   });
 });
 
+test("transaction fact ownership evidence survives HTTP compaction into the durable baseline", async ({ request }) => {
+  const travelerId = `trav_transaction_evidence_${Date.now()}`;
+  const started = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Reach verified payment review",
+      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "No paid extras" },
+      page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
+    }
+  });
+  const session = await started.json();
+  expect(started.status(), JSON.stringify(session)).toBe(201);
+
+  const observationId = `obs_transaction_evidence_${Date.now()}`;
+  const routeEvidence = {
+    source: "bounded_checkout_route",
+    ownerKey: "route_owner_1",
+    observationId,
+    confidence: 0.88,
+    authoritative: true
+  };
+  const response = await request.post(`${API}/agent/next-action`, {
+    data: {
+      sessionId: session.id,
+      observationId,
+      observationSnapshot: { snapshotHash: `hash_${observationId}` },
+      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "No paid extras" },
+      page: {
+        site: "example.test",
+        url: "https://example.test/checkout",
+        step: "traveler_information",
+        currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+        controls: [],
+        decisionGroups: [],
+        transactionFacts: {
+          evidenceMode: "typed",
+          itinerary: {
+            completeness: "partial",
+            segments: [{
+              segmentId: "segment_1",
+              origin: "LHR",
+              destination: "LJU",
+              departureDate: "",
+              departureTime: "",
+              arrivalTime: "",
+              flightNumber: "",
+              evidence: routeEvidence
+            }]
+          },
+          travelers: [{ travelerId, name: "Ali Example" }],
+          currency: "EUR",
+          basePrice: { amount: null, currency: "EUR" },
+          totalPrice: { amount: 208, currency: "EUR" },
+          fareBrand: "Economy Light",
+          selectedExtras: [],
+          factEvidence: {
+            itinerary: [{ segmentId: "segment_1", ...routeEvidence }],
+            fareBrand: {
+              source: "owned_fare_summary_line",
+              ownerKey: "fare_owner_1",
+              observationId,
+              confidence: 0.9,
+              authoritative: true
+            },
+            totalPrice: {
+              source: "owned_price_summary",
+              ownerKey: "page_total",
+              observationId,
+              confidence: 0.9,
+              authoritative: true
+            },
+            travelers: {
+              source: "selected_traveler_profile",
+              ownerKey: travelerId,
+              observationId,
+              confidence: 1,
+              authoritative: true
+            }
+          },
+          provenance: [{ source: "order_summary", observationId, confidence: 0.88 }]
+        }
+      }
+    }
+  });
+  const body = await response.json();
+  expect(response.status(), JSON.stringify(body)).toBe(200);
+  expect(body.debug.taskState.transactionReview.baseline).toMatchObject({
+    itinerary: {
+      segments: [{
+        origin: "LHR",
+        destination: "LJU",
+        evidence: routeEvidence
+      }]
+    },
+    fareBrand: "Economy Light",
+    factEvidence: {
+      itinerary: [{
+        source: "bounded_checkout_route",
+        ownerKey: "route_owner_1",
+        authoritative: true
+      }],
+      fareBrand: {
+        source: "owned_fare_summary_line",
+        ownerKey: "fare_owner_1",
+        authoritative: true
+      }
+    }
+  });
+  expect(body.debug.taskState.transactionReview.baselineStatus).toBe("approved");
+});
+
 test("non-empty decision-group alternatives survive HTTP compaction with their control identity", async ({ request }) => {
   const started = await request.post(`${API}/agent/session`, {
     data: {

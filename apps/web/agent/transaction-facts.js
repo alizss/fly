@@ -22,6 +22,27 @@ function semanticToken(value, limit = 120) {
   return normalizedText(value, limit).replace(/\s+/g, "_");
 }
 
+function canonicalFareBrand(value = "") {
+  return text(value, 160)
+    .replace(/\b(?:continue with|ticket type|fare type|fare brand|ticket class|fare class|cabin class|travel class)\b/gi, " ")
+    .replace(/^\s*\d+\s*x\s*/i, "")
+    .replace(/\s+\b(?:edit|change|modify|details|selected)\b.*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function normalizeFactEvidence(entry = null, fallbackObservationId = "") {
+  if (!entry || typeof entry !== "object") return null;
+  return {
+    source: text(entry.source || "unknown", 80),
+    ownerKey: text(entry.ownerKey, 180),
+    observationId: text(entry.observationId || fallbackObservationId, 120),
+    confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0)),
+    authoritative: entry.authoritative === true
+  };
+}
+
 function canonicalSubjectKey(extra = {}) {
   const family = text(extra.family || extra.subjectFamily, 40).toLowerCase();
   const explicit = semanticToken(extra.subjectKey || extra.subject, 120);
@@ -68,6 +89,7 @@ function normalizedRouteEndpoint(value = "") {
 function normalizeSegment(segment = {}, index = 0) {
   const origin = normalizedRouteEndpoint(segment.origin);
   const destination = normalizedRouteEndpoint(segment.destination);
+  const evidence = normalizeFactEvidence(segment.evidence);
   return {
     segmentId: text(segment.segmentId || `segment_${index + 1}`, 120),
     origin,
@@ -75,7 +97,8 @@ function normalizeSegment(segment = {}, index = 0) {
     departureDate: text(segment.departureDate, 40),
     departureTime: text(segment.departureTime, 20),
     arrivalTime: text(segment.arrivalTime, 20),
-    flightNumber: text(segment.flightNumber, 30).toUpperCase()
+    flightNumber: text(segment.flightNumber, 30).toUpperCase(),
+    ...(evidence ? { evidence } : {})
   };
 }
 
@@ -88,7 +111,9 @@ function normalizeExtra(extra = {}, currency = "") {
     outcomeKey: text(extra.outcomeKey || `${family}:${subjectKey}`, 180),
     family,
     subjectKey,
-    label: text(extra.label || extra.selectedLabel, 180),
+    label: family === "fare"
+      ? canonicalFareBrand(extra.label || extra.selectedLabel)
+      : text(extra.label || extra.selectedLabel, 180),
     disposition: text(extra.disposition || extra.semantic, 80),
     outcome: text(extra.outcome || extra.semanticOutcome || extra.disposition || extra.semantic, 80),
     priceAmount: number(extra.priceAmount),
@@ -159,8 +184,29 @@ function travelerKey(entry = {}) {
 }
 
 function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {} } = {}) {
+  // Older persisted observations predate typed fact evidence. New producer
+  // observations always include factEvidence and must not regain authority
+  // from value-only transport if ownership proof is missing or stripped.
+  const evidenceEntries = raw.factEvidence && typeof raw.factEvidence === "object"
+    ? [
+        ...(Array.isArray(raw.factEvidence.itinerary) ? raw.factEvidence.itinerary : []),
+        raw.factEvidence.fareBrand,
+        raw.factEvidence.totalPrice,
+        raw.factEvidence.travelers
+      ].filter((entry) => entry && typeof entry === "object")
+    : [];
+  const evidenceContractPresent = raw.evidenceMode === "typed" || evidenceEntries.length > 0;
   const rawSegments = Array.isArray(raw.itinerary?.segments) ? raw.itinerary.segments : [];
-  const segments = rawSegments.map(normalizeSegment);
+  const itineraryEvidence = Array.isArray(raw.factEvidence?.itinerary) ? raw.factEvidence.itinerary : [];
+  const segments = rawSegments
+    .map((segment, index) => normalizeSegment({
+      ...segment,
+      evidence: segment.evidence || itineraryEvidence.find((entry) => entry?.segmentId === segment.segmentId) || null
+    }, index))
+    .filter((segment) => segment.origin && segment.destination)
+    .filter((segment) => evidenceContractPresent
+      ? segment.evidence?.authoritative === true
+      : segment.evidence == null || segment.evidence.authoritative === true);
   const stateTravelers = Array.isArray(state.travelerIds) ? state.travelerIds.filter(Boolean) : [];
   const observedTravelers = Array.isArray(raw.travelers) ? raw.travelers.map(normalizeTraveler).filter(travelerKey) : [];
   const authoritativeTravelers = observedTravelers.length
@@ -176,8 +222,24 @@ function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {
     observationId: text(entry.observationId || observationId, 120),
     confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0))
   })).slice(0, 20);
+  const fareEvidence = normalizeFactEvidence(raw.factEvidence?.fareBrand, observationId);
+  const fareBrand = evidenceContractPresent
+    ? fareEvidence?.authoritative === true ? canonicalFareBrand(raw.fareBrand || "") : ""
+    : fareEvidence && fareEvidence.authoritative !== true
+      ? ""
+      : canonicalFareBrand(raw.fareBrand || "");
+  const factEvidence = {
+    itinerary: segments.map((segment) => {
+      const evidence = normalizeFactEvidence(segment.evidence, observationId);
+      return evidence ? { segmentId: segment.segmentId, ...evidence } : null;
+    }).filter(Boolean),
+    fareBrand: fareEvidence,
+    totalPrice: normalizeFactEvidence(raw.factEvidence?.totalPrice, observationId),
+    travelers: normalizeFactEvidence(raw.factEvidence?.travelers, observationId)
+  };
   return {
     contractVersion: TRANSACTION_CONTRACT_VERSION,
+    evidenceMode: evidenceContractPresent ? "typed" : "legacy",
     itinerary: {
       completeness: normalizeCompleteness(raw.itinerary?.completeness, segments),
       segments
@@ -186,11 +248,15 @@ function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {
     currency,
     basePrice: { amount: number(basePrice.amount ?? raw.basePrice), currency: text(basePrice.currency || currency, 20).toUpperCase() },
     totalPrice: { amount: number(pagePrice.amount ?? raw.totalPrice), currency: text(pagePrice.currency || currency, 20).toUpperCase() },
-    fareBrand: text(raw.fareBrand, 120),
+    fareBrand,
     selectedExtras: mergeCommerceSelections((Array.isArray(raw.selectedExtras) ? raw.selectedExtras : []).map((extra) => ({
       ...extra,
+      label: fareBrand && String(extra?.family || "").toLowerCase() === "fare"
+        ? fareBrand
+        : extra.label,
       currency: extra.currency || currency
     }))),
+    factEvidence,
     provenance: provenance.length ? provenance : [{ source: "unknown", observationId: text(observationId, 120), confidence: 0 }]
   };
 }
@@ -219,6 +285,7 @@ function factsFromObservation(state = {}, observation = {}, traveler = {}) {
 module.exports = {
   COMMERCE_FAMILIES,
   TRANSACTION_CONTRACT_VERSION,
+  canonicalFareBrand,
   canonicalOutcomeKey,
   canonicalSubjectKey,
   commerceSelectionsFromPage,

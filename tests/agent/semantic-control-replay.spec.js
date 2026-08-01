@@ -3364,6 +3364,36 @@ test("P0.5 browser observation publishes structured transaction facts instead of
   expect(observed).not.toHaveProperty("offerFingerprint");
 });
 
+test("a persistent untagged checkout route anchors transaction identity before final review", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <div class="generated-title"><span>Antalya → Istanbul</span></div>
+      <nav>Passengers, baggage, insurance · Ticket fare · Seating</nav>
+      <section>
+        <h2>Passenger information</h2>
+        <label>First name <input name="passengers.0.firstName"></label>
+      </section>
+      <aside><span>1x Basic Saver fare</span><strong>Total (TRY)</strong><span>1,637.80 TL</span></aside>
+      <button type="button">Continue</button>
+    </main>
+  `);
+
+  const observed = await page.evaluate(() => window.__ATW_TEST__.compactPageMap(window.__ATW_TEST__.buildPageMap()));
+
+  expect(observed.step).not.toBe("payment");
+  expect(observed.transactionFacts.itinerary.segments).toEqual([
+    expect.objectContaining({ origin: "ANTALYA", destination: "ISTANBUL" })
+  ]);
+  expect(observed.transactionFacts.itinerary.segments[0].evidence).toMatchObject({
+    source: "bounded_checkout_route",
+    authoritative: true
+  });
+  expect(observed.transactionFacts.factEvidence.itinerary[0]).toMatchObject({
+    source: "bounded_checkout_route",
+    authoritative: true
+  });
+});
+
 test("payment review compiles a tightly owned city route and canonical booking outcomes", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
@@ -3438,6 +3468,63 @@ test("owned itinerary context accepts city endpoints but rejects a generic Direc
   expect(observed.transactionFacts.itinerary.segments).not.toEqual(expect.arrayContaining([
     expect.objectContaining({ origin: "DIRECT", destination: "FLIGHT" })
   ]));
+});
+
+test("real review-card structure compiles owned route and fare without marketing contamination", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Overview &amp; payment</h1>
+      <div class="review-card">
+        <div>Antalya → Istanbul</div>
+        <div>Tue 9 Feb</div>
+        <button type="button">View full itinerary</button>
+      </div>
+      <section>
+        <p>Get the option to change or cancel your trip. Upgrade your ticket when plans change.</p>
+        <h3>Ticket type</h3>
+        <div>1x Basic Saver</div>
+        <button type="button">Edit</button>
+      </section>
+      <aside><strong>Total (TRY)</strong><span>1,637.80 TL</span></aside>
+      <fieldset><legend>Payment method</legend><label><input type="radio" name="payment-method"> New card</label></fieldset>
+      <button type="button">Pay 1,637.80 TL</button>
+    </main>
+  `);
+
+  const observed = await page.evaluate(() => window.__ATW_TEST__.compactPageMap(window.__ATW_TEST__.buildPageMap()));
+
+  expect(observed.transactionFacts.itinerary.segments).toEqual([
+    expect.objectContaining({ origin: "ANTALYA", destination: "ISTANBUL", departureDate: "Tue 9 Feb" })
+  ]);
+  expect(observed.transactionFacts.itinerary.segments[0].evidence).toMatchObject({
+    source: "itinerary_control_owner",
+    authoritative: true
+  });
+  expect(observed.transactionFacts.fareBrand).toBe("Basic Saver");
+  expect(observed.transactionFacts.factEvidence.fareBrand).toMatchObject({
+    source: "review_summary_row",
+    authoritative: true
+  });
+  expect(observed.transactionFacts.fareBrand).not.toMatch(/cancel|upgrade/i);
+});
+
+test("owned compact fare summary establishes fare identity without borrowing selected button copy", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Customize your trip</h1>
+      <button type="button">Continue with Saver</button>
+      <aside><p class="fare-summary">1x Basic Saver fare</p></aside>
+      <button type="button">Continue</button>
+    </main>
+  `);
+
+  const observed = await page.evaluate(() => window.__ATW_TEST__.compactPageMap(window.__ATW_TEST__.buildPageMap()));
+
+  expect(observed.transactionFacts.fareBrand).toBe("Basic Saver");
+  expect(observed.transactionFacts.factEvidence.fareBrand).toMatchObject({
+    source: "owned_fare_summary_line",
+    authoritative: true
+  });
 });
 
 test("payment boundary finishes contact prerequisites then publishes no payment or billing action", async ({ page }) => {

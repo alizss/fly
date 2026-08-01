@@ -96,6 +96,7 @@ test("transaction facts retain only explicitly typed commerce selections", () =>
 
 test("generic checkout prose cannot become canonical route endpoints", () => {
   const normalized = normalizeFacts({
+    evidenceMode: "typed",
     itinerary: {
       completeness: "partial",
       segments: [
@@ -106,10 +107,56 @@ test("generic checkout prose cannot become canonical route endpoints", () => {
   });
 
   assert.equal(normalized.itinerary.completeness, "partial");
-  assert.deepEqual(normalized.itinerary.segments.map(({ origin, destination }) => ({ origin, destination })), [
-    { origin: "", destination: "" },
-    { origin: "", destination: "" }
-  ]);
+  assert.deepEqual(normalized.itinerary.segments, []);
+});
+
+test("transaction facts reject unowned fare prose and canonicalize authoritative fare evidence", () => {
+  const rejected = normalizeFacts({
+    fareBrand: "cancel your trip Upgrade your",
+    factEvidence: {
+      fareBrand: {
+        source: "whole_page_text",
+        ownerKey: "page",
+        confidence: 0.4,
+        authoritative: false
+      }
+    }
+  });
+  assert.equal(rejected.fareBrand, "");
+
+  const accepted = normalizeFacts({
+    fareBrand: "Ticket type 1x Basic Saver Edit",
+    factEvidence: {
+      fareBrand: {
+        source: "review_summary_row",
+        ownerKey: "ticket_row",
+        confidence: 0.95,
+        authoritative: true
+      }
+    }
+  });
+  assert.equal(accepted.fareBrand, "Basic Saver");
+  assert.equal(accepted.factEvidence.fareBrand.ownerKey, "ticket_row");
+});
+
+test("typed transaction evidence cannot silently fall back to value-only route or fare authority", () => {
+  const normalized = normalizeFacts({
+    evidenceMode: "typed",
+    itinerary: {
+      completeness: "complete",
+      segments: [{ segmentId: "seg_1", origin: "LHR", destination: "LJU" }]
+    },
+    fareBrand: "Economy Light",
+    factEvidence: {
+      itinerary: [],
+      fareBrand: null,
+      totalPrice: null,
+      travelers: null
+    }
+  });
+
+  assert.deepEqual(normalized.itinerary.segments, []);
+  assert.equal(normalized.fareBrand, "");
 });
 
 test("current canonical decisions enrich transaction outcomes without erasing review rows", () => {
@@ -160,7 +207,7 @@ test("durable commerce outcomes use semantic identity across rerendered decision
   assert.equal(merged[0].priceAmount, 0);
 });
 
-test("P0.5 immutable baseline treats absence and matching partial itinerary evidence as stable", () => {
+test("P0.5 approved baseline preserves identity while enriching previously missing components", () => {
   let state = createCheckoutSessionState({ travelerId: "trav_1" });
   state.id = "txn_partial_stable";
   const partial = facts({ completeness: "partial", departureDate: "", departureTime: "", arrivalTime: "", flightNumber: "" });
@@ -176,7 +223,10 @@ test("P0.5 immutable baseline treats absence and matching partial itinerary evid
   const complete = prepareTransactionInvariants(absent.state, observation("obs_complete", facts()), { id: "trav_1" });
   const completeDecision = invariantDecision(complete, { type: "wait", risk: "safe" }, complete.state);
   assert.equal(completeDecision.allow, true);
-  assert.deepEqual(complete.envelope.baseline, immutableBaseline);
+  assert.equal(complete.envelope.baseline.itinerary.segments[0].origin, immutableBaseline.itinerary.segments[0].origin);
+  assert.equal(complete.envelope.baseline.itinerary.segments[0].destination, immutableBaseline.itinerary.segments[0].destination);
+  assert.equal(complete.envelope.baseline.itinerary.completeness, "complete");
+  assert.equal(complete.envelope.baseline.itinerary.segments[0].departureDate, "2026-08-10");
   assert.equal(complete.envelope.evidence.length, 3);
   assert.equal(complete.envelope.evidence.at(-1).facts.itinerary.completeness, "complete");
 });
@@ -251,6 +301,109 @@ test("a final payment review cannot establish its own missing itinerary baseline
   assert.equal(reviewed.envelope.reviewFacts.itinerary.segments[0].origin, "LHR");
   assert.equal(reviewed.review.ready, false);
   assert.ok(reviewed.review.missingFacts.includes("itinerary_route"));
+});
+
+test("approved identity accepts later owned fare evidence while final review cannot rewrite the outcome ledger", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_late_fare_provenance";
+  const initial = facts();
+  initial.fareBrand = "";
+  initial.selectedExtras = [];
+  state = prepareTransactionInvariants(state, observation("obs_identity_approved", initial), { id: "trav_1" }).state;
+  assert.equal(state.transactionInvariants.baselineStatus, "approved");
+  assert.equal(state.transactionInvariants.baseline.fareBrand, "");
+
+  const selectedFare = facts();
+  selectedFare.evidenceMode = "typed";
+  selectedFare.fareBrand = "Basic Saver";
+  selectedFare.itinerary.segments[0].evidence = {
+    source: "structured_itinerary_attributes",
+    ownerKey: "segment_1",
+    confidence: 0.95,
+    authoritative: true
+  };
+  selectedFare.factEvidence = {
+    itinerary: [{
+      segmentId: "segment_1",
+      source: "structured_itinerary_attributes",
+      ownerKey: "segment_1",
+      confidence: 0.95,
+      authoritative: true
+    }],
+    fareBrand: {
+      source: "owned_fare_summary_line",
+      ownerKey: "fare_summary",
+      confidence: 0.95,
+      authoritative: true
+    }
+  };
+  selectedFare.selectedExtras = [{
+    family: "fare",
+    subjectKey: "ticket",
+    decisionGroupId: "dg_saver",
+    label: "Continue with Saver",
+    outcome: "selected",
+    priceAmount: 0,
+    currency: "EUR"
+  }];
+  state = prepareTransactionInvariants(state, observation("obs_fare_selected", selectedFare), { id: "trav_1" }).state;
+  assert.equal(state.transactionInvariants.baseline.fareBrand, "Basic Saver");
+  assert.equal(state.transactionInvariants.outcomeLedger.find((item) => item.family === "fare").label, "Basic Saver");
+
+  const review = facts();
+  review.evidenceMode = "typed";
+  review.fareBrand = "Basic Saver Edit";
+  review.itinerary.segments[0].evidence = {
+    source: "owned_route_structure",
+    ownerKey: "review_route",
+    confidence: 0.95,
+    authoritative: true
+  };
+  review.factEvidence = {
+    itinerary: [{
+      segmentId: "segment_1",
+      source: "owned_route_structure",
+      ownerKey: "review_route",
+      confidence: 0.95,
+      authoritative: true
+    }],
+    fareBrand: {
+      source: "review_summary_row",
+      ownerKey: "review_ticket_row",
+      confidence: 0.95,
+      authoritative: true
+    }
+  };
+  review.selectedExtras = [{
+    family: "fare",
+    subjectKey: "ticket",
+    decisionGroupId: "review_fare",
+    label: "Basic Saver Edit",
+    outcome: "selected",
+    currency: "EUR"
+  }];
+  review.provenance = [{ source: "payment_summary", observationId: "obs_review", confidence: 0.95 }];
+  const reviewed = prepareTransactionInvariants(state, observation("obs_review", review), { id: "trav_1" });
+
+  assert.equal(reviewed.review.ready, true, JSON.stringify(reviewed.review));
+  assert.deepEqual(reviewed.review.contradictions, []);
+  assert.equal(reviewed.envelope.outcomeLedger.find((item) => item.family === "fare").label, "Basic Saver");
+});
+
+test("fare reconciliation does not collapse materially different branded fares", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_distinct_fare_brands";
+  const baseline = facts();
+  baseline.fareBrand = "Economy";
+  state = prepareTransactionInvariants(state, observation("obs_economy", baseline), { id: "trav_1" }).state;
+
+  const review = facts();
+  review.fareBrand = "Basic Economy";
+  review.provenance = [{ source: "payment_summary", observationId: "obs_basic_economy", confidence: 0.95 }];
+  const reviewed = prepareTransactionInvariants(state, observation("obs_basic_economy", review), { id: "trav_1" });
+
+  assert.equal(reviewed.review.ready, false);
+  assert.ok(reviewed.review.contradictions.includes("FARE_BRAND_CHANGED"));
 });
 
 test("final review reconciles the immutable trip and durable semantic outcomes", () => {

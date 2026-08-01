@@ -2899,29 +2899,88 @@
       return !tokens.length || tokens.every((token) => reserved.has(token));
     };
     const routeUtilityText = (value = "") => /\b(?:phone|mobile|telephone|sms|text message|email|e-mail|wifi|wi-fi|data plan|valid number|enter a number|country code)\b/i.test(String(value || ""));
-    const headingSegments = queryAllDeep("h1, h2, h3, [aria-label*='route' i], [data-testid*='route' i]")
+    const directElementText = (element) => Array.from(element?.childNodes || [])
+      .filter((node) => node.nodeType === Node.TEXT_NODE)
+      .map((node) => node.textContent || "")
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const visibleElementText = (element, limit = 720) => String(
+      element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || ""
+    ).replace(/\s+/g, " ").trim().slice(0, limit);
+    const itineraryCommand = (element) => /\b(?:view|show|open)\s+(?:full\s+)?(?:flight\s+)?(?:itinerary|trip details|flight details)\b/i.test(
+      String(element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || "")
+    );
+    const routeSeparator = /(?:→|–|—|\bto\b)/i;
+    const routeDateCue = /\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\s+\d{1,2}(?:\s+[\p{L}]+)?(?:\s+20\d{2})?\b|\b20\d{2}-\d{2}-\d{2}\b/iu;
+    const itineraryControlOwners = queryAllDeep("button, a, [role='button'], [role='link']")
+      .filter((element) => isVisible(element) && itineraryCommand(element))
+      .map((control) => {
+        let owner = control.parentElement;
+        for (let depth = 0; owner && depth < 7; depth += 1, owner = owner.parentElement) {
+          if (!isVisible(owner)) continue;
+          const ownerText = visibleElementText(owner);
+          if (!ownerText || ownerText.length > 720 || routeUtilityText(ownerText)) continue;
+          const prefix = ownerText.split(routeDateCue)[0].replace(/\b(?:view|show|open)\s+(?:full\s+)?(?:flight\s+)?(?:itinerary|trip details|flight details)\b.*$/i, "").trim();
+          const unseparatedPair = /^\p{L}[\p{L}.'’-]*(?:\s+\p{L}[\p{L}.'’-]*)?\s+\p{L}[\p{L}.'’-]*(?:\s+\p{L}[\p{L}.'’-]*)?$/u.test(prefix);
+          if ((routeSeparator.test(ownerText) || unseparatedPair) && routeDateCue.test(ownerText)) return owner;
+        }
+        return null;
+      })
+      .filter(Boolean);
+    // Checkout sites frequently render the persistent selected route as an
+    // ordinary styled div/span rather than a semantic heading. Read only a
+    // small, exact route-shaped owner; never infer a route from page-wide text.
+    const checkoutRouteContext = Boolean(
+      price
+      || decisionGroups.length
+      || /\b(?:booking|checkout|passengers?|ticket fare|seating|overview\s*(?:&|and)\s*payment)\b/i.test(text)
+    );
+    const boundedRouteSegments = queryAllDeep("h1, h2, h3, h4, h5, h6, [role='heading'], [aria-label*='route' i], [data-testid*='route' i], main div, main span, [role='main'] div, [role='main'] span, form div, form span")
       .filter((element) => isVisible(element))
-      .map((element) => String(element.innerText || element.textContent || element.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim())
-      .map((label, index) => {
-        if (routeUtilityText(label)) return null;
+      .map((element) => {
+        const directText = directElementText(element);
+        const label = directText || ((element.children?.length || 0) <= 6 ? visibleElementText(element, 180) : "");
+        return { element, label };
+      })
+      .filter(({ label }) => label.length >= 5 && label.length <= 180 && !routeUtilityText(label))
+      .map(({ element, label }, index) => {
+        const semanticOwner = /^h[1-6]$/i.test(element.tagName || "")
+          || implicitRole(element) === "heading"
+          || /route|itinerary/i.test(`${element.getAttribute?.("aria-label") || ""} ${element.getAttribute?.("data-testid") || ""}`);
+        const explicitVisualSeparator = /[→–—]/.test(label);
+        if (!semanticOwner && (!checkoutRouteContext || !explicitVisualSeparator)) return null;
         const match = label.match(/^(.{2,80}?)\s*(?:→|–|—|\bto\b)\s*(.{2,80}?)$/i);
         if (!match) return null;
         const origin = normalizeRouteEndpoint(match[1]);
         const destination = normalizeRouteEndpoint(match[2]);
-        if (!origin || !destination || origin === destination) return null;
+        if (!origin || !destination || origin === destination || reservedRouteEndpoint(origin) || reservedRouteEndpoint(destination)) return null;
+        const localText = visibleElementText(element.parentElement, 320);
+        const ownedDate = localText.match(routeDateCue)?.[0] || "";
         return {
-          segmentId: `heading_${index + 1}_${stableHash(`${origin}:${destination}`)}`,
+          segmentId: `bounded_route_${index + 1}_${stableHash(`${origin}:${destination}:${ownedDate}`)}`,
           origin,
           destination,
-          departureDate: "",
+          departureDate: ownedDate,
           departureTime: "",
           arrivalTime: "",
           flightNumber: "",
-          confidence: 0.78
+          confidence: semanticOwner ? 0.88 : 0.84,
+          evidence: {
+            source: semanticOwner ? "owned_route_heading" : "bounded_checkout_route",
+            ownerKey: stableHash(`${element.tagName || "element"}:${label}`),
+            authoritative: true
+          }
         };
       })
-      .filter(Boolean);
-    const ownedRouteSegments = queryAllDeep("[data-testid*='itinerary' i], [data-testid*='route' i], [aria-label*='itinerary' i], [aria-label*='route' i], h1, h2, h3")
+      .filter(Boolean)
+      .filter((segment, index, segments) => segments.findIndex((candidate) => (
+        candidate.origin === segment.origin
+        && candidate.destination === segment.destination
+        && candidate.departureDate === segment.departureDate
+      )) === index);
+    const explicitRouteOwners = queryAllDeep("[data-testid*='itinerary' i], [data-testid*='route' i], [aria-label*='itinerary' i], [aria-label*='route' i], h1, h2, h3");
+    const ownedRouteSegments = [...new Set([...explicitRouteOwners, ...itineraryControlOwners])]
       .filter((element) => isVisible(element))
       .map((element) => ({
         element,
@@ -2935,8 +2994,10 @@
         const prefix = label
           .split(/\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b|\bview\s+(?:full\s+)?itinerary\b/i)[0]
           .trim();
-        const ownedItineraryCue = /itinerary|route/i.test(`${element.getAttribute?.("aria-label") || ""} ${element.getAttribute?.("data-testid") || ""}`)
-          || (/\bview\s+(?:full\s+)?itinerary\b/i.test(label) && /\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b/i.test(label));
+        const ownedItineraryCue = itineraryControlOwners.includes(element)
+          || /itinerary|route/i.test(`${element.getAttribute?.("aria-label") || ""} ${element.getAttribute?.("data-testid") || ""}`)
+          || (/\b(?:view|show|open)\s+(?:full\s+)?(?:flight\s+)?(?:itinerary|trip details|flight details)\b/i.test(label)
+            && /\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b/i.test(label));
         const unseparated = !separated
           && ownedItineraryCue
           && /^\p{L}[\p{L}.'’-]*\s+\p{L}[\p{L}.'’-]*$/u.test(prefix)
@@ -2955,7 +3016,12 @@
           departureTime: "",
           arrivalTime: "",
           flightNumber: flight ? `${flight[1]}${flight[2]}` : "",
-          confidence: /itinerary|flight|booking|view full/i.test(label) ? 0.88 : 0.8
+          confidence: /itinerary|flight|booking|view full/i.test(label) ? 0.88 : 0.8,
+          evidence: {
+            source: itineraryControlOwners.includes(element) ? "itinerary_control_owner" : "owned_route_structure",
+            ownerKey: stableHash(`${element.tagName || "element"}:${label.slice(0, 240)}`),
+            authoritative: true
+          }
         };
       })
       .filter(Boolean)
@@ -2964,7 +3030,6 @@
         && candidate.destination === segment.destination
         && candidate.departureDate === segment.departureDate
       )) === index);
-    const routeMatches = [...text.matchAll(/\b([A-Z]{3})\b(?:\s+[\p{L}.'-]+){0,3}\s*(?:-|–|—|→|\bto\b)\s*\b([A-Z]{3})\b/gu)];
     const dates = [
       ...[...text.matchAll(/\b20\d{2}-\d{2}-\d{2}\b/g)].map((match) => match[0]),
       ...[...text.matchAll(/\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\s+\d{1,2}\s+[\p{L}]+\s+20\d{2}\b/giu)].map((match) => match[0])
@@ -2973,23 +3038,16 @@
     const flights = [...text.matchAll(/\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\s*([0-9]{2,4})\b/g)]
       .map((match) => `${match[1]}${match[2]}`)
       .filter((value) => !/^20\d{2}$/.test(value));
-    const textSegments = routeMatches.map((match, index) => ({
-      segmentId: `observed_${index + 1}_${stableHash(`${match[1]}:${match[2]}:${dates[index] || ""}:${flights[index] || ""}`)}`,
-      origin: match[1].toUpperCase(),
-      destination: match[2].toUpperCase(),
-      departureDate: dates[index] || (dates.length === 1 ? dates[0] : ""),
-      departureTime: timePairs[index]?.[1] || (timePairs.length === 1 ? timePairs[0][1] : ""),
-      arrivalTime: timePairs[index]?.[2] || (timePairs.length === 1 ? timePairs[0][2] : ""),
-      flightNumber: flights[index] || (flights.length === 1 ? flights[0] : ""),
-      confidence: 0.68
-    }));
     const segments = (attributeSegments.length
-      ? attributeSegments
+      ? attributeSegments.map((segment) => ({
+          ...segment,
+          evidence: { source: "structured_itinerary_attributes", ownerKey: segment.segmentId, authoritative: true }
+        }))
       : ownedRouteSegments.length
         ? ownedRouteSegments
-        : headingSegments.length
-          ? headingSegments
-          : textSegments)
+        : boundedRouteSegments.length
+          ? boundedRouteSegments
+          : [])
       .map(({ confidence, ...segment }) => segment)
       .slice(0, 12);
     const completeness = !segments.length
@@ -2998,8 +3056,63 @@
         ? "complete"
         : "partial";
     const baseFareMatch = text.match(/\b(?:price per (?:adult|passenger)|flight ticket|base fare)\s*[:\-]?\s*(\d+(?:[.,]\d{1,2})?)\s*(EUR|USD|GBP|CHF|CAD|AUD|€|\$|£)\b/i);
-    const fareBrandMatch = text.match(/\b(?:fare|ticket)\s*(?:brand|type|class)\s*[:\-]?\s*(?:\d+\s*x\s*)?([\p{L}][\p{L}0-9 +_-]{1,40}?)(?=\s{2,}|\s+(?:seating|baggage|insurance|contact|payment|passenger)\b|$)/iu)
-      || text.match(/\b(?:\d+\s*x\s*)?([\p{L}][\p{L}0-9 +_-]{1,30}?)\s+(?:fare|ticket)\b/iu);
+    const canonicalFareLabel = (value = "") => String(value || "")
+      .replace(/\b(?:continue with|ticket type|fare type|fare brand|ticket class|fare class|cabin class|travel class)\b/gi, " ")
+      .replace(/^\s*\d+\s*x\s*/i, "")
+      .replace(/\s+\b(?:edit|change|modify|details|selected)\b.*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80);
+    const ownedFareRows = queryAllDeep("h1, h2, h3, h4, h5, h6, [role='heading'], dt, th, [data-testid*='fare' i], [data-testid*='ticket' i], [aria-label*='fare' i], [aria-label*='ticket' i]")
+      .filter((element) => isVisible(element))
+      .filter((element) => /^(?:ticket type|fare type|fare brand|ticket class|fare class|cabin class|travel class)$/i.test(
+        directElementText(element) || visibleElementText(element, 120)
+      ))
+      .map((heading) => {
+        let sibling = heading.nextElementSibling;
+        for (let offset = 0; sibling && offset < 4; offset += 1, sibling = sibling.nextElementSibling) {
+          if (!isVisible(sibling)) continue;
+          const siblingText = visibleElementText(sibling, 180);
+          if (!siblingText) continue;
+          if (/^h[1-6]$/i.test(sibling.tagName || "") || implicitRole(sibling) === "heading") break;
+          if (/^(?:edit|change|modify|details)$/i.test(siblingText)) continue;
+          const candidate = canonicalFareLabel(siblingText);
+          if (candidate && candidate.length <= 120) {
+            return { label: candidate, ownerKey: stableHash(`${heading.tagName || "heading"}:${siblingText}`) };
+          }
+        }
+        let owner = heading.parentElement;
+        for (let depth = 0; owner && depth < 5; depth += 1, owner = owner.parentElement) {
+          if (!isVisible(owner)) continue;
+          const ownerText = visibleElementText(owner, 420);
+          if (ownerText.length <= 420 && /\b(?:ticket|fare|cabin|travel)\s+(?:type|brand|class)\b/i.test(ownerText)) {
+            const candidate = canonicalFareLabel(ownerText);
+            if (candidate && !/^(?:type|brand|class)$/i.test(candidate)) {
+              return { label: candidate, ownerKey: stableHash(`${heading.tagName || "heading"}:${ownerText}`) };
+            }
+          }
+        }
+        return null;
+      })
+      .filter(Boolean);
+    const ownedFareSummaryLines = queryAllDeep("p, li, dd, td, th, [class*='fare' i], [data-testid*='fare' i], [data-testid*='ticket' i], [aria-label*='fare' i], [aria-label*='ticket' i]")
+      .filter((element) => isVisible(element))
+      .map((element) => {
+        const semanticOwner = /fare|ticket/i.test(`${element.getAttribute?.("class") || ""} ${element.getAttribute?.("data-testid") || ""} ${element.getAttribute?.("aria-label") || ""}`);
+        const label = directElementText(element)
+          || (semanticOwner ? visibleElementText(element, 140) : "");
+        if (!label || label.length > 140) return null;
+        const match = label.match(/^(?:\d+\s*x\s*)?([\p{L}][\p{L}0-9 +_'-]{1,80}?)\s+(?:fare|ticket)$/iu);
+        const candidate = canonicalFareLabel(match?.[1] || "");
+        if (!candidate || /^(?:base|flight|ticket|fare|total|price)$/i.test(candidate)) return null;
+        return {
+          label: candidate,
+          ownerKey: stableHash(`${element.tagName || "element"}:${label}`)
+        };
+      })
+      .filter(Boolean);
+    const ownedFare = ownedFareRows[0] || ownedFareSummaryLines[0] || null;
+    const fareBrand = canonicalFareLabel(ownedFare?.label || "");
     const currentTraveler = traveler() || {};
     const finalReviewSurface = ["payment", "confirmation"].includes(step)
       && /\b(?:overview\s*(?:&|and)\s*payment|payment review|review your booking|order summary|contact details|pay securely|pay\s+[\d.,]+\s*(?:eur|usd|gbp|try|tl|€|\$|£))\b/i.test(text);
@@ -3062,7 +3175,7 @@
           currency: price?.currency || ""
         });
       };
-      const reviewFare = fareBrandMatch?.[1]?.trim() || "";
+      const reviewFare = fareBrand;
       if (reviewFare) addReviewOutcome({ family: "fare", subjectKey: "ticket", label: reviewFare, outcome: "selected" });
       if (/\bno travel insurance\b|\bwithout (?:travel )?insurance\b/i.test(text)) {
         addReviewOutcome({ family: "insurance", subjectKey: "trip_insurance", label: "No travel insurance", outcome: "not_included", disposition: "declined" });
@@ -3079,6 +3192,7 @@
       .map((extra) => [extra.outcomeKey || `${extra.family}:${extra.subjectKey}`, extra])).values()]
       .slice(0, 40);
     return {
+      evidenceMode: "typed",
       itinerary: { completeness, segments },
       travelers: currentTraveler.id ? [{
         travelerId: currentTraveler.id,
@@ -3090,12 +3204,43 @@
         currency: normalizeCurrency(baseFareMatch[2])
       } : { amount: null, currency: normalizeCurrency(price?.currency || "") },
       totalPrice: price ? { amount: Number(price.amount), currency: normalizeCurrency(price.currency) } : { amount: null, currency: "" },
-      fareBrand: fareBrandMatch?.[1]?.trim() || "",
+      fareBrand,
       selectedExtras: selectedOutcomes,
+      factEvidence: {
+        itinerary: segments.map((segment) => ({
+          segmentId: segment.segmentId,
+          source: segment.evidence?.source || "owned_route_structure",
+          ownerKey: segment.evidence?.ownerKey || segment.segmentId,
+          observationId: agent.activeObservationId || "",
+          confidence: segment.evidence?.source === "structured_itinerary_attributes" ? 0.95 : 0.88,
+          authoritative: segment.evidence?.authoritative === true
+        })),
+        fareBrand: fareBrand ? {
+          source: ownedFareRows[0] ? "review_summary_row" : "owned_fare_summary_line",
+          ownerKey: ownedFare?.ownerKey || "",
+          observationId: agent.activeObservationId || "",
+          confidence: ownedFareRows[0] ? 0.92 : 0.88,
+          authoritative: true
+        } : null,
+        totalPrice: price ? {
+          source: finalReviewSurface ? "payment_summary_total" : "owned_price_summary",
+          ownerKey: "page_total",
+          observationId: agent.activeObservationId || "",
+          confidence: 0.9,
+          authoritative: true
+        } : null,
+        travelers: currentTraveler.id ? {
+          source: "selected_traveler_profile",
+          ownerKey: currentTraveler.id,
+          observationId: agent.activeObservationId || "",
+          confidence: 1,
+          authoritative: true
+        } : null
+      },
       provenance: [{
         source,
         observationId: agent.activeObservationId || "",
-        confidence: attributeSegments.length ? 0.95 : segments.length ? 0.68 : price ? 0.75 : 0.35
+        confidence: attributeSegments.length ? 0.95 : segments.length ? 0.88 : price ? 0.75 : 0.35
       }]
     };
   }
@@ -3209,13 +3354,15 @@
         decisionGroupId: foreground.decisionGroupId || ""
       },
       transactionFacts: map.transactionFacts ? {
+        evidenceMode: map.transactionFacts.evidenceMode,
         itinerary: map.transactionFacts.itinerary,
         travelers: map.transactionFacts.travelers,
         currency: map.transactionFacts.currency,
         basePrice: map.transactionFacts.basePrice,
         totalPrice: map.transactionFacts.totalPrice,
         fareBrand: map.transactionFacts.fareBrand,
-        selectedExtras: map.transactionFacts.selectedExtras
+        selectedExtras: map.transactionFacts.selectedExtras,
+        factEvidence: map.transactionFacts.factEvidence
       } : null,
       price: map.price || null,
       controls,

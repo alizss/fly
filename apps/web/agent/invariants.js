@@ -1,5 +1,5 @@
 const { withUpdate } = require("../../../packages/shared/agent-state");
-const { factsFromObservation, mergeCommerceSelections, normalizeFacts } = require("./transaction-facts");
+const { canonicalFareBrand, factsFromObservation, mergeCommerceSelections, normalizeFacts } = require("./transaction-facts");
 const { controlBelongsToCurrentSurface } = require("./surface-contract");
 
 function text(value, limit = 180) {
@@ -23,10 +23,7 @@ function isFinalReviewFacts(facts = {}) {
 function outcomeClass(extra = {}) {
   const meaning = normalizedText(`${extra.outcome || ""} ${extra.disposition || ""} ${extra.label || ""}`, 280);
   if (extra.family === "fare") {
-    return normalizedText(extra.label, 120)
-      .replace(/\b(?:continue with|selected|ticket type|fare|ticket|\d+\s*x)\b/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    return normalizedText(canonicalFareBrand(extra.label), 120);
   }
   if (extra.family === "seat") {
     if (/random|automatic|assigned by|without seat selection|skip seat/.test(meaning)) return "random_assignment";
@@ -41,6 +38,13 @@ function outcomeClass(extra = {}) {
     if (/included|selected|present|\b\d+\s*x/.test(meaning)) return "included";
   }
   return meaning;
+}
+
+function compatibleFareBrands(left = "", right = "") {
+  const before = normalizedText(canonicalFareBrand(left), 120);
+  const after = normalizedText(canonicalFareBrand(right), 120);
+  if (!before || !after) return true;
+  return before === after;
 }
 
 function materialReviewOutcomes(selections = []) {
@@ -60,6 +64,7 @@ function outcomeReviewContradictions(expectedSelections = [], reviewSelections =
     // verified ledger remains authoritative for absence; review rows can
     // contradict an outcome, but their omission cannot erase it.
     if (!actual) continue;
+    if (wanted.family === "fare" && compatibleFareBrands(wanted.label, actual.label)) continue;
     const wantedClass = outcomeClass(wanted);
     const actualClass = outcomeClass(actual);
     if (wantedClass && actualClass && wantedClass !== actualClass) {
@@ -84,6 +89,7 @@ function legacyBaseline(invariants = {}, state = {}) {
 }
 
 function mergeSegmentIdentity(existing = {}, observed = {}, index = 0) {
+  const evidence = existing.evidence || observed.evidence || null;
   return {
     segmentId: text(existing.segmentId || observed.segmentId || `segment_${index + 1}`, 120),
     origin: text(existing.origin || observed.origin, 80).toUpperCase(),
@@ -91,7 +97,8 @@ function mergeSegmentIdentity(existing = {}, observed = {}, index = 0) {
     departureDate: text(existing.departureDate || observed.departureDate, 40),
     departureTime: text(existing.departureTime || observed.departureTime, 20),
     arrivalTime: text(existing.arrivalTime || observed.arrivalTime, 20),
-    flightNumber: text(existing.flightNumber || observed.flightNumber, 30).toUpperCase()
+    flightNumber: text(existing.flightNumber || observed.flightNumber, 30).toUpperCase(),
+    ...(evidence ? { evidence } : {})
   };
 }
 
@@ -122,7 +129,13 @@ function enrichBaseline(existing = {}, observed = {}) {
     },
     fareBrand: existing.fareBrand || observed.fareBrand,
     selectedExtras: existing.selectedExtras || [],
-    provenance: [...(existing.provenance || []), ...(observed.provenance || [])].slice(-20)
+    factEvidence: {
+      itinerary: existing.factEvidence?.itinerary?.length ? existing.factEvidence.itinerary : observed.factEvidence?.itinerary,
+      fareBrand: existing.factEvidence?.fareBrand || observed.factEvidence?.fareBrand || null,
+      totalPrice: existing.factEvidence?.totalPrice || observed.factEvidence?.totalPrice || null,
+      travelers: existing.factEvidence?.travelers || observed.factEvidence?.travelers || null
+    },
+    provenance: existing.provenance?.length ? existing.provenance : observed.provenance
   });
 }
 
@@ -154,6 +167,12 @@ function mergeCurrentFacts(previous = {}, observed = {}, baseline = {}) {
     totalPrice: number(observed.totalPrice?.amount) == null ? identity.totalPrice : observed.totalPrice,
     fareBrand: observed.fareBrand || identity.fareBrand,
     selectedExtras: selections,
+    factEvidence: {
+      itinerary: observed.factEvidence?.itinerary?.length ? observed.factEvidence.itinerary : identity.factEvidence?.itinerary,
+      fareBrand: observed.factEvidence?.fareBrand || identity.factEvidence?.fareBrand || null,
+      totalPrice: observed.factEvidence?.totalPrice || identity.factEvidence?.totalPrice || null,
+      travelers: observed.factEvidence?.travelers || identity.factEvidence?.travelers || null
+    },
     provenance: [...(previous.provenance || []), ...(observed.provenance || [])].slice(-20)
   });
 }
@@ -200,8 +219,9 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
   if (unauthorizedExtras.length) contradictions.push("UNAPPROVED_SELECTED_EXTRA");
   if (reviewFacts) {
     contradictions.push(...outcomeReviewContradictions(durableSelections, reviewFacts.selectedExtras || []));
-    if (baseline.fareBrand && reviewFacts.fareBrand
-      && normalizedText(baseline.fareBrand) !== normalizedText(reviewFacts.fareBrand)) {
+    const durableFare = durableSelections.find((extra) => extra.family === "fare");
+    if (!durableFare && baseline.fareBrand && reviewFacts.fareBrand
+      && !compatibleFareBrands(baseline.fareBrand, reviewFacts.fareBrand)) {
       contradictions.push("FARE_BRAND_CHANGED");
     }
   }
@@ -241,7 +261,10 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       evidence: []
     };
   } else if ((existing.version === 4 || existing.version === 3) && existing.baseline) {
-    const baseline = existing.baselineStatus === "approved" || finalReviewObservation
+    // Approved identity is immutable, but facts that were genuinely unknown
+    // (for example a fare chosen later in checkout) may still be filled from
+    // authoritative non-review evidence. Final review can never seed them.
+    const baseline = finalReviewObservation
       ? existing.baseline
       : enrichBaseline(existing.baseline, observed);
     const approved = !transactionFactGaps(baseline).length;
@@ -251,7 +274,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       baseline,
       current: mergeCurrentFacts(existing.current || existing.baseline, observed, baseline),
       outcomeLedger: finalReviewObservation
-        ? mergeCommerceSelections(existing.outcomeLedger, existing.current?.selectedExtras)
+        ? mergeCommerceSelections(existing.outcomeLedger)
         : mergeCommerceSelections(existing.outcomeLedger, existing.current?.selectedExtras, observed.selectedExtras),
       reviewFacts: finalReviewObservation ? observed : (existing.reviewFacts || null),
       baselineStatus: existing.baselineStatus === "approved" || approved ? "approved" : "collecting",
