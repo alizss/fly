@@ -74,7 +74,16 @@ function looksLikeLegalAcceptance(action) {
 function looksLikePaidExtraSelection(action) {
   if (isNonMutatingAction(action) || isDeclineOrSkipAction(action) || isOpenChoiceControlAction(action)) return false;
   const target = action.targetSnapshot || {};
-  return Number(action.affordance?.structuredPrice?.amount) > 0
+  const typedEffect = String(
+    action.mechanicalEffect
+    || action.physicalEffect
+    || action.affordance?.mechanicalEffect
+    || action.affordance?.physicalEffect
+    || action.affordance?.effect
+    || ""
+  ).toLowerCase();
+  return typedEffect === "select_paid_option"
+    || Number(action.affordance?.structuredPrice?.amount) > 0
     || action.affordance?.risk === "money"
     || action.risk === "money"
     || target.risk === "money"
@@ -85,7 +94,7 @@ function looksLikePaidExtraSelection(action) {
 
 function profileWantsNoExtras(profile = {}) {
   const rules = String(profile.booking_rules || "").toLowerCase();
-  return /no paid|no extras|no add-?ons|no seat|no insurance|no bundle|personal item only|avoid paid/.test(rules);
+  return /no paid|no extras|no add-?ons|no seat|no insurance|no bundle|personal item only|avoid paid|decline (?:all )?paid extras/.test(rules);
 }
 
 function boundedPaidAuthorization(action = {}, merged = {}) {

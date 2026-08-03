@@ -1,5 +1,11 @@
 const { withUpdate } = require("../../../packages/shared/agent-state");
-const { canonicalFareBrand, factsFromObservation, mergeCommerceSelections, normalizeFacts } = require("./transaction-facts");
+const {
+  canonicalFareBrand,
+  durableCommerceSelections,
+  factsFromObservation,
+  mergeCommerceSelections,
+  normalizeFacts
+} = require("./transaction-facts");
 const { controlBelongsToCurrentSurface } = require("./surface-contract");
 
 function text(value, limit = 180) {
@@ -241,6 +247,7 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
 
 function prepareTransactionInvariants(state = {}, observation = {}, traveler = {}) {
   const observed = factsFromObservation(state, observation, traveler);
+  const admittedOutcomes = durableCommerceSelections(observed.selectedExtras);
   const existing = state.transactionInvariants;
   const at = new Date().toISOString();
   const finalReviewObservation = isFinalReviewFacts(observed);
@@ -253,7 +260,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       version: 4,
       baseline,
       current: mergeCurrentFacts({}, observed, baseline),
-      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(observed.selectedExtras),
+      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
       baselineStatus: transactionFactGaps(baseline).length ? "collecting" : "approved",
       baselineObservationId: observation.observationId || "",
@@ -275,7 +282,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       current: mergeCurrentFacts(existing.current || existing.baseline, observed, baseline),
       outcomeLedger: finalReviewObservation
         ? mergeCommerceSelections(existing.outcomeLedger)
-        : mergeCommerceSelections(existing.outcomeLedger, existing.current?.selectedExtras, observed.selectedExtras),
+        : mergeCommerceSelections(existing.outcomeLedger, admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : (existing.reviewFacts || null),
       baselineStatus: existing.baselineStatus === "approved" || approved ? "approved" : "collecting",
       approvedAt: existing.approvedAt || (approved ? at : "")
@@ -287,7 +294,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       version: 4,
       baseline,
       current: mergeCurrentFacts(existing.baseline, observed, baseline),
-      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(observed.selectedExtras),
+      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
       baselineStatus: approved ? "approved" : "collecting",
       baselineObservationId: existing.baselineObservationId || observation.observationId || "",
@@ -301,7 +308,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       version: 4,
       baseline,
       current: mergeCurrentFacts({}, observed, baseline),
-      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(observed.selectedExtras),
+      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
       baselineStatus: approved ? "approved" : "collecting",
       baselineObservationId: existing.baselineObservationId || "",

@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const { diffObservations } = require("../../apps/web/agent/observation-diff");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
+const { verifiedCommerceObligationFromActionResult } = require("../../apps/web/agent/task-state-reducer");
 const {
   advanceActionLifecycle,
   canonicalFailureCode,
@@ -74,20 +75,139 @@ test("authoritative transition records exact free selection as fresh visible pro
     controls: [{ controlId: "ctrl_free", decisionGroupId: "dg_seat", label: "No thanks", semantic: "decline_paid_extra", risk: "safe_decline", selected: true }],
     decisionGroups: [{ decisionGroupId: "dg_seat", status: "satisfied", selectedControlId: "ctrl_free", selectedLabel: "No thanks", selectedSemantic: "decline_paid_extra" }]
   }, result());
+  const governedAction = {
+    id: "act_1",
+    controlId: "ctrl_free",
+    decisionGroupId: "dg_seat",
+    mechanicalEffect: "select_free_option",
+    expectedOutcome: {
+      type: "exact_free_option_selected",
+      controlId: "ctrl_free",
+      expectedSelectedControlId: "ctrl_free",
+      parentExpectedSelectedControlId: "ctrl_free",
+      decisionGroupId: "dg_seat",
+      parentDecisionGroupId: "dg_seat",
+      mustNotIncreasePrice: true
+    },
+    affordance: {
+      physicalEffect: "select_free_option",
+      task: {
+        canonicalOwnerId: "seats:extras:seat-decline:dg_seat:global",
+        decisionInstanceId: "seats:extras:seat-decline:dg_seat:global",
+        decisionGroupId: "dg_seat",
+        parentDecisionGroupId: "dg_seat",
+        parentExpectedSelectedControlId: "ctrl_free",
+        semanticType: "decline_optional_extra"
+      }
+    }
+  };
   const transition = evaluateTransition({
     beforeObservation: before,
-    governedAction: {
-      id: "act_1",
-      controlId: "ctrl_free",
-      decisionGroupId: "dg_seat",
-      expectedOutcome: { type: "exact_free_option_selected", controlId: "ctrl_free", expectedSelectedControlId: "ctrl_free", decisionGroupId: "dg_seat", mustNotIncreasePrice: true }
-    },
+    governedAction,
     browserResult: result(),
     afterObservation: after
   });
   assert.equal(transition.status, "progressed");
   assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
   assert.equal(transition.postcondition.evidence.selectedControlId, "ctrl_free");
+
+  after.lastActionResult = {
+    ...after.lastActionResult,
+    action: governedAction,
+    mechanicalEffect: "select_free_option",
+    expectedOutcome: governedAction.expectedOutcome
+  };
+  const advanced = advanceActionLifecycle({
+    state: { lastAction: governedAction },
+    observation: after,
+    previousObservation: before
+  });
+  assert.equal(advanced.transition.status, "progressed");
+  assert.equal(advanced.lifecycle.verified, false);
+  assert.equal(advanced.lifecycle.localOutcomeVerified, true, JSON.stringify({
+    postcondition: advanced.transition.postcondition,
+    currentObligationResult: advanced.transition.currentObligationResult,
+    localMechanicalResult: advanced.transition.localMechanicalResult
+  }));
+  assert.equal(advanced.observation.lastActionResult.taskProgressStatus, "progressed");
+  assert.equal(advanced.observation.lastActionResult.localPostconditionSatisfied, true);
+  assert.equal(advanced.observation.lastActionResult.localOutcomeVerified, true);
+  assert.equal(advanced.observation.lastActionResult.verified, true);
+  const receipt = verifiedCommerceObligationFromActionResult(
+    advanced.observation.lastActionResult,
+    after.observationId
+  );
+  assert.equal(receipt.actionId, "act_1");
+  assert.equal(receipt.decisionInstanceId, "seats:extras:seat-decline:dg_seat:global");
+});
+
+test("child confirmation verifies the selected free outcome on its parent decision", () => {
+  const before = observation("before_flex_confirm", {
+    currentSurface: { id: "flex_confirm", type: "popover", label: "Flexible Ticket confirmation" },
+    controls: [{
+      controlId: "ctrl_decline_confirm",
+      decisionGroupId: "dg_flex_confirm",
+      surfaceId: "flex_confirm",
+      label: "I'll go without",
+      semantic: "decline_paid_extra",
+      physicalEffect: "dismiss_surface",
+      risk: "safe_decline"
+    }],
+    decisionGroups: [{ decisionGroupId: "dg_flex_confirm", status: "missing", selectedControlId: "" }]
+  });
+  const after = observation("after_flex_confirm", {
+    currentSurface: { id: "flex_options", type: "dropdown", label: "Flexible Ticket options" },
+    controls: [{
+      controlId: "ctrl_flex_none",
+      decisionGroupId: "dg_flexible_ticket",
+      surfaceId: "flex_options",
+      label: "None of the passengers 0 EUR",
+      semantic: "decline_paid_extra",
+      physicalEffect: "select_free_option",
+      risk: "safe_decline",
+      selected: true,
+      structuredPrice: { amount: 0, currency: "EUR" }
+    }],
+    decisionGroups: [{
+      decisionGroupId: "dg_flexible_ticket",
+      status: "satisfied",
+      selectedControlId: "ctrl_flex_none",
+      selectedLabel: "None of the passengers 0 EUR",
+      selectedSemantic: "decline_paid_extra",
+      selectedEvidence: { disposition: "free", structuredPrice: { amount: 0, currency: "EUR" } }
+    }]
+  }, result("act_flex_confirm"));
+  const expectedOutcome = {
+    type: "exact_free_option_selected",
+    controlId: "ctrl_decline_confirm",
+    decisionGroupId: "dg_flex_confirm",
+    parentDecisionGroupId: "dg_flexible_ticket",
+    parentExpectedSelectedControlId: "ctrl_flex_none",
+    childSurfaceId: "flex_confirm",
+    requireChildSurfaceDismissed: true,
+    mustNotIncreasePrice: true
+  };
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: {
+      id: "act_flex_confirm",
+      controlId: "ctrl_decline_confirm",
+      decisionGroupId: "dg_flex_confirm",
+      mechanicalEffect: "select_free_option",
+      expectedOutcome
+    },
+    browserResult: {
+      ...result("act_flex_confirm"),
+      verified: true,
+      expectedPostconditions: [expectedOutcome]
+    },
+    afterObservation: after
+  });
+
+  assert.equal(transition.postcondition.satisfied, true);
+  assert.equal(transition.postcondition.evidence.parentDecisionGroupId, "dg_flexible_ticket");
+  assert.equal(transition.postcondition.evidence.childSurfaceDismissed, true);
+  assert.equal(transition.postcondition.evidence.completionMode, "child_confirmed_parent_selection");
 });
 
 test("paid-conflict correction requires the exact selection charge to disappear", () => {

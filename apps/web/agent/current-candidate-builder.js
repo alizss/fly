@@ -66,9 +66,27 @@ function candidateActionabilityFailure(candidate = {}, control = {}, observation
   return strategyAlreadyFailed ? "FAILED_STRATEGY_REUSE" : "TARGET_NOT_ACTIONABLE";
 }
 
-function pipelineContractForCandidate(goal = {}, candidate = {}, control = {}, expectedOutcome = {}) {
+function surfaceOwnershipForCandidate(goal = {}, candidate = {}, control = {}, observation = {}) {
+  const ownership = goal.surfaceExitOwnership || candidate.pipelineContract?.surfaceOwnership || null;
+  if (
+    goal.semanticType !== "completed_choice_surface"
+    || ownership?.kind !== "parent_controls_active_surface"
+    || ownership?.status !== "proven"
+    || ownership.parentControlId !== control.controlId
+    || !candidate.targetId
+    || !["open", "activate"].includes(candidateOperation(candidate))
+  ) return null;
+  return {
+    ...ownership,
+    observationId: observation.observationId || ownership.observationId || "",
+    parentActuatorId: candidate.targetId,
+    operation: candidateOperation(candidate)
+  };
+}
+
+function pipelineContractForCandidate(goal = {}, candidate = {}, control = {}, expectedOutcome = {}, observation = {}) {
   const observed = agentContract.observedComponentContract(control, {
-    surfaceId: candidate.surfaceId || control.surfaceId || ""
+    surfaceId: control.surfaceId || candidate.surfaceId || ""
   });
   const operation = candidateOperation(candidate);
   const existing = candidate.pipelineContract || null;
@@ -112,7 +130,10 @@ function pipelineContractForCandidate(goal = {}, candidate = {}, control = {}, e
     },
     capability,
     expectedOutcome,
-    validationOwnership: existing?.validationOwnership || goal.validationOwnership || observed.validationOwnership || {}
+    validationOwnership: existing?.validationOwnership || goal.validationOwnership || observed.validationOwnership || {},
+    surfaceOwnership: surfaceOwnershipForCandidate(goal, candidate, control, observation)
+      || existing?.surfaceOwnership
+      || null
   });
 }
 
@@ -222,17 +243,28 @@ function buildCurrentCandidateSet({
     || goal.parentOutcomeContract
     || outcomeContract;
   const allCapabilities = allCurrentCapabilityCandidates(goal, observation, traveler);
+  const completedSurfaceExitIds = new Set(
+    goal.semanticType === "completed_choice_surface"
+      ? (goal.actionableControlIds || []).filter(Boolean)
+      : []
+  );
   const current = allCapabilities.candidates.filter((candidate) => {
     if (!["click", "type", "select", "keypress", "scroll", "click_xy"].includes(candidate.type)) return true;
     const control = (page.controls || []).find((item) => item.controlId === candidate.controlId);
-    return Boolean(control && controlBelongsToCurrentSurface(control, page));
+    return Boolean(control && (
+      controlBelongsToCurrentSurface(control, page)
+      // A completed dropdown can only be dismissed through its page-owned
+      // opener. TaskState publishes that exact actuator; it is the sole safe
+      // exception to foreground ownership and prevents reselecting the value.
+      || completedSurfaceExitIds.has(control.controlId)
+    ));
   }).map((candidate, index) => {
     const bound = bindCandidateEnvelope(candidate, index, observation, binding);
     const control = (page.controls || []).find((item) => item.controlId === bound.controlId) || {};
     const semantics = normalizedActionSemantics(bound, { control, goal, expectedOutcome: bound.expectedOutcome });
     const physicalEffect = predictPhysicalEffect({ semantics, control, candidate: bound, goal: { ...goal, outcomeContract } });
     const expectedOutcome = compileTypedExpectedOutcome({ ...bound, physicalEffect, goal: { ...goal, outcomeContract } }, page);
-    const pipelineContract = pipelineContractForCandidate(goal, bound, control, expectedOutcome);
+    const pipelineContract = pipelineContractForCandidate(goal, bound, control, expectedOutcome, observation);
     const semanticIntent = semanticIntentForAction({
       mechanicalEffect: physicalEffect,
       control,
@@ -265,13 +297,26 @@ function buildCurrentCandidateSet({
     const strategyAlreadyFailed = attemptedStrategies.has(actuatorSignature(bound));
     const laneInput = {
       ...bound,
+      goalCandidate: allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)),
       // A visible foreground surface owns the next click. TaskState remains
       // useful planning context, but it cannot hide a grounded safe control
       // merely because its predicted semantic effect is incomplete/unknown.
       goalRelevant: goal.kind === "profile_field"
         ? allCapabilities.goalCandidateKeys.has(capabilityKey(candidate))
         : foregroundOwnsSelection
-          ? relevantToVisibleSurface(goal, bound, allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)))
+          ? (
+              relevantToVisibleSurface(goal, bound, allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)))
+              // A foreground modal/drawer owns interaction. Its exact safe
+              // forward actuator remains admissible even when the earlier
+              // goal snapshot did not enumerate a newly hydrated Next or
+              // Continue control. Paid/uncertain siblings still go through
+              // typed policy and never inherit this admission.
+              || (
+                bound.intent === "navigate_stage"
+                && bound.risk === "safe"
+                && bound.requiresApproval !== true
+              )
+            )
           : allCapabilities.goalCandidateKeys.has(capabilityKey(candidate)),
       risk: bound.risk || (goal.kind === "profile_field" ? "safe" : "uncertain"),
       requiresApproval: Boolean(bound.requiresApproval),
@@ -387,7 +432,23 @@ function buildCurrentCandidateSet({
       return true;
     });
   };
-  const selectable = oneCurrentStrategyPerOperation(selectablePool);
+  // An exact goal-owned action outranks safe contextual navigation. This
+  // prevents a Continue/Next control from bypassing a required correction.
+  const hasGoalOwnedAction = selectablePool.some((candidate) => (
+    candidate.goalCandidate === true
+    && !["ask_user", "wait"].includes(candidate.type)
+  ));
+  const goalBoundSelectablePool = hasGoalOwnedAction
+    ? selectablePool.filter((candidate) => candidate.goalCandidate === true)
+    : selectablePool;
+  // Handoff/wait are fallbacks, not peers of a grounded executable action.
+  // Keeping both model-selectable lets ambiguity machinery choose to stop even
+  // after the current surface has supplied one exact safe actuator.
+  const hasGroundedAction = goalBoundSelectablePool.some((candidate) => !["ask_user", "wait"].includes(candidate.type));
+  const decisiveSelectablePool = hasGroundedAction
+    ? goalBoundSelectablePool.filter((candidate) => !["ask_user", "wait"].includes(candidate.type))
+    : goalBoundSelectablePool;
+  const selectable = oneCurrentStrategyPerOperation(decisiveSelectablePool);
   const recoveryCandidates = oneCurrentStrategyPerOperation(current.filter((candidate) => (
     policySelectable(candidate)
     && candidate.policyDecision?.allow === true

@@ -21,6 +21,8 @@ function normalizeSurface(surface = {}, observationId = "") {
     ownership: isPage ? "page" : "exclusive",
     decisionGroupId: clean(surface.decisionGroupId),
     parentSurfaceId: clean(surface.parentSurfaceId),
+    parentControlId: clean(surface.parentControlId),
+    parentElementId: clean(surface.parentElementId),
     memberControlIds: [...new Set((surface.memberControlIds || surface.controlIds || []).map(clean).filter(Boolean))],
     memberActuatorIds: [...new Set((surface.memberActuatorIds || []).map(clean).filter(Boolean))],
     observationId: clean(surface.observationId || observationId)

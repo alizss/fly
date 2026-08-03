@@ -226,6 +226,12 @@ function validateCanonicalTarget(action, observation, checks, executionLane = ""
   }
   const control = resolution.control;
   const authoritativeLane = executionLane || executionLaneForAction(action, control, observation);
+  const authorizedParentSurfaceExit = agentContract.parentSurfaceExitOwnershipIsCurrent({
+    action,
+    pipelineContract: action.pipelineContract || {},
+    control,
+    observation
+  });
   if (!control?.controlId || !target.controlId) {
     return fail("CANONICAL_TARGET_REQUIRED", "DOM mutations require one canonical control from the stored current observation.", checks);
   }
@@ -269,7 +275,7 @@ function validateCanonicalTarget(action, observation, checks, executionLane = ""
       pass(checks, "CANONICAL_OPERATION_BOUND", `${action.operation}:${target.id}`);
       pass(checks, "CANONICAL_ACTUATOR_ACTIONABLE", `${action.operation}:${target.id}`);
       const precondition = capability?.precondition || {};
-      if (precondition.expanded === false && control.state?.expanded === true) {
+      if (precondition.expanded === false && control.state?.expanded === true && !authorizedParentSurfaceExit) {
         return fail("OPERATION_PRECONDITION_FAILED", "The canonical control is already expanded, so its open operation is no longer valid.", checks);
       }
     } else {
@@ -310,7 +316,7 @@ function validateCanonicalTarget(action, observation, checks, executionLane = ""
   }
   const region = control.visualRegion || target.visualRegion || target.box;
   if (region?.inViewport === false) return recoverable("TARGET_OUT_OF_VIEW", "The canonical target is outside the observed viewport and can be recovered by governed scrolling.", checks);
-  if (!controlBelongsToCurrentSurface(control, observation.page || {})) {
+  if (!controlBelongsToCurrentSurface(control, observation.page || {}) && !authorizedParentSurfaceExit) {
     return recoverable("TARGET_OUTSIDE_CURRENT_SURFACE", "The selected control does not belong to the authoritative current surface.", checks);
   }
   pass(checks, "CANONICAL_TARGET_CURRENT", control.controlId);
@@ -597,6 +603,26 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   if (!policy.allow) {
     const decision = policy.decision === "ask_user" ? "requires_user" : "blocked_by_policy";
     return denied({ ...fail("POLICY_BLOCKED", policy.reason, checks, decision), action, state, policy });
+  }
+  const governedMechanicalEffect = String(
+    action.mechanicalEffect
+    || action.physicalEffect
+    || action.affordance?.mechanicalEffect
+    || action.affordance?.physicalEffect
+    || action.affordance?.effect
+    || ""
+  ).toLowerCase();
+  if (governedMechanicalEffect === "select_paid_option" && !policy.authorization?.authorizationId) {
+    return denied({
+      ...fail(
+        "UNAPPROVED_PAID_EFFECT",
+        "A typed paid-option effect requires one explicit bounded authorization before browser dispatch.",
+        checks
+      ),
+      action,
+      state,
+      policy
+    });
   }
   pass(checks, "POLICY_ALLOWED", policy.reason);
 

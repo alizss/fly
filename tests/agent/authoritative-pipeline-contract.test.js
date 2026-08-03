@@ -40,6 +40,71 @@ function provenCapability(operation, actuatorId) {
   };
 }
 
+test("raw exact commerce receipt is persisted before lifecycle can reinterpret parent progress", () => {
+  const actionId = "act_raw_airhelp_decline";
+  const canonicalOwnerId = "traveler_information:extras:airhelp:dg_airhelp:global";
+  const rawResult = {
+    actionId,
+    dispatched: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    mechanicalEffect: "select_free_option",
+    expectedOutcome: {
+      type: "exact_free_option_selected",
+      decisionGroupId: "dg_airhelp",
+      expectedSelectedControlId: "airhelp_none",
+      expectedSelectedLabel: "No thanks",
+      expectedDisposition: "decline_free_no_extra"
+    },
+    action: {
+      id: actionId,
+      controlId: "airhelp_none",
+      decisionGroupId: "dg_airhelp",
+      targetLabel: "No thanks",
+      mechanicalEffect: "select_free_option",
+      affordance: {
+        physicalEffect: "select_free_option",
+        task: {
+          canonicalOwnerId,
+          decisionInstanceId: canonicalOwnerId,
+          parentDecisionGroupId: "dg_airhelp",
+          decisionGroupId: "dg_airhelp",
+          semanticType: "airhelp"
+        }
+      }
+    }
+  };
+  const state = loopPrivate.recordRawVerifiedCommerceReceipt(
+    createCheckoutSessionState({ travelerId: "trav_raw_receipt" }),
+    {
+      observationId: "obs_raw_airhelp",
+      lastActionResult: rawResult,
+      page: { step: "traveler_information" }
+    }
+  );
+
+  assert.equal(state.verifiedCommerceObligations.length, 1);
+  assert.equal(state.verifiedCommerceObligations[0].actionId, actionId);
+  assert.equal(state.verifiedCommerceObligations[0].decisionInstanceId, canonicalOwnerId);
+
+  // Parent checkout status is free to progress later; the receipt is already
+  // immutable and no longer depends on those rewritten booleans.
+  const rewritten = {
+    ...rawResult,
+    verified: false,
+    expectedOutcomeObserved: false,
+    postconditionSatisfied: false,
+    taskProgressStatus: "progressed"
+  };
+  const unchanged = loopPrivate.recordRawVerifiedCommerceReceipt(state, {
+    observationId: "obs_after_parent_progress",
+    lastActionResult: rewritten,
+    page: { step: "traveler_information" }
+  });
+  assert.deepEqual(unchanged.verifiedCommerceObligations, state.verifiedCommerceObligations);
+});
+
 function profileControl({
   controlId,
   name,
@@ -384,6 +449,98 @@ test("geometry never becomes proven and modal Dismiss/Advance remain separate ou
   assert.equal(advance.capability.status, "proven_executable");
   assert.notDeepEqual(dismiss.expectedOutcome, advance.expectedOutcome);
   assert.notEqual(dismiss.component.componentIdentity, advance.component.componentIdentity);
+});
+
+test("canonical parent-surface exit proof is narrow, fresh, and shared by execution classification", () => {
+  const opener = profileControl({
+    controlId: "flex_opener",
+    name: "flexible_ticket",
+    fieldType: "choice",
+    operation: "open",
+    actuatorId: "flex_opener_button",
+    role: "combobox",
+    kind: "button"
+  });
+  opener.state.expanded = true;
+  opener.operations = { open: provenCapability("open", "flex_opener_button") };
+  const observed = agentContract.observedComponentContract(opener, { surfaceId: "surface-page" });
+  const capability = observed.capabilities.find((item) => item.operation === "open");
+  const pipelineContract = agentContract.canonicalPipelineContract({
+    requirement: { requirementId: "flexible_ticket", semanticType: "completed_choice_surface" },
+    component: { componentIdentity: opener.stableKey, controlId: opener.controlId, controlRole: opener.role },
+    capability: {
+      ...capability,
+      actuatorId: "flex_opener_button",
+      selectedStrategy: capability.strategies.find((item) => item.actuatorId === "flex_opener_button"),
+      proof: capability.exactActuators.find((item) => item.actuatorId === "flex_opener_button")?.proof
+    },
+    expectedOutcome: { type: "active_surface_dismissed", previousSurfaceId: "flex_dropdown" },
+    surfaceOwnership: {
+      kind: "parent_controls_active_surface",
+      status: "proven",
+      observationId: "obs_flex_exit",
+      activeSurfaceId: "flex_dropdown",
+      activeSurfaceType: "dropdown",
+      parentSurfaceId: "surface-page",
+      parentControlId: opener.controlId,
+      parentActuatorId: "flex_opener_button",
+      operation: "open",
+      decisionEpisodeId: "episode:flexible_ticket",
+      parentDecisionGroupId: "decision:flexible_ticket",
+      proof: { completedChoice: true, uniqueExpandedOpener: true }
+    }
+  });
+  const action = {
+    type: "click",
+    operation: "open",
+    interactionMethod: pipelineContract.capability.selectedStrategy.method,
+    observationId: "obs_flex_exit",
+    controlId: opener.controlId,
+    targetId: "flex_opener_button",
+    surfaceId: "flex_dropdown",
+    targetSnapshot: { id: "flex_opener_button", controlId: opener.controlId, surfaceId: "surface-page" },
+    visualRegion: { observationId: "obs_flex_exit", controlId: opener.controlId, operation: "open", surfaceId: "flex_dropdown" },
+    expectedOutcome: pipelineContract.expectedOutcome,
+    pipelineContract,
+    risk: "safe"
+  };
+  const observation = {
+    observationId: "obs_flex_exit",
+    page: {
+      currentSurface: {
+        id: "flex_dropdown",
+        type: "dropdown",
+        surfaceClass: "choice_set",
+        parentControlId: opener.controlId
+      },
+      controls: [opener]
+    }
+  };
+  assert.equal(agentContract.classifyExecutionLane({ action, pipelineContract, control: opener, observation }), "normal");
+
+  const secondOpener = {
+    ...opener,
+    controlId: "other_opener",
+    state: { ...opener.state, expanded: true }
+  };
+  assert.equal(agentContract.classifyExecutionLane({
+    action,
+    pipelineContract,
+    control: opener,
+    observation: { ...observation, page: { ...observation.page, controls: [opener, secondOpener] } }
+  }), "deny");
+  assert.equal(agentContract.classifyExecutionLane({
+    action,
+    pipelineContract,
+    control: opener,
+    observation: { ...observation, observationId: "obs_stale_exit" }
+  }), "deny");
+  assert.equal(agentContract.classifyExecutionLane({
+    action: { ...action, visualRegion: { ...action.visualRegion, observationId: "obs_stale_region" } },
+    pipelineContract,
+    control: opener,
+    observation
+  }), "deny");
 });
 
 test("shared execution-lane classifier admits only fresh exact bounded recovery", () => {

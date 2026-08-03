@@ -241,6 +241,7 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
   const routeEvidence = {
     source: "bounded_checkout_route",
     ownerKey: "route_owner_1",
+    qualification: "persistent_checkout_route",
     observationId,
     confidence: 0.88,
     authoritative: true
@@ -323,6 +324,7 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
       itinerary: [{
         source: "bounded_checkout_route",
         ownerKey: "route_owner_1",
+        qualification: "persistent_checkout_route",
         authoritative: true
       }],
       fareBrand: {
@@ -333,6 +335,68 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
     }
   });
   expect(body.debug.taskState.transactionReview.baselineStatus).toBe("approved");
+});
+
+test("authoritative terminal evidence survives HTTP compaction without payment capabilities", async ({ request }) => {
+  const travelerId = `trav_terminal_transport_${Date.now()}`;
+  const started = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Reach verified payment review",
+      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "Stop before real payment" },
+      page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
+    }
+  });
+  const session = await started.json();
+  expect(started.status(), JSON.stringify(session)).toBe(201);
+
+  const observationId = `obs_terminal_transport_${Date.now()}`;
+  const response = await request.post(`${API}/agent/next-action`, {
+    data: {
+      sessionId: session.id,
+      observationId,
+      observationSnapshot: { snapshotHash: `hash_${observationId}` },
+      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "Stop before real payment" },
+      page: {
+        site: "example.test",
+        url: "https://example.test/checkout/payment",
+        step: "payment",
+        currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+        controls: [],
+        decisionGroups: [],
+        terminalEvidence: {
+          contractVersion: "terminal-evidence/v1",
+          stage: "payment_review",
+          signals: { route: true, progress: true, form: true, method: true, commit: false, legal: false, review: true, heading: true },
+          signalStates: { route: "present", progress: "present", form: "present", method: "present", commit: "unknown", legal: "unknown", review: "present", heading: "present" },
+          signalCount: 6,
+          boundaryObserved: true,
+          verified: true,
+          evidenceOnly: true,
+          paymentCredentialKinds: ["card_number", "card_expiry", "card_security_code"],
+          evidenceSources: ["visible_owned_payment_labels", "visible_hosted_payment_widget", "active_payment_progress"],
+          capabilities: { paymentActionsAllowed: false }
+        }
+      }
+    }
+  });
+  const body = await response.json();
+  expect(response.status(), JSON.stringify(body)).toBe(200);
+  expect(body.debug.taskState.paymentEvidence).toMatchObject({
+    boundaryObserved: true,
+    contractVersion: "terminal-evidence/v1",
+    signals: { route: true, progress: true, form: true, method: true, review: true },
+    paymentActionsAllowed: false
+  });
+  expect(body.debug.taskState.stageDecisionEvidence.terminalEvidence).toMatchObject({
+    boundaryObserved: true,
+    evidenceOnly: true,
+    evidenceSources: expect.arrayContaining([
+      "visible_owned_payment_labels",
+      "visible_hosted_payment_widget",
+      "active_payment_progress"
+    ]),
+    capabilities: { paymentActionsAllowed: false }
+  });
 });
 
 test("non-empty decision-group alternatives survive HTTP compaction with their control identity", async ({ request }) => {

@@ -96,6 +96,22 @@ function observation(controls, validationIssues = [], observationId = "obs_1") {
   };
 }
 
+test("activation-only payment command is not inferred as an email field from accessibility prose", () => {
+  const pay = {
+    controlId: "ctrl_pay",
+    role: "button",
+    kind: "button",
+    label: "Pay",
+    accessibleName: "Pay 100% secure booking e-mail confirmation",
+    capabilities: ["activate"],
+    operations: {
+      activate: { operation: "activate", actuatorId: "target_pay" }
+    }
+  };
+
+  assert.equal(semanticTypeForControl(pay, {}), "");
+});
+
 test("dob_partial_group_validation_does_not_retry_completed_component", () => {
   const controls = [
     dateControl("day", "31"),
@@ -191,6 +207,107 @@ test("displayed custom choice remains unresolved until its interaction commit se
 
   assert.equal(logicalFieldSatisfied(settledLogical), true);
   assert.equal(deriveProfileGoal(settled, traveler), null);
+});
+
+test("editable combobox value is not committed while its exact choice surface remains active", () => {
+  const profile = { ...traveler, phone: "+38670328922", nationality: "Slovenia" };
+  const country = {
+    controlId: "ctrl_country_code",
+    stableKey: "contact-phone-country-code",
+    semantic: "phone_country_code",
+    fieldType: "phone_country_code",
+    sectionId: "contact_1",
+    sectionType: "contact",
+    role: "editable_combobox",
+    kind: "select",
+    label: "Country code",
+    name: "contact.phoneCountryCode",
+    state: {
+      normalizedValue: "+386",
+      valuePresent: true,
+      expanded: true,
+      disabled: false,
+      invalid: false
+    },
+    operations: {
+      type: {
+        operation: "type",
+        actuatorId: "target_country_code",
+        actuatorIds: ["target_country_code"]
+      }
+    }
+  };
+  const active = observation([country], [], "obs_country_suggestion_open");
+  active.page.currentSurface = {
+    id: "surface_country_options",
+    type: "dropdown",
+    label: "Slovenia (+386)",
+    blocksBackground: true
+  };
+
+  const activeField = resolveLogicalFields(active.page, profile)[0];
+  assert.equal(activeField.components[0].interactionKind, "editable_combobox");
+  assert.equal(activeField.components[0].commitRequirement, "logical_component_committed");
+  assert.equal(activeField.components[0].activeChoiceSurface, true);
+  assert.equal(activeField.components[0].interactionSettled, false);
+  assert.equal(activeField.components[0].status, "pending");
+  assert.equal(logicalFieldSatisfied(activeField), false);
+  assert.equal(deriveProfileGoal(active, profile).componentRole, "country_code");
+
+  country.state = { ...country.state, expanded: false };
+  const atomicallyCommitted = observation([country], [], "obs_country_committed_directly");
+  atomicallyCommitted.page.currentSurface = { id: "surface-page", type: "page" };
+  const committedField = resolveLogicalFields(atomicallyCommitted.page, profile)[0];
+  assert.equal(committedField.components[0].activeChoiceSurface, false);
+  assert.equal(committedField.components[0].interactionSettled, true);
+  assert.equal(committedField.components[0].status, "resolved");
+  assert.equal(logicalFieldSatisfied(committedField), true);
+  assert.equal(deriveProfileGoal(atomicallyCommitted, profile), null);
+});
+
+test("fresh valid owner retires only stale presence validation", () => {
+  const profile = { ...traveler, email: "ali@aztela.com" };
+  const email = {
+    controlId: "ctrl_email",
+    stableKey: "contact-email",
+    semantic: "email",
+    fieldType: "email",
+    sectionId: "contact_1",
+    sectionType: "contact",
+    role: "textbox",
+    kind: "email",
+    label: "E-mail",
+    name: "contact.email",
+    state: {
+      normalizedValue: "ali@aztela.com",
+      valuePresent: true,
+      invalid: false,
+      validationMessage: "",
+      disabled: false
+    },
+    operations: {
+      type: {
+        operation: "type",
+        actuatorId: "target_email",
+        actuatorIds: ["target_email"]
+      }
+    }
+  };
+  const stalePresence = observation([email], [{
+    controlId: email.controlId,
+    semanticType: "email",
+    message: "email is empty"
+  }], "obs_email_stale_presence");
+  assert.equal(logicalFieldSatisfied(resolveLogicalFields(stalePresence.page, profile)[0]), true);
+  assert.equal(deriveProfileGoal(stalePresence, profile), null);
+
+  const currentFormat = observation([email], [{
+    controlId: email.controlId,
+    semanticType: "email",
+    message: "email format is invalid"
+  }], "obs_email_current_format_error");
+  assert.equal(logicalFieldSatisfied(resolveLogicalFields(currentFormat.page, profile)[0]), false);
+  assert.equal(deriveProfileGoal(currentFormat, profile).semanticType, "email");
 });
 
 test("disabled Continue never reopens a settled logical field", () => {

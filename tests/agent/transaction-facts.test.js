@@ -81,6 +81,17 @@ test("transaction facts retain only explicitly typed commerce selections", () =>
     priceAmount: null,
     currency: "EUR"
   }, {
+    family: "extras",
+    subjectKey: "decision_country_code",
+    decisionGroupId: "profile_country_code",
+    decisionOwnerKey: "profile_country_code",
+    sourceKind: "profile_field",
+    fieldType: "phone_country_code",
+    label: "Country code",
+    disposition: "selected",
+    priceAmount: 0,
+    currency: "EUR"
+  }, {
     family: "insurance",
     subjectKey: "travel_insurance",
     decisionGroupId: "insurance_choice",
@@ -108,6 +119,49 @@ test("generic checkout prose cannot become canonical route endpoints", () => {
 
   assert.equal(normalized.itinerary.completeness, "partial");
   assert.deepEqual(normalized.itinerary.segments, []);
+});
+
+test("transaction facts reject passenger-age routes and coalesce duplicate owned segments", () => {
+  const authoritative = (segmentId) => ({
+    segmentId,
+    source: "bounded_checkout_route",
+    ownerKey: `owner_${segmentId}`,
+    qualification: "persistent_checkout_route",
+    confidence: 0.88,
+    authoritative: true
+  });
+  const rawSegments = [
+    { segmentId: "route_without_date", origin: "ANTALYA", destination: "ISTANBUL" },
+    { segmentId: "route_with_date", origin: "ANTALYA", destination: "ISTANBUL", departureDate: "Tue 9 Feb" },
+    { segmentId: "age_route_1", origin: "PRIMARY PASSENGER ADULT (OVER 12 YEARS) CHILD (2", destination: "12 YEARS) INFANT (UNDER 2 YEARS)" },
+    { segmentId: "age_route_2", origin: "ADULT (OVER 12 YEARS) CHILD (2", destination: "12 YEARS) INFANT (UNDER 2 YEARS)" }
+  ];
+  const normalized = normalizeFacts({
+    evidenceMode: "typed",
+    itinerary: { completeness: "partial", segments: rawSegments },
+    factEvidence: {
+      itinerary: rawSegments.map((segment) => authoritative(segment.segmentId))
+    }
+  });
+
+  assert.deepEqual(normalized.itinerary.segments, [{
+    segmentId: "route_with_date",
+    origin: "ANTALYA",
+    destination: "ISTANBUL",
+    departureDate: "Tue 9 Feb",
+    departureTime: "",
+    arrivalTime: "",
+    flightNumber: "",
+    evidence: {
+      source: "bounded_checkout_route",
+      ownerKey: "owner_route_with_date",
+      qualification: "persistent_checkout_route",
+      observationId: "",
+      confidence: 0.88,
+      authoritative: true
+    }
+  }]);
+  assert.deepEqual(normalized.factEvidence.itinerary.map((entry) => entry.segmentId), ["route_with_date"]);
 });
 
 test("transaction facts reject unowned fare prose and canonicalize authoritative fare evidence", () => {
@@ -183,6 +237,130 @@ test("current canonical decisions enrich transaction outcomes without erasing re
   assert.equal(observed.selectedExtras.find((extra) => extra.family === "seat").outcome, "random_assignment");
 });
 
+test("a foreground child keeps its selected background opener provisional without wording rules", () => {
+  const paidSeat = {
+    controlId: "seat_parent_paid",
+    stateElementId: "seat_parent_paid",
+    preferredActivationElementId: "seat_parent_paid",
+    surfaceId: "surface-page",
+    selected: true,
+    risk: "money",
+    semantic: "add_paid_extra",
+    structuredPrice: { amount: 19, currency: "EUR" },
+    state: { checked: true, selected: true },
+    operations: {}
+  };
+  const page = {
+    step: "seats",
+    currentSurface: {
+      id: "seat_child_surface",
+      type: "popover",
+      taskHint: "seat",
+      label: "Confirm your itinerary choice"
+    },
+    controls: [paidSeat],
+    decisionGroups: [{
+      decisionGroupId: "decision_seat_parent",
+      requirementId: "seat:seat_assignment",
+      sectionId: "seat_owner",
+      sectionType: "seat",
+      sectionLabel: "Seat reservations",
+      surfaceId: "surface-page",
+      surfaceType: "page",
+      required: true,
+      status: "satisfied",
+      selectedControlId: paidSeat.controlId,
+      selectedLabel: "Add to cart",
+      alternatives: [{ ...paidSeat, label: "Add to cart" }]
+    }],
+    transactionFacts: { selectedExtras: [], currency: "EUR" }
+  };
+
+  const observed = factsFromObservation({ userPolicy: {} }, {
+    observationId: "obs_provisional_seat_parent",
+    page
+  }, { id: "trav_1", seat_policy: "random_assignment", booking_rules: "No paid seats" });
+
+  assert.deepEqual(observed.selectedExtras, []);
+});
+
+test("transaction facts consume terminal decision outcomes and preserve genuine paid seats", () => {
+  const baseState = {
+    userPolicy: {},
+    taskState: {
+      decisionEpisode: {
+        episodeId: "seats:seat:seat_assignment:decision_seat_parent",
+        decisionInstanceId: "seats:seat:seat_reservations:flight_1",
+        canonicalOwnerId: "seats:seat:seat_reservations:flight_1",
+        family: "seat",
+        subjectKey: "seat_assignment",
+        parentDecisionGroupId: "decision_seat_parent",
+        status: "completed",
+        commitmentPhase: "committed_free",
+        outcomeVerified: true,
+        terminalOutcome: {
+          decisionGroupId: "decision_seat_parent",
+          decisionInstanceId: "seats:seat:seat_reservations:flight_1",
+          decisionOwnerKey: "seats:seat:seat_reservations:flight_1",
+          originKind: "verified_commerce_decision",
+          outcomeKey: "seat:seat_assignment",
+          family: "seat",
+          subjectKey: "seat_assignment",
+          label: "Random seat assignment",
+          disposition: "declined",
+          outcome: "random_assignment",
+          priceAmount: 0,
+          currency: "EUR",
+          verified: true
+        }
+      }
+    }
+  };
+  const free = factsFromObservation(baseState, observation("obs_terminal_random_seat", {
+    selectedExtras: [],
+    currency: "EUR"
+  }), { id: "trav_1" });
+  assert.equal(free.selectedExtras.length, 1);
+  assert.equal(free.selectedExtras[0].outcomeKey, "seat:seat_assignment");
+  assert.equal(free.selectedExtras[0].disposition, "declined");
+  assert.equal(free.selectedExtras[0].outcome, "random_assignment");
+  assert.equal(free.selectedExtras[0].priceAmount, 0);
+
+  const paidState = {
+    ...baseState,
+    taskState: {
+      decisionEpisode: {
+        ...baseState.taskState.decisionEpisode,
+        commitmentPhase: "committed_paid",
+        terminalOutcome: {
+          decisionGroupId: "decision_seat_parent",
+          decisionInstanceId: "seats:seat:seat_reservations:flight_1",
+          decisionOwnerKey: "seats:seat:seat_reservations:flight_1",
+          originKind: "verified_commerce_decision",
+          outcomeKey: "seat:seat_assignment",
+          family: "seat",
+          subjectKey: "seat_assignment",
+          label: "Seat 12A",
+          disposition: "paid",
+          outcome: "paid_affirmative",
+          priceAmount: 19,
+          currency: "EUR",
+          verified: true
+        }
+      }
+    }
+  };
+  const paid = factsFromObservation(paidState, observation("obs_terminal_paid_seat", {
+    selectedExtras: [],
+    currency: "EUR"
+  }), { id: "trav_1" });
+  assert.equal(paid.selectedExtras.length, 1);
+  assert.equal(paid.selectedExtras[0].outcomeKey, "seat:seat_assignment");
+  assert.equal(paid.selectedExtras[0].disposition, "paid");
+  assert.equal(paid.selectedExtras[0].outcome, "paid_affirmative");
+  assert.equal(paid.selectedExtras[0].priceAmount, 19);
+});
+
 test("durable commerce outcomes use semantic identity across rerendered decision ids", () => {
   const merged = mergeCommerceSelections([{
     family: "fare",
@@ -205,6 +383,101 @@ test("durable commerce outcomes use semantic identity across rerendered decision
   assert.equal(merged[0].outcomeKey, "fare:ticket");
   assert.equal(merged[0].decisionGroupId, "dg_fare_review");
   assert.equal(merged[0].priceAmount, 0);
+});
+
+test("sibling extras with the same presentation subject retain owner-specific outcomes", () => {
+  const merged = mergeCommerceSelections([{
+    family: "extras",
+    subjectKey: "select_an_option",
+    decisionGroupId: "dg_airhelp",
+    decisionOwnerKey: "dg_airhelp",
+    label: "No thanks",
+    outcome: "declined",
+    priceAmount: 0,
+    currency: "EUR"
+  }, {
+    family: "extras",
+    subjectKey: "select_an_option",
+    decisionGroupId: "dg_sms",
+    decisionOwnerKey: "dg_sms",
+    label: "No thanks",
+    outcome: "declined",
+    priceAmount: 0,
+    currency: "EUR"
+  }], [{
+    family: "extras",
+    subjectKey: "select_an_option",
+    decisionGroupId: "dg_airhelp_rerendered",
+    decisionOwnerKey: "dg_airhelp",
+    label: "No thanks to AirHelp",
+    outcome: "declined",
+    priceAmount: 0,
+    currency: "EUR"
+  }]);
+
+  assert.equal(merged.length, 2);
+  assert.deepEqual(
+    merged.map((extra) => extra.outcomeKey).sort(),
+    ["extras:select_an_option:dg_airhelp", "extras:select_an_option:dg_sms"]
+  );
+  assert.equal(merged.find((extra) => extra.decisionOwnerKey === "dg_airhelp").label, "No thanks to AirHelp");
+});
+
+test("verified outcome journal keeps generic sibling decisions distinct and rejects profile provenance", () => {
+  const state = {
+    taskState: {
+      outcomeJournal: [{
+        decisionGroupId: "dg_airhelp",
+        decisionInstanceId: "traveler_information:extras:airhelp:global",
+        decisionOwnerKey: "traveler_information:extras:airhelp:global",
+        originKind: "verified_commerce_decision",
+        verified: true,
+        family: "extras",
+        subjectKey: "select_an_option",
+        label: "No thanks",
+        disposition: "declined",
+        outcome: "declined",
+        priceAmount: 0,
+        currency: "EUR"
+      }, {
+        decisionGroupId: "dg_sms",
+        decisionInstanceId: "traveler_information:extras:sms_updates:global",
+        decisionOwnerKey: "traveler_information:extras:sms_updates:global",
+        originKind: "verified_commerce_decision",
+        verified: true,
+        family: "extras",
+        subjectKey: "select_an_option",
+        label: "No thanks",
+        disposition: "declined",
+        outcome: "declined",
+        priceAmount: 0,
+        currency: "EUR"
+      }, {
+        decisionGroupId: "profile_country_code",
+        decisionInstanceId: "traveler_information:profile:country_code:global",
+        decisionOwnerKey: "traveler_information:profile:country_code:global",
+        originKind: "profile_field",
+        verified: true,
+        family: "extras",
+        subjectKey: "country_code",
+        label: "+386",
+        disposition: "selected",
+        outcome: "selected",
+        priceAmount: 0,
+        currency: "EUR"
+      }]
+    }
+  };
+  const observed = factsFromObservation(state, observation("obs_journal_siblings", {
+    selectedExtras: [],
+    currency: "EUR"
+  }), { id: "trav_1" });
+
+  assert.deepEqual(
+    observed.selectedExtras.map((extra) => extra.decisionGroupId).sort(),
+    ["dg_airhelp", "dg_sms"]
+  );
+  assert.equal(observed.selectedExtras.every((extra) => extra.verified === true), true);
 });
 
 test("P0.5 approved baseline preserves identity while enriching previously missing components", () => {
@@ -301,6 +574,30 @@ test("a final payment review cannot establish its own missing itinerary baseline
   assert.equal(reviewed.envelope.reviewFacts.itinerary.segments[0].origin, "LHR");
   assert.equal(reviewed.review.ready, false);
   assert.ok(reviewed.review.missingFacts.includes("itinerary_route"));
+});
+
+test("typed terminal evidence is the sole final-review authority when provenance wording is absent", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_terminal_evidence_review";
+  state = prepareTransactionInvariants(state, observation("obs_baseline", facts()), { id: "trav_1" }).state;
+  const paymentFacts = facts();
+  paymentFacts.provenance = [{ source: "unknown", observationId: "obs_payment", confidence: 0 }];
+  const paymentObservation = observation("obs_payment", paymentFacts);
+  paymentObservation.page.step = "payment";
+  paymentObservation.page.terminalEvidence = {
+    contractVersion: "terminal-evidence/v1",
+    boundaryObserved: true,
+    verified: true,
+    evidenceOnly: true,
+    capabilities: { paymentActionsAllowed: false }
+  };
+
+  const reviewed = prepareTransactionInvariants(state, paymentObservation, { id: "trav_1" });
+
+  assert.ok(reviewed.envelope.reviewFacts);
+  assert.equal(reviewed.envelope.reviewFacts.provenance.some((entry) => entry.source === "payment_summary"), true);
+  assert.equal(reviewed.review.missingFacts.includes("payment_review"), false);
+  assert.equal(reviewed.review.ready, true);
 });
 
 test("approved identity accepts later owned fare evidence while final review cannot rewrite the outcome ledger", () => {

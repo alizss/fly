@@ -255,9 +255,16 @@ function expectedFor(governedAction = {}, browserResult = {}) {
 }
 
 function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPage = {}) {
-  const groupId = expected.decisionGroupId || action.decisionGroupId || action.targetSnapshot?.decisionGroupId || "";
+  const parentDecisionGroupId = expected.parentDecisionGroupId || action.affordance?.task?.parentDecisionGroupId || "";
+  const groupId = parentDecisionGroupId
+    || expected.decisionGroupId
+    || action.decisionGroupId
+    || action.targetSnapshot?.decisionGroupId
+    || "";
   const group = groupById(afterPage, groupId);
-  const expectedControlId = expected.expectedSelectedControlId || expected.controlId || action.controlId || "";
+  const expectedControlId = parentDecisionGroupId
+    ? (expected.parentExpectedSelectedControlId || action.affordance?.task?.parentExpectedSelectedControlId || "")
+    : (expected.expectedSelectedControlId || expected.controlId || action.controlId || "");
   const chosen = controlById(afterPage, group?.selectedControlId || expectedControlId);
   const semantic = text(`${group?.selectedSemantic || ""} ${chosen?.semantic || ""} ${chosen?.risk || ""} ${chosen?.label || group?.selectedLabel || ""}`);
   const exact = Boolean(group && expectedControlId && group.selectedControlId === expectedControlId && selected(chosen || {}));
@@ -310,8 +317,13 @@ function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPa
   const unrelatedSelectionChangesObserved = unrelatedSelectionChanges(beforePage, afterPage, groupId)
     .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
   const exactOrLinkedCorrection = (exact && freeDisposition) || linkedPaidSelectionCleared;
+  const childSurfaceId = expected.childSurfaceId || "";
+  const childSurfaceDismissed = expected.requireChildSurfaceDismissed !== true
+    || !childSurfaceId
+    || String(afterPage.currentSurface?.id || "surface-page") !== childSurfaceId;
   return {
     satisfied: exactOrLinkedCorrection
+      && childSurfaceDismissed
       && selectedChargeRemoved
       && unrelatedSelectionChangesObserved.length === 0
       && !paidSelected
@@ -319,11 +331,13 @@ function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPa
       && !validation,
     evidence: {
       groupId,
+      parentDecisionGroupId,
       expectedControlId,
       selectedControlId: group?.selectedControlId || "",
       freeDisposition,
       semanticOwnershipLinkId: semanticOwnershipLink?.linkId || "",
       linkedPaidSelectionCleared,
+      childSurfaceDismissed,
       selectedChargeRemoved,
       selectedChargeAmount: Number.isFinite(selectedChargeAmount) ? selectedChargeAmount : null,
       unrelatedSelectionChanges: unrelatedSelectionChangesObserved,
@@ -573,11 +587,14 @@ function evaluatePostcondition(
   if (type === "exact_free_option_selected") {
     const exact = exactFreeSelection(expected, action, beforePage, afterPage);
     const safeTransition = policySafeChoiceTransition(expected, action, beforePage, afterPage, diff);
+    const browserExpected = browserResult.expectedOutcome
+      || browserResult.expectedPostconditions?.find((condition) => condition?.type === "exact_free_option_selected")
+      || expected;
     const browserVerifiedBeforeDismissal = Boolean(
       !exact.satisfied
       && !safeTransition.satisfied
       && browserResult.verified === true
-      && browserResult.expectedOutcome?.type === "exact_free_option_selected"
+      && browserExpected?.type === "exact_free_option_selected"
       && (diff.modalClosed || (diff.disappeared || []).some((item) => item.controlId === (expected.controlId || action.controlId)))
       && !priceIncreased(beforePage, afterPage)
       && !(diff.errorsAppeared || []).length
@@ -589,8 +606,10 @@ function evaluatePostcondition(
         ...exact.evidence,
         ...safeTransition.evidence,
         completionMode: exact.satisfied
-          ? "same_surface_selection"
-          : (safeTransition.satisfied ? "safe_stage_transition" : "unproven"),
+          ? (expected.parentDecisionGroupId ? "child_confirmed_parent_selection" : "same_surface_selection")
+          : (safeTransition.satisfied
+            ? "safe_stage_transition"
+            : (browserVerifiedBeforeDismissal ? "browser_verified_dismissal" : "unproven")),
         browserVerifiedBeforeDismissal
       }
     };
@@ -657,7 +676,7 @@ function evaluatePostcondition(
       }
     };
   }
-  if (["normalized_value_changed", "field_value_changed"].includes(type)) {
+  if (["normalized_value_changed", "logical_component_committed", "field_value_changed"].includes(type)) {
     if (expected.logicalFieldId) {
       const hierarchical = verifyLogicalField(afterPage, { ...expected, controlId }, {});
       return {
@@ -812,7 +831,7 @@ function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}) {
   if (postcondition.satisfied && postcondition.type === "control_selected") {
     return { effect: predictedEffect === "select_paid_option" ? "select_paid_option" : predictedEffect, verified: true, evidence: postcondition.evidence };
   }
-  if (postcondition.satisfied && ["normalized_value_changed", "field_value_changed", "date_value_committed"].includes(postcondition.type)) {
+  if (postcondition.satisfied && ["normalized_value_changed", "logical_component_committed", "field_value_changed", "date_value_committed"].includes(postcondition.type)) {
     return { effect: predictedEffect === "enter_payment_credentials" ? "enter_payment_credentials" : "set_field_value", verified: true, evidence: postcondition.evidence };
   }
   if (postcondition.satisfied && postcondition.type === "checkout_stage_advanced") {

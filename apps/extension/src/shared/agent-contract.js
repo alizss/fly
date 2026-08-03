@@ -6,6 +6,7 @@
   "use strict";
 
   const CONTRACT_VERSION = "agent-contract/v1";
+  const TERMINAL_EVIDENCE_VERSION = "terminal-evidence/v1";
   const CAPABILITY_STATUS = Object.freeze({
     PROVEN_EXECUTABLE: "proven_executable",
     RECOVERABLE: "recoverable",
@@ -87,6 +88,131 @@
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "")
       .slice(0, 100);
+  }
+
+  function paymentCredentialKindsFromText(value = "") {
+    const visible = normalizedText(value).toLowerCase();
+    const kinds = [];
+    if (/\bcard\s*(?:number|no\.?|#)\b|\bcc-number\b/.test(visible)) kinds.push("card_number");
+    if (/\b(?:expiry|expiration|valid\s+through)\b|\bcc-exp\b/.test(visible)) kinds.push("card_expiry");
+    if (/\b(?:cvc|cvv|security\s+code)\b|\bcc-csc\b/.test(visible)) kinds.push("card_security_code");
+    if (/\bcardholder\b|\bname\s+on\s+card\b/.test(visible)) kinds.push("cardholder");
+    return kinds;
+  }
+
+  function terminalSignalState(present, negativeEvidence = false) {
+    if (present === true) return "present";
+    return negativeEvidence === true ? "absent" : "unknown";
+  }
+
+  // Payment controls are terminal evidence, never executable capabilities.
+  // This compiler is shared by browser perception, readiness and TaskState so
+  // those layers cannot independently reinterpret payment-looking page copy.
+  function compileTerminalEvidence(input = {}) {
+    const page = input?.page && typeof input.page === "object" ? input.page : input;
+    const supplied = page?.terminalEvidence;
+    if (supplied?.contractVersion === TERMINAL_EVIDENCE_VERSION) {
+      const signals = supplied.signals || {};
+      const signalCount = Object.values(signals).filter(Boolean).length;
+      const boundaryObserved = supplied.boundaryObserved === true || supplied.verified === true;
+      return Object.freeze({
+        ...cloneSerializable(supplied),
+        contractVersion: TERMINAL_EVIDENCE_VERSION,
+        stage: boundaryObserved ? "payment_review" : "unknown",
+        signals: Object.freeze({ ...signals }),
+        signalCount,
+        boundaryObserved,
+        verified: boundaryObserved,
+        capabilities: Object.freeze({ paymentActionsAllowed: false })
+      });
+    }
+
+    const structural = page?.terminalStructure || page?.structuralEvidence || {};
+    const url = normalizedText(page?.url || input?.url || "").toLowerCase();
+    const visible = normalizedText([
+      page?.visibleText,
+      page?.fullText,
+      page?.text,
+      page?.heading,
+      page?.title,
+      input?.visibleText,
+      input?.headingText
+    ].filter(Boolean).join(" ")).toLowerCase();
+    const activeProgress = normalizedText(
+      structural.activeProgressText || input?.activeProgressText || ""
+    ).toLowerCase();
+    const route = /(?:^|[\/#?&_-])payment(?:[\/#?&=_-]|$)/.test(url);
+    const progress = structural.activePaymentProgress === true || /\bpayment\b|\bpay\b/.test(activeProgress);
+    const nativeCredentialKinds = structural.paymentCredentialKinds || [];
+    const ownedCredentialKinds = [
+      ...(structural.paymentCredentialLabelKinds || []),
+      ...(structural.hostedPaymentCredentialKinds || [])
+    ];
+    const credentialKinds = new Set([...nativeCredentialKinds, ...ownedCredentialKinds]);
+    const structuralPaymentProbe = Object.prototype.hasOwnProperty.call(structural, "paymentCredentialCount")
+      || Object.prototype.hasOwnProperty.call(structural, "paymentFormPresent")
+      || Object.prototype.hasOwnProperty.call(structural, "paymentCredentialKinds");
+    // A native-control probe can be empty when a payment provider owns its
+    // inputs inside an opaque iframe/custom widget. Empty native evidence is
+    // therefore unknown, not authoritative absence. Visible credential copy
+    // may contribute only when perception tied it to a visible payment owner.
+    const visibleFallbackAllowed = !structuralPaymentProbe
+      || structural.paymentOwnerPresent === true
+      || structural.visibleTextFallbackAllowed === true;
+    if (visibleFallbackAllowed) {
+      paymentCredentialKindsFromText(visible).forEach((kind) => credentialKinds.add(kind));
+    }
+    const form = structural.paymentFormPresent === true
+      || structural.paymentOwnerPresent === true
+      || structural.hostedPaymentWidgetPresent === true
+      || Number(structural.paymentCredentialCount || 0) >= 2
+      || credentialKinds.size >= 2;
+    const method = structural.paymentMethodPresent === true
+      || /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/.test(visible);
+    const commit = structural.payControlPresent === true
+      || /\b(?:pay(?:\s+now|\s+securely|\s+\d)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase)\b/.test(visible);
+    const legal = structural.legalAcceptancePresent === true;
+    const review = structural.reviewSummaryPresent === true
+      || (/\b(?:amount\s+to\s+pay|total)\b/.test(visible)
+        && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/.test(visible));
+    const heading = structural.paymentHeadingPresent === true
+      || /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/.test(visible);
+    const signals = Object.freeze({ route, progress, form, method, commit, legal, review, heading });
+    const signalStates = Object.freeze({
+      route: terminalSignalState(route, Boolean(url)),
+      progress: terminalSignalState(progress),
+      form: terminalSignalState(form, structural.paymentOwnerProbeState === "observed_absent"),
+      method: terminalSignalState(method),
+      commit: terminalSignalState(commit),
+      legal: terminalSignalState(legal),
+      review: terminalSignalState(review),
+      heading: terminalSignalState(heading)
+    });
+    const signalCount = Object.values(signals).filter(Boolean).length;
+    const stageAnchor = route || progress || heading;
+    const boundaryObserved = Boolean(
+      (form && (stageAnchor || method || commit))
+      || (stageAnchor && method && commit)
+      || (route && progress && (method || commit || review))
+      // Some review/payment pages reveal credential controls progressively.
+      // A payment heading plus owned order review plus at least one exact
+      // credential kind is a typed terminal boundary; generic payment copy or
+      // a lone card field without review ownership still cannot qualify.
+      || (heading && review && credentialKinds.size >= 1)
+    );
+    return Object.freeze({
+      contractVersion: TERMINAL_EVIDENCE_VERSION,
+      stage: boundaryObserved ? "payment_review" : "unknown",
+      signals,
+      signalCount,
+      boundaryObserved,
+      verified: boundaryObserved,
+      evidenceOnly: true,
+      paymentCredentialKinds: Object.freeze([...credentialKinds]),
+      signalStates,
+      evidenceSources: Object.freeze([...(structural.terminalEvidenceSources || [])]),
+      capabilities: Object.freeze({ paymentActionsAllowed: false })
+    });
   }
 
   function operationAvailability(operation = {}) {
@@ -260,12 +386,15 @@
 
   function subjectFromEvidence(value = "") {
     const evidence = normalizedText(value).toLowerCase();
-    if (/fare|ticket|saver|standard|flexi|economy light|basic\/plus/.test(evidence)) return "fare_package";
+    // Exact product nouns outrank generic commercial tier words. A seat
+    // legend such as "Standard seat — 9 EUR" is still a seat decision; the
+    // adjective "standard" alone is not authoritative fare ownership.
     if (/seat|seating|legroom|aisle|window/.test(evidence)) return "seat";
     if (/bag|baggage|luggage|carry.?on/.test(evidence)) return "baggage";
     if (/insurance|protection|medical cover/.test(evidence)) return "insurance";
     if (/meal|vegetarian|food/.test(evidence)) return "meal";
     if (/priority|boarding/.test(evidence)) return "priority_boarding";
+    if (/fare|ticket|saver|flexi|economy light|basic\/plus|basic (?:standard|saver|flexi)|standard fare|continue with standard/.test(evidence)) return "fare_package";
     return "unknown";
   }
 
@@ -1202,8 +1331,10 @@
     component = {},
     capability = {},
     expectedOutcome = {},
-    validationOwnership = {}
+    validationOwnership = {},
+    surfaceOwnership = {}
   } = {}) {
+    surfaceOwnership = surfaceOwnership || {};
     const normalizedRequirement = {
       requirementId: text(requirement.requirementId || requirement.id, 320),
       subjectId: text(requirement.subjectId, 160),
@@ -1248,13 +1379,28 @@
       proof: cloneSerializable(capability.proof || capability.actionability || null),
       recovery: cloneSerializable(capability.recovery || null)
     };
+    const normalizedSurfaceOwnership = {
+      kind: text(surfaceOwnership.kind, 80),
+      status: text(surfaceOwnership.status, 40),
+      observationId: text(surfaceOwnership.observationId, 240),
+      activeSurfaceId: text(surfaceOwnership.activeSurfaceId, 160),
+      activeSurfaceType: text(surfaceOwnership.activeSurfaceType, 80),
+      parentSurfaceId: text(surfaceOwnership.parentSurfaceId, 160),
+      parentControlId: text(surfaceOwnership.parentControlId, 160),
+      parentActuatorId: text(surfaceOwnership.parentActuatorId, 160),
+      operation: text(surfaceOwnership.operation, 60),
+      decisionEpisodeId: text(surfaceOwnership.decisionEpisodeId, 320),
+      parentDecisionGroupId: text(surfaceOwnership.parentDecisionGroupId, 320),
+      proof: cloneSerializable(surfaceOwnership.proof || null)
+    };
     return {
       contractVersion: CONTRACT_VERSION,
       requirement: normalizedRequirement,
       component: normalizedComponent,
       capability: normalizedCapability,
       expectedOutcome: cloneSerializable(expectedOutcome || {}),
-      validationOwnership: cloneSerializable(validationOwnership || {})
+      validationOwnership: cloneSerializable(validationOwnership || {}),
+      surfaceOwnership: normalizedSurfaceOwnership.kind ? normalizedSurfaceOwnership : null
     };
   }
 
@@ -1286,6 +1432,66 @@
     const surface = observation.page?.currentSurface || observation.currentSurface || {};
     const type = text(surface.type || "page", 80).toLowerCase();
     return type === "page" ? "surface-page" : text(surface.id || surface.surfaceId, 160);
+  }
+
+  function parentSurfaceExitOwnershipIsCurrent({ action = {}, pipelineContract = {}, control = {}, observation = {} } = {}) {
+    const ownership = pipelineContract?.surfaceOwnership || {};
+    const expected = action.expectedOutcome || pipelineContract?.expectedOutcome || {};
+    const page = observation.page || observation || {};
+    const surface = page.currentSurface || page.activeSurface || {};
+    const observationId = text(observation.observationId || surface.observationId, 240);
+    const activeSurfaceId = currentSurfaceId(observation.page ? observation : { page });
+    const controlId = text(control.controlId, 160);
+    const targetId = text(action.targetId || action.targetSnapshot?.id, 160);
+    const operation = text(action.operation || pipelineContract?.capability?.operation, 60);
+    if (
+      ownership.kind !== "parent_controls_active_surface"
+      || ownership.status !== "proven"
+      || expected.type !== "active_surface_dismissed"
+      || !/dropdown|listbox|menu|popover|choice/.test(text(`${surface.type || ""} ${surface.surfaceClass || ""}`, 180).toLowerCase())
+      || !["open", "activate"].includes(operation)
+      || !controlId
+      || ownership.parentControlId !== controlId
+      || ownership.parentActuatorId !== targetId
+      || ownership.operation !== operation
+      || ownership.activeSurfaceId !== activeSurfaceId
+      || (ownership.observationId && ownership.observationId !== observationId)
+      || expected.previousSurfaceId !== activeSurfaceId
+      || control.state?.expanded !== true
+    ) return false;
+    if (
+      action.visualRegion?.observationId
+      && text(action.visualRegion.observationId, 240) !== observationId
+    ) return false;
+
+    const declaredParentControlId = text(surface.parentControlId, 160);
+    if (declaredParentControlId && declaredParentControlId !== controlId) return false;
+    const capability = control.operations?.[operation] || null;
+    const executable = capability?.actionability?.executable === true
+      || capability?.actionabilityByActuator?.[targetId]?.executable === true;
+    if (!executable || !(capability?.actuatorIds || []).includes(targetId)) return false;
+
+    const expandedOpeners = (page.controls || []).filter((candidate) => (
+      candidate.state?.expanded === true
+      && /combobox|button/.test(`${candidate.role || ""} ${candidate.kind || ""}`.toLowerCase())
+      && [candidate.operations?.open, candidate.operations?.activate].some((candidateCapability) => (
+        candidateCapability?.actionability?.executable === true
+      ))
+    ));
+    if (expandedOpeners.length !== 1 || expandedOpeners[0].controlId !== controlId) return false;
+
+    const allowedSurfaceIds = new Set([
+      activeSurfaceId,
+      text(ownership.parentSurfaceId, 160),
+      text(control.surfaceId, 160)
+    ].filter(Boolean));
+    const boundSurfaceIds = [
+      action.surfaceId,
+      action.targetSnapshot?.surfaceId,
+      control.surfaceId,
+      action.visualRegion?.surfaceId
+    ].map((value) => text(value, 160)).filter(Boolean);
+    return boundSurfaceIds.every((value) => allowedSurfaceIds.has(value));
   }
 
   function expectedOutcomeIsVerifiable(expectedOutcome = {}) {
@@ -1329,6 +1535,8 @@
       && control.controlId
       && text(pipelineContract.component.controlId, 160) !== text(control.controlId, 160)
     ) return false;
+
+    if (parentSurfaceExitOwnershipIsCurrent({ action, pipelineContract, control, observation })) return true;
 
     const surfaceId = currentSurfaceId(observation);
     const boundSurfaceIds = [
@@ -1455,6 +1663,7 @@
 
   return Object.freeze({
     CONTRACT_VERSION,
+    TERMINAL_EVIDENCE_VERSION,
     CAPABILITY_STATUS,
     INTERACTION_METHOD,
     EXECUTION_LANE,
@@ -1476,9 +1685,11 @@
     serializeObservedControl,
     canonicalPipelineContract,
     normalizeDecisionContract,
+    compileTerminalEvidence,
     compileSemanticCheckout,
     isNormalExecutableContract,
     isBoundedRecoveryContract,
-    classifyExecutionLane
+    classifyExecutionLane,
+    parentSurfaceExitOwnershipIsCurrent
   });
 });

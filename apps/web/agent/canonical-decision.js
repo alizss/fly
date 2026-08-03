@@ -359,12 +359,87 @@ function selectedOutcome(selected = null, transitions = [], controlType = "") {
   return "selected";
 }
 
+function terminalEpisodeCommitment(episode = {}) {
+  return ["committed", "committed_free", "committed_paid", "declined_free"].includes(
+    clean(episode.commitmentPhase).toLowerCase()
+  ) || episode.status === "completed" && Boolean(episode.terminalOutcome);
+}
+
+function episodeOwnsDecision(episode = {}, decisionGroupId = "", subject = {}) {
+  if (!episode || typeof episode !== "object") return false;
+  if (clean(episode.parentDecisionGroupId) === clean(decisionGroupId)) return true;
+  const owner = clean(episode.canonicalOwnerId || episode.decisionInstanceId);
+  const decisionOwner = clean(subject.canonicalOwnerId || subject.decisionInstanceId);
+  return Boolean(owner && decisionOwner && owner === decisionOwner);
+}
+
+function deferredChoiceCommitment({
+  group = {},
+  page = {},
+  subject = {},
+  selected = null,
+  selectedTransition = null,
+  decisionEpisode = null
+} = {}) {
+  const surface = page.currentSurface || {};
+  if (!selected || !selectedTransition?.paid || !surface.type || surface.type === "page") return false;
+  const sourceSurfaceId = clean(selected.surfaceId || group.surfaceId || "surface-page");
+  if (sourceSurfaceId === clean(surface.id)) return false;
+
+  const ownedEpisode = episodeOwnsDecision(decisionEpisode, groupId(group), subject);
+  if (ownedEpisode && terminalEpisodeCommitment(decisionEpisode)) {
+    return clean(decisionEpisode.terminalOutcome?.disposition).toLowerCase() !== "paid";
+  }
+
+  const surfaceEvidence = lower([
+    surface.taskHint,
+    surface.parentSectionType,
+    surface.parentSectionLabel,
+    surface.label,
+    surface.foreground?.progressMarkers?.selectedText,
+    surface.expectedResolution
+  ].filter(Boolean).join(" "));
+  const sameSubject = subject.family === "seat"
+    ? /seat|seating/.test(surfaceEvidence)
+    : subject.family === "baggage"
+      ? /bag|baggage|luggage/.test(surfaceEvidence)
+      : subject.family === "insurance"
+        ? /insurance|protection|cover/.test(surfaceEvidence)
+        : subject.family === "extras"
+          ? /extra|bundle|meal|priority|support|subscription/.test(surfaceEvidence)
+          : false;
+  if (!sameSubject) return false;
+
+  const exactParentSection = clean(surface.parentSectionId)
+    && clean(group.sectionId) === clean(surface.parentSectionId);
+  const matchingSelectedParents = (page.decisionGroups || []).filter((candidateGroup) => {
+    const candidateControls = controlsForGroup(candidateGroup, page);
+    const candidateSubject = exactSubject(candidateGroup, candidateControls);
+    if (candidateSubject.family !== subject.family) return false;
+    const candidateSelected = selectedControl(candidateGroup, candidateControls);
+    if (!candidateSelected) return false;
+    const candidateAlternative = (candidateGroup.alternatives || []).find((option) => (
+      option.controlId === candidateSelected.controlId
+    )) || {};
+    return paid({ ...candidateAlternative, ...candidateSelected });
+  });
+  const uniquePendingParent = matchingSelectedParents.length === 1
+    && groupId(matchingSelectedParents[0]) === groupId(group);
+  if (!exactParentSection && !uniquePendingParent) return false;
+
+  // A selected background opener is presentation state while its exact child
+  // decision remains foreground-owned. Wording may identify the subject, but
+  // it cannot commit a purchase. Only a verified terminal episode can do so.
+  return ownedEpisode || exactParentSection || uniquePendingParent;
+}
+
 function canonicalDecisionForGroup({
   group = {},
   page = {},
   previousCompletion = null,
   userPolicy = {},
-  traveler = {}
+  traveler = {},
+  decisionEpisode = null
 } = {}) {
   const id = groupId(group);
   const controls = controlsForGroup(group, page);
@@ -423,9 +498,28 @@ function canonicalDecisionForGroup({
       ])]
     };
   }
-  const currentOutcome = evidencePaid && !explicitlyFree(selectedTransition || {}) && intent.match !== "exact"
+  const optionPending = deferredChoiceCommitment({
+    group,
+    page,
+    subject,
+    selected,
+    selectedTransition,
+    decisionEpisode
+  });
+  const currentOutcome = optionPending
+    ? "option_pending"
+    : evidencePaid && !explicitlyFree(selectedTransition || {}) && intent.match !== "exact"
     ? "paid_affirmative"
     : selectedOutcome(selected, transitions, controlType);
+  const commitmentPhase = optionPending
+    ? "option_pending"
+    : currentOutcome === "paid_affirmative"
+      ? "committed_paid"
+      : selected && explicitlyFree(selectedTransition || {})
+        ? "declined_free"
+        : selected
+          ? "committed"
+          : "unresolved";
   const required = group.required === true;
   const validation = (page.validationIssues || []).find((issue) => (
     issue.stageWide === true
@@ -502,6 +596,13 @@ function canonicalDecisionForGroup({
     needsAction = true;
     actionReason = "fresh_validation";
     reopenEvidence = { code: "FRESH_VALIDATION_REQUIRES_DECISION", issue: validation };
+  } else if (optionPending) {
+    // The child surface owns the unresolved choice. Keeping the parent out of
+    // the goal queue prevents a disabled/open-intent radio from competing
+    // with the exact Skip/No-thanks actuator in the foreground.
+    status = "pending";
+    needsAction = false;
+    actionReason = "owned_child_choice_pending";
   } else if (paidConflict) {
     status = paidAuthorization ? "blocked" : "conflicted";
     needsAction = true;
@@ -613,9 +714,11 @@ function canonicalDecisionForGroup({
     required,
     optional: !required,
     currentOutcome,
+    commitmentPhase,
     availableTransitions: Object.freeze(transitions),
     priceRisk: Object.freeze({
-      selectedPaid: Boolean(evidencePaid && !explicitlyFree(selectedTransition || {})),
+      selectedPaid: Boolean(commitmentPhase === "committed_paid"),
+      observedPaidIntent: Boolean(evidencePaid && !explicitlyFree(selectedTransition || {})),
       amount: selectedTransition?.price?.amount
         ?? selectedEvidence?.structuredPrice?.amount
         ?? transactionSelection?.priceAmount
@@ -703,7 +806,8 @@ function buildCanonicalDecisions({
   page = {},
   previousCompletions = new Map(),
   userPolicy = {},
-  traveler = {}
+  traveler = {},
+  decisionEpisode = null
 } = {}) {
   const grouped = (page.decisionGroups || []).filter((group) => groupId(group)).map((group) => (
     canonicalDecisionForGroup({
@@ -711,7 +815,8 @@ function buildCanonicalDecisions({
       page,
       previousCompletion: previousCompletions.get(groupId(group)) || null,
       userPolicy,
-      traveler
+      traveler,
+      decisionEpisode
     })
   ));
   const ownedControlIds = new Set(grouped.flatMap((decision) => decision.physicalControlIds));

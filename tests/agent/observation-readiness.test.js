@@ -163,6 +163,45 @@ test("seat loading copy outranks baggage and insurance query parameters until se
   assert.equal(ready.evidence.expectedStage, "seats");
 });
 
+test("blank Kiwi seat destination remains transient when navigation evidence lives in session state", () => {
+  const shell = shellObservation("obs_kiwi_blank_seat_destination");
+  shell.lastActionResult = null;
+  shell.page = {
+    ...shell.page,
+    step: "seats",
+    url: "https://www.kiwi.com/en/booking/?activeStep=2&holdBags=15kg&insurance=0",
+    heading: "Select your seats",
+    text: "Select your seats. Find the most comfortable seats for your group.",
+    controls: [
+      { controlId: "currency", label: "TRY", semantic: "unknown", surfaceId: "surface-page", operations: operation("el_currency") },
+      { controlId: "price", label: "View price breakdown", semantic: "open_surface", surfaceId: "surface-page", operations: operation("el_price") }
+    ],
+    decisionGroups: [],
+    summary: { fields: 0, controls: 2, decisionGroups: 0 },
+    readiness: {
+      documentReadyState: "complete",
+      ariaBusy: false,
+      loadingIndicatorCount: 0,
+      loadingTextEvidence: false,
+      mainTextLength: 64,
+      stableForMs: 350
+    }
+  };
+
+  const readiness = classifyObservationReadiness({
+    observation: shell,
+    navigationContext: {
+      action: { semanticIntent: "advance_checkout_stage", mechanicalEffect: "advance_checkout_stage" },
+      feedback: { navigationOccurred: true, pageChanged: true }
+    }
+  });
+
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.reason, "POST_NAVIGATION_DESTINATION_NOT_READY");
+  assert.equal(readiness.evidence.expectedStage, "seats");
+  assert.equal(readiness.handoffEligible, false);
+});
+
 test("actionable seat confirmation owns readiness over executable background traveler controls", () => {
   const observation = shellObservation("obs_kiwi_seat_confirmation");
   observation.page = {
@@ -255,6 +294,28 @@ test("strong payment evidence is ready even when ordinary payment actions are su
   assert.equal(ready.evidence.strongPaymentEvidence, true);
 });
 
+test("payment route and generic confirmation copy remain a transient shell", () => {
+  const observation = shellObservation("obs_payment_route_shell");
+  observation.page = {
+    ...observation.page,
+    step: "confirmation",
+    url: "https://example.test/rf/payment",
+    heading: "",
+    text: "Booking confirmation and updates will be sent by email.",
+    controls: [],
+    summary: { fields: 0, controls: 0, decisionGroups: 0 },
+    readiness: { documentReadyState: "complete", ariaBusy: false, loadingIndicatorCount: 0, mainTextLength: 58, stableForMs: 400 }
+  };
+  observation.lastActionResult = {
+    feedback: { navigationOccurred: true, pageChanged: true },
+    action: { semanticIntent: "advance_checkout_stage", mechanicalEffect: "advance_checkout_stage" }
+  };
+  const readiness = classifyObservationReadiness({ observation });
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.evidence.strongPaymentEvidence, false);
+  assert.equal(readiness.reason, "POST_NAVIGATION_DESTINATION_NOT_READY");
+});
+
 test("loop returns wait before TaskState reduction and never hands off a transient shell", async () => {
   const state = createCheckoutSessionState({
     goal: "Reach payment review",
@@ -274,6 +335,55 @@ test("loop returns wait before TaskState reduction and never hands off a transie
   assert.equal(result.clientDecision.semanticIntent, "wait_for_ready_observation");
   assert.equal(result.state.status, "running");
   assert.equal(result.state.taskState.sentinel, "preserved_before_ready");
+  assert.equal(result.state.observationReadiness.classification, READINESS.TRANSIENT);
+  assert.equal(result.debug.modelCalled, false);
+});
+
+test("loop reads navigation commitment from durable state when the new observation omits action feedback", async () => {
+  const state = createCheckoutSessionState({
+    goal: "Reach payment review",
+    travelerId: "trav_durable_navigation",
+    site: { host: "kiwi.com", url: "https://www.kiwi.com/en/booking/?activeStep=2" }
+  });
+  state.taskState = { sentinel: "destination_not_reduced" };
+  state.lastAction = {
+    id: "act_advance_to_seats",
+    semanticIntent: "advance_checkout_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    feedback: { navigationOccurred: true, pageChanged: true }
+  };
+  const observation = shellObservation("obs_loop_blank_seat_destination");
+  observation.lastActionResult = null;
+  observation.page = {
+    ...observation.page,
+    step: "seats",
+    url: "https://www.kiwi.com/en/booking/?activeStep=2",
+    heading: "Select your seats",
+    text: "Select your seats. Find the most comfortable seats for your group.",
+    controls: [{
+      controlId: "price",
+      label: "View price breakdown",
+      semantic: "open_surface",
+      surfaceId: "surface-page",
+      operations: operation("el_price")
+    }],
+    decisionGroups: [],
+    summary: { fields: 0, controls: 1, decisionGroups: 0 },
+    readiness: { documentReadyState: "complete", ariaBusy: false, loadingIndicatorCount: 0, mainTextLength: 64, stableForMs: 350 }
+  };
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation,
+    traveler: { id: "trav_durable_navigation" }
+  });
+
+  assert.equal(result.clientDecision.action, "wait");
+  assert.equal(result.clientDecision.semanticIntent, "wait_for_ready_observation");
+  assert.equal(result.state.taskState.sentinel, "destination_not_reduced");
   assert.equal(result.state.observationReadiness.classification, READINESS.TRANSIENT);
   assert.equal(result.debug.modelCalled, false);
 });

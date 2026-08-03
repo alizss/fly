@@ -115,9 +115,19 @@ function operationActionType(operation = "") {
 function intentFor(control = {}, operation = "", goal = {}) {
   const semantic = String(control.semantic || "").toLowerCase();
   const risk = String(control.risk || "").toLowerCase();
+  const meaning = `${semantic} ${risk} ${control.physicalEffect || ""} ${control.label || ""} ${control.accessibleName || ""}`.toLowerCase();
   if (operation === "open") return "open_choice_control";
-  if (/decline|no[_ -]?(?:extra|protection|seat|bag)|without|skip|free|none/.test(`${semantic} ${risk} ${control.label || ""}`.toLowerCase())) return "decline_optional_extra";
-  if (/continue|navigation/.test(`${semantic} ${risk} ${goal.semanticType || ""}`)) return "navigate_stage";
+  if (/decline|no[_ -]?(?:extra|protection|seat|bag)|without|skip|free|none/.test(meaning)) return "decline_optional_extra";
+  // An explicit close/dismiss semantic remains a surface resolution even if
+  // the airline gives that button the same visible label as checkout submit.
+  if (semantic === "dismiss_surface" || /dialog close|close (?:dialog|modal|surface)/.test(String(control.meaning || "").toLowerCase())) {
+    return "resolve_active_surface";
+  }
+  // The exact actuator's forward meaning outranks price or choice semantics
+  // inherited from the surrounding section. This keeps a plain Next/Continue
+  // button navigational without treating arbitrary nearby prose as an action.
+  if (/\b(?:continue|next|proceed|advance)\b|navigation|safe_continue/.test(meaning)) return "navigate_stage";
+  if (/navigation/.test(String(goal.semanticType || "").toLowerCase())) return "navigate_stage";
   if (control.surfaceType && control.surfaceType !== "page") return "resolve_active_surface";
   return "choose_option";
 }
@@ -192,6 +202,12 @@ function isObservedSafeProgressControl(control = {}) {
   return /continue|navigation|advance|next|proceed|dismiss_surface|safe_continue/.test(meaning);
 }
 
+function controlIsCurrentlySelected(control = {}) {
+  return control.selected === true
+    || control.state?.selected === true
+    || control.state?.checked === true;
+}
+
 function controlsForGoal(page = {}, goal = {}) {
   const controls = (page.controls || []).filter((control) => {
     const meaning = `${control.semantic || ""} ${control.semanticType || ""} ${control.meaning || ""}`.toLowerCase();
@@ -199,8 +215,16 @@ function controlsForGoal(page = {}, goal = {}) {
       && optionContractIsCoherent(control)
       && !(/selection[_ -]?cta/.test(meaning) && !control.choiceContract);
   });
+  if (goal.semanticType === "completed_choice_surface") {
+    const exactIds = new Set((goal.actionableControlIds || []).filter(Boolean));
+    return controls.filter((control) => exactIds.has(control.controlId));
+  }
   if (goal.semanticType === "surface_ambiguity" || goal.selectionMode === "ai_ambiguity") {
-    return controls;
+    // Selected values are current state, not executable alternatives. If the
+    // selected outcome still needs confirmation, its child surface owns the
+    // next action; if it is complete, TaskState publishes the exact surface
+    // exit instead of offering the same option again.
+    return controls.filter((control) => !controlIsCurrentlySelected(control));
   }
   const policyAllowedIds = new Set((goal.policyAllowedControlIds || []).filter(Boolean));
   const provenFreeIds = (goal.freeAlternativeControlIds || []).filter((controlId) => (
@@ -269,9 +293,17 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   const surface = currentSurface(page);
   const foreground = surface.type !== "page" ? surface : null;
   const ambiguousControlIds = conflictedControlIds(page);
+  const parentSurfaceControlIds = new Set(
+    goal.semanticType === "completed_choice_surface"
+      ? (goal.actionableControlIds || []).filter(Boolean)
+      : []
+  );
   const controls = controlsForGoal(page, goal).filter((control) => (
     !ambiguousControlIds.has(control.controlId)
-    && controlBelongsToCurrentSurface(control, page)
+    && (
+      controlBelongsToCurrentSurface(control, page)
+      || parentSurfaceControlIds.has(control.controlId)
+    )
   ));
   const raw = [];
   const freeAlternativeIds = new Set((goal.freeAlternativeControlIds || []).filter(Boolean));
@@ -293,6 +325,9 @@ function rawObservationCandidates(observation = {}, goal = {}) {
     });
     for (const { operation, capability, strategy } of usable) {
       if (!["open", "choose", "activate", "keyboard"].includes(operation)) continue;
+      const completesChoiceSurface = goal.semanticType === "completed_choice_surface"
+        && parentSurfaceControlIds.has(control.controlId);
+      if (completesChoiceSurface && !["activate", "open"].includes(operation)) continue;
       const actionability = strategy.proof || capability.actionability || {};
       const visible = actionability.executable === true;
       const actionType = strategy.actionType || operationActionType(operation);
@@ -320,8 +355,39 @@ function rawObservationCandidates(observation = {}, goal = {}) {
             intendedOutcome: "open_correction_surface"
           } : null))
         : null;
-      const opensChoiceControl = opensChoiceControlFor(control, operation);
-      const risk = opensChoiceControl
+      const opensChoiceControl = !completesChoiceSurface && opensChoiceControlFor(control, operation);
+      const candidateIntent = completesChoiceSurface
+        ? "dismiss_completed_choice_surface"
+        : semanticCorrection
+        ? "reconcile_policy_conflict"
+        : interpretedFree
+        ? "decline_optional_extra"
+        : intentFor(control, operation, goal);
+      const physicalEffect = completesChoiceSurface
+        ? "dismiss_surface"
+        : opensChoiceControl
+        ? "open_surface"
+        : semanticCorrection
+        ? (control.physicalEffect || "unknown")
+        : interpretedFree
+        ? "select_free_option"
+        : interpretedPaid
+          ? "select_paid_option"
+          : candidateIntent === "navigate_stage"
+            ? (
+                control.physicalEffect === "advance_checkout_stage"
+                || !foreground
+                || goal.semanticType === "payment_review"
+                  ? "advance_checkout_stage"
+                  : "advance_surface"
+              )
+          : (control.physicalEffect || "");
+      // Keep paid controls as non-selectable diagnostic context. Typed policy
+      // below owns admission to the finite model-selectable candidate set,
+      // even when an airline's price text is unfamiliar or failed to parse.
+      const risk = completesChoiceSurface
+        ? "safe"
+        : opensChoiceControl
         ? "safe"
         : semanticCorrection
         ? "safe"
@@ -333,7 +399,9 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       const rawChoiceLike = /choice|option|radio|checkbox/.test(
         `${control.kind || ""} ${control.role || ""} ${control.semantic || ""}`.toLowerCase()
       );
-      const semantics = semanticCorrection
+      const semantics = completesChoiceSurface
+        ? { interactionRole: "command", semanticEffect: "waive", expectedEvidence: "dismissed" }
+        : semanticCorrection
         ? deriveActionSemantics({ control, operation, type: actionType, goal })
         : !opensChoiceControl && (interpretedFree || interpretedPaid) && rawChoiceLike
         ? { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" }
@@ -343,17 +411,13 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       raw.push({
         candidateId: "",
         semanticGoal: goal.semanticGoal,
-        semantic: opensChoiceControl ? "open_choice_control" : (interpretedFree ? "select_free_option" : (control.semantic || operation)),
-        physicalEffect: opensChoiceControl
-          ? "open_surface"
-          : semanticCorrection
-          ? (control.physicalEffect || "unknown")
-          : interpretedFree
-          ? "select_free_option"
-          : interpretedPaid
-            ? "select_paid_option"
-            : (control.physicalEffect || ""),
-        policyOutcome: semanticCorrection ? "proposed_policy_correction" : (interpretedFree ? "selected_free_option" : (interpretedPaid ? "selected_paid_option" : "selected_policy_allowed_option")),
+        semantic: completesChoiceSurface
+          ? "dismiss_completed_choice_surface"
+          : opensChoiceControl ? "open_choice_control" : (interpretedFree ? "select_free_option" : (control.semantic || operation)),
+        physicalEffect,
+        policyOutcome: completesChoiceSurface
+          ? "completed_decision_surface_dismissed"
+          : semanticCorrection ? "proposed_policy_correction" : (interpretedFree ? "selected_free_option" : (interpretedPaid ? "selected_paid_option" : "selected_policy_allowed_option")),
         intendedOutcome: semanticCorrection?.intendedOutcome || (
           interpretedFree ? (goal.desiredSemanticOutcome || "") : ""
         ),
@@ -378,8 +442,18 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         targetId,
         targetLabel: control.label || control.accessibleName || control.semantic || operation,
         requirementId: goal.requirementId || "",
-        intent: semanticCorrection ? "reconcile_policy_conflict" : (interpretedFree ? "decline_optional_extra" : intentFor(control, operation, goal)),
-        expectedOutcome: semanticCorrection ? {
+        intent: candidateIntent,
+        expectedOutcome: completesChoiceSurface ? {
+          type: "active_surface_dismissed",
+          controlId: control.controlId,
+          decisionGroupId: goal.parentDecisionGroupId || goal.decisionGroupId || "",
+          previousSurfaceId: surface.id || "",
+          surfaceId: surface.id || "",
+          parentDecisionGroupId: goal.parentDecisionGroupId || goal.decisionGroupId || "",
+          parentExpectedSelectedControlId: goal.parentSelectedControlId || "",
+          decisionEpisodeId: goal.decisionEpisodeId || "",
+          mustNotIncreasePrice: true
+        } : semanticCorrection ? {
           type: semanticCorrection.intendedOutcome === "open_correction_surface"
             ? "options_surface_appeared"
             : "policy_conflict_resolved",
@@ -391,7 +465,15 @@ function rawObservationCandidates(observation = {}, goal = {}) {
           beforePriceAmount: Number.isFinite(Number(page.price?.amount)) ? Number(page.price.amount) : null,
           beforePriceText: page.priceText || "",
           mustNotIncreasePrice: true
-        } : null,
+        } : (goal.parentDecisionGroupId && interpretedFree ? {
+          type: "exact_free_option_selected",
+          parentDecisionGroupId: goal.parentDecisionGroupId,
+          parentExpectedSelectedControlId: goal.parentExpectedSelectedControlId || "",
+          decisionEpisodeId: goal.decisionEpisodeId || "",
+          childSurfaceId: surface.id || "",
+          requireChildSurfaceDismissed: true,
+          mustNotIncreasePrice: true
+        } : null),
         risk,
         requiresApproval: ["money", "payment", "legal"].includes(risk) && !paidAuthorization,
         visible,

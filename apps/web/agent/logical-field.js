@@ -153,6 +153,35 @@ function semanticTypesFromLabel(value = "") {
   return matches;
 }
 
+function supportsProfileLabelInference(control = {}, field = {}) {
+  const roleEvidence = [
+    control.role,
+    control.kind,
+    control.type,
+    field.role,
+    field.kind,
+    field.type
+  ].filter(Boolean).join(" ").toLowerCase();
+  const operationEvidence = [
+    ...Object.keys(control.operations || {}),
+    ...Object.keys(field.operations || {}),
+    ...(Array.isArray(control.capabilities) ? control.capabilities : []),
+    ...(Array.isArray(field.capabilities) ? field.capabilities : [])
+  ].join(" ").toLowerCase();
+  if (/textbox|input|textarea|select|combobox|listbox|option|radio|checkbox|spinbutton|date/.test(roleEvidence)) {
+    return true;
+  }
+  if (/type|fill|input|set[_ -]?value|select|choose|toggle|check/.test(operationEvidence)) {
+    return true;
+  }
+  // A command can mention profile concepts in its accessible description,
+  // but an activation-only actuator cannot own a traveler value.
+  if (/button|link/.test(roleEvidence) || /(?:^|\s)activate(?:\s|$)/.test(operationEvidence)) {
+    return false;
+  }
+  return true;
+}
+
 function semanticTypeForControl(control = {}, field = {}) {
   if (
     control.fieldClassification?.source === "direct_non_profile_control"
@@ -204,7 +233,7 @@ function semanticTypeForControl(control = {}, field = {}) {
   if (rawTypes.length === 1) return rawTypes[0];
   if (rawTypes.length > 1) return "";
 
-  if (explicitTypes.length === 1) return explicitTypes[0];
+  if (explicitTypes.length === 1 && supportsProfileLabelInference(control, field)) return explicitTypes[0];
   if (explicitTypes.length > 1) return "";
 
   // Broad fieldset/group text is observation context, not semantic ownership.
@@ -438,24 +467,44 @@ function desiredComponentValue(semanticType = "", role = "", desired = "") {
   return desired;
 }
 
+function validationIssueContradictedByFreshOwner(issue = {}, control = {}) {
+  if (!issue?.controlId || issue.controlId !== control.controlId) return false;
+  const state = control.state || control.controlState || {};
+  const presenceOnly = /\b(?:empty|required|missing|fill|enter|provide)\b/i.test(
+    String(issue.message || issue.text || issue.label || "")
+  );
+  return Boolean(
+    presenceOnly
+    && state.valuePresent === true
+    && state.invalid !== true
+    && !String(state.validationMessage || "").trim()
+  );
+}
+
 function relevantComponentIssues(page = {}, control = {}, logicalFieldId = "", role = "") {
-  return (page.validationIssues || []).filter((issue) => (
-    Boolean(control.controlId && issue.controlId === control.controlId)
-    || Boolean(
-      logicalFieldId
-      && issue.logicalFieldId === logicalFieldId
-      && issue.componentRole
-      && issue.componentRole === role
-    )
-  ));
+  return (page.validationIssues || []).filter((issue) => {
+    const owned = Boolean(control.controlId && issue.controlId === control.controlId)
+      || Boolean(
+        logicalFieldId
+        && issue.logicalFieldId === logicalFieldId
+        && issue.componentRole
+        && issue.componentRole === role
+      );
+    return owned && !validationIssueContradictedByFreshOwner(issue, control);
+  });
 }
 
 function relevantLogicalIssues(page = {}, logicalFieldId = "", controlIds = new Set(), ownerKey = "") {
-  return (page.validationIssues || []).filter((issue) => (
-    Boolean(logicalFieldId && issue.logicalFieldId === logicalFieldId && !issue.componentRole)
-    || Boolean(ownerKey && issue.logicalOwnerKey === ownerKey && !issue.componentRole)
-    || Boolean(issue.controlId && controlIds.has(issue.controlId))
-  ));
+  return (page.validationIssues || []).filter((issue) => {
+    const owned = Boolean(logicalFieldId && issue.logicalFieldId === logicalFieldId && !issue.componentRole)
+      || Boolean(ownerKey && issue.logicalOwnerKey === ownerKey && !issue.componentRole)
+      || Boolean(issue.controlId && controlIds.has(issue.controlId));
+    if (!owned) return false;
+    const control = issue.controlId
+      ? (page.controls || []).find((candidate) => candidate.controlId === issue.controlId) || {}
+      : {};
+    return !validationIssueContradictedByFreshOwner(issue, control);
+  });
 }
 
 function semanticMachineOwner(control = {}, field = {}, semanticType = "") {
@@ -684,7 +733,7 @@ function bindResolvedComponentToCurrentPage(page = {}, resolved = {}) {
   });
   const expectedOutcome = Object.freeze({
     ...(resolved.expectedOutcome || {}),
-    type: "normalized_value_changed",
+    type: "logical_component_committed",
     controlId: resolved.componentBinding?.controlId || resolved.controlId || "",
     expectedNormalizedValue: resolved.desiredValue || resolved.desiredCanonicalValue || "",
     expectedCanonicalValue: resolved.requirementContract?.desiredCanonicalValue
@@ -742,8 +791,13 @@ function expectedOutcomeForComponent({
   const dateCodec = DATE_FIELDS.has(semanticType)
     ? inferDateFieldCodec({ ...field, dateField: control.dateField || field.dateField })
     : null;
+  const interactionKind = interactionKindForControl(control);
   return Object.freeze({
-    type: DATE_FIELDS.has(semanticType) ? "date_value_committed" : "normalized_value_changed",
+    type: DATE_FIELDS.has(semanticType)
+      ? "date_value_committed"
+      : interactionKind === "scalar"
+        ? "normalized_value_changed"
+        : "logical_component_committed",
     logicalFieldId,
     subjectId,
     semanticType,
@@ -753,7 +807,64 @@ function expectedOutcomeForComponent({
     expectedNormalizedValue: desiredValue,
     expectedCanonicalValue: desiredCanonicalValue,
     dateCodec: dateCodec?.ok ? dateCodec : null,
+    interactionKind,
+    commitRequirement: interactionKind === "scalar"
+      ? "normalized_value_retained"
+      : "logical_component_committed",
     validationOwnership
+  });
+}
+
+function interactionKindForControl(control = {}) {
+  const role = String(control.role || control.domRole || "").toLowerCase();
+  const kind = String(control.kind || control.controlKind || "").toLowerCase();
+  if (role === "editable_combobox") return "editable_combobox";
+  if (role === "combobox" || kind === "select") {
+    return control.state?.native === true || kind === "select" && control.role !== "editable_combobox"
+      ? "native_choice"
+      : "custom_choice";
+  }
+  if (control.operations?.open || control.operations?.select || control.recovery?.select) return "custom_choice";
+  return "scalar";
+}
+
+function componentCommitRequirement(control = {}, page = {}) {
+  const interactionKind = interactionKindForControl(control);
+  const surface = authoritativeCurrentSurface(page);
+  const parentOwnsSurface = Boolean(
+    surface?.type
+    && surface.type !== "page"
+    && surface.parentControlId
+    && surface.parentControlId === control.controlId
+  );
+  const foregroundChoiceSurface = Boolean(
+    surface?.type
+    && surface.type !== "page"
+    && (control.state?.expanded === true || parentOwnsSurface)
+  );
+  const activeChoiceSurface = interactionKind !== "scalar" && Boolean(
+    foregroundChoiceSurface
+    || control.commitState?.status === "unsettled"
+  );
+  const commitState = control.commitState || null;
+  const settledCommit = Boolean(
+    commitState
+    && commitState.status === "settled"
+    && commitState.popupClosed !== false
+    && commitState.focusSettled !== false
+  );
+  const interactionSettled = interactionKind === "scalar"
+    ? true
+    : commitState
+      ? settledCommit
+      : !activeChoiceSurface;
+  return Object.freeze({
+    interactionKind,
+    commitRequirement: interactionKind === "scalar"
+      ? "normalized_value_retained"
+      : "logical_component_committed",
+    activeChoiceSurface,
+    interactionSettled
   });
 }
 
@@ -942,7 +1053,7 @@ function resolveLogicalFields(page = {}, profile = {}) {
         validationOwnership
       });
       const commitState = control.commitState || null;
-      const interactionSettled = !commitState || commitState.status === "settled";
+      const commitment = componentCommitRequirement(control, page);
       return Object.freeze({
         semanticType: componentSemanticType,
         role,
@@ -964,8 +1075,11 @@ function resolveLogicalFields(page = {}, profile = {}) {
         bindingContract: Object.freeze(bindingContract),
         requirementContract,
         commitState,
-        interactionSettled,
-        status: desiredValue && currentValue === desiredValue && validationIssues.length === 0 && interactionSettled
+        interactionKind: commitment.interactionKind,
+        commitRequirement: commitment.commitRequirement,
+        activeChoiceSurface: commitment.activeChoiceSurface,
+        interactionSettled: commitment.interactionSettled,
+        status: desiredValue && currentValue === desiredValue && validationIssues.length === 0 && commitment.interactionSettled
           ? "resolved"
           : "pending",
         validationIssues: Object.freeze(validationIssues),

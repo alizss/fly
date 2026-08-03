@@ -61,7 +61,10 @@ const {
   applyAuthoritativeOutcomeToRequirements,
   contextForPublishedGoal
 } = require("./task-action-context");
-const { reduceTaskState } = require("./task-state-reducer");
+const {
+  reduceTaskState,
+  verifiedCommerceObligationFromActionResult
+} = require("./task-state-reducer");
 const { prepareTransactionInvariants } = require("./invariants");
 const { READINESS, classifyObservationReadiness } = require("./observation-readiness");
 const {
@@ -1829,6 +1832,7 @@ function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) 
   let pendingAction = normalizePendingAction(state.pendingAction);
   let attemptedCandidateIds = [...(state.attemptedCandidateIds || [])];
   let verifiedResults = [...(state.verifiedResults || [])];
+  const verifiedCommerceObligations = [...(state.verifiedCommerceObligations || [])];
   const result = observation.lastActionResult || {};
 
   if (pendingAction?.originalAction?.id && result.actionId === pendingAction.originalAction.id) {
@@ -1880,10 +1884,37 @@ function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) 
     pendingAction,
     attemptedCandidateIds,
     verifiedResults,
+    verifiedCommerceObligations,
     activeSkillPlan: undefined,
     blockedObligation: undefined,
     policySnapshot: undefined,
     invariantBaseline: undefined
+  });
+}
+
+// Snapshot narrowly verified commerce evidence before lifecycle evaluation is
+// allowed to rewrite the result for parent-task planning. This function does
+// not clear pending actions, publish goals, or infer profile completion; those
+// responsibilities remain in recordPreviousActionFacts after transition.
+function recordRawVerifiedCommerceReceipt(state = {}, observation = {}) {
+  const receipt = verifiedCommerceObligationFromActionResult(
+    observation.lastActionResult || null,
+    observation.observationId || "",
+    {
+      taskState: state.taskState || {},
+      decisionEpisode: state.taskState?.decisionEpisode || null,
+      currentGoal: state.taskState?.currentGoal || null
+    }
+  );
+  if (!receipt) return state;
+  const previous = Array.isArray(state.verifiedCommerceObligations)
+    ? state.verifiedCommerceObligations
+    : [];
+  return withUpdate(state, {
+    verifiedCommerceObligations: [
+      ...previous.filter((entry) => entry?.actionId !== receipt.actionId),
+      receipt
+    ].slice(-120)
   });
 }
 
@@ -1988,7 +2019,10 @@ async function runLoopTurn({
       }, latency, modelUsageFromMetas(model, []))
     };
   }
-  const transactionContext = prepareTransactionInvariants(state, observation, traveler);
+  // Immutable local evidence must cross the boundary before lifecycle status
+  // can classify the parent checkout as progressed/blocked/achieved.
+  state = recordRawVerifiedCommerceReceipt(state, observation);
+  let transactionContext = prepareTransactionInvariants(state, observation, traveler);
   state = transactionContext.state;
   transactionStore?.saveSession?.(state);
   // Readiness is evaluated before transition closure. A URL change or an
@@ -1997,6 +2031,12 @@ async function runLoopTurn({
   const observationReadiness = classifyObservationReadiness({
     observation,
     previousReadiness: state.observationReadiness || {},
+    navigationContext: {
+      action: state.lastAction || state.pendingAction?.originalAction || null,
+      feedback: observation.lastActionResult?.feedback || state.lastAction?.feedback || null,
+      result: observation.lastActionResult || null,
+      lifecycle: state.actionLifecycle || null
+    },
     readinessDeadlineAt: Number(
       observation.destinationReadiness?.deadlineAt
       || state.actionLifecycle?.destinationReadiness?.deadlineAt
@@ -2310,6 +2350,7 @@ async function runLoopTurn({
     },
     observation,
     previousActionResult: observation.lastActionResult || null,
+    verifiedCommerceObligations: state.verifiedCommerceObligations || [],
     userPolicy: effectiveUserPolicy,
     traveler,
     transactionReview: transactionContext.review,
@@ -2320,6 +2361,34 @@ async function runLoopTurn({
       paymentPreference: traveler.payment_preference || state.userPolicy?.paymentPreference || ""
     }
   });
+  // A freshly verified decision is committed by TaskState before transaction
+  // reconciliation consumes it. Re-run the pure invariant compiler once when
+  // that journal changes so the same turn cannot reach payment review with an
+  // empty or one-turn-late outcome ledger.
+  const previousJournalIdentity = JSON.stringify((state.taskState?.outcomeJournal || [])
+    .map((entry) => `${entry.decisionInstanceId || ""}:${entry.outcome || entry.disposition || ""}`));
+  const nextJournalIdentity = JSON.stringify((taskState.outcomeJournal || [])
+    .map((entry) => `${entry.decisionInstanceId || ""}:${entry.outcome || entry.disposition || ""}`));
+  if (previousJournalIdentity !== nextJournalIdentity) {
+    state = withUpdate(state, { taskState });
+    transactionContext = prepareTransactionInvariants(state, observation, traveler);
+    state = transactionContext.state;
+    taskState = reduceTaskState({
+      previousTaskState: taskState,
+      observation,
+      previousActionResult: observation.lastActionResult || null,
+      verifiedCommerceObligations: state.verifiedCommerceObligations || [],
+      userPolicy: effectiveUserPolicy,
+      traveler,
+      transactionReview: transactionContext.review,
+      blockedProfileGoalKeys,
+      parentObjective: {
+        goal: state.goal || "Complete this checkout safely to payment review.",
+        bookingRules: traveler.booking_rules || state.userPolicy?.bookingRules || "",
+        paymentPreference: traveler.payment_preference || state.userPolicy?.paymentPreference || ""
+      }
+    });
+  }
   if (taskState.clearObsoleteRecovery) {
     blockedProfileGoalKeys = [];
     state = withUpdate(state, {
@@ -2785,7 +2854,12 @@ async function runLoopTurn({
   const publishedProfileGoal = taskState.currentGoal?.kind === "profile_field"
     ? taskState.currentGoal
     : null;
-  if (profileReadiness.profileStage && !profileReadiness.ready && !publishedProfileGoal) {
+  if (
+    taskState.terminalStatus === "active"
+    && profileReadiness.profileStage
+    && !profileReadiness.ready
+    && !publishedProfileGoal
+  ) {
     const missing = profileReadiness.missingUserData || [];
     const blockedReasonCode = String(
       profileReadiness.blockedReasonCode
@@ -3223,6 +3297,7 @@ async function runLoopTurn({
       previousTaskState: taskState,
       observation,
       previousActionResult: observation.lastActionResult || null,
+      verifiedCommerceObligations: canonicalState.verifiedCommerceObligations || [],
       userPolicy: effectiveUserPolicy,
       traveler,
       transactionReview: transactionContext.review,
@@ -3942,6 +4017,7 @@ module.exports = {
     observationPageStateHash,
     targetLocalRecoveryScope,
     persistentBlockedProfileGoalKeys,
+    recordRawVerifiedCommerceReceipt,
     failedStrategySignaturesForGoal,
     groundedObservationCandidateSet,
     groundedObservationCandidates,

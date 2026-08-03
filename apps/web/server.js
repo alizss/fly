@@ -528,6 +528,8 @@ function compactSurface(surface = {}) {
     surfaceClass: clampText(surface.surfaceClass || "unknown", 40),
     blocksBackground: Boolean(surface.blocksBackground),
     parentSurfaceId: clampText(surface.parentSurfaceId, 80),
+    parentControlId: clampText(surface.parentControlId, 140),
+    parentElementId: clampText(surface.parentElementId, 80),
     observationId: clampText(surface.observationId, 120),
     memberControlIds: [...new Set(surfaceMembers.map((id) => clampText(id, 140)).filter(Boolean))],
     memberActuatorIds: [...new Set(surfaceActuators.map((id) => clampText(id, 80)).filter(Boolean))],
@@ -849,6 +851,7 @@ function compactTransactionFactEvidence(entry = null) {
   return {
     source: clampText(entry.source || "unknown", 80),
     ownerKey: clampText(entry.ownerKey, 180),
+    qualification: clampText(entry.qualification, 80),
     observationId: clampText(entry.observationId, 120),
     confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0)),
     authoritative: entry.authoritative === true
@@ -922,6 +925,30 @@ function compactTransactionFacts(facts = null) {
           confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0))
         })).slice(0, 20)
       : []
+  };
+}
+
+function compactTerminalEvidence(evidence = null) {
+  if (!evidence || typeof evidence !== "object") return null;
+  const compiled = agentContract.compileTerminalEvidence({ terminalEvidence: evidence });
+  const signals = compiled.signals || {};
+  const signalStates = compiled.signalStates || {};
+  return {
+    contractVersion: clampText(compiled.contractVersion, 80),
+    stage: clampText(compiled.stage, 80),
+    signals: Object.fromEntries(Object.entries(signals).map(([key, value]) => [clampText(key, 40), value === true])),
+    signalStates: Object.fromEntries(Object.entries(signalStates).map(([key, value]) => [clampText(key, 40), clampText(value, 20)])),
+    signalCount: Number(compiled.signalCount || 0),
+    boundaryObserved: compiled.boundaryObserved === true,
+    verified: compiled.verified === true,
+    evidenceOnly: true,
+    paymentCredentialKinds: Array.isArray(compiled.paymentCredentialKinds)
+      ? compiled.paymentCredentialKinds.map((kind) => clampText(kind, 60)).slice(0, 12)
+      : [],
+    evidenceSources: Array.isArray(compiled.evidenceSources)
+      ? compiled.evidenceSources.map((source) => clampText(source, 80)).slice(0, 16)
+      : [],
+    capabilities: { paymentActionsAllowed: false }
   };
 }
 
@@ -1084,6 +1111,7 @@ function compactAgentPayload(rawBody) {
         aliasConflictCount: Number(page.graphIntegrity.aliasConflictCount || 0),
         aliasConflicts: Array.isArray(page.graphIntegrity.aliasConflicts) ? page.graphIntegrity.aliasConflicts.slice(0, 20) : []
       } : null,
+      terminalEvidence: compactTerminalEvidence(page.terminalEvidence),
       transactionFacts: compactTransactionFacts(page.transactionFacts),
       priceText: clampText(page.priceText, 80),
       price: page.price && typeof page.price === "object" ? page.price : null,

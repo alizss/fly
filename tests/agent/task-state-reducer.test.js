@@ -1,7 +1,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
+const {
+  reduceTaskState,
+  verifiedCommerceObligationFromActionResult
+} = require("../../apps/web/agent/task-state-reducer");
 const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
 
 function readyTransactionReview() {
@@ -1369,7 +1372,16 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
         url: "https://example.test/checkout/payment",
         text: "Payment details. Choose payment method. Total to pay 208 EUR.",
         currentSurface: { id: "surface-page", type: "page" },
-        controls: [control("card", { semantic: "card_number" })],
+        controls: [
+          control("card", { semantic: "card_number" }),
+          {
+            ...control("pay", { label: "Pay", semantic: "submit_purchase" }),
+            role: "button",
+            kind: "button",
+            accessibleName: "Pay secure booking e-mail confirmation",
+            capabilities: ["activate"]
+          }
+        ],
         foreground: { progressMarkers: { payment: "current" } },
         decisionGroups: []
       }
@@ -1379,6 +1391,7 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
   assert.equal(state.stage, "payment");
   assert.equal(state.terminalStatus, "payment_review_reached");
   assert.equal(state.currentGoal, null);
+  assert.equal(state.profileReadiness.ready, true);
   assert.deepEqual(state.goal, { id: "reach_payment_review", status: "completed" });
   assert.equal(state.paymentEvidence.observed, true);
   assert.equal(state.paymentEvidence.signalCount >= 3, true);
@@ -1845,4 +1858,1061 @@ test("seat-map traveler rows never become free-seat candidates", () => {
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["next_leg"]);
   assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "traveler_row").selectable, false);
   assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "paid_seat_1e").selectable, false);
+});
+
+test("one decision episode closes a selected parent dropdown after child confirmation without reselecting it", () => {
+  const traveler = { booking_rules: "No paid extras" };
+  const parentDecisionGroupId = "flexible_ticket";
+  const freeOption = control("flex_none", {
+    surfaceId: "flex_options",
+    surfaceType: "dropdown",
+    decisionGroupId: parentDecisionGroupId,
+    label: "None of the passengers 0 EUR",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline",
+    structuredPrice: { amount: 0, currency: "EUR" },
+    kind: "option",
+    role: "option"
+  });
+  freeOption.operations = { choose: capability("choose", "flex_none_node") };
+  const paidOption = control("flex_all", {
+    surfaceId: "flex_options",
+    surfaceType: "dropdown",
+    decisionGroupId: parentDecisionGroupId,
+    label: "All passengers 16 EUR",
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: { amount: 16, currency: "EUR" },
+    kind: "option",
+    role: "option"
+  });
+  paidOption.operations = { choose: capability("choose", "flex_all_node") };
+  const parentGroup = (selected = false) => ({
+    decisionGroupId: parentDecisionGroupId,
+    requirementId: "extras:flexible_ticket",
+    surfaceId: "flex_options",
+    surfaceType: "dropdown",
+    sectionType: "extras",
+    sectionLabel: "Flexible Ticket",
+    required: true,
+    status: selected ? "satisfied" : "missing",
+    selectedControlId: selected ? "flex_none" : "",
+    selectedLabel: selected ? "None of the passengers 0 EUR" : "",
+    selectedSemantic: selected ? "decline_paid_extra" : "",
+    alternatives: [
+      { ...freeOption, selected },
+      { ...paidOption, selected: false }
+    ]
+  });
+  const dropdownObservation = (id, selected = false) => ({
+    observationId: id,
+    observationSnapshot: { snapshotHash: `hash_${id}` },
+    page: {
+      step: "traveler_information",
+      currentSurface: {
+        id: "flex_options",
+        type: "dropdown",
+        surfaceClass: "choice_set",
+        label: "All passengers 16 EUR None of the passengers 0 EUR",
+        memberControlIds: ["flex_all", "flex_none"]
+      },
+      controls: [
+        { ...freeOption, selected, state: { ...(freeOption.state || {}), selected } },
+        paidOption,
+        ...(selected ? [control("flex_opener", {
+          surfaceId: "surface-page",
+          decisionGroupId: parentDecisionGroupId,
+          label: "None of the passengers",
+          semantic: "required_dropdown_choice",
+          risk: "safe_decline",
+          state: { expanded: true, normalizedValue: "none of the passengers" }
+        })] : [])
+      ],
+      decisionGroups: [parentGroup(selected)],
+      validationIssues: []
+    }
+  });
+
+  const parentState = reduceTaskState({
+    observation: dropdownObservation("obs_flex_parent"),
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+  assert.equal(parentState.currentGoal.decisionGroupId, parentDecisionGroupId);
+  assert.equal(parentState.decisionEpisode.status, "active");
+
+  const declineChild = control("flex_decline_confirm", {
+    surfaceId: "flex_confirm",
+    surfaceType: "popover",
+    decisionGroupId: "flexible_ticket_confirmation",
+    label: "I'll go without",
+    semantic: "decline_paid_extra",
+    physicalEffect: "dismiss_surface",
+    risk: "safe_decline"
+  });
+  const childObservation = {
+    observationId: "obs_flex_child",
+    observationSnapshot: { snapshotHash: "hash_obs_flex_child" },
+    page: {
+      step: "traveler_information",
+      currentSurface: {
+        id: "flex_confirm",
+        type: "popover",
+        label: "Flexible Ticket confirmation",
+        memberControlIds: ["flex_decline_confirm"]
+      },
+      controls: [declineChild],
+      decisionGroups: [{
+        decisionGroupId: "flexible_ticket_confirmation",
+        requirementId: "extras:flexible_ticket_confirmation",
+        surfaceId: "flex_confirm",
+        surfaceType: "popover",
+        sectionType: "extras",
+        sectionLabel: "Flexible Ticket confirmation",
+        required: true,
+        status: "missing",
+        selectedControlId: "",
+        alternatives: [declineChild]
+      }],
+      validationIssues: []
+    }
+  };
+  const childState = reduceTaskState({
+    previousTaskState: parentState,
+    observation: childObservation,
+    previousActionResult: {
+      dispatched: true,
+      verified: false,
+      feedback: { surfaceChanged: true },
+      action: { decisionGroupId: parentDecisionGroupId, controlId: "flex_none" }
+    },
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+  assert.equal(childState.currentGoal.decisionGroupId, "flexible_ticket_confirmation");
+  assert.equal(childState.currentGoal.parentDecisionGroupId, parentDecisionGroupId);
+  assert.equal(childState.currentGoal.decisionEpisodeId, parentState.decisionEpisode.episodeId);
+
+  const completedObservation = dropdownObservation("obs_flex_completed", true);
+  const completedState = reduceTaskState({
+    previousTaskState: childState,
+    observation: completedObservation,
+    previousActionResult: {
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      action: {
+        decisionGroupId: "flexible_ticket_confirmation",
+        controlId: "flex_decline_confirm",
+        affordance: {
+          physicalEffect: "dismiss_surface",
+          task: {
+            decisionEpisodeId: childState.decisionEpisode.episodeId,
+            decisionInstanceId: childState.decisionEpisode.decisionInstanceId,
+            parentDecisionGroupId,
+            decisionGroupId: "flexible_ticket_confirmation"
+          }
+        }
+      }
+    },
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+  assert.equal(completedState.decisionEpisode.status, "completed_pending_surface_exit");
+  assert.equal(completedState.outcomeJournal.length, 1);
+  assert.equal(completedState.outcomeJournal[0].decisionInstanceId, parentState.decisionEpisode.decisionInstanceId);
+  assert.equal(completedState.currentGoal.semanticType, "completed_choice_surface");
+  const candidates = buildCurrentCandidateSet({
+    goal: completedState.currentGoal,
+    observation: completedObservation,
+    traveler,
+    state: { taskState: completedState, approvals: {} }
+  });
+  assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["flex_opener"]);
+  assert.equal(candidates.candidates[0].physicalEffect, "dismiss_surface");
+  assert.equal(candidates.candidates.some((candidate) => candidate.controlId === "flex_none"), false);
+
+  const closedObservation = dropdownObservation("obs_flex_closed", true);
+  closedObservation.page.currentSurface = {
+    id: "surface-page",
+    type: "page",
+    surfaceClass: "page",
+    label: "Traveller information",
+    memberControlIds: []
+  };
+  closedObservation.page.controls = closedObservation.page.controls.map((entry) => (
+    entry.controlId === "flex_opener"
+      ? { ...entry, state: { ...(entry.state || {}), expanded: false } }
+      : entry
+  ));
+  const journalState = reduceTaskState({
+    previousTaskState: completedState,
+    observation: closedObservation,
+    previousActionResult: {
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      action: {
+        decisionEpisodeId: completedState.decisionEpisode.episodeId,
+        parentDecisionGroupId,
+        decisionGroupId: parentDecisionGroupId,
+        controlId: "flex_opener"
+      }
+    },
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+  assert.equal(journalState.decisionEpisode.status, "completed");
+  assert.equal(journalState.outcomeJournal.length, 1);
+  assert.equal(journalState.outcomeJournal[0].originKind, "verified_commerce_decision");
+  assert.equal(journalState.outcomeJournal[0].verified, true);
+});
+
+test("explicit child identity cannot inherit a stale fallback episode when the exact completed parent returns", () => {
+  const traveler = { booking_rules: "No paid extras" };
+  const parentDecisionGroupId = "dg_flexible_ticket";
+  const surfaceId = "flex_options";
+  const free = control("flex_none", {
+    surfaceId,
+    surfaceType: "dropdown",
+    decisionGroupId: parentDecisionGroupId,
+    label: "None of the passengers \u202AEUR0.00\u202C 0.00 Euro",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline",
+    structuredPrice: { amount: 0, currency: "EUR" },
+    kind: "option",
+    role: "option",
+    selected: true,
+    state: { selected: true }
+  });
+  free.operations = { choose: capability("choose", "flex_none_node") };
+  const paid = control("flex_all", {
+    surfaceId,
+    surfaceType: "dropdown",
+    decisionGroupId: parentDecisionGroupId,
+    label: "All passengers \u202AEUR37.95\u202C 37.95 Euro",
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: { amount: 37.95, currency: "EUR" },
+    kind: "option",
+    role: "option"
+  });
+  paid.operations = { choose: capability("choose", "flex_all_node") };
+  const opener = control("flex_opener", {
+    surfaceId: "surface-page",
+    decisionGroupId: parentDecisionGroupId,
+    label: "Select one option * None of the passengers",
+    semantic: "required_dropdown_choice",
+    risk: "safe_decline",
+    state: { expanded: true, normalizedValue: "none of the passengers" }
+  });
+  const observation = {
+    observationId: "obs_live_prefix_currency_parent_return",
+    observationSnapshot: { snapshotHash: "hash_live_prefix_currency_parent_return" },
+    page: {
+      step: "traveler_information",
+      currentSurface: {
+        id: surfaceId,
+        type: "dropdown",
+        surfaceClass: "choice_set",
+        label: "All passengers \u202AEUR37.95\u202C None of the passengers \u202AEUR0.00\u202C",
+        memberControlIds: ["flex_all", "flex_none"]
+      },
+      controls: [free, paid, opener],
+      decisionGroups: [{
+        decisionGroupId: parentDecisionGroupId,
+        requirementId: "extras:flexible_ticket",
+        surfaceId,
+        surfaceType: "dropdown",
+        sectionType: "passenger",
+        sectionLabel: "Flexible Ticket",
+        required: true,
+        status: "satisfied",
+        selectedControlId: free.controlId,
+        selectedLabel: free.label,
+        selectedSemantic: free.semantic,
+        alternatives: [free, paid]
+      }],
+      validationIssues: []
+    }
+  };
+  const staleEpisode = {
+    episodeId: "traveler_information:extras:extras",
+    decisionInstanceId: "extras:extras",
+    canonicalOwnerId: "extras:extras",
+    family: "extras",
+    subjectKey: "extras",
+    parentDecisionGroupId: "extras:extras",
+    status: "awaiting_child_confirmation",
+    commitmentPhase: "option_pending",
+    selectedControlId: "",
+    surfacePath: ["page|unknown|traveler_information", "popover|unknown|flexible ticket confirmation"],
+    segmentOutcomes: []
+  };
+  const previousTaskState = {
+    decisionEpisode: staleEpisode,
+    currentGoal: {
+      goalId: "obs_child:goal:flexible_confirmation",
+      decisionInstanceId: "child_flexible_confirmation",
+      decisionGroupId: "dg_flexible_confirmation",
+      semanticType: "extras_choice",
+      surfaceId: "flex_confirm"
+    }
+  };
+  const state = reduceTaskState({
+    previousTaskState,
+    observation,
+    previousActionResult: {
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      mechanicalEffect: "select_free_option",
+      expectedOutcome: {
+        type: "exact_free_option_selected",
+        decisionGroupId: "dg_flexible_confirmation",
+        expectedSelectedControlId: "flex_decline_confirm"
+      },
+      action: {
+        decisionInstanceId: "child_flexible_confirmation",
+        decisionGroupId: "dg_flexible_confirmation",
+        controlId: "flex_decline_confirm",
+        mechanicalEffect: "select_free_option",
+        affordance: {
+          physicalEffect: "select_free_option",
+          task: {
+            decisionInstanceId: "child_flexible_confirmation",
+            decisionGroupId: "dg_flexible_confirmation"
+          }
+        }
+      }
+    },
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+
+  assert.equal(state.decisionEpisode.parentDecisionGroupId, parentDecisionGroupId);
+  assert.equal(state.decisionEpisode.status, "completed_pending_surface_exit");
+  assert.equal(state.currentGoal.semanticType, "completed_choice_surface");
+  assert.deepEqual(state.currentGoal.actionableControlIds, ["flex_opener"]);
+  const candidateSet = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    traveler,
+    state: { taskState: state, approvals: {} }
+  });
+  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["flex_opener"]);
+  assert.equal(candidateSet.contextCapabilities.some((candidate) => (
+    candidate.controlId === "flex_all" && candidate.selectable === true
+  )), false);
+});
+
+test("verified nested action lineage journals same-label sibling extras under distinct canonical owners", () => {
+  const traveler = { booking_rules: "No paid extras" };
+  const ancillaryObservation = (id, decisionGroupId, selected = false) => {
+    const free = control(`${decisionGroupId}_none`, {
+      decisionGroupId,
+      label: "None of the passengers 0 EUR",
+      semantic: "decline_paid_extra",
+      physicalEffect: "select_free_option",
+      risk: "safe_decline",
+      structuredPrice: { amount: 0, currency: "EUR" },
+      kind: "option",
+      role: "option",
+      selected
+    });
+    free.operations = { choose: capability("choose", `${decisionGroupId}_none_node`) };
+    const paid = control(`${decisionGroupId}_all`, {
+      decisionGroupId,
+      label: "All passengers 13 EUR",
+      semantic: "add_paid_extra",
+      physicalEffect: "select_paid_option",
+      risk: "money",
+      structuredPrice: { amount: 13, currency: "EUR" },
+      kind: "option",
+      role: "option"
+    });
+    paid.operations = { choose: capability("choose", `${decisionGroupId}_all_node`) };
+    return {
+      observationId: id,
+      observationSnapshot: { snapshotHash: `hash_${id}` },
+      page: {
+        step: "traveler_information",
+        currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Traveller information" },
+        controls: [free, paid],
+        decisionGroups: [{
+          decisionGroupId,
+          requirementId: "contact:select-an-option",
+          surfaceId: "surface-page",
+          surfaceType: "page",
+          sectionType: "extras",
+          sectionLabel: "Select an option",
+          required: true,
+          status: selected ? "satisfied" : "missing",
+          selectedControlId: selected ? free.controlId : "",
+          selectedLabel: selected ? free.label : "",
+          selectedSemantic: selected ? free.semantic : "",
+          alternatives: [{ ...free, selected }, paid]
+        }],
+        validationIssues: []
+      }
+    };
+  };
+  const commitSibling = (previousTaskState, groupId, suffix) => {
+    const active = reduceTaskState({
+      previousTaskState: { ...previousTaskState, decisionEpisode: null, currentGoal: null },
+      observation: ancillaryObservation(`obs_${suffix}_active`, groupId),
+      userPolicy: { bookingRules: traveler.booking_rules },
+      traveler
+    });
+    const actionResult = {
+      actionId: `act_${suffix}_none`,
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      mechanicalEffect: "select_free_option",
+      expectedOutcome: {
+        type: "exact_free_option_selected",
+        decisionGroupId: groupId,
+        expectedSelectedControlId: `${groupId}_none`
+      },
+      action: {
+        id: `act_${suffix}_none`,
+        controlId: `${groupId}_none`,
+        decisionGroupId: groupId,
+        mechanicalEffect: "select_free_option",
+        affordance: {
+          physicalEffect: "select_free_option",
+          task: {
+            decisionEpisodeId: active.decisionEpisode.episodeId,
+            decisionInstanceId: active.decisionEpisode.decisionInstanceId,
+            parentDecisionGroupId: groupId,
+            decisionGroupId: groupId
+          }
+        }
+      }
+    };
+    const receipt = verifiedCommerceObligationFromActionResult(
+      actionResult,
+      `obs_${suffix}_selected`,
+      { decisionEpisode: active.decisionEpisode }
+    );
+    return reduceTaskState({
+      previousTaskState: active,
+      verifiedCommerceObligations: [
+        ...(previousTaskState.verifiedCommerceObligations || []),
+        receipt
+      ],
+      observation: ancillaryObservation(`obs_${suffix}_selected`, groupId, true),
+      previousActionResult: actionResult,
+      userPolicy: { bookingRules: traveler.booking_rules },
+      traveler
+    });
+  };
+
+  const airhelp = commitSibling({}, "dg_airhelp", "airhelp");
+  assert.equal(airhelp.outcomeJournal.length, 1);
+  const sms = commitSibling(airhelp, "dg_sms", "sms");
+  assert.equal(sms.outcomeJournal.length, 2);
+  assert.equal(new Set(sms.outcomeJournal.map((entry) => entry.decisionInstanceId)).size, 2);
+  assert.deepEqual(sms.outcomeJournal.map((entry) => entry.decisionGroupId).sort(), ["dg_airhelp", "dg_sms"]);
+  assert.equal(sms.outcomeCoverage.expectedDecisionInstanceIds.length, 2);
+  assert.equal(sms.outcomeCoverage.missingJournalDecisionInstanceIds.length, 0);
+});
+
+test("a verified commerce result is journaled even when its transient episode is absent", () => {
+  const traveler = { booking_rules: "No paid extras" };
+  const decisionGroupId = "dg_airhelp";
+  const free = control("airhelp_none", {
+    decisionGroupId,
+    label: "No thanks AirHelp",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline",
+    kind: "radio",
+    role: "radio",
+    selected: true,
+    state: { checked: true, selected: true }
+  });
+  free.operations = { choose: capability("choose", "airhelp_none_node") };
+  const paid = control("airhelp_paid", {
+    decisionGroupId,
+    label: "Add AirHelp — 10 EUR",
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: { amount: 10, currency: "EUR" },
+    kind: "radio",
+    role: "radio"
+  });
+  paid.operations = { choose: capability("choose", "airhelp_paid_node") };
+  const observation = {
+    observationId: "obs_airhelp_verified_without_episode",
+    observationSnapshot: { snapshotHash: "airhelp_verified_without_episode" },
+    page: {
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Traveller information" },
+      controls: [free, paid],
+      decisionGroups: [{
+        decisionGroupId,
+        requirementId: "contact:select-an-option",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionType: "extras",
+        sectionLabel: "AirHelp",
+        required: false,
+        status: "satisfied",
+        selectedControlId: free.controlId,
+        selectedLabel: free.label,
+        selectedSemantic: free.semantic,
+        alternatives: [{ ...free, selected: true }, paid]
+      }],
+      validationIssues: []
+    }
+  };
+  const decisionInstanceId = "traveler_information:extras:airhelp:dg_airhelp:global";
+  const state = reduceTaskState({
+    // This is the live failure shape: browser verification has the exact
+    // owner, but the reducer has no surviving decisionEpisode to reconstruct.
+    previousTaskState: { decisionEpisode: null, currentGoal: null },
+    observation,
+    previousActionResult: {
+      actionId: "act_airhelp_verified",
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      mechanicalEffect: "select_free_option",
+      expectedOutcome: {
+        type: "exact_free_option_selected",
+        decisionGroupId,
+        expectedSelectedControlId: free.controlId,
+        expectedSelectedLabel: free.label,
+        expectedDisposition: "decline_free_no_extra"
+      },
+      action: {
+        id: "act_airhelp_verified",
+        controlId: free.controlId,
+        decisionGroupId,
+        mechanicalEffect: "select_free_option",
+        affordance: {
+          physicalEffect: "select_free_option",
+          task: {
+            decisionInstanceId,
+            canonicalOwnerId: decisionInstanceId,
+            parentDecisionGroupId: decisionGroupId,
+            decisionGroupId,
+            requirementId: "contact:select-an-option"
+          }
+        }
+      }
+    },
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+
+  assert.equal(state.outcomeJournal.length, 1);
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, decisionInstanceId);
+  assert.equal(state.outcomeJournal[0].admissionSource, "verified_action_contract");
+  // Direct journal admission is useful backward-compatible evidence, but it
+  // is not allowed to manufacture an expected obligation. Production loop
+  // accounting establishes expectations from the raw receipt register.
+  assert.deepEqual(state.outcomeCoverage.expectedDecisionInstanceIds, []);
+  assert.deepEqual(state.outcomeCoverage.missingJournalDecisionInstanceIds, []);
+  assert.deepEqual(state.outcomeCoverage.missingLedgerDecisionInstanceIds, []);
+  assert.equal(state.outcomeCoverage.complete, true);
+});
+
+test("a verified commerce receipt remains an expected obligation after the source page is gone", () => {
+  const decisionGroupId = "dg_lost_bundle";
+  const decisionInstanceId = "traveler_information:extras:bundle:dg_lost_bundle:global";
+  const actionResult = {
+    actionId: "act_lost_bundle_decline",
+    dispatched: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    mechanicalEffect: "select_free_option",
+    expectedOutcome: {
+      type: "exact_free_option_selected",
+      decisionGroupId,
+      expectedSelectedControlId: "bundle_none",
+      expectedSelectedLabel: "No thanks",
+      expectedDisposition: "decline_free_no_extra"
+    },
+    action: {
+      id: "act_lost_bundle_decline",
+      controlId: "bundle_none",
+      decisionGroupId,
+      mechanicalEffect: "select_free_option",
+      affordance: {
+        physicalEffect: "select_free_option",
+        task: {
+          decisionInstanceId,
+          canonicalOwnerId: decisionInstanceId,
+          parentDecisionGroupId: decisionGroupId,
+          decisionGroupId,
+          semanticType: "decline_bundle"
+        }
+      }
+    }
+  };
+  const receipt = verifiedCommerceObligationFromActionResult(actionResult, "obs_bundle_selected");
+  const state = reduceTaskState({
+    // The next page no longer contains the bundle and there is no action
+    // result left to replay. The independently persisted receipt must still
+    // enter the journal and block terminal certification until ledgered.
+    previousTaskState: { decisionEpisode: null, currentGoal: null },
+    verifiedCommerceObligations: [receipt],
+    observation: {
+      observationId: "obs_after_bundle_rerender",
+      observationSnapshot: { snapshotHash: "after_bundle_rerender" },
+      page: {
+        step: "seat_selection",
+        currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Seat selection" },
+        controls: [],
+        decisionGroups: [],
+        validationIssues: []
+      }
+    }
+  });
+
+  assert.equal(state.outcomeJournal.length, 1);
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, decisionInstanceId);
+  assert.equal(state.outcomeJournal[0].admissionSource, "verified_action_obligation");
+  assert.deepEqual(state.outcomeCoverage.expectedActionIds, ["act_lost_bundle_decline"]);
+  assert.deepEqual(state.outcomeCoverage.missingActionIds, ["act_lost_bundle_decline"]);
+  assert.equal(state.outcomeCoverage.complete, false);
+});
+
+test("one verified action cannot create duplicate receipt and direct journal owners", () => {
+  const canonicalOwnerId = "traveler_information:extras:flexible_ticket:dg_flexible:global";
+  const transientOwnerId = JSON.stringify({
+    stage: "traveler_information",
+    surface: "flexible ticket dropdown",
+    decisionGroup: "dg_flexible"
+  });
+  const result = {
+    actionId: "act_flexible_none",
+    dispatched: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    mechanicalEffect: "select_free_option",
+    decisionInstanceId: transientOwnerId,
+    expectedOutcome: {
+      type: "exact_free_option_selected",
+      decisionGroupId: "dg_flexible",
+      expectedSelectedControlId: "flexible_none",
+      expectedSelectedLabel: "None of the passengers",
+      expectedDisposition: "decline_free_no_extra"
+    },
+    action: {
+      id: "act_flexible_none",
+      decisionInstanceId: transientOwnerId,
+      decisionGroupId: "dg_flexible",
+      controlId: "flexible_none",
+      targetLabel: "None of the passengers",
+      mechanicalEffect: "select_free_option",
+      affordance: {
+        physicalEffect: "select_free_option",
+        task: {
+          canonicalOwnerId,
+          decisionInstanceId: canonicalOwnerId,
+          parentDecisionGroupId: "dg_flexible",
+          decisionGroupId: "dg_flexible",
+          semanticType: "flexible_ticket"
+        }
+      }
+    }
+  };
+  const receipt = verifiedCommerceObligationFromActionResult(result, "obs_flexible");
+  const state = reduceTaskState({
+    previousTaskState: { decisionEpisode: null, currentGoal: null },
+    verifiedCommerceObligations: [receipt],
+    previousActionResult: result,
+    observation: {
+      observationId: "obs_after_flexible",
+      observationSnapshot: { snapshotHash: "after_flexible" },
+      lastActionResult: result,
+      page: {
+        step: "traveler_information",
+        currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Traveler" },
+        controls: [],
+        decisionGroups: [],
+        validationIssues: []
+      }
+    }
+  });
+
+  assert.equal(state.outcomeJournal.length, 1);
+  assert.equal(state.outcomeJournal[0].actionId, "act_flexible_none");
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, canonicalOwnerId);
+  assert.equal(state.outcomeJournal[0].admissionSource, "verified_action_obligation");
+  assert.deepEqual(state.outcomeCoverage.expectedDecisionInstanceIds, [canonicalOwnerId]);
+  assert.equal(state.outcomeCoverage.expectedDecisionInstanceIds.includes(transientOwnerId), false);
+});
+
+test("a stale page episode cannot own the next sibling receipt while its exact foreground child can", () => {
+  const staleEpisode = {
+    episodeId: "episode_airhelp",
+    decisionInstanceId: "owner_airhelp",
+    canonicalOwnerId: "owner_airhelp",
+    parentDecisionGroupId: "dg_airhelp",
+    childSurfaceId: "surface-page",
+    family: "extras",
+    subjectKey: "airhelp"
+  };
+  const exactResult = ({
+    actionId,
+    owner,
+    decisionGroupId,
+    label,
+    surfaceId = "surface-page"
+  }) => ({
+    actionId,
+    dispatched: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    mechanicalEffect: "select_free_option",
+    expectedOutcome: {
+      type: "exact_free_option_selected",
+      decisionGroupId,
+      surfaceId,
+      expectedSelectedControlId: `${decisionGroupId}_none`,
+      expectedSelectedLabel: label,
+      expectedDisposition: "decline_free_no_extra"
+    },
+    action: {
+      id: actionId,
+      controlId: `${decisionGroupId}_none`,
+      decisionGroupId,
+      targetLabel: label,
+      mechanicalEffect: "select_free_option",
+      affordance: {
+        physicalEffect: "select_free_option",
+        task: {
+          canonicalOwnerId: owner,
+          decisionInstanceId: owner,
+          decisionEpisodeId: `episode_${decisionGroupId}`,
+          parentDecisionGroupId: decisionGroupId,
+          decisionGroupId,
+          semanticType: decisionGroupId
+        }
+      }
+    }
+  });
+  const baggage = verifiedCommerceObligationFromActionResult(
+    exactResult({
+      actionId: "act_baggage_none",
+      owner: "owner_baggage",
+      decisionGroupId: "dg_baggage",
+      label: "No thanks baggage"
+    }),
+    "obs_baggage",
+    { decisionEpisode: staleEpisode }
+  );
+  assert.equal(baggage.decisionInstanceId, "owner_baggage");
+  assert.notEqual(baggage.decisionInstanceId, staleEpisode.canonicalOwnerId);
+
+  const parentEpisode = {
+    ...staleEpisode,
+    episodeId: "episode_flexible",
+    decisionInstanceId: "owner_flexible",
+    canonicalOwnerId: "owner_flexible",
+    parentDecisionGroupId: "dg_flexible",
+    childSurfaceId: "surface_flexible_confirmation",
+    subjectKey: "flexible_ticket"
+  };
+  const child = verifiedCommerceObligationFromActionResult(
+    exactResult({
+      actionId: "act_flexible_confirm_none",
+      owner: "transient_confirmation_owner",
+      decisionGroupId: "dg_flexible_confirmation",
+      label: "I'll go without",
+      surfaceId: "surface_flexible_confirmation"
+    }),
+    "obs_flexible_confirmation",
+    { decisionEpisode: parentEpisode }
+  );
+  assert.equal(child.decisionInstanceId, "owner_flexible");
+  assert.equal(child.decisionGroupId, "dg_flexible");
+});
+
+test("a compact verified result resolves its exact commerce owner from the result target snapshot", () => {
+  const traveler = { booking_rules: "No paid extras" };
+  const decisionGroupId = "dg_compact_airhelp";
+  const free = control("compact_airhelp_none", {
+    decisionGroupId,
+    label: "No thanks AirHelp",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline",
+    kind: "radio",
+    role: "radio",
+    selected: true,
+    state: { checked: true, selected: true }
+  });
+  free.operations = { choose: capability("choose", "compact_airhelp_none_node") };
+  const paid = control("compact_airhelp_paid", {
+    decisionGroupId,
+    label: "Add AirHelp — 10 EUR",
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: { amount: 10, currency: "EUR" },
+    kind: "radio",
+    role: "radio"
+  });
+  const decisionInstanceId = "traveler_information:extras:airhelp:dg_compact_airhelp:global";
+  const state = reduceTaskState({
+    previousTaskState: { decisionEpisode: null, currentGoal: null },
+    observation: {
+      observationId: "obs_compact_airhelp_verified",
+      observationSnapshot: { snapshotHash: "compact_airhelp_verified" },
+      page: {
+        step: "traveler_information",
+        currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Traveller information" },
+        controls: [free, paid],
+        decisionGroups: [{
+          decisionGroupId,
+          requirementId: "extras:airhelp",
+          surfaceId: "surface-page",
+          surfaceType: "page",
+          sectionType: "extras",
+          sectionLabel: "AirHelp",
+          required: false,
+          status: "satisfied",
+          selectedControlId: free.controlId,
+          selectedLabel: free.label,
+          selectedSemantic: free.semantic,
+          alternatives: [{ ...free, selected: true }, paid]
+        }],
+        validationIssues: []
+      }
+    },
+    // This mirrors the transport shape from a real browser result: planning
+    // metadata is compacted off action, while the exact resolved target and
+    // canonical task contract remain present.
+    previousActionResult: {
+      actionId: "act_compact_airhelp_verified",
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      mechanicalEffect: "select_free_option",
+      targetSnapshot: { controlId: free.controlId, decisionGroupId },
+      expectedOutcome: {
+        type: "exact_free_option_selected",
+        expectedSelectedControlId: free.controlId,
+        expectedSelectedLabel: free.label,
+        expectedDisposition: "decline_free_no_extra"
+      },
+      action: {
+        id: "act_compact_airhelp_verified",
+        controlId: free.controlId,
+        mechanicalEffect: "select_free_option",
+        affordance: {
+          physicalEffect: "select_free_option",
+          task: { decisionInstanceId, canonicalOwnerId: decisionInstanceId, decisionGroupId }
+        }
+      }
+    },
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+
+  assert.equal(state.outcomeJournal.length, 1);
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, decisionInstanceId);
+  assert.equal(state.outcomeJournal[0].subjectKey, "extras_airhelp");
+  assert.deepEqual(state.outcomeCoverage.expectedDecisionInstanceIds, []);
+});
+
+test("a stale completed-extra episode cannot block its visible sibling queue", () => {
+  const traveler = { booking_rules: "No paid extras" };
+  const safeChoice = (decisionGroupId, label, selected = false) => {
+    const free = control(`${decisionGroupId}_none`, {
+      decisionGroupId,
+      label: `No thanks ${label}`,
+      semantic: "decline_paid_extra",
+      physicalEffect: "select_free_option",
+      risk: "safe_decline",
+      kind: "radio",
+      role: "radio",
+      selected,
+      state: { checked: selected, selected }
+    });
+    free.operations = { choose: capability("choose", `${decisionGroupId}_none_node`) };
+    const paid = control(`${decisionGroupId}_paid`, {
+      decisionGroupId,
+      label: `Add ${label} — 10 EUR`,
+      semantic: "add_paid_extra",
+      physicalEffect: "select_paid_option",
+      risk: "money",
+      structuredPrice: { amount: 10, currency: "EUR" },
+      kind: "radio",
+      role: "radio"
+    });
+    paid.operations = { choose: capability("choose", `${decisionGroupId}_paid_node`) };
+    return {
+      decisionGroupId,
+      requirementId: "contact:select-an-option",
+      surfaceId: "surface-page",
+      surfaceType: "page",
+      sectionType: "extras",
+      sectionLabel: "Select an option",
+      required: true,
+      status: selected ? "satisfied" : "missing",
+      selectedControlId: selected ? free.controlId : "",
+      selectedLabel: selected ? free.label : "",
+      selectedSemantic: selected ? free.semantic : "",
+      alternatives: [{ ...free, selected }, paid],
+      controls: [free, paid]
+    };
+  };
+  const bankruptcy = safeChoice("dg_bankruptcy", "bankruptcy protection", true);
+  const airhelp = safeChoice("dg_airhelp", "AirHelp");
+  const sms = safeChoice("dg_sms", "SMS updates");
+  const observation = {
+    observationId: "obs_gotogate_after_first_decline",
+    observationSnapshot: { snapshotHash: "gotogate_after_first_decline" },
+    page: {
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Traveller information" },
+      controls: [
+        ...bankruptcy.controls,
+        ...airhelp.controls,
+        ...sms.controls
+      ],
+      decisionGroups: [bankruptcy, airhelp, sms],
+      validationIssues: []
+    }
+  };
+  const staleBundleEpisode = {
+    episodeId: "traveler_information:bundle",
+    decisionInstanceId: "bundle-owner",
+    canonicalOwnerId: "bundle-owner",
+    family: "extras",
+    subjectKey: "bundle",
+    parentDecisionGroupId: "dg_bundle",
+    requirementId: "bundle:add-a-bundle",
+    status: "blocked_cycle",
+    commitmentPhase: "option_pending",
+    semanticOutcomeKey: "satisfied|bundle_none|",
+    surfacePath: ["page|unknown|traveller information"],
+    cycleCount: 2,
+    cycleDetected: true
+  };
+  const state = reduceTaskState({
+    previousTaskState: { decisionEpisode: staleBundleEpisode, currentGoal: { decisionGroupId: "dg_bundle" } },
+    // This is the malformed lineage from the live regression: the actual
+    // action selected bankruptcy, but an old bundle episode was carried too.
+    previousActionResult: {
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      action: {
+        decisionEpisodeId: staleBundleEpisode.episodeId,
+        parentDecisionGroupId: "dg_bundle",
+        decisionGroupId: "dg_bankruptcy",
+        controlId: "dg_bankruptcy_none"
+      }
+    },
+    observation,
+    userPolicy: { bookingRules: traveler.booking_rules },
+    traveler
+  });
+
+  assert.equal(state.ambiguityReason, "");
+  assert.equal(state.currentGoal.decisionGroupId, "dg_airhelp");
+  assert.notEqual(state.currentGoal.decisionEpisodeId, staleBundleEpisode.episodeId);
+  assert.equal(state.currentGoal.parentDecisionGroupId, "dg_airhelp");
+  assert.ok(state.activeDecisions.some((decision) => decision.decisionGroupId === "dg_sms"));
+});
+
+test("payment review remains active until every verified decision is present in the transaction ledger", () => {
+  const decisionInstanceId = "traveler_information:extras:airhelp:dg_airhelp:global";
+  const outcome = {
+    decisionGroupId: "dg_airhelp",
+    decisionInstanceId,
+    decisionOwnerKey: decisionInstanceId,
+    canonicalOwnerId: decisionInstanceId,
+    originKind: "verified_commerce_decision",
+    verified: true,
+    family: "extras",
+    subjectKey: "airhelp",
+    label: "No thanks",
+    disposition: "declined",
+    outcome: "declined",
+    priceAmount: 0,
+    currency: "EUR"
+  };
+  const paymentObservation = {
+    observationId: "obs_payment_coverage",
+    observationSnapshot: { snapshotHash: "hash_payment_coverage" },
+    page: {
+      url: "https://example.test/payment",
+      step: "payment",
+      heading: "Payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Payment" },
+      controls: [],
+      decisionGroups: [],
+      terminalEvidence: {
+        contractVersion: "terminal-evidence/v1",
+        stage: "payment_review",
+        signals: { route: true, progress: true, form: true, method: true, heading: true },
+        signalCount: 5,
+        boundaryObserved: true,
+        verified: true,
+        evidenceOnly: true,
+        capabilities: { paymentActionsAllowed: false }
+      },
+      validationIssues: []
+    }
+  };
+  const previousTaskState = {
+    verifiedCommerceObligations: [{
+      actionId: "act_airhelp_none",
+      decisionGroupId: "dg_airhelp",
+      decisionInstanceId,
+      decisionOwnerKey: decisionInstanceId,
+      canonicalOwnerId: decisionInstanceId,
+      originKind: "verified_commerce_obligation",
+      verified: true
+    }],
+    outcomeJournal: [outcome],
+    outcomeCoverage: {
+      expectedDecisionInstanceIds: [decisionInstanceId],
+      journaledDecisionInstanceIds: [decisionInstanceId],
+      ledgeredDecisionInstanceIds: [],
+      missingDecisionInstanceIds: [decisionInstanceId],
+      complete: false
+    }
+  };
+  const blocked = reduceTaskState({
+    previousTaskState,
+    observation: paymentObservation,
+    transactionReview: readyTransactionReview()
+  });
+  assert.equal(blocked.terminalStatus, "active");
+  assert.equal(blocked.transactionReview.ready, false);
+  assert.ok(blocked.transactionReview.missingFacts.includes("verified_decision_outcomes"));
+
+  const accepted = reduceTaskState({
+    previousTaskState,
+    observation: paymentObservation,
+    transactionReview: { ...readyTransactionReview(), outcomeLedger: [outcome] }
+  });
+  assert.equal(accepted.terminalStatus, "payment_review_reached");
+  assert.equal(accepted.transactionReview.ready, true);
+  assert.equal(accepted.outcomeCoverage.complete, true);
 });

@@ -1128,6 +1128,28 @@ test("price history is observation evidence and approval is checked only at cost
   }, state, { booking_rules: "Decline all paid extras" }, {});
   assert.equal(costAdding.allow, false);
 
+  const typedPaidEffectWithoutParsedPrice = evaluateActionPolicy({
+    ...ordinaryAdvance,
+    intent: "resolve_active_surface",
+    mechanicalEffect: "select_paid_option",
+    physicalEffect: "select_paid_option",
+    risk: "uncertain",
+    affordance: {
+      physicalEffect: "select_paid_option",
+      structuredPrice: null
+    },
+    targetSnapshot: {
+      ...ordinaryAdvance.targetSnapshot,
+      controlId: "ctrl_paid_prefix_currency",
+      semantic: "choice",
+      physicalEffect: "select_paid_option",
+      risk: "uncertain",
+      structuredPrice: null
+    }
+  }, state, { booking_rules: "Decline all paid extras" }, {});
+  assert.equal(typedPaidEffectWithoutParsedPrice.allow, false);
+  assert.equal(typedPaidEffectWithoutParsedPrice.decision, "deny");
+
   const finalPayment = evaluateActionPolicy({
     ...ordinaryAdvance,
     intent: "submit_payment",

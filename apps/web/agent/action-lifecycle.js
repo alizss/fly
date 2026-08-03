@@ -356,6 +356,18 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
 function transitionResult(result = {}, transition = null) {
   if (!transition) return { ...result, failureCode: canonicalFailureCode(result) };
   const interveningMutation = transition.causality?.classification === "intervening_external_mutation";
+  // One action can finish its exact local obligation while the durable parent
+  // objective merely progresses to another decision. Keep those facts
+  // separate: parent progress must never erase a browser-proven local outcome
+  // before the journal/ledger consumes it.
+  const localPostconditionSatisfied = transition.postcondition?.satisfied === true
+    || transition.currentObligationResult?.completed === true;
+  const localOutcomeVerified = localPostconditionSatisfied
+    && (
+      transition.localMechanicalResult?.verified === true
+      || transition.localEffect?.verified === true
+      || transition.physicalResult?.verified === true
+    );
   return {
     ...result,
     failureCode: interveningMutation
@@ -375,10 +387,15 @@ function transitionResult(result = {}, transition = null) {
     parentProgress: transition.parentProgress || null,
     taskOutcome: transition.taskOutcome || "",
     taskOutcomeCompleted: (transition.durableObjectiveProgress || transition.parentProgress)?.completed === true,
+    taskProgressStatus: transition.status,
+    localPostconditionSatisfied,
+    localExpectedOutcomeObserved: localPostconditionSatisfied,
+    localOutcomeVerified,
+    browserReportedVerified: result.verified === true,
     completionAuthority: "task_state",
-    postconditionSatisfied: transition.status === "achieved",
-    expectedOutcomeObserved: transition.status === "achieved",
-    verified: transition.status === "achieved"
+    postconditionSatisfied: localPostconditionSatisfied,
+    expectedOutcomeObserved: localPostconditionSatisfied,
+    verified: localOutcomeVerified
   };
 }
 
@@ -552,7 +569,27 @@ function advanceActionLifecycle({
       directive = "advance_goal";
     } else if (transition.status === "progressed") {
       recovery = updateRecoveryState(state, { kind: "meaningful_progress", code });
-      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, awaitingDestination: false, destinationReadiness: observationReadiness, transitionStatus: "progressed", resultCode: code };
+      lifecycle = {
+        ...lifecycle,
+        status: "observed",
+        dispatched: true,
+        observed,
+        verified: false,
+        localOutcomeVerified: (
+          transition.postcondition?.satisfied === true
+          || transition.currentObligationResult?.completed === true
+        ) && (
+          transition.localMechanicalResult?.verified === true
+          || transition.localEffect?.verified === true
+          || transition.physicalResult?.verified === true
+        ),
+        closed: true,
+        awaitingClarification: false,
+        awaitingDestination: false,
+        destinationReadiness: observationReadiness,
+        transitionStatus: "progressed",
+        resultCode: code
+      };
       directive = "rebuild_candidates";
     } else if (transition.status === "blocked") {
       const rebuildFromCurrentState = transition.nextDirective === "rebuild_task_state";

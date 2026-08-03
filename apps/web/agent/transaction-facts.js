@@ -1,4 +1,5 @@
 const { buildCanonicalDecisions } = require("./canonical-decision");
+const { normalizeProfileFieldType } = require("./logical-field");
 
 const TRANSACTION_CONTRACT_VERSION = "transaction-facts/v1";
 const COMMERCE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
@@ -37,6 +38,7 @@ function normalizeFactEvidence(entry = null, fallbackObservationId = "") {
   return {
     source: text(entry.source || "unknown", 80),
     ownerKey: text(entry.ownerKey, 180),
+    qualification: text(entry.qualification, 80),
     observationId: text(entry.observationId || fallbackObservationId, 120),
     confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0)),
     authoritative: entry.authoritative === true
@@ -58,10 +60,36 @@ function canonicalSubjectKey(extra = {}) {
   return explicit || semanticToken(extra.label, 100) || "selection";
 }
 
+function canonicalDecisionOwnerKey(extra = {}) {
+  const owner = semanticToken(
+    extra.decisionOwnerKey || extra.decisionInstanceId || extra.ownerKey,
+    300
+  );
+  return owner.length <= 96
+    ? owner
+    : `${owner.slice(0, 47).replace(/_+$/, "")}_${owner.slice(-48).replace(/^_+/, "")}`;
+}
+
+function isProfileSelection(extra = {}) {
+  const sourceKind = semanticToken(extra.sourceKind || extra.originKind || extra.selectionKind, 60);
+  const fieldType = normalizeProfileFieldType(
+    extra.profileFieldType || extra.fieldType || extra.semanticType,
+  );
+  return sourceKind === "profile_field" || Boolean(fieldType);
+}
+
 function canonicalOutcomeKey(extra = {}) {
   const family = text(extra.family || extra.subjectFamily, 40).toLowerCase();
   if (!COMMERCE_FAMILIES.has(family)) return "";
-  return `${family}:${canonicalSubjectKey(extra)}`;
+  const subjectKey = canonicalSubjectKey(extra);
+  const base = `${family}:${subjectKey}`;
+  const ownerKey = canonicalDecisionOwnerKey(extra);
+  // Extras are open-ended and frequently share presentation labels such as
+  // "Select an option". Their semantic owner is therefore part of identity.
+  // Closed families retain their established canonical reconciliation keys.
+  return family === "extras" && ownerKey
+    ? `${family}:${semanticToken(subjectKey, 60)}:${ownerKey}`
+    : base;
 }
 
 function normalizeCompleteness(value, segments = []) {
@@ -81,7 +109,9 @@ const RESERVED_ROUTE_ENDPOINTS = new Set([
 function normalizedRouteEndpoint(value = "") {
   const endpoint = text(value, 80).toUpperCase();
   const tokens = normalizedText(endpoint, 80).split(/\s+/).filter(Boolean);
+  const nonTravelMeaning = /\b(?:adult|child|children|infant|teen|passengers?|age|aged|years?|months?|over|under|younger|older|kg|kgs|kilograms?|lb|lbs|pounds?|cm|centimet(?:er|re)s?|dimensions?)\b/i;
   if (!endpoint || !tokens.length) return "";
+  if (/\d/.test(endpoint) || tokens.length > 8 || nonTravelMeaning.test(endpoint)) return "";
   if (tokens.every((token) => RESERVED_ROUTE_ENDPOINTS.has(token))) return "";
   return endpoint;
 }
@@ -102,13 +132,68 @@ function normalizeSegment(segment = {}, index = 0) {
   };
 }
 
+function routeEvidenceAuthoritative(evidence = null) {
+  if (evidence?.authoritative !== true) return false;
+  if (evidence.source !== "bounded_checkout_route") return true;
+  return [
+    "semantic_route_owner",
+    "airport_code_pair",
+    "owned_travel_date",
+    "persistent_checkout_route"
+  ].includes(evidence.qualification);
+}
+
+function canonicalizeSegments(rawSegments = []) {
+  return rawSegments.reduce((segments, segment) => {
+    const duplicateIndex = segments.findIndex((candidate) => (
+      candidate.origin === segment.origin
+      && candidate.destination === segment.destination
+      && (
+        candidate.departureDate === segment.departureDate
+        || !candidate.departureDate
+        || !segment.departureDate
+      )
+    ));
+    if (duplicateIndex < 0) {
+      segments.push(segment);
+      return segments;
+    }
+    const existing = segments[duplicateIndex];
+    const existingDetail = [existing.departureDate, existing.departureTime, existing.arrivalTime, existing.flightNumber].filter(Boolean).length;
+    const incomingDetail = [segment.departureDate, segment.departureTime, segment.arrivalTime, segment.flightNumber].filter(Boolean).length;
+    const preferred = incomingDetail > existingDetail ? segment : existing;
+    const secondary = preferred === segment ? existing : segment;
+    segments[duplicateIndex] = {
+      ...secondary,
+      ...preferred,
+      departureDate: preferred.departureDate || secondary.departureDate || "",
+      departureTime: preferred.departureTime || secondary.departureTime || "",
+      arrivalTime: preferred.arrivalTime || secondary.arrivalTime || "",
+      flightNumber: preferred.flightNumber || secondary.flightNumber || ""
+    };
+    return segments;
+  }, []);
+}
+
 function normalizeExtra(extra = {}, currency = "") {
   const family = text(extra.family || extra.subjectFamily, 40).toLowerCase();
-  if (!COMMERCE_FAMILIES.has(family)) return null;
+  if (!COMMERCE_FAMILIES.has(family) || isProfileSelection(extra)) return null;
   const subjectKey = canonicalSubjectKey({ ...extra, family });
+  const decisionOwnerKey = canonicalDecisionOwnerKey(extra);
+  const canonicalKey = canonicalOutcomeKey({ ...extra, family, subjectKey, decisionOwnerKey });
+  const sourceKind = text(extra.sourceKind || extra.originKind, 60);
   return {
     decisionGroupId: text(extra.decisionGroupId, 140),
-    outcomeKey: text(extra.outcomeKey || `${family}:${subjectKey}`, 180),
+    ...(extra.decisionInstanceId ? { decisionInstanceId: text(extra.decisionInstanceId, 220) } : {}),
+    ...(decisionOwnerKey ? { decisionOwnerKey } : {}),
+    ...(extra.canonicalOwnerId ? { canonicalOwnerId: text(extra.canonicalOwnerId, 220) } : {}),
+    ...(sourceKind ? { sourceKind } : {}),
+    outcomeKey: text(
+      family === "extras" && decisionOwnerKey
+        ? canonicalKey
+        : extra.outcomeKey || canonicalKey,
+      180
+    ),
     family,
     subjectKey,
     label: family === "fare"
@@ -117,8 +202,39 @@ function normalizeExtra(extra = {}, currency = "") {
     disposition: text(extra.disposition || extra.semantic, 80),
     outcome: text(extra.outcome || extra.semanticOutcome || extra.disposition || extra.semantic, 80),
     priceAmount: number(extra.priceAmount),
-    currency: text(extra.currency || currency, 20).toUpperCase()
+    currency: text(extra.currency || currency, 20).toUpperCase(),
+    ...(extra.verified === true ? { verified: true } : {})
   };
+}
+
+function durableCommerceSelections(selections = []) {
+  return (Array.isArray(selections) ? selections : []).filter((entry) => {
+    const sourceKind = semanticToken(entry?.sourceKind || entry?.originKind, 60);
+    if (sourceKind === "profile_field" || isProfileSelection(entry)) return false;
+    if (sourceKind === "commerce_decision") return false;
+    if (sourceKind === "verified_commerce_decision") return entry?.verified === true;
+    // Untyped rows are retained only for compatibility with authoritative
+    // transaction-fact producers (fare/bag/review summaries). They are page
+    // evidence, not inferred canonical-control selections.
+    return !sourceKind;
+  });
+}
+
+function decisionOwnsProfileField(decision = {}, page = {}) {
+  const ownedIds = new Set([
+    decision.selectedControlId,
+    ...(decision.physicalControlIds || [])
+  ].filter(Boolean));
+  if (!ownedIds.size) return false;
+  return (page.controls || []).some((control) => (
+    ownedIds.has(control.controlId)
+    && control.fieldClassification?.source !== "direct_non_profile_control"
+    && Boolean(normalizeProfileFieldType(
+      control.fieldClassification?.fieldType
+      || control.profileFieldType
+      || control.fieldType
+    ))
+  ));
 }
 
 function mergeCommerceSelections(...collections) {
@@ -146,19 +262,39 @@ function mergeCommerceSelections(...collections) {
 }
 
 function commerceSelectionsFromPage(page = {}, state = {}, traveler = {}) {
+  const decisionEpisode = state.taskState?.decisionEpisode || state.decisionEpisode || null;
   const decisions = buildCanonicalDecisions({
     page,
     userPolicy: state.userPolicy || {},
-    traveler
+    traveler,
+    decisionEpisode
   });
   return decisions
     .filter((decision) => (
       COMMERCE_FAMILIES.has(String(decision.family || decision.subject?.family || "").toLowerCase())
+      && !decisionOwnsProfileField(decision, page)
       && decision.currentState?.selected === true
       && decision.currentState?.selectedLabel
+      // Opening a nested paid-product chooser is intent, not transaction
+      // evidence. Only a committed child outcome may enter selectedExtras.
+      && !["intent_opened", "option_pending", "unresolved"].includes(decision.commitmentPhase)
+      && !(
+        decisionEpisode
+        && (
+          String(decisionEpisode.parentDecisionGroupId || "") === String(decision.decisionGroupId || "")
+          || (
+            decisionEpisode.canonicalOwnerId
+            && String(decisionEpisode.canonicalOwnerId) === String(decision.canonicalOwnerId || "")
+          )
+        )
+      )
     ))
     .map((decision) => normalizeExtra({
       decisionGroupId: decision.decisionGroupId || decision.decisionId,
+      decisionInstanceId: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
+      decisionOwnerKey: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
+      canonicalOwnerId: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
+      sourceKind: "commerce_decision",
       family: decision.family || decision.subject?.family,
       subjectKey: decision.subject?.key,
       label: decision.currentState.selectedLabel,
@@ -169,6 +305,30 @@ function commerceSelectionsFromPage(page = {}, state = {}, traveler = {}) {
     }))
     .filter(Boolean)
     .slice(0, 40);
+}
+
+function commerceSelectionsFromJournal(state = {}) {
+  const journal = state.taskState?.outcomeJournal || state.outcomeJournal || [];
+  return (Array.isArray(journal) ? journal : [])
+    .filter((entry) => (
+      entry?.verified === true
+      && entry?.originKind === "verified_commerce_decision"
+      && entry?.decisionInstanceId
+    ))
+    .map((entry) => normalizeExtra(entry, entry.currency || ""))
+    .filter(Boolean);
+}
+
+function commerceSelectionFromEpisode(state = {}) {
+  const episode = state.taskState?.decisionEpisode || state.decisionEpisode || null;
+  if (
+    !episode?.terminalOutcome
+    || episode.status !== "completed"
+    || episode.outcomeVerified !== true
+    || episode.terminalOutcome.verified !== true
+  ) return [];
+  const normalized = normalizeExtra(episode.terminalOutcome, episode.terminalOutcome.currency || "");
+  return normalized ? [normalized] : [];
 }
 
 function normalizeTraveler(entry = {}) {
@@ -198,15 +358,15 @@ function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {
   const evidenceContractPresent = raw.evidenceMode === "typed" || evidenceEntries.length > 0;
   const rawSegments = Array.isArray(raw.itinerary?.segments) ? raw.itinerary.segments : [];
   const itineraryEvidence = Array.isArray(raw.factEvidence?.itinerary) ? raw.factEvidence.itinerary : [];
-  const segments = rawSegments
+  const segments = canonicalizeSegments(rawSegments
     .map((segment, index) => normalizeSegment({
       ...segment,
       evidence: segment.evidence || itineraryEvidence.find((entry) => entry?.segmentId === segment.segmentId) || null
     }, index))
     .filter((segment) => segment.origin && segment.destination)
     .filter((segment) => evidenceContractPresent
-      ? segment.evidence?.authoritative === true
-      : segment.evidence == null || segment.evidence.authoritative === true);
+      ? routeEvidenceAuthoritative(segment.evidence)
+      : segment.evidence == null || routeEvidenceAuthoritative(segment.evidence)));
   const stateTravelers = Array.isArray(state.travelerIds) ? state.travelerIds.filter(Boolean) : [];
   const observedTravelers = Array.isArray(raw.travelers) ? raw.travelers.map(normalizeTraveler).filter(travelerKey) : [];
   const authoritativeTravelers = observedTravelers.length
@@ -263,7 +423,16 @@ function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {
 
 function factsFromObservation(state = {}, observation = {}, traveler = {}) {
   const page = observation.page || {};
-  const raw = page.transactionFacts && typeof page.transactionFacts === "object"
+  const terminalReviewObserved = page.terminalEvidence?.boundaryObserved === true
+    || page.terminalEvidence?.verified === true;
+  const profileDecisionGroupIds = new Set((page.decisionGroups || [])
+    .filter((group) => decisionOwnsProfileField({
+      selectedControlId: group.selectedControlId,
+      physicalControlIds: (group.alternatives || []).map((option) => option.controlId).filter(Boolean)
+    }, page))
+    .map((group) => group.decisionGroupId || group.requirementId)
+    .filter(Boolean));
+  const sourceRaw = page.transactionFacts && typeof page.transactionFacts === "object"
     ? page.transactionFacts
     : {
         itinerary: { completeness: "unknown", segments: [] },
@@ -272,23 +441,56 @@ function factsFromObservation(state = {}, observation = {}, traveler = {}) {
         totalPrice: page.price || null,
         provenance: [{ source: "legacy_page_summary", observationId: observation.observationId || "", confidence: 0.3 }]
       };
+  const sourceProvenance = Array.isArray(sourceRaw.provenance) ? sourceRaw.provenance : [];
+  const raw = {
+    ...sourceRaw,
+    // The shared typed terminal contract is the sole authority for whether
+    // these facts came from final review. This also hardens older/compacted
+    // browser payloads whose producer omitted the matching provenance label.
+    provenance: terminalReviewObserved
+      ? [
+          ...sourceProvenance,
+          ...(sourceProvenance.some((entry) => entry?.source === "payment_summary")
+            ? []
+            : [{
+                source: "payment_summary",
+                observationId: observation.observationId || "",
+                confidence: 1
+              }])
+        ]
+      : sourceProvenance,
+    selectedExtras: (sourceRaw.selectedExtras || []).filter((extra) => (
+      !profileDecisionGroupIds.has(extra?.decisionGroupId)
+    ))
+  };
   const normalized = normalizeFacts(raw, { observationId: observation.observationId || "", state, traveler });
   const compiledSelections = commerceSelectionsFromPage(page, state, traveler);
+  const episodeSelections = commerceSelectionFromEpisode(state);
+  const journalSelections = commerceSelectionsFromJournal(state);
   return {
     ...normalized,
     // Current controls may enrich the observation, but they must never erase
     // review rows or previously compiled outcomes from the same page map.
-    selectedExtras: mergeCommerceSelections(normalized.selectedExtras, compiledSelections)
+    selectedExtras: mergeCommerceSelections(
+      normalized.selectedExtras,
+      journalSelections,
+      episodeSelections,
+      compiledSelections
+    )
   };
 }
 
 module.exports = {
   COMMERCE_FAMILIES,
   TRANSACTION_CONTRACT_VERSION,
+  canonicalDecisionOwnerKey,
   canonicalFareBrand,
   canonicalOutcomeKey,
   canonicalSubjectKey,
+  commerceSelectionFromEpisode,
+  commerceSelectionsFromJournal,
   commerceSelectionsFromPage,
+  durableCommerceSelections,
   factsFromObservation,
   mergeCommerceSelections,
   normalizeFacts

@@ -1699,10 +1699,21 @@
     return surfaceMembershipForElement(element, surface).surfaceId === (surface.id || "surface-page");
   }
 
+  function isAuthorizedCompletedChoiceSurfaceExit(decision = {}, element, map = agent.pageMap || buildPageMap()) {
+    const targetControl = lookupControlForElement(map, element);
+    return Boolean(targetControl && AGENT_CONTRACT?.parentSurfaceExitOwnershipIsCurrent({
+      action: decision,
+      pipelineContract: decision.pipelineContract || {},
+      control: targetControl,
+      observation: { observationId: decision.observationId || map.observationId || "", page: map }
+    }));
+  }
+
   function validateResolvedTarget(decision = {}, element, map = agent.pageMap || buildPageMap()) {
     const expected = decision.targetSnapshot;
     const live = liveTargetSnapshot(element, map);
-    if (!targetBelongsToCurrentSurface(map, element)) {
+    const authorizedCompletedChoiceExit = isAuthorizedCompletedChoiceSurfaceExit(decision, element, map);
+    if (!targetBelongsToCurrentSurface(map, element) && !authorizedCompletedChoiceExit) {
       return {
         ok: false,
         code: "TARGET_OUTSIDE_CURRENT_SURFACE",
@@ -1715,11 +1726,19 @@
       };
     }
     if (!live) return { ok: false, code: "TARGET_MISSING", expected, live: null };
-    const exactActionability = actuatorActionability(
+    let exactActionability = actuatorActionability(
       element,
       map.currentSurface || { id: "surface-page", type: "page" },
       decision.operation || decision.action || "activate"
     );
+    if (authorizedCompletedChoiceExit && exactActionability.inCurrentSurface !== true) {
+      exactActionability = {
+        ...exactActionability,
+        inCurrentSurface: true,
+        operationAuthorized: true,
+        operationProof: "The single expanded choice opener owns dismissal of the active completed choice surface."
+      };
+    }
     if (!exactActionability.rendered) return { ok: false, code: "TARGET_NOT_RENDERED", expected: expected || null, live, actionability: exactActionability };
     if (!exactActionability.visible) return { ok: false, code: "TARGET_NOT_VISIBLE", expected: expected || null, live, actionability: exactActionability };
     if (!exactActionability.enabled) return { ok: false, code: "TARGET_DISABLED", expected: expected || null, live, actionability: exactActionability };
@@ -2863,7 +2882,7 @@
     return `h${(hash >>> 0).toString(36)}`;
   }
 
-  function transactionFactsEvidence({ step = "unknown", price = null, decisionGroups = [], activeSurface = {} } = {}) {
+  function transactionFactsEvidence({ step = "unknown", price = null, decisionGroups = [], activeSurface = {}, terminalEvidence = null } = {}) {
     const text = String(primaryPageText() || visiblePageText() || "")
       .replace(/[\u200e\u200f\u202a-\u202e]/g, " ")
       .replace(/\s+/g, " ")
@@ -2890,14 +2909,49 @@
       return (airportCode || endpoint).slice(0, 80).toUpperCase();
     };
     const reservedRouteEndpoint = (value = "") => {
-      const tokens = String(value || "").toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
+      const endpoint = String(value || "").trim();
+      const tokens = endpoint.toLowerCase().match(/[\p{L}\p{N}]+/gu) || [];
       const reserved = new Set([
         "trip", "summary", "primary", "passenger", "checked", "baggage",
         "travel", "insurance", "direct", "flight", "booking", "payment",
         "overview", "contact", "details", "ticket", "fare", "seat", "seating"
       ]);
-      return !tokens.length || tokens.every((token) => reserved.has(token));
+      const nonTravelMeaning = /\b(?:adult|child|children|infant|teen|passengers?|age|aged|years?|months?|over|under|younger|older|kg|kgs|kilograms?|lb|lbs|pounds?|cm|centimet(?:er|re)s?|dimensions?)\b/i;
+      return !tokens.length
+        || /\d/.test(endpoint)
+        || tokens.length > 8
+        || nonTravelMeaning.test(endpoint)
+        || tokens.every((token) => reserved.has(token));
     };
+    const canonicalRouteSegments = (rawSegments = []) => rawSegments.reduce((segments, segment) => {
+      const duplicateIndex = segments.findIndex((candidate) => (
+        candidate.origin === segment.origin
+        && candidate.destination === segment.destination
+        && (
+          candidate.departureDate === segment.departureDate
+          || !candidate.departureDate
+          || !segment.departureDate
+        )
+      ));
+      if (duplicateIndex < 0) {
+        segments.push(segment);
+        return segments;
+      }
+      const existing = segments[duplicateIndex];
+      const existingDetail = [existing.departureDate, existing.departureTime, existing.arrivalTime, existing.flightNumber].filter(Boolean).length;
+      const incomingDetail = [segment.departureDate, segment.departureTime, segment.arrivalTime, segment.flightNumber].filter(Boolean).length;
+      const preferred = incomingDetail > existingDetail ? segment : existing;
+      const secondary = preferred === segment ? existing : segment;
+      segments[duplicateIndex] = {
+        ...secondary,
+        ...preferred,
+        departureDate: preferred.departureDate || secondary.departureDate || "",
+        departureTime: preferred.departureTime || secondary.departureTime || "",
+        arrivalTime: preferred.arrivalTime || secondary.arrivalTime || "",
+        flightNumber: preferred.flightNumber || secondary.flightNumber || ""
+      };
+      return segments;
+    }, []);
     const routeUtilityText = (value = "") => /\b(?:phone|mobile|telephone|sms|text message|email|e-mail|wifi|wi-fi|data plan|valid number|enter a number|country code)\b/i.test(String(value || ""));
     const directElementText = (element) => Array.from(element?.childNodes || [])
       .filter((node) => node.nodeType === Node.TEXT_NODE)
@@ -2908,7 +2962,7 @@
     const visibleElementText = (element, limit = 720) => String(
       element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || ""
     ).replace(/\s+/g, " ").trim().slice(0, limit);
-    const itineraryCommand = (element) => /\b(?:view|show|open)\s+(?:full\s+)?(?:flight\s+)?(?:itinerary|trip details|flight details)\b/i.test(
+    const itineraryCommand = (element) => /\b(?:view|show|open)?\s*(?:full\s+)?(?:flight\s+)?(?:itinerary|trip details|travel details|flight details)\b/i.test(
       String(element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || "")
     );
     const routeSeparator = /(?:→|–|—|\bto\b)/i;
@@ -2923,11 +2977,40 @@
           if (!ownerText || ownerText.length > 720 || routeUtilityText(ownerText)) continue;
           const prefix = ownerText.split(routeDateCue)[0].replace(/\b(?:view|show|open)\s+(?:full\s+)?(?:flight\s+)?(?:itinerary|trip details|flight details)\b.*$/i, "").trim();
           const unseparatedPair = /^\p{L}[\p{L}.'’-]*(?:\s+\p{L}[\p{L}.'’-]*)?\s+\p{L}[\p{L}.'’-]*(?:\s+\p{L}[\p{L}.'’-]*)?$/u.test(prefix);
-          if ((routeSeparator.test(ownerText) || unseparatedPair) && routeDateCue.test(ownerText)) return owner;
+          const airportHyphenPair = /\b[A-Z]{3}(?:\s+[\p{L}.'’-]+){1,4}\s*-\s*[A-Z]{3}\b/u.test(ownerText);
+          if ((routeSeparator.test(ownerText) || unseparatedPair || airportHyphenPair) && routeDateCue.test(ownerText)) return owner;
         }
         return null;
       })
       .filter(Boolean);
+    // Some checkouts render an owned travel-details card as rows such as
+    // "AYT Antalya - SAW Istanbul". Airport-code pairs inside that exact
+    // itinerary owner are authoritative even when the visual separator is a
+    // plain hyphen; arbitrary page-wide hyphens remain ineligible.
+    const itinerarySummarySegments = itineraryControlOwners.flatMap((owner, ownerIndex) => {
+      const ownerText = visibleElementText(owner, 720);
+      const matches = [...ownerText.matchAll(/\b([A-Z]{3})(?:\s+[\p{L}.'’-]+){1,4}\s*[-–—]\s*([A-Z]{3})(?:\s+[\p{L}.'’-]+){1,4}/gu)];
+      return matches.map((match, matchIndex) => {
+        const preceding = ownerText.slice(Math.max(0, Number(match.index || 0) - 140), Number(match.index || 0));
+        const departureDate = [...preceding.matchAll(new RegExp(routeDateCue.source, "giu"))].at(-1)?.[0] || "";
+        return {
+          segmentId: `itinerary_summary_${ownerIndex + 1}_${matchIndex + 1}_${stableHash(`${match[1]}:${match[2]}:${departureDate}`)}`,
+          origin: match[1],
+          destination: match[2],
+          departureDate,
+          departureTime: "",
+          arrivalTime: "",
+          flightNumber: "",
+          confidence: 0.94,
+          evidence: {
+            source: "itinerary_summary_owner",
+            ownerKey: stableHash(`itinerary-summary:${ownerText.slice(0, 320)}`),
+            qualification: "airport_code_pair_in_itinerary_owner",
+            authoritative: true
+          }
+        };
+      });
+    });
     // Checkout sites frequently render the persistent selected route as an
     // ordinary styled div/span rather than a semantic heading. Read only a
     // small, exact route-shaped owner; never infer a route from page-wide text.
@@ -2936,6 +3019,12 @@
       || decisionGroups.length
       || /\b(?:booking|checkout|passengers?|ticket fare|seating|overview\s*(?:&|and)\s*payment)\b/i.test(text)
     );
+    const boundedPlaceLabel = (value = "") => {
+      const words = String(value || "").trim().split(/\s+/).filter(Boolean);
+      return words.length >= 1
+        && words.length <= 4
+        && words.every((word) => /^[\p{Lu}][\p{L}.'’-]*$/u.test(word));
+    };
     const boundedRouteSegments = queryAllDeep("h1, h2, h3, h4, h5, h6, [role='heading'], [aria-label*='route' i], [data-testid*='route' i], main div, main span, [role='main'] div, [role='main'] span, form div, form span")
       .filter((element) => isVisible(element))
       .map((element) => {
@@ -2945,9 +3034,11 @@
       })
       .filter(({ label }) => label.length >= 5 && label.length <= 180 && !routeUtilityText(label))
       .map(({ element, label }, index) => {
+        const ownerMetadata = `${element.getAttribute?.("aria-label") || ""} ${element.getAttribute?.("data-testid") || ""}`;
+        const explicitRouteOwner = /route|itinerary/i.test(ownerMetadata);
         const semanticOwner = /^h[1-6]$/i.test(element.tagName || "")
           || implicitRole(element) === "heading"
-          || /route|itinerary/i.test(`${element.getAttribute?.("aria-label") || ""} ${element.getAttribute?.("data-testid") || ""}`);
+          || explicitRouteOwner;
         const explicitVisualSeparator = /[→–—]/.test(label);
         if (!semanticOwner && (!checkoutRouteContext || !explicitVisualSeparator)) return null;
         const match = label.match(/^(.{2,80}?)\s*(?:→|–|—|\bto\b)\s*(.{2,80}?)$/i);
@@ -2957,6 +3048,21 @@
         if (!origin || !destination || origin === destination || reservedRouteEndpoint(origin) || reservedRouteEndpoint(destination)) return null;
         const localText = visibleElementText(element.parentElement, 320);
         const ownedDate = localText.match(routeDateCue)?.[0] || "";
+        const airportPair = /(?:^|\s|\()([A-Z]{3})(?:\)|\s|$)/.test(match[1])
+          && /(?:^|\s|\()([A-Z]{3})(?:\)|\s|$)/.test(match[2]);
+        const persistentCheckoutRoute = checkoutRouteContext
+          && boundedPlaceLabel(match[1])
+          && boundedPlaceLabel(match[2]);
+        const qualification = explicitRouteOwner
+          ? "semantic_route_owner"
+          : airportPair
+            ? "airport_code_pair"
+            : ownedDate
+              ? "owned_travel_date"
+              : persistentCheckoutRoute
+                ? "persistent_checkout_route"
+                : "";
+        if (!qualification) return null;
         return {
           segmentId: `bounded_route_${index + 1}_${stableHash(`${origin}:${destination}:${ownedDate}`)}`,
           origin,
@@ -2969,16 +3075,12 @@
           evidence: {
             source: semanticOwner ? "owned_route_heading" : "bounded_checkout_route",
             ownerKey: stableHash(`${element.tagName || "element"}:${label}`),
+            qualification,
             authoritative: true
           }
         };
       })
-      .filter(Boolean)
-      .filter((segment, index, segments) => segments.findIndex((candidate) => (
-        candidate.origin === segment.origin
-        && candidate.destination === segment.destination
-        && candidate.departureDate === segment.departureDate
-      )) === index);
+      .filter(Boolean);
     const explicitRouteOwners = queryAllDeep("[data-testid*='itinerary' i], [data-testid*='route' i], [aria-label*='itinerary' i], [aria-label*='route' i], h1, h2, h3");
     const ownedRouteSegments = [...new Set([...explicitRouteOwners, ...itineraryControlOwners])]
       .filter((element) => isVisible(element))
@@ -3024,12 +3126,7 @@
           }
         };
       })
-      .filter(Boolean)
-      .filter((segment, index, segments) => segments.findIndex((candidate) => (
-        candidate.origin === segment.origin
-        && candidate.destination === segment.destination
-        && candidate.departureDate === segment.departureDate
-      )) === index);
+      .filter(Boolean);
     const dates = [
       ...[...text.matchAll(/\b20\d{2}-\d{2}-\d{2}\b/g)].map((match) => match[0]),
       ...[...text.matchAll(/\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\s+\d{1,2}\s+[\p{L}]+\s+20\d{2}\b/giu)].map((match) => match[0])
@@ -3038,12 +3135,14 @@
     const flights = [...text.matchAll(/\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\s*([0-9]{2,4})\b/g)]
       .map((match) => `${match[1]}${match[2]}`)
       .filter((value) => !/^20\d{2}$/.test(value));
-    const segments = (attributeSegments.length
+    const segments = canonicalRouteSegments(attributeSegments.length
       ? attributeSegments.map((segment) => ({
           ...segment,
           evidence: { source: "structured_itinerary_attributes", ownerKey: segment.segmentId, authoritative: true }
         }))
-      : ownedRouteSegments.length
+      : itinerarySummarySegments.length
+        ? itinerarySummarySegments
+        : ownedRouteSegments.length
         ? ownedRouteSegments
         : boundedRouteSegments.length
           ? boundedRouteSegments
@@ -3114,8 +3213,10 @@
     const ownedFare = ownedFareRows[0] || ownedFareSummaryLines[0] || null;
     const fareBrand = canonicalFareLabel(ownedFare?.label || "");
     const currentTraveler = traveler() || {};
-    const finalReviewSurface = ["payment", "confirmation"].includes(step)
-      && /\b(?:overview\s*(?:&|and)\s*payment|payment review|review your booking|order summary|contact details|pay securely|pay\s+[\d.,]+\s*(?:eur|usd|gbp|try|tl|€|\$|£))\b/i.test(text);
+    // Terminal ownership is compiled once above this fact compiler. Do not
+    // maintain a second airline-wording classifier for the same page.
+    const finalReviewSurface = terminalEvidence?.boundaryObserved === true
+      || terminalEvidence?.verified === true;
     const source = finalReviewSurface
       ? "payment_summary"
       : activeSurface?.type && activeSurface.type !== "page"
@@ -3514,6 +3615,17 @@
 
   function controlOwnedEvidence(element) {
     const form = element?.form || element?.closest?.("form") || null;
+    const controlledIds = String(element?.getAttribute?.("aria-controls") || "")
+      .split(/\s+/)
+      .filter(Boolean);
+    const controlledElements = controlledIds
+      .map((id) => document.getElementById(id))
+      .filter(Boolean);
+    const controlsInformationOnly = controlledElements.length > 0
+      && controlledElements.every((controlled) => (
+        !controlled.matches?.("[role='dialog'], [role='listbox'], [role='menu'], [role='option']")
+        && !controlled.querySelector?.("input, select, textarea, button, [role='option'], [role='radio'], [role='checkbox']")
+      ));
     return {
       testId: compactText(element?.getAttribute?.("data-testid") || element?.getAttribute?.("data-test-id") || element?.getAttribute?.("data-test") || "", 160),
       formAction: compactText(element?.getAttribute?.("formaction") || form?.getAttribute?.("action") || "", 300),
@@ -3525,6 +3637,12 @@
       tagName: String(element?.tagName || "").toLowerCase(),
       role: String(implicitRole(element) || "").toLowerCase(),
       type: compactText(element?.getAttribute?.("type") || "", 40).toLowerCase(),
+      ariaControls: controlledIds.join(" "),
+      ariaExpanded: element?.hasAttribute?.("aria-expanded")
+        ? String(element.getAttribute("aria-expanded"))
+        : "",
+      ariaHasPopup: compactText(element?.getAttribute?.("aria-haspopup") || "", 40).toLowerCase(),
+      controlsInformationOnly,
       iconOnly: Boolean(element?.querySelector?.("svg, [class*='icon'], [data-icon]") && !controlOwnedText(element))
     };
   }
@@ -3542,6 +3660,14 @@
     const strongOpen = /edit|change|open/.test(identity)
       || /^(edit|change|open)\b/.test(ownMeaning);
     const choiceControl = /radio|checkbox|option/.test(`${evidence.role || ""} ${evidence.type || ""}`);
+    const informationDisclosure = evidence.controlsInformationOnly === true
+      && Boolean(evidence.ariaControls)
+      && evidence.ariaExpanded !== ""
+      && !evidence.ariaHasPopup
+      && !choiceControl
+      && /detail|characteristic|information|info|read|learn|description|benefit/.test(
+        `${identity} ${evidence.ariaControls || ""}`
+      );
     const explicitDeclineCommand = /^(?:no,?\s*thanks|not now|skip|decline|(?:i(?:'|’)ll )?go without|continue without|without)\b/.test(ownMeaning);
 
     // Conflicting structural identities are not guessed. A misleading ARIA
@@ -3551,6 +3677,7 @@
       return { semantic: "unknown", physicalEffect: "unknown", conflict: true };
     }
     if (strongDismiss) return { semantic: "dismiss_surface", physicalEffect: "dismiss_surface", conflict: false };
+    if (informationDisclosure) return { semantic: "reveal_information", physicalEffect: "open_surface", conflict: false };
     if (strongOpen) return { semantic: "open_surface", physicalEffect: "open_surface", conflict: false };
     if (strongAdvance) {
       const checkoutStage = /payment/.test(`${identity} ${ownMeaning}`) || surfaceType === "page";
@@ -4559,20 +4686,39 @@
   }
 
   function structuredPricesFromText(value = "") {
-    const text = String(value || "").replace(/\s+/g, " ").trim();
-    const numberPattern = "-?\\d(?:[\\d\\s.,'’]*\\d)?";
+    // Airline accessibility labels frequently wrap prefix-currency prices in
+    // bidi isolation/embedding marks (for example `\u202AEUR37.95\u202C`).
+    // Those are presentation controls, not semantic separators.
+    const text = String(value || "")
+      .replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    // Accept plain decimals and localized thousands groups, but never merge
+    // duplicated accessibility amounts such as `EUR37.95 37.95 Euro` into
+    // one synthetic number.
+    const numberPattern = "-?(?:\\d{1,3}(?:[\\s'’.,]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?)";
     // Alphabetic currency codes must be standalone tokens. Without both word
     // boundaries, ordinary labels such as "Country 001" are parsed as
     // "TRY 001", incorrectly turning a free form control into a money-risk
     // action that policy will reject.
     const currencyPattern = "(?:\\b(?:[A-Za-z]{3}|TL)\\b|€|\\$|£|¥|₩|₹|₺)";
+    // A compact amount such as "30EUR" has no word boundary between the
+    // digit and E. Direction-specific patterns preserve the protection
+    // against matching the TRY inside "Country" while accepting compact ISO
+    // prices emitted by accessibility text.
+    const currencyAfterAmountPattern = "(?:(?:[A-Za-z]{3}|TL)\\b|€|\\$|£|¥|₩|₹|₺)";
+    // Prefix ISO prices may also be compact (`EUR37.95`). Require a leading
+    // token boundary and a following numeric lookahead rather than a trailing
+    // word boundary; this accepts the compact price without matching the TRY
+    // substring inside labels such as `Country001`.
+    const currencyBeforeAmountPattern = "(?:\\b(?:[A-Za-z]{3}|TL)(?=\\s*-?\\d)|€|\\$|£|¥|₩|₹|₺)";
     const matches = [
-      ...text.matchAll(new RegExp(`(${numberPattern})\\s*(${currencyPattern})`, "gi"))
+      ...text.matchAll(new RegExp(`(${numberPattern})\\s*(${currencyAfterAmountPattern})`, "gi"))
     ].map((match) => ({
       amount: localizedPriceAmount(match[1]),
       currency: normalizedCurrencyToken(match[2])
     })).concat([
-      ...text.matchAll(new RegExp(`(${currencyPattern})\\s*(${numberPattern})`, "gi"))
+      ...text.matchAll(new RegExp(`(${currencyBeforeAmountPattern})\\s*(${numberPattern})`, "gi"))
     ].map((match) => ({
       amount: localizedPriceAmount(match[2]),
       currency: normalizedCurrencyToken(match[1])
@@ -4584,6 +4730,22 @@
 
   function structuredPriceFromText(value = "") {
     return structuredPricesFromText(value)[0] || null;
+  }
+
+  function currentCommercialOptionPrice(value = "") {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) return null;
+    const cues = [...text.matchAll(/\b(?:discounted|current|final|now|today(?:'s|’s)?)\s*(?:price)?\s*[:–—-]?\s*/gi)];
+    for (const cue of cues.reverse()) {
+      // Airline copy often renders a human price followed by an accessible
+      // canonical token: "Discounted Price: 30 Euro 30EUR". Parse the first
+      // structured token owned by the current-price cue instead of requiring
+      // the currency code to be adjacent to the cue itself.
+      const boundedTail = text.slice(cue.index + cue[0].length, cue.index + cue[0].length + 100);
+      const price = structuredPricesFromText(boundedTail)[0] || null;
+      if (price) return price;
+    }
+    return null;
   }
 
   function choiceGoalTerms(semantic = "", dateField = null) {
@@ -4710,6 +4872,7 @@
     const structuredPrice = structuredPriceFromText(label);
     if (/no checked baggage|no baggage|without baggage|i.ll go without|go without/.test(text)) return "decline_baggage";
     if (/skip (?:seat|seating)|random seating|random assignment|continue without (?:a )?seat|no seat selection/.test(text)) return "decline_paid_extra";
+    if (/\b(?:do not|don.t|not)\s+(?:wish|want|agree|consent)\s+to\s+(?:receive|join|subscribe)|\bopt(?:ing)?\s*out\b|\bunsubscribe\b/.test(text)) return "decline_paid_extra";
     if (/^\s*(?:no|without)\b|no,?\s*thanks|none of the passengers|none\b|without|(?:i(?:’|'| wi)?ll\s+)?take the risk|keep (?:my|the) current/.test(text)) return "decline_paid_extra";
     if ((structuredPrice && structuredPrice.amount > 0)
       || /add to cart|add to my trip|premium|bundle|checked baggage|\b\d+\s*x\s*\d+\s*kg/.test(text)) return "add_paid_extra";
@@ -5764,6 +5927,7 @@
         500
       );
       const prices = structuredPricesFromText(optionText);
+      const currentPrice = currentCommercialOptionPrice(optionText);
       const explicitlyIncluded = /\b(?:included|free|no extra (?:cost|charge)|at no extra (?:cost|charge))\b/i.test(optionText)
         || /\b0(?:[.,]0{1,2})?\s*(?:eur|usd|try|tl|€|\$|₺)\b/i.test(optionText);
       return {
@@ -5774,9 +5938,11 @@
         optionText,
         prices,
         explicitlyIncluded,
-        structuredPrice: explicitlyIncluded
-          ? { amount: 0, currency: "" }
-          : (signedCommercialOptionPrice(optionText) || (prices.length === 1 ? prices[0] : null))
+        structuredPrice: currentPrice
+          || signedCommercialOptionPrice(optionText)
+          || (explicitlyIncluded
+            ? { amount: 0, currency: "" }
+            : (prices.length === 1 ? prices[0] : null))
       };
     });
     const paidCurrencies = [...new Set(parsed
@@ -6026,10 +6192,15 @@
         || actuatorCandidates[0].element.innerText
         || actuatorCandidates[0].element.textContent
         || "",
-      nativeRadio ? choiceLabel(stateElement) : ""
+      nativeRadio ? choiceLabel(stateElement) : "",
+      // ARIA descriptions are explicit option-owned evidence even when the
+      // rendered price node is a sibling rather than a DOM descendant of the
+      // label/card. This is common in OTA bundle components.
+      describedText(stateElement)
     ].filter(Boolean).join(" ");
     const optionText = compactText(rawOptionText, 220);
     const directOptionPrices = structuredPricesFromText(rawOptionText);
+    const currentOptionPrice = currentCommercialOptionPrice(rawOptionText);
     const directActuatorText = compactText(
       directControlName(stateElement)
       || buttonText(stateElement)
@@ -6049,12 +6220,11 @@
       || /\b0(?:[.,]0{1,2})?\s*(?:eur|usd|try|tl|€|\$|₺)\b/i.test(rawOptionText);
     const commercialOption = selectionCtaEvidence?.parsed.find((item) => item.peer === stateElement) || null;
     let structuredPrice = commercialOption?.structuredPrice
+      || currentOptionPrice
       || signedOptionPrice
-      || (directOptionPrices.length === 1
-        ? directOptionPrices[0]
-        : optionExplicitlyIncluded
-          ? { amount: 0, currency: siblingCurrencies.length === 1 ? siblingCurrencies[0] : "" }
-          : null);
+      || (optionExplicitlyIncluded
+        ? { amount: 0, currency: siblingCurrencies.length === 1 ? siblingCurrencies[0] : "" }
+        : (directOptionPrices.length === 1 ? directOptionPrices[0] : null));
     // The exact actuator is the authority for the action it will perform.
     // Surrounding option/summary copy may supply missing context, but it may
     // never turn a directly priced paid action into a free action.
@@ -6098,6 +6268,8 @@
         ? (Number(commercialOption.structuredPrice?.amount) === 0
           ? "bounded_option_owner_included"
           : "bounded_option_owner_signed_delta")
+        : currentOptionPrice
+          ? "bounded_option_owner_current_price"
         : signedOptionPrice
           ? "bounded_option_owner_signed_delta"
         : directOptionPrices.length === 1
@@ -7554,17 +7726,26 @@
       option.choiceStructure === true
       || /radio|checkbox|option/.test(String(option.accessibility?.role || "").toLowerCase())
     ));
+    const explicitSurfaceDecline = (option = {}) => (
+      /decline_paid_extra|decline_baggage|safe_decline|select_free_option/.test(
+        `${option.semantic || ""} ${option.risk || ""} ${option.physicalEffect || ""}`.toLowerCase()
+      )
+      && /no,?\s*thanks|not now|skip|decline|go without|continue without|without|none/.test(
+        String(option.label || "").toLowerCase()
+      )
+    );
     const surfaceDecisionOptions = structuralSurfaceChoices.length
       ? (activeSurface?.options || []).filter((option) => (
           option.choiceStructure === true
           || /radio|checkbox|option/.test(String(option.accessibility?.role || "").toLowerCase())
           || ["select_free_option", "select_paid_option"].includes(option.physicalEffect)
+          || explicitSurfaceDecline(option)
         ))
-      : [];
+      : (activeSurface?.options || []).filter(explicitSurfaceDecline);
     // A surface is not a decision merely because it contains several
     // commands. Only actual mutually-exclusive choice capabilities form a
     // decision group; review/edit/close/continue commands remain capabilities.
-    const surfaceGroups = activeSurface?.type && activeSurface.type !== "page" && surfaceDecisionOptions.length >= 2
+    const surfaceGroups = activeSurface?.type && activeSurface.type !== "page" && surfaceDecisionOptions.length >= 1
       ? [(() => {
           const decisionGroupId = activeSurface.decisionGroupId || decisionGroupIdForContext({ sectionType: activeSurface.taskHint || activeSurface.type || "", sectionLabel: activeSurface.parentSectionLabel || activeSurface.label || activeSurface.taskHint || "" });
           const alternatives = surfaceDecisionOptions.map((option) => {
@@ -8185,7 +8366,6 @@
       input.required
       || input.getAttribute?.("aria-required") === "true"
       || owner?.getAttribute?.("aria-required") === "true"
-      || /required|select one|choose one|\*/i.test(owner?.innerText || "")
     );
     return { instance, label: ownerLabel, required };
   }
@@ -8747,6 +8927,21 @@
     };
   }
 
+  function currentOwnedValidationErrors(map = {}, expected = {}, controlState = {}) {
+    return (map.validationIssues || []).filter((issue) => {
+      const owned = issue.stageWide === true || (expected.controlId && issue.controlId === expected.controlId);
+      if (!owned) return false;
+      const contradictedPresenceError = Boolean(
+        issue.controlId === expected.controlId
+        && controlState?.valuePresent === true
+        && controlState?.invalid !== true
+        && !String(controlState?.validationMessage || "").trim()
+        && /\b(?:empty|required|missing|fill|enter|provide)\b/i.test(String(issue.message || issue.text || issue.label || ""))
+      );
+      return !contradictedPresenceError;
+    });
+  }
+
   function verifyExpectedOutcomeInternal(expected = {}, beforeMap = buildPageMap(), afterMap = buildPageMap(), target = null) {
     const beforeSignature = expected.beforeSignature || structuralPageSignature(beforeMap);
     const afterSignature = structuralPageSignature(afterMap);
@@ -8943,9 +9138,7 @@
       const surfaceDismissed = !expected.requireSurfaceDismissed
         || !expected.surfaceId
         || currentSurface.id !== expected.surfaceId;
-      const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
-        issue.stageWide === true || (expected.controlId && issue.controlId === expected.controlId)
-      ));
+      const ownedValidationErrors = currentOwnedValidationErrors(afterMap, expected, afterControlState);
       const ok = Boolean(
         wantedNormalizedValue
         && (
@@ -8970,6 +9163,67 @@
           actualSemanticValue,
           wantedSemanticValue,
           surfaceDismissed,
+          ownedValidationErrors,
+          control: afterControl || null,
+          currentSurface
+        }
+      };
+    }
+    if (expected.type === "logical_component_committed") {
+      const actualNormalizedValue = String(afterControlState?.normalizedValue || "");
+      const wantedNormalizedValue = String(expected.expectedNormalizedValue || expected.expectedComponentValue || "");
+      const semanticType = expected.semanticType || afterControl?.fieldType || afterControl?.semantic || "";
+      const actualSemanticValue = normalizedProfileChoiceValue(actualNormalizedValue, semanticType);
+      const wantedSemanticValue = normalizedProfileChoiceValue(wantedNormalizedValue, semanticType);
+      const currentSurface = afterMap.currentSurface || {};
+      const expectedChildSurfaceId = String(expected.surfaceId || "");
+      const activeChoiceSurface = Boolean(
+        currentSurface.type
+        && currentSurface.type !== "page"
+        && (
+          afterControlState?.expanded === true
+          || currentSurface.parentControlId === expected.controlId
+          || (expectedChildSurfaceId && currentSurface.id === expectedChildSurfaceId)
+        )
+      );
+      const commitState = afterControl?.commitState || null;
+      const commitSettled = commitState
+        ? Boolean(
+            commitState.status === "settled"
+            && commitState.popupClosed !== false
+            && commitState.focusSettled !== false
+          )
+        : !activeChoiceSurface;
+      const ownedValidationErrors = currentOwnedValidationErrors(afterMap, expected, afterControlState);
+      const exactValue = Boolean(
+        wantedNormalizedValue
+        && (
+          actualNormalizedValue === wantedNormalizedValue
+          || (
+            actualSemanticValue
+            && wantedSemanticValue
+            && actualSemanticValue === wantedSemanticValue
+          )
+        )
+      );
+      const ok = exactValue && commitSettled && ownedValidationErrors.length === 0;
+      return {
+        ok,
+        code: ok ? "LOGICAL_COMPONENT_COMMITTED" : "LOGICAL_COMPONENT_NOT_COMMITTED",
+        message: ok
+          ? "The logical component retained its canonical value and its owned choice interaction settled."
+          : "The logical component has not proven both its canonical value and choice-interaction settlement.",
+        evidence: {
+          ...evidence,
+          actualNormalizedValue,
+          wantedNormalizedValue,
+          actualSemanticValue,
+          wantedSemanticValue,
+          interactionKind: expected.interactionKind || "choice",
+          commitRequirement: expected.commitRequirement || "logical_component_committed",
+          activeChoiceSurface,
+          commitSettled,
+          commitState,
           ownedValidationErrors,
           control: afterControl || null,
           currentSurface
@@ -10164,7 +10418,9 @@
     return {
       visibleText: String(evidence.visibleText || evidence.text || ""),
       routePath,
-      structuralEvidence: evidence.structuralEvidence || structuralEvidence || {}
+      structuralEvidence: evidence.structuralEvidence || structuralEvidence || {},
+      terminalEvidence: evidence.terminalEvidence || null,
+      url: String(evidence.url || location.href || "")
     };
   }
 
@@ -10174,6 +10430,12 @@
     const evidence = stepEvidenceInput(input, structuralEvidence);
     const lower = evidence.visibleText.toLowerCase();
     const route = evidence.routePath;
+    const terminalEvidence = AGENT_CONTRACT?.compileTerminalEvidence?.({
+      url: evidence.url,
+      visibleText: evidence.visibleText,
+      structuralEvidence: evidence.structuralEvidence,
+      terminalEvidence: evidence.terminalEvidence
+    }) || null;
     const newSearchRoute = /(?:^|\/)rf\/start\/?$/.test(route)
       || /(?:^|\/)(?:flight-)?search\/?$/.test(route);
     const extrasEvidence = /select baggage|configure your trip|upgrade your trip|checked baggage|bundle|premium support|airhelp|cancellation guarantee|voucher refund|add to cart|no thanks|add baggage|choose your bundle/.test(lower);
@@ -10183,7 +10445,7 @@
     const travelerRouteEvidence = /\/rf\/traveler-details|\/rf\/traveller-details|traveler-details|traveller-details/.test(route);
     const paymentFormEvidence = /card number|security code|cvc|cvv|pay now|complete booking|confirm and pay|submit payment|billing card|cardholder/.test(lower);
     const paymentRouteEvidence = /\/rf\/payment|\/payment\b/.test(route);
-    const confirmationEvidence = /booking confirmed|confirmation|booking reference|reservation number|pnr/.test(lower);
+    const confirmationEvidence = /booking confirmed|confirmation number|booking reference|reservation number|\bpnr\b/.test(lower);
     const flightSelectionEvidence = /flight selection|select flight|choose flight|fare/.test(lower);
     const repeatedSeatInventory = Number(evidence.structuralEvidence.seatInventoryCount || 0) >= 64;
     const loadingEvidence = /\bplease\s+wait\b|\b(?:loading|fetching|preparing)\b.{0,80}\b(?:option|seat|fare|checkout|payment|travell?er|passenger|detail|trip)\b/.test(lower);
@@ -10196,6 +10458,7 @@
 
     if (newSearchRoute) return result("flight_selection", 0.98, ["route_path"]);
     if (repeatedSeatInventory && strongSeatEvidence) return result("seats", 0.98, ["seat_inventory", "seat_copy"]);
+    if (terminalEvidence?.boundaryObserved === true) return result("payment", 0.99, ["terminal_evidence_contract"]);
     if (confirmationEvidence) return result("confirmation", 0.95, ["confirmation_copy"]);
     if (paymentFormEvidence) return result("payment", 0.95, ["payment_controls_copy"]);
     if (strongSeatEvidence) return result("seats", 0.9, ["seat_controls_copy"]);
@@ -10212,6 +10475,104 @@
 
   function classifyStep(input, structuralEvidence = {}) {
     return classifyStepDetailed(input, structuralEvidence).step;
+  }
+
+  function observeTerminalStructure(fullText = "") {
+    // One traversal keeps this evidence probe cheap on large seat maps.
+    const visibleTerminalNodes = queryAllDeep("input, select, textarea, button, [role='button'], [aria-current='step'], [data-current='true'], [data-active='true']")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"));
+    const visibleInputs = visibleTerminalNodes.filter((element) => element.matches("input, select, textarea"));
+    const credentialKindsFromText = (value = "") => {
+      const descriptor = String(value || "").toLowerCase().replace(/\s+/g, " ");
+      const kinds = new Set();
+      if (/card.?number|cc-number/.test(descriptor)) kinds.add("card_number");
+      if (/expir|expiration|valid.?through|cc-exp/.test(descriptor)) kinds.add("card_expiry");
+      if (/\bcvc\b|\bcvv\b|security.?code|cc-csc/.test(descriptor)) kinds.add("card_security_code");
+      if (/cardholder|name.?on.?card/.test(descriptor)) kinds.add("cardholder");
+      return kinds;
+    };
+    const credentialKinds = new Set();
+    for (const input of visibleInputs) {
+      const descriptor = `${labelText(input)} ${input.getAttribute("name") || ""} ${input.getAttribute("autocomplete") || ""} ${input.getAttribute("placeholder") || ""} ${input.getAttribute("aria-label") || ""}`.toLowerCase();
+      credentialKindsFromText(descriptor).forEach((kind) => credentialKinds.add(kind));
+    }
+    const visibleActions = visibleTerminalNodes.filter((element) => element.matches("button, input[type='button'], input[type='submit'], [role='button']"));
+    const payControlPresent = visibleActions.some((element) => (
+      /^(?:pay(?:\s+now|\s+securely|\s+[\d.,]+)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase)\b/i.test(actionElementLabel(element))
+    ));
+    const activeProgressText = visibleTerminalNodes
+      .filter((element) => element.matches("[aria-current='step'], [data-current='true'], [data-active='true']"))
+      .map((element) => actionElementLabel(element) || element.textContent || "")
+      .join(" ")
+      .slice(0, 500);
+    const normalized = String(fullText || "").replace(/\s+/g, " ");
+    const activePaymentProgress = /\bpayment\b|\bpay\b/i.test(activeProgressText);
+    const paymentRoute = /(?:^|\/)payment(?:\/|$)/i.test(String(location.pathname || ""));
+    const visiblePaymentOwners = queryAllDeep([
+      "main",
+      "form",
+      "fieldset",
+      "section",
+      "[role='form']",
+      "[aria-label*='payment' i]",
+      "[aria-label*='card' i]",
+      "[data-testid*='payment' i]",
+      "[data-testid*='card' i]",
+      "[id*='payment' i]",
+      "[id*='card' i]"
+    ].join(", "))
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .map((element) => {
+        const ownerText = String(element.innerText || element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 4000);
+        const metadata = `${element.getAttribute?.("aria-label") || ""} ${element.getAttribute?.("data-testid") || ""} ${element.id || ""}`;
+        const kinds = credentialKindsFromText(`${metadata} ${ownerText}`);
+        const paymentAnchored = paymentRoute
+          || activePaymentProgress
+          || /\bpayment\b|\bdebit\s*card\b|\bcredit\s*card\b/i.test(`${metadata} ${ownerText}`);
+        return { element, kinds, paymentAnchored };
+      })
+      .filter((owner) => owner.paymentAnchored && owner.kinds.size >= 2);
+    const paymentCredentialLabelKinds = new Set();
+    visiblePaymentOwners.forEach((owner) => owner.kinds.forEach((kind) => paymentCredentialLabelKinds.add(kind)));
+    const visibleHostedPaymentFrames = queryAllDeep("iframe")
+      .filter((frame) => isVisible(frame) && !frame.closest("#atw-sidebar"))
+      .filter((frame) => /payment|card|checkout|secure|adyen|stripe|braintree|worldpay/i.test([
+        frame.title,
+        frame.name,
+        frame.getAttribute("aria-label"),
+        frame.getAttribute("src")
+      ].filter(Boolean).join(" ")));
+    const paymentOwnerPresent = visiblePaymentOwners.length > 0;
+    const hostedPaymentWidgetPresent = visibleHostedPaymentFrames.length > 0 && (
+      paymentOwnerPresent || activePaymentProgress || paymentRoute
+    );
+    const terminalEvidenceSources = [
+      ...(credentialKinds.size ? ["visible_native_payment_credentials"] : []),
+      ...(paymentOwnerPresent ? ["visible_owned_payment_labels"] : []),
+      ...(hostedPaymentWidgetPresent ? ["visible_hosted_payment_widget"] : []),
+      ...(activePaymentProgress ? ["active_payment_progress"] : []),
+      ...(paymentRoute ? ["payment_route"] : [])
+    ];
+    return {
+      paymentCredentialKinds: [...credentialKinds],
+      paymentCredentialCount: credentialKinds.size,
+      paymentFormPresent: credentialKinds.size >= 2,
+      paymentCredentialProbeState: credentialKinds.size >= 2 ? "observed_present" : "unknown",
+      paymentCredentialLabelKinds: [...paymentCredentialLabelKinds],
+      paymentOwnerPresent,
+      paymentOwnerProbeState: paymentOwnerPresent ? "observed_present" : "unknown",
+      hostedPaymentWidgetPresent,
+      visibleTextFallbackAllowed: paymentOwnerPresent,
+      paymentMethodPresent: /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/i.test(normalized),
+      payControlPresent,
+      legalAcceptancePresent: visibleInputs.some((input) => input.type === "checkbox" && /terms|conditions|privacy|purchase/i.test(labelText(input))),
+      reviewSummaryPresent: /\b(?:amount\s+to\s+pay|total)\b/i.test(normalized)
+        && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/i.test(normalized),
+      paymentHeadingPresent: /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/i.test(normalized),
+      activePaymentProgress,
+      activeProgressText,
+      terminalEvidenceSources
+    };
   }
 
   function pageCoverage() {
@@ -10340,9 +10701,32 @@
     return stableHash([
       surface.type || "",
       normalizeMatchText(surface.label || ""),
-      (surface.options || []).map((option) => `${normalizeMatchText(option.label)}:${option.selected ? "1" : "0"}`).join("|"),
+      boundedSurfaceEvidenceOptions(surface).map((option) => `${normalizeMatchText(option.label)}:${option.selected ? "1" : "0"}`).join("|"),
+      (surface.controlCollections || []).map((collection) => `${collection.collectionId}:${collection.totalCount}:${collection.selectedCount}`).join("|"),
       JSON.stringify(surfaceProgressMarkers(surface.label || ""))
     ].join("||"));
+  }
+
+  // Canonical surfaces may intentionally retain a large inventory when the
+  // traveler asked for a specific seat. Visual fingerprints and diagnostics do
+  // not need to serialize that inventory again. Keep selected and stage-exit
+  // controls first, then a bounded representative sample.
+  function boundedSurfaceEvidenceOptions(surface = {}, limit = 48) {
+    const options = surface.options || [];
+    const important = options.filter((option) => (
+      option.selected === true
+      || /^(?:next|continue|close|done|confirm|back|skip|proceed)\b/i.test(option.label || "")
+    ));
+    const evidence = [];
+    const seen = new Set();
+    for (const option of [...important, ...options]) {
+      const key = `${option.id || ""}:${option.label || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      evidence.push(option);
+      if (evidence.length >= limit) break;
+    }
+    return evidence;
   }
 
   function foregroundSurfaceState(activeSurface = {}) {
@@ -10404,7 +10788,7 @@
     const activeSurface = map.currentSurface || {};
     const foreground = foregroundSurfaceState(activeSurface);
     const surfaceControls = foreground.active
-      ? [...(activeSurface.buttons || []), ...(activeSurface.options || [])]
+      ? boundedSurfaceEvidenceOptions(activeSurface, 120)
       : [];
     const pageControls = !foreground.active
       ? [
@@ -10413,8 +10797,16 @@
           ...(map.sections || []).flatMap((section) => section.choices || [])
         ]
       : [];
-    const controls = [...surfaceControls, ...pageControls]
-      .filter((item, index, list) => item && (item.id || item.label || item.field) && list.findIndex((other) => other?.id === item.id && other?.label === item.label) === index)
+    const uniqueControls = [];
+    const seenControls = new Set();
+    for (const item of [...surfaceControls, ...pageControls]) {
+      if (!item || !(item.id || item.label || item.field)) continue;
+      const key = `${item.id || ""}:${item.label || ""}`;
+      if (seenControls.has(key)) continue;
+      seenControls.add(key);
+      uniqueControls.push(item);
+    }
+    const controls = uniqueControls
       .map(compactVisualControl)
       .filter((item) => item.box?.inViewport || foreground.active)
       .slice(0, 120);
@@ -10447,7 +10839,10 @@
   }
 
   function activeOverlayElements() {
-    const selectors = "[role='dialog'], [aria-modal='true'], [role='listbox'], [role='menu'], [data-headlessui-state], .modal, .popover";
+    // Headless UI places data-headlessui-state on every option as well as the
+    // open owner. Only an open state can be a foreground surface; treating each
+    // seat option as an overlay multiplies observation work before compilation.
+    const selectors = "[role='dialog'], [aria-modal='true'], [role='listbox'], [role='menu'], [data-headlessui-state~='open'], .modal, .popover";
     const explicit = queryAllDeep(selectors);
     const floating = queryAllDeep("body *")
       .filter((element) => {
@@ -10952,7 +11347,7 @@
     return "unknown";
   }
 
-  function buildActiveSurface(overlays = activeOverlayElements(), sections = [], taskQueue = []) {
+  function buildActiveSurface(overlays = activeOverlayElements(), sections = [], taskQueue = [], structuralCollections = []) {
     const overlay = overlays[0];
     if (!overlay) {
       return {
@@ -10963,6 +11358,7 @@
         taskHint: "",
         options: [],
         buttons: [],
+        controlCollections: [],
         box: null,
         accessibility: null,
         visualState: foregroundSurfaceState({ type: "page" })
@@ -10973,7 +11369,13 @@
     const type = isTransientChoiceOverlay(overlay) ? "dropdown" : /dialog|modal/i.test(role) || overlay.getAttribute("aria-modal") === "true" ? "modal" : "popover";
     const map = agent.pageMap || null;
     const parentContext = inferSurfaceParentDecisionContext(overlay, sections);
-    const options = surfaceActionElements(overlay).map((option) => {
+    const overlayId = elementId(overlay);
+    const boundedSurfaceActions = boundHighCardinalityActionElements(
+      surfaceActionElements(overlay),
+      structuralCollections,
+      { surfaceId: overlayId }
+    );
+    const options = boundedSurfaceActions.elements.map((option) => {
       const label = overlayChoiceText(option);
       const ownedEvidence = controlOwnedEvidence(option);
       const fallbackSemantic = overlayOptionSemantic(label);
@@ -11020,7 +11422,7 @@
     const surfaceClass = classifySurfaceSemantics(overlay, prioritized, type);
     let surface = {
       type,
-      id: elementId(overlay),
+      id: overlayId,
       decisionGroupId: parentContext.decisionGroupId || "",
       parentControlId: parentContext.parentControlId || "",
       parentElementId: parentContext.parentElementId || "",
@@ -11033,6 +11435,9 @@
       surfaceClass,
       options: prioritized,
       buttons: prioritized,
+      controlCollections: boundedSurfaceActions.collections,
+      sourceActionCount: boundedSurfaceActions.sourceCount,
+      omittedActionCount: boundedSurfaceActions.omittedCount,
       box: elementBox(overlay),
       accessibility: accessibilityNode(overlay, map)
     };
@@ -11051,7 +11456,10 @@
   }
 
   function surfaceText(surface = {}) {
-    return `${surface.label || ""} ${surface.text || ""} ${(surface.options || []).map((option) => option.label || "").join(" ")}`.replace(/\s+/g, " ").trim();
+    const collectionEvidence = (surface.controlCollections || [])
+      .map((collection) => `${collection.type || "collection"} ${collection.totalCount || 0} items`)
+      .join(" ");
+    return `${surface.label || ""} ${surface.text || ""} ${boundedSurfaceEvidenceOptions(surface).map((option) => option.label || "").join(" ")} ${collectionEvidence}`.replace(/\s+/g, " ").trim();
   }
 
   function surfaceLooksLikeSeatSkip(surface = {}) {
@@ -11211,13 +11619,13 @@
       });
     }
 
-    // The tightest root with the largest repeated membership is the collection
-    // owner. This excludes surrounding checkout chrome even when it shares a
-    // broad ancestor with the collection.
+    // The deepest repeated owner is the collection boundary. Choosing the
+    // largest ancestor first can absorb dialog footer controls into a seat
+    // inventory and then hide the exact Continue/Back actuators we must keep.
     const selected = [];
     const claimed = new Set();
     candidates
-      .sort((left, right) => right.members.length - left.members.length || right.depth - left.depth)
+      .sort((left, right) => right.depth - left.depth || right.members.length - left.members.length)
       .forEach((candidate) => {
         const unclaimed = candidate.members.filter((element) => !claimed.has(element));
         if (unclaimed.length < 64) return;
@@ -11231,7 +11639,7 @@
     return selected;
   }
 
-  function boundHighCardinalityActionElements(elements = [], descriptors = []) {
+  function boundHighCardinalityActionElements(elements = [], descriptors = [], options = {}) {
     const source = [...elements];
     if (source.length < 120) {
       return { elements: source, collections: [], sourceCount: source.length, omittedCount: 0 };
@@ -11260,7 +11668,7 @@
       decisionGroupId: "",
       sectionId: "",
       sectionType: "seat",
-      surfaceId: "surface-page",
+      surfaceId: options.surfaceId || "surface-page",
       totalCount: inventory.length,
       retainedCount: retainedInventory.length,
       omittedCount: Math.max(0, inventory.length - retainedInventory.length),
@@ -11302,10 +11710,17 @@
     const seatInventoryCount = structuralCollections
       .filter((collection) => collection.type === "seat_inventory")
       .reduce((total, collection) => total + collection.members.length, 0);
+    const terminalStructure = observeTerminalStructure(fullText);
+    const terminalEvidence = AGENT_CONTRACT?.compileTerminalEvidence?.({
+      url: location.href,
+      visibleText: `${text} ${fullText}`,
+      structuralEvidence: terminalStructure
+    }) || null;
     const step = classifyStep({
       visibleText: `${text} ${fullText.slice(0, 2500)}`,
       url: location.href,
-      structuralEvidence: { seatInventoryCount }
+      structuralEvidence: { seatInventoryCount, ...terminalStructure },
+      terminalEvidence
     });
     const fields = candidateInputs().map((input) => {
       const detected = detectField(input);
@@ -11379,7 +11794,11 @@
     const overlays = visibleOverlays();
     const sections = buildSectionModels(detectCheckoutSections(), fields, buttons);
     const taskQueue = buildTaskQueue(sections);
-    const activeSurface = buildActiveSurface(activeOverlayElements(), sections, taskQueue);
+    const activeSurface = buildActiveSurface(activeOverlayElements(), sections, taskQueue, structuralCollections);
+    const controlCollections = [...new Map([
+      ...(boundedActions.collections || []),
+      ...(activeSurface.controlCollections || [])
+    ].map((collection) => [collection.collectionId, collection])).values()];
     let controls = buildCanonicalControlGraph(sections, fields, buttons, activeSurface);
     syncRequiredProfileChoiceGroups(fields, controls, sections);
     const validationIssues = collectValidationIssues(text, fields, controls, sections, activeSurface);
@@ -11451,7 +11870,13 @@
     decisionGroups = semanticCompilation.decisionGroups;
     const surfaceModel = buildSurfaceStack(activeSurface, sections, taskQueue, overlays, step);
     const stageExit = buildStageExit(decisionGroups, fields, buttons, overlays, errors, step, controls);
-    const transactionFacts = transactionFactsEvidence({ step, price, decisionGroups, activeSurface });
+    const transactionFacts = transactionFactsEvidence({
+      step,
+      price,
+      decisionGroups,
+      activeSurface,
+      terminalEvidence
+    });
     const map = {
       site: inferCheckoutSite(),
       step,
@@ -11459,6 +11884,7 @@
       fullText,
       coverage: pageCoverage(),
       readiness: pageReadinessFacts(),
+      terminalEvidence,
       fields,
       buttons,
       overlays,
@@ -11473,7 +11899,7 @@
       priceText: price ? `${price.amount} ${price.currency}` : "",
       transactionFacts,
       controls,
-      controlCollections: boundedActions.collections,
+      controlCollections,
       graphIntegrity,
       decisionGroups,
       decisionContracts: semanticCompilation.decisionContracts,
@@ -12422,6 +12848,7 @@
       },
       coverage: map.coverage || null,
       readiness: map.readiness || null,
+      terminalEvidence: map.terminalEvidence || null,
       stageExit: map.stageExit || null,
       text: map.text || map.fullText,
       snapshotHash: observationHashForMap(map),

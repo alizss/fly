@@ -37,10 +37,16 @@ function foregroundReady(page = {}) {
   return surface.type !== "page" && executableControlsForCurrentSurface(page).length > 0;
 }
 
-function navigationShaped(observation = {}, previousReadiness = {}) {
-  const result = observation.lastActionResult || {};
-  const feedback = result.feedback || {};
-  const action = result.action || observation.lastAction || {};
+function navigationShaped(observation = {}, previousReadiness = {}, navigationContext = {}) {
+  const result = observation.lastActionResult || navigationContext.result || {};
+  const feedback = result.feedback || navigationContext.feedback || {};
+  const action = result.action
+    || observation.lastAction
+    || navigationContext.action
+    || navigationContext.originalAction
+    || navigationContext
+    || {};
+  const lifecycle = navigationContext.lifecycle || {};
   return Boolean(
     feedback.navigationOccurred
     || feedback.pageChanged
@@ -49,6 +55,9 @@ function navigationShaped(observation = {}, previousReadiness = {}) {
     || result.pageChanged
     || /navigate|advance|continue|next|reobserve_after_transient/.test(lower(`${action.intent || ""} ${action.semanticIntent || ""}`))
     || /advance_surface|advance_checkout_stage/.test(lower(action.mechanicalEffect || action.physicalEffect || ""))
+    || (lifecycle.navigation === true && lifecycle.closed !== true)
+    || lifecycle.awaitingDestination === true
+    || lifecycle.status === "waiting_for_destination"
     || previousReadiness.classification === READINESS.TRANSIENT
     || previousReadiness.classification === READINESS.DEGRADED
   );
@@ -104,6 +113,8 @@ function visibleStage(page = {}) {
 }
 
 function expectedDestinationStage(page = {}) {
+  const checkoutEvidence = stageEvidence({ page });
+  if (checkoutEvidence.terminalEvidence?.boundaryObserved === true) return "payment";
   const surface = currentSurface(page);
   const foregroundLabel = surface.type === "page" ? "" : lower(surface.label);
   if (/payment|billing|card details|pay now/.test(foregroundLabel)) return "payment";
@@ -112,9 +123,7 @@ function expectedDestinationStage(page = {}) {
   if (/extra|ancillar|baggage|bundle|insurance|protection/.test(foregroundLabel)) return "extras";
 
   const routed = routeStage(page.url || "");
-  const checkoutEvidence = stageEvidence({ page });
-  const strongPaymentEvidence = checkoutEvidence.paymentSignals >= 3
-    || (checkoutEvidence.payment.route && checkoutEvidence.paymentSignals >= 2);
+  const strongPaymentEvidence = checkoutEvidence.terminalEvidence?.boundaryObserved === true;
   if (routed === "payment" && strongPaymentEvidence) return "payment";
 
   const visible = visibleStage(page);
@@ -184,8 +193,7 @@ function expectedStageContentMissing(page = {}) {
   }
   if (stage === "payment") {
     const evidence = stageEvidence({ page });
-    const terminalPaymentEvidence = evidence.paymentSignals >= 3
-      || (evidence.payment.route && evidence.paymentSignals >= 2);
+    const terminalPaymentEvidence = evidence.terminalEvidence?.boundaryObserved === true;
     return !terminalPaymentEvidence
       && !has(/card_number|card_expiry|card_cvc|payment_method|billing_address|submit_payment|submit_purchase|cc-number|cc-exp|cc-csc/);
   }
@@ -206,6 +214,7 @@ function readinessKey(observation = {}) {
 function classifyObservationReadiness({
   observation = {},
   previousReadiness = {},
+  navigationContext = {},
   readinessDeadlineAt = 0,
   nowMs = Date.now(),
   readinessTimeoutMs = DESTINATION_READINESS_TIMEOUT_MS
@@ -237,9 +246,8 @@ function classifyObservationReadiness({
   const usableForeground = foregroundReady(page) && !explicitLoading && !semanticUnresolved;
   const expectedStage = expectedDestinationStage(page);
   const checkoutEvidence = stageEvidence(observation);
-  const strongPaymentEvidence = checkoutEvidence.paymentSignals >= 3
-    || (checkoutEvidence.payment.route && checkoutEvidence.paymentSignals >= 2);
-  const afterNavigation = navigationShaped(observation, previousReadiness);
+  const strongPaymentEvidence = checkoutEvidence.terminalEvidence?.boundaryObserved === true;
+  const afterNavigation = navigationShaped(observation, previousReadiness, navigationContext);
   const shellAfterNavigation = afterNavigation
     && !usableForeground
     && (incompleteStage || (

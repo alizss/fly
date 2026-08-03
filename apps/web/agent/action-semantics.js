@@ -61,7 +61,7 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
     return normalizedOutcomeContract({
       taskOutcome: "profile_field_completed",
       acceptablePhysicalEffects: ["set_field_value", "open_surface", "reveal_control"],
-      completionEvidence: ["normalized_value_changed", "date_value_committed"]
+      completionEvidence: ["normalized_value_changed", "logical_component_committed", "date_value_committed"]
     });
   }
   if (/payment_review|reach payment|review before payment/.test(semantic)) {
@@ -313,7 +313,7 @@ function fromExpectedOutcome(expectedOutcome = {}) {
   if (type === "target_in_view") return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "target_visible" };
   if (/options_surface_appeared|active_surface_change|semantic_progress/.test(type)) return { interactionRole: "opener", semanticEffect: "open", expectedEvidence: "options_appeared" };
   if (/exact_free_option_selected|control_selected|section_choice_verified/.test(type)) return { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" };
-  if (/normalized_value_changed|field_value_changed|date_value_committed/.test(type)) return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
+  if (/normalized_value_changed|logical_component_committed|field_value_changed|date_value_committed/.test(type)) return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
   if (/stage_exit_or_feedback/.test(type)) return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "progress_changed" };
   if (/active_surface_dismissed|requirement_status/.test(type)) return { interactionRole: "command", semanticEffect: "waive", expectedEvidence: "dismissed" };
   return null;
@@ -451,7 +451,9 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
     return {
       ...existing,
       ...base,
-      type: existing.type === "date_value_committed" ? "date_value_committed" : "normalized_value_changed",
+      type: ["date_value_committed", "logical_component_committed"].includes(existing.type)
+        ? existing.type
+        : "normalized_value_changed",
       expectedValue: existing.expectedValue || action.value || "",
       expectedNormalizedValue: existing.expectedNormalizedValue || action.value || ""
     };
@@ -562,6 +564,11 @@ function buildSemanticAffordance({ candidate = {}, control = {}, goal = {}, post
       : {}),
     task: Object.freeze({
       goalId: String(goal.goalId || ""),
+      ...(goal.decisionInstanceId ? { decisionInstanceId: String(goal.decisionInstanceId) } : {}),
+      ...(goal.canonicalOwnerId ? { canonicalOwnerId: String(goal.canonicalOwnerId) } : {}),
+      ...(goal.decisionEpisodeId ? { decisionEpisodeId: String(goal.decisionEpisodeId) } : {}),
+      ...(goal.parentDecisionGroupId ? { parentDecisionGroupId: String(goal.parentDecisionGroupId) } : {}),
+      ...(goal.parentExpectedSelectedControlId ? { parentExpectedSelectedControlId: String(goal.parentExpectedSelectedControlId) } : {}),
       ...(goal.transactionOutcomeId ? { transactionOutcomeId: String(goal.transactionOutcomeId) } : {}),
       ...(goal.stageOutcomeId ? { stageOutcomeId: String(goal.stageOutcomeId) } : {}),
       ...(goal.surfaceSubgoalId ? { surfaceSubgoalId: String(goal.surfaceSubgoalId) } : {}),
