@@ -10,6 +10,7 @@ const {
   controlBelongsToCurrentSurface,
   currentSurface
 } = require("./surface-contract");
+const { checkoutRelevantControl } = require("./adaptive-interaction");
 
 function lower(value = "") {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -92,7 +93,7 @@ function routeStage(url = "") {
   if (/payment|checkout\/pay|\/pay(?:\/|$)/.test(value)) return "payment";
   if (/travell?er|passenger|contact/.test(value)) return "traveler";
   if (/seat/.test(value)) return "seats";
-  if (/extra|ancillar|baggage|bundle|insurance/.test(value)) return "extras";
+  if (/extra|ancillar|baggage|bundle|insurance|cabin-?bags?|hold-?bags?|\/(?:bags?|luggage)(?:\/|$)/.test(value)) return "extras";
   return "";
 }
 
@@ -200,6 +201,30 @@ function expectedStageContentMissing(page = {}) {
   return controls.length === 0;
 }
 
+function meaningfulDestinationCapability(page = {}, stage = "") {
+  const controls = executableControlsForCurrentSurface(page);
+  return controls.some((control) => {
+    const semantic = canonicalSemantic(control);
+    const effect = lower(`${control.physicalEffect || ""} ${control.mechanicalEffect || ""} ${control.semanticEffect || ""}`);
+    const evidence = `${semantic} ${effect}`;
+    if (stage === "traveler") {
+      return /first_name|last_name|surname|full_name|email|phone|date_of_birth|dob|passport|nationality|traveler_title|age_at_departure|\btitle\b/.test(evidence);
+    }
+    if (stage === "seats") {
+      return /seat|select_free_option|select_paid_option|add_paid_extra|required_dropdown_choice|decline_paid_extra/.test(evidence)
+        || checkoutRelevantControl(control);
+    }
+    if (stage === "extras") {
+      return /select_free_option|select_paid_option|add_paid_extra|optional_extra|baggage|bundle|insurance|protection|decline_paid_extra/.test(evidence)
+        || checkoutRelevantControl(control);
+    }
+    if (stage === "payment") {
+      return /card_number|card_expiry|card_cvc|payment_method|billing_address|submit_payment|submit_purchase|cc-number|cc-exp|cc-csc/.test(evidence);
+    }
+    return checkoutRelevantControl(control);
+  });
+}
+
 function readinessKey(observation = {}) {
   const page = observation.page || {};
   const surface = page.currentSurface || page.activeSurface || {};
@@ -230,9 +255,14 @@ function classifyObservationReadiness({
     : Number(nowMs);
   const suppliedDeadline = Number(readinessDeadlineAt || 0);
   const previousDeadline = samePendingDestination ? Number(previousReadiness.deadlineAt || 0) : 0;
-  const deadlineAt = suppliedDeadline > 0
-    ? suppliedDeadline
-    : (previousDeadline > 0 ? previousDeadline : startedAt + Math.max(1, Number(readinessTimeoutMs || 0)));
+  // A deadline belongs to one exact destination key. A new stage, surface,
+  // or URL starts a fresh readiness episode instead of inheriting time spent
+  // hydrating the previous page.
+  const deadlineAt = previousDeadline > 0
+    ? previousDeadline
+    : (samePendingDestination && suppliedDeadline > 0
+        ? suppliedDeadline
+        : startedAt + Math.max(1, Number(readinessTimeoutMs || 0)));
   const deadlineExpired = Number(nowMs) >= deadlineAt;
   const controls = actionableControlCount(page);
   const explicitLoading = facts.documentReadyState === "loading"
@@ -248,13 +278,6 @@ function classifyObservationReadiness({
   const checkoutEvidence = stageEvidence(observation);
   const strongPaymentEvidence = checkoutEvidence.terminalEvidence?.boundaryObserved === true;
   const afterNavigation = navigationShaped(observation, previousReadiness, navigationContext);
-  const shellAfterNavigation = afterNavigation
-    && !usableForeground
-    && (incompleteStage || (
-      !expectedStage
-      && Number(page.summary?.fields || 0) === 0
-      && Number(page.summary?.decisionGroups || 0) === 0
-    ));
   const stable = facts.documentReadyState === "complete"
     && facts.ariaBusy !== true
     && Number(facts.loadingIndicatorCount || 0) === 0
@@ -263,6 +286,17 @@ function classifyObservationReadiness({
       || Number(facts.mainTextLength || 0) > 0
       || Number(facts.visibleMainCount || 0) > 0
     );
+  const controllerReady = stable
+    && !explicitLoading
+    && (strongPaymentEvidence || meaningfulDestinationCapability(page, expectedStage));
+  const shellAfterNavigation = afterNavigation
+    && !usableForeground
+    && !controllerReady
+    && (incompleteStage || (
+      !expectedStage
+      && Number(page.summary?.fields || 0) === 0
+      && Number(page.summary?.decisionGroups || 0) === 0
+    ));
   const transient = explicitLoading || shellAfterNavigation;
   const evidence = Object.freeze({
     controls,
@@ -272,6 +306,7 @@ function classifyObservationReadiness({
     strongPaymentEvidence,
     semanticReadiness,
     semanticUnresolved,
+    controllerReady,
     unownedMaterialControls: page.semanticCompilation?.unownedMaterialControls || [],
     unresolvedDecisions: page.semanticCompilation?.unresolvedDecisions || [],
     stable,
@@ -295,7 +330,7 @@ function classifyObservationReadiness({
       evidence
     });
   }
-  if (transient) {
+  if (transient && (!stable || explicitLoading)) {
     return Object.freeze({
       classification: READINESS.DEGRADED,
       key,
@@ -305,25 +340,23 @@ function classifyObservationReadiness({
       elapsedMs: Math.max(0, Number(nowMs) - startedAt),
       remainingMs: 0,
       deadlineExpired: true,
-      reason: explicitLoading || !stable
-          ? "DESTINATION_READINESS_DEADLINE_EXPIRED_WHILE_LOADING"
-          : "DESTINATION_CONTENT_MISSING_AT_READINESS_DEADLINE",
+      reason: "DESTINATION_READINESS_DEADLINE_EXPIRED_WHILE_LOADING",
       handoffEligible: true,
       evidence
     });
   }
-  if (semanticUnresolved) {
+  if (transient) {
     return Object.freeze({
-      classification: READINESS.UNRESOLVED,
+      classification: READINESS.READY,
       key,
-      attempts,
-      startedAt,
-      deadlineAt,
-      elapsedMs: Math.max(0, Number(nowMs) - startedAt),
-      remainingMs: Math.max(0, deadlineAt - Number(nowMs)),
-      deadlineExpired,
-      reason: "SEMANTIC_COMPILATION_INCOMPLETE",
-      handoffEligible: deadlineExpired,
+      attempts: 0,
+      startedAt: 0,
+      deadlineAt: 0,
+      elapsedMs: 0,
+      remainingMs: 0,
+      deadlineExpired: false,
+      reason: "STABLE_DESTINATION_CONTROLLER_HANDOFF",
+      handoffEligible: false,
       evidence
     });
   }
@@ -336,9 +369,11 @@ function classifyObservationReadiness({
     elapsedMs: 0,
     remainingMs: 0,
     deadlineExpired: false,
-    reason: usableForeground ? "FOREGROUND_ACTIONABLE" : "OBSERVATION_SEMANTICALLY_READY",
+    reason: usableForeground
+      ? "FOREGROUND_ACTIONABLE"
+      : (controllerReady ? "STABLE_DESTINATION_CONTROLLER_READY" : "OBSERVATION_STABLE"),
     handoffEligible: false,
-    evidence: Object.freeze({ ...evidence, incompleteStage: false, explicitLoading: false })
+    evidence
   });
 }
 
@@ -348,6 +383,7 @@ module.exports = {
   classifyObservationReadiness,
   expectedDestinationStage,
   expectedStageContentMissing,
+  meaningfulDestinationCapability,
   navigationShaped,
   readinessKey
 };

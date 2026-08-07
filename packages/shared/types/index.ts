@@ -37,6 +37,7 @@ export type TravelerProfile = {
   emergency_contact_email?: string;
   meal_preference?: string;
   special_assistance?: string;
+  travel_purpose?: "leisure" | "business";
   preferred_seat: "aisle" | "window" | "no preference";
   baggage_preference: "personal item" | "cabin bag" | "checked bag";
   default_cabin: "economy" | "business";

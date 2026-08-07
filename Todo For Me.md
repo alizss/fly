@@ -5,7 +5,9 @@ Fly sees individual DOM elements, but it does not yet reliably understand how un
 
 > The semantic compiler creates the decision contract. Downstream code consumes or validates that contract—it does not reinterpret the raw page again.
 
-2.
+2. Get the GoToGate working + kiwi have baseline architerture done (working reaching payment stage)
+
+3. Go on to next OTE or checkout find faster way and loop of doing this and testing ensuring 99% reliability
 
 ### Testing Observations
 
@@ -66,12 +68,27 @@ Croatian Airlines
 	-  Seat like window seat
 	- Fast checking etc.
 	- Added luggage
-	- Ambiguity to aks the user
+	- Ambiguity to ask the user
 - Non required answers (e.g. above 12 years old)
 - Multi user booking
+
+
+| Priority | Scenario                                  | Why                                             |
+| -------- | ----------------------------------------- | ----------------------------------------------- |
+| 1        | One adult, no paid extras                 | Universal structural baseline                   |
+| 2        | Two adults                                | Repeated-control and passenger-ownership safety |
+| 3        | Adult plus child                          | DOB, title, age policy, and subject differences |
+| 4        | International documents                   | High-risk identity/document ownership           |
+| 5        | Specific seat with explicit cap           | Passenger-scoped paid authorization             |
+| 6        | Checked baggage with explicit cap         | Product quantity, weight, traveler, and price   |
+| 7        | Priority/fast-track/check-in              | Optional service classification and pricing     |
+| 8        | Fare flexibility/refundability            | Consequential fare semantics                    |
+| 9        | Missing profile preference                | Must ask exactly one question rather than guess |
+| 10       | Accessibility, loyalty, meals, assistance | Important extended profile coverage             |
 
 ### Tests Search Engines
 
 Skyscanner
 Googleflights
 KAYAK
+

@@ -1,7 +1,7 @@
 const { buildCanonicalDecisions } = require("./canonical-decision");
 const { normalizeProfileFieldType } = require("./logical-field");
 
-const TRANSACTION_CONTRACT_VERSION = "transaction-facts/v1";
+const TRANSACTION_CONTRACT_VERSION = "transaction-facts/v2";
 const COMMERCE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
 
 function text(value, limit = 180) {
@@ -38,6 +38,8 @@ function normalizeFactEvidence(entry = null, fallbackObservationId = "") {
   return {
     source: text(entry.source || "unknown", 80),
     ownerKey: text(entry.ownerKey, 180),
+    ...(entry.role ? { role: text(entry.role, 40) } : {}),
+    ...(entry.ownerType ? { ownerType: text(entry.ownerType, 60) } : {}),
     qualification: text(entry.qualification, 80),
     observationId: text(entry.observationId || fallbackObservationId, 120),
     confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0)),
@@ -110,8 +112,9 @@ function normalizedRouteEndpoint(value = "") {
   const endpoint = text(value, 80).toUpperCase();
   const tokens = normalizedText(endpoint, 80).split(/\s+/).filter(Boolean);
   const nonTravelMeaning = /\b(?:adult|child|children|infant|teen|passengers?|age|aged|years?|months?|over|under|younger|older|kg|kgs|kilograms?|lb|lbs|pounds?|cm|centimet(?:er|re)s?|dimensions?)\b/i;
+  const nonRouteCommerceMeaning = /\b(?:non[ -]?refundable|refundable|changeable|changes?|subject|fees?|charges?|conditions?|restrictions?|included|excluded|add|buy|purchase|upgrade|bags?|baggage|luggage|onboard|carry[ -]?on|bring)\b/i;
   if (!endpoint || !tokens.length) return "";
-  if (/\d/.test(endpoint) || tokens.length > 8 || nonTravelMeaning.test(endpoint)) return "";
+  if (/\d/.test(endpoint) || tokens.length > 8 || nonTravelMeaning.test(endpoint) || nonRouteCommerceMeaning.test(endpoint)) return "";
   if (tokens.every((token) => RESERVED_ROUTE_ENDPOINTS.has(token))) return "";
   return endpoint;
 }
@@ -138,8 +141,7 @@ function routeEvidenceAuthoritative(evidence = null) {
   return [
     "semantic_route_owner",
     "airport_code_pair",
-    "owned_travel_date",
-    "persistent_checkout_route"
+    "owned_travel_date"
   ].includes(evidence.qualification);
 }
 
@@ -177,7 +179,10 @@ function canonicalizeSegments(rawSegments = []) {
 
 function normalizeExtra(extra = {}, currency = "") {
   const family = text(extra.family || extra.subjectFamily, 40).toLowerCase();
-  if (!COMMERCE_FAMILIES.has(family) || isProfileSelection(extra)) return null;
+  const effectRole = semanticToken(extra.effectRole, 60);
+  if (!COMMERCE_FAMILIES.has(family)
+    || isProfileSelection(extra)
+    || ["scope_toggle", "information_only", "navigation"].includes(effectRole)) return null;
   const subjectKey = canonicalSubjectKey({ ...extra, family });
   const decisionOwnerKey = canonicalDecisionOwnerKey(extra);
   const canonicalKey = canonicalOutcomeKey({ ...extra, family, subjectKey, decisionOwnerKey });
@@ -195,6 +200,7 @@ function normalizeExtra(extra = {}, currency = "") {
       180
     ),
     family,
+    ...(effectRole ? { effectRole } : {}),
     subjectKey,
     label: family === "fare"
       ? canonicalFareBrand(extra.label || extra.selectedLabel)
@@ -274,6 +280,9 @@ function commerceSelectionsFromPage(page = {}, state = {}, traveler = {}) {
       COMMERCE_FAMILIES.has(String(decision.family || decision.subject?.family || "").toLowerCase())
       && !decisionOwnsProfileField(decision, page)
       && decision.currentState?.selected === true
+      && !["scope_toggle", "information_only", "navigation"].includes(
+        semanticToken(decision.currentState?.effectRole, 60)
+      )
       && decision.currentState?.selectedLabel
       // Opening a nested paid-product chooser is intent, not transaction
       // evidence. Only a committed child outcome may enter selectedExtras.
@@ -295,6 +304,7 @@ function commerceSelectionsFromPage(page = {}, state = {}, traveler = {}) {
       decisionOwnerKey: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
       canonicalOwnerId: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
       sourceKind: "commerce_decision",
+      effectRole: decision.currentState?.effectRole,
       family: decision.family || decision.subject?.family,
       subjectKey: decision.subject?.key,
       label: decision.currentState.selectedLabel,
@@ -388,13 +398,40 @@ function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {
     : fareEvidence && fareEvidence.authoritative !== true
       ? ""
       : canonicalFareBrand(raw.fareBrand || "");
+  const rawTotalAmount = number(pagePrice.amount ?? raw.totalPrice);
+  const totalPriceEvidence = normalizeFactEvidence(raw.factEvidence?.totalPrice, observationId)
+    || (raw.evidenceMode === "typed" && raw.contractVersion !== TRANSACTION_CONTRACT_VERSION && rawTotalAmount != null
+      ? {
+          source: "legacy_typed_total",
+          ownerKey: "legacy_total",
+          role: "booking_total",
+          ownerType: "legacy_transaction_summary",
+          qualification: "pre_v2_compatibility",
+          observationId: text(observationId, 120),
+          confidence: 0.3,
+          authoritative: true
+        }
+      : null);
+  // Pre-v2 observations did not carry a monetary role. Preserve their
+  // migration path as booking totals, while every v2 producer must publish
+  // the role explicitly. This keeps one compatibility seam instead of
+  // letting downstream layers reinterpret raw price text.
+  const normalizedTotalPriceEvidence = totalPriceEvidence
+    ? {
+        ...totalPriceEvidence,
+        role: totalPriceEvidence.role
+          || (raw.contractVersion === TRANSACTION_CONTRACT_VERSION ? "" : "booking_total")
+      }
+    : null;
+  const typedBookingTotal = normalizedTotalPriceEvidence?.authoritative === true
+    && normalizedTotalPriceEvidence.role === "booking_total";
   const factEvidence = {
     itinerary: segments.map((segment) => {
       const evidence = normalizeFactEvidence(segment.evidence, observationId);
       return evidence ? { segmentId: segment.segmentId, ...evidence } : null;
     }).filter(Boolean),
     fareBrand: fareEvidence,
-    totalPrice: normalizeFactEvidence(raw.factEvidence?.totalPrice, observationId),
+    totalPrice: normalizedTotalPriceEvidence,
     travelers: normalizeFactEvidence(raw.factEvidence?.travelers, observationId)
   };
   return {
@@ -407,7 +444,12 @@ function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {
     travelers: authoritativeTravelers,
     currency,
     basePrice: { amount: number(basePrice.amount ?? raw.basePrice), currency: text(basePrice.currency || currency, 20).toUpperCase() },
-    totalPrice: { amount: number(pagePrice.amount ?? raw.totalPrice), currency: text(pagePrice.currency || currency, 20).toUpperCase() },
+    totalPrice: {
+      amount: evidenceContractPresent && !typedBookingTotal
+        ? null
+        : rawTotalAmount,
+      currency: text(pagePrice.currency || currency, 20).toUpperCase()
+    },
     fareBrand,
     selectedExtras: mergeCommerceSelections((Array.isArray(raw.selectedExtras) ? raw.selectedExtras : []).map((extra) => ({
       ...extra,

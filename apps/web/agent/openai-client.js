@@ -1,5 +1,5 @@
 // Thin, reusable wrapper around OpenAI's structured-output Responses API.
-// requirement-extractor, verifier, and planner all call this with their own
+// Semantic grounding and candidate selection call this with their own
 // instructions/schema — the HTTP mechanics (screenshot attach, strict JSON
 // schema, error handling) live in exactly one place.
 

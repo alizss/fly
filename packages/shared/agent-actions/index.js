@@ -23,6 +23,11 @@
  * @property {string} [goalId]
  * @property {string} [decisionInstanceId]
  * @property {string} [candidateId]
+ * @property {"proven_action"|"mechanical_hypothesis"} [candidateClass]
+ * @property {boolean} [mechanicalHypothesis]
+ * @property {Object} [discoveryEnvelope]
+ * @property {string} [logicalControlId]
+ * @property {string} [actuatorId]
  * @property {string} [skillPlanId]
  * @property {string} [skillAtomId]
  * @property {string} [controlId]
@@ -184,6 +189,17 @@ function normalizeAction(raw = {}) {
     goalId: raw.goalId ? String(raw.goalId).slice(0, 200) : "",
     decisionInstanceId: raw.decisionInstanceId ? String(raw.decisionInstanceId).slice(0, 900) : "",
     candidateId: raw.candidateId ? String(raw.candidateId).slice(0, 240) : "",
+    candidateClass: ["proven_action", "mechanical_hypothesis"].includes(raw.candidateClass)
+      ? raw.candidateClass
+      : "proven_action",
+    mechanicalHypothesis: raw.mechanicalHypothesis === true,
+    discoveryEnvelope: raw.discoveryEnvelope && typeof raw.discoveryEnvelope === "object"
+      ? { ...raw.discoveryEnvelope }
+      : null,
+    logicalControlId: raw.logicalControlId
+      ? String(raw.logicalControlId).slice(0, 160)
+      : (raw.controlId ? String(raw.controlId).slice(0, 160) : ""),
+    actuatorId: normalizeTargetId(raw.actuatorId || raw.targetId),
     skillPlanId: raw.skillPlanId ? String(raw.skillPlanId).slice(0, 160) : "",
     skillAtomId: raw.skillAtomId ? String(raw.skillAtomId).slice(0, 200) : "",
     controlId: raw.controlId ? String(raw.controlId).slice(0, 140) : (raw.targetSnapshot?.controlId ? String(raw.targetSnapshot.controlId).slice(0, 140) : ""),

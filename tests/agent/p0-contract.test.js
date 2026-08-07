@@ -591,7 +591,7 @@ test("the server-owned semantic affordance is unchanged from candidate through a
   assert.equal(action.affordance.postcondition.type, "exact_free_option_selected");
 });
 
-test("surface ambiguity excludes global site chrome but retains checkout controls", () => {
+test("surface ambiguity is diagnostic context and never an executable goal", () => {
   const observation = {
     observationId: "obs_checkout_relevance",
     observationSnapshot: { snapshotHash: "hash_checkout_relevance" },
@@ -635,7 +635,8 @@ test("surface ambiguity excludes global site chrome but retains checkout control
   };
 
   const candidateSet = buildCurrentCandidateSet({ goal, observation });
-  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["ctrl_continue"]);
+  assert.deepEqual(candidateSet.candidates, []);
+  assert.equal(candidateSet.contextCapabilities.some((candidate) => candidate.controlId === "ctrl_continue"), true);
   assert.equal(candidateSet.contextCapabilities.some((candidate) => candidate.controlId === "ctrl_sidebar"), false);
 });
 

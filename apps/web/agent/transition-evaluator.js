@@ -52,6 +52,12 @@ function surfaceOf(page = {}) {
   return currentSurface(page);
 }
 
+function currentSurfaceIsSiteFailure(page = {}) {
+  const surface = surfaceOf(page);
+  return surface.type !== "page"
+    && [surface.surfaceClass, page.surfaceClass].some((value) => text(value) === "site_failure");
+}
+
 function priceAmount(page = {}) {
   const amount = Number(page.price?.amount);
   return Number.isFinite(amount) ? amount : null;
@@ -732,7 +738,14 @@ function evaluatePostcondition(
   if (["options_surface_appeared", "active_surface_change", "semantic_progress"].includes(type)) {
     const expanded = afterControl?.state?.expanded === true && beforeControl?.state?.expanded !== true;
     const optionAppeared = (diff.appeared || []).some((item) => /option|choice|radio|menuitem/.test(text(item.role)));
-    return { type, satisfied: Boolean(expanded || diff.modalOpened || optionAppeared || diff.surfaceChanged), evidence: { expanded, optionAppeared, modalOpened: diff.modalOpened } };
+    const beforeValue = controlValue(beforeControl || {});
+    const afterValue = controlValue(afterControl || {});
+    const valueChanged = type === "semantic_progress" && Boolean(afterControl && beforeValue !== afterValue);
+    return {
+      type,
+      satisfied: Boolean(expanded || diff.modalOpened || optionAppeared || diff.surfaceChanged || valueChanged),
+      evidence: { expanded, optionAppeared, modalOpened: diff.modalOpened, beforeValue, afterValue, valueChanged }
+    };
   }
   if (type === "active_surface_dismissed") {
     const expectedSurfaceId = expected.surfaceId || action.targetSnapshot?.surfaceId || surfaceOf(beforePage).id || "";
@@ -763,12 +776,13 @@ function evaluatePostcondition(
     return { type, satisfied: Boolean(target && target.visualRegion?.inViewport === true), evidence: { controlId: target?.controlId || "", inViewport: target?.visualRegion?.inViewport === true } };
   }
   if (type === "stage_exit_or_feedback") {
-    const satisfied = Boolean(diff.stageChanged || diff.urlChanged || diff.progressChanged || diff.modalOpened || diff.modalClosed || diff.errorsAppeared?.length || diff.surfaceChanged);
+    const satisfied = !currentSurfaceIsSiteFailure(afterPage)
+      && Boolean(diff.stageChanged || diff.urlChanged || diff.progressChanged || diff.modalOpened || diff.modalClosed || diff.errorsAppeared?.length || diff.surfaceChanged);
     return { type, satisfied, evidence: { stageChanged: diff.stageChanged, progressChanged: diff.progressChanged, modalOpened: diff.modalOpened, errorsAppeared: diff.errorsAppeared } };
   }
   if (type === "current_surface_advanced") {
     const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
-    const advanced = Boolean(
+    const advanced = !currentSurfaceIsSiteFailure(afterPage) && Boolean(
       diff.progressChanged
       || diff.stageChanged
       || diff.urlChanged
@@ -791,7 +805,7 @@ function evaluatePostcondition(
   }
   if (type === "checkout_stage_advanced") {
     const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
-    const advanced = Boolean(
+    const advanced = !currentSurfaceIsSiteFailure(afterPage) && Boolean(
       diff.stageChanged
       || diff.urlChanged
       || diff.progressChanged

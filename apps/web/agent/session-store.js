@@ -28,6 +28,97 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function eventSummary(value, depth = 0) {
+  if (value == null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value === "string") return value.length > 800 ? `${value.slice(0, 800)}…` : value;
+  if (depth >= 4) return "[bounded]";
+  if (Array.isArray(value)) return value.slice(0, 24).map((item) => eventSummary(item, depth + 1));
+  if (typeof value !== "object") return String(value);
+  const dropped = new Set([
+    "observation",
+    "previousObservation",
+    "beforeObservation",
+    "afterObservation",
+    "page",
+    "controls",
+    "candidateSet",
+    "contextCapabilities",
+    "screenshotDataUrl",
+    // These collections are observation-local execution evidence. Persisting
+    // them again inside every action/event duplicates the canonical
+    // observation and can turn a single governed action into hundreds of KB.
+    "operations",
+    "actuators",
+    "visualRegions",
+    "strategies",
+    "exactActuators",
+    "actionabilityByActuator",
+    "targetabilityByActuator"
+  ]);
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !dropped.has(key))
+    .slice(0, 80)
+    .map(([key, item]) => [key, eventSummary(item, depth + 1)]));
+}
+
+function governedActionSummary(action = {}) {
+  const summary = eventSummary(action) || {};
+  const target = action.targetSnapshot || {};
+  const pipeline = action.pipelineContract || {};
+  const capability = pipeline.capability || {};
+  const selectedStrategy = capability.selectedStrategy || {};
+  return {
+    ...summary,
+    // Keep the exact durable identity and governed postcondition. The full
+    // canonical control graph remains available from the immutable
+    // observation referenced by observationId/observationHash.
+    targetSnapshot: target && typeof target === "object" ? {
+      id: String(target.id || ""),
+      controlId: String(target.controlId || action.controlId || ""),
+      stableKey: String(target.stableKey || ""),
+      meaning: String(target.meaning || ""),
+      label: String(target.label || "").slice(0, 240),
+      normalizedLabel: String(target.normalizedLabel || "").slice(0, 240),
+      role: String(target.role || ""),
+      domRole: String(target.domRole || ""),
+      semantic: String(target.semantic || ""),
+      kind: String(target.kind || ""),
+      fieldType: String(target.fieldType || ""),
+      decisionGroupId: String(target.decisionGroupId || action.decisionGroupId || ""),
+      sectionId: String(target.sectionId || ""),
+      surfaceId: String(target.surfaceId || ""),
+      surfaceType: String(target.surfaceType || ""),
+      risk: String(target.risk || action.risk || ""),
+      state: eventSummary(target.state || null),
+      box: eventSummary(target.box || null)
+    } : null,
+    expectedOutcome: eventSummary(action.expectedOutcome || null),
+    expectedPostconditions: eventSummary(action.expectedPostconditions || []),
+    pipelineContract: pipeline && typeof pipeline === "object" ? {
+      contractVersion: String(pipeline.contractVersion || ""),
+      requirement: eventSummary(pipeline.requirement || null),
+      component: eventSummary(pipeline.component || null),
+      capability: {
+        capabilityId: String(capability.capabilityId || ""),
+        operation: String(capability.operation || action.operation || ""),
+        status: String(capability.status || ""),
+        actuatorId: String(capability.actuatorId || action.targetId || ""),
+        selectedStrategy: selectedStrategy && typeof selectedStrategy === "object" ? {
+          operation: String(selectedStrategy.operation || action.operation || ""),
+          actuatorId: String(selectedStrategy.actuatorId || action.targetId || ""),
+          method: String(selectedStrategy.method || action.interactionMethod || ""),
+          actionType: String(selectedStrategy.actionType || action.type || ""),
+          status: String(selectedStrategy.status || ""),
+          strategyId: String(selectedStrategy.strategyId || ""),
+          actuatorStableKey: String(selectedStrategy.actuatorStableKey || "")
+        } : null
+      },
+      expectedOutcome: eventSummary(pipeline.expectedOutcome || action.expectedOutcome || null),
+      validationOwnership: eventSummary(pipeline.validationOwnership || null)
+    } : null
+  };
+}
+
 function redactedObservation(observation = {}) {
   const page = { ...(observation.page || {}) };
   if (page.screenshotDataUrl) page.screenshotDataUrl = "[redacted-persisted-separately]";
@@ -128,7 +219,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     return saveSession(state);
   }
 
-  function recordObservation(transactionId, observation = {}) {
+  function recordObservation(transactionId, observation = {}, { updateSession = true } = {}) {
     const observationId = String(observation.observationId || "");
     const snapshotHash = String(observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "");
     if (!transactionId || !observationId || !snapshotHash) {
@@ -161,7 +252,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
         json(payload, {}),
         nowIso()
       );
-      const currentState = getSession(transactionId);
+      const currentState = updateSession ? getSession(transactionId) : null;
       if (currentState) {
         saveSession(withUpdate(currentState, {
           currentObservationId: observationId,
@@ -231,7 +322,17 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
         action_id, transaction_id, turn_id, observation_id, observation_hash,
         signature, status, action_json, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?, ?)
-    `).run(action.id, transactionId, turnId, observationId, observationHash, signature, json(action, {}), at, at);
+    `).run(
+      action.id,
+      transactionId,
+      turnId,
+      observationId,
+      observationHash,
+      signature,
+      json(governedActionSummary(action), {}),
+      at,
+      at
+    );
     return { ok: true, actionId: action.id, signature };
   }
 
@@ -344,24 +445,31 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     ))) {
       failures.push(failure);
     }
-    const updated = saveSession(withUpdate(state, {
-      ...patch,
-      lastActionResult: result,
-      failures: failures.slice(-80)
-    }));
-    const actionId = String(result.actionId || result.action?.id || "");
-    if (actionId) {
-      const dispatched = result.dispatched === true || result.executed === true;
-      const status = dispatched ? "dispatched" : "rejected_before_dispatch";
-      advanceGovernedAction(actionId, ["allowed", "approved", "dispatched"], status, result);
-      recordActionEvent(updated.id, {
-        actionId,
-        observationId: String(result.observationId || ""),
-        stage: status,
-        result
-      });
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = saveSession(withUpdate(state, {
+        ...patch,
+        lastActionResult: result,
+        failures: failures.slice(-80)
+      }));
+      const actionId = String(result.actionId || result.action?.id || "");
+      if (actionId) {
+        const dispatched = result.dispatched === true || result.executed === true;
+        const status = dispatched ? "dispatched" : "rejected_before_dispatch";
+        advanceGovernedAction(actionId, ["allowed", "approved", "dispatched"], status, result);
+        recordActionEvent(updated.id, {
+          actionId,
+          observationId: String(result.observationId || ""),
+          stage: status,
+          result
+        });
+      }
+      db.exec("COMMIT");
+      return updated;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
     }
-    return updated;
   }
 
   function recordActionEvent(transactionId, event = {}) {
@@ -376,7 +484,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       String(event.turnId || ""),
       String(event.observationId || ""),
       String(event.stage || "event"),
-      json(event, {}),
+      json(eventSummary(event), {}),
       at
     );
     return Number(outcome.lastInsertRowid);

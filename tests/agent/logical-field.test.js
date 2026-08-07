@@ -4,18 +4,23 @@ const assert = require("node:assert/strict");
 const {
   normalizeProfileFieldType,
   semanticTypeForControl,
+  derivedTravelerFacts,
   resolveLogicalFields,
   logicalFieldSatisfied,
   verifyLogicalField
 } = require("../../apps/web/agent/logical-field");
 const {
   fieldDescriptors,
-  deriveProfileGoal,
+  selectNextProfileRequirement,
   candidatesForProfileGoal,
   profileGoalSatisfied
 } = require("../../apps/web/agent/skill-expander");
 const { evaluatePostcondition } = require("../../apps/web/agent/transition-evaluator");
 const { semanticGoalKey, decisionInstanceKey } = require("../../packages/shared/agent-actions");
+
+function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
+  return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
+}
 
 const traveler = {
   first_name: "Ali",
@@ -28,6 +33,21 @@ const traveler = {
     expiry_date: "2031-09-14"
   }
 };
+
+test("travel-purpose radio groups compile as a profile-backed choice", () => {
+  const control = {
+    controlId: "purpose_leisure",
+    role: "radio",
+    kind: "radio",
+    label: "Leisure",
+    name: "reasonForTravelRadioInput",
+    operations: { choose: { actionability: { executable: true } } }
+  };
+
+  assert.equal(normalizeProfileFieldType("business_or_leisure"), "travel_purpose");
+  assert.equal(normalizeProfileFieldType("reasonForTravelRadioInput"), "travel_purpose");
+  assert.equal(semanticTypeForControl(control, {}), "travel_purpose");
+});
 
 function dateControl(role, value = "", options = {}) {
   const controlId = options.controlId || `ctrl_${role}`;
@@ -110,6 +130,118 @@ test("activation-only payment command is not inferred as an email field from acc
   };
 
   assert.equal(semanticTypeForControl(pay, {}), "");
+});
+
+test("combined first and middle name input is one given-names requirement and middle name stays optional", () => {
+  const control = {
+    controlId: "ctrl_given_names",
+    fieldType: "first_name",
+    field: "first_name",
+    role: "textbox",
+    kind: "text",
+    label: "First / Middle name (as shown on ID)",
+    name: "preventautofill passengername_0",
+    state: { normalizedValue: "", valuePresent: false, disabled: false },
+    operations: { type: { operation: "type", actuatorId: "target_given_names" } }
+  };
+  const field = fieldFor(control);
+
+  assert.equal(semanticTypeForControl(control, field), "given_names");
+  const [logical] = resolveLogicalFields({
+    step: "traveler_information",
+    controls: [control],
+    fields: [field],
+    validationIssues: []
+  }, { first_name: "Ali", middle_name: "" });
+
+  assert.equal(logical.semanticType, "given_names");
+  assert.equal(logical.desiredCanonicalValue, "ali");
+  assert.equal(logical.components[0].inputValue, "Ali");
+});
+
+test("split custom choice compiles visible mechanics and hidden state as one settled logical component", () => {
+  const makeControls = (hiddenValue = "") => [{
+    controlId: "title_picker",
+    stableKey: "select|meaning:title|path:input:combobox:0",
+    fieldType: "title",
+    semantic: "title",
+    sectionId: "passenger_1",
+    sectionType: "passenger",
+    role: "editable_combobox",
+    kind: "select",
+    label: "Title",
+    state: { normalizedValue: "", valuePresent: false, expanded: false, disabled: false },
+    operations: {
+      open: { operation: "open", actuatorId: "title_trigger", actuatorIds: ["title_trigger"] }
+    },
+    componentContract: {
+      logicalIdentity: "title",
+      componentIdentity: "title:value"
+    },
+    visualRegion: { x: 20, y: 20, width: 120, height: 32 }
+  }, {
+    controlId: "title_hidden_state",
+    stableKey: "field|name:title|type:hidden|path:input:textbox:0",
+    fieldType: "title",
+    semantic: "title",
+    sectionId: "passenger_1",
+    sectionType: "passenger",
+    role: "textbox",
+    kind: "field",
+    label: "title",
+    name: "title",
+    state: {
+      normalizedValue: hiddenValue,
+      valuePresent: Boolean(hiddenValue),
+      expanded: false,
+      disabled: false
+    },
+    operations: {},
+    componentContract: {
+      logicalIdentity: "title",
+      componentIdentity: "title:value"
+    },
+    visualRegion: { x: 0, y: 0, width: 0, height: 0 }
+  }];
+  const pageFor = (value) => {
+    const controls = makeControls(value);
+    return {
+      step: "traveler_information",
+      controls,
+      fields: controls.map((control) => fieldFor(control)),
+      validationIssues: [],
+      currentSurface: { id: "surface-page", type: "page" }
+    };
+  };
+
+  const beforePage = pageFor("");
+  const [before] = resolveLogicalFields(beforePage, traveler);
+  assert.equal(before.components.length, 1);
+  assert.equal(before.components[0].controlId, "title_picker");
+  assert.deepEqual(before.components[0].stateControlIds, ["title_picker", "title_hidden_state"]);
+  assert.equal(logicalFieldSatisfied(before), false);
+  assert.equal(deriveProfileGoal({ observationId: "obs_split_before", page: beforePage }, traveler).controlId, "title_picker");
+
+  const afterPage = pageFor("mr");
+  const [after] = resolveLogicalFields(afterPage, traveler);
+  assert.equal(after.components.length, 1);
+  assert.equal(after.components[0].controlId, "title_picker");
+  assert.equal(after.components[0].stateControlId, "title_hidden_state");
+  assert.equal(after.currentCanonicalValue, "mr");
+  assert.equal(logicalFieldSatisfied(after), true);
+  assert.equal(fieldDescriptors({ observationId: "obs_split_after", page: afterPage }, traveler)[0].hasValue, true);
+
+  const verification = verifyLogicalField(afterPage, {
+    logicalFieldId: after.logicalFieldId,
+    subjectId: after.subjectId,
+    semanticType: "title",
+    componentRole: "value",
+    controlId: "title_picker",
+    expectedNormalizedValue: "mr",
+    expectedCanonicalValue: "mr"
+  }, traveler);
+  assert.equal(verification.componentResult.satisfied, true);
+  assert.equal(verification.logicalFieldResult.satisfied, true);
 });
 
 test("dob_partial_group_validation_does_not_retry_completed_component", () => {
@@ -1010,4 +1142,70 @@ test("phone components share a stable owner through standard autocomplete contra
   assert.equal(phone.structure, "composite");
   assert.deepEqual(phone.components.map((component) => component.componentRole), ["country_code", "local_number"]);
   assert.equal(phone.currentCanonicalValue, "+905551112233");
+});
+
+test("age at departure is derived from DOB and the selected booking date and matched to a range", () => {
+  const page = {
+    step: "traveler_information",
+    selectedBooking: {
+      itinerary: {
+        segments: [{ origin: "SJJ", destination: "IST", departureDate: "2026-10-15" }]
+      }
+    },
+    controls: [{
+      controlId: "passenger_age",
+      fieldType: "age_at_departure",
+      label: "Age at time of travel",
+      role: "select",
+      kind: "select-one",
+      required: true,
+      representationLifecycle: { status: "active_rendered", active: true },
+      options: [
+        { value: "16_17", label: "16–17" },
+        { value: "18_24", label: "18–24" },
+        { value: "25_29", label: "25–29" }
+      ],
+      state: { valuePresent: false, selected: false, normalizedValue: "" },
+      operations: { select: { actuatorId: "passenger_age", status: "executable" } }
+    }],
+    fields: []
+  };
+  page.fields = page.controls.map((control) => ({ ...control, controlState: control.state }));
+
+  const facts = derivedTravelerFacts(traveler, { page });
+  const [ageField] = resolveLogicalFields(page, traveler);
+
+  assert.equal(facts.age_at_departure.value, "23");
+  assert.equal(facts.age_at_departure.source, "derived_fact.age_at_departure");
+  assert.deepEqual(facts.age_at_departure.inputs, ["profile.date_of_birth", "selected_booking.departure_date"]);
+  assert.equal(ageField.semanticType, "age_at_departure");
+  assert.equal(ageField.desiredCanonicalValue, "23");
+  assert.equal(ageField.components[0].desiredValue, "23");
+  assert.equal(ageField.components[0].inputValue, "18_24");
+  assert.equal(ageField.components[0].exactOption.label, "18–24");
+});
+
+test("age at departure respects the birthday boundary and is never invented without a departure date", () => {
+  const beforeBirthday = derivedTravelerFacts(traveler, {
+    selectedBooking: { segments: [{ departureDate: "2026-05-30" }] }
+  });
+  const noTrip = derivedTravelerFacts(traveler, {});
+
+  assert.equal(beforeBirthday.age_at_departure.value, "22");
+  assert.equal(noTrip.age_at_departure, null);
+});
+
+test("age derivation ignores transient current-page dates in favor of the selected-booking baseline", () => {
+  const facts = derivedTravelerFacts(traveler, {
+    page: {
+      transactionFacts: { itinerary: { segments: [{ departureDate: "2027-01-01" }] } }
+    },
+    transactionReview: {
+      current: { itinerary: { segments: [{ departureDate: "2027-01-01" }] } },
+      baseline: { itinerary: { segments: [{ departureDate: "2026-05-30" }] } }
+    }
+  });
+
+  assert.equal(facts.age_at_departure.value, "22");
+  assert.equal(facts.age_at_departure.departureDate, "2026-05-30");
 });

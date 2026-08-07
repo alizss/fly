@@ -9,6 +9,7 @@ const PHYSICAL_EFFECTS = new Set([
   "select_free_option",
   "select_paid_option",
   "set_field_value",
+  "filter_options",
   "advance_surface",
   "advance_checkout_stage",
   "accept_legal_terms",
@@ -60,7 +61,7 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
   if (goal.kind === "profile_field" || /profile_field|traveler field|contact field/.test(semantic)) {
     return normalizedOutcomeContract({
       taskOutcome: "profile_field_completed",
-      acceptablePhysicalEffects: ["set_field_value", "open_surface", "reveal_control"],
+      acceptablePhysicalEffects: ["set_field_value", "filter_options", "open_surface", "reveal_control"],
       completionEvidence: ["normalized_value_changed", "logical_component_committed", "date_value_committed"]
     });
   }
@@ -69,7 +70,7 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
       taskOutcome: "payment_review_reached",
       // These effects may advance an intermediate stage/surface, but only
       // fresh payment evidence completes this durable outcome.
-      acceptablePhysicalEffects: ["open_surface", "dismiss_surface", "select_free_option", "set_field_value", "advance_surface", "advance_checkout_stage", "reveal_control"],
+      acceptablePhysicalEffects: ["open_surface", "dismiss_surface", "select_free_option", "set_field_value", "filter_options", "advance_surface", "advance_checkout_stage", "reveal_control"],
       completionEvidence: ["fresh_payment_stage", "payment_url", "payment_progress_marker", "payment_controls"]
     });
   }
@@ -101,9 +102,9 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
   }
   if (/surface_ambiguity|interpret.*surface|safe_progress/.test(semantic)) {
     return normalizedOutcomeContract({
-      taskOutcome: "current_surface_completed",
-      acceptablePhysicalEffects: ["open_surface", "dismiss_surface", "select_free_option", "set_field_value", "advance_surface", "advance_checkout_stage", "reveal_control"],
-      completionEvidence: ["fresh_surface_state", "fresh_validation_state", "fresh_stage_state"]
+      taskOutcome: "active_requirement_unresolved",
+      acceptablePhysicalEffects: [],
+      completionEvidence: []
     });
   }
   if (/navigation|continue|next_stage|advance/.test(semantic)) {
@@ -117,7 +118,7 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
   }
   return normalizedOutcomeContract({
     taskOutcome: "current_surface_completed",
-    acceptablePhysicalEffects: ["open_surface", "dismiss_surface", "select_free_option", "set_field_value", "advance_surface", "advance_checkout_stage", "reveal_control"],
+    acceptablePhysicalEffects: ["open_surface", "dismiss_surface", "select_free_option", "set_field_value", "filter_options", "advance_surface", "advance_checkout_stage", "reveal_control"],
     completionEvidence: ["fresh_surface_state"]
   });
 }
@@ -163,6 +164,7 @@ function semanticIntentForAction({ mechanicalEffect = "unknown", control = {}, c
   if (mechanicalEffect === "advance_checkout_stage") return /payment/.test(text) ? "continue_to_payment" : "advance_checkout_stage";
   if (mechanicalEffect === "advance_surface") return "advance_current_surface";
   if (mechanicalEffect === "set_field_value") return "complete_profile_field";
+  if (mechanicalEffect === "filter_options") return "filter_current_options";
   return String(candidate.semanticIntent || candidate.intent || goal.semanticType || "unknown");
 }
 
@@ -222,6 +224,9 @@ function assessOutcomeCompatibility({
   }
   if (!verifiablePostconditions(expectedPostconditions)) {
     return { status: OUTCOME_COMPATIBILITY.UNKNOWN, reason: "postconditions_not_verifiable" };
+  }
+  if (goal.kind === "adaptive_surface" && mechanicalEffect === "filter_options") {
+    return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "bounded_filter_advances_owned_surface_discovery" };
   }
   if (durableOutcome === "payment_review_reached" && ["submit_purchase", "enter_payment_credentials"].includes(mechanicalEffect)) {
     return { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "effect_exceeds_payment_review_objective" };
@@ -446,6 +451,16 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
   }
   if (physicalEffect === "advance_surface" || semantics.interactionRole === "navigation") {
     return { ...existing, ...base, type: "current_surface_advanced" };
+  }
+  if (physicalEffect === "filter_options") {
+    return {
+      ...existing,
+      ...base,
+      type: "semantic_progress",
+      previousValue: existing.previousValue || "",
+      expectedNormalizedValue: existing.expectedNormalizedValue || action.value || "",
+      canonicalTarget: existing.canonicalTarget || ""
+    };
   }
   if (["set_field_value", "enter_payment_credentials"].includes(physicalEffect) || semantics.interactionRole === "field") {
     return {

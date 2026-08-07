@@ -120,6 +120,13 @@ function currentObservationSurfaceId(observation = {}) {
   return currentSurfaceId(observation.page || {});
 }
 
+// A bound target snapshot is the canonical action-to-observation ownership
+// contract. Candidate-only fields may exist before binding, but normalizeAction
+// intentionally does not transport a second top-level surface identity.
+function canonicalActionSurfaceId(action = {}) {
+  return String(action.targetSnapshot?.surfaceId || "");
+}
+
 function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = []) {
   const goal = state.taskState?.currentGoal;
   if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
@@ -189,6 +196,134 @@ function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks 
     `The current semantic goal ${goal.label || goal.semanticType}=${goal.desiredValue} must complete or exhaust its finite recovery budget before ${control.label || action.targetLabel || action.intent || action.type}.`,
     checks
   );
+}
+
+function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, checks = []) {
+  const goal = state.taskState?.currentGoal || {};
+  if (!["adaptive_surface", "adaptive_interaction"].includes(goal.kind)
+    || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
+  const envelope = goal.adaptiveEnvelope || {};
+  const observationSurfaceId = currentObservationSurfaceId(observation);
+  const targetSurfaceId = canonicalActionSurfaceId(action);
+  if (!observationSurfaceId
+    || envelope.surfaceId !== observationSurfaceId
+    || targetSurfaceId !== observationSurfaceId) {
+    return recoverable(
+      "ADAPTIVE_SURFACE_CHANGED",
+      "The bounded adaptive episode may act only on the exact foreground surface that created it.",
+      checks
+    );
+  }
+  if (Number(envelope.remainingSteps || 0) <= 0 || Number(envelope.deadlineAt || 0) <= Date.now()) {
+    return fail(
+      "ADAPTIVE_EPISODE_EXHAUSTED",
+      "The bounded adaptive episode exhausted its step or time budget before a verified result.",
+      checks
+    );
+  }
+  if (!(envelope.allowedOperations || []).includes(action.operation)) {
+    return fail(
+      "ADAPTIVE_OPERATION_FORBIDDEN",
+      `The adaptive envelope does not authorize ${action.operation || action.type}.`,
+      checks
+    );
+  }
+  const risk = String(action.risk || action.targetSnapshot?.risk || "uncertain").toLowerCase();
+  if ((envelope.forbiddenRisks || []).some((item) => risk === String(item).toLowerCase())) {
+    return fail("ADAPTIVE_RISK_FORBIDDEN", `The adaptive envelope forbids ${risk} actions.`, checks);
+  }
+  const effect = [
+    action.mechanicalEffect,
+    action.physicalEffect,
+    action.semanticIntent,
+    action.intent,
+    action.targetSnapshot?.semantic
+  ].filter(Boolean).join(" ").toLowerCase();
+  const profileChildSurface = goal.kind === "adaptive_surface";
+  if ((envelope.forbiddenEffects || []).some((item) => effect.includes(String(item).toLowerCase()))
+    || (profileChildSurface && action.intent === "navigate_stage")
+    || (profileChildSurface && action.interactionRole === "navigation")
+    || /payment|purchase|card|accept[_ ]legal|legal[_ ]consent|select[_ ]paid|add[_ ]paid/.test(effect)) {
+    return fail(
+      "ADAPTIVE_EFFECT_FORBIDDEN",
+      profileChildSurface
+        ? "The profile-surface episode cannot navigate checkout, add money, accept legal terms, or touch payment."
+        : "The adaptive interaction cannot add money, accept legal terms, alter the itinerary, or touch payment.",
+      checks
+    );
+  }
+  pass(checks, "ADAPTIVE_ENVELOPE_VALID", `${envelope.episodeId}:${envelope.remainingSteps}`);
+  return null;
+}
+
+function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, checks = []) {
+  if (action.mechanicalHypothesis !== true) return null;
+  const goal = state.taskState?.currentGoal || {};
+  const envelope = action.discoveryEnvelope || {};
+  const currentSurfaceId = currentObservationSurfaceId(observation);
+  const effect = [
+    action.mechanicalEffect,
+    action.physicalEffect,
+    action.semanticIntent,
+    action.intent,
+    action.targetSnapshot?.semantic
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (
+    goal.kind !== "profile_field"
+    || envelope.contractVersion !== "pre-surface-discovery/v1"
+    || action.candidateClass !== "mechanical_hypothesis"
+    || action.boundedRecovery !== true
+    || action.capabilityStatus !== agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+  ) {
+    return fail(
+      "DISCOVERY_CONTRACT_INVALID",
+      "A pre-surface hypothesis requires the exact profile goal and bounded discovery contract that created it.",
+      checks
+    );
+  }
+  if (
+    !currentSurfaceId
+    || envelope.sourceSurfaceId !== currentSurfaceId
+    || envelope.logicalControlId !== (action.logicalControlId || action.controlId)
+    || envelope.logicalControlId !== action.controlId
+    || envelope.actuatorId !== (action.actuatorId || action.targetId)
+    || envelope.actuatorId !== action.targetId
+  ) {
+    return recoverable(
+      "DISCOVERY_BINDING_STALE",
+      "The mechanical hypothesis no longer belongs to its exact logical control, actuator, and source surface.",
+      checks
+    );
+  }
+  if (
+    Number(envelope.remainingSteps || 0) !== 1
+    || Number(envelope.deadlineAt || 0) <= Date.now()
+    || !(envelope.allowedOperations || []).includes(action.operation)
+    || action.operation !== "open"
+    || !["click", "keypress"].includes(action.type)
+    || action.expectedOutcome?.type !== "options_surface_appeared"
+  ) {
+    return fail(
+      "DISCOVERY_BUDGET_OR_OPERATION_INVALID",
+      "Pre-surface discovery permits one fresh open action followed by mandatory reobservation.",
+      checks
+    );
+  }
+  const risk = String(action.risk || action.targetSnapshot?.risk || "uncertain").toLowerCase();
+  if (
+    risk !== "safe"
+    || (envelope.forbiddenRisks || []).includes(risk)
+    || (envelope.forbiddenEffects || []).some((item) => effect.includes(String(item).toLowerCase()))
+    || /payment|purchase|booking|paid|price|legal|terms|consent|subscribe|navigate|advance/.test(effect)
+  ) {
+    return fail(
+      "DISCOVERY_EFFECT_FORBIDDEN",
+      "Pre-surface discovery cannot navigate, add money, accept consent, or touch payment.",
+      checks
+    );
+  }
+  pass(checks, "PRE_SURFACE_DISCOVERY_VALID", `${envelope.logicalControlId}:${envelope.actuatorId}`);
+  return null;
 }
 
 function actionTargetsLaterCheckoutWork(action = {}, page = {}) {
@@ -314,7 +449,11 @@ function validateCanonicalTarget(action, observation, checks, executionLane = ""
   ) {
     return fail("TARGET_DISABLED", "The canonical target was observed as disabled.", checks);
   }
-  const region = control.visualRegion || target.visualRegion || target.box;
+  // Geometry belongs to the exact actuator, not necessarily to the logical
+  // state element. Composite selects commonly keep a hidden/disabled input
+  // while exposing a visible trigger. Falling back to the logical control
+  // first incorrectly converts a current trigger click into viewport work.
+  const region = target.visualRegion || target.box || control.visualRegion;
   if (region?.inViewport === false) return recoverable("TARGET_OUT_OF_VIEW", "The canonical target is outside the observed viewport and can be recovered by governed scrolling.", checks);
   if (!controlBelongsToCurrentSurface(control, observation.page || {}) && !authorizedParentSurfaceExit) {
     return recoverable("TARGET_OUTSIDE_CURRENT_SURFACE", "The selected control does not belong to the authoritative current surface.", checks);
@@ -462,6 +601,22 @@ function governAction({ action: rawAction, state: rawState, observation, travele
       state
     });
   }
+  const adaptiveFailure = adaptiveEnvelopeFailure(action, state, observation, checks);
+  if (adaptiveFailure) {
+    return denied({
+      ...adaptiveFailure,
+      action,
+      state
+    });
+  }
+  const discoveryFailure = preSurfaceDiscoveryFailure(action, state, observation, checks);
+  if (discoveryFailure) {
+    return denied({
+      ...discoveryFailure,
+      action,
+      state
+    });
+  }
   pass(checks, "SEMANTIC_GOAL_SEQUENCE_VALID");
 
   let executionLane = "";
@@ -479,7 +634,7 @@ function governAction({ action: rawAction, state: rawState, observation, travele
       });
     }
     const control = canonicalControlForAction(action, observation.page || {}) || {};
-    const strategyAlreadyFailed = new Set(state.attemptedStrategySignatures || [])
+    const strategyAlreadyFailed = new Set(state.recoveryState?.failedStrategySignatures || [])
       .has(actuatorSignature(action));
     executionLane = agentContract.classifyExecutionLane({
       action,
@@ -651,9 +806,12 @@ module.exports = {
   governAction,
   __private: {
     canonicalControlForAction,
+    canonicalActionSurfaceId,
     currentGoalCandidateFailure,
     currentObservationSurfaceId,
     currentGoalOwnershipFailure,
+    adaptiveEnvelopeFailure,
+    preSurfaceDiscoveryFailure,
     incompleteProfileStageBlocks,
     actionTargetsLaterCheckoutWork,
     validateCanonicalTarget,

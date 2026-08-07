@@ -3,9 +3,12 @@ const assert = require("node:assert/strict");
 
 const {
   reduceTaskState,
-  verifiedCommerceObligationFromActionResult
+  verifiedCommerceObligationFromActionResult,
+  verifiedProfileComponentFromActionResult
 } = require("../../apps/web/agent/task-state-reducer");
-const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
+const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 
 function readyTransactionReview() {
   const transaction = {
@@ -192,6 +195,276 @@ test("placeholder selects remain empty and disabled navigation identifies the so
   assert.equal(state.currentGoal, null);
 });
 
+test("a verified profile opener preserves its objective as one bounded adaptive surface episode", () => {
+  const surfaceId = "surface-country-options";
+  const countryField = {
+    ...control("country_code", {
+      label: "Country code",
+      semantic: "phone_country_code",
+      kind: "select",
+      role: "combobox"
+    }),
+    fieldType: "phone_country_code",
+    required: true,
+    state: { disabled: false, required: true, valuePresent: false, normalizedValue: "" }
+  };
+  const slovenia = control("option_slovenia", {
+    surfaceId,
+    surfaceType: "portal",
+    label: "Slovenia (+386)",
+    semantic: "choice",
+    kind: "option",
+    role: "option",
+    risk: "safe"
+  });
+  const turkey = control("option_turkey", {
+    surfaceId,
+    surfaceType: "portal",
+    label: "Türkiye (+90)",
+    semantic: "choice",
+    kind: "option",
+    role: "option",
+    risk: "safe"
+  });
+  const paid = control("option_paid", {
+    surfaceId,
+    surfaceType: "portal",
+    label: "Premium calling support +12 EUR",
+    semantic: "select_paid_option",
+    physicalEffect: "select_paid_option",
+    kind: "option",
+    role: "option",
+    risk: "money",
+    structuredPrice: { amount: 12, currency: "EUR" }
+  });
+  const observation = {
+    observationId: "obs_country_options_open",
+    page: {
+      url: "https://example.test/checkout/traveler",
+      step: "traveler_information",
+      currentSurface: {
+        id: surfaceId,
+        type: "portal",
+        label: "Country phone code",
+        memberControlIds: [slovenia.controlId, turkey.controlId, paid.controlId]
+      },
+      foreground: {
+        id: surfaceId,
+        type: "portal",
+        label: "Country phone code",
+        memberControlIds: [slovenia.controlId, turkey.controlId, paid.controlId]
+      },
+      controls: [countryField, slovenia, turkey, paid],
+      fields: [{
+        controlId: countryField.controlId,
+        field: "phone_country_code",
+        fieldType: "phone_country_code",
+        label: "Country code",
+        kind: "select",
+        role: "combobox",
+        value: "",
+        hasValue: false,
+        required: true
+      }],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+  const previousGoal = {
+    kind: "profile_field",
+    goalId: "profile:phone_country_code",
+    semanticGoal: "Set country code to +386",
+    semanticType: "phone_country_code",
+    desiredValue: "+386",
+    canonicalValue: "+386",
+    logicalFieldId: "traveler.phone_country_code",
+    componentRole: "country_code",
+    postcondition: { type: "logical_component_committed", expectedCanonicalValue: "+386" }
+  };
+  const actionResult = {
+    dispatched: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    expectedOutcome: { type: "options_surface_appeared", controlId: countryField.controlId },
+    action: {
+      goalId: previousGoal.goalId,
+      operation: "open",
+      mechanicalEffect: "open_surface",
+      controlId: countryField.controlId
+    }
+  };
+  const traveler = { phone_country_code: "+386" };
+  const state = reduceTaskState({
+    previousTaskState: { currentGoal: previousGoal },
+    observation,
+    previousActionResult: actionResult,
+    traveler
+  });
+
+  assert.equal(state.currentGoal.kind, "adaptive_surface");
+  assert.equal(state.currentGoal.sourceGoalId, previousGoal.goalId);
+  assert.equal(state.currentGoal.adaptiveEnvelope.surfaceId, surfaceId);
+  assert.equal(state.currentGoal.adaptiveEnvelope.remainingSteps, 6);
+  assert.deepEqual(state.currentGoal.adaptiveEnvelope.forbiddenRisks, ["money", "payment", "legal"]);
+
+  const candidateSet = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    traveler,
+    state: { taskState: state, approvals: {} }
+  });
+  const candidates = candidateSet.candidates;
+  assert.equal(candidates[0].controlId, slovenia.controlId);
+  assert.deepEqual(new Set(candidates.map((candidate) => candidate.controlId)), new Set([slovenia.controlId]));
+  assert.equal(candidates.some((candidate) => candidate.controlId === paid.controlId), false);
+
+  const revealActionability = {
+    ...slovenia.operations.activate.actionability,
+    inViewport: false,
+    hitTested: false,
+    notOccluded: false,
+    targetable: false,
+    executable: false,
+    revealable: true,
+    code: "ACTUATOR_OUT_OF_VIEW",
+    box: { x: 20, y: 8344, width: 260, height: 36, inViewport: false }
+  };
+  const offscreenSlovenia = {
+    ...slovenia,
+    visualRegion: revealActionability.box,
+    operations: {
+      activate: {
+        ...slovenia.operations.activate,
+        actionability: revealActionability,
+        actionabilityByActuator: {
+          [`${slovenia.controlId}_node`]: revealActionability
+        }
+      }
+    }
+  };
+  const numericCollision = control("option_numeric_collision", {
+    surfaceId,
+    surfaceType: "portal",
+    label: "Saint Kitts and Nevis (+869) country-option-193",
+    semantic: "choice",
+    kind: "option",
+    role: "option",
+    risk: "safe"
+  });
+  const offscreenObservation = {
+    ...observation,
+    observationId: "obs_country_options_exact_offscreen",
+    page: {
+      ...observation.page,
+      currentSurface: {
+        ...observation.page.currentSurface,
+        memberControlIds: [offscreenSlovenia.controlId, turkey.controlId, numericCollision.controlId, paid.controlId]
+      },
+      foreground: {
+        ...observation.page.foreground,
+        memberControlIds: [offscreenSlovenia.controlId, turkey.controlId, numericCollision.controlId, paid.controlId]
+      },
+      controls: [countryField, offscreenSlovenia, turkey, numericCollision, paid]
+    }
+  };
+  const offscreenSet = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation: offscreenObservation,
+    traveler,
+    state: { taskState: state, approvals: {} }
+  });
+  assert.deepEqual(offscreenSet.candidates, []);
+  assert.equal(offscreenSet.recoveryCandidates.length, 1);
+  assert.equal(offscreenSet.recoveryCandidates[0].controlId, offscreenSlovenia.controlId);
+  assert.equal(offscreenSet.recoveryCandidates[0].executionChannel, "reveal");
+  assert.equal(offscreenSet.recoveryCandidates[0].requiresJudgment, false);
+  assert.equal(offscreenSet.contextCapabilities.find((candidate) => candidate.controlId === turkey.controlId).selectable, false);
+  assert.equal(offscreenSet.contextCapabilities.find((candidate) => candidate.controlId === numericCollision.controlId).selectable, false);
+
+  const filter = control("country_filter", {
+    surfaceId,
+    surfaceType: "portal",
+    label: "Search country code",
+    semantic: "unknown",
+    kind: "text",
+    role: "editable_combobox",
+    risk: "safe"
+  });
+  filter.operations = {
+    type: capability("type", `${filter.controlId}_node`)
+  };
+  const filterObservation = {
+    ...offscreenObservation,
+    observationId: "obs_country_options_with_owned_filter",
+    page: {
+      ...offscreenObservation.page,
+      currentSurface: {
+        ...offscreenObservation.page.currentSurface,
+        memberControlIds: [...offscreenObservation.page.currentSurface.memberControlIds, filter.controlId]
+      },
+      controls: [...offscreenObservation.page.controls, filter]
+    }
+  };
+  const filteredSet = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation: filterObservation,
+    traveler,
+    state: { taskState: state, approvals: {} }
+  });
+  assert.equal(filteredSet.candidates.length, 1, JSON.stringify({
+    candidates: filteredSet.candidates,
+    recovery: filteredSet.recoveryCandidates,
+    context: filteredSet.contextCapabilities
+  }, null, 2));
+  assert.equal(filteredSet.candidates[0].controlId, filter.controlId);
+  assert.equal(filteredSet.candidates[0].operation, "type");
+  assert.equal(filteredSet.candidates[0].value, "386");
+  assert.equal(filteredSet.candidates[0].physicalEffect, "filter_options");
+  assert.equal(filteredSet.candidates[0].expectedOutcome.type, "semantic_progress");
+  assert.equal(filteredSet.candidates[0].expectedOutcome.canonicalTarget, "+386");
+  assert.equal(filteredSet.candidates[0].requiresJudgment, false);
+  assert.equal(filteredSet.recoveryCandidates.length, 0);
+
+  // Exercise the production seam that failed live: candidate construction
+  // -> target binding -> shared action normalization -> adaptive governance.
+  // The normalized action deliberately has no duplicate top-level surfaceId;
+  // its canonical target snapshot must retain exact surface ownership.
+  const boundRecovery = loopPrivate.bindTargetSnapshot(
+    actionForCurrentCandidate(state.currentGoal, offscreenSet.recoveryCandidates[0], offscreenObservation),
+    offscreenObservation
+  );
+  assert.equal(boundRecovery.surfaceId, undefined);
+  assert.equal(boundRecovery.targetSnapshot.surfaceId, surfaceId);
+  const adaptiveChecks = [];
+  assert.equal(
+    governorPrivate.adaptiveEnvelopeFailure(boundRecovery, { taskState: state }, offscreenObservation, adaptiveChecks),
+    null
+  );
+  assert.equal(adaptiveChecks.at(-1).code, "ADAPTIVE_ENVELOPE_VALID");
+  assert.equal(
+    governorPrivate.validateCanonicalTarget(boundRecovery, offscreenObservation, []).code,
+    "TARGET_OUT_OF_VIEW"
+  );
+
+  const continued = reduceTaskState({
+    previousTaskState: state,
+    observation: { ...observation, observationId: "obs_country_options_filtered" },
+    previousActionResult: {
+      dispatched: true,
+      verified: true,
+      expectedOutcomeObserved: true,
+      postconditionSatisfied: true,
+      action: { goalId: state.currentGoal.goalId, operation: "type", value: "386" },
+      expectedOutcome: { type: "semantic_progress" }
+    },
+    traveler
+  });
+  assert.equal(continued.currentGoal.kind, "adaptive_surface");
+  assert.equal(continued.currentGoal.adaptiveEnvelope.remainingSteps, 5);
+  assert.deepEqual(continued.currentGoal.adaptiveEnvelope.queryHistory, ["386"]);
+});
+
 test("disabled navigation queues multiple missing traveler facts instead of abandoning the form", () => {
   const blankField = (controlId, semantic, label) => ({
     ...control(controlId, { label, semantic, kind: "select", role: "combobox" }),
@@ -243,7 +516,7 @@ test("disabled navigation queues multiple missing traveler facts instead of aban
   assert.equal(state.profileReadiness.blockedReasonCode, "MISSING_PROFILE_DATA");
 });
 
-test("disabled navigation becomes a bounded diagnostic goal when no profile field owns the blocker", () => {
+test("unavailable navigation does not become a semantic goal when no profile field owns the blocker", () => {
   const firstName = {
     ...control("first_name", {
       label: "First name",
@@ -272,7 +545,8 @@ test("disabled navigation becomes a bounded diagnostic goal when no profile fiel
         required: true
       }],
       stageExit: {
-        continueControlId: "continue",
+        continueObserved: true,
+        candidates: [{ controlId: "continue", actuatorId: "continue_node", status: "disabled", executable: false }],
         continueDisabled: true,
         continueInViewport: false,
         blockers: []
@@ -288,9 +562,8 @@ test("disabled navigation becomes a bounded diagnostic goal when no profile fiel
   });
 
   assert.equal(state.profileReadiness.ready, true);
-  assert.equal(state.currentGoal.semanticType, "blocked_navigation");
-  assert.equal(state.currentGoal.diagnosticControlId, "continue");
-  assert.deepEqual(state.currentGoal.actionableControlIds, ["continue"]);
+  assert.equal(state.currentGoal, null);
+  assert.equal(state.ambiguityReason, "navigation_disabled_without_active_requirement");
 });
 
 test("the observed stage exit is scheduled even when its button wording is unfamiliar", () => {
@@ -311,8 +584,13 @@ test("the observed stage exit is scheduled even when its button wording is unfam
       validationIssues: [],
       stageExit: {
         continueAllowed: true,
-        continueControlId: forward.controlId,
-        continueTargetId: forward.preferredActivationElementId,
+        continueObserved: true,
+        candidates: [{
+          controlId: forward.controlId,
+          actuatorId: forward.preferredActivationElementId,
+          status: "ready",
+          executable: true
+        }],
         continueDisabled: false,
         blockers: []
       }
@@ -582,10 +860,124 @@ test("untouched optional decisions do not block safe progression", () => {
     traveler: { booking_rules: "No paid extras" }
   });
 
-  assert.equal(state.observedDecisions[0].status, "stale");
+  assert.equal(state.observedDecisions[0].status, "waived");
+  assert.equal(state.observedDecisions[0].requiresResolution, false);
   assert.equal(state.activeDecisions.length, 0);
   assert.equal(state.currentGoal.semanticType, "navigation");
   assert.deepEqual(state.currentGoal.actionableControlIds, ["continue"]);
+});
+
+test("an actionable blank optional profile representation cannot outrank a ready stage exit", () => {
+  const age = {
+    ...control("age_at_departure_parent", {
+      label: "Age at time of travel",
+      semantic: "age_at_departure",
+      kind: "select",
+      role: "editable_combobox"
+    }),
+    fieldType: "age_at_departure",
+    required: false,
+    representationLifecycle: {
+      status: "active_rendered",
+      active: true,
+      stateRendered: true,
+      renderedMemberIds: ["age_at_departure_trigger"]
+    },
+    state: {
+      valuePresent: false,
+      selected: false,
+      checked: false,
+      required: false,
+      invalid: false,
+      normalizedValue: ""
+    },
+    operations: {
+      open: capability("open", "age_at_departure_trigger")
+    }
+  };
+  const forward = control("continue_after_passenger", {
+    label: "Continue",
+    semantic: "continue",
+    risk: "safe_continue"
+  });
+  const observation = {
+    observationId: "obs_live_easyjet_optional_age_ready_continue",
+    observationSnapshot: { snapshotHash: "hash_live_easyjet_optional_age_ready_continue" },
+    page: {
+      url: "https://www.easyjet.com/en/buy/checkout",
+      step: "traveler_information",
+      heading: "Passenger details",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [age, forward],
+      fields: [{
+        controlId: age.controlId,
+        field: "age_at_departure",
+        fieldType: "age_at_departure",
+        label: age.label,
+        kind: age.kind,
+        role: age.role,
+        required: false,
+        hasValue: false,
+        representationLifecycle: age.representationLifecycle,
+        controlState: age.state
+      }],
+      decisionGroups: [{
+        decisionGroupId: "passenger_age_at_time_of_travel",
+        requirementId: "passenger:age_at_departure",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionType: "passenger",
+        sectionLabel: "Age at time of travel",
+        required: false,
+        status: "optional",
+        selectedControlId: "",
+        alternatives: [{ controlId: age.controlId, label: age.label }]
+      }],
+      validationIssues: [],
+      activeRequirementGrounding: {
+        contractVersion: "active-component-semantic-grounding/v1",
+        status: "unknown",
+        reasonCode: "ACTIVE_REQUIREMENT_UNRESOLVED",
+        candidateComponentIds: [age.controlId]
+      },
+      stageExit: {
+        continueAllowed: true,
+        continueObserved: true,
+        continueDisabled: false,
+        navigationState: "ready",
+        blockers: [],
+        candidates: [{
+          controlId: forward.controlId,
+          actuatorId: forward.preferredActivationElementId,
+          status: "ready",
+          executable: true
+        }]
+      }
+    }
+  };
+
+  const state = reduceTaskState({
+    previousTaskState: {
+      terminalStatus: "active",
+      currentGoal: {
+        goalId: "profile:age_at_departure:0",
+        kind: "profile_field",
+        semanticType: "age_at_departure",
+        desiredValue: "23",
+        controlId: age.controlId
+      }
+    },
+    observation,
+    traveler: { id: "trav_1", date_of_birth: "2003-05-31" },
+    transactionReview: readyTransactionReview()
+  });
+
+  assert.equal(state.observedDecisions[0].status, "waived");
+  assert.equal(state.observedDecisions[0].requiresResolution, false);
+  assert.equal(state.profileReadiness.ready, true, JSON.stringify(state.profileReadiness, null, 2));
+  assert.equal(state.currentGoal.semanticType, "navigation", JSON.stringify(state.currentGoal, null, 2));
+  assert.equal(state.currentGoal.authority, "task_state");
+  assert.deepEqual(state.currentGoal.actionableControlIds, [forward.controlId]);
 });
 
 test("a profile-resolved exclusive insurance choice is completed before real navigation", () => {
@@ -730,9 +1122,8 @@ test("marketing prose containing finish your booking is not navigation", () => {
 
   const state = reduceTaskState({ observation });
 
-  assert.notEqual(state.currentGoal.semanticType, "navigation");
-  assert.equal(state.currentGoal.semanticType, "surface_ambiguity");
-  assert.equal(state.currentGoal.ambiguityReason, "no_goal_relevant_candidate");
+  assert.equal(state.currentGoal, null);
+  assert.equal(state.ambiguityReason, "no_goal_relevant_candidate");
 });
 
 test("required and explicitly requested optional decisions still become active obligations", () => {
@@ -1428,6 +1819,49 @@ test("a confirmation-labeled final review latches from owned payment evidence", 
   assert.equal(state.processAwareness.finalOutcome.transactionVerified, true);
 });
 
+test("final checkout with terms and a disabled pay-by-card control is payment review", () => {
+  const state = reduceTaskState({
+    transactionReview: readyTransactionReview(),
+    observation: {
+      observationId: "obs_final_terms_review",
+      page: {
+        step: "seats",
+        url: "https://example.test/en/buy/checkout",
+        currentSurface: { id: "surface-page", type: "page" },
+        terminalStructure: {
+          legalAcceptancePresent: true,
+          reviewSummaryPresent: true,
+          payControlPresent: true,
+          paymentMethodPresent: true
+        },
+        controls: [
+          {
+            ...control("dormant_first_name", { label: "First name", semantic: "first_name", kind: "field", role: "textbox" }),
+            representationLifecycle: { status: "dormant_hidden", active: false }
+          },
+          control("terms", {
+            label: "I confirm I have read and accepted the terms and conditions",
+            semantic: "legal_acceptance",
+            kind: "checkbox",
+            role: "checkbox"
+          }),
+          {
+            ...control("pay_by_card", { label: "Pay by card", semantic: "submit_purchase", kind: "button", role: "button" }),
+            disabled: true,
+            state: { disabled: true }
+          }
+        ],
+        decisionGroups: []
+      }
+    }
+  });
+
+  assert.equal(state.stage, "payment");
+  assert.equal(state.paymentEvidence.boundaryObserved, true);
+  assert.equal(state.terminalStatus, "payment_review_reached");
+  assert.equal(state.currentGoal, null);
+});
+
 test("an unverified final review freezes payment and billing work without claiming success", () => {
   const current = readyTransactionReview().current;
   const state = reduceTaskState({
@@ -1611,7 +2045,7 @@ test("an active checkout redirected to the search start is classified as checkou
   assert.equal(left.currentGoal, null);
 });
 
-test("unknown foreground gives AI complete context but only policy-safe selectable IDs", () => {
+test("unknown foreground publishes one bounded reversible goal and excludes consequential controls", () => {
   const observation = {
     observationId: "obs_unknown_popup",
     observationSnapshot: { snapshotHash: "hash_popup" },
@@ -1632,17 +2066,96 @@ test("unknown foreground gives AI complete context but only policy-safe selectab
     }
   };
   const taskState = reduceTaskState({ observation });
+
+  assert.equal(taskState.currentGoal.kind, "adaptive_interaction");
+  assert.deepEqual(taskState.currentGoal.actionableControlIds, ["safe_close"]);
+  assert.equal(taskState.ambiguityReason, "");
   const candidates = buildCurrentCandidateSet({
     goal: taskState.currentGoal,
     observation,
-    state: { taskState, approvals: {} }
-  });
+    state: { taskState },
+    traveler: {}
+  }).candidates;
+  assert.deepEqual(candidates.map((candidate) => candidate.controlId), ["safe_close"]);
+  assert.equal(candidates[0].expectedOutcome.type, "active_surface_dismissed");
+  assert.equal(candidates.some((candidate) => candidate.controlId === "paid_upgrade"), false);
+});
 
-  assert.equal(taskState.currentGoal.selectionMode, "ai_ambiguity");
-  assert.equal(candidates.contextCapabilities.length, 2);
-  assert.equal(candidates.contextCapabilities.some((candidate) => candidate.controlId === "paid_upgrade"), true);
-  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "paid_upgrade").policyDecision.allow, false);
-  assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["safe_close"]);
+test("reversible utility controls do not become adaptive checkout progress", () => {
+  const observation = {
+    observationId: "obs_utility_only_shell",
+    observationSnapshot: { snapshotHash: "hash_utility_only_shell" },
+    page: {
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [
+        control("language", { label: "English", semantic: "unknown", risk: "safe" }),
+        control("support", { label: "Support", semantic: "unknown", risk: "safe" })
+      ],
+      decisionGroups: []
+    }
+  };
+  const taskState = reduceTaskState({ observation });
+  assert.equal(taskState.currentGoal, null);
+  assert.equal(taskState.ambiguityReason, "no_goal_relevant_candidate");
+});
+
+test("seat page without a decision group uses the consequence-gated fallback instead of stopping", () => {
+  const randomAssignment = control("random_assignment", {
+    label: "Choose seats for me",
+    semantic: "required_dropdown_choice",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline"
+  });
+  const manualSeats = control("manual_seats", {
+    label: "Choose seats manually 18 EUR",
+    semantic: "select_paid_seat",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: { amount: 18, currency: "EUR" }
+  });
+  const next = control("next_flight", {
+    label: "Next flight",
+    semantic: "continue",
+    risk: "safe_continue",
+    state: { disabled: true }
+  });
+  next.disabled = true;
+  const observation = {
+    observationId: "obs_easyjet_seat_shell",
+    observationSnapshot: { snapshotHash: "hash_easyjet_seat_shell" },
+    page: {
+      step: "seats",
+      currentSurface: {
+        id: "surface-page",
+        type: "page",
+        label: "Seat selection",
+        memberControlIds: [randomAssignment.controlId, manualSeats.controlId, next.controlId]
+      },
+      controls: [randomAssignment, manualSeats, next],
+      decisionGroups: [],
+      validationIssues: [],
+      stageExit: {
+        continueObserved: true,
+        continueDisabled: true,
+        candidates: [{ controlId: next.controlId, status: "disabled", executable: false }]
+      }
+    }
+  };
+  const traveler = { booking_rules: "No paid seats", seat_policy: "random_assignment" };
+  const taskState = reduceTaskState({ observation, traveler, userPolicy: { bookingRules: traveler.booking_rules } });
+
+  assert.equal(taskState.currentGoal.kind, "adaptive_interaction");
+  assert.deepEqual(taskState.currentGoal.actionableControlIds, [randomAssignment.controlId]);
+  const candidateSet = buildCurrentCandidateSet({
+    goal: taskState.currentGoal,
+    observation,
+    state: { taskState },
+    traveler
+  });
+  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), [randomAssignment.controlId]);
+  assert.equal(candidateSet.candidates[0].mechanicalEffect, "select_free_option");
+  assert.equal(candidateSet.candidates[0].expectedOutcome.type, "exact_free_option_selected");
 });
 
 test("decision planning keeps unrelated surface controls as context and uses one shared safe selectable set", () => {
@@ -2915,4 +3428,307 @@ test("payment review remains active until every verified decision is present in 
   assert.equal(accepted.terminalStatus, "payment_review_reached");
   assert.equal(accepted.transactionReview.ready, true);
   assert.equal(accepted.outcomeCoverage.complete, true);
+});
+
+test("an unresolved active component owns profile readiness with one precise stop code", () => {
+  const observation = {
+    observationId: "obs_active_requirement_unresolved",
+    observationSnapshot: { snapshotHash: "hash_active_requirement_unresolved" },
+    page: {
+      url: "https://example.test/passengers",
+      step: "traveler_information",
+      heading: "Passenger details",
+      currentSurface: { id: "surface-page", type: "page", label: "Passenger details" },
+      controls: [],
+      fields: [],
+      decisionGroups: [],
+      validationIssues: [],
+      activeRequirementGrounding: {
+        contractVersion: "active-component-semantic-grounding/v1",
+        status: "unknown",
+        reasonCode: "ACTIVE_REQUIREMENT_UNRESOLVED",
+        candidateComponentIds: ["unknown_component"]
+      }
+    }
+  };
+
+  const taskState = reduceTaskState({ observation, traveler: {} });
+
+  assert.equal(taskState.profileReadiness.profileStage, true);
+  assert.equal(taskState.profileReadiness.ready, false);
+  assert.equal(taskState.profileReadiness.blockedReasonCode, "ACTIVE_REQUIREMENT_UNRESOLVED");
+  assert.equal(taskState.currentGoal, null);
+});
+
+test("age at departure uses the authoritative selected-booking baseline when the page date is abbreviated", () => {
+  const ageControl = {
+    controlId: "age_on_trip",
+    surfaceId: "surface-page",
+    label: "Age at time of travel",
+    fieldType: "age_at_departure",
+    role: "select",
+    kind: "select-one",
+    required: true,
+    representationLifecycle: { status: "active_rendered", active: true },
+    state: { valuePresent: false, selected: false, normalizedValue: "" },
+    options: [
+      { value: "18_24", label: "18–24" },
+      { value: "25_29", label: "25–29" }
+    ],
+    operations: { select: capability("select", "age_on_trip") }
+  };
+  const observation = {
+    observationId: "obs_age_from_booking_baseline",
+    observationSnapshot: { snapshotHash: "hash_age_from_booking_baseline" },
+    page: {
+      url: "https://example.test/passengers",
+      step: "traveler_information",
+      heading: "Passenger details · 10 Aug",
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: ["age_on_trip"] },
+      controls: [ageControl],
+      fields: [{ ...ageControl, controlState: ageControl.state }],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+
+  const taskState = reduceTaskState({
+    observation,
+    traveler: { id: "trav_1", date_of_birth: "2003-05-31" },
+    transactionReview: readyTransactionReview()
+  });
+
+  assert.equal(taskState.profileReadiness.ready, false);
+  assert.equal(taskState.currentGoal.semanticType, "age_at_departure");
+  assert.equal(taskState.currentGoal.desiredValue, "23");
+  assert.equal(taskState.currentGoal.inputValue, "18_24");
+});
+
+test("a canonically verified child choice durably satisfies its blank parent profile requirement", () => {
+  const ageControl = {
+    controlId: "age_on_trip_receipt",
+    surfaceId: "surface-page",
+    label: "Age at time of travel",
+    fieldType: "age_at_departure",
+    role: "editable_combobox",
+    kind: "select",
+    required: true,
+    representationLifecycle: { status: "active_rendered", active: true },
+    state: { valuePresent: false, selected: false, normalizedValue: "", invalid: false },
+    options: [],
+    operations: { open: capability("open", "age_on_trip_receipt_opener") }
+  };
+  const observation = {
+    observationId: "obs_age_receipt_blank_parent",
+    observationSnapshot: { snapshotHash: "hash_age_receipt_blank_parent" },
+    page: {
+      url: "https://example.test/passengers",
+      step: "traveler_information",
+      heading: "Passenger details",
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: [ageControl.controlId] },
+      controls: [ageControl],
+      fields: [{ ...ageControl, controlState: ageControl.state }],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+  const traveler = { id: "trav_1", date_of_birth: "2003-05-31" };
+  const initial = reduceTaskState({ observation, traveler, transactionReview: readyTransactionReview() });
+  assert.equal(initial.currentGoal.semanticType, "age_at_departure");
+  assert.equal(initial.currentGoal.desiredValue, "23");
+
+  const logicalFieldId = initial.currentGoal.logicalFieldId;
+  const actionResult = {
+    actionId: "act_age_18_plus",
+    observationId: "obs_age_options",
+    resultObservationId: observation.observationId,
+    dispatched: true,
+    targetResolved: true,
+    clickReachedPage: true,
+    pageChanged: true,
+    activeSurfaceChanged: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "",
+    mechanicalEffect: "set_field_value",
+    action: {
+      id: "act_age_18_plus",
+      goalId: "profile:age_at_departure:0:surface:age-options:step:1",
+      operation: "choose",
+      mechanicalEffect: "set_field_value",
+      controlId: "age_option_18_plus",
+      targetId: "age_option_18_plus_node",
+      value: "18+",
+      targetLabel: "18+"
+    },
+    expectedOutcome: {
+      type: "logical_component_committed",
+      logicalFieldId,
+      subjectId: "traveler_1",
+      semanticType: "age_at_departure",
+      componentRole: "value",
+      controlId: ageControl.controlId,
+      expectedCanonicalValue: "23",
+      expectedNormalizedValue: "23",
+      mustNotIncreasePrice: true
+    },
+    outcome: {
+      ok: true,
+      code: "LOGICAL_COMPONENT_COMMITTED",
+      evidence: {
+        exactChildSettlement: {
+          contractVersion: "exact-child-choice-settlement/v1",
+          settled: true,
+          logicalFieldId,
+          subjectId: "traveler_1",
+          semanticType: "age_at_departure",
+          componentRole: "value",
+          parentControlId: ageControl.controlId,
+          selectedControlId: "age_option_18_plus",
+          selectedActuatorId: "age_option_18_plus_node",
+          desiredCanonicalValue: "23",
+          selectedCanonicalValue: "18+",
+          actualStateBlank: true,
+          validationClear: true,
+          popupClosed: true,
+          focusSettled: true
+        }
+      }
+    }
+  };
+  assert.ok(verifiedProfileComponentFromActionResult(actionResult, observation.observationId));
+
+  const settled = reduceTaskState({
+    previousTaskState: initial,
+    observation,
+    previousActionResult: actionResult,
+    traveler,
+    transactionReview: readyTransactionReview()
+  });
+  assert.equal(settled.verifiedProfileComponents.length, 1);
+  assert.equal(settled.verifiedProfileComponents[0].selectedCanonicalValue, "18+");
+  assert.equal(settled.profileReadiness.ready, true);
+  assert.equal(settled.currentGoal?.semanticType, undefined, JSON.stringify({
+    completion: settled.verifiedProfileComponents[0],
+    goal: settled.currentGoal,
+    readiness: settled.profileReadiness
+  }, null, 2));
+
+  const persisted = reduceTaskState({
+    previousTaskState: settled,
+    observation: {
+      ...observation,
+      observationId: "obs_age_receipt_next_read",
+      observationSnapshot: { snapshotHash: "hash_age_receipt_next_read" }
+    },
+    traveler,
+    transactionReview: readyTransactionReview()
+  });
+  assert.equal(persisted.verifiedProfileComponents.length, 1);
+  assert.equal(persisted.currentGoal?.semanticType, undefined);
+
+  const contradictoryControl = {
+    ...ageControl,
+    state: { valuePresent: true, selected: true, normalizedValue: "17", invalid: true }
+  };
+  const contradicted = reduceTaskState({
+    previousTaskState: persisted,
+    observation: {
+      ...observation,
+      observationId: "obs_age_receipt_contradicted",
+      observationSnapshot: { snapshotHash: "hash_age_receipt_contradicted" },
+      page: {
+        ...observation.page,
+        controls: [contradictoryControl],
+        fields: [{ ...contradictoryControl, controlState: contradictoryControl.state }],
+        validationIssues: [{
+          controlId: ageControl.controlId,
+          message: "Select the passenger age",
+          stageWide: false
+        }]
+      }
+    },
+    traveler,
+    transactionReview: readyTransactionReview()
+  });
+  assert.equal(contradicted.verifiedProfileComponents.length, 0);
+  assert.equal(contradicted.profileReadiness.ready, false);
+});
+
+test("popup closure without canonical verification cannot settle a profile requirement", () => {
+  const result = verifiedProfileComponentFromActionResult({
+    actionId: "act_weak_age_close",
+    dispatched: true,
+    targetResolved: true,
+    clickReachedPage: true,
+    failureCode: "LOGICAL_COMPONENT_NOT_COMMITTED",
+    action: { operation: "choose", mechanicalEffect: "set_field_value", controlId: "age_18", value: "18+" },
+    expectedOutcome: {
+      type: "logical_component_committed",
+      logicalFieldId: "lf_age",
+      subjectId: "traveler_1",
+      semanticType: "age_at_departure",
+      componentRole: "value",
+      controlId: "age_parent",
+      expectedCanonicalValue: "23",
+      mustNotIncreasePrice: true
+    },
+    outcome: {
+      code: "LOGICAL_COMPONENT_NOT_COMMITTED",
+      evidence: {
+        choiceCommit: { ok: true, popupClosed: true, focusSettled: true }
+      }
+    }
+  });
+  assert.equal(result, null);
+});
+
+test("missing selected-flight date outranks semantic grounding and never asks the user for derived age", () => {
+  const ageControl = {
+    controlId: "age_on_trip_missing_booking",
+    surfaceId: "surface-page",
+    label: "Age at time of travel",
+    fieldType: "age_at_departure",
+    role: "select",
+    kind: "select-one",
+    required: true,
+    representationLifecycle: { status: "active_rendered", active: true },
+    state: { valuePresent: false, selected: false, normalizedValue: "" },
+    options: [{ value: "18_24", label: "18–24" }],
+    operations: { select: capability("select", "age_on_trip_missing_booking") }
+  };
+  const observation = {
+    observationId: "obs_age_missing_selected_booking",
+    observationSnapshot: { snapshotHash: "hash_age_missing_selected_booking" },
+    page: {
+      url: "https://example.test/passengers",
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: [ageControl.controlId] },
+      controls: [ageControl],
+      fields: [{ ...ageControl, controlState: ageControl.state }],
+      decisionGroups: [],
+      validationIssues: [],
+      activeRequirementGrounding: {
+        status: "unknown",
+        candidateComponentIds: [ageControl.controlId]
+      }
+    }
+  };
+
+  const taskState = reduceTaskState({
+    observation,
+    traveler: { id: "trav_1", date_of_birth: "2003-05-31" },
+    transactionReview: { baseline: { itinerary: { completeness: "unknown", segments: [] } } }
+  });
+
+  assert.equal(taskState.profileReadiness.blockedReasonCode, "SELECTED_BOOKING_FACT_MISSING");
+  assert.deepEqual(taskState.profileReadiness.missingDerivedFacts, [{
+    semanticType: "age_at_departure",
+    reasonCode: "SELECTED_BOOKING_FACT_MISSING",
+    sourceField: "departure_date",
+    sourcePath: "selected_booking.departure_date",
+    label: "selected flight departure date"
+  }]);
+  assert.equal(taskState.currentGoal, null);
 });

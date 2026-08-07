@@ -160,6 +160,8 @@ function recoveryStateFor(state = {}) {
     attempts: Number(existing.attempts ?? migratedAttempts),
     phase: String(existing.phase || "idle"),
     stateHash: String(existing.stateHash || state.unchangedStateHash || ""),
+    attemptedCandidateIds: [...(existing.attemptedCandidateIds || state.attemptedCandidateIds || [])].slice(-24),
+    failedStrategies: [...(existing.failedStrategies || state.failedStrategyMemory || [])].slice(-80),
     failedStrategySignatures: [...(existing.failedStrategySignatures || state.unchangedStateFailedStrategySignatures || [])],
     lastCode: String(existing.lastCode || ""),
     lastRevealSample: existing.lastRevealSample || null,
@@ -226,6 +228,12 @@ function stateWithRecovery(state = {}, recoveryState = {}) {
     uncertainTransitionCount: _uncertainTransitionCount,
     unchangedStateHash: _unchangedStateHash,
     unchangedStateFailedStrategySignatures: _unchangedStateFailedStrategySignatures,
+    attemptedCandidateIds: _attemptedCandidateIds,
+    failedStrategyMemory: _failedStrategyMemory,
+    blockedProfileGoalKeys: _blockedProfileGoalKeys,
+    blockedProfilePageStateHash: _blockedProfilePageStateHash,
+    navigationSettling: _navigationSettling,
+    legacyRequirementsDiagnostic: _legacyRequirementsDiagnostic,
     ...rest
   } = state;
   return { ...rest, recoveryState };
@@ -243,6 +251,8 @@ function updateRecoveryState(state = {}, event = {}) {
     next.phase = kind;
     next.stateHash = "";
     next.failedStrategySignatures = [];
+    next.attemptedCandidateIds = [];
+    next.failedStrategies = [];
     next.lastCode = code;
     next.lastRevealSample = null;
     next.decisionInstanceId = "";
@@ -356,18 +366,27 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
 function transitionResult(result = {}, transition = null) {
   if (!transition) return { ...result, failureCode: canonicalFailureCode(result) };
   const interveningMutation = transition.causality?.classification === "intervening_external_mutation";
+  const browserCanonicalComponentCommit = Boolean(
+    result.verified === true
+    && result.expectedOutcomeObserved === true
+    && result.postconditionSatisfied === true
+    && result.expectedOutcome?.type === "logical_component_committed"
+    && result.outcome?.ok === true
+    && String(result.outcome?.code || result.failureCode || "") === "LOGICAL_COMPONENT_COMMITTED"
+  );
   // One action can finish its exact local obligation while the durable parent
   // objective merely progresses to another decision. Keep those facts
   // separate: parent progress must never erase a browser-proven local outcome
   // before the journal/ledger consumes it.
-  const localPostconditionSatisfied = transition.postcondition?.satisfied === true
+  const localPostconditionSatisfied = browserCanonicalComponentCommit
+    || transition.postcondition?.satisfied === true
     || transition.currentObligationResult?.completed === true;
-  const localOutcomeVerified = localPostconditionSatisfied
-    && (
+  const localOutcomeVerified = browserCanonicalComponentCommit
+    || (localPostconditionSatisfied && (
       transition.localMechanicalResult?.verified === true
       || transition.localEffect?.verified === true
       || transition.physicalResult?.verified === true
-    );
+    ));
   return {
     ...result,
     failureCode: interveningMutation

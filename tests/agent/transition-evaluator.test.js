@@ -758,6 +758,52 @@ test("authoritative transition treats popup and reversible price changes as fres
   assert.equal(unsafe.nextDirective, "stop_or_request_approval");
 });
 
+test("a foreground site-failure modal cannot satisfy checkout-stage advancement", () => {
+  const before = observation("site_failure_before", {
+    step: "traveler_information",
+    url: "https://example.test/traveler",
+    currentSurface: { id: "surface-page", type: "page", surfaceClass: "unknown", label: "Traveler information" },
+    controls: [{ controlId: "ctrl_continue", label: "Continue" }]
+  });
+  const after = observation("site_failure_after", {
+    step: "traveler_information",
+    url: "https://example.test/traveler",
+    currentSurface: {
+      id: "site_failure_modal",
+      type: "modal",
+      surfaceClass: "site_failure",
+      label: "We are currently unable to process your request. Please try again later."
+    },
+    controls: [{ controlId: "ctrl_close", label: "Close", surfaceId: "site_failure_modal" }]
+  }, result("act_continue"));
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: {
+      id: "act_continue",
+      type: "click",
+      intent: "navigate_stage",
+      controlId: "ctrl_continue",
+      expectedOutcome: { type: "checkout_stage_advanced" }
+    },
+    browserResult: result("act_continue"),
+    afterObservation: after,
+    navigationContext: {
+      destinationReady: true,
+      origin: {
+        stage: "traveler_information",
+        url: "https://example.test/traveler",
+        surfaceId: "surface-page",
+        progressFingerprint: "{}"
+      }
+    }
+  });
+
+  assert.equal(transition.postcondition.satisfied, false);
+  assert.equal(transition.currentObligationResult.completed, false);
+  assert.equal(transition.status, "progressed");
+  assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
+});
+
 test("the same modal instance verifies progress when its foreground marker advances", () => {
   const before = observation("same_modal_before", {
     currentSurface: { id: "flow_modal", type: "modal", label: "Configuration" },
@@ -868,15 +914,15 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
       operation: "open",
       expectedOutcome: { type: "options_surface_appeared", controlId: "ctrl_flex" }
     },
-    attemptedStrategySignatures: [],
+    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] },
     aiDecisionCache: { candidateSelection: { candidateId: "cached" } }
   };
   const applied = loopPrivate.applyTransitionStatus(state, after, before);
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.observation.lastActionResult.verified, false);
   assert.equal(applied.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
-  assert.deepEqual(applied.state.attemptedStrategySignatures, ["click:open:ctrl_flex:,"]);
-  assert.equal(applied.state.failedStrategyMemory[0].failureCount, 1);
+  assert.deepEqual(applied.state.recoveryState.failedStrategySignatures, ["click:open:ctrl_flex:,"]);
+  assert.equal(applied.state.recoveryState.failedStrategies[0].failureCount, 1);
   assert.equal(applied.directive, "try_distinct_capability");
   assert.equal(applied.state.recoveryState.attempts, 1);
   assert.equal(applied.state.recoveryState.phase, "execution_no_effect");
@@ -933,8 +979,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
       currentGoal: { goalId: "goal_title", semanticType: "title" }
     },
     lastAction: action,
-    attemptedStrategySignatures: [],
-    failedStrategyMemory: [],
+    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] },
     aiDecisionCache: { candidateSelection: { candidateId: "stale_reused_candidate" } }
   };
 
@@ -942,9 +987,9 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   const signature = "native_click:open:ctrl_title:,";
   assert.equal(applied.transition, null);
   assert.equal(applied.directive, "rebuild_candidates");
-  assert.deepEqual(applied.state.attemptedStrategySignatures, [signature]);
-  assert.equal(applied.state.failedStrategyMemory[0].strategySignature, signature);
-  assert.equal(applied.state.failedStrategyMemory[0].failureCount, 1);
+  assert.deepEqual(applied.state.recoveryState.failedStrategySignatures, [signature]);
+  assert.equal(applied.state.recoveryState.failedStrategies[0].strategySignature, signature);
+  assert.equal(applied.state.recoveryState.failedStrategies[0].failureCount, 1);
   assert.equal(applied.state.aiDecisionCache, null);
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, after),
@@ -961,28 +1006,6 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, unrelatedProgress),
     [signature]
-  );
-});
-
-test("profile blocked-goal memory persists across observation ids only while the page state is unchanged", () => {
-  const goalKey = "profile:title:value:traveler_1";
-  const state = {
-    blockedProfileGoalKeys: [goalKey],
-    blockedProfilePageStateHash: "traveler_form_state"
-  };
-  assert.deepEqual(
-    loopPrivate.persistentBlockedProfileGoalKeys(state, {
-      observationId: "obs_rerendered",
-      observationSnapshot: { snapshotHash: "traveler_form_state" }
-    }),
-    [goalKey]
-  );
-  assert.deepEqual(
-    loopPrivate.persistentBlockedProfileGoalKeys(state, {
-      observationId: "obs_page_changed",
-      observationSnapshot: { snapshotHash: "traveler_form_advanced" }
-    }),
-    []
   );
 });
 
@@ -1053,7 +1076,7 @@ test("every failed strategy is excluded on the same unchanged page state", () =>
   };
   const goalKey = loopPrivate.semanticGoalRecoveryKey(goal, observationForSurface);
   const state = {
-    failedStrategyMemory: [{
+    recoveryState: { failedStrategies: [{
       goalKey,
       strategySignature: "keypress:open:origin::ArrowDown",
       pageStateHash: observationForSurface.observationSnapshot.snapshotHash,
@@ -1063,7 +1086,7 @@ test("every failed strategy is excluded on the same unchanged page state", () =>
       strategySignature: "click:open:origin_button::",
       pageStateHash: observationForSurface.observationSnapshot.snapshotHash,
       failureCount: 1
-    }]
+    }], failedStrategySignatures: [] }
   };
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(state, goal, observationForSurface),
@@ -1311,7 +1334,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
   const applied = loopPrivate.applyTransitionStatus({
     currentGoal: goal,
     lastAction: dispatchedSkip,
-    attemptedStrategySignatures: []
+    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] }
   }, unchanged, before);
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.directive, "try_distinct_capability");
@@ -1319,7 +1342,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
   const retrySet = loopPrivate.groundedObservationCandidateSet(
     goal,
     unchanged,
-    applied.state.attemptedStrategySignatures,
+    applied.state.recoveryState.failedStrategySignatures,
     taskStateContext
   );
   assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_skip"), false);
@@ -1513,7 +1536,7 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
   const firstSet = loopPrivate.groundedObservationCandidateSet(goal, current, [], { state, traveler, approvals: state.approvals });
   assert.deepEqual(firstSet.candidates.map((candidate) => candidate.targetLabel), ["Next"]);
   state.currentGoal = goal;
-  state.failedStrategyMemory = [];
+  state.recoveryState = { ...state.recoveryState, failedStrategies: [], failedStrategySignatures: [] };
 
   const store = {
     isCurrentObservation: (_transactionId, observationId, observationHash) => (

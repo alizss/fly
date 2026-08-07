@@ -9,46 +9,6 @@
   const AGENT_CONTRACT = globalThis.AtwAgentContract || null;
   const BAGGAGE_TERMS = ["no cabin bag", "baggage not included", "personal item only", "without baggage", "checked baggage not included"];
   const MULTI_AIRPORT_CODES = new Set(["LHR", "LGW", "LTN", "STN", "LCY", "CDG", "ORY", "BVA", "IST", "SAW"]);
-  const PROFILE_FIELD_ALIASES = new Map(Object.entries({
-    title: ["title", "traveler_title", "traveller_title", "salutation", "gender_title", "honorific"],
-    gender: ["gender", "sex"],
-    first_name: ["first_name", "firstname", "given_name", "given_names", "forename"],
-    middle_name: ["middle_name", "middlename"],
-    last_name: ["last_name", "lastname", "surname", "family_name"],
-    second_last_name: ["second_last_name", "second_surname", "additional_surname", "maternal_surname"],
-    full_name: ["full_name", "fullname", "passenger_name", "traveler_name", "traveller_name"],
-    email: ["email", "email_address", "e_mail"],
-    confirm_email: ["confirm_email", "email_confirmation", "repeat_email", "confirm_email_address"],
-    phone: ["phone", "phone_number", "mobile", "mobile_number", "telephone", "tel"],
-    phone_country_code: ["phone_country_code", "country_dial_code", "dial_code", "calling_code", "country_calling_code"],
-    date_of_birth: ["date_of_birth", "birth_date", "birthdate", "dob", "bday"],
-    place_of_birth: ["place_of_birth", "birth_place", "birth_city"],
-    nationality: ["nationality", "citizenship"],
-    country_of_residence: ["country_of_residence", "residence_country", "resident_country"],
-    document_type: ["document_type", "travel_document_type", "identity_document_type", "id_type"],
-    passport_number: ["passport_number", "passport_no"],
-    document_number: ["document_number", "travel_document_number", "identity_document_number"],
-    issuing_country: ["issuing_country", "document_issuing_country", "passport_issuing_country"],
-    document_issue_date: ["document_issue_date", "passport_issue_date", "date_of_issue", "issue_date"],
-    address_line1: ["address_line1", "address1", "street_address", "billing_address", "billing_address_line1"],
-    address_line2: ["address_line2", "address2", "billing_address_line2"],
-    city: ["city", "address_city", "billing_city", "locality"],
-    state: ["state", "province", "region", "address_state", "billing_state"],
-    postal_code: ["postal_code", "postcode", "zip", "zip_code", "billing_postal_code"],
-    country: ["country", "address_country", "billing_country", "country_name"],
-    passport_expiry: ["passport_expiry", "passport_expiration", "passport_expiry_date"],
-    document_expiry: ["document_expiry", "document_expiration", "document_expiry_date"],
-    frequent_flyer_program: ["frequent_flyer_program", "loyalty_program", "airline_loyalty_program"],
-    frequent_flyer_number: ["frequent_flyer_number", "loyalty_number", "membership_number"],
-    known_traveler_number: ["known_traveler_number", "known_traveller_number", "ktn"],
-    redress_number: ["redress_number", "redress_control_number"],
-    emergency_contact_name: ["emergency_contact_name", "emergency_name"],
-    emergency_contact_relationship: ["emergency_contact_relationship", "emergency_relationship"],
-    emergency_contact_phone: ["emergency_contact_phone", "emergency_phone"],
-    emergency_contact_email: ["emergency_contact_email", "emergency_email"],
-    meal_preference: ["meal_preference", "meal_request", "special_meal"],
-    special_assistance: ["special_assistance", "assistance_request", "accessibility_request"]
-  }).flatMap(([canonical, aliases]) => aliases.map((alias) => [alias, canonical])));
   const PAYMENT_TERMS = ["card", "cvc", "cvv", "security code", "payment", "cc-number", "cc-csc"];
   const SLOW_STEP_MS = 160;
   const VERIFY_STEP_MS = 120;
@@ -150,6 +110,7 @@
     canonicalSelectionCommitments.set(surfaceId, commitment);
     return commitment;
   }
+
   document.addEventListener("click", (event) => {
     const option = event.target?.closest?.("[role='option'], option, [role='menuitem']");
     if (option) rememberCanonicalSelectionCommitment(option);
@@ -194,6 +155,7 @@
     actionLedger: [],
     lastActionResult: null,
     lastBackendDebug: null,
+    processDiagnostics: null,
     pageMap: null,
     lastPageMutationAt: Date.now(),
     pageUnderstanding: null,
@@ -219,9 +181,97 @@
   }
 
   const RESUME_KEY = "atwAgentResume";
+  const SELECTED_BOOKING_KEY = "atwSelectedBookingAcquisitionV1";
+  const SELECTED_BOOKING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
   const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
   const DESTINATION_RETRY_INTERVAL_MS = 300;
+  let selectedBookingCaptureTimer = null;
+
+  function authoritativeSelectedBookingFacts(facts = null) {
+    if (!facts || facts.evidenceMode !== "typed") return null;
+    const segments = Array.isArray(facts.itinerary?.segments) ? facts.itinerary.segments : [];
+    const evidence = Array.isArray(facts.factEvidence?.itinerary) ? facts.factEvidence.itinerary : [];
+    const totalAmount = Number(facts.totalPrice?.amount);
+    const totalCurrency = String(facts.totalPrice?.currency || facts.currency || "").trim().toUpperCase();
+    const totalEvidence = facts.factEvidence?.totalPrice || null;
+    const authoritativeTotal = Number.isFinite(totalAmount)
+      && totalAmount >= 0
+      && Boolean(totalCurrency)
+      && totalEvidence?.authoritative === true
+      && totalEvidence?.role === "booking_total"
+      && Boolean(String(totalEvidence.ownerKey || "").trim());
+    if (facts.itinerary?.completeness !== "complete" || !segments.length || !authoritativeTotal) return null;
+    const complete = segments.every((segment) => {
+      const proof = segment.evidence || evidence.find((entry) => entry?.segmentId === segment.segmentId) || null;
+      return Boolean(
+        String(segment.origin || "").trim()
+        && String(segment.destination || "").trim()
+        && String(segment.departureDate || "").trim()
+        && proof?.authoritative === true
+        && String(proof.ownerKey || "").trim()
+      );
+    });
+    return complete ? facts : null;
+  }
+
+  function captureSelectedBookingFromMap(map = null) {
+    const facts = authoritativeSelectedBookingFacts(map?.transactionFacts);
+    if (!facts) return null;
+    const existing = readSelectedBookingAcquisition();
+    // Once checkout has started rendering traveler/extras/payment pages, the
+    // selected flight is immutable. Only the actual flight-selection stage
+    // may replace a prior capture when the user chooses a different flight.
+    if (existing && map?.step !== "flight_selection") return existing;
+    const acquisition = {
+      contractVersion: "selected-booking-acquisition/v1",
+      capturedAt: new Date().toISOString(),
+      sourceOrigin: location.origin,
+      sourceUrl: location.href,
+      observationId: `booking_capture_${Date.now().toString(36)}`,
+      facts
+    };
+    try {
+      sessionStorage.setItem(SELECTED_BOOKING_KEY, JSON.stringify(acquisition));
+      return acquisition;
+    } catch (error) {
+      // Sandboxed/opaque documents may deny sessionStorage. The acquisition
+      // is still valid for the current page/session handshake even though it
+      // cannot survive navigation in that environment.
+      return acquisition;
+    }
+  }
+
+  function readSelectedBookingAcquisition() {
+    try {
+      const acquisition = JSON.parse(sessionStorage.getItem(SELECTED_BOOKING_KEY) || "null");
+      const capturedAt = Date.parse(acquisition?.capturedAt || "");
+      if (
+        acquisition?.contractVersion !== "selected-booking-acquisition/v1"
+        || acquisition.sourceOrigin !== location.origin
+        || !Number.isFinite(capturedAt)
+        || Date.now() - capturedAt > SELECTED_BOOKING_MAX_AGE_MS
+        || !authoritativeSelectedBookingFacts(acquisition.facts)
+      ) {
+        sessionStorage.removeItem(SELECTED_BOOKING_KEY);
+        return null;
+      }
+      return acquisition;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function scheduleSelectedBookingCapture(reason = "page_update") {
+    if (agent.running || agent.sessionId || selectedBookingCaptureTimer) return false;
+    selectedBookingCaptureTimer = setTimeout(() => {
+      selectedBookingCaptureTimer = null;
+      if (agent.running) return;
+      const observed = pageStateStore.observe({ reason: `selected_booking_${reason}` });
+      captureSelectedBookingFromMap(observed.map);
+    }, 350);
+    return true;
+  }
 
   async function saveResumeMarker() {
     try {
@@ -446,26 +496,7 @@
   }
 
   function canonicalProfileFieldType(value = "") {
-    const alias = normalizedFieldAlias(value);
-    if (!alias) return "";
-    if (PROFILE_FIELD_ALIASES.has(alias)) return PROFILE_FIELD_ALIASES.get(alias);
-    const withoutSubject = alias
-      .replace(/^(?:passengers?|travell?ers?|adults?)_\d+_/, "")
-      .replace(/^(?:contact|profile)_/, "");
-    if (PROFILE_FIELD_ALIASES.has(withoutSubject)) return PROFILE_FIELD_ALIASES.get(withoutSubject);
-    if (/^(?:birth|dob|bday)_(?:day|month|year)$/.test(withoutSubject)) return "date_of_birth";
-    if (/^(?:passport_)?nationality$|^country_of_citizenship$/.test(withoutSubject)) return "nationality";
-    if (/^(?:travell?er_)?title$|^salutation$|^gender_title$/.test(withoutSubject)) return "title";
-    if (/^(?:passport_)?id_number$|^travel_document_(?:number|no)$/.test(withoutSubject)) {
-      return withoutSubject.startsWith("passport") ? "passport_number" : "document_number";
-    }
-    if (/^(?:passport|document)_(?:expiry|expiration)_(?:day|month|year)$/.test(withoutSubject)) {
-      return withoutSubject.startsWith("passport") ? "passport_expiry" : "document_expiry";
-    }
-    if (/^(?:passport|document)_(?:issue|issued)_(?:day|month|year)$/.test(withoutSubject)) {
-      return "document_issue_date";
-    }
-    return "";
+    return AGENT_CONTRACT?.canonicalProfileFieldType?.(value) || "";
   }
 
   function boundedPhrase(text = "", phrase = "") {
@@ -571,10 +602,15 @@
     if (/emergency contact.*relationship|relationship.*emergency contact/.test(evidence)) add("emergency_contact_relationship");
     if (/emergency contact.*(?:phone|mobile|telephone)|(?:phone|mobile|telephone).*emergency contact/.test(evidence)) add("emergency_contact_phone");
     if (boundedPhrase(evidence, "surname") || /family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
-    if (/first[ _-]?name|given[ _-]?name|forename/.test(evidence)) add("first_name");
-    if (/middle[ _-]?name/.test(evidence)) add("middle_name");
+    const combinedGivenNames = /(?:first|given)\s*(?:\/|and|&)\s*middle\s+names?\b|\bgiven names\b|\bforenames\b/.test(evidence);
+    if (combinedGivenNames) add("given_names");
+    else {
+      if (/first[ _-]?name|given[ _-]?name|forename/.test(evidence)) add("first_name");
+      if (/middle[ _-]?name/.test(evidence)) add("middle_name");
+    }
     if (/second (?:last name|surname)|additional surname|maternal surname/.test(evidence)) add("second_last_name");
     if (editable && /(?:^|\s)(?:birth|date of birth|dob|bday)(?:\s|$)/.test(evidence)) add("date_of_birth");
+    if (editable && /(?:age at (?:the )?time of travel|age (?:at|on) departure|departure age|travel age|passenger age)/.test(evidence)) add("age_at_departure");
     if (editable && /(?:^|\s)(?:place of birth|birth place|birth city)(?:\s|$)/.test(evidence)) add("place_of_birth");
     if (editable && /(?:^|\s)(?:nationality|citizenship|country of citizenship)(?:\s|$)/.test(evidence)) add("nationality");
     if (editable && /country of residence|residence country|resident country/.test(evidence)) add("country_of_residence");
@@ -591,11 +627,16 @@
     if (editable && /redress (?:control )?(?:number|no)/.test(evidence)) add("redress_number");
     if (editable && /meal preference|special meal|meal request/.test(evidence)) add("meal_preference");
     if (editable && /special assistance|assistance request|accessibility request/.test(evidence)) add("special_assistance");
-    if (editable && (/(?:^|\s)(?:phone|telephone|mobile)(?:\s|$)/.test(evidence))
-      && !/(?:plan|bundle|package|insurance|addon|add on|emergency contact)/.test(evidence)) {
-      add(/country.*code|dial.*code|calling.*code/.test(evidence) ? "phone_country_code" : "phone");
-    } else if (editable && /country.*code|dial.*code|calling.*code/.test(evidence)) {
+    if (/purpose of (?:the )?(?:trip|travel|journey)|(?:trip|travel|journey) purpose|reason for (?:the )?(?:trip|travel|journey)|business or leisure|travell?ing for (?:business|leisure)/.test(evidence)) add("travel_purpose");
+    const countryPhoneCode = /country.*(?:phone|dial|calling)?\s*code|(?:phone|dial|calling).*country.*code|dial.*code|calling.*code/.test(evidence);
+    // A custom country-code select may expose only a button opener. Exact
+    // phone-code wording remains field evidence even though that actuator is
+    // not itself editable.
+    if (countryPhoneCode) {
       add("phone_country_code");
+    } else if (editable && (/(?:^|\s)(?:phone|telephone|mobile)(?:\s|$)/.test(evidence))
+      && !/(?:plan|bundle|package|insurance|addon|add on|emergency contact)/.test(evidence)) {
+      add("phone");
     }
     if (/(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(evidence)) add("title");
     if (/(?:^|\s)(?:gender|sex)(?:\s|$)/.test(evidence)) add("gender");
@@ -680,6 +721,14 @@
         .map(canonicalProfileFieldType)
         .filter(Boolean)
     ];
+    const explicitLabelTypes = profileFieldTypesFromText(explicitLabel, { editable });
+    if (
+      explicitLabelTypes.length === 1
+      && explicitLabelTypes[0] === "given_names"
+      && rawCandidates.every((candidate) => ["first_name", "given_names"].includes(candidate))
+    ) {
+      return result("given_names", "explicit_composite_label", 0.99, explicitLabel);
+    }
     const optionCodecCandidates = (() => {
       if (!(type === "radio" || role === "radio") || !group.tight) return [];
       const titleValues = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "title"));
@@ -696,7 +745,7 @@
     const crossChannelCandidates = [...new Set([
       ...rawCandidates,
       ...profileFieldTypesFromText(directMachineText, { editable }),
-      ...profileFieldTypesFromText(explicitLabel, { editable }),
+      ...explicitLabelTypes,
       ...optionCodecCandidates
     ].filter(Boolean).map(ownershipFamily))];
     if (crossChannelCandidates.length > 1) {
@@ -724,7 +773,7 @@
     );
     if (directMachineResolution) return directMachineResolution;
     const directMachineAlias = normalizedFieldAlias(directMachineText);
-    if (/(?:passenger|travell?er|adult)_(?:category|type|class)|(?:category|type|class)_(?:passenger|travell?er|adult)/.test(directMachineAlias)) {
+    if (!explicitLabelTypes.length && /(?:passenger|travell?er|adult)_(?:category|type|class)|(?:category|type|class)_(?:passenger|travell?er|adult)/.test(directMachineAlias)) {
       return result("", "direct_non_profile_control", 0.99, directMachineText);
     }
 
@@ -804,6 +853,7 @@
     const values = {
       confirm_email: t.email,
       first_name: t.first_name,
+      given_names: t.given_names || [t.first_name, t.middle_name].filter(Boolean).join(" "),
       middle_name: t.middle_name,
       last_name: t.last_name,
       second_last_name: t.second_last_name,
@@ -841,6 +891,7 @@
       emergency_contact_email: t.emergency_contact_email || "",
       meal_preference: t.meal_preference || "",
       special_assistance: t.special_assistance || "",
+      travel_purpose: t.travel_purpose || "leisure",
       email: t.email,
       phone_country_code: travelerPhoneParts(t).countryCode,
       phone: travelerPhoneParts(t).local || phoneValueForField(t.phone)
@@ -1339,6 +1390,10 @@
     const resolveLiveElement = typeof options.resolveLiveElement === "function"
       ? options.resolveLiveElement
       : () => element;
+    const reportLocalResult = options.reportResult !== false;
+    const reportFieldResult = async (payload) => {
+      if (reportLocalResult) await reportActionResult(payload);
+    };
     const result = {
       ok: false,
       fieldType,
@@ -1353,7 +1408,7 @@
       recordAction("field_fill", result);
       setAgentActivity(result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok ? "Moving to the next required item" : "Will rescan and recover");
       await verifyAgentStep(element, "Field", result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok, 700);
-      await reportActionResult({
+      await reportFieldResult({
         type: "field_fill",
         action: "fill_text",
         fieldType,
@@ -1373,7 +1428,7 @@
       result.method = selectResult.method;
       result.actual = selectResult.value || currentElementValue(element);
       recordAction("field_fill", result);
-      await reportActionResult({
+      await reportFieldResult({
         type: "field_fill",
         action: "select_dropdown",
         fieldType,
@@ -1399,7 +1454,7 @@
         recordAction("field_fill", result);
         setAgentActivity(`${fieldLabel} accepted`, "Moving to the next required item");
         await verifyAgentStep(element, "Field", `${fieldLabel} accepted`, true, 700);
-        await reportActionResult({
+        await reportFieldResult({
           type: "field_fill",
           action: "fill_text",
           fieldType,
@@ -1422,7 +1477,7 @@
       result.actual = currentElementValue(element);
       recordAction("field_fill", result);
       setAgentActivity(result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok ? "Moving to the next required item" : "Will rescan and recover");
-      await reportActionResult({
+      await reportFieldResult({
         type: "field_fill",
         action: "fill_text",
         fieldType,
@@ -1437,7 +1492,7 @@
       result.reason = error.message;
       result.actual = currentElementValue(element);
       recordAction("field_fill", result);
-      await reportActionResult({
+      await reportFieldResult({
         type: "field_fill",
         action: "fill_text",
         fieldType,
@@ -2104,10 +2159,9 @@
   function isDestinationReadinessDecision(decision = {}) {
     if (decision.action !== "wait") return false;
     const intent = `${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase();
-    return /wait_for_ready_observation|reobserve_after_transient_observation|reobserve_degraded_loading_destination|wait_for_navigation_enablement|reobserve_blocked_navigation_settling|reobserve_after_grounding_rejection/.test(intent)
+    return /wait_for_ready_observation|reobserve_after_transient_observation|reobserve_degraded_loading_destination|reobserve_after_grounding_rejection/.test(intent)
       || (decision.expectedPostconditions || []).some((postcondition) => (
-        (postcondition?.type === "observation_readiness" && postcondition?.status === "READY")
-        || postcondition?.type === "navigation_enabled_or_blocker_identified"
+        postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
       ));
   }
 
@@ -2600,6 +2654,8 @@
   async function startAgentSession(resumeSessionId = "") {
     try {
       const settings = await storageGet(["apiBase"]);
+      const currentBookingCapture = captureSelectedBookingFromMap(agent.pageMap);
+      const selectedBooking = readSelectedBookingAcquisition() || currentBookingCapture;
       const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/session`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2609,6 +2665,7 @@
           goal: agent.userGoal || "Complete this flight checkout safely with one-click assistance.",
           userIntent: userIntentText(),
           traveler: traveler(),
+          selectedBooking,
           page: compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
         })
       });
@@ -2882,6 +2939,49 @@
     return `h${(hash >>> 0).toString(36)}`;
   }
 
+  function canonicalItineraryActionDate(value = "") {
+    const text = String(value || "").replace(/(\d{1,2})(?:st|nd|rd|th)\b/gi, "$1").trim();
+    const iso = text.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+    const months = new Map([
+      ["january", 1], ["february", 2], ["march", 3], ["april", 4], ["may", 5], ["june", 6],
+      ["july", 7], ["august", 8], ["september", 9], ["october", 10], ["november", 11], ["december", 12],
+      ["jan", 1], ["feb", 2], ["mar", 3], ["apr", 4], ["jun", 6], ["jul", 7], ["aug", 8],
+      ["sep", 9], ["sept", 9], ["oct", 10], ["nov", 11], ["dec", 12]
+    ]);
+    const dayFirst = text.match(/\b(\d{1,2})\s+([\p{L}.]+)\s+(20\d{2})\b/iu);
+    const monthFirst = text.match(/\b([\p{L}.]+)\s+(\d{1,2})(?:,)?\s+(20\d{2})\b/iu);
+    const match = dayFirst || monthFirst;
+    if (!match) return "";
+    const day = Number(dayFirst ? match[1] : match[2]);
+    const monthName = String(dayFirst ? match[2] : match[1]).toLowerCase().replace(/\.$/, "");
+    const year = Number(match[3]);
+    const month = months.get(monthName) || 0;
+    const date = new Date(Date.UTC(year, month - 1, day));
+    if (!month || date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return "";
+    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+
+  function itineraryActionEvidence(element) {
+    if (!element?.matches?.("button, a, [role='button'], [role='link']")) return null;
+    const labels = [
+      element.getAttribute?.("aria-label"),
+      directControlName(element),
+      buttonText(element),
+      element.getAttribute?.("title")
+    ].map((value) => String(value || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    for (const label of [...new Set(labels)]) {
+      const match = label.match(/^(?:edit|change|modify|view)\s+([\p{L}][\p{L} .'’-]{1,78}?)\s+(?:to|→|–|—)\s+([\p{L}][\p{L} .'’-]{1,78}?)\s+flight\s+(?:on|departing(?:\s+on)?)\s+(.{5,60}?)(?:[.!]|$)/iu);
+      if (!match) continue;
+      const departureDate = canonicalItineraryActionDate(match[3]);
+      const origin = match[1].trim();
+      const destination = match[2].trim();
+      if (!departureDate || origin.toLowerCase() === destination.toLowerCase()) continue;
+      return { label, origin, destination, departureDate };
+    }
+    return null;
+  }
+
   function transactionFactsEvidence({ step = "unknown", price = null, decisionGroups = [], activeSurface = {}, terminalEvidence = null } = {}) {
     const text = String(primaryPageText() || visiblePageText() || "")
       .replace(/[\u200e\u200f\u202a-\u202e]/g, " ")
@@ -2917,10 +3017,12 @@
         "overview", "contact", "details", "ticket", "fare", "seat", "seating"
       ]);
       const nonTravelMeaning = /\b(?:adult|child|children|infant|teen|passengers?|age|aged|years?|months?|over|under|younger|older|kg|kgs|kilograms?|lb|lbs|pounds?|cm|centimet(?:er|re)s?|dimensions?)\b/i;
+      const nonRouteCommerceMeaning = /\b(?:non[ -]?refundable|refundable|changeable|changes?|subject|fees?|charges?|conditions?|restrictions?|included|excluded|add|buy|purchase|upgrade|bags?|baggage|luggage|onboard|carry[ -]?on|bring)\b/i;
       return !tokens.length
         || /\d/.test(endpoint)
         || tokens.length > 8
         || nonTravelMeaning.test(endpoint)
+        || nonRouteCommerceMeaning.test(endpoint)
         || tokens.every((token) => reserved.has(token));
     };
     const canonicalRouteSegments = (rawSegments = []) => rawSegments.reduce((segments, segment) => {
@@ -3011,6 +3113,90 @@
         };
       });
     });
+    // Persistent checkout summaries may expose the selected leg as an exact
+    // context action rather than a semantic itinerary card, for example:
+    // "Edit Ljubljana to Edinburgh flight on 15th August 2026". The control
+    // is evidence-only; it is never a checkout action candidate.
+    const itineraryActionSegments = queryAllDeep("button, a, [role='button'], [role='link']")
+      .filter((element) => isVisible(element))
+      .map((element, index) => {
+        const evidence = itineraryActionEvidence(element);
+        if (!evidence) return null;
+        const origin = normalizeRouteEndpoint(evidence.origin);
+        const destination = normalizeRouteEndpoint(evidence.destination);
+        if (!origin || !destination || reservedRouteEndpoint(origin) || reservedRouteEndpoint(destination)) return null;
+        return {
+          segmentId: `itinerary_action_${index + 1}_${stableHash(`${origin}:${destination}:${evidence.departureDate}`)}`,
+          origin,
+          destination,
+          departureDate: evidence.departureDate,
+          departureTime: "",
+          arrivalTime: "",
+          flightNumber: "",
+          confidence: 0.98,
+          evidence: {
+            source: "itinerary_action_owner",
+            ownerKey: stableHash(`itinerary-action:${evidence.label}`),
+            qualification: "exact_route_flight_full_date_action",
+            authoritative: true
+          }
+        };
+      })
+      .filter(Boolean);
+    // Progressive payment pages can render the selected itinerary as one
+    // compact sentence instead of semantic cards: "FROM City (AAA) ... TO
+    // City (BBB) ...". FROM/TO + two IATA codes + owned travel timing is a
+    // positive route contract; arbitrary page prose and separators remain
+    // ineligible.
+    const progressiveItinerarySegments = [...text.matchAll(
+      /\bFROM\s+([\p{L} .'’-]{1,60}?)\s*\(([A-Z]{3})\)\s+(.{0,90}?)\bTO\s+([\p{L} .'’-]{1,60}?)\s*\(([A-Z]{3})\)\s+(.{0,90}?)(?=\b(?:FROM|economy|business|premium|show\s+details|which\s+currency|payment|$))/giu
+    )].map((match, index) => {
+      const departureContext = String(match[3] || "");
+      const arrivalContext = String(match[6] || "");
+      const departureDate = departureContext.match(/\b(?:\d{1,2}\s+[\p{L}]+\s+(?:mon|tue|wed|thu|fri|sat|sun)|(?:mon|tue|wed|thu|fri|sat|sun)\s+\d{1,2}\s+[\p{L}]+|20\d{2}-\d{2}-\d{2})\b/iu)?.[0] || "";
+      const departureTime = departureContext.match(/\b\d{1,2}:\d{2}\b/)?.[0] || "";
+      const arrivalTime = arrivalContext.match(/\b\d{1,2}:\d{2}\b/)?.[0] || "";
+      if (!departureDate || !departureTime || !arrivalTime) return null;
+      return {
+        segmentId: `progressive_itinerary_${index + 1}_${stableHash(`${match[2]}:${match[5]}:${departureDate}`)}`,
+        origin: match[2],
+        destination: match[5],
+        departureDate,
+        departureTime,
+        arrivalTime,
+        flightNumber: "",
+        confidence: 0.94,
+        evidence: {
+          source: "progressive_from_to_itinerary",
+          ownerKey: stableHash(`progressive-itinerary:${match[0].slice(0, 260)}`),
+          qualification: "from_to_iata_pair_with_date_and_times",
+          authoritative: true
+        }
+      };
+    }).filter(Boolean);
+    // Persistent checkout chrome commonly publishes a compact selected
+    // booking such as "Departure SJJ - IST • 15 Oct Thu Departure: 20:45 |
+    // Arrival: 23:40". Require labelled direction, two IATA endpoints, a
+    // travel date, and both times. This is evidence-only page chrome; it does
+    // not become a foreground surface or an actuator.
+    const persistentSummarySegments = [...text.matchAll(
+      /\b(Departure|Outbound|Return|Inbound)\s+([A-Z]{3})\s*[-–—]\s*([A-Z]{3})\s*[•|]?\s*(\d{1,2}\s+[\p{L}]+(?:\s+(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?)?(?:\s+20\d{2})?).{0,100}?\bDeparture\s*:\s*(\d{1,2}:\d{2})\s*[|·•]?\s*Arrival\s*:\s*(\d{1,2}:\d{2})/giu
+    )].map((match, index) => ({
+      segmentId: `persistent_summary_${index + 1}_${stableHash(`${match[2]}:${match[3]}:${match[4]}`)}`,
+      origin: match[2],
+      destination: match[3],
+      departureDate: match[4],
+      departureTime: match[5],
+      arrivalTime: match[6],
+      flightNumber: "",
+      confidence: 0.95,
+      evidence: {
+        source: "persistent_booking_summary",
+        ownerKey: stableHash(`persistent-booking:${match[0].slice(0, 260)}`),
+        qualification: "labelled_iata_pair_with_date_and_times",
+        authoritative: true
+      }
+    }));
     // Checkout sites frequently render the persistent selected route as an
     // ordinary styled div/span rather than a semantic heading. Read only a
     // small, exact route-shaped owner; never infer a route from page-wide text.
@@ -3019,12 +3205,6 @@
       || decisionGroups.length
       || /\b(?:booking|checkout|passengers?|ticket fare|seating|overview\s*(?:&|and)\s*payment)\b/i.test(text)
     );
-    const boundedPlaceLabel = (value = "") => {
-      const words = String(value || "").trim().split(/\s+/).filter(Boolean);
-      return words.length >= 1
-        && words.length <= 4
-        && words.every((word) => /^[\p{Lu}][\p{L}.'’-]*$/u.test(word));
-    };
     const boundedRouteSegments = queryAllDeep("h1, h2, h3, h4, h5, h6, [role='heading'], [aria-label*='route' i], [data-testid*='route' i], main div, main span, [role='main'] div, [role='main'] span, form div, form span")
       .filter((element) => isVisible(element))
       .map((element) => {
@@ -3050,18 +3230,13 @@
         const ownedDate = localText.match(routeDateCue)?.[0] || "";
         const airportPair = /(?:^|\s|\()([A-Z]{3})(?:\)|\s|$)/.test(match[1])
           && /(?:^|\s|\()([A-Z]{3})(?:\)|\s|$)/.test(match[2]);
-        const persistentCheckoutRoute = checkoutRouteContext
-          && boundedPlaceLabel(match[1])
-          && boundedPlaceLabel(match[2]);
         const qualification = explicitRouteOwner
           ? "semantic_route_owner"
           : airportPair
             ? "airport_code_pair"
             : ownedDate
               ? "owned_travel_date"
-              : persistentCheckoutRoute
-                ? "persistent_checkout_route"
-                : "";
+              : "";
         if (!qualification) return null;
         return {
           segmentId: `bounded_route_${index + 1}_${stableHash(`${origin}:${destination}:${ownedDate}`)}`,
@@ -3109,6 +3284,9 @@
         const destination = normalizeRouteEndpoint(separated?.[2] || unseparated?.[1] || "");
         if (!origin || !destination || origin === destination || reservedRouteEndpoint(origin) || reservedRouteEndpoint(destination)) return null;
         const ownedDate = label.match(/\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\s+\d{1,2}\s+[\p{L}]+(?:\s+20\d{2})?\b/iu)?.[0] || "";
+        const airportPair = /(?:^|\s|\()([A-Z]{3})(?:\)|\s|$)/.test(separated?.[1] || "")
+          && /(?:^|\s|\()([A-Z]{3})(?:\)|\s|$)/.test(separated?.[2] || "");
+        if (!ownedItineraryCue && !ownedDate && !airportPair) return null;
         const flight = label.match(/\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\s*([0-9]{2,4})\b/) || null;
         return {
           segmentId: `owned_route_${index + 1}_${stableHash(`${origin}:${destination}:${ownedDate}`)}`,
@@ -3140,8 +3318,14 @@
           ...segment,
           evidence: { source: "structured_itinerary_attributes", ownerKey: segment.segmentId, authoritative: true }
         }))
+      : itineraryActionSegments.length
+        ? itineraryActionSegments
       : itinerarySummarySegments.length
         ? itinerarySummarySegments
+        : persistentSummarySegments.length
+          ? persistentSummarySegments
+        : progressiveItinerarySegments.length
+          ? progressiveItinerarySegments
         : ownedRouteSegments.length
         ? ownedRouteSegments
         : boundedRouteSegments.length
@@ -3217,6 +3401,41 @@
     // maintain a second airline-wording classifier for the same page.
     const finalReviewSurface = terminalEvidence?.boundaryObserved === true
       || terminalEvidence?.verified === true;
+    const normalizedMonetaryText = (value = "") => String(value || "")
+      .replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
+      .replace(/\b(EUR|USD|GBP|CHF|CAD|AUD)\s+(?:euros?|dollars?|pounds?|francs?)\b/gi, "$1")
+      .replace(/(\d)\s+([.,])\s*(\d)/g, "$1$2$3")
+      .replace(/\s+/g, " ")
+      .trim();
+    const bookingTotalFromText = (value = "") => {
+      const normalized = normalizedMonetaryText(value);
+      const cue = /\b(?:amount to pay|grand total|booking total|trip total|order total|total(?:\s+(?:amount|price)(?:\s+for\s+\d+\s+passengers?)?)?)\b/gi;
+      const candidates = [];
+      for (const match of normalized.matchAll(cue)) {
+        const bounded = normalized.slice(match.index, match.index + 180);
+        const found = structuredPricesFromText(bounded)[0] || null;
+        if (found) candidates.push({
+          ...found,
+          ownerKey: stableHash(`booking-total:${bounded.slice(0, 160)}`),
+          qualification: match[0].toLowerCase().replace(/\s+/g, "_")
+        });
+      }
+      return candidates.at(-1) || null;
+    };
+    const stronglyOwnedBookingTotal = bookingTotalFromText(text);
+    const coherentSelectedBooking = completeness === "complete"
+      && segments.length > 0
+      && segments.every((segment) => segment.origin && segment.destination && segment.departureDate);
+    const bookingTotal = stronglyOwnedBookingTotal && (finalReviewSurface || coherentSelectedBooking)
+      ? stronglyOwnedBookingTotal
+      : finalReviewSurface && price
+        ? {
+            amount: Number(price.amount),
+            currency: normalizeCurrency(price.currency),
+            ownerKey: stableHash(`payment-total:${price.amount}:${price.currency}`),
+            qualification: "verified_payment_summary"
+          }
+        : null;
     const source = finalReviewSurface
       ? "payment_summary"
       : activeSurface?.type && activeSurface.type !== "page"
@@ -3258,7 +3477,7 @@
           disposition,
           outcome: canonicalOutcome(family, group.selectedLabel || "", disposition),
           priceAmount: group.selectedEvidence?.structuredPrice?.amount ?? null,
-          currency: group.selectedEvidence?.structuredPrice?.currency || price?.currency || ""
+          currency: group.selectedEvidence?.structuredPrice?.currency || bookingTotal?.currency || price?.currency || ""
         };
       });
     if (finalReviewSurface) {
@@ -3273,7 +3492,7 @@
           disposition,
           outcome,
           priceAmount: null,
-          currency: price?.currency || ""
+          currency: bookingTotal?.currency || price?.currency || ""
         });
       };
       const reviewFare = fareBrand;
@@ -3293,18 +3512,21 @@
       .map((extra) => [extra.outcomeKey || `${extra.family}:${extra.subjectKey}`, extra])).values()]
       .slice(0, 40);
     return {
+      contractVersion: "transaction-facts/v2",
       evidenceMode: "typed",
       itinerary: { completeness, segments },
       travelers: currentTraveler.id ? [{
         travelerId: currentTraveler.id,
         name: [currentTraveler.first_name, currentTraveler.middle_name, currentTraveler.last_name].filter(Boolean).join(" ")
       }] : [],
-      currency: normalizeCurrency(price?.currency || baseFareMatch?.[2] || ""),
+      currency: normalizeCurrency(bookingTotal?.currency || baseFareMatch?.[2] || ""),
       basePrice: baseFareMatch ? {
         amount: Number(baseFareMatch[1].replace(",", ".")),
         currency: normalizeCurrency(baseFareMatch[2])
-      } : { amount: null, currency: normalizeCurrency(price?.currency || "") },
-      totalPrice: price ? { amount: Number(price.amount), currency: normalizeCurrency(price.currency) } : { amount: null, currency: "" },
+      } : { amount: null, currency: normalizeCurrency(bookingTotal?.currency || "") },
+      totalPrice: bookingTotal
+        ? { amount: Number(bookingTotal.amount), currency: normalizeCurrency(bookingTotal.currency) }
+        : { amount: null, currency: "" },
       fareBrand,
       selectedExtras: selectedOutcomes,
       factEvidence: {
@@ -3323,9 +3545,12 @@
           confidence: ownedFareRows[0] ? 0.92 : 0.88,
           authoritative: true
         } : null,
-        totalPrice: price ? {
+        totalPrice: bookingTotal ? {
           source: finalReviewSurface ? "payment_summary_total" : "owned_price_summary",
-          ownerKey: "page_total",
+          ownerKey: bookingTotal.ownerKey,
+          role: "booking_total",
+          ownerType: finalReviewSurface ? "payment_summary" : "selected_booking_summary",
+          qualification: bookingTotal.qualification,
           observationId: agent.activeObservationId || "",
           confidence: 0.9,
           authoritative: true
@@ -3341,7 +3566,7 @@
       provenance: [{
         source,
         observationId: agent.activeObservationId || "",
-        confidence: attributeSegments.length ? 0.95 : segments.length ? 0.88 : price ? 0.75 : 0.35
+        confidence: attributeSegments.length ? 0.95 : segments.length ? 0.88 : bookingTotal ? 0.75 : 0.35
       }]
     };
   }
@@ -4465,6 +4690,10 @@
 
   function isGlobalChromeControl(element) {
     if (!element) return false;
+    // Selected-itinerary Edit/Change/View controls are context evidence only.
+    // Marking them non-task chrome prevents planning from ever clicking them
+    // while retaining their route/date facts in transaction evidence.
+    if (itineraryActionEvidence(element)) return true;
     const meaning = normalizeMatchText([
       directControlName(element),
       buttonText(element),
@@ -4489,12 +4718,16 @@
 
   function sectionTypeFor(label, text = "") {
     const source = `${label} ${text}`.toLowerCase();
+    if (AGENT_CONTRACT?.isLegalAcceptanceText?.(source)) return "legal_acceptance";
     if (/contact|e-?mail|mobile/.test(source)) return "contact";
     if (/passenger|traveller|traveler|surname|first name|passport|title/.test(source)) return "passenger";
     if (/baggage|bag|personal item|hand baggage|checked/.test(source)) return "baggage";
     if (/bundle|premium support|airhelp|sms/.test(source)) return "bundle";
     if (/flexible ticket|reschedule|change your ticket/.test(source)) return "flexible_ticket";
-    if (/cancellation|voucher refund|insurance|refund/.test(source)) return "cancellation_insurance";
+    if (AGENT_CONTRACT?.isInsuranceOfferText?.(source)
+      || (!AGENT_CONTRACT?.isInsuranceOfferText && /cancellation|voucher refund|insurance|refund/.test(source))) {
+      return "cancellation_insurance";
+    }
     if (/continue|protect your personal data/.test(source)) return "continue";
     if (/seat|reserve seating|seat map/.test(source)) return "seat";
     if (/payment|pay|card|cvc/.test(source)) return "payment";
@@ -4870,6 +5103,7 @@
   function semanticChoiceType(label = "") {
     const text = label.toLowerCase();
     const structuredPrice = structuredPriceFromText(label);
+    if (AGENT_CONTRACT?.isLegalAcceptanceText?.(label)) return "legal_acceptance";
     if (/no checked baggage|no baggage|without baggage|i.ll go without|go without/.test(text)) return "decline_baggage";
     if (/skip (?:seat|seating)|random seating|random assignment|continue without (?:a )?seat|no seat selection/.test(text)) return "decline_paid_extra";
     if (/\b(?:do not|don.t|not)\s+(?:wish|want|agree|consent)\s+to\s+(?:receive|join|subscribe)|\bopt(?:ing)?\s*out\b|\bunsubscribe\b/.test(text)) return "decline_paid_extra";
@@ -4889,11 +5123,53 @@
     if (structuredPrice?.amount === 0) return "safe";
     if (structuredPrice && structuredPrice.amount > 0) return "money";
     const semantic = semanticChoiceType(label);
+    if (semantic === "legal_acceptance") return "legal";
     if (/decline_/.test(semantic)) return "safe_decline";
     if (semantic === "add_paid_extra") return "money";
     if (semantic === "selection_cta") return "uncertain";
     if (semantic === "continue" || semantic === "traveler_title") return "safe";
     return "uncertain";
+  }
+
+  const NON_ECONOMIC_EFFECT_ROLES = new Set(["scope_toggle", "information_only", "navigation"]);
+
+  function canonicalDecisionEffectRole(control = {}) {
+    const localMeaning = normalizeMatchText([
+      control.label,
+      control.ownText,
+      control.ariaLabel,
+      control.title,
+      control.semantic,
+      control.physicalEffect,
+      control.testId
+    ].filter(Boolean).join(" "));
+    const meaning = normalizeMatchText([
+      control.label,
+      control.accessibleName,
+      control.ownText,
+      control.ariaLabel,
+      control.title,
+      control.semantic,
+      control.physicalEffect,
+      control.testId,
+      control.sectionLabel
+    ].filter(Boolean).join(" "));
+    const shape = normalizeMatchText(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""} ${control.inputType || ""}`);
+    if (/same for all|apply (?:this )?to all|both (?:flights|legs|journeys)|copy (?:to|for) all/.test(localMeaning)
+      && /checkbox|switch|toggle|button/.test(shape)) return "scope_toggle";
+    if (/decline paid extra|decline baggage|safe decline|select free option/.test(meaning)
+      || /no,? thanks|skip (?:bags?|baggage|luggage|seats?|seating|selection)|go without|continue without|random (?:seat|assignment)|none/.test(meaning)) {
+      return "free_decline";
+    }
+    if (/included|already (?:have|selected)|personal item/.test(meaning)
+      && !/add|buy|upgrade|select paid|purchase/.test(meaning)) return "included_entitlement";
+    if (/show details|learn more|more info|information|allowance|dimensions|what.s included/.test(meaning)
+      && !/add|buy|upgrade|select|choose/.test(meaning)) return "information_only";
+    if (/add paid extra|select paid option|purchase|upgrade|buy|\badd\b.{0,40}\b(?:bag|baggage|luggage)\b|bring onboard/.test(meaning)
+      || Number(control.structuredPrice?.amount) > 0) return "commerce_option";
+    if (/continue|next|proceed|navigate stage|advance checkout|close|done|back/.test(meaning)
+      && !/continue without/.test(meaning)) return "navigation";
+    return "unknown";
   }
 
   function slugControlPart(value = "") {
@@ -4938,9 +5214,32 @@
     return tag === "select" || role === "combobox" || role === "listbox" || element?.getAttribute?.("aria-haspopup") === "listbox";
   }
 
-  function isPlaceholderChoiceValue(value = "") {
-    return /^(choose|select|please select|select one|select one option|please choose|month|day|year|title|gender|nationality|country)$/i.test(
-      String(value || "").replace(/\s+/g, " ").trim()
+  function isPlaceholderChoiceValue(value = "", element = null) {
+    const normalized = String(value || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return false;
+    if (/^(choose|select|please select|select one|select one option|please choose|month|day|year|title|gender|nationality|country)$/i.test(normalized)) {
+      return true;
+    }
+    if (!element || !isDropdownLikeElement(element)) return false;
+    const explicitPlaceholders = [
+      element.getAttribute?.("placeholder"),
+      element.getAttribute?.("aria-placeholder"),
+      element.tagName === "SELECT" && element.selectedIndex >= 0
+        && !String(element.options?.[element.selectedIndex]?.value || "").trim()
+        ? element.options?.[element.selectedIndex]?.textContent
+        : ""
+    ].map((candidate) => normalizeMatchText(candidate || "")).filter(Boolean);
+    const normalizedValue = normalizeMatchText(normalized);
+    if (explicitPlaceholders.includes(normalizedValue)) return true;
+    const stablePrompt = normalizeMatchText(
+      element.getAttribute?.("aria-label")
+      || element.getAttribute?.("title")
+      || ""
+    );
+    return Boolean(
+      stablePrompt
+      && stablePrompt === normalizedValue
+      && !isChoiceSelected(element)
     );
   }
 
@@ -4968,6 +5267,63 @@
     if (labelledInput) return labelledInput;
     return queryAllDeep("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], button, [role='button']", element)
       .filter((candidate) => isVisible(candidate) && !candidate.closest("#atw-sidebar"))[0] || element;
+  }
+
+  function exclusiveChoicePresentationText(element) {
+    return compactText(
+      element?.getAttribute?.("aria-label")
+      || element?.getAttribute?.("title")
+      || element?.innerText
+      || element?.textContent
+      || "",
+      160
+    );
+  }
+
+  function isNestedExclusiveChoiceActuator(candidate, stateRadio) {
+    if (
+      !candidate
+      || !stateRadio
+      || candidate === stateRadio
+      || candidate.closest?.("[role='radio']") !== stateRadio
+      || candidate.matches?.("input, select, textarea")
+      || candidate.getAttribute?.("name")
+      || candidate.getAttribute?.("value")
+      || isInformationalChoiceUtility(candidate)
+    ) {
+      return false;
+    }
+    const nestedMeaning = exclusiveChoicePresentationText(candidate);
+    if (!nestedMeaning) return true;
+    const optionMeaning = exclusiveChoicePresentationText(stateRadio) || compactText(choiceLabel(stateRadio), 160);
+    const nestedKey = normalizeMatchText(nestedMeaning);
+    const optionKey = normalizeMatchText(optionMeaning);
+    return Boolean(nestedKey && optionKey && (
+      nestedKey === optionKey
+      || nestedKey.includes(optionKey)
+      || optionKey.includes(nestedKey)
+    ));
+  }
+
+  // Some component libraries split one exclusive option across an outer node
+  // that owns selection state and a nested node that owns click activation.
+  // Resolve that alias before assigning identity or semantics; otherwise the
+  // wrapper and actuator are published as two competing decisions.
+  function canonicalExclusiveChoiceState(element, context = {}) {
+    const initial = stateElementForControl(element);
+    if (!element || !initial || structuralDecisionChoiceKind(initial) === "radio") return initial;
+    const radio = element.closest?.("[role='radio']") || null;
+    if (!radio || radio === initial || !isVisible(radio)) return initial;
+    const owner = exclusiveDecisionOwner(radio, context.section || {});
+    if (!owner) return initial;
+    const peers = structuralDecisionChoicePeers(owner, radio);
+    const optionOwner = boundedChoiceOptionOwner(radio, owner, peers);
+    if (!optionOwner || !optionOwner.contains(element)) return initial;
+
+    // Native inputs and explicitly named nested controls remain independent.
+    // Only presentation actuators without their own stable meaning alias the
+    // state-bearing radio option.
+    return isNestedExclusiveChoiceActuator(initial, radio) ? radio : initial;
   }
 
   function normalizedControlValue(value = "", semantic = "", element = null) {
@@ -5145,11 +5501,11 @@
 
   function controlStateForElement(element, semantic = "", choiceBinding = null) {
     const value = currentElementValue(element);
-    const meaningfulValue = value && !isPlaceholderChoiceValue(value) ? value : "";
+    const meaningfulValue = value && !isPlaceholderChoiceValue(value, element) ? value : "";
     const dateField = semantic === "date_of_birth" ? dateFieldEvidenceForElement(element) : null;
     const decodedDate = dateField ? decodeObservedDateValue(value, dateField) : {};
     const exposesChoiceValue = isDropdownLikeElement(element) || implicitRole(element) === "option";
-    const valueText = exposesChoiceValue && value && !isPlaceholderChoiceValue(value)
+    const valueText = exposesChoiceValue && value && !isPlaceholderChoiceValue(value, element)
       ? compactText(value, 180)
       : "";
     const choiceLike = Boolean(
@@ -5159,7 +5515,14 @@
       || ["radio", "checkbox", "option"].includes(implicitRole(element))
     );
     const optionValue = choiceLike
-      ? normalizedProfileChoiceValue(choiceLabel(element) || element?.getAttribute?.("value") || "", semantic)
+      ? normalizedProfileChoiceValue(
+          choiceBinding?.optionLabels?.[choiceBinding.optionIndex]
+          || choiceBinding?.label
+          || choiceLabel(element)
+          || element?.getAttribute?.("value")
+          || "",
+          semantic
+        )
       : "";
     const normalizedValue = !meaningfulValue
       ? ""
@@ -5471,6 +5834,7 @@
     kind,
     role,
     state,
+    profileChoiceOpener = false,
     openTargetCandidates = [],
     choiceActuatorCandidates = []
   }) {
@@ -5504,7 +5868,7 @@
     const activationId = activationElement ? elementId(activationElement) : "";
     const tag = String(stateElement?.tagName || "").toLowerCase();
     const inputType = String(stateElement?.getAttribute?.("type") || "").toLowerCase();
-    const dropdownLike = tag === "select" || role === "combobox" || role === "listbox" || stateElement?.getAttribute?.("aria-haspopup") === "listbox";
+    const dropdownLike = profileChoiceOpener || tag === "select" || role === "combobox" || role === "listbox" || stateElement?.getAttribute?.("aria-haspopup") === "listbox";
     const editable = stateElement?.isContentEditable
       || tag === "textarea"
       || (tag === "input" && !["button", "submit", "reset", "radio", "checkbox", "file", "hidden"].includes(inputType));
@@ -5535,7 +5899,7 @@
         "control_selected",
         { disabled: false }
       );
-    } else if (kind === "button" || role === "button") {
+    } else if (!dropdownLike && (kind === "button" || role === "button")) {
       operations.activate = make("activate", [activationId, stateId], "observable_change", { disabled: false });
     }
     return operations;
@@ -5870,17 +6234,20 @@
   function exactNativeChoiceActuators(stateElement, optionOwner) {
     const associatedLabel = labelElementForInput(stateElement);
     const nearestLabel = stateElement.closest?.("label") || null;
+    const nestedPresentationActuators = queryAllDeep("button, [role='button'], [role='checkbox']", optionOwner || stateElement)
+      .filter((candidate) => isNestedExclusiveChoiceActuator(candidate, stateElement));
     const candidates = [
       associatedLabel,
       nearestLabel,
       optionOwner?.matches?.("label") ? optionOwner : null,
+      ...nestedPresentationActuators,
       ...queryAllDeep("button, [role='button']", optionOwner || stateElement.parentElement)
         .filter((candidate) => elementExplicitlyTargetsChoiceState(candidate, stateElement))
     ].filter(Boolean);
     return candidates.filter((candidate, index, list) => (
       candidate !== stateElement
       && (!candidate.matches?.("button, [role='button']") || !isInformationalChoiceUtility(candidate))
-      && elementExplicitlyTargetsChoiceState(candidate, stateElement)
+      && (nestedPresentationActuators.includes(candidate) || elementExplicitlyTargetsChoiceState(candidate, stateElement))
       && list.indexOf(candidate) === index
     ));
   }
@@ -6169,6 +6536,15 @@
       || "",
       500
     ));
+    const optionLabels = decisionPeers.map((peer, index) => compactText(
+      optionTexts[index]
+      || peer.innerText
+      || peer.textContent
+      || choiceLabel(peer)
+      || directControlName(peer)
+      || "",
+      160
+    ));
     const siblingCurrencies = [...new Set(optionTexts
       .flatMap((text) => structuredPricesFromText(text))
       .map((price) => price.currency)
@@ -6258,6 +6634,7 @@
       label: optionText,
       optionIndex,
       optionCount: decisionPeers.length,
+      optionLabels,
       ownerLabel,
       ownerKey,
       decisionInstance: nativeRadio && nativeChoiceName
@@ -6287,7 +6664,7 @@
 
   function canonicalControlForElement(element, context = {}) {
     if (!element || element.closest?.("#atw-sidebar")) return null;
-    const stateElement = stateElementForControl(element);
+    const stateElement = canonicalExclusiveChoiceState(element, context);
     if (!stateElement || stateElement.closest?.("#atw-sidebar")) return null;
     const labelElement = labelElementForInput(stateElement);
     const wrapper = controlWrapperForElement(element, stateElement);
@@ -6318,7 +6695,37 @@
           || controlText(stateElement)),
       220
     );
-    const fieldClassification = classifyProfileField(stateElement, context.fieldType || context.field || "");
+    const baseFieldClassification = classifyProfileField(stateElement, context.fieldType || context.field || "");
+    const ownedOptionSetClassification = (() => {
+      if (!presentationBinding || baseFieldClassification.fieldType || baseFieldClassification.ambiguity) return null;
+      const labels = (presentationBinding.optionLabels || []).filter(Boolean);
+      if (labels.length < 2 || labels.length !== presentationBinding.optionCount) return null;
+      const titleValues = labels.map((value) => normalizedProfileChoiceValue(value, "title"));
+      const genderValues = labels.map((value) => normalizedProfileChoiceValue(value, "gender"));
+      const exactTitleSet = titleValues.includes("mr")
+        && titleValues.includes("mrs/ms")
+        && titleValues.every((value) => ["mr", "mrs/ms"].includes(value));
+      const exactGenderSet = genderValues.includes("male")
+        && genderValues.includes("female")
+        && genderValues.every((value) => ["male", "female"].includes(value));
+      const fieldType = exactTitleSet ? "title" : (exactGenderSet ? "gender" : "");
+      if (!fieldType) return null;
+      return {
+        fieldType,
+        source: "owned_exclusive_option_set",
+        confidence: 0.98,
+        evidence: labels,
+        evidenceByChannel: {
+          rawAttributes: [],
+          explicitLabel: [],
+          tightLocalOwner: [presentationBinding.ownerLabel, ...labels].filter(Boolean),
+          sectionContext: []
+        },
+        tightOwnerId: elementId(presentationBinding.decisionOwner),
+        tightOwnerKey: presentationBinding.ownerKey || ""
+      };
+    })();
+    const fieldClassification = ownedOptionSetClassification || baseFieldClassification;
     const fieldType = fieldClassification.fieldType || "";
     const fieldSemantic = semanticFieldType({ label, kind, fieldType, field: context.field || "" });
     const contextualSectionType = context.sectionType || context.section?.type || "";
@@ -6332,9 +6739,11 @@
     // Once an exclusive option owner has been reconstructed, broad label
     // parsing must not reintroduce prices from descriptive benefits or sibling
     // content. A missing exact option price remains unknown, not inherited.
-    const structuredPrice = presentationBinding
-      ? (presentationBinding.structuredPrice || null)
-      : structuredPriceFromText(label);
+    const structuredPrice = fieldType
+      ? null
+      : presentationBinding
+        ? (presentationBinding.structuredPrice || null)
+        : structuredPriceFromText(label);
     const choiceControl = Boolean(presentationBinding)
       || /radio|checkbox|option|choice/.test(`${kind || ""} ${ownedEvidence.role || ""} ${ownedEvidence.type || ""} ${fallbackSemantic || ""}`.toLowerCase());
     let physicalEffect = presentationBinding && Number(structuredPrice?.amount) === 0
@@ -6370,15 +6779,23 @@
             compactText(presentationBinding.decisionOwner?.innerText || presentationBinding.decisionOwner?.textContent || "", 500)
           )
         : "unknown";
-    const sectionType = exactDecisionSectionType && exactDecisionSectionType !== "unknown"
+    const contextualDecisionSectionType = exactDecisionSectionType && exactDecisionSectionType !== "unknown"
       ? exactDecisionSectionType
       : contextualSectionType;
+    // A proven profile-choice semantic owns its logical decision. The broad
+    // visual section (for example "passenger") remains layout context only.
+    const sectionType = presentationBinding && fieldType
+      ? fieldType
+      : contextualDecisionSectionType;
+    const decisionLabel = presentationBinding && fieldType
+      ? fieldType
+      : (presentationBinding?.ownerLabel || sectionLabel);
     const surfaceDecisionGroupId = surface?.type && surface.type !== "page"
       ? (surface.decisionGroupId || decisionGroupIdForContext({ sectionType: surface.taskHint || surface.type || "", sectionLabel: surface.parentSectionLabel || surface.label || surface.taskHint || "" }))
       : "";
     const decisionGroupId = context.decisionGroupId || surfaceDecisionGroupId || decisionGroupIdForContext({
       sectionType,
-      sectionLabel: presentationBinding?.ownerLabel || sectionLabel,
+      sectionLabel: decisionLabel,
       field: fieldType || context.field || "",
       instance: presentationBinding?.decisionInstance || ""
     });
@@ -6406,7 +6823,10 @@
       : baseStableKey;
     const identityHash = stableHash(stableKey);
     const controlId = `ctrl_${slugControlPart(kind).slice(0, 24)}_${identityHash}`.slice(0, 140);
-    const selectLike = stateTag === "select"
+    const profileChoiceOpener = fieldType === "phone_country_code"
+      && (kind === "button" || domRole === "button")
+      && /select|choose|country.*code|dial.*code|calling.*code/i.test(label || "");
+    const selectLike = profileChoiceOpener || stateTag === "select"
       || ["combobox", "listbox"].includes(String(domRole || "").toLowerCase())
       || stateElement.getAttribute?.("aria-haspopup") === "listbox";
     let openTargetCandidates = selectLike
@@ -6451,6 +6871,7 @@
       kind,
       role: domRole,
       state,
+      profileChoiceOpener,
       openTargetCandidates,
       choiceActuatorCandidates: presentationBinding?.actuatorCandidates || []
     });
@@ -6498,7 +6919,9 @@
             ? ["focus_arrow_down"]
             : operation === "open"
               ? ["native_click"]
-              : ["native_click", "pointer_sequence"];
+              : operation === "activate" && physicalEffect === "advance_checkout_stage"
+              ? ["browser_trusted_input", "native_click"]
+                : ["native_click", "pointer_sequence"];
       capability.strategies = (capability.actuatorIds || []).flatMap((actuatorId) => methods.map((method) => ({
         operation,
         actuatorId,
@@ -6747,6 +7170,23 @@
       .filter(Boolean)
       .filter((entry, index, list) => list.findIndex((other) => other.nodeId === entry.nodeId && other.relation === entry.relation) === index);
     const perceptionRole = perceptionRoleForControl(stateElement, kind, domRole, operations);
+    const effectRole = canonicalDecisionEffectRole({
+      label,
+      accessibleName: accessibleName(stateElement) || accessibleName(element),
+      ownText: ownedEvidence.ownText,
+      ariaLabel: ownedEvidence.ariaLabel,
+      title: ownedEvidence.title,
+      semantic,
+      physicalEffect,
+      testId: ownedEvidence.testId,
+      sectionLabel: context.sectionLabel || context.section?.label || "",
+      kind,
+      role: perceptionRole,
+      domRole,
+      inputType: stateElement.getAttribute?.("type") || "",
+      structuredPrice
+    });
+    const economicStructuredPrice = NON_ECONOMIC_EFFECT_ROLES.has(effectRole) ? null : structuredPrice;
     const hasActionableActuator = Boolean(
       Object.values(operations).some((capability) => (
         capability?.actionability?.executable === true
@@ -6761,6 +7201,20 @@
         || (capability?.regions || []).some((region) => region?.inViewport !== false)
       ))
     );
+    const renderedRepresentationMembers = members
+      .filter((item) => item.relation !== "wrapper" && isVisible(item.element))
+      .filter((item) => {
+        const box = elementBox(item.element);
+        return box.width > 0 && box.height > 0;
+      });
+    const representationLifecycle = {
+      status: renderedRepresentationMembers.length || hasActionableActuator
+        ? "active_rendered"
+        : "dormant_hidden",
+      active: Boolean(renderedRepresentationMembers.length || hasActionableActuator),
+      stateRendered: isVisible(stateElement),
+      renderedMemberIds: [...new Set(renderedRepresentationMembers.map((item) => elementId(item.element)).filter(Boolean))]
+    };
     const visualRegion = unionBoxes(boxes) || elementBox(stateElement);
     const visualRegions = [
       visualRegion ? normalizeVisualRegionContract(visualRegion, {
@@ -6808,25 +7262,30 @@
       semantic,
       semanticIntent: semantic,
       physicalEffect: physicalEffect || "unknown",
+      effectRole,
+      economicEffect: NON_ECONOMIC_EFFECT_ROLES.has(effectRole) ? "none" : "decision_outcome",
       semanticConflict: ownedMeaning.conflict === true,
-      risk: Number(structuredPrice?.amount) > 0
+      risk: Number(economicStructuredPrice?.amount) > 0
         ? "money"
-        : Number(structuredPrice?.amount) === 0
+        : Number(economicStructuredPrice?.amount) === 0
           ? "safe"
-          : choiceRisk(label),
-      structuredPrice,
+          : effectRole === "scope_toggle"
+            ? "safe"
+            : choiceRisk(label),
+      structuredPrice: economicStructuredPrice,
       dateField,
       state,
+      representationLifecycle,
       choiceContract: presentationBinding ? {
         decisionOwnerId: elementId(presentationBinding.decisionOwner),
         optionOwnerId: elementId(presentationBinding.optionOwner),
         stateControlId: elementId(stateElement),
         actuatorIds: (presentationBinding.actuatorCandidates || []).map((candidate) => candidate.nodeId).filter(Boolean),
         decisionInstance: presentationBinding.decisionInstance || "",
-        decisionLabel: presentationBinding.ownerLabel || "",
+        decisionLabel: decisionLabel || "",
         optionSemantic: semantic,
         optionPhysicalEffect: physicalEffect || "unknown",
-        structuredPrice: structuredPrice || null,
+        structuredPrice: economicStructuredPrice || null,
         ownershipComplete: Boolean(
           presentationBinding.decisionOwner
           && presentationBinding.optionOwner
@@ -6884,6 +7343,7 @@
     model.decisionGroupId = control.decisionGroupId || model.decisionGroupId || "";
     model.controlKind = control.kind;
     model.controlState = control.state;
+    model.representationLifecycle = control.representationLifecycle || model.representationLifecycle || null;
     model.currentValue = control.currentValue || "";
     model.fieldType = control.fieldType || model.fieldType || canonicalProfileFieldType(model.field || model.semantic || "");
     model.fieldClassification = control.fieldClassification?.fieldType
@@ -6909,7 +7369,7 @@
     if (model.field || Object.prototype.hasOwnProperty.call(model, "value")) {
       const modelValue = String(model.value || control.currentValue || "").replace(/\s+/g, " ").trim();
       model.hasValue = Boolean(
-        (modelValue && !isPlaceholderChoiceValue(modelValue))
+        (modelValue && !isPlaceholderChoiceValue(modelValue, elementById(control.stateElementId || model.id || "")))
         || control.state?.selectedValue
         || control.state?.normalizedValue
         || control.state?.checked
@@ -6966,7 +7426,9 @@
   }
 
   function choiceLikeModelFromDecisionField(field = {}, control = {}) {
-    const selectedLabel = field.controlState?.valueText || control.state?.valueText || "";
+    const stateElement = elementById(control.stateElementId || field.id || "");
+    const observedLabel = field.controlState?.valueText || control.state?.valueText || "";
+    const selectedLabel = isPlaceholderChoiceValue(observedLabel, stateElement) ? "" : observedLabel;
     return {
       controlId: field.controlId || control.controlId || "",
       targetId: field.id || field.preferredActivationElementId || control.preferredActivationElementId || control.stateElementId || "",
@@ -7003,10 +7465,10 @@
       || committedLabelMatches
     );
     const buttonLike = /button/.test(`${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase());
+    const stateElement = elementById(control.stateElementId || control.preferredActivationElementId || "");
     const selectedLabel = selectedByState
       ? (control.label || observedValue)
-      : (!buttonLike && observedValue && !isPlaceholderChoiceValue(observedValue) ? observedValue : "");
-    const stateElement = elementById(control.stateElementId || control.preferredActivationElementId || "");
+      : (!buttonLike && observedValue && !isPlaceholderChoiceValue(observedValue, stateElement) ? observedValue : "");
     const optionsSurfaceId = stateElement?.getAttribute?.("aria-controls") || "";
     const optionsSurface = optionsSurfaceId ? document.getElementById(optionsSurfaceId) : null;
     const committedEvidence = optionsSurfaceId ? canonicalSelectionCommitments.get(optionsSurfaceId) : null;
@@ -7026,6 +7488,7 @@
       label: selectedLabel || control.label || "",
       semantic: matchingCommitment?.semantic || (selectedLabel ? semanticChoiceType(selectedLabel) : (control.semantic || "required_dropdown_choice")),
       risk: matchingCommitment?.risk || (selectedLabel ? choiceRisk(selectedLabel) : (control.risk || "uncertain")),
+      effectRole: control.effectRole || canonicalDecisionEffectRole(control),
       selected: Boolean(selectedByState || selectedLabel),
       state: control.state || null,
       exclusive: control.choiceContract?.exclusive === true,
@@ -7063,6 +7526,9 @@
 
   function selectedDisposition({ selected = null, selectedControl = {}, structuredPrice = null } = {}) {
     if (!selected) return "unknown";
+    const effectRole = selected.effectRole || selectedControl.effectRole || canonicalDecisionEffectRole(selectedControl);
+    if (NON_ECONOMIC_EFFECT_ROLES.has(effectRole)) return "non_economic";
+    if (effectRole === "free_decline" || effectRole === "included_entitlement") return "free";
     if (Number(structuredPrice?.amount) > 0) return "paid";
     if (Number(structuredPrice?.amount) === 0) return "free";
     const selectedLabel = normalizeMatchText(selected.label || selectedControl.ownText || "");
@@ -7088,11 +7554,18 @@
     const selected = choices.find((choice) => choice.selected) || null;
     if (!selected) return group;
     const selectedControl = byControlId.get(selected.controlId) || {};
-    const directPrice = selectedControl.structuredPrice
+    const effectRole = selected.effectRole || selectedControl.effectRole || canonicalDecisionEffectRole(selectedControl);
+    const economic = !NON_ECONOMIC_EFFECT_ROLES.has(effectRole);
+    const directPrice = economic ? (selectedControl.structuredPrice
       || structuredPriceFromText(selected.priceText || "")
-      || structuredPriceFromText(selected.label || "");
+      || structuredPriceFromText(selected.label || "")) : null;
     const exactDisposition = selectedDisposition({ selected, selectedControl, structuredPrice: directPrice });
-    const owner = directPrice ? null : ownedDecisionElement(section, choices, byControlId);
+    // Nearby price ownership is legal only for an exact commerce option.
+    // Scope/applicability toggles and informational controls must never inherit
+    // a sibling product's price from their shared visual section.
+    const owner = directPrice || !economic
+      ? null
+      : ownedDecisionElement(section, choices, byControlId);
     const ownedPrices = owner ? structuredPricesFromText(owner.innerText || owner.textContent || "") : [];
     const eligibleOwnedPrices = exactDisposition === "free"
       ? ownedPrices.filter((price) => Number(price.amount) === 0)
@@ -7105,6 +7578,8 @@
       selectedEvidence: {
         selected: true,
         disposition,
+        effectRole,
+        economicEffect: economic ? "decision_outcome" : "none",
         structuredPrice,
         source: directPrice ? "selected_control" : (ownedPrice ? "owned_decision_section" : "selected_control_state"),
         ownerElementId: owner ? elementId(owner) : "",
@@ -7113,6 +7588,95 @@
         semantic: selected.semantic || selectedControl.semantic || "",
         risk: selected.risk || selectedControl.risk || ""
       }
+    };
+  }
+
+  function attachExactCommerceOptionPrices(controls = []) {
+    const commerceControls = (controls || []).filter((control) => (
+      (control.effectRole || canonicalDecisionEffectRole(control)) === "commerce_option"
+    ));
+    for (const control of commerceControls) {
+      if (control.structuredPrice || control.selected || control.state?.checked || control.state?.selected) continue;
+      const source = elementById(control.preferredActivationElementId || control.stateElementId || "");
+      if (!source) continue;
+      let ownedPrice = null;
+      for (let owner = source.parentElement, depth = 0; owner && depth < 6; owner = owner.parentElement, depth += 1) {
+        const ownedCommerceControls = commerceControls.filter((candidate) => {
+          const candidateSource = elementById(candidate.preferredActivationElementId || candidate.stateElementId || "");
+          return candidateSource && owner.contains(candidateSource);
+        });
+        if (ownedCommerceControls.length !== 1 || ownedCommerceControls[0].controlId !== control.controlId) continue;
+        const prices = structuredPricesFromText(owner.innerText || owner.textContent || "");
+        if (prices.length !== 1) continue;
+        ownedPrice = prices[0];
+        break;
+      }
+      if (!ownedPrice) continue;
+      control.structuredPrice = ownedPrice;
+      control.risk = Number(ownedPrice.amount) > 0 ? "money" : "safe";
+      if (control.choiceContract) {
+        control.choiceContract = {
+          ...control.choiceContract,
+          structuredPrice: ownedPrice,
+          priceEvidenceSource: control.choiceContract.priceEvidenceSource || "exact_commerce_option_owner"
+        };
+      }
+    }
+  }
+
+  function explicitOwnedSelectionState(owner, removalSource) {
+    if (!owner || !removalSource) return { selected: false, quantity: null, evidence: [] };
+    const evidence = [];
+    const selectedStateNode = [...owner.querySelectorAll([
+      "input:checked",
+      "option:checked",
+      "[aria-selected='true']",
+      "[aria-checked='true']",
+      "[aria-pressed='true']",
+      "[data-selected='true']",
+      "[data-active='true']",
+      "[data-selected-item]"
+    ].join(", "))].find((node) => node !== removalSource && !removalSource.contains(node));
+    const ownerSelectedItem = owner.matches?.("[data-selected-item]")
+      && !/^(?:false|0|none|no)$/i.test(String(owner.getAttribute("data-selected-item") || "true").trim());
+    if (selectedStateNode || ownerSelectedItem) evidence.push("explicit_selected_state");
+
+    const quantityNodes = [...owner.querySelectorAll([
+      "input[type='number']",
+      "[role='spinbutton']",
+      "[aria-valuenow]",
+      "[data-quantity]",
+      "[data-count]",
+      "[class*='quantity']",
+      "[class*='counter-value']",
+      "[class*='count-value']",
+      "output"
+    ].join(", "))];
+    const quantities = quantityNodes.map((node) => {
+      const raw = node.value
+        ?? node.getAttribute?.("aria-valuenow")
+        ?? node.getAttribute?.("data-quantity")
+        ?? node.getAttribute?.("data-count")
+        ?? node.textContent
+        ?? "";
+      const normalized = String(raw || "").trim().replace(",", ".");
+      return /^\d+(?:\.\d+)?$/.test(normalized) ? Number(normalized) : null;
+    }).filter((value) => Number.isFinite(value));
+    const quantity = quantities.length ? Math.max(...quantities) : null;
+    if (Number.isFinite(quantity)) evidence.push(`explicit_quantity:${quantity}`);
+
+    const ownerStateText = normalizeMatchText(owner.innerText || owner.textContent || "");
+    const textualSelection = /\b(?:selected|added)\b|\bin (?:your|the) (?:trip|booking|basket|cart)\b/.test(ownerStateText);
+    if (textualSelection) evidence.push("explicit_selected_copy");
+    const textualQuantity = ownerStateText.match(/\b(?:quantity|qty|count)\s*[:x-]?\s*(\d+)\b/)
+      || ownerStateText.match(/\b(\d+)\s+(?:bags?|items?)\s+(?:selected|added)\b/);
+    const declaredQuantity = textualQuantity ? Number(textualQuantity[1]) : null;
+    if (Number.isFinite(declaredQuantity)) evidence.push(`explicit_text_quantity:${declaredQuantity}`);
+    const authoritativeQuantity = Number.isFinite(quantity) ? quantity : declaredQuantity;
+    return {
+      selected: Boolean(selectedStateNode || ownerSelectedItem || textualSelection || (Number.isFinite(authoritativeQuantity) && authoritativeQuantity > 0)),
+      quantity: Number.isFinite(authoritativeQuantity) ? authoritativeQuantity : null,
+      evidence
     };
   }
 
@@ -7156,6 +7720,12 @@
         if (current === sectionElement) break;
       }
       if (!owner || !ownedPrice) return [];
+      // A remove/decrement affordance and a catalog price describe what the
+      // widget can do, not what is currently selected. Quantity counters keep
+      // both controls and the unit price rendered at zero. Only explicit
+      // selected/quantity evidence may promote an offer into transaction state.
+      const explicitSelection = explicitOwnedSelectionState(owner, source);
+      if (!explicitSelection.selected) return [];
       const inferredSectionLabel = compactText(
         sectionElement?.getAttribute?.("aria-label")
         || sectionElement?.querySelector?.("h1, h2, h3, h4, h5, h6, [role='heading']")?.textContent
@@ -7206,7 +7776,9 @@
           selected: true,
           disposition: "paid",
           structuredPrice: ownedPrice,
-          source: "owned_selected_item_summary",
+          quantity: explicitSelection.quantity,
+          source: "explicit_owned_selection_state",
+          evidence: explicitSelection.evidence,
           ownerElementId: elementId(owner),
           selectedControlId: "",
           selectedLabel: compactText(owner.innerText || owner.textContent || "", 180),
@@ -7242,8 +7814,8 @@
         || "",
         180
       );
-      if (!displayedValue || isPlaceholderChoiceValue(displayedValue)) return [];
       const source = elementById(control.stateElementId || control.preferredActivationElementId || "");
+      if (!displayedValue || isPlaceholderChoiceValue(displayedValue, source)) return [];
       if (!source) return [];
       const section = sections.find((item) => item.id === control.sectionId)
         || sections.find((item) => (elementById(item.id || "") || item.element)?.contains?.(source));
@@ -7350,6 +7922,10 @@
   function sectionDecisionControls(section = {}, controls = []) {
     return (controls || []).filter((control) => {
       if (!control?.controlId || control.sectionId !== section.id) return false;
+      // A profile-field opener is one component of a logical value, not a
+      // commerce decision. Its exact options remain owned by the field
+      // adapter when the popup is active.
+      if (control.fieldType && control.operations?.open && !control.choiceContract?.decisionInstance) return false;
       const role = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
       const semantic = String(control.semantic || "").toLowerCase();
       const optionalCommand = /button/.test(role) && (
@@ -7459,6 +8035,7 @@
   }
 
   function buildCanonicalDecisionGroups(sections = [], controls = [], activeSurface = {}) {
+    attachExactCommerceOptionPrices(controls);
     const byControlId = new Map((controls || []).map((control) => [control.controlId, control]));
     const sectionGroups = (sections || [])
       .filter((section) => (
@@ -7476,6 +8053,7 @@
             label: control.label || choice.label || "",
             semantic: control.semantic || choice.semantic || "",
             risk: control.risk || choice.risk || "",
+            effectRole: control.effectRole || "unknown",
             selected: Boolean(choice.selected || control.selected || control.state?.checked || control.state?.selected),
             state: choice.controlState || control.state || null,
             priceText: structuredPriceFromText(choice.label || "") ? choice.label : "",
@@ -7572,6 +8150,7 @@
               label: choice.label,
               semantic: choice.semantic,
               risk: choice.risk,
+              effectRole: choice.effectRole || byControlId.get(choice.controlId)?.effectRole || "unknown",
               selected: choice.selected,
               structuredPrice: byControlId.get(choice.controlId)?.structuredPrice || choice.structuredPrice || null,
               priceText: choice.priceText
@@ -7711,6 +8290,7 @@
           semantic: control.semantic || "",
           physicalEffect: control.physicalEffect || "unknown",
           risk: control.risk || "uncertain",
+          effectRole: control.effectRole || "unknown",
           selected: Boolean(control.selected || control.state?.checked || control.state?.selected),
           structuredPrice: control.structuredPrice || null,
           priceText: control.structuredPrice
@@ -7758,6 +8338,7 @@
               semantic: option.semantic || control.semantic || "",
               physicalEffect: option.physicalEffect || control.physicalEffect || "unknown",
               risk: option.risk || control.risk || "",
+              effectRole: option.effectRole || control.effectRole || "unknown",
               selected,
               priceText: (option.label || "").match(/(?:\d+(?:[.,]\d{1,2})?\s?(?:EUR|€|USD|\$)|(?:EUR|€|USD|\$)\s?\d+(?:[.,]\d{1,2})?)/i)?.[0] || ""
             };
@@ -7793,7 +8374,10 @@
     const collapsedSelectorGroups = ownedCollapsedSelectorDecisionGroups(sections, controls, representedGroups);
     const removalGroups = ownedRemovalDecisionGroups(sections, controls, [...representedGroups, ...collapsedSelectorGroups], activeSurface);
     return reconcileExclusiveDecisionControlOwnership(
-      [...representedGroups, ...collapsedSelectorGroups, ...removalGroups],
+      reconcileDecisionEffectGroups(
+        [...representedGroups, ...collapsedSelectorGroups, ...removalGroups],
+        controls
+      ),
       byControlId
     ).slice(0, 80);
   }
@@ -7808,6 +8392,115 @@
     if (/nationality|citizenship/.test(text)) return "nationality";
     if (/traveler title|passenger title|gender/.test(text)) return "traveler_title";
     return "";
+  }
+
+  function reconcileDecisionEffectGroups(groups = [], controls = []) {
+    const byControlId = new Map((controls || []).map((control) => [control.controlId, control]));
+    const roleFor = (value = {}) => value.effectRole
+      || byControlId.get(value.controlId)?.effectRole
+      || canonicalDecisionEffectRole(byControlId.get(value.controlId) || value);
+    // A scope toggle is a mechanic of applying a choice, not a commerce
+    // choice itself. Keeping it as a decision creates false selected extras.
+    const result = (groups || []).filter((group) => {
+      const roles = (group.alternatives || []).map(roleFor).filter((role) => role && role !== "unknown");
+      return !roles.length || roles.some((role) => !NON_ECONOMIC_EFFECT_ROLES.has(role));
+    });
+    const subjectFor = (control = {}) => decisionSubjectCue([
+      control.label,
+      control.accessibleName,
+      control.ownText,
+      control.ariaLabel,
+      control.semantic,
+      control.physicalEffect,
+      control.sectionLabel
+    ].filter(Boolean).join(" "));
+    const buckets = new Map();
+    for (const control of controls || []) {
+      const role = roleFor(control);
+      if (!["commerce_option", "free_decline", "included_entitlement"].includes(role)) continue;
+      const subject = subjectFor(control);
+      if (!subject) continue;
+      const bucketKey = `${control.surfaceId || "surface-page"}:${subject}`;
+      if (!buckets.has(bucketKey)) buckets.set(bucketKey, { subject, controls: [] });
+      buckets.get(bucketKey).controls.push(control);
+    }
+    for (const { subject, controls: subjectControls } of buckets.values()) {
+      const commerce = subjectControls.filter((control) => roleFor(control) === "commerce_option");
+      const declines = subjectControls.filter((control) => roleFor(control) === "free_decline");
+      if (!commerce.length || !declines.length) continue;
+      const ids = new Set(subjectControls.map((control) => control.controlId));
+      const owners = result.filter((group) => (group.alternatives || []).some((choice) => ids.has(choice.controlId)));
+      const target = owners[0] || {
+        decisionGroupId: `decision-effect:${subject}`,
+        surfaceId: subjectControls[0]?.surfaceId || "surface-page",
+        sectionId: subjectControls[0]?.sectionId || "",
+        sectionType: subject.includes("baggage") ? "baggage" : subject,
+        sectionLabel: subjectControls[0]?.sectionLabel || subject.replace(/_/g, " "),
+        requirementId: `${subject}:decision`,
+        required: false,
+        status: "optional",
+        selectedControlId: "",
+        selectedLabel: "",
+        selectedSemantic: "",
+        alternatives: [],
+        evidence: [`No selected option for ${subject.replace(/_/g, " ")}`]
+      };
+      if (!owners.length) result.push(target);
+      const alternatives = [...(target.alternatives || [])];
+      for (const control of subjectControls) {
+        if (alternatives.some((choice) => choice.controlId === control.controlId)) continue;
+        alternatives.push({
+          controlId: control.controlId,
+          targetId: control.preferredActivationElementId || control.stateElementId || "",
+          label: control.label || "",
+          semantic: control.semantic || "",
+          physicalEffect: control.physicalEffect || "unknown",
+          risk: control.risk || "uncertain",
+          effectRole: roleFor(control),
+          selected: Boolean(control.selected || control.state?.checked || control.state?.selected),
+          structuredPrice: control.structuredPrice || null,
+          priceText: control.structuredPrice
+            ? `${control.structuredPrice.amount} ${control.structuredPrice.currency || ""}`.trim()
+            : ""
+        });
+      }
+      for (const owner of owners.slice(1)) {
+        for (const alternative of owner.alternatives || []) {
+          if (!alternatives.some((choice) => choice.controlId === alternative.controlId)) alternatives.push(alternative);
+        }
+        const index = result.indexOf(owner);
+        if (index >= 0) result.splice(index, 1);
+      }
+      const selectedChoices = alternatives.filter((choice) => choice.selected && !NON_ECONOMIC_EFFECT_ROLES.has(roleFor(choice)));
+      const selected = selectedChoices.length === 1 ? selectedChoices[0] : null;
+      target.alternatives = alternatives;
+      target.selectionInvariant = { exclusive: true, valid: selectedChoices.length <= 1, selectedCount: selectedChoices.length };
+      target.selectedControlId = selected?.controlId || "";
+      target.selectedLabel = selected?.label || "";
+      target.selectedSemantic = selected?.semantic || "";
+      target.status = selected ? "satisfied" : (target.required ? "missing" : "optional");
+      target.evidence = selected
+        ? [`Selected: ${selected.label}`]
+        : [`No selected option for ${target.sectionLabel || subject.replace(/_/g, " ")}`];
+      if (selected) {
+        const selectedControl = byControlId.get(selected.controlId) || {};
+        const disposition = selectedDisposition({ selected, selectedControl, structuredPrice: selected.structuredPrice });
+        target.selectedEvidence = {
+          selected: true,
+          disposition,
+          effectRole: roleFor(selected),
+          economicEffect: "decision_outcome",
+          structuredPrice: selected.structuredPrice || null,
+          source: "selected_control_state",
+          selectedControlId: selected.controlId,
+          selectedLabel: selected.label,
+          semantic: selected.semantic || selectedControl.semantic || "",
+          risk: selected.risk || selectedControl.risk || ""
+        };
+      }
+      for (const control of subjectControls) control.decisionGroupId = target.decisionGroupId;
+    }
+    return result;
   }
 
   function decisionGroupOwnershipScore(group = {}, control = {}) {
@@ -7935,6 +8628,42 @@
     return [...ids];
   }
 
+  // A broad temporary representation of a composite widget may include a
+  // nested atomic control in addition to its own actuator. The atomic control
+  // is the more precise owner of that physical node; retaining the broad
+  // claim as an unresolved conflict would suppress a valid child mechanic
+  // such as a dropdown's owned search/filter input. This resolver is narrow:
+  // both controls must overlap, one must own exactly one canonical actuator,
+  // and every operation on that control must use only that actuator. Two
+  // controls making competing claims over the same atomic actuator remain an
+  // unresolved conflict.
+  function exactAtomicControlNodeId(control = {}) {
+    const exclusiveIds = controlExclusiveNodeIds(control);
+    if (exclusiveIds.length !== 1) return "";
+    const [nodeId] = exclusiveIds;
+    if (control.stateElementId && control.stateElementId !== nodeId) return "";
+    if (control.preferredActivationElementId && control.preferredActivationElementId !== nodeId) return "";
+    const operationIds = [...new Set(Object.values(control.operations || {})
+      .flatMap((capability) => capability?.actuatorIds || [])
+      .filter(Boolean))];
+    if (!operationIds.length || operationIds.some((id) => id !== nodeId)) return "";
+    return nodeId;
+  }
+
+  function narrowerExactControlOwner(existing = {}, incoming = {}) {
+    const existingIds = new Set(controlExclusiveNodeIds(existing));
+    const incomingIds = new Set(controlExclusiveNodeIds(incoming));
+    const existingAtomicId = exactAtomicControlNodeId(existing);
+    const incomingAtomicId = exactAtomicControlNodeId(incoming);
+    if (existingAtomicId && incomingIds.has(existingAtomicId) && incomingIds.size > existingIds.size) {
+      return existing;
+    }
+    if (incomingAtomicId && existingIds.has(incomingAtomicId) && existingIds.size > incomingIds.size) {
+      return incoming;
+    }
+    return null;
+  }
+
   function controlContextPriority(context = {}) {
     const surface = context.surface || {};
     if (surface?.type && surface.type !== "page") return 100;
@@ -8025,9 +8754,14 @@
       const incompatibleOwner = existingOwners.find((owner) => !controlsAreCompatibleAliases(owner, control));
       if (incompatibleOwner) {
         const ownerPriority = priorityByControlId.get(incompatibleOwner.controlId) || 0;
-        const resolvedBy = priority > ownerPriority
-          ? "foreground_or_higher_priority"
-          : (priority < ownerPriority ? "existing_higher_priority" : "unresolved_equal_priority");
+        const exactOwner = priority === ownerPriority
+          ? narrowerExactControlOwner(incompatibleOwner, control)
+          : null;
+        const resolvedBy = exactOwner
+          ? "narrower_exact_actuator_owner"
+          : priority > ownerPriority
+            ? "foreground_or_higher_priority"
+            : (priority < ownerPriority ? "existing_higher_priority" : "unresolved_equal_priority");
         conflicts.push({
           nodeIds: memberIds,
           existing: {
@@ -8049,6 +8783,11 @@
           resolved: resolvedBy !== "unresolved_equal_priority",
           resolvedBy
         });
+        if (exactOwner === incompatibleOwner) return incompatibleOwner;
+        if (exactOwner === control) {
+          removeOwnedControl(incompatibleOwner);
+          return registerOwnedControl(control, priority);
+        }
         if (priority <= ownerPriority) return incompatibleOwner;
         removeOwnedControl(incompatibleOwner);
       }
@@ -8395,6 +9134,7 @@
 
   function unfilledRequiredFields(fields = []) {
     return fields.filter((field) => {
+      if (field.representationLifecycle?.status === "dormant_hidden") return false;
       if (!field.required || field.field === "unknown" || field.hasValue || field.controlState?.valuePresent) return false;
       const groupedChoice = /radio|checkbox/i.test(String(field.kind || "")) || ["title", "gender"].includes(String(field.field || ""));
       if (!groupedChoice) return true;
@@ -8532,22 +9272,22 @@
       /selection[_ -]?cta/.test(`${control?.semantic || ""} ${control?.semanticType || ""} ${control?.meaning || ""}`.toLowerCase())
       && !control?.choiceContract
     );
-    const rawContinueButton = buttons.find((button) => (
+    const rawContinueButtons = buttons.filter((button) => (
       button.risk === "safe_continue" &&
       !/skip to/i.test(button.label || "") &&
       meaningfulActionBox(button.box)
     ));
-    const buttonOwnedContinueControl = rawContinueButton
-      ? controls.find((control) => (
-          controlMemberNodeIds(control).includes(rawContinueButton.id)
-          || control.preferredActivationElementId === rawContinueButton.id
-          || control.stateElementId === rawContinueButton.id
-        )) || null
-      : null;
-    const continueButton = isUnboundSelectionCta(buttonOwnedContinueControl)
-      ? null
-      : rawContinueButton;
-    const observedContinueControl = controls.find((control) => (
+    const buttonOwnedContinueControls = rawContinueButtons.map((button) => (
+      controls.find((control) => (
+        !isUnboundSelectionCta(control)
+        && (
+          controlMemberNodeIds(control).includes(button.id)
+          || control.preferredActivationElementId === button.id
+          || control.stateElementId === button.id
+        )
+      )) || null
+    )).filter(Boolean);
+    const semanticContinueControls = controls.filter((control) => (
       !isUnboundSelectionCta(control)
       && (
         control.semantic === "continue"
@@ -8555,13 +9295,93 @@
         || ["advance_surface", "advance_checkout_stage"].includes(control.physicalEffect)
         || /(?:^|\s)(?:continue|next)(?:\s|$)/i.test(control.label || "")
       )
-    )) || null;
-    const continueControl = buttonOwnedContinueControl || observedContinueControl;
-    const continueObserved = Boolean(continueButton || continueControl);
+    ));
+    const continueControls = [...new Map([
+      ...buttonOwnedContinueControls,
+      ...semanticContinueControls
+    ].filter(Boolean).map((control) => [control.controlId, control])).values()];
+    const actionabilityForControl = (control) => {
+      const capabilities = Object.values(control.operations || {});
+      const strategies = capabilities.flatMap((capability) => capability?.strategies || []);
+      const executableStrategy = strategies.find((strategy) => strategy?.proof?.executable === true);
+      const revealableStrategy = strategies.find((strategy) => strategy?.proof?.revealable === true);
+      const selectedStrategy = executableStrategy || revealableStrategy || strategies[0] || null;
+      const capability = capabilities.find((item) => (
+        item?.actuatorId === selectedStrategy?.actuatorId
+        || item?.actuatorIds?.includes(selectedStrategy?.actuatorId)
+      )) || capabilities.find((item) => item?.actionability) || capabilities[0] || null;
+      const proof = selectedStrategy?.proof || capability?.actionability || {};
+      return {
+        targetId: selectedStrategy?.actuatorId
+          || capability?.actuatorId
+          || control.preferredActivationElementId
+          || control.stateElementId
+          || "",
+        operation: selectedStrategy?.operation || capability?.operation || "activate",
+        method: selectedStrategy?.method || "",
+        proof
+      };
+    };
+    const stageExitCandidates = continueControls.map((control) => {
+      const { targetId, operation, method, proof } = actionabilityForControl(control);
+      const disabled = Boolean(
+        control.logicalDisabled === true
+        || control.disabled === true
+        || control.state?.disabled === true
+        || proof.code === "ACTUATOR_DISABLED"
+      );
+      const status = proof.executable === true
+        ? "ready"
+        : disabled
+          ? "disabled"
+          : proof.revealable === true
+            ? "revealable"
+            : proof.code === "ACTUATOR_OCCLUDED"
+              ? "occluded"
+              : "unavailable";
+      return Object.freeze({
+        controlId: control.controlId || "",
+        actuatorId: targetId,
+        operation,
+        method,
+        status,
+        rendered: proof.rendered === true,
+        visible: proof.visible === true,
+        enabled: !disabled && proof.enabled === true,
+        inViewport: proof.inViewport === true,
+        inCurrentSurface: proof.inCurrentSurface === true,
+        hitTested: proof.hitTested === true,
+        notOccluded: proof.notOccluded === true,
+        selfOccluded: proof.selfOccluded === true,
+        executable: proof.executable === true,
+        revealable: proof.revealable === true,
+        code: String(proof.code || ""),
+        hitTestEvidence: proof.hitTestEvidence || null
+      });
+    }).sort((left, right) => {
+      const rank = { ready: 0, revealable: 1, occluded: 2, disabled: 3, unavailable: 4 };
+      return (rank[left.status] ?? 9) - (rank[right.status] ?? 9);
+    });
+    const readyCandidate = stageExitCandidates.find((candidate) => candidate.status === "ready") || null;
+    const observedCandidate = readyCandidate || stageExitCandidates[0] || null;
+    const buttonOwnedContinueControl = readyCandidate
+      ? controls.find((control) => control.controlId === readyCandidate.controlId) || null
+      : buttonOwnedContinueControls[0] || null;
+    const buttonOwnedNodeIds = new Set(buttonOwnedContinueControl
+      ? [
+          ...controlMemberNodeIds(buttonOwnedContinueControl),
+          buttonOwnedContinueControl.preferredActivationElementId,
+          buttonOwnedContinueControl.stateElementId
+        ].filter(Boolean)
+      : []);
+    const rawContinueButton = rawContinueButtons.find((button) => (
+      buttonOwnedNodeIds.has(button.id)
+    )) || rawContinueButtons[0] || null;
+    const safeContinueObserved = Boolean(readyCandidate || (!continueControls.length && rawContinueButton));
+    const continueObserved = Boolean(stageExitCandidates.length || rawContinueButton);
     const continueDisabled = Boolean(
-      continueControl?.logicalDisabled === true
-      || continueControl?.disabled === true
-      || continueControl?.state?.disabled === true
+      stageExitCandidates.length
+      && stageExitCandidates.every((candidate) => candidate.status === "disabled")
     );
     const blockers = [];
     const unresolvedGroup = (decisionGroups || []).find((group) => group.required && !["satisfied", "waived", "waived_by_policy"].includes(group.status));
@@ -8572,10 +9392,10 @@
     if (actionableCheckoutErrors(errors).length) blockers.push(`visible errors: ${actionableCheckoutErrors(errors).slice(0, 2).join("; ")}`);
     if (!continueObserved) blockers.push("Continue not observed");
     else if (continueDisabled) blockers.push("Continue is disabled");
-    else if (!continueButton) blockers.push("Continue is not safely actionable");
+    else if (!safeContinueObserved) blockers.push("Continue is not safely actionable");
     return {
       continueAllowed: Boolean(
-        continueButton &&
+        safeContinueObserved &&
         !continueDisabled &&
         !unresolvedGroup &&
         !unresolvedField &&
@@ -8583,19 +9403,15 @@
         !actionableCheckoutErrors(errors).length &&
         !["payment", "confirmation"].includes(step)
       ),
-      continueTargetId: continueButton?.id
-        || continueControl?.preferredActivationElementId
-        || continueControl?.stateElementId
-        || "",
-      continueControlId: continueControl?.controlId || "",
+      candidates: Object.freeze(stageExitCandidates),
       continueObserved,
       continueDisabled,
-      continueInViewport: continueControl?.visualRegion?.inViewport === true,
+      continueInViewport: readyCandidate?.inViewport === true || observedCandidate?.inViewport === true,
       navigationState: !continueObserved
         ? "not_observed"
         : continueDisabled
           ? "disabled"
-          : continueButton
+          : safeContinueObserved
             ? "ready"
             : "not_safely_actionable",
       blockers
@@ -8897,12 +9713,95 @@
     };
   }
 
-  function withChoiceCommitEvidence(verification = {}, commit = null) {
+  function exactChildChoiceSettlementEvidence(verification = {}, commit = null, expected = {}, decision = {}) {
+    if (!commit || expected.type !== "logical_component_committed" || verification.ok === true) return null;
+    const evidence = verification.evidence && typeof verification.evidence === "object" && !Array.isArray(verification.evidence)
+      ? verification.evidence
+      : {};
+    const semanticType = canonicalProfileFieldType(expected.semanticType || "") || String(expected.semanticType || "");
+    const desiredCanonicalValue = String(
+      expected.expectedCanonicalValue
+      || expected.expectedNormalizedValue
+      || expected.expectedComponentValue
+      || ""
+    );
+    const selectedCanonicalValue = String(
+      decision.value
+      || decision.targetLabel
+      || commit.desiredLabel
+      || ""
+    );
+    const ownedValidationErrors = Array.isArray(evidence.ownedValidationErrors)
+      ? evidence.ownedValidationErrors
+      : null;
+    const validationClear = Boolean(ownedValidationErrors && ownedValidationErrors.length === 0);
+    const exactCompatibleChoice = AGENT_CONTRACT?.profileChoiceValueCompatible?.(
+      selectedCanonicalValue,
+      desiredCanonicalValue,
+      semanticType
+    ) === true;
+    const actualNormalizedValue = String(evidence.actualNormalizedValue || "");
+    const settled = Boolean(
+      verification.code === "LOGICAL_COMPONENT_NOT_COMMITTED"
+      && !actualNormalizedValue
+      && desiredCanonicalValue
+      && selectedCanonicalValue
+      && exactCompatibleChoice
+      && commit.ok === true
+      && commit.popupClosed === true
+      && commit.focusSettled === true
+      && evidence.commitSettled === true
+      && evidence.activeChoiceSurface === false
+      && validationClear
+      && verification.feedback?.priceChanged !== true
+    );
+    return {
+      contractVersion: "exact-child-choice-settlement/v1",
+      settled,
+      reasonCode: settled
+        ? "EXACT_CHILD_CHOICE_SEMANTICALLY_COMMITTED"
+        : "EXACT_CHILD_CHOICE_NOT_PROVEN",
+      logicalFieldId: String(expected.logicalFieldId || ""),
+      subjectId: String(expected.subjectId || "traveler_1"),
+      semanticType,
+      componentRole: String(expected.componentRole || "value"),
+      parentControlId: String(expected.controlId || ""),
+      selectedControlId: String(decision.controlId || commit.controlId || ""),
+      selectedActuatorId: String(decision.actuatorId || decision.targetId || commit.actuatorId || ""),
+      desiredCanonicalValue,
+      selectedCanonicalValue,
+      actualStateBlank: !actualNormalizedValue,
+      validationClear,
+      popupClosed: commit.popupClosed === true,
+      focusSettled: commit.focusSettled === true
+    };
+  }
+
+  function withChoiceCommitEvidence(verification = {}, commit = null, expected = {}, decision = {}) {
     if (!commit) return verification;
     const compactCommit = compactChoiceCommitEvidence(commit);
     const existingEvidence = verification.evidence && typeof verification.evidence === "object" && !Array.isArray(verification.evidence)
       ? verification.evidence
       : { verifierEvidence: verification.evidence || null };
+    const exactChildSettlement = exactChildChoiceSettlementEvidence(
+      verification,
+      compactCommit,
+      expected,
+      decision
+    );
+    if (exactChildSettlement?.settled === true) {
+      return {
+        ...verification,
+        ok: true,
+        code: "LOGICAL_COMPONENT_COMMITTED",
+        message: "The exact compatible child choice settled the logical component with clear validation and no price change.",
+        evidence: {
+          ...existingEvidence,
+          choiceCommit: compactCommit,
+          exactChildSettlement
+        }
+      };
+    }
     if (commit.ok && verification.ok) {
       return {
         ...verification,
@@ -8922,7 +9821,8 @@
         : "The intended value may be visible, but the choice popup/focus episode did not close and settle.",
       evidence: {
         ...existingEvidence,
-        choiceCommit: compactCommit
+        choiceCommit: compactCommit,
+        ...(exactChildSettlement ? { exactChildSettlement } : {})
       }
     };
   }
@@ -8999,6 +9899,22 @@
     const directlyMatchedControl = expectedControlId
       ? (afterMap.controls || []).find((control) => control.controlId === expectedControlId)
       : null;
+    const beforeExpectedControl = expectedControlId
+      ? (beforeMap.controls || []).find((control) => control.controlId === expectedControlId)
+      : null;
+    const stableStateElementId = String(
+      expected.stateElementId
+      || beforeExpectedControl?.stateElementId
+      || beforeExpectedControl?.componentContract?.controlIdentity?.stateElementId
+      || ""
+    );
+    const stateElementReboundControl = stableStateElementId
+      ? (afterMap.controls || []).find((control) => String(
+          control.stateElementId
+          || control.componentContract?.controlIdentity?.stateElementId
+          || ""
+        ) === stableStateElementId)
+      : null;
     const validationOwnerControlId = String(expected.validationOwnership?.controlId || "");
     const validationOwnerControl = validationOwnerControlId
       ? (afterMap.controls || []).find((control) => control.controlId === validationOwnerControlId)
@@ -9018,7 +9934,19 @@
           );
           if (controlSemanticType !== expectedSemanticType) return false;
           if (expectedComponentRole === "value") return true;
-          return String(control.dateField?.component || "") === expectedComponentRole
+          // Some sites expose a split requirement (for example phone country
+          // code) as its own exact semantic control whose local component role
+          // is simply "value". The exact semantic identity is sufficient to
+          // rebind that control after its visible label and hashed control id
+          // change on selection.
+          if (String(control.componentContract?.componentRole || control.componentRole || "") === "value") return true;
+          return String(
+            control.componentRole
+            || control.componentContract?.componentRole
+            || control.fieldClassification?.componentRole
+            || control.dateField?.component
+            || ""
+          ) === expectedComponentRole
             || boundedPhrase(`${control.name || ""} ${control.autocomplete || ""}`, expectedComponentRole);
         })
       : [];
@@ -9027,16 +9955,50 @@
       || expected.expectedComponentValue
       || ""
     );
-    const afterControl = directlyMatchedControl
-      || validationOwnerControl
-      || semanticRebindCandidates.find((control) => (
-        expectedReboundValue
+    const expectedSemanticValue = normalizedProfileChoiceValue(
+      expectedReboundValue,
+      expectedSemanticType
+    );
+    const controlMatchesExpectedValue = (control) => {
+      if (!control || !expectedReboundValue) return false;
+      const rawValue = String(
+        control.state?.normalizedValue
+        || control.state?.dateComponentValue
+        || control.state?.canonicalDateValue
+        || ""
+      );
+      if (rawValue === expectedReboundValue) return true;
+      const semanticValue = normalizedProfileChoiceValue(rawValue, expectedSemanticType);
+      return Boolean(semanticValue && expectedSemanticValue && semanticValue === expectedSemanticValue);
+    };
+    const exactStateControlIds = new Set([
+      ...(Array.isArray(expected.stateControlIds) ? expected.stateControlIds : []),
+      expected.controlId || ""
+    ].filter(Boolean));
+    const expectedRepresentationIdentity = String(expected.representationIdentity || "");
+    const ownerStateControls = (afterMap.controls || []).filter((control) => (
+      exactStateControlIds.has(control.controlId)
+      || Boolean(
+        expectedRepresentationIdentity
         && String(
-          control.state?.normalizedValue
-          || control.state?.dateComponentValue
+          control.componentContract?.componentIdentity
+          || control.componentIdentity
           || ""
-        ) === expectedReboundValue
-      ))
+        ) === expectedRepresentationIdentity
+      )
+    ));
+    // A custom control may keep mechanics on a visible combobox while writing
+    // its canonical value into a hidden state sibling. Prefer fresh value
+    // evidence from that exact logical owner over a blank actuator shell.
+    const valueMatchedOwnerControl = ownerStateControls.find(controlMatchesExpectedValue);
+    const valueMatchedSemanticControl = semanticRebindCandidates.find(controlMatchesExpectedValue);
+    const afterControl = valueMatchedOwnerControl
+      || (controlMatchesExpectedValue(directlyMatchedControl) ? directlyMatchedControl : null)
+      || (controlMatchesExpectedValue(stateElementReboundControl) ? stateElementReboundControl : null)
+      || valueMatchedSemanticControl
+      || directlyMatchedControl
+      || validationOwnerControl
+      || stateElementReboundControl
       || (semanticRebindCandidates.length === 1 ? semanticRebindCandidates[0] : null);
     const afterDecisionGroup = expectedDecisionGroupId
       ? (afterMap.decisionGroups || []).find((group) => group.decisionGroupId === expectedDecisionGroupId)
@@ -9134,6 +10096,11 @@
       const semanticType = expected.semanticType || afterControl?.fieldType || afterControl?.semantic || "";
       const actualSemanticValue = normalizedProfileChoiceValue(actualNormalizedValue, semanticType);
       const wantedSemanticValue = normalizedProfileChoiceValue(wantedNormalizedValue, semanticType);
+      const compatibleProfileChoice = AGENT_CONTRACT?.profileChoiceValueCompatible?.(
+        actualNormalizedValue,
+        wantedNormalizedValue,
+        canonicalProfileFieldType(semanticType) || semanticType
+      ) === true;
       const currentSurface = afterMap.currentSurface || {};
       const surfaceDismissed = !expected.requireSurfaceDismissed
         || !expected.surfaceId
@@ -9148,6 +10115,7 @@
             && wantedSemanticValue
             && actualSemanticValue === wantedSemanticValue
           )
+          || compatibleProfileChoice
         )
         && surfaceDismissed
         && ownedValidationErrors.length === 0
@@ -9175,6 +10143,11 @@
       const semanticType = expected.semanticType || afterControl?.fieldType || afterControl?.semantic || "";
       const actualSemanticValue = normalizedProfileChoiceValue(actualNormalizedValue, semanticType);
       const wantedSemanticValue = normalizedProfileChoiceValue(wantedNormalizedValue, semanticType);
+      const compatibleProfileChoice = AGENT_CONTRACT?.profileChoiceValueCompatible?.(
+        actualNormalizedValue,
+        wantedNormalizedValue,
+        canonicalProfileFieldType(semanticType) || semanticType
+      ) === true;
       const currentSurface = afterMap.currentSurface || {};
       const expectedChildSurfaceId = String(expected.surfaceId || "");
       const activeChoiceSurface = Boolean(
@@ -9204,9 +10177,14 @@
             && wantedSemanticValue
             && actualSemanticValue === wantedSemanticValue
           )
+          || compatibleProfileChoice
         )
       );
-      const ok = exactValue && commitSettled && ownedValidationErrors.length === 0;
+      const ok = Boolean(
+        exactValue
+        && commitSettled
+        && ownedValidationErrors.length === 0
+      );
       return {
         ok,
         code: ok ? "LOGICAL_COMPONENT_COMMITTED" : "LOGICAL_COMPONENT_NOT_COMMITTED",
@@ -9563,12 +10541,15 @@
       );
       const freeCommandDismissed = Boolean(
         beforeExpectedControl
-        && beforeExpectedControl.surfaceType
-        && beforeExpectedControl.surfaceType !== "page"
         && /decline|safe decline|free|no thanks|without|skip/.test(selectedText)
         && sourceRetired
         && changed
-        && (afterMap.currentSurface?.id !== beforeExpectedControl.surfaceId || afterMap.currentSurface?.type === "page")
+        && (
+          (beforeExpectedControl.surfaceType
+            && beforeExpectedControl.surfaceType !== "page"
+            && (afterMap.currentSurface?.id !== beforeExpectedControl.surfaceId || afterMap.currentSurface?.type === "page"))
+          || (beforeExpectedControl.surfaceType === "page" && checkoutStageAdvanced)
+        )
       );
       const policySafeTransitionCandidate = Boolean(
         beforeExpectedControl
@@ -9982,25 +10963,27 @@
     const rect = element.getBoundingClientRect();
     const x = Math.round(rect.left + rect.width / 2);
     const y = Math.round(rect.top + rect.height / 2);
-    if (typeof globalThis.__ATW_TEST_TRUSTED_INPUT__ === "function") {
-      return globalThis.__ATW_TEST_TRUSTED_INPUT__({ element, x, y, decision });
-    }
-    if (!globalThis.chrome?.runtime?.sendMessage) {
-      return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE" };
-    }
-    try {
-      return await chrome.runtime.sendMessage({
-        type: "ATW_TRUSTED_POINTER_CLICK",
-        governed: true,
-        actionId: decision.actionId || decision.id || "",
-        observationId: decision.observationId || "",
-        controlId: decision.controlId || "",
-        x,
-        y
-      });
-    } catch (error) {
-      return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE", error: error.message };
-    }
+    return withAgentUiPointerPassthrough(async () => {
+      if (typeof globalThis.__ATW_TEST_TRUSTED_INPUT__ === "function") {
+        return globalThis.__ATW_TEST_TRUSTED_INPUT__({ element, x, y, decision });
+      }
+      if (!globalThis.chrome?.runtime?.sendMessage) {
+        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE" };
+      }
+      try {
+        return await chrome.runtime.sendMessage({
+          type: "ATW_TRUSTED_POINTER_CLICK",
+          governed: true,
+          actionId: decision.actionId || decision.id || "",
+          observationId: decision.observationId || "",
+          controlId: decision.controlId || "",
+          x,
+          y
+        });
+      } catch (error) {
+        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE", error: error.message };
+      }
+    });
   }
 
   async function trustedBrowserChoice(element, decision = {}) {
@@ -10020,44 +11003,46 @@
     const rect = element.getBoundingClientRect();
     const x = Math.round(rect.left + rect.width / 2);
     const y = Math.round(rect.top + rect.height / 2);
-    if (typeof globalThis.__ATW_TEST_TRUSTED_CHOICE__ === "function") {
-      const result = await globalThis.__ATW_TEST_TRUSTED_CHOICE__({ element, x, y, choiceLabel, decision });
-      if (result?.ok !== true) {
+    return withAgentUiPointerPassthrough(async () => {
+      if (typeof globalThis.__ATW_TEST_TRUSTED_CHOICE__ === "function") {
+        const result = await globalThis.__ATW_TEST_TRUSTED_CHOICE__({ element, x, y, choiceLabel, decision });
+        if (result?.ok !== true) {
+          updateChoiceInteractionState(decision.controlId, {
+            status: "unsettled",
+            code: result?.code || "TRUSTED_INPUT_UNAVAILABLE"
+          });
+        }
+        return result;
+      }
+      if (!globalThis.chrome?.runtime?.sendMessage) {
+        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE" };
+      }
+      try {
+        const result = await chrome.runtime.sendMessage({
+          type: "ATW_TRUSTED_CHOICE",
+          governed: true,
+          actionId: decision.actionId || decision.id || "",
+          observationId: decision.observationId || "",
+          controlId: decision.controlId || "",
+          choiceLabel,
+          x,
+          y
+        });
+        if (result?.ok !== true) {
+          updateChoiceInteractionState(decision.controlId, {
+            status: "unsettled",
+            code: result?.code || "TRUSTED_INPUT_UNAVAILABLE"
+          });
+        }
+        return result;
+      } catch (error) {
         updateChoiceInteractionState(decision.controlId, {
           status: "unsettled",
-          code: result?.code || "TRUSTED_INPUT_UNAVAILABLE"
+          code: "TRUSTED_INPUT_UNAVAILABLE"
         });
+        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE", error: error.message };
       }
-      return result;
-    }
-    if (!globalThis.chrome?.runtime?.sendMessage) {
-      return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE" };
-    }
-    try {
-      const result = await chrome.runtime.sendMessage({
-        type: "ATW_TRUSTED_CHOICE",
-        governed: true,
-        actionId: decision.actionId || decision.id || "",
-        observationId: decision.observationId || "",
-        controlId: decision.controlId || "",
-        choiceLabel,
-        x,
-        y
-      });
-      if (result?.ok !== true) {
-        updateChoiceInteractionState(decision.controlId, {
-          status: "unsettled",
-          code: result?.code || "TRUSTED_INPUT_UNAVAILABLE"
-        });
-      }
-      return result;
-    } catch (error) {
-      updateChoiceInteractionState(decision.controlId, {
-        status: "unsettled",
-        code: "TRUSTED_INPUT_UNAVAILABLE"
-      });
-      return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE", error: error.message };
-    }
+    });
   }
 
   async function trustedBrowserKey(key = "", decision = {}) {
@@ -10300,16 +11285,18 @@
     });
   }
 
-  function exactChoiceCommitReadiness(target, decision = {}) {
+  function exactChoiceCommitReadiness(target, decision = {}, pageMap = agent.pageMap || {}) {
     if (isChoiceSelected(target)) {
       return { ready: true, source: "observed_selected_state" };
     }
-    const continueButton = findSafeContinueButton();
-    if (continueButton && !isDisabledLike(continueButton)) {
+    const readyStageExitCandidates = (pageMap?.stageExit?.candidates || []).filter((candidate) => (
+      candidate.status === "ready" || candidate.executable === true
+    ));
+    if (readyStageExitCandidates.length) {
       return {
         ready: true,
         source: "stage_exit_enabled",
-        continueControlId: lookupControlForElement(agent.pageMap || {}, continueButton)?.controlId || ""
+        candidateControlIds: readyStageExitCandidates.map((candidate) => candidate.controlId).filter(Boolean)
       };
     }
     return { ready: false, source: "not_ready" };
@@ -10330,7 +11317,11 @@
     }
     const startedAt = performance.now();
     while (performance.now() - startedAt < timeoutMs) {
-      const readiness = exactChoiceCommitReadiness(target, decision);
+      // The site may enable its forward action asynchronously without changing
+      // the selected card itself. Recompile the current surface on every bounded
+      // probe so commitment never depends on an old agent.pageMap snapshot.
+      afterMap = buildPageMap();
+      const readiness = exactChoiceCommitReadiness(target, decision, afterMap);
       if (readiness.ready) {
         const commitment = rememberExactChoiceCommitment(target, decision, readiness);
         pageStateStore.invalidate("exact_choice_commitment");
@@ -10438,13 +11429,15 @@
     }) || null;
     const newSearchRoute = /(?:^|\/)rf\/start\/?$/.test(route)
       || /(?:^|\/)(?:flight-)?search\/?$/.test(route);
-    const extrasEvidence = /select baggage|configure your trip|upgrade your trip|checked baggage|bundle|premium support|airhelp|cancellation guarantee|voucher refund|add to cart|no thanks|add baggage|choose your bundle/.test(lower);
+    const extrasEvidence = /select baggage|configure your trip|upgrade your trip|checked baggage|hold (?:bags?|baggage|luggage)|add your hold bags|cabin bags?|bundle|premium support|airhelp|cancellation guarantee|voucher refund|add to cart|no thanks|add baggage|choose your bundle/.test(lower);
+    const strongExtrasEvidence = /add your hold bags|hold (?:bag|baggage|luggage) options?|select (?:your )?(?:cabin|checked|hold) bags?|add (?:a |your )?(?:cabin|checked|hold) bags?/.test(lower);
     const travelerEvidence = /traveller information|traveler information|contact information|provide your contact details|passport|date of birth|surname|first name|first and middle names|mobile number|confirm e-?mail/.test(lower);
     const seatEvidence = /seat selection|select (?:your )?seats?\b|choose (?:your )?seats?\b/.test(lower);
     const strongSeatEvidence = /reserve seating|seat map|seat map key|standard seat|not selected|select a seat|choose a seat/.test(lower);
     const travelerRouteEvidence = /\/rf\/traveler-details|\/rf\/traveller-details|traveler-details|traveller-details/.test(route);
     const paymentFormEvidence = /card number|security code|cvc|cvv|pay now|complete booking|confirm and pay|submit payment|billing card|cardholder/.test(lower);
-    const paymentRouteEvidence = /\/rf\/payment|\/payment\b/.test(route);
+    const paymentRouteEvidence = /\/rf\/payments?|\/payments?\b/.test(route);
+    const extrasRouteEvidence = /\/(?:cabin-?bags?|hold-?bags?|bags?|baggage|luggage|extras?|ancillar(?:y|ies)|insurance|bundles?)(?:\/|$)/.test(route);
     const confirmationEvidence = /booking confirmed|confirmation number|booking reference|reservation number|\bpnr\b/.test(lower);
     const flightSelectionEvidence = /flight selection|select flight|choose flight|fare/.test(lower);
     const repeatedSeatInventory = Number(evidence.structuralEvidence.seatInventoryCount || 0) >= 64;
@@ -10461,6 +11454,11 @@
     if (terminalEvidence?.boundaryObserved === true) return result("payment", 0.99, ["terminal_evidence_contract"]);
     if (confirmationEvidence) return result("confirmation", 0.95, ["confirmation_copy"]);
     if (paymentFormEvidence) return result("payment", 0.95, ["payment_controls_copy"]);
+    // The active destination route outranks checkout-progress links retained
+    // in the page shell. A hold-bag page commonly contains a visible "Seat
+    // selection" breadcrumb, but that is navigation history, not page state.
+    if (extrasRouteEvidence) return result("extras", 0.92, ["route_path"]);
+    if (strongExtrasEvidence) return result("extras", 0.9, ["baggage_controls_copy"]);
     if (strongSeatEvidence) return result("seats", 0.9, ["seat_controls_copy"]);
     if (travelerRouteEvidence) return result("traveler_information", 0.9, ["route_path"]);
     if (paymentRouteEvidence && extrasEvidence) return result("extras", 0.75, ["payment_route", "extras_copy"]);
@@ -10498,7 +11496,8 @@
     }
     const visibleActions = visibleTerminalNodes.filter((element) => element.matches("button, input[type='button'], input[type='submit'], [role='button']"));
     const payControlPresent = visibleActions.some((element) => (
-      /^(?:pay(?:\s+now|\s+securely|\s+[\d.,]+)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase)\b/i.test(actionElementLabel(element))
+      AGENT_CONTRACT?.isPaymentCommitText?.(actionElementLabel(element))
+      || /^(?:pay(?:\s+now|\s+securely|\s+by\s+(?:card|bank|wallet)|\s+[\d.,]+)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase|place\s+order)\b/i.test(actionElementLabel(element))
     ));
     const activeProgressText = visibleTerminalNodes
       .filter((element) => element.matches("[aria-current='step'], [data-current='true'], [data-active='true']"))
@@ -10507,7 +11506,7 @@
       .slice(0, 500);
     const normalized = String(fullText || "").replace(/\s+/g, " ");
     const activePaymentProgress = /\bpayment\b|\bpay\b/i.test(activeProgressText);
-    const paymentRoute = /(?:^|\/)payment(?:\/|$)/i.test(String(location.pathname || ""));
+    const paymentRoute = /(?:^|\/)payments?(?:\/|$)/i.test(String(location.pathname || ""));
     const visiblePaymentOwners = queryAllDeep([
       "main",
       "form",
@@ -10546,12 +11545,19 @@
     const hostedPaymentWidgetPresent = visibleHostedPaymentFrames.length > 0 && (
       paymentOwnerPresent || activePaymentProgress || paymentRoute
     );
+    const visibleFromToItinerary = /\bFROM\s+[\p{L} .'’-]{1,60}\s*\([A-Z]{3}\).{0,120}\bTO\s+[\p{L} .'’-]{1,60}\s*\([A-Z]{3}\)/iu.test(normalized);
+    const visiblePaymentCurrencyPrompt = /\b(?:which|choose|select)\s+(?:the\s+)?currency\b.{0,100}\bpayment\b|\bpayment\b.{0,100}\bcurrency\b/i.test(normalized);
+    const visibleExactCurrencyTotal = /\b(?:EUR|USD|GBP|CHF|CAD|AUD)\s*\d+(?:[.,]\d{1,2})\b|\b\d+(?:[.,]\d{1,2})\s*(?:EUR|USD|GBP|CHF|CAD|AUD)\b/i.test(normalized);
+    const progressivePaymentEntryPresent = visibleFromToItinerary
+      && visiblePaymentCurrencyPrompt
+      && visibleExactCurrencyTotal;
     const terminalEvidenceSources = [
       ...(credentialKinds.size ? ["visible_native_payment_credentials"] : []),
       ...(paymentOwnerPresent ? ["visible_owned_payment_labels"] : []),
       ...(hostedPaymentWidgetPresent ? ["visible_hosted_payment_widget"] : []),
       ...(activePaymentProgress ? ["active_payment_progress"] : []),
-      ...(paymentRoute ? ["payment_route"] : [])
+      ...(paymentRoute ? ["payment_route"] : []),
+      ...(progressivePaymentEntryPresent ? ["visible_progressive_payment_entry"] : [])
     ];
     return {
       paymentCredentialKinds: [...credentialKinds],
@@ -10565,12 +11571,16 @@
       visibleTextFallbackAllowed: paymentOwnerPresent,
       paymentMethodPresent: /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/i.test(normalized),
       payControlPresent,
-      legalAcceptancePresent: visibleInputs.some((input) => input.type === "checkbox" && /terms|conditions|privacy|purchase/i.test(labelText(input))),
+      legalAcceptancePresent: visibleInputs.some((input) => input.type === "checkbox" && (
+        AGENT_CONTRACT?.isLegalAcceptanceText?.(labelText(input))
+        || /terms|conditions|privacy|purchase/i.test(labelText(input))
+      )),
       reviewSummaryPresent: /\b(?:amount\s+to\s+pay|total)\b/i.test(normalized)
         && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/i.test(normalized),
       paymentHeadingPresent: /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/i.test(normalized),
       activePaymentProgress,
       activeProgressText,
+      progressivePaymentEntryPresent,
       terminalEvidenceSources
     };
   }
@@ -10730,7 +11740,15 @@
   }
 
   function foregroundSurfaceState(activeSurface = {}) {
-    const active = Boolean(activeSurface?.type && activeSurface.type !== "page");
+    // A positioned panel is not automatically an exclusive foreground. Only
+    // structurally blocking surfaces (modal/dialog, open choice surface,
+    // backdrop/focus trap, or a panel that actually covers the interaction
+    // center) own the next action. Persistent summaries remain page context.
+    const active = Boolean(
+      activeSurface?.type
+      && activeSurface.type !== "page"
+      && activeSurface.blocksBackground === true
+    );
     const text = surfaceText(activeSurface);
     const optionCount = (activeSurface.options || []).length;
     const navCount = (activeSurface.options || []).filter((option) => /^(next|continue|close|done|confirm)\b/i.test(option.label || "")).length;
@@ -10745,7 +11763,7 @@
       id: activeSurface.id || "",
       type: activeSurface.type || "page",
       label: activeSurface.label || "",
-      blocksBackground: active,
+      blocksBackground: activeSurface.blocksBackground === true,
       confidence,
       reason: active ? "Visible foreground surface owns the next action until it closes or changes." : "No foreground surface detected.",
       progressMarkers: surfaceProgressMarkers(text),
@@ -10859,6 +11877,7 @@
       });
     const candidates = [...new Set([...explicit, ...floating])]
       .filter((element) => isVisible(element) && !element.closest("#atw-sidebar, #atw-agent-cursor, .atw-section-outline"))
+      .filter((element) => !isPersistentEdgeCheckoutChrome(element))
       .filter((element) => {
         const rect = element.getBoundingClientRect();
         if (rect.width < 12 || rect.height < 12) return false;
@@ -10884,6 +11903,75 @@
       .filter((item) => item.hitCount > 0)
       .sort((a, b) => b.score - a.score)
       .map((item) => item.element);
+  }
+
+  // Fixed/sticky itinerary and price summaries are checkout page chrome, not
+  // foreground decisions. Treating every positioned panel as a modal hides the
+  // actual traveler fields and page Continue action from the planner. A real
+  // dialog, menu, listbox, expanded choice owner, or choice form keeps owning
+  // the foreground even when it happens to touch a viewport edge.
+  function isPersistentEdgeCheckoutChrome(element) {
+    if (!element || !isVisible(element)) return false;
+    const role = String(element.getAttribute?.("role") || "").toLowerCase();
+    if (element.getAttribute?.("aria-modal") === "true" || ["dialog", "alertdialog", "listbox", "menu"].includes(role)) return false;
+    if (element.getAttribute?.("aria-expanded") === "true" || queryAllDeep("[aria-expanded='true'], [role='option']", element).some(isVisible)) return false;
+    if (queryAllDeep("input:not([type='hidden']), select, textarea, [role='radio'], [role='checkbox']", element).some(isVisible)) return false;
+
+    const style = getComputedStyle(element);
+    if (!/fixed|sticky|absolute/.test(style.position)) return false;
+    const rect = element.getBoundingClientRect();
+    const viewportWidth = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const viewportHeight = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    const edgeTolerance = 8;
+    const bottomStrip = rect.bottom >= viewportHeight - edgeTolerance
+      && rect.width >= viewportWidth * 0.55
+      && rect.height <= Math.max(190, viewportHeight * 0.24);
+    const sidePanel = rect.right >= viewportWidth - edgeTolerance
+      && rect.height >= viewportHeight * 0.5
+      && rect.width <= Math.max(520, viewportWidth * 0.34);
+    if (!bottomStrip && !sidePanel) return false;
+
+    const text = overlayText(element).toLowerCase();
+    const pageChromeEvidence = /(?:departure|return|flight|route|itinerary|price|total|amount|booking summary|your order|details)/.test(text);
+    // Text such as "Choose seats for me" can legitimately appear inside a
+    // persistent price/itinerary summary. Lexical action words do not make the
+    // entire positioned panel modal. Structural modal/choice evidence above is
+    // the authority for exclusivity.
+    return pageChromeEvidence;
+  }
+
+  function surfaceStructurallyBlocksBackground(overlay, type = "popover") {
+    if (!overlay) return false;
+    const role = String(overlay.getAttribute?.("role") || implicitRole(overlay) || "").toLowerCase();
+    if (overlay.getAttribute?.("aria-modal") === "true" || ["dialog", "alertdialog"].includes(role)) return true;
+    if (type === "dropdown" || ["listbox", "menu"].includes(role)) return true;
+    if (overlay.getAttribute?.("aria-expanded") === "true") return true;
+    if (queryAllDeep("[role='option']", overlay).some(isVisible)) return true;
+    if (overlay.matches?.(".modal, [data-modal='true'], [data-state='open'][role='dialog']")) return true;
+
+    const viewportWidth = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+    const viewportHeight = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
+    const backdrop = queryAllDeep("[inert], .modal-backdrop, .backdrop, [data-backdrop]")
+      .some((element) => {
+        if (element === overlay || !isVisible(element)) return false;
+        const backdropRect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return /fixed|absolute/.test(style.position)
+          && backdropRect.width >= viewportWidth * 0.6
+          && backdropRect.height >= viewportHeight * 0.6;
+      });
+    const bodyLocked = /hidden/.test(getComputedStyle(document.body).overflow || "");
+    const focusOwned = Boolean(document.activeElement && overlay.contains(document.activeElement));
+    if (backdrop || (bodyLocked && focusOwned)) return true;
+
+    const rect = overlay.getBoundingClientRect();
+    const centerX = viewportWidth / 2;
+    const centerY = viewportHeight / 2;
+    const coversInteractionCenter = rect.left <= centerX
+      && rect.right >= centerX
+      && rect.top <= centerY
+      && rect.bottom >= centerY;
+    return coversInteractionCenter && overlayTopHitCount(overlay) > 0;
   }
 
   function overlayText(element) {
@@ -10941,7 +12029,12 @@
 
   function surfaceMembershipForElement(element, surface = {}) {
     if (!element) return { surfaceId: "", evidence: "missing_element" };
-    if (!surface?.type || surface.type === "page") return { surfaceId: "surface-page", evidence: "page_surface" };
+    if (!surface?.type || surface.type === "page" || surface.blocksBackground !== true) {
+      return {
+        surfaceId: "surface-page",
+        evidence: surface.blocksBackground === false ? "nonblocking_context_surface" : "page_surface"
+      };
+    }
     const elementNodeId = elementId(element);
     const registeredIds = new Set([
       ...(surface.memberActuatorIds || []),
@@ -10960,6 +12053,22 @@
       const root = document.getElementById(id);
       return root && (root === element || root.contains(element));
     })) return { surfaceId: surface.id || "", evidence: "aria_owned_root" };
+    // Combobox search/filter inputs commonly live beside a portalled listbox
+    // and point to it with aria-controls/aria-owns. That reverse relation is
+    // as strong as DOM containment and must keep the deterministic filter in
+    // the foreground surface. Geometry alone still grants no ownership.
+    const controlledIds = `${element.getAttribute?.("aria-controls") || ""} ${element.getAttribute?.("aria-owns") || ""}`
+      .split(/\s+/)
+      .filter(Boolean);
+    const reverseOwnedFilter = element.matches?.("input:not([readonly]):not([disabled]), textarea:not([readonly]):not([disabled])")
+      && (
+        String(element.getAttribute?.("type") || "").toLowerCase() === "search"
+        || /\b(?:search|filter|find|query)\b/i.test(`${labelText(element)} ${element.getAttribute?.("placeholder") || ""} ${element.getAttribute?.("name") || ""}`)
+      );
+    if (reverseOwnedFilter && surfaceElement && controlledIds.some((id) => {
+      const controlled = document.getElementById(id);
+      return controlled && (controlled === surfaceElement || surfaceElement.contains(controlled) || controlled.contains(surfaceElement));
+    })) return { surfaceId: surface.id || "", evidence: "reverse_aria_owned_surface" };
     const surfaceBox = surface.box;
     const targetBox = elementBox(element);
     if (surfaceBox && targetBox) {
@@ -11025,6 +12134,80 @@
       }
     }
     return { ok: false, reason: "overlay did not change" };
+  }
+
+  // Normalize conclusive live mechanical feedback into the same verification
+  // contract consumed by the durable action ledger. This stays deliberately
+  // narrow: field values, stage navigation, validation, and price-sensitive
+  // outcomes still require a fresh canonical observation.
+  function verificationFromSurfaceFeedback(expected = {}, beforeMap = {}, target = null, {
+    beforeOverlaySignature = "",
+    progress = null
+  } = {}) {
+    if (expected.mustNotIncreasePrice === true) return null;
+    const allowed = new Set([
+      "options_surface_appeared",
+      "active_surface_dismissed",
+      "active_surface_change",
+      "observable_change"
+    ]);
+    if (!allowed.has(String(expected.type || ""))) return null;
+
+    const afterOverlay = activeOverlayElements()[0] || null;
+    const afterOverlaySignature = afterOverlay ? overlaySignature(afterOverlay) : "";
+    const overlayAppeared = Boolean(
+      afterOverlaySignature
+      && (!beforeOverlaySignature || afterOverlaySignature !== beforeOverlaySignature)
+    );
+    const overlayDismissed = Boolean(beforeOverlaySignature && !afterOverlaySignature);
+    const overlayChanged = Boolean(
+      beforeOverlaySignature
+      && afterOverlaySignature
+      && beforeOverlaySignature !== afterOverlaySignature
+    );
+    const urlChanged = Boolean(expected.beforeUrl && location.href !== expected.beforeUrl);
+
+    let ok = false;
+    if (expected.type === "options_surface_appeared") ok = overlayAppeared;
+    else if (expected.type === "active_surface_dismissed") ok = overlayDismissed || progress?.ok === true;
+    else if (expected.type === "active_surface_change") ok = overlayChanged || overlayDismissed || progress?.ok === true;
+    else if (expected.type === "observable_change") ok = overlayAppeared || overlayChanged || overlayDismissed || urlChanged;
+    if (!ok) return null;
+
+    return {
+      ok: true,
+      code: "MECHANICAL_SURFACE_FEEDBACK_VERIFIED",
+      message: "The governed action produced its bounded local surface transition.",
+      evidence: {
+        source: "live_mechanical_feedback",
+        expectedType: expected.type,
+        beforeObservationHash: observationHashForMap(beforeMap),
+        afterObservationHash: "pending_fresh_observation",
+        beforeOverlaySignature: stableHash(beforeOverlaySignature),
+        afterOverlaySignature: stableHash(afterOverlaySignature),
+        overlayAppeared,
+        overlayDismissed,
+        overlayChanged,
+        urlChanged,
+        progress: progress || null,
+        targetConnected: Boolean(target?.isConnected)
+      },
+      feedback: {
+        dispatched: true,
+        targetFound: Boolean(target),
+        targetVisible: Boolean(target && isVisible(target)),
+        dispatchSucceeded: true,
+        targetReacted: true,
+        surfaceChanged: overlayAppeared || overlayDismissed || overlayChanged,
+        overlayAppeared,
+        navigationOccurred: urlChanged,
+        validationAppeared: false,
+        priceChanged: false,
+        pageChanged: true,
+        expectedOutcomeObserved: true,
+        postconditionSatisfied: true
+      }
+    };
   }
 
   async function settleAndHandleInterrupts(context = "") {
@@ -11433,6 +12616,7 @@
       role,
       taskHint: parentContext.parentSectionType || "",
       surfaceClass,
+      blocksBackground: surfaceStructurallyBlocksBackground(overlay, type),
       options: prioritized,
       buttons: prioritized,
       controlCollections: boundedSurfaceActions.collections,
@@ -11470,13 +12654,14 @@
   }
 
   function buildSurfaceStack(activeSurface, sections = [], taskQueue = [], overlays = [], step = "unknown") {
+    const blocksBackground = activeSurface?.blocksBackground === true;
     const pageSurface = {
       id: "surface-page",
       type: "page",
       label: step,
       role: "document",
       blocksBackground: false,
-      isCurrent: !activeSurface?.type || activeSurface.type === "page",
+      isCurrent: !activeSurface?.type || activeSurface.type === "page" || !blocksBackground,
       taskQueue,
       backgroundTaskQueue: [],
       sectionIds: (sections || []).map((section) => section.id).filter(Boolean),
@@ -11495,13 +12680,21 @@
     const surface = {
       ...activeSurface,
       text: activeSurface.label || "",
-      blocksBackground: true,
-      isCurrent: true,
+      blocksBackground,
+      isCurrent: blocksBackground,
       taskQueue: [],
       backgroundTaskQueue: taskQueue,
       expectedResolution: surfaceLooksLikeSeatSkip(activeSurface) ? "waive_or_skip_seat_selection" : "resolve_active_surface",
       foreground: foregroundSurfaceState(activeSurface)
     };
+    if (!blocksBackground) {
+      return {
+        surfaceStack: [pageSurface, surface],
+        currentSurface: pageSurface,
+        backgroundTasks: [],
+        currentSurfaceTasks: taskQueue
+      };
+    }
     return {
       surfaceStack: [{ ...pageSurface, isCurrent: false, backgroundTaskQueue: [] }, surface],
       currentSurface: surface,
@@ -11726,6 +12919,19 @@
       const detected = detectField(input);
       const semantic = detected?.fieldType || detected?.field || "unknown";
       const value = fieldValue(input);
+      const linkedRepresentationElements = [
+        input,
+        labelElementForInput(input),
+        clickableAncestor(input)
+      ].filter(Boolean);
+      const renderedRepresentationElements = [...new Set(linkedRepresentationElements)]
+        .filter((element) => isVisible(element));
+      const representationLifecycle = {
+        status: renderedRepresentationElements.length ? "active_rendered" : "dormant_hidden",
+        active: renderedRepresentationElements.length > 0,
+        stateRendered: isVisible(input),
+        renderedMemberIds: renderedRepresentationElements.map(elementId).filter(Boolean)
+      };
       return {
         element: input,
         id: elementId(input),
@@ -11765,8 +12971,9 @@
           || input.getAttribute?.("aria-required") === "true"
           || /\*|\brequired\b/i.test(`${labelText(input)} ${profileFieldGroupEvidence(input).label}`)
         ),
+        representationLifecycle,
         value,
-      hasValue: Boolean(value && !isPlaceholderChoiceValue(value)),
+        hasValue: Boolean(value && !isPlaceholderChoiceValue(value, input)),
         confidence: detected?.confidence || 0,
         accessibility: accessibilityNode(input, null)
       };
@@ -11869,7 +13076,15 @@
     controls = semanticCompilation.controls;
     decisionGroups = semanticCompilation.decisionGroups;
     const surfaceModel = buildSurfaceStack(activeSurface, sections, taskQueue, overlays, step);
-    const stageExit = buildStageExit(decisionGroups, fields, buttons, overlays, errors, step, controls);
+    const stageExit = buildStageExit(
+      decisionGroups,
+      fields,
+      buttons,
+      activeSurface.blocksBackground === true ? overlays : [],
+      errors,
+      step,
+      controls
+    );
     const transactionFacts = transactionFactsEvidence({
       step,
       price,
@@ -12350,7 +13565,10 @@
           awaitMutationMs: 0
         });
         const observed = observe({
-          forceFull: attempt > 1,
+          // A retry reconciles the pending mutations. observe() already
+          // escalates to a material rescan when incremental refresh is unsafe;
+          // forcing a second full document build here only duplicates work.
+          forceFull: false,
           reason: attempt === 1 ? reason : `${reason}:fresh_retry_${attempt}`
         });
         lastObserved = observed;
@@ -12564,17 +13782,6 @@
       if (issues.length >= 12) break;
     }
 
-    const emailInputs = candidateInputs().filter((input) => labelText(input).includes("email"));
-    const confirmEmail = emailInputs.find((input) => labelText(input).includes("confirm"));
-    if (confirmEmail && !confirmEmail.value) {
-      const field = fields.find((item) => item.element === confirmEmail);
-      const control = controls.find((item) => item.controlId === field?.controlId || item.stateElementId === field?.id);
-      addIssue("confirm email is empty", confirmEmail, {
-        controlId: control?.controlId || field?.controlId || "",
-        semanticType: "confirm_email"
-      });
-    }
-
     const titleAreaVisible = document.body.innerText.toLowerCase().includes("title *") || document.body.innerText.toLowerCase().includes("you must enter a gender");
     const anyTitleChecked = queryAllDeep("input[type='radio']")
       .filter((radio) => /mr|mrs|ms|title|gender/.test(labelText(radio)))
@@ -12657,12 +13864,120 @@
     return null;
   }
 
-  function clickPointIsClear(element) {
+  const AGENT_OWNED_SELECTOR = "#atw-sidebar, #atw-agent-cursor, #atw-screenshot-annotations, .atw-section-outline";
+
+  function isAgentOwnedElement(element) {
+    return Boolean(element?.closest?.(AGENT_OWNED_SELECTOR));
+  }
+
+  function agentOwnedInteractionRoots() {
+    return [...new Set([
+      document.getElementById("atw-sidebar"),
+      document.getElementById("atw-agent-cursor"),
+      document.getElementById("atw-screenshot-annotations"),
+      ...document.querySelectorAll(".atw-section-outline")
+    ].filter(Boolean))];
+  }
+
+  async function withAgentUiPointerPassthrough(callback) {
+    const previous = agentOwnedInteractionRoots().map((element) => ({
+      element,
+      pointerEvents: element.style.getPropertyValue("pointer-events"),
+      pointerEventsPriority: element.style.getPropertyPriority("pointer-events"),
+      userSelect: element.style.getPropertyValue("user-select"),
+      userSelectPriority: element.style.getPropertyPriority("user-select")
+    }));
+    for (const { element } of previous) {
+      element.style.setProperty("pointer-events", "none", "important");
+      element.style.setProperty("user-select", "none", "important");
+    }
+    try {
+      // Inline style mutation is synchronous. Force style resolution without
+      // requestAnimationFrame: background tabs may throttle rAF indefinitely,
+      // but trusted dispatch must behave identically when Fly is not focused.
+      document.documentElement.getBoundingClientRect();
+      return await callback();
+    } finally {
+      for (const {
+        element,
+        pointerEvents,
+        pointerEventsPriority,
+        userSelect,
+        userSelectPriority
+      } of previous) {
+        if (!element?.isConnected) continue;
+        if (pointerEvents) element.style.setProperty("pointer-events", pointerEvents, pointerEventsPriority);
+        else element.style.removeProperty("pointer-events");
+        if (userSelect) element.style.setProperty("user-select", userSelect, userSelectPriority);
+        else element.style.removeProperty("user-select");
+      }
+    }
+  }
+
+  function clickPointEvidence(element) {
     const rect = element.getBoundingClientRect();
     const x = Math.min(window.innerWidth - 2, Math.max(2, rect.left + rect.width / 2));
     const y = Math.min(window.innerHeight - 2, Math.max(2, rect.top + rect.height / 2));
-    const top = document.elementFromPoint(x, y);
-    return Boolean(top && (top === element || element.contains(top) || top.contains(element)));
+    const stack = typeof document.elementsFromPoint === "function"
+      ? document.elementsFromPoint(x, y)
+      : [document.elementFromPoint(x, y)].filter(Boolean);
+    const top = stack[0] || null;
+    const underlying = stack.find((candidate) => !isAgentOwnedElement(candidate)) || null;
+    const directlyClear = Boolean(top && (top === element || element.contains(top) || top.contains(element)));
+    const underlyingClear = Boolean(
+      underlying
+      && (underlying === element || element.contains(underlying) || underlying.contains(element))
+    );
+    const selfOccluded = Boolean(!directlyClear && isAgentOwnedElement(top) && underlyingClear);
+    const clear = directlyClear || selfOccluded;
+    const topRect = top?.getBoundingClientRect?.() || null;
+    const underlyingRect = underlying?.getBoundingClientRect?.() || null;
+    return {
+      clear,
+      directlyClear,
+      selfOccluded,
+      point: { x: Math.round(x), y: Math.round(y) },
+      target: {
+        tag: String(element?.tagName || "").toLowerCase(),
+        id: String(element?.id || ""),
+        rect: {
+          x: Math.round(rect.left),
+          y: Math.round(rect.top),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height)
+        }
+      },
+      topElement: top ? {
+        tag: String(top.tagName || "").toLowerCase(),
+        id: String(top.id || ""),
+        role: String(top.getAttribute?.("role") || ""),
+        ariaLabel: String(top.getAttribute?.("aria-label") || "").slice(0, 120),
+        agentOwned: isAgentOwnedElement(top),
+        rect: topRect ? {
+          x: Math.round(topRect.left),
+          y: Math.round(topRect.top),
+          width: Math.round(topRect.width),
+          height: Math.round(topRect.height)
+        } : null
+      } : null,
+      underlyingElement: underlying ? {
+        tag: String(underlying.tagName || "").toLowerCase(),
+        id: String(underlying.id || ""),
+        role: String(underlying.getAttribute?.("role") || ""),
+        ariaLabel: String(underlying.getAttribute?.("aria-label") || "").slice(0, 120),
+        agentOwned: isAgentOwnedElement(underlying),
+        rect: underlyingRect ? {
+          x: Math.round(underlyingRect.left),
+          y: Math.round(underlyingRect.top),
+          width: Math.round(underlyingRect.width),
+          height: Math.round(underlyingRect.height)
+        } : null
+      } : null
+    };
+  }
+
+  function clickPointIsClear(element) {
+    return clickPointEvidence(element).clear;
   }
 
   function revealabilityForElement(element, box = null) {
@@ -12730,7 +14045,8 @@
       ? surfaceMembershipForElement(element, surface)
       : { surfaceId: "", evidence: [] };
     const inCurrentSurface = Boolean(element && membership.surfaceId === expectedSurfaceId);
-    const hitTested = Boolean(enabled && inViewport && clickPointIsClear(element));
+    const hitTest = enabled && inViewport ? clickPointEvidence(element) : null;
+    const hitTested = Boolean(hitTest?.clear);
     const notOccluded = hitTested;
     const revealability = revealabilityForElement(element, box);
     const operationAuthorized = Boolean(operation);
@@ -12778,6 +14094,11 @@
                   ? "OPERATION_NOT_PROVEN"
                   : "OPERATION_NOT_AUTHORIZED";
     return {
+      visualRegion: box ? normalizeVisualRegionContract(box, {
+        operation,
+        source: "exact-actuator-actionability",
+        surfaceId: surface.id || ""
+      }) : null,
       rendered,
       visible,
       enabled,
@@ -12785,6 +14106,7 @@
       inCurrentSurface,
       hitTested,
       notOccluded,
+      selfOccluded: hitTest?.selfOccluded === true,
       targetable,
       operationAuthorized,
       operationProven: operationProven === true,
@@ -12792,6 +14114,7 @@
       executable,
       revealable,
       code,
+      hitTestEvidence: hitTest && (!hitTest.clear || hitTest.selfOccluded) ? hitTest : null,
       surfaceId: membership.surfaceId || "",
       operation,
       box
@@ -13271,6 +14594,9 @@
   function minimalActionResultForTransport(result = {}) {
     const outcome = result.outcome && typeof result.outcome === "object" ? result.outcome : {};
     const choiceCommit = compactChoiceCommitEvidence(outcome.evidence?.choiceCommit || null);
+    const exactChildSettlement = compactActionTransportValue(
+      outcome.evidence?.exactChildSettlement || null
+    );
     return {
       at: result.at || "",
       actionId: String(result.actionId || ""),
@@ -13307,7 +14633,10 @@
         code: String(outcome.code || result.failureCode || ""),
         message: compactText(outcome.message || "", 600),
         feedback: compactActionTransportValue(outcome.feedback || {}),
-        evidence: choiceCommit ? { choiceCommit } : {}
+        evidence: {
+          ...(choiceCommit ? { choiceCommit } : {}),
+          ...(exactChildSettlement ? { exactChildSettlement } : {})
+        }
       }
     };
   }
@@ -13947,6 +15276,18 @@
         transportMode: transport.transportMode
       });
       agent.lastBackendDebug = decision.debug || null;
+      const diagnosticTaskState = decision.debug?.taskState || null;
+      const processAwareness = decision.debug?.processAwareness
+        || diagnosticTaskState?.processAwareness
+        || null;
+      const transactionReview = decision.debug?.transactionReview
+        || diagnosticTaskState?.transactionReview
+        || null;
+      agent.processDiagnostics = processAwareness || transactionReview ? {
+        processAwareness,
+        transactionReview,
+        updatedAt: Date.now()
+      } : agent.processDiagnostics;
       const backendLatency = decision.debug?.latency || {};
       const modelUsage = decision.debug?.modelUsage || {};
       logAgentEvent("agent_decision", {
@@ -13977,6 +15318,11 @@
         classification_model_ms: backendLatency.classification_model_ms ?? null,
         verify_plan_model_ms: backendLatency.verify_plan_model_ms ?? null,
         policy_ms: backendLatency.policy_ms ?? null,
+        semantic_compile_ms: backendLatency.semantic_compile_ms ?? null,
+        task_state_ms: backendLatency.task_state_ms ?? null,
+        trace_write_ms: backendLatency.trace_write_ms ?? null,
+        final_state_persist_ms: backendLatency.final_state_persist_ms ?? null,
+        turn_total_ms: backendLatency.turn_total_ms ?? null,
         input_tokens: modelUsage.input_tokens ?? null,
         output_tokens: modelUsage.output_tokens ?? null,
         model: modelUsage.model || "",
@@ -13991,6 +15337,11 @@
         classification_model_ms: backendLatency.classification_model_ms ?? null,
         verify_plan_model_ms: backendLatency.verify_plan_model_ms ?? null,
         policy_ms: backendLatency.policy_ms ?? null,
+        semantic_compile_ms: backendLatency.semantic_compile_ms ?? null,
+        task_state_ms: backendLatency.task_state_ms ?? null,
+        trace_write_ms: backendLatency.trace_write_ms ?? null,
+        final_state_persist_ms: backendLatency.final_state_persist_ms ?? null,
+        turn_total_ms: backendLatency.turn_total_ms ?? null,
         input_tokens: modelUsage.input_tokens ?? null,
         output_tokens: modelUsage.output_tokens ?? null,
         model: modelUsage.model || "",
@@ -14724,7 +16075,7 @@
           decision,
           {
             ok: false,
-            code: "NAVIGATION_SETTLING",
+            code: "DUPLICATE_ACTION_PENDING_OBSERVATION",
             message: "An identical navigation action was dispatched recently; reobserve before retrying.",
             retryable: true
           }
@@ -14744,6 +16095,9 @@
         return;
       }
       const surfaceWasActive = Boolean(map.currentSurface?.type && map.currentSurface.type !== "page");
+      // The canonical page surface proves there is no foreground owner, so do
+      // not rescan the DOM for an overlay before dispatch. After dispatch, one
+      // bounded live probe can prove that a new modal/listbox appeared.
       const beforeOverlay = surfaceWasActive ? activeOverlayElements()[0] : null;
       const beforeOverlaySignature = beforeOverlay ? overlaySignature(beforeOverlay) : "";
       const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
@@ -14827,11 +16181,22 @@
       });
       if (surfaceWasActive) {
         const progress = await waitForOverlayProgress(beforeOverlay, beforeOverlaySignature, 2200);
-        const afterMap = (await observePageStateAfterMutation("verify_foreground_action", 650)).map;
-        const verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+        const verification = verificationFromSurfaceFeedback(
+          expectedOutcome,
+          map,
+          target,
+          { beforeOverlaySignature, progress }
+        ) || verifyExpectedOutcome(
+          expectedOutcome,
+          map,
+          (await observePageStateAfterMutation("verify_foreground_action", 650)).map,
+          target
+        );
         const verifiedResult = withChoiceCommitEvidence(
           withOverlayProgressEvidence(verification, progress),
-          choiceCommitResult
+          choiceCommitResult,
+          expectedOutcome,
+          decision
         );
         await pushVerificationLedger(actionId, actionObservationId, decision, expectedOutcome, verifiedResult);
         await verifyAgentStep(
@@ -14850,8 +16215,18 @@
         return;
       }
       await waitForUiSettle(800);
-      let afterMap = (await observePageStateAfterMutation("verify_click", 750)).map;
-      let verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+      const mechanicalVerification = verificationFromSurfaceFeedback(
+        expectedOutcome,
+        map,
+        target,
+        { beforeOverlaySignature }
+      );
+      let afterMap = map;
+      let verification = mechanicalVerification;
+      if (!verification) {
+        afterMap = (await observePageStateAfterMutation("verify_click", 750)).map;
+        verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
+      }
       if (!verification.ok && expectedOutcome.type === "exact_free_option_selected") {
         const settledChoice = await settleExactChoiceOutcome(
           target,
@@ -14863,7 +16238,12 @@
         afterMap = settledChoice.afterMap;
         verification = settledChoice.verification;
       }
-      const verifiedResult = withChoiceCommitEvidence(verification, choiceCommitResult);
+      const verifiedResult = withChoiceCommitEvidence(
+        verification,
+        choiceCommitResult,
+        expectedOutcome,
+        decision
+      );
       await finalizeGovernedAction(actionId, actionObservationId, decision, expectedOutcome, verifiedResult, 900);
       return;
     }
@@ -14955,7 +16335,11 @@
       const result = await setFieldValue(target, governedValue, {
         fieldType: decision.action,
         exactOption: decision.exactOption || decision.pipelineContract?.component?.exactOption || null,
-        resolveLiveElement
+        resolveLiveElement,
+        // The governed action lifecycle below emits the one authoritative
+        // result. The low-level setter must not independently POST a second
+        // anonymous field-fill result for the same operation.
+        reportResult: false
       });
       if (!result.ok) {
         await rejectMechanicalAction(actionId, actionObservationId, decision, {
@@ -15222,6 +16606,7 @@
     agent.messages = [];
     agent.reasoningLog = [];
     agent.actionHistory = [];
+    agent.processDiagnostics = null;
     agent.observerTab = agent.observerTab || "summary";
     setAgentActivity("Observing page (no actions will be taken)", travelerRules() || "Using saved traveler profile");
     agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "observe_only" }).map;
@@ -15270,6 +16655,7 @@
     agent.sessionProfileOverrides = {};
     agent.skipPaidExtrasApproved = shouldAutoDeclinePaidExtras();
     agent.actionHistory = [];
+    agent.processDiagnostics = null;
     resetFieldProgress();
     setAgentActivity("Starting checkout agent", travelerRules() || "Using saved traveler profile");
     agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "agent_start" }).map;
@@ -15307,9 +16693,22 @@
     agent.pendingInputRequest = null;
     agent.sessionProfileOverrides = {};
     agent.actionHistory = [];
+    agent.processDiagnostics = null;
     resetFieldProgress();
     setAgentActivity("Continuing checkout agent after page change", travelerRules() || "Using saved traveler profile");
-    agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "navigation_resume" }).map;
+    // A newly loaded checkout document is still hydrating when the content
+    // script starts. Building the entire page map immediately and then again
+    // after the old 650 ms delay caused two multi-second DOM scans on large
+    // airline pages. Let initial framework work land first, then create one
+    // atomic fresh observation which the first planning turn can reuse.
+    await sleep(650);
+    const resumedObservation = await pageStateStore.observeFresh({
+      reason: "navigation_resume",
+      maxWaitMs: 650,
+      maxAttempts: 2,
+      postBuildGraceMs: 100
+    });
+    agent.pageMap = rememberPagePlan(resumedObservation.map);
     const resumeSessionId = String(marker.sessionId || "");
     const session = resumeSessionId ? await startAgentSession(resumeSessionId) : null;
     if (!session || agent.sessionId !== resumeSessionId) {
@@ -15324,7 +16723,6 @@
     addAgentMessage("assistant", "Picking back up where I left off after the page changed.");
     renderSidebar("agent");
     await announceSectionQueue();
-    await sleep(650);
     processCheckoutAgent();
   }
 
@@ -15439,10 +16837,6 @@
       }
       if (issues.length >= 4) break;
     }
-
-    const emailInputs = candidateInputs().filter((input) => labelText(input).includes("email"));
-    const confirmEmail = emailInputs.find((input) => labelText(input).includes("confirm"));
-    if (confirmEmail && !confirmEmail.value) issues.unshift("confirm email is empty");
 
     const titleAreaVisible = document.body.innerText.toLowerCase().includes("title *") || document.body.innerText.toLowerCase().includes("you must enter a gender");
     const anyTitleChecked = [...document.querySelectorAll("input[type='radio']")]
@@ -15785,6 +17179,67 @@
     `;
   }
 
+  function diagnosticRoute(facts = {}) {
+    return (facts.itinerary?.segments || [])
+      .map((segment) => `${segment.origin || "?"} → ${segment.destination || "?"}`)
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  function diagnosticPrice(facts = {}) {
+    const amount = facts.totalPrice?.amount;
+    const currency = facts.totalPrice?.currency || facts.currency || "";
+    return amount == null ? "unknown" : `${amount} ${currency}`.trim();
+  }
+
+  function agentProcessDiagnosticsHtml() {
+    const diagnostics = agent.processDiagnostics;
+    if (!diagnostics) return "";
+    const awareness = diagnostics.processAwareness || {};
+    const review = diagnostics.transactionReview || {};
+    const baseline = review.baseline || {};
+    const current = review.reviewFacts || review.current || {};
+    const achievements = (awareness.achievements || []).slice(-4).reverse();
+    const unresolved = (awareness.unresolved || []).slice(0, 4);
+    const contradictions = review.contradictions || [];
+    const missing = review.missingFacts || [];
+    const route = diagnosticRoute(baseline) || diagnosticRoute(current) || "not established";
+    return `
+      <details class="atw-process-diagnostics" open>
+        <summary>Agent state · testing</summary>
+        <div class="atw-process-grid">
+          <div><span>Where</span><strong>${escapeHtml(awareness.currentPosition?.stage || agent.pageMap?.step || "observing")}</strong></div>
+          <div><span>Status</span><strong>${escapeHtml(awareness.status || (agent.running ? "in progress" : "waiting"))}</strong></div>
+          <div class="is-wide"><span>Doing</span><strong>${escapeHtml(awareness.currentObjective || agent.currentAction || "observe and plan the next safe action")}</strong></div>
+          <div class="is-wide"><span>Selected booking</span><strong>${escapeHtml(route)} · ${escapeHtml(diagnosticPrice(baseline))} · ${escapeHtml(review.baselineStatus || "collecting")}</strong></div>
+          <div class="is-wide"><span>Current/review evidence</span><strong>${escapeHtml(diagnosticPrice(current))}${review.ready === true ? " · verified" : ""}</strong></div>
+        </div>
+        ${achievements.length ? `<div class="atw-process-list"><span>Done</span>${achievements.map((item) => `<em>✓ ${escapeHtml(item.label || item.kind || item.achievementId)}</em>`).join("")}</div>` : ""}
+        ${unresolved.length || missing.length || contradictions.length ? `<div class="atw-process-list is-warn"><span>Still unresolved</span>${[...unresolved, ...missing.map((item) => `transaction: ${item}`), ...contradictions.map((item) => `conflict: ${item}`)].slice(0, 6).map((item) => `<em>${escapeHtml(item)}</em>`).join("")}</div>` : ""}
+      </details>
+    `;
+  }
+
+  function selectedBookingAcquisitionHtml() {
+    const acquisition = readSelectedBookingAcquisition();
+    const durable = agent.processDiagnostics?.transactionReview?.baseline || null;
+    const facts = acquisition?.facts || durable || null;
+    const segments = facts?.itinerary?.segments || [];
+    const captured = segments.length > 0 && segments.every((segment) => (
+      segment.origin && segment.destination && segment.departureDate
+    ));
+    const route = captured ? diagnosticRoute(facts) : "missing";
+    const dates = captured
+      ? segments.map((segment) => segment.departureDate).filter(Boolean).join(" · ")
+      : "departure date unavailable";
+    const source = acquisition
+      ? "captured before session"
+      : captured
+        ? "durable baseline"
+        : "not acquired";
+    return `<div class="atw-map-line">Selected booking: <strong>${captured ? "captured" : "missing"}</strong> · ${escapeHtml(route)} · ${escapeHtml(dates)} · ${escapeHtml(source)}</div>`;
+  }
+
   // Sidebar is logs-only by design: it starts the agent and shows what it's doing
   // (section checklist, reasoning log). Anything that needs the user's input is
   // asked on the page itself, next to the AI cursor — see cursorPromptHtml().
@@ -15793,6 +17248,8 @@
     return `
       ${agentStatusHtml(map)}
       <div class="atw-map-line">Reading ${map.site}: ${map.step.replace(/_/g, " ")} · ${map.summary.knownFields}/${map.summary.fields} fields · ${map.summary.paidChoices} paid areas</div>
+      ${selectedBookingAcquisitionHtml()}
+      ${agentProcessDiagnosticsHtml()}
       ${agentSectionsHtml(map)}
       ${agent.running ? agentReasoningHtml() : ""}
       ${agent.awaiting ? `<div class="atw-mini-note">Waiting for you — answer next to the AI cursor on the page.</div>` : ""}
@@ -16102,6 +17559,13 @@
   function watchForCheckoutChanges() {
     const observer = new MutationObserver((mutations) => {
       const pageChanged = pageStateStore.noteMutations(mutations);
+      const externalPageMutation = mutations.some((mutation) => {
+        const target = mutation.target?.nodeType === Node.ELEMENT_NODE
+          ? mutation.target
+          : mutation.target?.parentElement;
+        return !target?.closest?.("#atw-sidebar, #atw-agent-cursor, .atw-agent-cursor");
+      });
+      if (pageChanged && externalPageMutation) scheduleSelectedBookingCapture("dom_mutation");
       if (pageChanged && agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
         scheduleDestinationObservation("dom_mutation", 0);
       }
@@ -16136,7 +17600,10 @@
     window.addEventListener("resize", () => pageStateStore.noteEvent({ type: "viewport", target: document.documentElement }), { passive: true });
   }
 
-  window.addEventListener("pagehide", () => { saveResumeMarker(); });
+  window.addEventListener("pagehide", () => {
+    if (!agent.running) captureSelectedBookingFromMap(pageStateStore.current());
+    saveResumeMarker();
+  });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") saveResumeMarker();
   });
@@ -16155,6 +17622,8 @@
       },
       setAgentRunningForTest: (running) => { agent.running = Boolean(running); },
       setAgentSessionForTest: (sessionId) => { agent.sessionId = String(sessionId || ""); },
+      setProcessDiagnosticsForTest: (diagnostics = null) => { agent.processDiagnostics = diagnostics; },
+      renderSidebarForTest: (mode = "agent") => renderSidebar(mode),
       repeatGuardFor,
       repeatGuardState: () => ({
         lastClickSignature: agent.lastClickSignature,
@@ -16185,7 +17654,12 @@
       clearDestinationWait,
       isDestinationReadinessDecision,
       createObservationControlRegistry,
+      narrowerExactControlOwner,
       compactPageMap,
+      authoritativeSelectedBookingFacts,
+      captureSelectedBookingFromMap,
+      readSelectedBookingAcquisition,
+      scheduleSelectedBookingCapture,
       compactSurfaceReference,
       observationTransportBytes,
       observationNeedsScreenshot,
@@ -16206,6 +17680,7 @@
       mutationMayBeMaterial,
       observePageState: (options = {}) => pageStateStore.observe(options),
       observeFreshPageState: (options = {}) => pageStateStore.observeFresh(options),
+      verificationFromSurfaceFeedback,
       notePageMutations: (mutations = []) => pageStateStore.noteMutations(mutations),
       notePageEvent: (event = {}) => pageStateStore.noteEvent(event),
       pageStateStoreState: () => ({
@@ -16255,6 +17730,7 @@
 
   try {
     await fetchData();
+    captureSelectedBookingFromMap(pageStateStore.observe({ forceFull: true, reason: "selected_booking_initial" }).map);
     warnings = runRiskChecks();
     const resumeMarker = await readResumeMarker();
     const resumeIsFresh = Boolean(resumeMarker) && (Date.now() - (resumeMarker.savedAt || 0) < RESUME_MAX_AGE_MS);

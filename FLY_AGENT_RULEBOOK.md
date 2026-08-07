@@ -7,22 +7,27 @@ From a flight chosen in cart, this agent must complete checkout on unfamiliar ai
 - Apply traveler profile policy to select one exact action.
 - Execute only grounded actuators on the observed page.
 - Verify observed effects.
-- Continue only when proof is complete.
+- Use canonical semantics as the fast path; when semantics are incomplete, allow one exact low-consequence reversible mechanic through the shared governor and verifier.
+- Continue only when the resulting state change is freshly verified.
 - Stop at verified payment review, never trigger payment/card actions.
 
 ## Why this exists
 Our success depends less on per-site button labels and more on a robust, reusable decision pipeline.
 
 ## Current non-negotiable components
-1. Decision Evidence = what is actually on the page now.
-2. Decision-Effect Compiler = what the decision changes if accepted/rejected/selected.
-3. Profile Resolver = which decision is allowed/preferred from user policy.
-4. Grounded Actuator = exact button/link/input to execute.
-5. Verifier = checks whether the action changed the page as expected.
-6. Outcome Journal / Transaction Ledger = durable proof that the right decisions were applied.
-7. Transition Readiness = strict rules for moving to next step (seat, insurance, bundles, contacts, review).
+1. Current Obligation = the one exact active requirement, decision, or stage exit Fly is solving now.
+2. Decision Evidence = what is actually on the page now.
+3. Decision-Effect Compiler = what the decision changes if accepted/rejected/selected.
+4. Profile Resolver = which decision is allowed/preferred from user policy.
+5. Grounded Actuator = exact button/link/input owned by the Current Obligation.
+6. Verifier = checks whether the action changed the page as expected.
+7. Outcome Journal / Transaction Ledger = durable proof that the right decisions were applied.
+8. Consequence-Gated Adaptive Operator = the fallback that can try one exact current reversible control when canonical planning has no goal.
+9. Transition Readiness = rules for moving to the next step (seat, insurance, bundles, contacts, review).
 
-If any stage lacks one of these links, we are not at a universal solution.
+Transition Readiness owns only loading, hydration, and transport stability. It must not reinterpret semantic completeness, inherit a deadline from a different stage/surface/URL, or ask the traveler about internal mechanics. Once a destination is stable and exposes a checkout-relevant capability, the one runtime controller owns what to do next.
+
+The full semantic chain is mandatory for consequential choices and completion. It is supporting evidence—not a veto—for a harmless, exact, reversible mechanic whose outcome can be observed immediately.
 
 ## How to triage failures (first principles)
 When stuck, do not start with site-specific patches.
@@ -47,10 +52,13 @@ When stuck, do not start with site-specific patches.
 
 ## What to remove / simplify first
 - Remove duplicate inferencing that re-derives meaning already provided by the compiler.
+- Remove schedulers that skip the current field because its present actuator failed; keep the obligation and try bounded mechanics against it.
+- Keep unknown-surface observations as context only. Generic ambiguity itself is never executable, but it may trigger one bounded task over exact current low-consequence controls.
 - Remove heuristic guesses like "continue always means safe", "no thanks always free", "any matching label satisfies decision".
 - Remove navigation readiness that depends on stale or non-durable markers.
 - Remove broad route parsing where it overfits unrelated text as route data.
-- Remove any rule that asks user without bounded evidence deadline.
+- Remove any rule that asks the user to diagnose internal mechanics. User questions are for missing profile facts, authentication/challenges, consequential choices, or authority boundaries.
+- Remove any rule that promotes a positioned summary/sidebar to exclusive foreground from action words alone; blocking ownership requires structural evidence.
 
 ## What must always stay
 - Outcome verification before final success.
@@ -58,6 +66,32 @@ When stuck, do not start with site-specific patches.
 - Stale-action and duplicate-action refusal.
 - Route evidence dedup + richer-route merge rules.
 - Explicit policy-boundary checks for paid extras and unsupported actions.
+- Deterministic authority over identity, itinerary, price, legal acceptance, payment, purchase, and final completion.
+
+## The one runtime loop
+
+```text
+Observe a compact fresh surface
+→ prefer one canonical requirement/decision
+→ otherwise admit one exact safe reversible control
+→ consequence governor
+→ execute one atomic action
+→ fresh state-change verification
+→ persist verified progress or try one distinct bounded mechanic
+```
+
+Do not add a second planner, a generic blocked-navigation journey, or another completion receipt. Semantic classifiers inform this loop; they do not independently stop it.
+
+## Valid reasons to stop
+
+- A required traveler fact is genuinely missing.
+- CAPTCHA, OTP, login, bank approval, or another human challenge is active.
+- A consequential choice lacks profile policy or explicit authority.
+- Itinerary, price, currency, identity, legal, payment, or purchase evidence conflicts with the approved contract.
+- The website is unavailable or rejects valid completed input.
+- The bounded controller exhausted distinct grounded mechanics and reports an internal diagnostic.
+
+Do not ask the traveler because Fly could not classify an ordinary enabled button or because an internal semantic goal is absent.
 
 ## Minimal test of a fix
 Before moving to next bug:

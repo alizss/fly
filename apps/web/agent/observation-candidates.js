@@ -24,6 +24,23 @@ function normalizedRisk(risk = "", operation = "", structuredPrice = null) {
   return "uncertain";
 }
 
+function adaptiveMechanicalQuery(goal = {}, control = {}) {
+  const envelope = goal.adaptiveEnvelope || {};
+  const tried = new Set((envelope.queryHistory || []).map((value) => String(value || "").trim()).filter(Boolean));
+  const desired = String(goal.desiredValue ?? goal.canonicalValue ?? "").trim();
+  const digits = desired.replace(/\D/g, "");
+  const hypotheses = envelope.queryHypotheses?.length
+    ? envelope.queryHypotheses
+    : [digits && digits !== desired ? digits : "", ...(goal.choiceTerms || []), desired];
+  const current = String(
+    control.state?.normalizedValue
+    || control.currentValue
+    || ""
+  ).trim();
+  return [...new Set(hypotheses.map((value) => String(value || "").trim()).filter(Boolean))]
+    .find((value) => !tried.has(value) && value !== current) || "";
+}
+
 function semanticGoalForGroup(group = {}) {
   return `resolve ${group.sectionLabel || group.sectionType || group.requirementId || "current decision"}`;
 }
@@ -213,9 +230,16 @@ function controlsForGoal(page = {}, goal = {}) {
     const meaning = `${control.semantic || ""} ${control.semanticType || ""} ${control.meaning || ""}`.toLowerCase();
     return !isGlobalSiteChromeControl(control)
       && optionContractIsCoherent(control)
-      && !(/selection[_ -]?cta/.test(meaning) && !control.choiceContract);
+      && (
+        goal.kind === "adaptive_interaction"
+        || !(/selection[_ -]?cta/.test(meaning) && !control.choiceContract)
+      );
   });
   if (goal.semanticType === "completed_choice_surface") {
+    const exactIds = new Set((goal.actionableControlIds || []).filter(Boolean));
+    return controls.filter((control) => exactIds.has(control.controlId));
+  }
+  if (goal.kind === "adaptive_interaction") {
     const exactIds = new Set((goal.actionableControlIds || []).filter(Boolean));
     return controls.filter((control) => exactIds.has(control.controlId));
   }
@@ -309,6 +333,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   const freeAlternativeIds = new Set((goal.freeAlternativeControlIds || []).filter(Boolean));
   const paidAlternativeIds = new Set((goal.paidAlternativeControlIds || []).filter(Boolean));
   const semanticCorrectionIds = new Set((goal.semanticCorrectionControlIds || []).filter(Boolean));
+  const adaptiveSurface = goal.kind === "adaptive_surface";
 
   for (const control of controls) {
     const usable = Object.entries(control.operations || {}).flatMap(([operation, rawCapability]) => {
@@ -324,7 +349,15 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         .map((strategy) => ({ operation, capability, strategy }));
     });
     for (const { operation, capability, strategy } of usable) {
-      if (!["open", "choose", "activate", "keyboard"].includes(operation)) continue;
+      if (!["open", "choose", "activate", "keyboard", ...(adaptiveSurface ? ["type", "select"] : [])].includes(operation)) continue;
+      if (adaptiveSurface && operation === "type") {
+        const searchMeaning = `${control.kind || ""} ${control.role || ""} ${control.semantic || ""} ${control.label || ""}`.toLowerCase();
+        if (!/search|filter|query|find|textbox|searchbox/.test(searchMeaning)) continue;
+      }
+      const mechanicalQuery = adaptiveSurface && operation === "type"
+        ? adaptiveMechanicalQuery(goal, control)
+        : "";
+      if (adaptiveSurface && operation === "type" && !mechanicalQuery) continue;
       const completesChoiceSurface = goal.semanticType === "completed_choice_surface"
         && parentSurfaceControlIds.has(control.controlId);
       if (completesChoiceSurface && !["activate", "open"].includes(operation)) continue;
@@ -443,7 +476,16 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         targetLabel: control.label || control.accessibleName || control.semantic || operation,
         requirementId: goal.requirementId || "",
         intent: candidateIntent,
-        expectedOutcome: completesChoiceSurface ? {
+        expectedOutcome: adaptiveSurface && operation === "type" ? {
+          type: "semantic_progress",
+          controlId: control.controlId,
+          semanticType: goal.semanticType || "",
+          previousValue: String(control.state?.normalizedValue || control.currentValue || ""),
+          expectedNormalizedValue: mechanicalQuery,
+          canonicalTarget: String(goal.desiredValue ?? goal.canonicalValue ?? ""),
+          surfaceId: surface.id || "",
+          mustNotIncreasePrice: true
+        } : completesChoiceSurface ? {
           type: "active_surface_dismissed",
           controlId: control.controlId,
           decisionGroupId: goal.parentDecisionGroupId || goal.decisionGroupId || "",
@@ -477,7 +519,15 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         risk,
         requiresApproval: ["money", "payment", "legal"].includes(risk) && !paidAuthorization,
         visible,
-        value: "",
+        value: adaptiveSurface && operation === "type"
+          ? mechanicalQuery
+          : adaptiveSurface && operation === "select"
+            ? String(goal.desiredValue ?? goal.canonicalValue ?? "")
+          : "",
+        canonicalTarget: adaptiveSurface
+          ? String(goal.desiredValue ?? goal.canonicalValue ?? "")
+          : "",
+        mechanicalHypothesis: mechanicalQuery,
         keys: strategy.keys || (operation === "keyboard" ? "ArrowDown" : ""),
         needsReveal: !visible && actionability.revealable === true,
         summary: `${operation} the current ${control.label || control.semantic || "control"}${visible ? "." : " after revealing it."}`

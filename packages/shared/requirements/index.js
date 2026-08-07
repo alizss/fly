@@ -17,6 +17,7 @@
  * @property {string} label
  * @property {RequirementStatus} status
  * @property {boolean} required
+ * @property {boolean} requiresResolution
  * @property {RiskLevel} risk
  * @property {string[]} evidence
  * @property {number} confidence
@@ -45,6 +46,13 @@ function normalizeRequirement(raw = {}, index = 0) {
     label: String(raw.label || "").slice(0, 200),
     status: REQUIREMENT_STATUSES.has(raw.status) ? raw.status : "unknown",
     required: Boolean(raw.required),
+    // Visible optional UI is not automatically work. Producers may declare
+    // the one authoritative admission bit; required unresolved items retain
+    // the legacy-safe default when the bit is absent.
+    requiresResolution: raw.requiresResolution === true
+      || (raw.requiresResolution !== false
+        && raw.required === true
+        && !["satisfied", "waived_by_policy"].includes(raw.status)),
     risk: RISK_LEVELS.has(raw.risk) ? raw.risk : "uncertain",
     evidence: Array.isArray(raw.evidence) ? raw.evidence.map((item) => String(item).slice(0, 300)).slice(0, 5) : [],
     confidence: clampConfidence(raw.confidence),

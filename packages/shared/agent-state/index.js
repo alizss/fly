@@ -40,7 +40,6 @@
  * @property {string[]} travelerIds
  * @property {{host: string, url: string, sellerName?: string}} site
  * @property {CheckoutStep} currentStep
- * @property {{diagnosticOnly: true, requirements: import("../requirements").CheckoutRequirement[]}} legacyRequirementsDiagnostic
  * @property {ApprovalState} approvals
  * @property {import("../agent-actions").AgentAction|null} lastAction
  * @property {Object|null} lastVerification
@@ -54,15 +53,10 @@
  * @property {Object|null} taskState
  * @property {Object|null} terminalGoalLatch
  * @property {Object} observationReadiness
- * @property {Object|null} navigationSettling
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
  * @property {{semanticOwnership?: Object, candidateSelection?: Object}|null} aiDecisionCache
  * @property {Object|null} fastStaleRecovery
- * @property {string[]} attemptedCandidateIds
- * @property {Object[]} failedStrategyMemory
- * @property {string[]} blockedProfileGoalKeys
- * @property {string} blockedProfilePageStateHash
  * @property {Object} recoveryState
  * @property {Object[]} verifiedResults
  * @property {Object} userPolicy
@@ -102,7 +96,6 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     pendingUserInput: null,
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
     currentStep: "unknown",
-    legacyRequirementsDiagnostic: { diagnosticOnly: true, requirements: [] },
     currentObservation: null,
     currentGoal: null,
     currentObligation: null,
@@ -116,19 +109,16 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
       reason: "",
       evidence: null
     },
-    navigationSettling: null,
     pendingAction: null,
     actionLifecycle: null,
     aiDecisionCache: null,
     fastStaleRecovery: null,
-    attemptedCandidateIds: [],
-    failedStrategyMemory: [],
-    blockedProfileGoalKeys: [],
-    blockedProfilePageStateHash: "",
     recoveryState: {
       attempts: 0,
       phase: "idle",
       stateHash: "",
+      attemptedCandidateIds: [],
+      failedStrategies: [],
       failedStrategySignatures: [],
       lastCode: "",
       lastRevealSample: null,
@@ -151,7 +141,18 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
 }
 
 function withUpdate(state, patch) {
-  return { ...state, ...patch, updatedAt: nowIso() };
+  const merged = { ...state, ...patch, updatedAt: nowIso() };
+  // One obligation-owned recovery state is authoritative. Remove historical
+  // scheduler/diagnostic fields whenever a session advances so old persisted
+  // sessions cannot reactivate competing runtime paths.
+  delete merged.legacyRequirementsDiagnostic;
+  delete merged.navigationSettling;
+  delete merged.attemptedCandidateIds;
+  delete merged.attemptedStrategySignatures;
+  delete merged.failedStrategyMemory;
+  delete merged.blockedProfileGoalKeys;
+  delete merged.blockedProfilePageStateHash;
+  return merged;
 }
 
 function normalizeStep(step) {

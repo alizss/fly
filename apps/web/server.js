@@ -19,6 +19,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const agentLoop = require("./agent/loop");
 const agentSessionStore = require("./agent/session-store");
 const agentTraceStore = require("./agent/trace-store");
+const { prepareTransactionInvariants } = require("./agent/invariants");
 const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
 const { PAGE_SURFACE_ID, normalizeSurface } = require("./agent/surface-contract");
 const { normalizeCanonicalDate } = require("./agent/date-field-codec");
@@ -39,6 +40,11 @@ function finiteNumberOrNull(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function normalizeTravelPurpose(value, fallback = "leisure") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["leisure", "business"].includes(normalized) ? normalized : fallback;
+}
+
 function summarizeAgentSession(session) {
   if (!session) return null;
   return {
@@ -56,7 +62,7 @@ function summarizeAgentSession(session) {
     lastPageSummary: {
       site: session.site?.host || "",
       url: session.site?.url || "",
-      requirements: (session.legacyRequirementsDiagnostic?.requirements || []).length,
+      requirements: 0,
       missing: (session.taskState?.activeDecisions || []).filter((decision) => decision.required === true).length
         + (session.taskState?.validationBlockers || []).length
     },
@@ -76,7 +82,7 @@ function createAgentSession(body = {}) {
     travelerId: clampText(traveler.id || body.travelerId || "", 120),
     site: { host: body.page?.site || "", url: body.page?.url || "" }
   });
-  const updated = withUpdate(state, {
+  let updated = withUpdate(state, {
     status: "running",
     userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
     travelerIds: [traveler.id || body.travelerId || state.travelerId].filter(Boolean),
@@ -94,6 +100,18 @@ function createAgentSession(body = {}) {
       priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
     }
   });
+  const selectedBooking = validatedSelectedBookingAcquisition(body.selectedBooking);
+  if (selectedBooking) {
+    updated = prepareTransactionInvariants(updated, {
+      observationId: selectedBooking.observationId,
+      page: {
+        site: body.page?.site || "",
+        url: selectedBooking.sourceUrl || body.page?.url || "",
+        step: "flight_selection",
+        transactionFacts: selectedBooking.facts
+      }
+    }, traveler).state;
+  }
   agentSessionStore.saveSession(updated);
   return updated;
 }
@@ -197,6 +215,7 @@ function seedDb() {
         emergency_contact_email: "jordan.example@example.test",
         meal_preference: "standard meal",
         special_assistance: "none",
+        travel_purpose: "leisure",
         preferred_seat: "aisle",
         baggage_preference: "cabin bag",
         default_cabin: "economy",
@@ -276,6 +295,7 @@ function readDb() {
       billing_address: "22 Market Street, San Francisco, CA 94105",
       billing_email: traveler.email || "invoices@example.com",
       payment_preference: "browser saved card",
+      travel_purpose: "leisure",
       booking_rules: "Avoid paid seats, insurance, support bundles, SMS updates, and paid extras unless I explicitly approve. Stop before real payment."
     };
     for (const [key, value] of Object.entries(defaults)) {
@@ -283,6 +303,11 @@ function readDb() {
         traveler[key] = value;
         changed = true;
       }
+    }
+    const normalizedTravelPurpose = normalizeTravelPurpose(traveler.travel_purpose);
+    if (traveler.travel_purpose !== normalizedTravelPurpose) {
+      traveler.travel_purpose = normalizedTravelPurpose;
+      changed = true;
     }
     if (!traveler.gender && traveler.first_name === "Maya" && traveler.last_name === "Patel") {
       traveler.gender = "female";
@@ -309,6 +334,7 @@ function publicTraveler(db, traveler) {
   const document = db.traveler_documents.find((doc) => doc.traveler_profile_id === traveler.id);
   return {
     ...traveler,
+    travel_purpose: normalizeTravelPurpose(traveler.travel_purpose),
     document: document
       ? {
           id: document.id,
@@ -790,6 +816,16 @@ function mergeObservationRecords(previous = [], incoming = [], key, removedIds =
 
 function hydrateIncrementalAgentBody(body = {}) {
   const update = body.observationUpdate || {};
+  // Reference-only transport is not part of this backend contract. A stale
+  // extension must be forced through its existing full-resynchronization path;
+  // otherwise the empty reference shell can be admitted as the canonical page
+  // and erase every current control.
+  if (update.mode === "reference" || body.page?.referenceOnly === true) {
+    const error = new Error("Reference-only observations require a full canonical resynchronization.");
+    error.code = "OBSERVATION_RESYNC_REQUIRED";
+    error.retryable = true;
+    throw error;
+  }
   if (update.mode !== "incremental" || body.page?.incremental !== true) return body;
   const sessionId = clampText(body.sessionId || "", 120);
   const previous = sessionId ? agentSessionStore.getCurrentObservation(sessionId) : null;
@@ -851,6 +887,8 @@ function compactTransactionFactEvidence(entry = null) {
   return {
     source: clampText(entry.source || "unknown", 80),
     ownerKey: clampText(entry.ownerKey, 180),
+    role: clampText(entry.role, 40),
+    ownerType: clampText(entry.ownerType, 60),
     qualification: clampText(entry.qualification, 80),
     observationId: clampText(entry.observationId, 120),
     confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0)),
@@ -867,6 +905,7 @@ function compactTransactionFacts(facts = null) {
       })).filter((entry) => entry.segmentId && entry.ownerKey).slice(0, 12)
     : [];
   return {
+    contractVersion: clampText(facts.contractVersion, 40),
     evidenceMode: clampText(facts.evidenceMode, 20),
     itinerary: {
       completeness: clampText(facts.itinerary?.completeness || "unknown", 20),
@@ -925,6 +964,42 @@ function compactTransactionFacts(facts = null) {
           confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0))
         })).slice(0, 20)
       : []
+  };
+}
+
+function validatedSelectedBookingAcquisition(raw = null) {
+  if (!raw || typeof raw !== "object") return null;
+  const facts = compactTransactionFacts(raw.facts || raw);
+  const segments = facts?.itinerary?.segments || [];
+  const evidence = facts?.factEvidence?.itinerary || [];
+  const totalAmount = finiteNumberOrNull(facts?.totalPrice?.amount);
+  const totalCurrency = clampText(facts?.totalPrice?.currency || facts?.currency, 20).toUpperCase();
+  const totalEvidence = facts?.factEvidence?.totalPrice || null;
+  const authoritativeTotal = totalAmount != null
+    && totalAmount >= 0
+    && Boolean(totalCurrency)
+    && totalEvidence?.authoritative === true
+    && totalEvidence?.role === "booking_total"
+    && Boolean(totalEvidence?.ownerKey);
+  const complete = facts?.evidenceMode === "typed"
+    && facts?.itinerary?.completeness === "complete"
+    && segments.length > 0
+    && authoritativeTotal
+    && segments.every((segment) => {
+      const proof = segment.evidence || evidence.find((entry) => entry.segmentId === segment.segmentId) || null;
+      return Boolean(
+        segment.origin
+        && segment.destination
+        && segment.departureDate
+        && proof?.authoritative === true
+        && proof.ownerKey
+      );
+    });
+  if (!complete) return null;
+  return {
+    observationId: clampText(raw.observationId || `selected_booking_${Date.now()}`, 120),
+    sourceUrl: clampText(raw.sourceUrl, 1000),
+    facts
   };
 }
 
@@ -1083,6 +1158,7 @@ function compactAgentPayload(rawBody) {
       emergency_contact_email: clampText(traveler.emergency_contact_email, 160),
       meal_preference: clampText(traveler.meal_preference, 120),
       special_assistance: clampText(traveler.special_assistance, 500),
+      travel_purpose: normalizeTravelPurpose(traveler.travel_purpose),
       payment_preference: clampText(traveler.payment_preference, 120),
       baggage_preference: clampText(traveler.baggage_preference, 120),
       preferred_seat: clampText(traveler.preferred_seat, 120),
@@ -1252,12 +1328,21 @@ async function decideAgentNextActionViaLoop(body) {
     lastActionResult: payload.lastActionResult || null
   };
 
-  agentSessionStore.recordObservation(state.id, observation);
+  // The loop owns the single authoritative state commit for this turn. The
+  // immutable observation row is recorded first so governance can reference
+  // it, but recording it must not rewrite the full transaction state.
+  agentSessionStore.recordObservation(state.id, observation, { updateSession: false });
   // Previous browser evidence is read from the durable ledger and attached
   // only for this turn. It is not nested into the newly persisted observation.
   observation.previousObservation = previousObservation;
-  state = agentSessionStore.getSession(state.id) || state;
-  state = agentSessionStore.saveSession(withUpdate(state, {
+  state = withUpdate(state, {
+    currentObservationId: payload.observationId,
+    currentObservationHash: payload.observationSnapshot?.snapshotHash || payload.page?.snapshotHash || "",
+    site: {
+      ...(state.site || {}),
+      host: String(payload.page?.site || state.site?.host || ""),
+      url: String(payload.page?.url || state.site?.url || "")
+    },
     userIntent: payload.userIntent || state.userIntent || state.goal,
     travelerIds: [payload.traveler?.id || state.travelerId].filter(Boolean),
     userPolicy: canonicalizeUserPolicy({
@@ -1279,7 +1364,7 @@ async function decideAgentNextActionViaLoop(body) {
       paymentAuthorization: payload.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
       priceAuthorization: payload.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
     }
-  }));
+  });
 
   logAgent("loop turn start", { clientTurnId: payload.clientTurnId, observationId: payload.observationId, sessionId: state.id, site: payload.page?.site, step: state.currentStep, stallCount: state.stallCount || 0 });
 
@@ -1298,7 +1383,6 @@ async function decideAgentNextActionViaLoop(body) {
       transactionStore: agentSessionStore,
       clientTurnId: payload.clientTurnId
     });
-    agentSessionStore.saveSession(nextState);
     const latency = debug?.latency || {};
     const modelUsage = debug?.modelUsage || {};
     logAgent("loop turn decision", {
@@ -1325,6 +1409,11 @@ async function decideAgentNextActionViaLoop(body) {
       classification_model_ms: latency.classification_model_ms ?? null,
       verify_plan_model_ms: latency.verify_plan_model_ms ?? null,
       policy_ms: latency.policy_ms ?? null,
+      semantic_compile_ms: latency.semantic_compile_ms ?? null,
+      task_state_ms: latency.task_state_ms ?? null,
+      trace_write_ms: latency.trace_write_ms ?? null,
+      final_state_persist_ms: latency.final_state_persist_ms ?? null,
+      turn_total_ms: latency.turn_total_ms ?? null,
       input_tokens: modelUsage.input_tokens ?? null,
       output_tokens: modelUsage.output_tokens ?? null,
       model: modelUsage.model || AGENT_MODEL,
@@ -1501,6 +1590,7 @@ function travelerFromBody(body, existing = {}) {
     emergency_contact_email: body.emergency_contact_email || "",
     meal_preference: body.meal_preference || "",
     special_assistance: body.special_assistance || "",
+    travel_purpose: normalizeTravelPurpose(body.travel_purpose || existing.travel_purpose),
     preferred_seat: body.preferred_seat || "no preference",
     baggage_preference: body.baggage_preference || "personal item",
     default_cabin: body.default_cabin || "economy",

@@ -1,4 +1,9 @@
-const { profileStageReadiness, selectExecutableProfileGoal } = require("./skill-expander");
+const {
+  fieldDescriptors,
+  profileStageReadiness,
+  selectNextProfileRequirement,
+  verifiedProfileComponentMatchesDescriptor
+} = require("./skill-expander");
 const { currentSurface, controlBelongsToCurrentSurface } = require("./surface-contract");
 const { outcomeContractForGoal } = require("./action-semantics");
 const { decisionInstanceKey } = require("../../../packages/shared/agent-actions");
@@ -10,6 +15,8 @@ const {
 } = require("./canonical-decision");
 const { normalizeProfilePolicy, seatPolicyFrom } = require("./policy-profile");
 const { canonicalDecisionOwnerKey } = require("./transaction-facts");
+const { missingDerivedFactDependency } = require("./logical-field");
+const { adaptiveInteractionGoal } = require("./adaptive-interaction");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 const COMPLETED = new Set(["satisfied", "waived", "waived_by_policy"]);
@@ -22,6 +29,15 @@ function clean(value = "") {
 
 function lower(value = "") {
   return clean(value).toLowerCase();
+}
+
+function unblockedStageExitReady(page = {}) {
+  const exit = page.stageExit || {};
+  if (exit.continueDisabled === true || exit.navigationState === "disabled") return false;
+  const readyCandidate = (exit.candidates || []).some((candidate) => (
+    candidate.executable === true || candidate.status === "ready"
+  ));
+  return Boolean(readyCandidate && !(exit.blockers || []).length);
 }
 
 function groupId(group = {}) {
@@ -114,11 +130,11 @@ function decisionFamily(group = {}) {
     if (["seat", "baggage", "insurance", "extras"].includes(resolvedFamily)) return resolvedFamily;
   }
   const text = lower(`${group.sectionType || ""} ${group.sectionLabel || ""} ${group.requirementId || ""}`);
+  if (/legal|terms|conditions|consent|agree|acceptance/.test(text)) return "legal";
   if (/seat/.test(text)) return "seat";
   if (/bag|luggage/.test(text)) return "baggage";
   if (/insurance|cancellation|protection/.test(text)) return "insurance";
   if (/bundle|support|sms|flexible|extra|add.?on/.test(text)) return "extras";
-  if (/legal|terms|consent/.test(text)) return "legal";
   if (/payment|card|pay/.test(text)) return "payment";
   return "decision";
 }
@@ -128,11 +144,16 @@ function stageEvidence(observation = {}) {
   const controls = page.controls || [];
   const fields = page.fields || [];
   const surface = currentSurface(page);
+  const activeRepresentations = controls.concat(fields).filter((control) => (
+    control.representationLifecycle?.status !== "dormant_hidden"
+    && control.representationLifecycle?.active !== false
+    && (control.surfaceId ? controlBelongsToCurrentSurface(control, page) : true)
+  ));
   const url = lower(page.url || observation.url);
   const controlText = (control = {}) => lower(
     `${control.fieldType || ""} ${control.field || ""} ${control.semanticType || ""} ${control.semantic || ""} ${control.inputType || ""} ${control.autocomplete || ""} ${control.name || ""} ${control.testId || ""} ${control.stableKey || ""}`
   );
-  const directControlText = controls.concat(fields).map(controlText).join(" ");
+  const directControlText = activeRepresentations.map(controlText).join(" ");
   const primarySections = (page.sections || []).filter((section) => (
     !/order|summary|price|total|itinerary/.test(lower(`${section.type || ""} ${section.sectionType || ""}`))
   ));
@@ -148,7 +169,7 @@ function stageEvidence(observation = {}) {
     headingText,
     ...(page.sections || []).map((section) => `${section.type || ""} ${section.label || ""}`),
     ...(page.decisionGroups || []).map((group) => `${group.sectionType || ""} ${group.sectionLabel || ""}`),
-    ...controls.slice(0, 180).map((control) => `${control.field || ""} ${control.semantic || ""} ${control.label || ""} ${control.inputType || ""}`)
+    ...activeRepresentations.slice(0, 180).map((control) => `${control.field || ""} ${control.semantic || ""} ${control.label || ""} ${control.inputType || ""}`)
   ].filter(Boolean).join(" "));
   const progressFacts = page.checkoutProgress
     || page.progress
@@ -211,16 +232,20 @@ function stageEvidence(observation = {}) {
     .filter((key) => payment[key]).length;
   const confirmation = /booking confirmed|booking reference|reservation number|confirmation number|\bpnr\b/.test(headingText)
     || /confirmation|booking-confirmed/.test(url);
-  const seat = /(?:^|[\/#?&_-])seats?(?:[\/#?&=_-]|$)/.test(url)
+  const seatRoute = /(?:^|[\/#?&_-])seats?(?:[\/#?&=_-]|$)/.test(url);
+  const extrasRoute = /\/(?:cabin-?bags?|hold-?bags?|bags?|baggage|luggage|extras?|ancillar(?:y|ies)|insurance|bundles?)(?:\/|$)/.test(url);
+  const seat = seatRoute
     || /seat_option|seat_map|seat_selection/.test(directControlText)
     || /seat selection|reserve seating|seat map/.test(headingText)
     || (surface.type !== "page" && /seat|seating/.test(lower(surface.label)));
   const traveler = /(?:^|[\/#?&_-])(?:travell?er|passenger|contact)(?:[\/#?&=_-]|$)/.test(url)
     || /first_name|last_name|surname|full_name|email|phone|date_of_birth|dob|passport|nationality|traveler_title/.test(directControlText)
     || /travell?er information|passenger details|contact information/.test(headingText);
-  const extras = (page.decisionGroups || []).some((group) => ["seat", "baggage", "insurance", "extras"].includes(decisionFamily(group)))
+  const extras = extrasRoute
+    || (page.decisionGroups || []).some((group) => ["seat", "baggage", "insurance", "extras"].includes(decisionFamily(group)))
     || /(?:^|[\/#?&_-])(?:extras?|ancillar(?:y|ies)?|baggage|bundle|insurance)(?:[\/#?&=_-]|$)/.test(url)
     || /baggage|insurance|bundle|flexible ticket|add.?on|upgrade your trip/.test(headingText);
+  const strongExtras = /add your hold bags|hold (?:bag|baggage|luggage) options?|select (?:your )?(?:cabin|checked|hold) bags?|add (?:a |your )?(?:cabin|checked|hold) bags?/.test(headingText);
   const flight = /(?:^|[\/#?&_-])(?:flights?|search)(?:[\/#?&=_-]|$)/.test(url)
     || /select flight|choose flight|flight selection|fare selection/.test(headingText);
   return {
@@ -229,8 +254,11 @@ function stageEvidence(observation = {}) {
     terminalEvidence,
     confirmation,
     seat,
+    seatRoute,
     traveler,
     extras,
+    extrasRoute,
+    strongExtras,
     flight,
     newSearchRoute,
     activeProgressText,
@@ -249,6 +277,10 @@ function decideStage(observation = {}) {
   // Search/start routes are outside an active checkout. Route structure is
   // stronger than stale extras copy retained in a rerendered shell.
   if (evidence.newSearchRoute) return { stage: "flight_selection", evidence };
+  // Active ancillary routes outrank stale checkout-progress labels such as
+  // "Seat selection" that remain visible throughout later bag pages.
+  if (evidence.extrasRoute) return { stage: "extras", evidence };
+  if (evidence.strongExtras) return { stage: "extras", evidence };
   if (surface.type !== "page" && evidence.seat) return { stage: "seats", evidence };
   if (evidence.traveler) return { stage: "traveler_information", evidence };
   if (evidence.seat) return { stage: "seats", evidence };
@@ -281,8 +313,9 @@ function completedMap(previousTaskState = {}) {
 function forwardControlIds(observation = {}) {
   const page = observation.page || {};
   const explicitStageExitIds = new Set([
-    page.stageExit?.continueControlId,
-    page.stageExit?.continueTargetId
+    ...(page.stageExit?.candidates || [])
+      .filter((candidate) => candidate.status === "ready" || candidate.executable === true)
+      .flatMap((candidate) => [candidate.controlId, candidate.actuatorId])
   ].filter(Boolean));
   return (page.controls || []).filter((control) => {
     if (!controlBelongsToCurrentSurface(control, page)) return false;
@@ -295,10 +328,16 @@ function forwardControlIds(observation = {}) {
 }
 
 function controlHasExecutableCapability(control = {}) {
-  return Object.values(control.operations || {}).some((capability) => (
-    capability?.actionability?.executable === true
-    || capability?.actionability?.revealable === true
-  ));
+  const disabledState = control.disabled === true || control.state?.disabled === true;
+  return Object.values(control.operations || {}).some((capability) => {
+    const actuatorId = capability?.actuatorId || "";
+    const disabledActuator = disabledState
+      && (!actuatorId || actuatorId === control.stateElementId);
+    return !disabledActuator && (
+      capability?.actionability?.executable === true
+      || capability?.actionability?.revealable === true
+    );
+  });
 }
 
 function capabilitiesForDecision(decision = {}, observation = {}) {
@@ -345,6 +384,12 @@ function optionLooksExplicitlyFree(control = {}) {
 
 function optionIsBoundedChoice(control = {}) {
   return /radio|checkbox|option|choice/.test(lower(`${control.kind || ""} ${control.role || ""} ${control.semantic || ""}`));
+}
+
+function policyOutcomeAllowsStageExit(decision = {}) {
+  return /random_assignment|declin|skip|no_selection|without_selection|not_selected|keep_unselected/.test(
+    lower(decision.userIntent?.desiredOutcome || "")
+  );
 }
 
 function decisionOptionContract(decision = {}, observation = {}) {
@@ -418,23 +463,6 @@ function decisionOptionContract(decision = {}, observation = {}) {
     policyAllowedControlIds: [],
     policyChoiceBounded: false
   };
-}
-
-function ambiguityGoal(observation = {}, reason = "unknown_surface") {
-  const surface = currentSurface(observation.page || {});
-  return Object.freeze({
-    goalId: `${observation.observationId || "observation"}:goal:interpret_surface`,
-    semanticGoal: "interpret and resolve the current foreground surface",
-    semanticType: "surface_ambiguity",
-    desiredValue: "safe_progress",
-    decisionGroupId: "",
-    requirementId: "",
-    surfaceId: surface.id || "surface-page",
-    observationId: observation.observationId || "",
-    selectionMode: "ai_ambiguity",
-    ambiguityReason: reason,
-    postcondition: { type: "surface_change_or_feedback" }
-  });
 }
 
 function goalForDecision(decision = {}, observation = {}, userPolicy = {}, traveler = {}) {
@@ -1598,34 +1626,6 @@ function choiceDecisionEpisode({
   });
 }
 
-function blockedNavigationGoal(observation = {}, decision = null) {
-  const surface = currentSurface(observation.page || {});
-  const controlId = clean(decision?.physicalControlIds?.[0]);
-  const control = (observation.page?.controls || []).find((item) => item.controlId === controlId) || {};
-  const blockers = [
-    ...(observation.page?.stageExit?.blockers || []),
-    ...(observation.page?.validationIssues || []).map((issue) => issue.message || issue.label || issue.code)
-  ].map(clean).filter(Boolean);
-  return Object.freeze({
-    goalId: `${observation.observationId || "observation"}:goal:diagnose_blocked_navigation`,
-    semanticGoal: `diagnose why ${clean(control.label || decision?.subject?.label || "Continue")} is unavailable`,
-    semanticType: "blocked_navigation",
-    desiredValue: "identify_and_resolve_blocker",
-    decisionGroupId: "",
-    requirementId: "",
-    surfaceId: surface.id || "surface-page",
-    observationId: observation.observationId || "",
-    diagnosticControlId: controlId,
-    actionableControlIds: controlId ? [controlId] : [],
-    blockerEvidence: Object.freeze(blockers),
-    postcondition: Object.freeze({
-      type: "navigation_enabled_or_blocker_identified",
-      controlId,
-      previousDisabled: control.disabled === true || control.state?.disabled === true
-    })
-  });
-}
-
 function terminalForStage(stage = "unknown") {
   if (stage === "payment") return "payment_review_reached";
   if (stage === "confirmation") return "confirmation_reached";
@@ -1847,6 +1847,260 @@ function createSurfaceSubgoal(previousTaskState = {}, goal = null, surface = {},
   });
 }
 
+const ADAPTIVE_SURFACE_MAX_STEPS = 6;
+const ADAPTIVE_SURFACE_DEADLINE_MS = 20_000;
+
+function boundedAdaptiveQueryHypotheses(goal = {}) {
+  const desired = clean(goal.desiredValue || goal.canonicalValue);
+  const terms = [
+    ...(goal.choiceTerms || []),
+    ...(goal.options || []).flatMap((option) => [option?.label, option?.value]),
+    desired
+  ].map(clean).filter(Boolean);
+  const digits = desired.replace(/\D/g, "");
+  const textual = terms.filter((term) => (
+    /[a-z]/i.test(term)
+    && lower(term) !== lower(desired)
+    && !/^(?:select|choose|search|find|country|code|phone|dial|calling)$/i.test(term)
+  ));
+  return Object.freeze([...new Set([
+    digits && digits !== desired ? digits : "",
+    ...textual,
+    desired
+  ].filter(Boolean).map((value) => value.slice(0, 120)))].slice(0, 4));
+}
+
+function verifiedReversibleSurfaceEntry(actionResult = {}) {
+  const expectedOutcome = actionResult.expectedOutcome || {};
+  const action = actionResult.action || {};
+  return Boolean(
+    actionResult.verified === true
+    && actionResult.expectedOutcomeObserved === true
+    && actionResult.postconditionSatisfied === true
+    && (
+      expectedOutcome.type === "options_surface_appeared"
+      || action.operation === "open"
+      || action.mechanicalEffect === "open_surface"
+    )
+  );
+}
+
+function verifiedProfileComponentIdentity(value = {}) {
+  return [
+    clean(value.subjectId || "traveler_1"),
+    clean(value.logicalFieldId || value.semanticType),
+    clean(value.componentRole || "value")
+  ].join("::");
+}
+
+function verifiedProfileComponentFromActionResult(actionResult = null, observationId = "") {
+  if (!actionResult || typeof actionResult !== "object") return null;
+  const expected = actionResult.expectedOutcome || {};
+  const proof = actionResult.outcome?.evidence?.exactChildSettlement || {};
+  const verified = Boolean(
+    actionResult.verified === true
+    && actionResult.expectedOutcomeObserved === true
+    && actionResult.postconditionSatisfied === true
+    && actionResult.outcome?.ok === true
+    && clean(actionResult.outcome?.code || actionResult.failureCode) === "LOGICAL_COMPONENT_COMMITTED"
+  );
+  if (!verified || expected.type !== "logical_component_committed") return null;
+  const completion = {
+    contractVersion: "verified-profile-component/v1",
+    completionId: verifiedProfileComponentIdentity({
+      subjectId: expected.subjectId,
+      logicalFieldId: expected.logicalFieldId,
+      semanticType: expected.semanticType,
+      componentRole: expected.componentRole
+    }),
+    status: "verified",
+    actionId: clean(actionResult.actionId || actionResult.action?.id),
+    observationId: clean(observationId || actionResult.resultObservationId || actionResult.observationId),
+    logicalFieldId: clean(expected.logicalFieldId),
+    subjectId: clean(expected.subjectId || "traveler_1"),
+    semanticType: clean(expected.semanticType),
+    componentRole: clean(expected.componentRole || "value"),
+    parentControlId: clean(expected.controlId),
+    selectedControlId: clean(proof.selectedControlId || actionResult.controlId || actionResult.action?.controlId),
+    selectedActuatorId: clean(proof.selectedActuatorId || actionResult.action?.actuatorId || actionResult.action?.targetId),
+    desiredCanonicalValue: clean(
+      proof.desiredCanonicalValue
+      || expected.expectedCanonicalValue
+      || expected.expectedNormalizedValue
+      || expected.expectedComponentValue
+    ),
+    selectedCanonicalValue: clean(
+      proof.selectedCanonicalValue
+      || actionResult.action?.value
+      || actionResult.action?.targetLabel
+    ),
+    evidenceSource: proof.contractVersion === "exact-child-choice-settlement/v1"
+      ? "canonical_exact_child_verifier"
+      : "canonical_parent_state_verifier"
+  };
+  if (!completion.completionId || !completion.actionId || !completion.selectedCanonicalValue) return null;
+  if (!agentContract.profileChoiceValueCompatible(
+    completion.selectedCanonicalValue,
+    completion.desiredCanonicalValue,
+    completion.semanticType
+  )) return null;
+  return Object.freeze(completion);
+}
+
+function verifiedProfileComponentContradicted(completion = {}, observation = {}, traveler = {}) {
+  const matching = fieldDescriptors(observation, traveler).filter((descriptor) => (
+    verifiedProfileComponentMatchesDescriptor(completion, descriptor)
+    || Boolean(
+      completion.logicalFieldId
+      && descriptor.logicalFieldId
+      && completion.logicalFieldId === descriptor.logicalFieldId
+    )
+  ));
+  if (!matching.length) return false;
+  return matching.some((descriptor) => {
+    const validationErrors = [
+      ...(descriptor.validationIssues || []),
+      ...(descriptor.logicalFieldValidationIssues || [])
+    ];
+    if (validationErrors.length) return true;
+    const currentValue = clean(
+      descriptor.currentNormalizedValue
+      || descriptor.control?.state?.normalizedValue
+      || descriptor.control?.state?.selectedValue
+      || descriptor.control?.state?.optionValue
+    );
+    return Boolean(
+      currentValue
+      && !agentContract.profileChoiceValueCompatible(
+        currentValue,
+        completion.desiredCanonicalValue,
+        completion.semanticType
+      )
+    );
+  });
+}
+
+function reconcileVerifiedProfileComponents(previous = [], admitted = null, observation = {}, traveler = {}) {
+  const components = new Map();
+  for (const completion of Array.isArray(previous) ? previous : []) {
+    if (completion?.contractVersion === "verified-profile-component/v1" && completion?.status === "verified") {
+      components.set(completion.completionId, completion);
+    }
+  }
+  if (admitted) components.set(admitted.completionId, admitted);
+  for (const [completionId, completion] of components.entries()) {
+    if (verifiedProfileComponentContradicted(completion, observation, traveler)) components.delete(completionId);
+  }
+  return Object.freeze([...components.values()].slice(-80));
+}
+
+function verifiedProfileComponentMatchesDecision(completion = {}, decision = {}) {
+  if (clean(decision.family || decision.subject?.family) !== "profile") return false;
+  const semanticType = clean(
+    decision.semanticType
+    || decision.subject?.key
+    || decision.observed?.fieldType
+    || decision.observed?.semanticType
+  );
+  if (!semanticType || semanticType !== clean(completion.semanticType)) return false;
+  const physicalControlIds = new Set([
+    ...(decision.physicalControlIds || []),
+    decision.controlId,
+    decision.observed?.controlId
+  ].map(clean).filter(Boolean));
+  return Boolean(completion.parentControlId && physicalControlIds.has(clean(completion.parentControlId)));
+}
+
+function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, observation = {}, surface = {} } = {}) {
+  if (!surface.id || surface.type === "page") return null;
+  const previousGoal = previousTaskState.currentGoal || {};
+  const continuing = previousGoal.kind === "adaptive_surface"
+    && previousGoal.adaptiveEnvelope?.surfaceId === surface.id;
+  const entering = previousGoal.kind === "profile_field"
+    && verifiedReversibleSurfaceEntry(actionResult || {});
+  if (!continuing && !entering) return null;
+
+  const sourceGoal = continuing
+    ? (previousGoal.sourceGoal || previousGoal)
+    : previousGoal;
+  const priorEnvelope = continuing ? previousGoal.adaptiveEnvelope || {} : {};
+  const priorQueryHistory = Array.isArray(priorEnvelope.queryHistory)
+    ? priorEnvelope.queryHistory.map(clean).filter(Boolean)
+    : [];
+  const completedQuery = continuing
+    && actionResult?.action?.operation === "type"
+    && actionResult?.dispatched !== false
+      ? clean(actionResult.action.value)
+      : "";
+  const queryHistory = [...new Set([
+    ...priorQueryHistory,
+    completedQuery
+  ].filter(Boolean))].slice(-ADAPTIVE_SURFACE_MAX_STEPS);
+  const consumedStep = continuing
+    && actionResult?.action?.goalId === previousGoal.goalId
+    && actionResult?.dispatched !== false
+      ? 1
+      : 0;
+  const remainingSteps = continuing
+    ? Math.max(0, Number(priorEnvelope.remainingSteps || ADAPTIVE_SURFACE_MAX_STEPS) - consumedStep)
+    : ADAPTIVE_SURFACE_MAX_STEPS;
+  const now = Date.now();
+  const deadlineAt = Number(priorEnvelope.deadlineAt || (now + ADAPTIVE_SURFACE_DEADLINE_MS));
+  if (remainingSteps <= 0 || deadlineAt <= now) return null;
+
+  const sourceGoalId = clean(sourceGoal.sourceGoalId || sourceGoal.goalId);
+  const episodeId = clean(priorEnvelope.episodeId)
+    || `${sourceGoalId || observation.observationId || "profile"}:surface:${surface.id}`;
+  return Object.freeze({
+    ...sourceGoal,
+    kind: "adaptive_surface",
+    goalId: `${episodeId}:step:${ADAPTIVE_SURFACE_MAX_STEPS - remainingSteps + 1}`,
+    sourceGoalId,
+    sourceGoal: Object.freeze({
+      kind: sourceGoal.kind || "profile_field",
+      goalId: sourceGoalId,
+      semanticGoal: clean(sourceGoal.semanticGoal),
+      semanticType: clean(sourceGoal.semanticType),
+      desiredValue: sourceGoal.desiredValue,
+      canonicalValue: sourceGoal.canonicalValue,
+      logicalFieldId: clean(sourceGoal.logicalFieldId),
+      componentRole: clean(sourceGoal.componentRole),
+      choiceTerms: Object.freeze([...(sourceGoal.choiceTerms || [])].map(clean).filter(Boolean))
+    }),
+    semanticGoal: clean(sourceGoal.semanticGoal || `complete the current ${surface.label || "choice"}`),
+    selectionMode: "ai_ambiguity",
+    surfaceId: surface.id,
+    observationId: observation.observationId || "",
+    postcondition: sourceGoal.postcondition || {
+      type: "profile_requirement_satisfied",
+      semanticType: clean(sourceGoal.semanticType)
+    },
+    adaptiveEnvelope: Object.freeze({
+      contractVersion: "bounded-adaptive-surface/v1",
+      episodeId,
+      objective: clean(sourceGoal.semanticGoal),
+      desiredValue: sourceGoal.desiredValue,
+      queryHypotheses: priorEnvelope.queryHypotheses
+        || boundedAdaptiveQueryHypotheses(sourceGoal),
+      queryHistory: Object.freeze(queryHistory),
+      surfaceId: surface.id,
+      surfaceType: surface.type,
+      allowedOperations: Object.freeze(["open", "choose", "activate", "type", "select", "keyboard"]),
+      forbiddenRisks: Object.freeze(["money", "payment", "legal"]),
+      forbiddenEffects: Object.freeze([
+        "select_paid_option",
+        "add_paid",
+        "accept_legal",
+        "submit_payment",
+        "submit_purchase",
+        "advance_checkout_stage"
+      ]),
+      remainingSteps,
+      deadlineAt
+    })
+  });
+}
+
 function reduceTaskState({
   previousTaskState = {},
   observation = {},
@@ -1856,7 +2110,7 @@ function reduceTaskState({
   traveler = {},
   transactionReview = null,
   parentObjective = null,
-  blockedProfileGoalKeys = []
+  mechanicalEvidence = null
 } = {}) {
   const rawPage = observation.page || {};
   const semanticCompilation = agentContract.compileSemanticCheckout(rawPage);
@@ -2063,7 +2317,7 @@ function reduceTaskState({
     // label and keep a proven paid conflict ahead of navigation.
     return capabilitiesForDecision(decision, observation).length > 0;
   });
-  const activeDecisions = owned
+  let activeDecisions = owned
     .filter((decision) => GOAL_CREATING.has(decision.status))
     .sort((left, right) => {
       const priority = (decision) => {
@@ -2079,7 +2333,7 @@ function reduceTaskState({
     });
   // Loop recovery is decision-local. A loop in one old decision must never
   // erase a distinct, executable sibling such as AirHelp after insurance.
-  const routableActiveDecisions = decisionEpisode?.cycleDetected === true
+  let routableActiveDecisions = decisionEpisode?.cycleDetected === true
     ? activeDecisions.filter((decision) => !episodeOwnsDecision(decisionEpisode, decision))
     : activeDecisions;
   const suspendedDecisions = foreground
@@ -2089,11 +2343,10 @@ function reduceTaskState({
     control.controlId === issue.controlId && controlBelongsToCurrentSurface(control, page)
   )));
   const controlIds = forwardControlIds(observation);
-  const blockedNavigationDecision = owned.find((decision) => (
-    decision.controlType === CONTROL_TYPES.NAVIGATION_ACTION
-    && decision.currentState?.available !== true
-    && (decision.physicalControlIds || []).some(Boolean)
-  )) || null;
+  const readyStageExitControlIds = (page.stageExit?.candidates || [])
+    .filter((candidate) => candidate.executable === true || candidate.status === "ready")
+    .map((candidate) => candidate.controlId)
+    .filter((controlId) => controlIds.includes(controlId));
   const profileEvaluationStage = paymentReviewBoundary.observed ? "traveler_information" : stage;
   const paymentContactControlIds = new Set(
     paymentReviewBoundary.observed
@@ -2104,11 +2357,18 @@ function reduceTaskState({
   // support. That text must not reopen the whole page as a traveler form.
   // At the terminal boundary, only exact controls already proven to be
   // unfinished contact inputs remain eligible for profile evaluation.
+  const profilePage = {
+    ...page,
+    // Derived traveler facts must use the same immutable booking authority as
+    // transaction reconciliation. This is especially important on later
+    // pages whose visible date label omits a year.
+    selectedBooking: transactionReview?.baseline || null
+  };
   const profileObservation = paymentReviewBoundary.observed
     ? {
         ...observation,
         page: {
-          ...page,
+          ...profilePage,
           step: profileEvaluationStage,
           controls: (page.controls || []).filter((control) => paymentContactControlIds.has(control.controlId)),
           fields: (page.fields || []).filter((field) => paymentContactControlIds.has(field.controlId)),
@@ -2117,23 +2377,62 @@ function reduceTaskState({
           ))
         }
       }
-    : { ...observation, page: { ...page, step: profileEvaluationStage } };
-  const baseProfileReadiness = profileStageReadiness(profileObservation, traveler);
+    : { ...observation, page: { ...profilePage, step: profileEvaluationStage } };
+  const admittedVerifiedProfileComponent = verifiedProfileComponentFromActionResult(
+    authoritativeActionResult,
+    observation.observationId || ""
+  );
+  const verifiedProfileComponents = reconcileVerifiedProfileComponents(
+    previousTaskState.verifiedProfileComponents,
+    admittedVerifiedProfileComponent,
+    profileObservation,
+    traveler
+  );
+  // Canonical semantic verification is the only completion authority. Once
+  // it verifies an exact component, blank framework shells cannot recreate a
+  // parallel profile decision; explicit contradictory state still reopens it.
+  activeDecisions = activeDecisions.filter((decision) => !verifiedProfileComponents.some((completion) => (
+    verifiedProfileComponentMatchesDecision(completion, decision)
+  )));
+  routableActiveDecisions = routableActiveDecisions.filter((decision) => !verifiedProfileComponents.some((completion) => (
+    verifiedProfileComponentMatchesDecision(completion, decision)
+  )));
+  const baseProfileReadiness = profileStageReadiness(profileObservation, traveler, verifiedProfileComponents);
+  const missingDerivedFacts = Object.freeze((baseProfileReadiness.missingUserData || [])
+    .map((item) => missingDerivedFactDependency(item.semanticType, traveler, {
+      selectedBooking: transactionReview?.baseline || null
+    }))
+    .filter(Boolean));
+  const activeRequirementGrounding = page.activeRequirementGrounding || null;
+  const groundingUnresolved = Boolean(
+    activeRequirementGrounding
+    && activeRequirementGrounding.status !== "bound"
+    && (activeRequirementGrounding.candidateComponentIds || []).length
+    && !unblockedStageExitReady(page)
+  );
   const profileSelection = profileEvaluationStage === "traveler_information"
     && baseProfileReadiness.profileStage
-    && !baseProfileReadiness.ready
-    ? selectExecutableProfileGoal(
-        profileObservation,
-        traveler,
-        previousTaskState.currentGoal,
-        { blockedGoalKeys: blockedProfileGoalKeys }
-      )
+    && (!baseProfileReadiness.ready || groundingUnresolved)
+      ? selectNextProfileRequirement(
+          profileObservation,
+          traveler,
+          previousTaskState.currentGoal,
+          verifiedProfileComponents
+        )
     : { goal: null, blockedFields: [], failureCode: "" };
   const profileReadiness = Object.freeze({
     ...baseProfileReadiness,
+    profileStage: baseProfileReadiness.profileStage || groundingUnresolved,
+    ready: groundingUnresolved ? false : baseProfileReadiness.ready,
     temporarilyBlockedFields: Object.freeze(profileSelection.blockedFields || []),
-    blockedReasonCode: baseProfileReadiness.missingUserData?.length
+    activeRequirementGrounding,
+    missingDerivedFacts,
+    blockedReasonCode: missingDerivedFacts.length
+      ? "SELECTED_BOOKING_FACT_MISSING"
+      : baseProfileReadiness.missingUserData?.length
       ? "MISSING_PROFILE_DATA"
+      : groundingUnresolved
+      ? "ACTIVE_REQUIREMENT_UNRESOLVED"
       : profileSelection.failureCode || ""
   });
   const selectedProfileGoal = profileSelection.goal;
@@ -2236,6 +2535,16 @@ function reduceTaskState({
     controlBelongsToCurrentSurface(control, page)
     && String(control.fieldType || control.field || "") === String(profileGoal.semanticType || "")
   )));
+  // A verified profile-field opener transfers that exact unfinished task to
+  // its child surface. Do not make continuity depend on re-derived page
+  // readiness: a portalled dropdown may temporarily hide/suspend its parent
+  // field and make the page look complete even though no value was selected.
+  const adaptiveGoal = adaptiveSurfaceGoal({
+    previousTaskState,
+    actionResult: authoritativeActionResult,
+    observation,
+    surface
+  });
   let currentGoal = null;
   let ambiguityReason = "";
   if (terminalStatus === "active") {
@@ -2256,6 +2565,12 @@ function reduceTaskState({
           : "payment_review_boundary";
     } else if (profileGoal && (!foreground || foregroundOwnsProfileGoal)) {
       currentGoal = Object.freeze(profileGoal);
+    } else if (adaptiveGoal) {
+      // A verified reversible opener may reveal controls whose local labels no
+      // longer repeat the parent profile field semantics. Preserve the exact
+      // unfinished objective inside that one foreground surface instead of
+      // erasing it and falling into a generic no-actuator stop.
+      currentGoal = adaptiveGoal;
     } else if (profileReadiness.profileStage && !profileReadiness.ready && !profileGoal) {
       // An unresolved profile field with no executable actuator must not be
       // replaced by a navigation or unrelated surface goal. A fresh
@@ -2274,7 +2589,12 @@ function reduceTaskState({
       const viableDecisionCapabilities = decisionCapabilities.filter((control) => (
         viableControlIds.includes(control.controlId)
       ));
-      if (!viableDecisionCapabilities.length && decisionCapabilities.length) {
+      const policyStageExitIds = optionContract.policyChoiceBounded
+        && !optionContract.policyAllowedControlIds.length
+        && policyOutcomeAllowsStageExit(decision)
+        ? controlIds
+        : [];
+      if (!viableDecisionCapabilities.length && !policyStageExitIds.length && decisionCapabilities.length) {
         const blockedGoal = goalForDecision(decision, observation, userPolicy, traveler);
         currentGoal = Object.freeze({
           ...blockedGoal,
@@ -2284,32 +2604,110 @@ function reduceTaskState({
           })
         });
         ambiguityReason = "no_policy_allowed_candidate";
-      } else if (!decisionCapabilities.length && surfaceCapabilities.length) {
-        currentGoal = ambiguityGoal(observation, "no_goal_relevant_candidate");
-        ambiguityReason = currentGoal.ambiguityReason;
+      } else if (!decisionCapabilities.length && !policyStageExitIds.length && surfaceCapabilities.length) {
+        currentGoal = null;
+        ambiguityReason = "no_goal_relevant_candidate";
       } else {
-        currentGoal = goalForDecision(decision, observation, userPolicy, traveler);
+        const decisionGoal = goalForDecision(decision, observation, userPolicy, traveler);
+        currentGoal = policyStageExitIds.length
+          ? Object.freeze({
+              ...decisionGoal,
+              actionableControlIds: Object.freeze([...new Set(policyStageExitIds)])
+            })
+          : decisionGoal;
       }
     } else if (decisionEpisode?.status === "completed_pending_surface_exit") {
       currentGoal = completedChoiceSurfaceGoal(observation, decisionEpisode);
     } else if (validationBlockers.length) {
-      currentGoal = ambiguityGoal(observation, "contradictory_or_validation_evidence");
+      currentGoal = null;
       ambiguityReason = "contradictory_or_validation_evidence";
-    } else if (controlIds.length && foreground && ["review_confirmation", "warning", "navigation", "choice_set"].includes(surfaceClass)) {
+    } else if (unblockedStageExitReady(page) && readyStageExitControlIds.length) {
+      // Decisive stage invariant: after canonical profile/decision/validation
+      // admission has produced no blocker, an exact executable stage exit is
+      // the next task. Optional blank framework representations cannot outrank
+      // it or manufacture a new semantic obligation.
+      currentGoal = navigationGoal(observation, readyStageExitControlIds);
+    } else if (controlIds.length && foreground && (
+      ["review_confirmation", "warning", "navigation", "choice_set"].includes(surfaceClass)
+      || (page.stageExit?.candidates || []).some((candidate) => controlIds.includes(candidate.controlId))
+    )) {
       currentGoal = navigationGoal(observation, controlIds);
     } else if (foreground && stage === "unknown") {
-      currentGoal = ambiguityGoal(observation, "unknown_foreground_surface");
-      ambiguityReason = currentGoal.ambiguityReason;
+      currentGoal = null;
+      ambiguityReason = "unknown_foreground_surface";
     } else if (controlIds.length) {
       currentGoal = navigationGoal(observation, controlIds);
-    } else if (blockedNavigationDecision) {
-      currentGoal = blockedNavigationGoal(observation, blockedNavigationDecision);
+    } else if (
+      page.stageExit?.continueObserved === true
+      || (page.stageExit?.candidates || []).length > 0
+    ) {
+      currentGoal = null;
+      ambiguityReason = page.stageExit?.continueDisabled === true
+        ? "navigation_disabled_without_active_requirement"
+        : "navigation_actuator_unavailable";
     } else {
       const currentCapabilities = (page.controls || []).filter((control) => controlBelongsToCurrentSurface(control, page));
       if (foreground || currentCapabilities.length) {
-        currentGoal = ambiguityGoal(observation, foreground ? "unknown_foreground_surface" : "no_goal_relevant_candidate");
-        ambiguityReason = currentGoal.ambiguityReason;
+        currentGoal = null;
+        ambiguityReason = foreground ? "unknown_foreground_surface" : "no_goal_relevant_candidate";
       }
+    }
+  }
+  // Formal compilation remains the preferred path, but it is no longer a
+  // prerequisite for one harmless reversible mechanic. When the task is
+  // unfinished and no canonical goal survived, publish one bounded adaptive
+  // interaction over exact current-surface actuators. The consequence
+  // governor and fresh postcondition verification remain authoritative.
+  const adaptiveFallbackReasons = new Set([
+    "navigation_actuator_unavailable",
+    "navigation_disabled_without_active_requirement",
+    "no_goal_relevant_candidate",
+    "unknown_foreground_surface"
+  ]);
+  if (
+    terminalStatus === "active"
+    && !currentGoal
+    && adaptiveFallbackReasons.has(ambiguityReason)
+    && !siteFailure
+    && !validationBlockers.length
+    && (!profileReadiness.profileStage || profileReadiness.ready === true)
+    && !paymentReviewBoundary.observed
+  ) {
+    const fallback = adaptiveInteractionGoal({
+      observation,
+      userPolicy,
+      traveler,
+      reason: ambiguityReason
+    });
+    if (fallback) {
+      currentGoal = fallback;
+      ambiguityReason = "";
+    }
+  }
+  // Candidate exhaustion is mechanical evidence, not authority for the loop
+  // to replace semantic work. When the exact TaskState-published goal has
+  // exhausted its grounded strategies, TaskState alone may yield to one
+  // consequence-gated adaptive goal on the same fresh surface.
+  if (
+    terminalStatus === "active"
+    && currentGoal
+    && mechanicalEvidence?.kind === "goal_strategies_exhausted"
+    && mechanicalEvidence.goalId === currentGoal.goalId
+    && !["profile_field", "adaptive_surface", "adaptive_interaction"].includes(currentGoal.kind)
+    && !["payment", "legal"].includes(currentGoal.semanticType)
+    && !siteFailure
+    && !paymentReviewBoundary.observed
+  ) {
+    const fallback = adaptiveInteractionGoal({
+      observation,
+      userPolicy,
+      traveler,
+      reason: "canonical_goal_exhausted_without_observable_change",
+      excludedControlIds: mechanicalEvidence.excludedControlIds || []
+    });
+    if (fallback) {
+      currentGoal = fallback;
+      ambiguityReason = "";
     }
   }
   if (!decisionEpisode && currentGoal?.decisionGroupId) {
@@ -2367,6 +2765,7 @@ function reduceTaskState({
       : null;
     currentGoal = Object.freeze({
       ...currentGoal,
+      authority: "task_state",
       decisionInstanceId: activeEpisode?.decisionInstanceId || decisionInstanceKey(currentGoal, observation),
       canonicalOwnerId: activeEpisode?.canonicalOwnerId || activeEpisode?.decisionInstanceId || "",
       ...(activeEpisode
@@ -2474,6 +2873,7 @@ function reduceTaskState({
     surfaceSubgoal,
     decisionEpisode,
     verifiedCommerceObligations: durableVerifiedCommerceObligations,
+    verifiedProfileComponents,
     outcomeJournal,
     outcomeCoverage,
     activeDecisions: Object.freeze(activeDecisions),
@@ -2520,11 +2920,12 @@ function reduceTaskState({
 }
 
 module.exports = {
-  ambiguityGoal,
   decideStage,
   durableOutcomeHierarchy,
+  reconcileVerifiedProfileComponents,
   reduceTaskState,
   surfaceClassFrom,
   stageEvidence,
-  verifiedCommerceObligationFromActionResult
+  verifiedCommerceObligationFromActionResult,
+  verifiedProfileComponentFromActionResult
 };

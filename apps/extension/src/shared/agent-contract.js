@@ -48,6 +48,60 @@
     REVEALABLE: "revealable",
     INACTIVE: "inactive"
   });
+  const PROFILE_FIELD_ALIAS_GROUPS = Object.freeze({
+    title: ["title", "traveler_title", "traveller_title", "salutation", "gender_title", "honorific"],
+    gender: ["gender", "sex"],
+    first_name: ["first_name", "firstname", "given_name", "forename"],
+    given_names: ["given_names", "first_middle_name", "first_and_middle_name", "forenames"],
+    middle_name: ["middle_name", "middlename", "additional_name"],
+    last_name: ["last_name", "lastname", "surname", "family_name"],
+    second_last_name: ["second_last_name", "second_surname", "additional_surname", "maternal_surname"],
+    full_name: ["full_name", "fullname", "passenger_name", "traveler_name", "traveller_name"],
+    email: ["email", "email_address", "e_mail"],
+    confirm_email: ["confirm_email", "email_confirmation", "repeat_email", "confirm_email_address"],
+    phone: ["phone", "phone_number", "mobile", "mobile_number", "telephone", "tel"],
+    phone_country_code: ["phone_country_code", "country_dial_code", "dial_code", "calling_code", "country_calling_code"],
+    date_of_birth: ["date_of_birth", "birth_date", "birthdate", "dob", "bday"],
+    age_at_departure: ["age_at_departure", "travel_age", "departure_age", "age_on_departure", "age_at_time_of_travel"],
+    place_of_birth: ["place_of_birth", "birth_place", "birth_city"],
+    nationality: ["nationality", "citizenship", "country_of_citizenship", "passport_nationality"],
+    country_of_residence: ["country_of_residence", "residence_country", "resident_country"],
+    document_type: ["document_type", "travel_document_type", "identity_document_type", "id_type"],
+    passport_number: ["passport_number", "passport_no"],
+    document_number: ["document_number", "travel_document_number", "identity_document_number"],
+    issuing_country: ["issuing_country", "document_issuing_country", "passport_issuing_country"],
+    document_issue_date: ["document_issue_date", "passport_issue_date", "date_of_issue", "issue_date"],
+    address_line1: ["address_line1", "address1", "street_address", "billing_address", "billing_address_line1"],
+    address_line2: ["address_line2", "address2", "billing_address_line2"],
+    city: ["city", "address_city", "billing_city", "locality"],
+    state: ["state", "province", "region", "address_state", "billing_state"],
+    postal_code: ["postal_code", "postcode", "zip", "zip_code", "billing_postal_code"],
+    country: ["country", "address_country", "billing_country", "country_name"],
+    passport_expiry: ["passport_expiry", "passport_expiration", "passport_expiry_date"],
+    document_expiry: ["document_expiry", "document_expiration", "document_expiry_date"],
+    frequent_flyer_program: ["frequent_flyer_program", "loyalty_program", "airline_loyalty_program"],
+    frequent_flyer_number: ["frequent_flyer_number", "loyalty_number", "membership_number"],
+    known_traveler_number: ["known_traveler_number", "known_traveller_number", "ktn"],
+    redress_number: ["redress_number", "redress_control_number"],
+    emergency_contact_name: ["emergency_contact_name", "emergency_name"],
+    emergency_contact_relationship: ["emergency_contact_relationship", "emergency_relationship"],
+    emergency_contact_phone: ["emergency_contact_phone", "emergency_phone"],
+    emergency_contact_email: ["emergency_contact_email", "emergency_email"],
+    meal_preference: ["meal_preference", "meal_request", "special_meal"],
+    special_assistance: ["special_assistance", "assistance_request", "accessibility_request"],
+    travel_purpose: [
+      "travel_purpose",
+      "trip_purpose",
+      "journey_purpose",
+      "purpose_of_travel",
+      "reason_for_travel",
+      "reason_for_travel_radio_input",
+      "business_or_leisure"
+    ]
+  });
+  const PROFILE_FIELD_ALIASES = new Map(Object.entries(PROFILE_FIELD_ALIAS_GROUPS)
+    .flatMap(([canonical, aliases]) => aliases.map((alias) => [alias, canonical])));
+  const PROFILE_FIELD_TYPES = Object.freeze([...new Set(PROFILE_FIELD_ALIASES.values())]);
 
   function text(value, limit = 500) {
     return String(value == null ? "" : value).slice(0, limit);
@@ -84,10 +138,31 @@
 
   function normalizedKey(value = "") {
     return normalizedText(value)
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_+|_+$/g, "")
       .slice(0, 100);
+  }
+
+  function canonicalProfileFieldType(value = "") {
+    const normalized = normalizedKey(value);
+    if (PROFILE_FIELD_ALIASES.has(normalized)) return PROFILE_FIELD_ALIASES.get(normalized);
+    const withoutSubject = normalized
+      .replace(/^(?:passengers?|travell?ers?|adults?)_\d+_/, "")
+      .replace(/^(?:contact|profile)_/, "");
+    if (PROFILE_FIELD_ALIASES.has(withoutSubject)) return PROFILE_FIELD_ALIASES.get(withoutSubject);
+    if (/(?:^|_)(?:birth|dob|bday)_(?:day|month|year)(?:_|$)/.test(normalized)) return "date_of_birth";
+    if (/(?:passport|document|id)_(?:expiry|expiration)_(?:day|month|year)/.test(normalized)) {
+      return normalized.includes("passport") ? "passport_expiry" : "document_expiry";
+    }
+    if (/(?:passport|document|id)_(?:issue|issued)_(?:day|month|year)/.test(normalized)) return "document_issue_date";
+    if (/^(?:passport_)?nationality$|^country_of_citizenship$/.test(withoutSubject)) return "nationality";
+    if (/^(?:travell?er_)?title$|^salutation$|^gender_title$/.test(withoutSubject)) return "title";
+    if (/^(?:passport_)?id_number$|^travel_document_(?:number|no)$/.test(withoutSubject)) {
+      return withoutSubject.startsWith("passport") ? "passport_number" : "document_number";
+    }
+    return "";
   }
 
   function paymentCredentialKindsFromText(value = "") {
@@ -98,6 +173,24 @@
     if (/\b(?:cvc|cvv|security\s+code)\b|\bcc-csc\b/.test(visible)) kinds.push("card_security_code");
     if (/\bcardholder\b|\bname\s+on\s+card\b/.test(visible)) kinds.push("cardholder");
     return kinds;
+  }
+
+  function isLegalAcceptanceText(value = "") {
+    const visible = normalizedText(value).toLowerCase();
+    if (!visible) return false;
+    return /\b(?:accept|agree|confirm|acknowledge|read and accepted|aged?\s+18)\b/.test(visible)
+      && /\b(?:terms|conditions|fare rules|booking terms|cancellation terms|privacy|dangerous goods|legal)\b/.test(visible);
+  }
+
+  function isInsuranceOfferText(value = "") {
+    const visible = normalizedText(value).toLowerCase();
+    if (!visible || isLegalAcceptanceText(visible)) return false;
+    return /\b(?:travel|trip|cancellation|luggage|baggage)?\s*(?:insurance|protection|cover)\b|\bvoucher refund\b|\brefund protection\b/.test(visible);
+  }
+
+  function isPaymentCommitText(value = "") {
+    const visible = normalizedText(value).toLowerCase();
+    return /\b(?:pay(?:\s+now|\s+securely|\s+by\s+(?:card|bank|wallet)|\s+[\d.,])|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase|place\s+order)\b/.test(visible);
   }
 
   function terminalSignalState(present, negativeEvidence = false) {
@@ -141,7 +234,7 @@
     const activeProgress = normalizedText(
       structural.activeProgressText || input?.activeProgressText || ""
     ).toLowerCase();
-    const route = /(?:^|[\/#?&_-])payment(?:[\/#?&=_-]|$)/.test(url);
+    const route = /(?:^|[\/#?&_-])payments?(?:[\/#?&=_-]|$)/.test(url);
     const progress = structural.activePaymentProgress === true || /\bpayment\b|\bpay\b/.test(activeProgress);
     const nativeCredentialKinds = structural.paymentCredentialKinds || [];
     const ownedCredentialKinds = [
@@ -169,15 +262,19 @@
       || credentialKinds.size >= 2;
     const method = structural.paymentMethodPresent === true
       || /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/.test(visible);
-    const commit = structural.payControlPresent === true
-      || /\b(?:pay(?:\s+now|\s+securely|\s+\d)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase)\b/.test(visible);
+    const commit = structural.payControlPresent === true || isPaymentCommitText(visible);
     const legal = structural.legalAcceptancePresent === true;
     const review = structural.reviewSummaryPresent === true
       || (/\b(?:amount\s+to\s+pay|total)\b/.test(visible)
         && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/.test(visible));
     const heading = structural.paymentHeadingPresent === true
       || /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/.test(visible);
-    const signals = Object.freeze({ route, progress, form, method, commit, legal, review, heading });
+    // Some payment pages hydrate methods/credentials only after the traveler
+    // chooses a currency. A visible, owned itinerary + exact total + explicit
+    // payment/currency prompt is already the irreversible boundary we promise
+    // to stop at. URL or generic payment prose alone can never create it.
+    const entry = structural.progressivePaymentEntryPresent === true;
+    const signals = Object.freeze({ route, progress, form, method, commit, legal, review, heading, entry });
     const signalStates = Object.freeze({
       route: terminalSignalState(route, Boolean(url)),
       progress: terminalSignalState(progress),
@@ -186,7 +283,8 @@
       commit: terminalSignalState(commit),
       legal: terminalSignalState(legal),
       review: terminalSignalState(review),
-      heading: terminalSignalState(heading)
+      heading: terminalSignalState(heading),
+      entry: terminalSignalState(entry)
     });
     const signalCount = Object.values(signals).filter(Boolean).length;
     const stageAnchor = route || progress || heading;
@@ -194,11 +292,18 @@
       (form && (stageAnchor || method || commit))
       || (stageAnchor && method && commit)
       || (route && progress && (method || commit || review))
+      || ((route || progress) && entry)
       // Some review/payment pages reveal credential controls progressively.
       // A payment heading plus owned order review plus at least one exact
       // credential kind is a typed terminal boundary; generic payment copy or
       // a lone card field without review ownership still cannot qualify.
       || (heading && review && credentialKinds.size >= 1)
+      // A final review can intentionally keep payment credentials hidden
+      // until the user accepts terms. Review ownership + legal acceptance +
+      // an exact payment commit control is already the boundary at which Fly
+      // must stop; requiring hydrated card fields here caused the agent to
+      // reinterpret final checkout as an earlier traveler/seat page.
+      || (review && legal && commit)
     );
     return Object.freeze({
       contractVersion: TERMINAL_EVIDENCE_VERSION,
@@ -469,6 +574,8 @@
       subject: text(raw.subject?.key || raw.subject || raw.sectionType || "unknown", 120),
       subjectLabel: normalizedText(raw.subject?.label || raw.sectionLabel || raw.label || "Checkout decision"),
       required: raw.required === true,
+      requiresResolution: raw.requiresResolution === true
+        || (raw.requiresResolution !== false && raw.required === true && selected.length === 0),
       exclusive,
       currentSelection: selected.length === 1 ? selected[0].optionId : "",
       options,
@@ -491,12 +598,31 @@
     }
     return [...buckets.values()].flatMap((items) => {
       const distinctNames = new Set(items.map((item) => normalizedKey(item.descriptor.optionName)));
-      if (items.length < 2 || distinctNames.size !== items.length || !alignedRepeatedControls(items)) return [];
+      const localOwnerValues = items.map((item) => normalizedText(
+        item.control.sectionId
+        || item.control.choiceContract?.decisionOwnerId
+        || item.control.logicalFieldId
+        || ""
+      ));
+      const localOwnerKeys = new Set(localOwnerValues.filter(Boolean));
       const evidenceText = normalizedText([
         page.visibleText || page.fullText || page.text,
         ...items.map((item) => `${item.control.sectionLabel || ""} ${item.control.accessibleName || ""}`)
       ].join(" "));
       const subject = subjectFromEvidence(evidenceText);
+      // Repeated command wording across a whole page is not ownership. Only
+      // unknown controls under one bounded local owner may become one
+      // decision. A known fare/seat/etc. subject is already semantic owner
+      // evidence and preserves sanitized/replay observations without DOM ids.
+      if (
+        items.length < 2
+        || distinctNames.size !== items.length
+        || (subject === "unknown" && (
+          localOwnerValues.some((owner) => !owner)
+          || localOwnerKeys.size !== 1
+        ))
+        || !alignedRepeatedControls(items)
+      ) return [];
       const instance = `repeated_${items[0].descriptor.command}_${subject}_${items.map((item) => normalizedKey(item.descriptor.optionName)).join("_")}`;
       const decisionGroupId = `dg_compiled_${normalizedKey(instance)}`.slice(0, 220);
       const descriptors = items.map((item) => item.descriptor);
@@ -580,6 +706,7 @@
         subject,
         subjectLabel: subject === "fare_package" ? "Fare package" : "Checkout option",
         required,
+        requiresResolution: required,
         exclusive: true,
         options,
         evidence: [
@@ -600,6 +727,7 @@
         subject,
         kind: DECISION_KIND.EXCLUSIVE_CHOICE,
         required,
+        requiresResolution: required,
         material: true,
         status: decisionContract.currentSelection ? "satisfied" : (required ? "missing" : "optional"),
         selectedControlId: options.find((option) => option.selected)?.controlId || "",
@@ -1661,6 +1789,40 @@
     return EXECUTION_LANE.DENY;
   }
 
+  function ageChoiceBounds(value = "") {
+    const normalized = String(value || "")
+      .toLowerCase()
+      .replace(/[–—]/g, "-")
+      .replace(/_/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    let match = normalized.match(/(\d{1,3})\s*(?:-|to)\s*(\d{1,3})/i);
+    if (match) return { minimum: Number(match[1]), maximum: Number(match[2]) };
+    match = normalized.match(/(?:under|younger than|less than|<)\s*(\d{1,3})/i);
+    if (match) return { minimum: 0, maximum: Number(match[1]) - 1 };
+    match = normalized.match(/(\d{1,3})\s*(?:\+|plus|and (?:over|older)|or (?:over|older)|and above|or above)/i);
+    if (match) return { minimum: Number(match[1]), maximum: 130 };
+    match = normalized.match(/^\D*(\d{1,3})\s*(?:years?|yrs?)?\D*$/i);
+    if (!match) return null;
+    const exact = Number(match[1]);
+    return Number.isInteger(exact) && exact >= 0 && exact <= 130
+      ? { minimum: exact, maximum: exact }
+      : null;
+  }
+
+  function profileChoiceValueCompatible(actualValue = "", desiredValue = "", semanticType = "") {
+    const actual = String(actualValue || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const desired = String(desiredValue || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!actual || !desired) return false;
+    if (actual === desired) return true;
+    if (String(semanticType || "").toLowerCase() !== "age_at_departure") return false;
+    const desiredBounds = ageChoiceBounds(desired);
+    const actualBounds = ageChoiceBounds(actual);
+    if (!desiredBounds || desiredBounds.minimum !== desiredBounds.maximum || !actualBounds) return false;
+    const age = desiredBounds.minimum;
+    return age >= actualBounds.minimum && age <= actualBounds.maximum;
+  }
+
   return Object.freeze({
     CONTRACT_VERSION,
     TERMINAL_EVIDENCE_VERSION,
@@ -1670,6 +1832,10 @@
     DECISION_KIND,
     SEMANTIC_READINESS,
     DECISION_AVAILABILITY,
+    PROFILE_FIELD_ALIAS_GROUPS,
+    PROFILE_FIELD_ALIASES,
+    PROFILE_FIELD_TYPES,
+    canonicalProfileFieldType,
     cloneSerializable,
     operationAvailability,
     controlAvailability,
@@ -1686,7 +1852,11 @@
     canonicalPipelineContract,
     normalizeDecisionContract,
     compileTerminalEvidence,
+    isLegalAcceptanceText,
+    isInsuranceOfferText,
+    isPaymentCommitText,
     compileSemanticCheckout,
+    profileChoiceValueCompatible,
     isNormalExecutableContract,
     isBoundedRecoveryContract,
     classifyExecutionLane,

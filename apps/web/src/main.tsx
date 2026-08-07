@@ -61,6 +61,7 @@ type Traveler = {
   emergency_contact_email?: string;
   meal_preference?: string;
   special_assistance?: string;
+  travel_purpose?: string;
   preferred_seat: string;
   baggage_preference: string;
   default_cabin: string;
@@ -563,6 +564,12 @@ function TravelerForm({ data, id, onSave }: { data: Bootstrap; id?: string; onSa
         <Label title="Meal preference"><input name="meal_preference" defaultValue={traveler?.meal_preference || ""} /></Label>
         <Label title="Special assistance"><input name="special_assistance" defaultValue={traveler?.special_assistance || ""} /></Label>
         <div className="md:col-span-2 mt-2 border-t border-white/10 pt-4 text-sm font-black uppercase tracking-wide text-slate-300">Booking preferences</div>
+        <Label title="Default travel purpose">
+          <select name="travel_purpose" defaultValue={traveler?.travel_purpose || "leisure"}>
+            <option value="leisure">leisure</option>
+            <option value="business">business</option>
+          </select>
+        </Label>
         <Label title="Seat preference">
           <select name="preferred_seat" defaultValue={traveler?.preferred_seat || "no preference"}>
             <option>aisle</option>
@@ -625,6 +632,7 @@ function TravelerDetail({ data, id }: { data: Bootstrap; id: string }) {
     ["Email", traveler.email],
     ["Phone", traveler.phone],
     ["Default baggage", traveler.baggage_preference],
+    ["Default travel purpose", traveler.travel_purpose || "leisure"],
     ["Frequent-flyer program", traveler.frequent_flyer_program || "Not set"],
     ["Frequent-flyer number", traveler.frequent_flyer_number || "Not set"],
     ["Known Traveler Number", traveler.known_traveler_number || "Not set"],

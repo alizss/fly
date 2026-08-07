@@ -2,6 +2,60 @@ const { test, expect } = require("@playwright/test");
 
 const API = `http://127.0.0.1:${Number(process.env.ATW_TEST_PORT || 4273)}/api`;
 
+function selectedBookingAcquisition(observationId) {
+  const itineraryEvidence = {
+    segmentId: "segment_sjj_ist",
+    source: "itinerary_owner",
+    ownerKey: "itinerary:SJJ:IST:2026-10-15",
+    role: "itinerary_segment",
+    ownerType: "selected_flight",
+    qualification: "owned_route_with_departure_date",
+    observationId,
+    confidence: 1,
+    authoritative: true
+  };
+  return {
+    contractVersion: "selected-booking-acquisition/v1",
+    capturedAt: new Date().toISOString(),
+    sourceUrl: "https://example.test/flights/selected",
+    observationId,
+    facts: {
+      contractVersion: "transaction-facts/v2",
+      evidenceMode: "typed",
+      itinerary: {
+        completeness: "complete",
+        segments: [{
+          segmentId: "segment_sjj_ist",
+          origin: "SJJ",
+          destination: "IST",
+          departureDate: "2026-10-15",
+          evidence: itineraryEvidence
+        }]
+      },
+      travelers: [],
+      currency: "EUR",
+      basePrice: null,
+      totalPrice: { amount: 362, currency: "EUR" },
+      fareBrand: "",
+      selectedExtras: [],
+      factEvidence: {
+        itinerary: [itineraryEvidence],
+        totalPrice: {
+          source: "owned_price_summary",
+          ownerKey: "booking-total:SJJ-IST:362:EUR",
+          role: "booking_total",
+          ownerType: "selected_booking_summary",
+          qualification: "booking_total",
+          observationId,
+          confidence: 1,
+          authoritative: true
+        }
+      },
+      provenance: [{ source: "flight_selection", observationId, confidence: 1 }]
+    }
+  };
+}
+
 test("P0.2 next-action refuses to create a replacement transaction without a session", async ({ request }) => {
   const response = await request.post(`${API}/agent/next-action`, {
     data: {
@@ -49,6 +103,51 @@ test("P0.2 one session handshake resumes the exact transaction and rejects repla
   });
   expect(missing.status()).toBe(409);
   expect(await missing.json()).toMatchObject({ code: "DURABLE_SESSION_NOT_FOUND" });
+});
+
+test("selected flight facts enter the durable baseline before the passenger page hides them", async ({ request }) => {
+  const observationId = `obs_selected_booking_${Date.now()}`;
+  const started = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Complete checkout safely.",
+      traveler: { id: `trav_selected_booking_${Date.now()}`, date_of_birth: "2003-05-31" },
+      selectedBooking: selectedBookingAcquisition(observationId),
+      page: {
+        site: "example.test",
+        url: "https://example.test/checkout/passengers",
+        step: "traveler_information",
+        transactionFacts: { itinerary: { completeness: "unknown", segments: [] } }
+      }
+    }
+  });
+  const session = await started.json();
+  expect(started.status(), JSON.stringify(session)).toBe(201);
+
+  const durable = await request.get(`${API}/agent/session/${session.id}`);
+  const state = await durable.json();
+  expect(durable.status()).toBe(200);
+  expect(state.transactionInvariants.baseline.itinerary.segments).toEqual([
+    expect.objectContaining({ origin: "SJJ", destination: "IST", departureDate: "2026-10-15" })
+  ]);
+  expect(state.transactionInvariants.baselineObservationId).toBe(observationId);
+  expect(state.transactionInvariants.baseline.totalPrice).toEqual({ amount: 362, currency: "EUR" });
+  expect(state.transactionInvariants.baseline.currency).toBe("EUR");
+
+  const resumed = await request.post(`${API}/agent/session`, {
+    data: {
+      sessionId: session.id,
+      resumeOnly: true,
+      traveler: { id: state.travelerId, date_of_birth: "2003-05-31" },
+      page: {
+        site: "example.test",
+        url: "https://example.test/checkout/passengers",
+        step: "traveler_information"
+      }
+    }
+  });
+  expect(resumed.status()).toBe(201);
+  const afterResume = await (await request.get(`${API}/agent/session/${session.id}`)).json();
+  expect(afterResume.transactionInvariants.baseline.itinerary.segments[0].departureDate).toBe("2026-10-15");
 });
 
 test("a structured missing traveler answer crosses HTTP and resumes the exact field", async ({ request }) => {
@@ -241,7 +340,7 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
   const routeEvidence = {
     source: "bounded_checkout_route",
     ownerKey: "route_owner_1",
-    qualification: "persistent_checkout_route",
+    qualification: "airport_code_pair",
     observationId,
     confidence: 0.88,
     authoritative: true
@@ -260,16 +359,17 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
         controls: [],
         decisionGroups: [],
         transactionFacts: {
+          contractVersion: "transaction-facts/v2",
           evidenceMode: "typed",
           itinerary: {
-            completeness: "partial",
+            completeness: "complete",
             segments: [{
               segmentId: "segment_1",
               origin: "LHR",
               destination: "LJU",
-              departureDate: "",
-              departureTime: "",
-              arrivalTime: "",
+              departureDate: "2026-08-10",
+              departureTime: "10:20",
+              arrivalTime: "13:30",
               flightNumber: "",
               evidence: routeEvidence
             }]
@@ -291,7 +391,10 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
             },
             totalPrice: {
               source: "owned_price_summary",
-              ownerKey: "page_total",
+              ownerKey: "selected_booking_summary",
+              role: "booking_total",
+              ownerType: "selected_booking_summary",
+              qualification: "coherent_itinerary_and_total",
               observationId,
               confidence: 0.9,
               authoritative: true
@@ -324,7 +427,7 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
       itinerary: [{
         source: "bounded_checkout_route",
         ownerKey: "route_owner_1",
-        qualification: "persistent_checkout_route",
+        qualification: "airport_code_pair",
         authoritative: true
       }],
       fareBrand: {
@@ -783,4 +886,29 @@ test("incremental observation transport reconstructs the canonical page and reje
   });
   expect(stale.status()).toBe(409);
   expect(await stale.json()).toMatchObject({ code: "OBSERVATION_RESYNC_REQUIRED", retryable: true });
+
+  const unsupportedReference = await request.post(`${API}/agent/next-action`, {
+    data: {
+      sessionId: session.id,
+      observationId: `obs_reference_unsupported_${Date.now()}`,
+      observationSnapshot: { snapshotHash: "hash_reference_unsupported" },
+      observationUpdate: {
+        mode: "reference",
+        baseSnapshotHash: "hash_incremental_delta",
+        snapshotHash: "hash_incremental_delta",
+        diff: {}
+      },
+      page: {
+        incremental: true,
+        referenceOnly: true,
+        snapshotHash: "hash_incremental_delta",
+        controls: []
+      }
+    }
+  });
+  expect(unsupportedReference.status()).toBe(409);
+  expect(await unsupportedReference.json()).toMatchObject({
+    code: "OBSERVATION_RESYNC_REQUIRED",
+    retryable: true
+  });
 });

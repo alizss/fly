@@ -17,8 +17,11 @@ function normalizeSurface(surface = {}, observationId = "") {
     // prose and was the reason foreground site failures became stale form
     // goals again.
     surfaceClass: clean(surface.surfaceClass),
-    blocksBackground: isPage ? false : surface.blocksBackground !== false,
-    ownership: isPage ? "page" : "exclusive",
+    // Exclusivity must be proven structurally by the observer. A non-page
+    // positioned panel is context unless it is an actual modal/open choice
+    // surface; defaulting every popover to blocking hid valid page controls.
+    blocksBackground: isPage ? false : surface.blocksBackground === true,
+    ownership: isPage ? "page" : (surface.blocksBackground === true ? "exclusive" : "contextual"),
     decisionGroupId: clean(surface.decisionGroupId),
     parentSurfaceId: clean(surface.parentSurfaceId),
     parentControlId: clean(surface.parentControlId),

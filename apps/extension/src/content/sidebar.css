@@ -179,6 +179,73 @@
   font-weight: 750;
 }
 
+.atw-process-diagnostics {
+  border: 1px solid #dce3df;
+  border-radius: 14px;
+  background: #ffffff;
+  padding: 10px;
+}
+
+.atw-process-diagnostics summary {
+  cursor: pointer;
+  color: #516159;
+  font-size: 11px;
+  font-weight: 850;
+  text-transform: uppercase;
+}
+
+.atw-process-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.atw-process-grid > div {
+  min-width: 0;
+  padding: 8px;
+  border-radius: 10px;
+  background: #f4f8f6;
+}
+
+.atw-process-grid .is-wide {
+  grid-column: 1 / -1;
+}
+
+.atw-process-grid span,
+.atw-process-list > span {
+  display: block;
+  color: #77847e;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.atw-process-grid strong {
+  display: block;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+  color: #22332c;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.atw-process-list {
+  display: grid;
+  gap: 3px;
+  margin-top: 8px;
+}
+
+.atw-process-list em {
+  color: #276252;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.atw-process-list.is-warn em {
+  color: #8a5b12;
+}
+
 .atw-chat {
   display: grid;
   gap: 8px;

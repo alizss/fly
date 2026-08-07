@@ -7,48 +7,7 @@ const {
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { currentSurface: authoritativeCurrentSurface } = require("./surface-contract");
 
-const FIELD_ALIASES = new Map(Object.entries({
-  title: ["title", "traveler_title", "traveller_title", "salutation", "gender_title", "honorific"],
-  gender: ["gender", "sex"],
-  first_name: ["first_name", "firstname", "given_name", "given_names", "forename"],
-  middle_name: ["middle_name", "middlename", "additional_name"],
-  last_name: ["last_name", "lastname", "surname", "family_name"],
-  second_last_name: ["second_last_name", "second_surname", "additional_surname", "maternal_surname"],
-  full_name: ["full_name", "fullname", "passenger_name", "traveler_name", "traveller_name"],
-  email: ["email", "email_address", "e_mail"],
-  confirm_email: ["confirm_email", "email_confirmation", "repeat_email", "confirm_email_address"],
-  phone: ["phone", "phone_number", "mobile", "mobile_number", "telephone", "tel"],
-  phone_country_code: ["phone_country_code", "country_dial_code", "dial_code", "calling_code", "country_calling_code"],
-  date_of_birth: ["date_of_birth", "birth_date", "birthdate", "dob", "bday"],
-  place_of_birth: ["place_of_birth", "birth_place", "birth_city"],
-  nationality: ["nationality", "citizenship", "country_of_citizenship", "passport_nationality"],
-  country_of_residence: ["country_of_residence", "residence_country", "resident_country"],
-  document_type: ["document_type", "travel_document_type", "identity_document_type", "id_type"],
-  passport_number: ["passport_number", "passport_no"],
-  document_number: ["document_number", "travel_document_number", "identity_document_number"],
-  issuing_country: ["issuing_country", "document_issuing_country", "passport_issuing_country"],
-  document_issue_date: ["document_issue_date", "passport_issue_date", "date_of_issue", "issue_date"],
-  address_line1: ["address_line1", "address1", "street_address", "billing_address", "billing_address_line1"],
-  address_line2: ["address_line2", "address2", "billing_address_line2"],
-  city: ["city", "address_city", "billing_city", "locality"],
-  state: ["state", "province", "region", "address_state", "billing_state"],
-  postal_code: ["postal_code", "postcode", "zip", "zip_code", "billing_postal_code"],
-  country: ["country", "address_country", "billing_country", "country_name"],
-  passport_expiry: ["passport_expiry", "passport_expiration", "passport_expiry_date"],
-  document_expiry: ["document_expiry", "document_expiration", "document_expiry_date"],
-  frequent_flyer_program: ["frequent_flyer_program", "loyalty_program", "airline_loyalty_program"],
-  frequent_flyer_number: ["frequent_flyer_number", "loyalty_number", "membership_number"],
-  known_traveler_number: ["known_traveler_number", "known_traveller_number", "ktn"],
-  redress_number: ["redress_number", "redress_control_number"],
-  emergency_contact_name: ["emergency_contact_name", "emergency_name"],
-  emergency_contact_relationship: ["emergency_contact_relationship", "emergency_relationship"],
-  emergency_contact_phone: ["emergency_contact_phone", "emergency_phone"],
-  emergency_contact_email: ["emergency_contact_email", "emergency_email"],
-  meal_preference: ["meal_preference", "meal_request", "special_meal"],
-  special_assistance: ["special_assistance", "assistance_request", "accessibility_request"]
-}).flatMap(([canonical, aliases]) => aliases.map((alias) => [alias, canonical])));
-
-const PROFILE_FIELDS = new Set(FIELD_ALIASES.values());
+const PROFILE_FIELDS = new Set(agentContract.PROFILE_FIELD_TYPES);
 const DATE_FIELDS = new Set(["date_of_birth", "document_issue_date", "passport_expiry", "document_expiry"]);
 const COMPONENT_ORDER = new Map([
   ["value", 0],
@@ -88,25 +47,7 @@ function normalizedAlias(value = "") {
 }
 
 function normalizeProfileFieldType(value = "") {
-  const normalized = normalizedAlias(value);
-  if (FIELD_ALIASES.has(normalized)) return FIELD_ALIASES.get(normalized);
-  const withoutSubject = normalized
-    .replace(/^(?:passengers?|travell?ers?|adults?)_\d+_/, "")
-    .replace(/^(?:contact|profile)_/, "");
-  if (FIELD_ALIASES.has(withoutSubject)) return FIELD_ALIASES.get(withoutSubject);
-  if (/(?:^|_)(?:birth|dob|bday)_(?:day|month|year)(?:_|$)/.test(normalized)) return "date_of_birth";
-  if (/(?:passport|document|id)_(?:expiry|expiration)_(?:day|month|year)/.test(normalized)) {
-    return normalized.includes("passport") ? "passport_expiry" : "document_expiry";
-  }
-  if (/(?:passport|document|id)_(?:issue|issued)_(?:day|month|year)/.test(normalized)) {
-    return "document_issue_date";
-  }
-  if (/^(?:passport_)?nationality$|^country_of_citizenship$/.test(withoutSubject)) return "nationality";
-  if (/^(?:travell?er_)?title$|^salutation$|^gender_title$/.test(withoutSubject)) return "title";
-  if (/^(?:passport_)?id_number$|^travel_document_(?:number|no)$/.test(withoutSubject)) {
-    return withoutSubject.startsWith("passport") ? "passport_number" : "document_number";
-  }
-  return "";
+  return agentContract.canonicalProfileFieldType(value);
 }
 
 function semanticTypesFromLabel(value = "") {
@@ -119,10 +60,15 @@ function semanticTypesFromLabel(value = "") {
   if (/confirm.*e[ -]?mail|repeat.*e[ -]?mail/.test(evidence)) add("confirm_email");
   else if (/(?:^|\s)e[ -]?mail(?:\s|$)/.test(evidence)) add("email");
   if (/(?:^|\s)surname(?:\s|$)|family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
-  if (/first[ _-]?name|given[ _-]?name|forename/.test(evidence)) add("first_name");
-  if (/middle[ _-]?name/.test(evidence)) add("middle_name");
+  const combinedGivenNames = /(?:first|given)\s*(?:\/|and|&)\s*middle\s+names?\b|\bgiven names\b|\bforenames\b/.test(evidence);
+  if (combinedGivenNames) add("given_names");
+  else {
+    if (/first[ _-]?name|given[ _-]?name|forename/.test(evidence)) add("first_name");
+    if (/middle[ _-]?name/.test(evidence)) add("middle_name");
+  }
   if (/second (?:last name|surname)|additional surname|maternal surname/.test(evidence)) add("second_last_name");
   if (/(?:^|\s)(?:date of birth|birth date|dob|bday)(?:\s|$)/.test(evidence)) add("date_of_birth");
+  if (/(?:age at (?:the )?time of travel|age (?:at|on) departure|departure age|travel age|passenger age)/.test(evidence)) add("age_at_departure");
   if (/(?:^|\s)(?:place of birth|birth place|birth city)(?:\s|$)/.test(evidence)) add("place_of_birth");
   if (/(?:^|\s)(?:nationality|citizenship|country of citizenship)(?:\s|$)/.test(evidence)) add("nationality");
   if (/country of residence|residence country|resident country/.test(evidence)) add("country_of_residence");
@@ -143,6 +89,7 @@ function semanticTypesFromLabel(value = "") {
   if (/emergency contact.*e[ -]?mail|e[ -]?mail.*emergency contact/.test(evidence)) add("emergency_contact_email");
   if (/meal preference|special meal|meal request/.test(evidence)) add("meal_preference");
   if (/special assistance|assistance request|accessibility request/.test(evidence)) add("special_assistance");
+  if (/purpose of (?:the )?(?:trip|travel|journey)|(?:trip|travel|journey) purpose|reason for (?:the )?(?:trip|travel|journey)|business or leisure|travell?ing for (?:business|leisure)/.test(evidence)) add("travel_purpose");
   if (/(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(evidence)) add("title");
   if (/(?:^|\s)(?:gender|sex)(?:\s|$)/.test(evidence)) add("gender");
   if (/(?:^|\s)(?:country|dial|calling)[ _-]?code(?:\s|$)/.test(evidence)) add("phone_country_code");
@@ -199,6 +146,23 @@ function semanticTypeForControl(control = {}, field = {}) {
     field.accessibleName
   ].filter(Boolean).join(" ");
   const explicitTypes = semanticTypesFromLabel(explicitEvidence);
+  const declaredTypes = [
+    control.fieldClassification?.fieldType,
+    field.fieldClassification?.fieldType,
+    control.fieldType,
+    control.field,
+    field.fieldType,
+    field.field,
+    control.name,
+    field.name
+  ].map(normalizeProfileFieldType).filter(Boolean);
+  if (
+    explicitTypes.length === 1
+    && explicitTypes[0] === "given_names"
+    && declaredTypes.every((candidate) => ["first_name", "given_names"].includes(candidate))
+  ) {
+    return "given_names";
+  }
   const declaredCountry = [
     control.fieldClassification?.fieldType,
     field.fieldClassification?.fieldType,
@@ -287,6 +251,11 @@ function canonicalValue(semanticType = "", value = "") {
   if (!text) return "";
   if (DATE_FIELDS.has(type)) return normalizeCanonicalDate(text);
   if (["title", "gender"].includes(type)) return normalizedTitle(text);
+  if (type === "age_at_departure") {
+    const exactAge = text.match(/^\D*(\d{1,3})\s*(?:years?|yrs?)?\D*$/i)?.[1] || "";
+    const age = Number(exactAge);
+    return exactAge && Number.isInteger(age) && age >= 0 && age <= 130 ? String(age) : "";
+  }
   if (type === "phone_country_code") {
     const digits = text.replace(/\D/g, "");
     return digits ? `+${digits}` : "";
@@ -298,7 +267,77 @@ function canonicalValue(semanticType = "", value = "") {
   return text.toLowerCase().replace(/\s+/g, " ");
 }
 
-function desiredProfileInputValue(semanticType = "", traveler = {}) {
+function canonicalDepartureDate(value = "") {
+  const canonical = normalizeCanonicalDate(value);
+  if (canonical) return canonical;
+  const parsed = new Date(String(value || ""));
+  if (Number.isNaN(parsed.getTime())) return "";
+  const year = parsed.getUTCFullYear();
+  const month = String(parsed.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(parsed.getUTCDate()).padStart(2, "0");
+  return normalizeCanonicalDate(`${year}-${month}-${day}`);
+}
+
+function ageOnDate(dateOfBirth = "", departureDate = "") {
+  const birth = normalizeCanonicalDate(dateOfBirth);
+  const departure = canonicalDepartureDate(departureDate);
+  if (!birth || !departure || departure < birth) return null;
+  const [birthYear, birthMonth, birthDay] = birth.split("-").map(Number);
+  const [departureYear, departureMonth, departureDay] = departure.split("-").map(Number);
+  let age = departureYear - birthYear;
+  if (departureMonth < birthMonth || (departureMonth === birthMonth && departureDay < birthDay)) age -= 1;
+  return Number.isInteger(age) && age >= 0 && age <= 130 ? age : null;
+}
+
+function departureDatesFromContext(context = {}) {
+  const page = context.page || context.observation?.page || context;
+  // There is one authority for trip-dependent profile facts: the immutable
+  // selected-booking baseline. Current-page fragments and review totals may
+  // describe ancillary or abbreviated facts and must never be reinterpreted
+  // as the trip selected by the user.
+  const selectedBooking = context.selectedBooking
+    || context.transactionReview?.baseline
+    || page?.selectedBooking
+    || null;
+  return [...new Set([selectedBooking].filter(Boolean).flatMap((source) => (
+    source?.itinerary?.segments || source?.segments || []
+  )).map((segment) => canonicalDepartureDate(
+    segment?.departureDate || segment?.departure_date || segment?.date || ""
+  )).filter(Boolean))].sort();
+}
+
+function missingDerivedFactDependency(semanticType = "", traveler = {}, context = {}) {
+  if (normalizeProfileFieldType(semanticType) !== "age_at_departure") return null;
+  if (!normalizeCanonicalDate(traveler.date_of_birth || "")) return null;
+  if (departureDatesFromContext(context).length) return null;
+  return Object.freeze({
+    semanticType: "age_at_departure",
+    reasonCode: "SELECTED_BOOKING_FACT_MISSING",
+    sourceField: "departure_date",
+    sourcePath: "selected_booking.departure_date",
+    label: "selected flight departure date"
+  });
+}
+
+function derivedTravelerFacts(traveler = {}, context = {}) {
+  const explicitAge = canonicalValue(
+    "age_at_departure",
+    traveler.derived_facts?.age_at_departure || traveler.age_at_departure || ""
+  );
+  const departureDate = departureDatesFromContext(context)[0] || "";
+  const calculatedAge = explicitAge || String(ageOnDate(traveler.date_of_birth, departureDate) ?? "");
+  return Object.freeze({
+    age_at_departure: calculatedAge ? Object.freeze({
+      semanticType: "age_at_departure",
+      value: calculatedAge,
+      source: explicitAge ? "profile.age_at_departure" : "derived_fact.age_at_departure",
+      inputs: explicitAge ? Object.freeze([]) : Object.freeze(["profile.date_of_birth", "selected_booking.departure_date"]),
+      departureDate
+    }) : null
+  });
+}
+
+function desiredProfileInputValue(semanticType = "", traveler = {}, context = {}) {
   const type = normalizeProfileFieldType(semanticType) || semanticType;
   const document = traveler.document || {};
   const address = traveler.address || {};
@@ -327,6 +366,7 @@ function desiredProfileInputValue(semanticType = "", traveler = {}) {
     title,
     gender: traveler.gender,
     first_name: traveler.first_name,
+    given_names: traveler.given_names || [traveler.first_name, traveler.middle_name].filter(Boolean).join(" "),
     middle_name: traveler.middle_name,
     last_name: traveler.last_name,
     second_last_name: traveler.second_last_name,
@@ -336,6 +376,7 @@ function desiredProfileInputValue(semanticType = "", traveler = {}) {
     phone_country_code: inferredCode,
     phone: localPhone,
     date_of_birth: traveler.date_of_birth,
+    age_at_departure: derivedTravelerFacts(traveler, context).age_at_departure?.value || "",
     place_of_birth: traveler.place_of_birth,
     nationality: traveler.nationality,
     country_of_residence: traveler.country_of_residence || address.country || traveler.country,
@@ -361,14 +402,15 @@ function desiredProfileInputValue(semanticType = "", traveler = {}) {
     emergency_contact_phone: traveler.emergency_contact_phone,
     emergency_contact_email: traveler.emergency_contact_email,
     meal_preference: traveler.meal_preference,
-    special_assistance: traveler.special_assistance
+    special_assistance: traveler.special_assistance,
+    travel_purpose: traveler.travel_purpose
   };
   return String(values[type] || "");
 }
 
-function desiredProfileValue(semanticType = "", traveler = {}) {
+function desiredProfileValue(semanticType = "", traveler = {}, context = {}) {
   const type = normalizeProfileFieldType(semanticType) || semanticType;
-  return canonicalValue(type, desiredProfileInputValue(type, traveler));
+  return canonicalValue(type, desiredProfileInputValue(type, traveler, context));
 }
 
 function dateComponentRole(control = {}, field = {}) {
@@ -441,12 +483,24 @@ function rawControlValue(control = {}) {
   );
 }
 
-function currentComponentValue(semanticType = "", role = "", control = {}, field = {}) {
+function ageOptionContains(value = "", desiredAge = "") {
+  return agentContract.profileChoiceValueCompatible(value, desiredAge, "age_at_departure");
+}
+
+function currentComponentValue(semanticType = "", role = "", control = {}, field = {}, desiredValue = "") {
   if (role === "option"
     && !(control.selected || control.state?.selected || control.state?.checked)) {
     return "";
   }
   const raw = rawControlValue(control);
+  if (semanticType === "age_at_departure" && desiredValue) {
+    const options = [...(control.options || []), ...(field.options || [])];
+    const selectedOption = options.find((option) => (
+      String(option?.value || "") === raw || String(option?.label || "") === raw
+    ));
+    const evidence = [raw, selectedOption?.value, selectedOption?.label].filter(Boolean);
+    if (evidence.some((value) => ageOptionContains(value, desiredValue))) return String(desiredValue);
+  }
   if (DATE_FIELDS.has(semanticType)) {
     if (role !== "value") return dateComponentValue(role, raw);
     const canonical = control.state?.canonicalDateValue || normalizeCanonicalDate(raw);
@@ -524,6 +578,14 @@ function logicalOwner(control = {}, field = {}, semanticType = "") {
     || control.fieldOwnerId
     || field.fieldOwnerId;
   if (explicit) return String(explicit);
+  const sectionType = String(control.sectionType || field.sectionType || "").toLowerCase();
+  const sectionId = control.sectionId || field.sectionId || "";
+  // Phone country code and national number often use unrelated machine names
+  // but share one bounded contact owner. Prefer that composite owner before a
+  // component-local name so both pieces compile into one logical phone.
+  if (semanticType === "phone" && sectionId && /contact|phone/.test(`${sectionType} ${sectionId}`)) {
+    return `contact-phone:${sectionId}`;
+  }
   // Machine identity is more durable than a generated DOM/group id. It
   // survives value entry, validation, dropdown state, and React recreation.
   const machineOwner = semanticMachineOwner(control, field, semanticType);
@@ -534,16 +596,71 @@ function logicalOwner(control = {}, field = {}, semanticType = "") {
     || field.fieldClassification?.tightOwnerKey
     || "";
   if (tightOwnerKey) return String(tightOwnerKey);
-  const sectionType = String(control.sectionType || field.sectionType || "").toLowerCase();
-  const sectionId = control.sectionId || field.sectionId || "";
-  if (semanticType === "phone" && sectionId && /contact|phone/.test(`${sectionType} ${sectionId}`)) {
-    return `contact-phone:${sectionId}`;
-  }
   // A logical requirement must outlive the DOM node that currently renders it.
   // Physical ids, placeholders and current values are therefore never identity
   // fallbacks. One canonical profile fact per traveler is the durable owner when
   // the page exposes no tighter machine or structural ownership evidence.
   return `profile-fact:${semanticType || "unknown"}`;
+}
+
+function representationIdentity(control = {}, field = {}) {
+  return String(
+    control.componentContract?.componentIdentity
+    || control.componentIdentity
+    || field.componentIdentity
+    || control.componentContract?.logicalIdentity
+    || control.logicalIdentity
+    || field.logicalIdentity
+    || ""
+  ).trim();
+}
+
+function mechanicalOperationsForControl(control = {}) {
+  return [...new Set([
+    ...operationsFor(control),
+    ...Object.entries(control.recovery || {}).filter(([, value]) => Boolean(value)).map(([operation]) => operation),
+    ...(control.componentContract?.capabilities || []).map((capability) => capability.operation).filter(Boolean)
+  ])];
+}
+
+function representationIsStateOnly(control = {}) {
+  const operations = mechanicalOperationsForControl(control);
+  const stableKey = String(control.stableKey || "").toLowerCase();
+  const box = control.visualRegion || control.box || {};
+  const hasArea = Number(box.width) > 0 && Number(box.height) > 0;
+  const hasRecoveryMechanic = Object.values(control.recovery || {}).some(Boolean)
+    || (control.componentContract?.capabilities || []).some((capability) => (
+      capability.status !== agentContract.CAPABILITY_STATUS.UNAVAILABLE
+    ));
+  const mechanicallyInert = operations.length === 0
+    || control.state?.disabled === true
+    || control.disabled === true
+    || Object.values(control.operations || {}).filter(Boolean).every((capability) => (
+      capability.status === agentContract.CAPABILITY_STATUS.UNAVAILABLE
+      || capability.actionability?.executable === false
+    ));
+  return mechanicallyInert && (
+    /type:hidden/.test(stableKey)
+    || control.hidden === true
+    || control.accessibility?.hidden === true
+    || !hasArea
+    || !hasRecoveryMechanic
+  );
+}
+
+function representationsCanShareComponent(existing = {}, incoming = {}) {
+  if (existing.role !== incoming.role) return false;
+  const leftIdentity = representationIdentity(existing.control, existing.field);
+  const rightIdentity = representationIdentity(incoming.control, incoming.field);
+  if (!leftIdentity || leftIdentity !== rightIdentity) return false;
+  const leftSection = String(existing.control.sectionId || existing.field.sectionId || "");
+  const rightSection = String(incoming.control.sectionId || incoming.field.sectionId || "");
+  if (leftSection && rightSection && leftSection !== rightSection) return false;
+  const leftStateOnly = representationIsStateOnly(existing.control);
+  const rightStateOnly = representationIsStateOnly(incoming.control);
+  const leftInteractive = mechanicalOperationsForControl(existing.control).length > 0 && !leftStateOnly;
+  const rightInteractive = mechanicalOperationsForControl(incoming.control).length > 0 && !rightStateOnly;
+  return (leftStateOnly && rightInteractive) || (rightStateOnly && leftInteractive);
 }
 
 function operationsFor(control = {}) {
@@ -613,6 +730,9 @@ function canonicalOptionMatch(semanticType = "", role = "", desiredValue = "", o
   const raw = [option.value, option.label].map((value) => String(value || "").trim()).filter(Boolean);
   if (DATE_FIELDS.has(semanticType) && role !== "value") {
     return raw.some((value) => dateComponentValue(role, value) === desiredValue);
+  }
+  if (semanticType === "age_at_departure") {
+    return raw.some((value) => ageOptionContains(value, desiredValue));
   }
   return raw.some((value) => canonicalValue(semanticType, value) === desiredValue);
 }
@@ -811,6 +931,7 @@ function expectedOutcomeForComponent({
     commitRequirement: interactionKind === "scalar"
       ? "normalized_value_retained"
       : "logical_component_committed",
+    representationIdentity: representationIdentity(control, field),
     validationOwnership
   });
 }
@@ -868,6 +989,111 @@ function componentCommitRequirement(control = {}, page = {}) {
   });
 }
 
+function uniqueBy(items = [], keyFor = (item) => item) {
+  return items.filter((item, index, list) => (
+    list.findIndex((candidate) => keyFor(candidate) === keyFor(item)) === index
+  ));
+}
+
+function componentMechanicsScore(component = {}) {
+  const operationCount = mechanicalOperationsForControl(component.control || {}).length;
+  const capabilityCount = (component.capabilityContracts || []).length;
+  const stateOnly = representationIsStateOnly(component.control || {});
+  return stateOnly ? -1000 : operationCount * 100 + capabilityCount * 10 + 1;
+}
+
+function mergeComponentRepresentations(components = []) {
+  const byRole = new Map();
+  for (const component of components) {
+    const key = component.componentRole === "option"
+      ? `option:${component.controlId || component.order}`
+      : component.componentRole;
+    if (!byRole.has(key)) byRole.set(key, []);
+    byRole.get(key).push(component);
+  }
+  return [...byRole.values()].map((representations) => {
+    if (representations.length === 1) return representations[0];
+    const primary = [...representations].sort((left, right) => (
+      componentMechanicsScore(right) - componentMechanicsScore(left)
+      || left.order - right.order
+    ))[0];
+    const stateOwner = representations.find((component) => component.currentCanonicalValue)
+      || representations.find((component) => component.control?.state?.valuePresent === true)
+      || primary;
+    const stateControlIds = [...new Set(representations.map((component) => component.controlId).filter(Boolean))];
+    const currentCanonicalValue = stateOwner.currentCanonicalValue || primary.currentCanonicalValue || "";
+    const validationIssues = uniqueBy(
+      representations.flatMap((component) => component.validationIssues || []),
+      (issue) => `${issue.controlId || ""}|${issue.code || ""}|${issue.message || issue.text || ""}`
+    );
+    const operations = [...new Set(representations.flatMap((component) => component.operations || []))];
+    const capabilityContracts = uniqueBy(
+      representations.flatMap((component) => component.capabilityContracts || []),
+      (capability) => `${capability.operation || ""}|${capability.actuatorId || ""}|${capability.status || ""}`
+    );
+    const observedOptions = uniqueBy(
+      representations.flatMap((component) => component.observedOptions || []),
+      (option) => `${option.value || ""}|${option.label || ""}`
+    );
+    const selectionTerms = [...new Set(representations.flatMap((component) => component.selectionTerms || []))];
+    const exactOption = representations.find((component) => component.exactOption)?.exactOption || null;
+    const expectedOutcome = Object.freeze({
+      ...(primary.expectedOutcome || {}),
+      controlId: primary.controlId || "",
+      representationIdentity: representationIdentity(primary.control, primary.field),
+      stateControlIds: Object.freeze(stateControlIds)
+    });
+    const validationOwnership = Object.freeze({
+      ...(primary.validationOwnership || {}),
+      controlId: primary.controlId || "",
+      stateControlIds: Object.freeze(stateControlIds)
+    });
+    const bindingContract = agentContract.canonicalPipelineContract({
+      requirement: primary.requirementContract || {},
+      component: {
+        ...(primary.bindingContract?.component || {}),
+        controlId: primary.controlId || "",
+        currentCanonicalValue,
+        desiredCanonicalValue: primary.desiredCanonicalValue || "",
+        exactOption,
+        observedOptions,
+        representationControlIds: stateControlIds,
+        stateControlId: stateOwner.controlId || ""
+      },
+      capability: {},
+      expectedOutcome,
+      validationOwnership
+    });
+    const interactionSettled = primary.interactionSettled !== false
+      && stateOwner.interactionSettled !== false;
+    return Object.freeze({
+      ...primary,
+      currentValue: currentCanonicalValue,
+      currentCanonicalValue,
+      operations: Object.freeze(operations),
+      capabilityContracts: Object.freeze(capabilityContracts),
+      observedOptions: Object.freeze(observedOptions),
+      selectionTerms: Object.freeze(selectionTerms),
+      exactOption,
+      expectedOutcome,
+      validationOwnership,
+      bindingContract: Object.freeze(bindingContract),
+      stateControlId: stateOwner.controlId || "",
+      stateControlIds: Object.freeze(stateControlIds),
+      representationControlIds: Object.freeze(stateControlIds),
+      interactionSettled,
+      status: primary.desiredCanonicalValue
+        && currentCanonicalValue === primary.desiredCanonicalValue
+        && validationIssues.length === 0
+        && interactionSettled
+          ? "resolved"
+          : "pending",
+      validationIssues: Object.freeze(validationIssues),
+      order: Math.min(...representations.map((component) => component.order))
+    });
+  });
+}
+
 function expectedOutcomeForCapability(capability = {}, componentOutcome = {}, control = {}) {
   if (capability.operation === "open") {
     return Object.freeze({
@@ -907,6 +1133,14 @@ function resolveLogicalFields(page = {}, profile = {}) {
 
   for (const [order, control] of (page.controls || []).entries()) {
     const field = fieldsByControlId.get(control.controlId) || {};
+    const intermediateOwnedFilter = control.surfaceMembershipEvidence === "reverse_aria_owned_surface"
+      && /editable_combobox|searchbox|textbox/.test(String(control.role || control.kind || "").toLowerCase())
+      && /\b(?:search|filter|find|query)\b/i.test(`${control.label || ""} ${control.accessibleName || ""}`);
+    // A portalled search box is a mechanic for discovering the final option,
+    // not the profile component that stores the selected canonical value.
+    // Keep it in page controls for the adaptive episode, but never let its
+    // query text satisfy or replace the parent logical field.
+    if (intermediateOwnedFilter) continue;
     const semanticType = semanticTypeForControl(control, field);
     if (!PROFILE_FIELDS.has(semanticType)) continue;
     const subject = subjectForControl(control, field);
@@ -914,13 +1148,25 @@ function resolveLogicalFields(page = {}, profile = {}) {
     const owner = logicalOwner(control, field, normalizedType);
     const role = componentRole(control, field, semanticType);
     const baseKey = `${subject.id}|${normalizedType}|${owner}`;
-    const compatibleGroup = [...groups.entries()].find(([key, candidate]) => (
-      key.startsWith(`${baseKey}|`)
-      && (
-        role === "option"
-        || !candidate.members.some((member) => member.role === role)
-      )
-    ));
+    const incomingRepresentation = {
+      control,
+      field,
+      directSemanticType: semanticType,
+      role,
+      order
+    };
+    const compatibleGroup = [...groups.entries()].find(([key, candidate]) => {
+      const cooperativeRepresentation = candidate.subject.id === subject.id
+        && candidate.semanticType === normalizedType
+        && candidate.members.some((member) => representationsCanShareComponent(member, incomingRepresentation));
+      return cooperativeRepresentation || (
+        key.startsWith(`${baseKey}|`)
+        && (
+          role === "option"
+          || !candidate.members.some((member) => member.role === role)
+        )
+      );
+    });
     const key = compatibleGroup?.[0] || `${baseKey}|${[...groups.keys()].filter((item) => item.startsWith(`${baseKey}|`)).length}`;
     if (!groups.has(key)) {
       groups.set(key, {
@@ -944,7 +1190,7 @@ function resolveLogicalFields(page = {}, profile = {}) {
         : phoneTypes.has("phone_country_code")
           ? desiredProfileValue("phone_country_code", traveler)
           : desiredProfileValue("phone", traveler)
-      : desiredProfileValue(group.semanticType, traveler);
+      : desiredProfileValue(group.semanticType, traveler, { page });
     const requirementContract = Object.freeze({
       requirementId: logicalFieldId,
       subjectId: group.subject.id,
@@ -952,21 +1198,21 @@ function resolveLogicalFields(page = {}, profile = {}) {
       desiredCanonicalValue: desiredCanonicalValue || "",
       validationOwnerId: logicalFieldId
     });
-    const components = group.members.map(({ control, field, directSemanticType, role, order }) => {
+    const representationComponents = group.members.map(({ control, field, directSemanticType, role, order }) => {
       const componentSemanticType = directSemanticType === "phone_country_code"
         ? "phone_country_code"
         : directSemanticType === "phone"
           ? "phone"
           : group.semanticType;
-      const currentValue = currentComponentValue(componentSemanticType, role, control, field);
       const desiredValue = group.semanticType === "phone"
         ? desiredProfileValue(componentSemanticType, traveler)
         : desiredComponentValue(group.semanticType, role, desiredCanonicalValue);
+      const currentValue = currentComponentValue(componentSemanticType, role, control, field, desiredValue);
       const desiredInputValue = DATE_FIELDS.has(group.semanticType)
         ? desiredValue
         : group.semanticType === "phone"
           ? desiredProfileInputValue(componentSemanticType, traveler)
-          : desiredProfileInputValue(group.semanticType, traveler);
+          : desiredProfileInputValue(group.semanticType, traveler, { page });
       const validationIssues = relevantComponentIssues(page, control, logicalFieldId, role);
       const observedContract = agentContract.observedComponentContract(control, {
         surfaceId: control.surfaceId || ""
@@ -1088,6 +1334,10 @@ function resolveLogicalFields(page = {}, profile = {}) {
         order
       });
     }).sort((left, right) => (
+      (COMPONENT_ORDER.get(left.role) ?? 99) - (COMPONENT_ORDER.get(right.role) ?? 99)
+      || left.order - right.order
+    ));
+    const components = mergeComponentRepresentations(representationComponents).sort((left, right) => (
       (COMPONENT_ORDER.get(left.role) ?? 99) - (COMPONENT_ORDER.get(right.role) ?? 99)
       || left.order - right.order
     ));
@@ -1248,8 +1498,12 @@ module.exports = {
   subjectForControl,
   travelerForSubject,
   canonicalValue,
+  derivedTravelerFacts,
+  missingDerivedFactDependency,
+  desiredProfileInputValue,
   desiredProfileValue,
   componentRole,
+  canonicalOptionMatch,
   resolveLogicalFields,
   bindResolvedComponentToCurrentPage,
   logicalFieldSatisfied,

@@ -9,11 +9,13 @@ const FIELD_LABELS = Object.freeze({
   title: "title",
   gender: "gender",
   first_name: "first name",
+  given_names: "first and optional middle names",
   middle_name: "middle name",
   last_name: "last name",
   second_last_name: "second surname",
   full_name: "full name",
   date_of_birth: "date of birth",
+  age_at_departure: "age at departure",
   place_of_birth: "place of birth",
   nationality: "nationality",
   country_of_residence: "country of residence",
@@ -39,7 +41,8 @@ const FIELD_LABELS = Object.freeze({
   emergency_contact_phone: "emergency contact phone",
   emergency_contact_email: "emergency contact email",
   meal_preference: "meal preference",
-  special_assistance: "special-assistance requirements"
+  special_assistance: "special-assistance requirements",
+  travel_purpose: "travel purpose (business or leisure)"
 });
 
 const SUPPORTED_RESPONSE_FIELDS = new Set(Object.keys(FIELD_LABELS));

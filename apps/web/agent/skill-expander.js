@@ -11,6 +11,7 @@ const { deriveActionSemantics } = require("./action-semantics");
 const { normalizeCanonicalDate } = require("./date-field-codec");
 const {
   DATE_FIELDS,
+  PROFILE_FIELDS,
   normalizeProfileFieldType,
   semanticTypeForControl,
   canonicalValue: canonicalLogicalValue,
@@ -40,59 +41,21 @@ const NON_BLOCKING_PROFILE_FIELDS = new Set([
   "special_assistance"
 ]);
 
-const PROFILE_FIELDS = new Set([
-  "email",
-  "confirm_email",
-  "phone_country_code",
-  "phone",
-  "title",
-  "first_name",
-  "middle_name",
-  "last_name",
-  "second_last_name",
-  "full_name",
-  "gender",
-  "date_of_birth",
-  "place_of_birth",
-  "nationality",
-  "country_of_residence",
-  "document_type",
-  "passport_number",
-  "document_number",
-  "issuing_country",
-  "document_issue_date",
-  "address_line1",
-  "address_line2",
-  "city",
-  "state",
-  "postal_code",
-  "country",
-  "passport_expiry",
-  "document_expiry",
-  "frequent_flyer_program",
-  "frequent_flyer_number",
-  "known_traveler_number",
-  "redress_number",
-  "emergency_contact_name",
-  "emergency_contact_relationship",
-  "emergency_contact_phone",
-  "emergency_contact_email",
-  "meal_preference",
-  "special_assistance"
-]);
-
 const PROFILE_FIELD_ORDER = [
   "email",
   "confirm_email",
   "phone_country_code",
   "phone",
+  "travel_purpose",
   "title",
   "first_name",
+  "given_names",
   "middle_name",
   "last_name",
   "second_last_name",
   "full_name",
   "date_of_birth",
+  "age_at_departure",
   "place_of_birth",
   "nationality",
   "country_of_residence",
@@ -151,6 +114,25 @@ function observedFieldHasValue(field = {}, control = {}) {
   return Boolean(field.hasValue || control.hasValue || state.valuePresent || state.checked || state.selected);
 }
 
+function mergedRepresentationLifecycle(field = {}, control = {}) {
+  const contracts = [field.representationLifecycle, control.representationLifecycle]
+    .filter((contract) => contract && typeof contract === "object");
+  if (!contracts.length) return null;
+  const active = contracts.some((contract) => (
+    contract.active === true || contract.status === "active_rendered"
+  ));
+  return {
+    status: active ? "active_rendered" : "dormant_hidden",
+    active,
+    stateRendered: contracts.some((contract) => contract.stateRendered === true),
+    renderedMemberIds: [...new Set(contracts.flatMap((contract) => contract.renderedMemberIds || []))]
+  };
+}
+
+function ownsActiveRepresentation(field = {}, control = {}) {
+  return mergedRepresentationLifecycle(field, control)?.status !== "dormant_hidden";
+}
+
 function uid(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
@@ -163,6 +145,7 @@ function profileFieldsForPage(page = {}) {
       const normalized = {
         ...field,
         controlState: control.state || field.controlState || {},
+        representationLifecycle: mergedRepresentationLifecycle(field, control),
         required: Boolean(
           field.required
           || control.required
@@ -184,6 +167,7 @@ function profileFieldsForPage(page = {}) {
       field,
       fieldType: field,
       controlState: state,
+      representationLifecycle: mergedRepresentationLifecycle({}, control),
       required: Boolean(control.required || state.required),
       hasValue: observedFieldHasValue({}, control),
       value: state.valuePresent ? "[filled]" : ""
@@ -210,10 +194,11 @@ function inferredProfileBlockers(page = {}, fields = [], traveler = {}) {
   ));
   if (unresolvedRequiredDecision) return [];
   const candidates = fields.filter((field) => {
+    if (!ownsActiveRepresentation(field, {})) return false;
     const semanticType = normalizeProfileFieldType(field.fieldType || field.field || "");
     if (!PROFILE_FIELDS.has(semanticType) || NON_BLOCKING_PROFILE_FIELDS.has(semanticType)) return false;
     if (field.hasValue) return false;
-    return !desiredProfileValue(semanticType, traveler);
+    return !desiredProfileValue(semanticType, traveler, { page });
   });
   const unique = candidates.filter((field, index, list) => {
     const semanticType = normalizeProfileFieldType(field.fieldType || field.field || "");
@@ -255,6 +240,51 @@ function planScope(observation = {}) {
     surfaceType: String(surface?.type || "page"),
     surfaceLabel: String(surface?.label || "").slice(0, 240)
   };
+}
+
+const PROFILE_COMPONENT_DEPENDENCIES = new Map([
+  ["phone", ["phone_country_code"]],
+  ["confirm_email", ["email"]]
+]);
+
+const PROFILE_COMPONENT_ORDER = new Map([
+  ["country_code", 0],
+  ["day", 0],
+  ["month", 1],
+  ["year", 2],
+  ["value", 10]
+]);
+
+function orderedProfileDescriptors(descriptors = []) {
+  const spatiallyOrdered = [...descriptors].sort((left, right) => {
+    if (left.logicalFieldId && left.logicalFieldId === right.logicalFieldId) {
+      const leftComponentOrder = PROFILE_COMPONENT_ORDER.get(left.componentRole) ?? 5;
+      const rightComponentOrder = PROFILE_COMPONENT_ORDER.get(right.componentRole) ?? 5;
+      if (leftComponentOrder !== rightComponentOrder) return leftComponentOrder - rightComponentOrder;
+    }
+    const leftRegion = left.control?.visualRegion || left.control?.box || {};
+    const rightRegion = right.control?.visualRegion || right.control?.box || {};
+    const leftY = Number(leftRegion.y);
+    const rightY = Number(rightRegion.y);
+    const leftX = Number(leftRegion.x);
+    const rightX = Number(rightRegion.x);
+    const bothVisual = Number.isFinite(leftY) && Number.isFinite(rightY);
+    if (bothVisual && leftY !== rightY) return leftY - rightY;
+    if (bothVisual && Number.isFinite(leftX) && Number.isFinite(rightX) && leftX !== rightX) return leftX - rightX;
+    return left.domOrder - right.domOrder
+      || left.ordinal - right.ordinal
+      || String(left.componentRole).localeCompare(String(right.componentRole));
+  });
+  const remaining = [...spatiallyOrdered];
+  const ordered = [];
+  while (remaining.length) {
+    const nextIndex = remaining.findIndex((descriptor) => (
+      (PROFILE_COMPONENT_DEPENDENCIES.get(descriptor.semanticType) || [])
+        .every((dependency) => !remaining.some((candidate) => candidate.semanticType === dependency))
+    ));
+    ordered.push(...remaining.splice(nextIndex >= 0 ? nextIndex : 0, 1));
+  }
+  return ordered;
 }
 
 function fieldDescriptors(observation = {}, traveler = {}) {
@@ -338,20 +368,54 @@ function fieldDescriptors(observation = {}, traveler = {}) {
         logicalFieldValidationIssues: logicalField.validationIssues || [],
         instructions: logicalField.instructions || [],
         options: logicalField.options || [],
-        ambiguity: logicalField.ambiguity || null
+        ambiguity: logicalField.ambiguity || null,
+        representationLifecycle: mergedRepresentationLifecycle(field, control)
       };
     });
-  }).sort((left, right) => (
-    left.domOrder - right.domOrder
-    || left.ordinal - right.ordinal
-    || String(left.componentRole).localeCompare(String(right.componentRole))
-  ));
-  return descriptors;
+  });
+  return orderedProfileDescriptors(descriptors);
 }
 
-function descriptorOwnsActiveRequirement(descriptor = {}) {
+function decisionGroupForDescriptor(descriptor = {}, page = {}) {
+  const control = descriptor.control || {};
+  const exactDecisionGroupId = String(
+    control.decisionGroupId
+    || descriptor.field?.decisionGroupId
+    || descriptor.requirementContract?.decisionGroupId
+    || ""
+  );
+  return (page.decisionGroups || []).find((group) => {
+    if (exactDecisionGroupId && String(group.decisionGroupId || "") === exactDecisionGroupId) return true;
+    const ownedControlIds = new Set([
+      group.selectedControlId,
+      ...(group.alternativeControlIds || []),
+      ...(group.alternatives || []).flatMap((alternative) => [alternative.controlId, alternative.targetId])
+    ].filter(Boolean).map(String));
+    return Boolean(control.controlId && ownedControlIds.has(String(control.controlId)));
+  }) || null;
+}
+
+function unblockedStageExitReady(page = {}) {
+  const exit = page.stageExit || {};
+  if (exit.continueDisabled === true || exit.navigationState === "disabled") return false;
+  const readyCandidate = (exit.candidates || []).some((candidate) => (
+    candidate.executable === true
+    || candidate.status === "ready"
+  ));
+  return Boolean(
+    (exit.continueAllowed === true || exit.continueObserved === true || readyCandidate)
+    && readyCandidate
+    && !(exit.blockers || []).length
+  );
+}
+
+function descriptorOwnsActiveRequirement(descriptor = {}, page = {}) {
   const control = descriptor.control || {};
   const field = descriptor.field || {};
+  if (!ownsActiveRepresentation(
+    { ...field, representationLifecycle: descriptor.representationLifecycle || field.representationLifecycle },
+    control
+  )) return false;
   const required = Boolean(
     field.required
     || control.required
@@ -363,29 +427,86 @@ function descriptorOwnsActiveRequirement(descriptor = {}) {
     (descriptor.validationIssues || []).length
     || (descriptor.logicalFieldValidationIssues || []).length
   );
-  const actionability = [
-    ...(descriptor.capabilityContracts || []).flatMap((contract) => [
-      contract?.actionability,
-      ...Object.values(contract?.actionabilityByActuator || {})
-    ]),
-    ...Object.values(control.operations || {}).flatMap((capability) => [
-      capability?.actionability,
-      ...Object.values(capability?.actionabilityByActuator || {})
-    ]),
-    ...Object.values(control.recovery || {}).flatMap((recovery) => [
-      recovery?.actionability,
-      ...Object.values(recovery?.actionabilityByActuator || {})
-    ])
-  ].filter(Boolean);
-  const belongsToCurrentLifecycle = actionability.some((state) => (
-    state.executable === true
-    || state.revealable === true
-    || (state.rendered === true && state.visible === true && state.inCurrentSurface !== false)
-  ));
-  return required || ownsValidation || belongsToCurrentLifecycle;
+  const decisionGroup = decisionGroupForDescriptor(descriptor, page);
+  const decisionStatus = String(decisionGroup?.status || "").toLowerCase();
+  const decisionRequiresResolution = decisionGroup?.requiresResolution === true
+    || (decisionGroup?.required === true
+      && !["satisfied", "waived", "waived_by_policy", "optional"].includes(decisionStatus));
+  if (NON_BLOCKING_PROFILE_FIELDS.has(descriptor.semanticType) && !required && !ownsValidation) {
+    return false;
+  }
+  if (required || ownsValidation || decisionRequiresResolution) return true;
+
+  // Actionability describes how a control can be operated; it is never proof
+  // that the control represents work. A fresh, unblocked stage exit is an
+  // explicit statement that no optional blank profile representation owns
+  // the current task. This is the live EasyJet boundary where a blank
+  // framework parent survived after the exact age choice was already settled.
+  if (unblockedStageExitReady(page)) return false;
+
+  // Some checkout forms omit HTML `required` and canonical decision metadata.
+  // While their stage exit is absent or blocked, an exact active logical field
+  // remains admissible from current-owner evidence. This fallback depends on
+  // semantic ownership and form state, never on executable/revealable mechanics.
+  const lifecycle = descriptor.representationLifecycle || mergedRepresentationLifecycle(field, control);
+  const surface = authoritativeCurrentSurface(page);
+  const renderingEvidence = Object.values(control.operations || {}).flatMap((capability) => (
+    capability
+      ? [capability.actionability, ...Object.values(capability.actionabilityByActuator || {})]
+      : []
+  )).filter(Boolean);
+  const explicitlyNotRendered = renderingEvidence.length > 0
+    && renderingEvidence.every((evidence) => evidence.rendered === false);
+  const currentSurfaceOwner = Boolean(
+    control.controlId
+    && !explicitlyNotRendered
+    && (
+      !surface?.id
+      || surface.type === "page"
+      || control.surfaceId === surface.id
+      || (surface.memberControlIds || []).includes(control.controlId)
+    )
+  );
+  return Boolean(
+    lifecycle?.active === true
+    || lifecycle?.status === "active_rendered"
+    || currentSurfaceOwner
+    || field.required === true
+    || control.required === true
+  );
 }
 
-function profileStageReadiness(observation = {}, traveler = {}) {
+function descriptorHasActiveRepresentation(descriptor = {}) {
+  return ownsActiveRepresentation(
+    { ...(descriptor.field || {}), representationLifecycle: descriptor.representationLifecycle || descriptor.field?.representationLifecycle },
+    descriptor.control || {}
+  );
+}
+
+function verifiedProfileComponentMatchesDescriptor(completion = {}, descriptor = {}) {
+  if (completion?.status !== "verified" || completion?.contractVersion !== "verified-profile-component/v1") return false;
+  const sameOwner = Boolean(
+    completion.logicalFieldId
+    && descriptor.logicalFieldId
+    && completion.logicalFieldId === descriptor.logicalFieldId
+  ) || Boolean(
+    completion.semanticType === descriptor.semanticType
+    && String(completion.subjectId || "traveler_1") === String(descriptor.subjectId || "traveler_1")
+    && String(completion.componentRole || "value") === String(descriptor.componentRole || "value")
+  );
+  if (!sameOwner) return false;
+  const desiredValue = descriptor.desiredNormalizedValue
+    || canonicalLogicalValue(descriptor.semanticType, descriptor.value)
+    || descriptor.value
+    || "";
+  return agentContract.profileChoiceValueCompatible(
+    completion.selectedCanonicalValue,
+    desiredValue,
+    descriptor.semanticType
+  );
+}
+
+function profileStageReadiness(observation = {}, traveler = {}, verifiedProfileComponents = []) {
   const page = observation.page || {};
   const fields = profileFieldsForPage(page);
   const descriptors = fieldDescriptors(observation, traveler);
@@ -393,8 +514,11 @@ function profileStageReadiness(observation = {}, traveler = {}) {
   const hasProfileControls = fields.some((field) => PROFILE_FIELDS.has(normalizeProfileFieldType(field.fieldType || field.field || "")));
   const profileStage = hasProfileControls || /traveler|traveller|passenger|contact|document/.test(step);
   const unresolvedKnown = descriptors
-    .filter(descriptorOwnsActiveRequirement)
+    .filter((descriptor) => descriptorOwnsActiveRequirement(descriptor, page))
     .filter((descriptor) => !descriptor.hasValue)
+    .filter((descriptor) => !(verifiedProfileComponents || []).some((completion) => (
+      verifiedProfileComponentMatchesDescriptor(completion, descriptor)
+    )))
     .map((descriptor) => ({
       semanticType: descriptor.semanticType,
       controlId: descriptor.control?.controlId || "",
@@ -403,10 +527,22 @@ function profileStageReadiness(observation = {}, traveler = {}) {
       desiredNormalizedValue: descriptor.desiredNormalizedValue || ""
     }));
   const explicitUnresolvedRequired = fields.flatMap((field) => {
+    if (!ownsActiveRepresentation(field, {})) return [];
     if (!field.required) return [];
     const semanticType = normalizeProfileFieldType(field.fieldType || field.field || "");
     if (!PROFILE_FIELDS.has(semanticType)) return [];
-    const canonicalValue = desiredProfileValue(semanticType, traveler);
+    const descriptorForField = descriptors.find((descriptor) => (
+      descriptor.semanticType === semanticType
+      && (
+        !field.controlId
+        || descriptor.control?.controlId === field.controlId
+        || descriptor.logicalFieldId === field.logicalFieldId
+      )
+    ));
+    if (descriptorForField && (verifiedProfileComponents || []).some((completion) => (
+      verifiedProfileComponentMatchesDescriptor(completion, descriptorForField)
+    ))) return [];
+    const canonicalValue = desiredProfileValue(semanticType, traveler, { page });
     if (canonicalValue && descriptors.some((descriptor) => descriptor.semanticType === semanticType && descriptor.hasValue)) return [];
     if (canonicalValue && descriptors.some((descriptor) => descriptor.semanticType === semanticType && !descriptor.hasValue)) return [];
     const state = field.controlState || {};
@@ -425,7 +561,10 @@ function profileStageReadiness(observation = {}, traveler = {}) {
   ].filter((item, index, list) => list.findIndex((other) => other.semanticType === item.semanticType) === index);
   const missingUserData = unresolvedRequired.filter((item) => item.valueAvailable === false);
   const profileControlIds = new Set(fields
-    .filter((field) => PROFILE_FIELDS.has(normalizeProfileFieldType(field.fieldType || field.field || "")))
+    .filter((field) => (
+      ownsActiveRepresentation(field, {})
+      && PROFILE_FIELDS.has(normalizeProfileFieldType(field.fieldType || field.field || ""))
+    ))
     .map((field) => String(field.controlId || ""))
     .filter(Boolean));
   const validationIssues = scopedValidationIssues(page, {
@@ -491,6 +630,7 @@ function createSkillPlan(action, observation = {}, traveler = {}) {
   const planId = uid("skill");
   const observationId = String(observation.observationId || "");
   const atoms = fieldDescriptors(observation, traveler)
+    .filter(descriptorHasActiveRepresentation)
     .map((descriptor) => atomFromDescriptor(planId, descriptor, observationId));
   return {
     planId,
@@ -847,7 +987,7 @@ function reconcileDispatchedAtom(plan, lastActionResult = {}, observationId = ""
 function extendPlan(plan, observation = {}, traveler = {}) {
   const observationId = String(observation.observationId || "");
   const existing = new Set((plan.atoms || []).map((atom) => atom.descriptorKey || `${atom.semanticType}:${atom.ordinal}`));
-  for (const descriptor of fieldDescriptors(observation, traveler)) {
+  for (const descriptor of fieldDescriptors(observation, traveler).filter(descriptorHasActiveRepresentation)) {
     if (existing.has(descriptor.key)) continue;
     plan.atoms.push(atomFromDescriptor(plan.planId, descriptor, observationId));
     existing.add(descriptor.key);
@@ -855,9 +995,92 @@ function extendPlan(plan, observation = {}, traveler = {}) {
   return plan;
 }
 
-function descriptorForAtom(atom, observation = {}, traveler = {}) {
-  const descriptors = fieldDescriptors(observation, traveler);
-  const base = (
+function descriptorFromPublishedProfileGoal(atom, observation = {}) {
+  if (atom.kind !== "profile_field") return null;
+  const page = observation.page || {};
+  const publishedControlId = atom.controlId || atom.componentBinding?.controlId || "";
+  const control = (page.controls || []).find((candidate) => candidate.controlId === publishedControlId) || null;
+  if (!control || !ownsActiveRepresentation({}, control)) return null;
+
+  const field = (page.fields || []).find((candidate) => candidate.controlId === control.controlId) || {};
+  const desiredValue = atom.expectedNormalizedValue
+    || atom.semanticGoal?.desiredValue
+    || atom.expectedValue
+    || "";
+  const expectedOutcome = atom.expectedOutcome || atom.postcondition || null;
+  const componentBinding = atom.componentBinding || {
+    logicalFieldId: atom.logicalFieldId || "",
+    componentIdentity: atom.descriptorKey || `${atom.logicalFieldId || control.stableKey || control.controlId}:${atom.componentRole || "value"}`,
+    componentRole: atom.componentRole || "value",
+    controlId: control.controlId,
+    controlRole: control.role || field.role || "",
+    currentCanonicalValue: control.state?.normalizedValue || "",
+    desiredCanonicalValue: desiredValue,
+    exactOption: null,
+    observedOptions: control.options || []
+  };
+  return {
+    key: atom.descriptorKey || componentBinding.componentIdentity,
+    domOrder: Number(control.order || 0),
+    semanticType: atom.semanticType || atom.requirementContract?.semanticType || "",
+    ordinal: Number(atom.ordinal || 0),
+    label: control.label || field.label || atom.label || atom.semanticType || "",
+    field,
+    control,
+    value: atom.expectedValue || desiredValue,
+    observedRole: control.role || field.role || componentBinding.controlRole || "",
+    observedCapabilities: control.capabilities || [],
+    capabilityContracts: atom.capabilityContracts || [],
+    requirementContract: atom.requirementContract || null,
+    bindingContract: agentContract.canonicalPipelineContract({
+      requirement: atom.requirementContract || {},
+      component: {
+        ...componentBinding,
+        controlId: control.controlId,
+        controlRole: control.role || field.role || componentBinding.controlRole || ""
+      },
+      capability: {},
+      expectedOutcome: expectedOutcome || {},
+      validationOwnership: atom.validationOwnership || {}
+    }),
+    expectedOutcome,
+    validationOwnership: atom.validationOwnership || null,
+    choiceLike: false,
+    choiceTerms: [...(atom.choiceTerms || [])],
+    currentNormalizedValue: control.state?.normalizedValue || "",
+    desiredNormalizedValue: desiredValue,
+    exactOption: componentBinding.exactOption || null,
+    canonicalValue: atom.expectedCanonicalValue || desiredValue,
+    dateCodec: atom.dateCodec || null,
+    codecError: atom.codecError || null,
+    hasValue: false,
+    validationIssues: [],
+    conflictingSelectedControlIds: [],
+    logicalFieldId: atom.logicalFieldId || componentBinding.logicalFieldId || "",
+    subjectId: atom.subjectId || atom.requirementContract?.subjectId || "traveler_1",
+    componentRole: atom.componentRole || componentBinding.componentRole || "value",
+    logicalStructure: atom.logicalStructure || "scalar",
+    logicalCurrentCanonicalValue: "",
+    logicalDesiredCanonicalValue: atom.expectedCanonicalValue || desiredValue,
+    logicalFieldSatisfied: false,
+    logicalFieldValidationIssues: [],
+    instructions: [...(atom.instructions || [])],
+    options: [...(atom.options || [])],
+    ambiguity: atom.ambiguity || null,
+    representationLifecycle: mergedRepresentationLifecycle(field, control)
+  };
+}
+
+function descriptorForAtom(atom, observation = {}, traveler = {}, {
+  publishedSemanticAuthority = false
+} = {}) {
+  const published = publishedSemanticAuthority
+    ? descriptorFromPublishedProfileGoal(atom, observation)
+    : null;
+  const descriptors = published
+    ? []
+    : fieldDescriptors(observation, traveler).filter(descriptorHasActiveRepresentation);
+  let base = published || (
     (atom.descriptorKey
       ? descriptors.find((descriptor) => descriptor.key === atom.descriptorKey)
       : null)
@@ -873,6 +1096,12 @@ function descriptorForAtom(atom, observation = {}, traveler = {}) {
     ))
     || null
   );
+  // Legacy skill atoms do not always carry the full field contract. Preserve
+  // this narrow compatibility fallback; current profile-goal execution uses
+  // the published contract above and never runs a second semantic pass.
+  if (!base && atom.kind === "profile_field") {
+    base = descriptorFromPublishedProfileGoal(atom, observation);
+  }
   const currentBinding = bindResolvedComponentToCurrentPage(observation.page || {}, {
     selectionTerms: base?.choiceTerms || atom.choiceTerms || [],
     requirementContract: base?.requirementContract || null,
@@ -884,7 +1113,7 @@ function descriptorForAtom(atom, observation = {}, traveler = {}) {
     expectedOutcome: base?.expectedOutcome || atom.postcondition || null,
     validationOwnership: base?.validationOwnership || null
   });
-  if (currentBinding) {
+  if (currentBinding && ownsActiveRepresentation({}, currentBinding.control || {})) {
     return {
       ...(base || {}),
       label: currentBinding.control.label || atom.label,
@@ -1566,6 +1795,7 @@ function atomicActionForStrategy(plan, atom, descriptor, strategy, observation =
 function semanticGoalAtom(goal = {}, attemptedCandidateIds = []) {
   return {
     atomId: goal.goalId || "",
+    kind: goal.kind || "profile_field",
     descriptorKey: goal.descriptorKey || "",
     semanticType: goal.semanticType || "",
     ordinal: Number(goal.ordinal || 0),
@@ -1587,6 +1817,18 @@ function semanticGoalAtom(goal = {}, attemptedCandidateIds = []) {
     expectedNormalizedValue: goal.desiredValue || "",
     expectedCanonicalValue: goal.canonicalValue || "",
     dateCodec: goal.dateCodec || null,
+    codecError: goal.codecError || null,
+    ambiguity: goal.ambiguity || null,
+    logicalStructure: goal.logicalStructure || "scalar",
+    label: goal.label || goal.semanticType || "",
+    instructions: [...(goal.instructions || [])],
+    options: [...(goal.options || [])],
+    controlId: goal.controlId || goal.componentBinding?.controlId || "",
+    requirementContract: goal.requirementContract || null,
+    componentBinding: goal.componentBinding || null,
+    capabilityContracts: [...(goal.capabilityContracts || [])],
+    validationOwnership: goal.validationOwnership || null,
+    expectedOutcome: goal.expectedOutcome || goal.postcondition || null,
     choiceTerms: [...(goal.choiceTerms || [])],
     strategyHistory: (attemptedCandidateIds || []).map((strategyId) => ({
       strategyId,
@@ -1595,19 +1837,28 @@ function semanticGoalAtom(goal = {}, attemptedCandidateIds = []) {
   };
 }
 
-function descriptorForSemanticGoal(goal = {}, observation = {}, traveler = {}) {
+function descriptorForSemanticGoal(goal = {}, observation = {}, traveler = {}, options = {}) {
   const atom = semanticGoalAtom(goal);
-  return descriptorForAtom(atom, observation, traveler);
+  return descriptorForAtom(atom, observation, traveler, options);
 }
 
 function profileGoalForDescriptor(descriptor = {}, observation = {}, previousGoal = null) {
+  const {
+    semanticGoal: _discardedAdaptiveSemanticGoal,
+    selectionMode: _discardedSelectionMode,
+    adaptiveEnvelope: _discardedAdaptiveEnvelope,
+    sourceGoal: _discardedSourceGoal,
+    sourceGoalId: _discardedSourceGoalId,
+    surfaceId: _discardedAdaptiveSurfaceId,
+    ...stablePreviousGoal
+  } = previousGoal || {};
   const observationId = String(observation.observationId || "");
   const goalControl = descriptor.goalControl || descriptor.control || {};
   const desiredValue = descriptor.desiredNormalizedValue
     || canonicalLogicalValue(descriptor.semanticType, descriptor.value)
     || descriptor.value;
   return {
-    ...(previousGoal || {}),
+    ...stablePreviousGoal,
     goalId: previousGoal?.goalId || (descriptor.logicalFieldId && descriptor.logicalStructure === "composite"
       ? `profile:${descriptor.logicalFieldId}:${descriptor.componentRole || "value"}`
       : `profile:${descriptor.semanticType}:${descriptor.ordinal}`),
@@ -1650,127 +1901,41 @@ function profileGoalForDescriptor(descriptor = {}, observation = {}, previousGoa
   };
 }
 
-function deriveProfileGoal(observation = {}, traveler = {}, currentGoal = null) {
-  if (currentGoal?.goalId) {
-    const descriptor = descriptorForSemanticGoal(currentGoal, observation, traveler);
-    if (descriptor && !descriptor.hasValue) {
-      return profileGoalForDescriptor(descriptor, observation, currentGoal);
-    }
-    // A satisfied current goal is not a terminal signal. Fall through and
-    // select the next unresolved semantic descriptor from this observation.
-  }
-
-  const descriptor = fieldDescriptors(observation, traveler)
-    .find((item) => !item.hasValue);
-  return descriptor ? profileGoalForDescriptor(descriptor, observation) : null;
-}
-
-function executableProfileCandidate(candidate = {}, observation = {}) {
-  if (!candidate?.controlId || candidate.requiresJudgment || !isCandidateGrounded(candidate, observation)) return false;
-  if (candidate.capabilityStatus !== agentContract.CAPABILITY_STATUS.PROVEN_EXECUTABLE) return false;
-  const control = (observation.page?.controls || [])
-    .find((item) => item.controlId === candidate.controlId);
-  if (!control) return false;
-  if (candidate.type === "click_xy") {
-    const recovery = control.recovery?.[candidate.operation || ""];
-    return Boolean(
-      candidate.visualRegion
-      && recovery?.requiresVisualConfirmation === true
-      && (recovery.regions || []).some((region) => visualRegionsMatch(region, candidate.visualRegion))
-    );
-  }
-  const capability = control.operations?.[candidate.operation];
-  if (!capability) return false;
-  const actionability = capability.actionabilityByActuator?.[candidate.targetId]
-    || (capability.actuatorId === candidate.targetId ? capability.actionability : null);
-  const disabledState = control.disabled === true || control.state?.disabled === true;
-  if (disabledState && candidate.targetId === control.stateElementId) return false;
-  return actionability?.executable === true;
-}
-
-function selectExecutableProfileGoal(observation = {}, traveler = {}, currentGoal = null, {
-  blockedGoalKeys = []
-} = {}) {
+function selectNextProfileRequirement(observation = {}, traveler = {}, currentGoal = null, verifiedProfileComponents = []) {
+  const page = observation.page || {};
   const descriptors = fieldDescriptors(observation, traveler)
-    .filter(descriptorOwnsActiveRequirement)
-    .filter((descriptor) => !descriptor.hasValue);
-  const blockedGoals = new Set(blockedGoalKeys || []);
-  const ordered = [];
-  let rebound = null;
-  if (currentGoal?.goalId) {
-    rebound = descriptorForSemanticGoal(currentGoal, observation, traveler);
-    const surface = ownedCurrentSurface(observation.page || {});
-    if (rebound && !rebound.hasValue && surface?.type && surface.type !== "page") {
-      ordered.push({ descriptor: rebound, previousGoal: currentGoal });
-    }
-  }
-  for (const descriptor of descriptors) {
-    if (ordered.some((item) => item.descriptor.key === descriptor.key)) continue;
-    ordered.push({
-      descriptor,
-      previousGoal: rebound?.key === descriptor.key ? currentGoal : null
-    });
-  }
+    .filter((descriptor) => descriptorOwnsActiveRequirement(descriptor, page))
+    .filter((descriptor) => !descriptor.hasValue)
+    .filter((descriptor) => !(verifiedProfileComponents || []).some((completion) => (
+      verifiedProfileComponentMatchesDescriptor(completion, descriptor)
+    )));
 
-  const blockedFields = [];
-  let boundedRecoveryFallback = null;
-  for (const item of ordered) {
-    const goal = profileGoalForDescriptor(item.descriptor, observation, item.previousGoal);
-    if (blockedGoals.has(semanticGoalKey(goal))) {
-      blockedFields.push({
-        semanticType: item.descriptor.semanticType,
-        componentRole: item.descriptor.componentRole || "value",
-        controlId: item.descriptor.control?.controlId || "",
-        reasonCode: "STRATEGIES_EXHAUSTED"
-      });
-      continue;
-    }
-    const candidates = candidatesForProfileGoal(goal, observation, traveler);
-    const executable = candidates.filter((candidate) => executableProfileCandidate(candidate, observation));
-    if (executable.length) {
+  // Requirement ordering is semantic authority only. Current DOM mechanics
+  // must not decide which traveler fact Fly works on next.
+  if (currentGoal?.goalId) {
+    const rebound = descriptorForSemanticGoal(currentGoal, observation, traveler);
+    if (
+      rebound
+      && descriptorOwnsActiveRequirement(rebound, page)
+      && !rebound.hasValue
+      && !(verifiedProfileComponents || []).some((completion) => (
+        verifiedProfileComponentMatchesDescriptor(completion, rebound)
+      ))
+    ) {
       return {
-        goal,
-        candidates: executable,
-        blockedFields,
+        goal: profileGoalForDescriptor(rebound, observation, currentGoal),
+        candidates: [],
+        blockedFields: [],
         failureCode: ""
       };
     }
-    const boundedRecovery = candidates.filter((candidate) => (
-      !candidate.requiresJudgment
-      && isCandidateGrounded(candidate, observation)
-      && [
-        agentContract.CAPABILITY_STATUS.RECOVERABLE,
-        agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
-      ].includes(candidate.capabilityStatus)
-    ));
-    if (!boundedRecoveryFallback && boundedRecovery.length) {
-      boundedRecoveryFallback = { goal, candidates: boundedRecovery };
-    }
-    const ambiguous = Boolean(item.descriptor.ambiguity || item.descriptor.codecError);
-    blockedFields.push({
-      semanticType: item.descriptor.semanticType,
-      componentRole: item.descriptor.componentRole || "value",
-      controlId: item.descriptor.control?.controlId || "",
-      reasonCode: ambiguous ? "SEMANTIC_AMBIGUITY" : "MISSING_EXECUTABLE_ACTUATOR"
-    });
   }
-
-  if (boundedRecoveryFallback) {
-    return {
-      goal: boundedRecoveryFallback.goal,
-      candidates: boundedRecoveryFallback.candidates,
-      blockedFields,
-      failureCode: ""
-    };
-  }
-
-  const reasonCodes = new Set(blockedFields.map((item) => item.reasonCode));
-  const uniformReason = reasonCodes.size === 1 ? blockedFields[0]?.reasonCode || "" : "";
+  const descriptor = descriptors[0] || null;
   return {
-    goal: null,
+    goal: descriptor ? profileGoalForDescriptor(descriptor, observation) : null,
     candidates: [],
-    blockedFields,
-    failureCode: uniformReason || (blockedFields.length ? "PROFILE_FIELDS_TEMPORARILY_BLOCKED" : "")
+    blockedFields: [],
+    failureCode: ""
   };
 }
 
@@ -1802,7 +1967,11 @@ function profileGoalSatisfied(goal = {}, observation = {}, traveler = {}) {
 
 function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, attemptedCandidateIds = [], options = {}) {
   if (!goal?.goalId) return [];
-  const descriptor = descriptorForSemanticGoal(goal, observation, traveler);
+  const descriptor = descriptorForSemanticGoal(goal, observation, traveler, {
+    // TaskState already compiled the semantic type and desired value. This
+    // layer only rebinds that contract to the current exact actuator.
+    publishedSemanticAuthority: true
+  });
   if (!descriptor || descriptor.hasValue) return [];
   const boundedDateAmbiguity = DATE_FIELDS.has(descriptor.semanticType)
     && (
@@ -1877,6 +2046,11 @@ function actionForProfileCandidate(goal = {}, candidate = {}, observation = {}) 
     operation: candidate.operation,
     goalId: goal.goalId,
     candidateId: candidate.candidateId,
+    candidateClass: candidate.candidateClass || "proven_action",
+    mechanicalHypothesis: candidate.mechanicalHypothesis === true,
+    discoveryEnvelope: candidate.discoveryEnvelope || null,
+    logicalControlId: candidate.logicalControlId || candidate.controlId || goal.controlId || "",
+    actuatorId: candidate.actuatorId || candidate.targetId || "",
     controlId: candidate.controlId || goal.controlId || "",
     targetId: candidate.targetId || "",
     interactionMethod: candidate.interactionMethod || "",
@@ -1906,166 +2080,6 @@ function actionForProfileCandidate(goal = {}, candidate = {}, observation = {}) 
   });
 }
 
-function advanceSkillPlan(rawPlan, observation = {}, traveler = {}, lastActionResult = {}) {
-  let plan = clonePlan(rawPlan);
-  const observationId = String(observation.observationId || "");
-  plan.lastObservedObservationId = observationId;
-  plan.updatedAt = new Date().toISOString();
-
-  const reconciled = reconcileDispatchedAtom(plan, lastActionResult, observationId);
-  plan = reconciled.plan;
-  if (reconciled.ambiguous) {
-    return { plan, action: null, status: "ambiguous", reason: plan.suspendedReason };
-  }
-
-  const interrupted = scopeInterruption(plan, observation);
-  if (interrupted?.complete) {
-    plan.status = "complete";
-    plan.completedAt = new Date().toISOString();
-    return { plan, action: null, status: "complete", reason: interrupted.reason };
-  }
-  if (interrupted) {
-    plan = suspendPlan(plan, interrupted.reason, observationId);
-    return { plan, action: null, status: "ambiguous", reason: interrupted.reason };
-  }
-
-  plan = extendPlan(plan, observation, traveler);
-  for (const atom of plan.atoms.filter((item) => item.status === "pending")) {
-    const descriptor = descriptorForAtom(atom, observation, traveler);
-    if (descriptor?.hasValue) {
-      atom.status = "satisfied";
-      atom.completedObservationId = observationId;
-      atom.completionSource = "current_observation";
-    }
-  }
-
-  const atom = plan.atoms.find((item) => item.status === "pending");
-  if (!atom) {
-    const profileFields = profileFieldsForPage(observation.page || {}).filter((field) => PROFILE_FIELDS.has(String(field.field || "")));
-    const unresolvedRequired = profileFields.filter((field) => {
-      if (!field.required || field.hasValue || field.controlState?.valuePresent) return false;
-      if (["title", "gender"].includes(String(field.field || ""))) {
-        return !profileFields.some((peer) => peer.field === field.field && (peer.hasValue || peer.controlState?.checked || peer.controlState?.selected));
-      }
-      return true;
-    });
-    const planControlIds = new Set(profileFieldsForPage(observation.page || {})
-      .filter((field) => PROFILE_FIELDS.has(String(field.field || "")))
-      .map((field) => field.controlId)
-      .filter(Boolean));
-    const visibleErrors = scopedValidationIssues(observation.page || {}, {
-      controlIds: planControlIds,
-      sectionTypes: new Set(["contact", "passenger", "traveler", "traveller", "document"])
-    }).map(validationIssueMessage);
-    if (unresolvedRequired.length || visibleErrors.length) {
-      const labels = unresolvedRequired.map((field) => field.label || field.field).filter(Boolean).slice(0, 5);
-      const reason = unresolvedRequired.length
-        ? `Required profile controls remain unresolved: ${labels.join(", ")}.`
-        : `Visible validation errors remain: ${visibleErrors.slice(0, 3).join("; ")}.`;
-      plan = suspendPlan(plan, reason, observationId);
-      return { plan, action: null, status: "ambiguous", reason };
-    }
-    plan.status = "complete";
-    plan.completedAt = new Date().toISOString();
-    return { plan, action: null, status: "complete", reason: "All required profile-field atoms are satisfied with no visible validation errors." };
-  }
-  const descriptor = descriptorForAtom(atom, observation, traveler);
-  if (!descriptor || descriptor.hasValue) {
-    plan = suspendPlan(plan, `The current canonical field for ${atom.atomId} could not be resolved unambiguously.`, observationId);
-    return { plan, action: null, status: "ambiguous", reason: plan.suspendedReason };
-  }
-
-  const strategies = strategyCandidatesForAtom(atom, descriptor, observation);
-  if (strategies.length !== 1 || strategies[0]?.requiresAI) {
-    const reason = strategies.length
-      ? `The semantic goal ${atom.semanticType}=${atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue} has multiple grounded strategies and requires bounded strategy selection.`
-      : `The semantic goal ${atom.semanticType}=${atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue} has no untried grounded strategy in the current observation.`;
-    plan = suspendPlan(plan, reason, observationId);
-    return { plan, action: null, status: "ambiguous", reason: plan.suspendedReason };
-  }
-  const action = atomicActionForStrategy(plan, atom, descriptor, strategies[0], observation);
-  atom.status = "proposed";
-  atom.lastActionId = action.id;
-  atom.lastControlId = descriptor.control.controlId;
-  atom.lastObservationId = observationId;
-  plan.status = "running";
-  return { plan, action, atom, status: "action" };
-}
-
-function markSkillActionGoverned(rawPlan, actionId, observationId = "") {
-  const plan = clonePlan(rawPlan);
-  const atom = plan.atoms.find((item) => item.lastActionId === actionId && item.status === "proposed");
-  if (atom) {
-    atom.status = "governed";
-    atom.governedObservationId = observationId || atom.lastObservationId || "";
-  }
-  plan.updatedAt = new Date().toISOString();
-  return plan;
-}
-
-function failSkillAction(rawPlan, actionId, reason, observationId = "") {
-  const plan = clonePlan(rawPlan);
-  const atom = plan.atoms.find((item) => item.lastActionId === actionId && ["proposed", "governed", "dispatched"].includes(item.status));
-  if (atom) atom.status = "blocked";
-  return suspendPlan(plan, reason, observationId);
-}
-
-function prepareSkillViewportRecovery(rawPlan, actionId, observationId = "", maxRecoveries = 2) {
-  const plan = clonePlan(rawPlan);
-  const atom = plan.atoms.find((item) => item.lastActionId === actionId && ["proposed", "governed", "dispatched"].includes(item.status));
-  if (!atom) {
-    return { plan: suspendPlan(plan, "The recoverable action no longer belongs to an active skill atom.", observationId), recovered: false, exhausted: true };
-  }
-  atom.viewportRecoveryCount = Number(atom.viewportRecoveryCount || 0) + 1;
-  if (atom.viewportRecoveryCount > maxRecoveries) {
-    return {
-      plan: suspendPlan(plan, `Skill atom ${atom.atomId} remained outside the viewport after ${maxRecoveries} governed recovery attempts.`, observationId),
-      recovered: false,
-      exhausted: true
-    };
-  }
-  atom.status = "pending";
-  atom.attempts = Math.max(0, Number(atom.attempts || 0) - 1);
-  atom.lastViewportRejectedActionId = atom.lastActionId;
-  atom.lastActionId = "";
-  atom.lastControlId = "";
-  atom.lastObservationId = "";
-  plan.status = "running";
-  plan.suspendedReason = "";
-  plan.lastObservedObservationId = observationId || plan.lastObservedObservationId || "";
-  plan.updatedAt = new Date().toISOString();
-  return { plan, atom, recovered: true, exhausted: false };
-}
-
-// Compatibility wrapper for callers/tests that need to expand a newly chosen
-// skill. The returned plan must be persisted before dispatching its atom.
-function expandSkillAction(action, observation = {}, traveler = {}) {
-  if (!COMPOUND_ACTIONS.has(action?.type)) return { action, expanded: false, plan: null };
-  const plan = createSkillPlan(action, observation, traveler);
-  const advanced = advanceSkillPlan(plan, observation, traveler, {});
-  if (advanced.action) {
-    return {
-      action: advanced.action,
-      expanded: true,
-      exhausted: false,
-      skill: action.type,
-      field: advanced.atom?.semanticType || "",
-      atom: advanced.atom || null,
-      plan: advanced.plan
-    };
-  }
-  return {
-    action: null,
-    handoffReason: advanced.reason || "No canonical profile-field atom can be executed from the current observation.",
-    expanded: true,
-    exhausted: true,
-    skill: action.type,
-    field: "",
-    atom: null,
-    plan: advanced.plan
-  };
-}
-
 module.exports = {
   PROFILE_FIELDS,
   PROFILE_FIELD_ORDER,
@@ -2075,8 +2089,8 @@ module.exports = {
   validationIssueMessage,
   fieldDescriptors,
   descriptorOwnsActiveRequirement,
-  deriveProfileGoal,
-  selectExecutableProfileGoal,
+  verifiedProfileComponentMatchesDescriptor,
+  selectNextProfileRequirement,
   profileGoalSatisfied,
   candidatesForProfileGoal,
   actionForProfileCandidate

@@ -152,6 +152,13 @@ function meaningfulControlValue(control = {}) {
   return raw;
 }
 
+function explicitlyDormantRepresentation(control = {}) {
+  const lifecycle = control.representationLifecycle;
+  if (!lifecycle || typeof lifecycle !== "object") return false;
+  if (lifecycle.status === "active_rendered" || lifecycle.active === true) return false;
+  return lifecycle.status === "dormant_hidden" || lifecycle.active === false;
+}
+
 function controlsForGroup(group = {}, page = {}) {
   const ids = new Set([
     ...(group.alternativeControlIds || []),
@@ -320,9 +327,11 @@ function transitionFor(control = {}, alternative = {}) {
   const operation = Object.entries(control.operations || {}).find(([, capability]) => (
     capability?.actionability?.executable === true || capability?.actionability?.revealable === true
   ))?.[0] || "";
-  const price = control.structuredPrice || alternative.structuredPrice || (
+  const effectRole = clean(control.effectRole || alternative.effectRole || "unknown");
+  const nonEconomic = ["scope_toggle", "information_only", "navigation"].includes(effectRole);
+  const price = nonEconomic ? null : (control.structuredPrice || alternative.structuredPrice || (
     optionPrice(control) !== null ? { amount: optionPrice(control), currency: clean(control.currency) } : null
-  );
+  ));
   const merged = { ...alternative, ...control, structuredPrice: price };
   return Object.freeze({
     transitionId: `${clean(control.controlId || alternative.controlId)}:${operation || "unavailable"}`,
@@ -333,8 +342,9 @@ function transitionFor(control = {}, alternative = {}) {
     canonicalValue: alternative.canonicalValue ?? control.canonicalValue ?? alternative.value ?? control.currentValue ?? clean(alternative.label || control.label),
     selected: Boolean(control.selected || control.state?.checked || control.state?.selected || alternative.selected),
     executable: executable(control),
-    paid: paid(merged),
+    paid: !nonEconomic && paid(merged),
     price,
+    effectRole,
     risk: clean(control.risk || alternative.risk || "unknown"),
     semantic: clean(control.semantic || alternative.semantic)
   });
@@ -458,8 +468,10 @@ function canonicalDecisionForGroup({
     clean(item?.decisionGroupId) === id
   )) || null;
   const selectedEvidence = group.selectedEvidence || null;
+  const selectedEffectRole = clean(selectedEvidence?.effectRole || selectedTransition?.effectRole || "unknown");
+  const selectedIsEconomic = !["scope_toggle", "information_only", "navigation"].includes(selectedEffectRole);
   const evidencePaid = Boolean(
-    (transactionSelection && (
+    selectedIsEconomic && ((transactionSelection && (
       Number(transactionSelection.priceAmount) > 0
       || /paid|money|selected_paid/.test(lower(transactionSelection.disposition))
     ))
@@ -467,7 +479,7 @@ function canonicalDecisionForGroup({
       selectedEvidence.disposition === "paid"
       || Number(selectedEvidence.structuredPrice?.amount) > 0
       || /paid|money|purchase/.test(lower(`${selectedEvidence.risk || ""} ${selectedEvidence.semantic || ""}`))
-    ))
+    )))
   );
   let intent = exactUserIntent(subject, group, transitions, userPolicy, traveler);
   const discoveryControlIds = new Set(controls.filter((control) => (
@@ -557,8 +569,10 @@ function canonicalDecisionForGroup({
     && transitions.filter((transition) => transition.executable).every((transition) => transition.paid)
     && (page.controls || []).some((control) => {
       const explicitStageExitIds = new Set([
-        page.stageExit?.continueControlId,
-        page.stageExit?.continueTargetId
+        ...(page.stageExit?.candidates || []).flatMap((candidate) => [
+          candidate.controlId,
+          candidate.actuatorId
+        ])
       ].map(clean).filter(Boolean));
       const explicitStageExit = [
         control.controlId,
@@ -622,6 +636,14 @@ function canonicalDecisionForGroup({
       risk: selectedTransition?.risk || "",
       ...(paidAuthorization ? { authorizationId: clean(paidAuthorization.authorizationId) } : {})
     };
+  } else if (!required && !selected && !["exact", "constraint"].includes(intent.match)) {
+    // Visibility is not an obligation. Unchecked optional consent,
+    // enrollment, citizenship and similar toggles remain compatible unless
+    // exact profile or policy intent requires a state change.
+    status = "waived";
+    needsAction = false;
+    actionReason = "optional_compatible_without_affirmative_action";
+    completionReason = "optional_state_requires_no_resolution";
   } else if (["ambiguous", "unavailable"].includes(intent.match) && !selected && !previousCompletion) {
     const canDiscoverOptions = discoveryTransitions.length === 1
       && intent.desiredControlIds.includes(discoveryTransitions[0].controlId);
@@ -708,10 +730,12 @@ function canonicalDecisionForGroup({
       selectedLabel: clean(selectedTransition?.label || group.selectedLabel),
       canonicalValue: selectedTransition?.canonicalValue ?? null,
       selected: Boolean(selected),
+      effectRole: selectedEffectRole,
       checked: Boolean(selected?.state?.checked),
       empty: !selected
     }),
     required,
+    requiresResolution: needsAction,
     optional: !required,
     currentOutcome,
     commitmentPhase,
@@ -719,15 +743,15 @@ function canonicalDecisionForGroup({
     priceRisk: Object.freeze({
       selectedPaid: Boolean(commitmentPhase === "committed_paid"),
       observedPaidIntent: Boolean(evidencePaid && !explicitlyFree(selectedTransition || {})),
-      amount: selectedTransition?.price?.amount
+      amount: selectedIsEconomic ? (selectedTransition?.price?.amount
         ?? selectedEvidence?.structuredPrice?.amount
         ?? transactionSelection?.priceAmount
-        ?? null,
-      currency: clean(
+        ?? null) : null,
+      currency: selectedIsEconomic ? clean(
         selectedTransition?.price?.currency
         || selectedEvidence?.structuredPrice?.currency
         || transactionSelection?.currency
-      ),
+      ) : "",
       risk: selectedTransition?.risk || "unknown"
     }),
     userIntent: Object.freeze(intent),
@@ -747,6 +771,12 @@ function canonicalDecisionForGroup({
 
 function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
   if (!control.controlId || ownedControlIds.has(control.controlId)) return null;
+  // Lifecycle admission is authoritative. Dormant login, signup, future-step,
+  // responsive-duplicate, and other hidden branches remain available in the
+  // observation for diagnostics, but they are not current checkout decisions.
+  // A cooperative hidden state node linked to a rendered current component is
+  // compiled as active_rendered upstream and therefore remains eligible here.
+  if (explicitlyDormantRepresentation(control)) return null;
   const shape = lower(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""} ${control.inputType || ""}`);
   const semantic = lower(`${control.fieldType || ""} ${control.field || ""} ${control.semantic || ""} ${control.meaning || ""}`);
   if (/continue|next|proceed|advance|done|finish|navigation/.test(semantic)) {
@@ -809,16 +839,21 @@ function buildCanonicalDecisions({
   traveler = {},
   decisionEpisode = null
 } = {}) {
-  const grouped = (page.decisionGroups || []).filter((group) => groupId(group)).map((group) => (
-    canonicalDecisionForGroup({
+  const grouped = (page.decisionGroups || []).filter((group) => groupId(group)).flatMap((group) => {
+    const controls = controlsForGroup(group, page);
+    // A decision whose every observed representation is explicitly dormant
+    // is context, not current work. Do not let native requiredness in a hidden
+    // future branch outrank the rendered stage exit.
+    if (controls.length && controls.every(explicitlyDormantRepresentation)) return [];
+    return [canonicalDecisionForGroup({
       group,
       page,
       previousCompletion: previousCompletions.get(groupId(group)) || null,
       userPolicy,
       traveler,
       decisionEpisode
-    })
-  ));
+    })];
+  });
   const ownedControlIds = new Set(grouped.flatMap((decision) => decision.physicalControlIds));
   const standalone = (page.controls || [])
     .map((control) => standaloneControlDecision(control, ownedControlIds))
@@ -833,6 +868,7 @@ module.exports = {
   canonicalDecisionForGroup,
   exactSubject,
   exactUserIntent,
+  explicitlyDormantRepresentation,
   isTypedNavigationControl,
   meaningfulControlValue
 };

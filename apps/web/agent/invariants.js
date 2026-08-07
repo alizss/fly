@@ -22,6 +22,56 @@ function number(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function baselineTotalAmount(facts = {}) {
+  const amount = number(facts.totalPrice?.amount);
+  const evidence = facts.factEvidence?.totalPrice || null;
+  if (facts.evidenceMode === "typed" && (
+    evidence?.authoritative !== true
+    || evidence?.role !== "booking_total"
+  )) return null;
+  if (amount !== 0) return amount;
+  // Zero is often a loading placeholder. It may become immutable only when
+  // complete itinerary identity and authoritative price ownership prove that
+  // zero is the real transaction total (for example a points redemption).
+  const segments = facts.itinerary?.segments || [];
+  const completeIdentity = facts.itinerary?.completeness === "complete"
+    && segments.length > 0
+    && segments.every((segment) => segment.origin && segment.destination);
+  return completeIdentity && facts.factEvidence?.totalPrice?.authoritative === true ? 0 : null;
+}
+
+function coherentBookingEnvelope(facts = {}) {
+  const segments = facts.itinerary?.segments || [];
+  return facts.itinerary?.completeness === "complete"
+    && segments.length > 0
+    && segments.every((segment) => segment.origin && segment.destination && segment.departureDate)
+    && (facts.travelers || []).length > 0
+    && Boolean(facts.currency)
+    && facts.factEvidence?.totalPrice?.authoritative === true
+    && facts.factEvidence?.totalPrice?.role === "booking_total";
+}
+
+function promotableObservedTotal(facts = {}) {
+  const amount = baselineTotalAmount(facts);
+  if (amount == null) return null;
+  // Legacy observations are retained only for migration. The current typed
+  // producer must prove one coherent selected-booking envelope before its
+  // monetary fact can enter the immutable baseline.
+  if (facts.evidenceMode !== "typed") return amount;
+  return coherentBookingEnvelope(facts) ? amount : null;
+}
+
+function comparableBookingTotals(left = {}, right = {}) {
+  const leftEvidence = left.factEvidence?.totalPrice || null;
+  const rightEvidence = right.factEvidence?.totalPrice || null;
+  const legacyPair = left.evidenceMode !== "typed" && right.evidenceMode !== "typed";
+  const sameTypedRole = leftEvidence?.authoritative === true
+    && rightEvidence?.authoritative === true
+    && leftEvidence.role === "booking_total"
+    && rightEvidence.role === "booking_total";
+  return legacyPair || sameTypedRole;
+}
+
 function isFinalReviewFacts(facts = {}) {
   return (facts.provenance || []).some((entry) => entry.source === "payment_summary");
 }
@@ -120,7 +170,8 @@ function enrichBaseline(existing = {}, observed = {}) {
       : "partial"
     : "unknown";
   const existingBaseAmount = number(existing.basePrice?.amount);
-  const existingTotalAmount = number(existing.totalPrice?.amount);
+  const existingTotalAmount = baselineTotalAmount(existing);
+  const observedTotalAmount = promotableObservedTotal(observed);
   return normalizeFacts({
     itinerary: { completeness, segments },
     travelers: existing.travelers?.length ? existing.travelers : observed.travelers,
@@ -130,15 +181,19 @@ function enrichBaseline(existing = {}, observed = {}) {
       currency: existing.basePrice?.currency || observed.basePrice?.currency || existing.currency || observed.currency
     },
     totalPrice: {
-      amount: existingTotalAmount == null ? number(observed.totalPrice?.amount) : existingTotalAmount,
+      amount: existingTotalAmount == null ? observedTotalAmount : existingTotalAmount,
       currency: existing.totalPrice?.currency || observed.totalPrice?.currency || existing.currency || observed.currency
     },
     fareBrand: existing.fareBrand || observed.fareBrand,
     selectedExtras: existing.selectedExtras || [],
     factEvidence: {
-      itinerary: existing.factEvidence?.itinerary?.length ? existing.factEvidence.itinerary : observed.factEvidence?.itinerary,
+      itinerary: previousSegments.length && existing.factEvidence?.itinerary?.length
+        ? existing.factEvidence.itinerary
+        : observed.factEvidence?.itinerary,
       fareBrand: existing.factEvidence?.fareBrand || observed.factEvidence?.fareBrand || null,
-      totalPrice: existing.factEvidence?.totalPrice || observed.factEvidence?.totalPrice || null,
+      totalPrice: existingTotalAmount == null
+        ? observed.factEvidence?.totalPrice || null
+        : existing.factEvidence?.totalPrice || observed.factEvidence?.totalPrice || null,
       travelers: existing.factEvidence?.travelers || observed.factEvidence?.travelers || null
     },
     provenance: existing.provenance?.length ? existing.provenance : observed.provenance
@@ -189,7 +244,7 @@ function transactionFactGaps(facts = {}) {
   if (!segments.length || segments.some((segment) => !segment.origin || !segment.destination)) gaps.push("itinerary_route");
   if (!(facts.travelers || []).length) gaps.push("travelers");
   if (!facts.currency) gaps.push("currency");
-  if (number(facts.totalPrice?.amount) == null) gaps.push("total_price");
+  if (baselineTotalAmount(facts) == null) gaps.push("total_price");
   return gaps;
 }
 
@@ -208,7 +263,13 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
   if (baseline.currency && comparison.currency && baseline.currency !== comparison.currency) contradictions.push("CURRENCY_CHANGED");
   const baselineTotal = number(baseline.totalPrice?.amount);
   const currentTotal = number(comparison.totalPrice?.amount);
-  if (baselineTotal != null && currentTotal != null && currentTotal > baselineTotal) {
+  if (
+    envelope.baselineStatus === "approved"
+    && comparableBookingTotals(baseline, comparison)
+    && baselineTotal != null
+    && currentTotal != null
+    && currentTotal > baselineTotal
+  ) {
     const maximum = number(state.approvals?.priceAuthorization?.maximumAmount);
     if (!state.approvals?.priceAuthorization?.authorizationId || maximum == null || currentTotal > maximum) {
       contradictions.push("UNAPPROVED_PRICE_CHANGE");
@@ -538,7 +599,16 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
 
   const beforePrice = number(baseline.totalPrice?.amount);
   const currentPrice = number(observed.totalPrice?.amount);
-  if (beforePrice != null && currentPrice != null && currentPrice > beforePrice) {
+  const baselineApproved = prepared.envelope
+    ? prepared.envelope.baselineStatus === "approved"
+    : transactionFactGaps(baseline).length === 0;
+  if (
+    baselineApproved
+    && comparableBookingTotals(baseline, observed)
+    && beforePrice != null
+    && currentPrice != null
+    && currentPrice > beforePrice
+  ) {
     if (exactCostReducingCorrection) {
       pass("ELEVATED_PRICE_EXACT_CORRECTION", `${beforePrice} -> ${currentPrice}`);
     } else if (actionAddsCost || finalTransactionBoundary) {

@@ -313,6 +313,25 @@ function candidateSelectionSchemaFor(candidateIds = []) {
   };
 }
 
+function semanticBindingSchemaFor(componentIds = [], semanticTypes = [], factSources = []) {
+  const components = [...new Set(componentIds.map(String).filter(Boolean))];
+  const semantics = [...new Set(semanticTypes.map(String).filter(Boolean))];
+  const sources = [...new Set(factSources.map(String).filter(Boolean))];
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["status", "componentId", "semanticType", "factSource", "confidence", "evidence"],
+    properties: {
+      status: { type: "string", enum: ["bound", "unknown"] },
+      componentId: { type: "string", enum: ["", ...components] },
+      semanticType: { type: "string", enum: ["unknown", ...semantics] },
+      factSource: { type: "string", enum: ["", ...sources] },
+      confidence: { type: "string", enum: ["high", "medium", "low"] },
+      evidence: { type: "string" }
+    }
+  };
+}
+
 function verifyAndPlanSchemaFor(candidateIds = []) {
   const ids = [...new Set((candidateIds || []).map(String).filter(Boolean))];
   return {
@@ -340,5 +359,6 @@ module.exports = {
   verifyAndPlanSchema,
   candidateSelectionSchema,
   candidateSelectionSchemaFor,
+  semanticBindingSchemaFor,
   verifyAndPlanSchemaFor
 };

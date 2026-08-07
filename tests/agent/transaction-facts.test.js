@@ -126,13 +126,15 @@ test("transaction facts reject passenger-age routes and coalesce duplicate owned
     segmentId,
     source: "bounded_checkout_route",
     ownerKey: `owner_${segmentId}`,
-    qualification: "persistent_checkout_route",
+    qualification: "owned_travel_date",
     confidence: 0.88,
     authoritative: true
   });
   const rawSegments = [
     { segmentId: "route_without_date", origin: "ANTALYA", destination: "ISTANBUL" },
     { segmentId: "route_with_date", origin: "ANTALYA", destination: "ISTANBUL", departureDate: "Tue 9 Feb" },
+    { segmentId: "fare_prose_route", origin: "NON-REFUNDABLE. CHANGEABLE SUBJECT", destination: "FEES." },
+    { segmentId: "bag_prose_route", origin: "ADD A LARGE CABIN BAG", destination: "BRING ONBOARD" },
     { segmentId: "age_route_1", origin: "PRIMARY PASSENGER ADULT (OVER 12 YEARS) CHILD (2", destination: "12 YEARS) INFANT (UNDER 2 YEARS)" },
     { segmentId: "age_route_2", origin: "ADULT (OVER 12 YEARS) CHILD (2", destination: "12 YEARS) INFANT (UNDER 2 YEARS)" }
   ];
@@ -155,7 +157,7 @@ test("transaction facts reject passenger-age routes and coalesce duplicate owned
     evidence: {
       source: "bounded_checkout_route",
       ownerKey: "owner_route_with_date",
-      qualification: "persistent_checkout_route",
+      qualification: "owned_travel_date",
       observationId: "",
       confidence: 0.88,
       authoritative: true
@@ -559,6 +561,120 @@ test("P0.5 progressively promotes an unknown baseline once complete transaction 
   assert.equal(completed.envelope.baseline.itinerary.segments[0].origin, "LHR");
   assert.equal(completed.envelope.evidence.at(-1).facts.itinerary.completeness, "complete");
   assert.equal(completed.envelope.evidence.at(-1).facts.itinerary.segments[0].origin, "LHR");
+});
+
+test("a zero loading placeholder cannot become the immutable transaction baseline", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_zero_placeholder";
+  const placeholder = facts({ completeness: "unknown", origin: "", destination: "", departureDate: "", totalPrice: 0 });
+  placeholder.factEvidence = {
+    totalPrice: { source: "owned_price_summary", ownerKey: "loading_total", authoritative: true }
+  };
+  const collecting = prepareTransactionInvariants(state, observation("obs_zero_loading", placeholder), { id: "trav_1" });
+  const real = facts({ totalPrice: 317.54 });
+  real.evidenceMode = "typed";
+  real.itinerary.segments[0].evidence = {
+    source: "progressive_from_to_itinerary",
+    ownerKey: "real_segment",
+    authoritative: true
+  };
+  real.factEvidence = {
+    itinerary: [{
+      segmentId: "segment_1",
+      source: "progressive_from_to_itinerary",
+      ownerKey: "real_segment",
+      authoritative: true
+    }],
+    totalPrice: { source: "payment_summary_total", ownerKey: "real_total", authoritative: true }
+  };
+  const completed = prepareTransactionInvariants(collecting.state, observation("obs_real_total", real), { id: "trav_1" });
+
+  assert.equal(collecting.envelope.baselineStatus, "collecting");
+  assert.equal(collecting.envelope.baseline.totalPrice.amount, null);
+  assert.equal(completed.envelope.baselineStatus, "approved");
+  assert.equal(completed.envelope.baseline.totalPrice.amount, 317.54);
+  assert.equal(completed.review.contradictions.includes("UNAPPROVED_PRICE_CHANGE"), false);
+});
+
+test("an ancillary offer price cannot become the selected-booking baseline", () => {
+  const typedBooking = (totalPrice, { finalReview = false } = {}) => {
+    const raw = facts({ totalPrice });
+    raw.contractVersion = "transaction-facts/v2";
+    raw.evidenceMode = "typed";
+    raw.itinerary.segments[0].evidence = {
+      source: "persistent_booking_summary",
+      ownerKey: "selected_booking_summary",
+      authoritative: true
+    };
+    raw.factEvidence = {
+      itinerary: [{
+        segmentId: "segment_1",
+        source: "persistent_booking_summary",
+        ownerKey: "selected_booking_summary",
+        authoritative: true
+      }],
+      totalPrice: {
+        source: finalReview ? "payment_summary_total" : "owned_price_summary",
+        ownerKey: finalReview ? "payment_summary" : "selected_booking_summary",
+        role: "booking_total",
+        ownerType: finalReview ? "payment_summary" : "selected_booking_summary",
+        authoritative: true
+      }
+    };
+    if (finalReview) raw.provenance = [{ source: "payment_summary", observationId: "obs_payment", confidence: 0.95 }];
+    return raw;
+  };
+
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_ancillary_price_scope";
+  const insurance = {
+    contractVersion: "transaction-facts/v2",
+    evidenceMode: "typed",
+    itinerary: { completeness: "unknown", segments: [] },
+    travelers: [{ travelerId: "trav_1", name: "Alex Example" }],
+    currency: "EUR",
+    totalPrice: { amount: 66.25, currency: "EUR" },
+    selectedExtras: [],
+    factEvidence: {
+      totalPrice: {
+        source: "owned_option_price",
+        ownerKey: "insurance_xcover",
+        role: "option_price",
+        ownerType: "insurance_option",
+        authoritative: true
+      }
+    }
+  };
+
+  const collecting = prepareTransactionInvariants(state, observation("obs_insurance_offer", insurance), { id: "trav_1" });
+  assert.equal(collecting.envelope.baselineStatus, "collecting");
+  assert.equal(collecting.observed.totalPrice.amount, null);
+  assert.equal(collecting.envelope.baseline.totalPrice.amount, null);
+
+  const selected = prepareTransactionInvariants(
+    collecting.state,
+    observation("obs_selected_booking", typedBooking(317.54)),
+    { id: "trav_1" }
+  );
+  assert.equal(selected.envelope.baselineStatus, "approved");
+  assert.equal(selected.envelope.baseline.totalPrice.amount, 317.54);
+  assert.equal(selected.envelope.baseline.factEvidence.totalPrice.role, "booking_total");
+
+  const reviewed = prepareTransactionInvariants(
+    selected.state,
+    observation("obs_payment", typedBooking(317.54, { finalReview: true })),
+    { id: "trav_1" }
+  );
+  assert.equal(reviewed.review.ready, true);
+  assert.equal(reviewed.review.contradictions.includes("UNAPPROVED_PRICE_CHANGE"), false);
+
+  const increased = prepareTransactionInvariants(
+    selected.state,
+    observation("obs_payment_increased", typedBooking(350, { finalReview: true })),
+    { id: "trav_1" }
+  );
+  assert.equal(increased.review.ready, false);
+  assert.ok(increased.review.contradictions.includes("UNAPPROVED_PRICE_CHANGE"));
 });
 
 test("a final payment review cannot establish its own missing itinerary baseline", () => {

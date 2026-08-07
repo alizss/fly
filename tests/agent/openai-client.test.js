@@ -2,11 +2,183 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { callStructured } = require("../../apps/web/agent/openai-client");
+const {
+  activeUnknownComponents,
+  applySemanticBinding,
+  resolveActiveComponentSemantics
+} = require("../../apps/web/agent/active-component-grounding");
 const { resolveSemanticOwnership, selectCandidate } = require("../../apps/web/agent/select-candidate");
 const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
+
+function activeUnknownProfileObservation() {
+  return {
+    observationId: "obs_unknown_profile_component",
+    page: {
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: ["mystery_age"] },
+      controls: [{
+        controlId: "mystery_age",
+        surfaceId: "surface-page",
+        role: "select",
+        kind: "select-one",
+        label: "Traveller category on flight date",
+        required: true,
+        representationLifecycle: { status: "active_rendered", active: true },
+        state: { valuePresent: false, selected: false, checked: false },
+        options: [{ value: "18_24", label: "18–24" }],
+        operations: {
+          select: {
+            actuatorId: "mystery_age",
+            status: "executable",
+            strategies: [{ method: "native_select" }],
+            actionability: { executable: true, rendered: true, visible: true, hitTested: true }
+          }
+        }
+      }, {
+        controlId: "dormant_template",
+        surfaceId: "surface-page",
+        role: "textbox",
+        kind: "text",
+        label: "Template value",
+        required: true,
+        representationLifecycle: { status: "dormant_hidden", active: false },
+        state: { valuePresent: false },
+        operations: { type: { actuatorId: "dormant_template", status: "unavailable" } }
+      }],
+      fields: [],
+      validationIssues: [],
+      selectedBooking: {
+        itinerary: { segments: [{ departureDate: "2026-10-15" }] }
+      }
+    }
+  };
+}
+
+test("active semantic grounding admits only the current lifecycle representation", () => {
+  const components = activeUnknownComponents(activeUnknownProfileObservation());
+  assert.deepEqual(components.map((component) => component.controlId), ["mystery_age"]);
+});
+
+test("an unblocked executable stage exit suppresses unknown-component grounding authority", () => {
+  const observation = activeUnknownProfileObservation();
+  observation.page.stageExit = {
+    continueAllowed: true,
+    continueObserved: true,
+    continueDisabled: false,
+    navigationState: "ready",
+    blockers: [],
+    candidates: [{ controlId: "continue", status: "ready", executable: true }]
+  };
+
+  assert.deepEqual(activeUnknownComponents(observation), []);
+});
+
+test("disabled navigation does not promote a generic container into an active semantic requirement", () => {
+  const observation = activeUnknownProfileObservation();
+  observation.page.controls = [{
+    controlId: "passenger_container",
+    surfaceId: "surface-page",
+    role: "textbox",
+    kind: "input",
+    label: "Passenger information",
+    required: false,
+    representationLifecycle: { status: "active_rendered", active: true },
+    state: { valuePresent: false },
+    operations: {
+      type: {
+        actuatorId: "passenger_container",
+        actionability: { executable: true, rendered: true, visible: true, hitTested: true }
+      }
+    }
+  }, {
+    controlId: "continue",
+    surfaceId: "surface-page",
+    role: "button",
+    kind: "button",
+    label: "Continue",
+    state: { disabled: true },
+    operations: {}
+  }];
+
+  assert.deepEqual(activeUnknownComponents(observation), []);
+});
+
+test("bounded semantic grounding can only apply an exact supplied binding tuple", () => {
+  const observation = activeUnknownProfileObservation();
+  const bindings = [{
+    componentId: "mystery_age",
+    semanticType: "age_at_departure",
+    factSource: "derived_fact.age_at_departure"
+  }];
+  const accepted = applySemanticBinding(observation, {
+    status: "bound",
+    componentId: "mystery_age",
+    semanticType: "age_at_departure",
+    factSource: "derived_fact.age_at_departure",
+    confidence: "high",
+    evidence: "Local label asks for category on the flight date."
+  }, bindings);
+  const rejected = applySemanticBinding(observation, {
+    status: "bound",
+    componentId: "invented_component",
+    semanticType: "age_at_departure",
+    factSource: "derived_fact.age_at_departure",
+    confidence: "high",
+    evidence: "Invented target."
+  }, bindings);
+
+  assert.equal(accepted.page.controls[0].fieldType, "age_at_departure");
+  assert.equal(accepted.page.activeRequirementGrounding.status, "bound");
+  assert.equal(rejected.page.activeRequirementGrounding.status, "unknown");
+  assert.equal(rejected.page.activeRequirementGrounding.reasonCode, "ACTIVE_REQUIREMENT_UNRESOLVED");
+});
+
+test("pre-goal grounding sends a binding-only InteractionView and returns no browser action", async () => {
+  const previousFetch = global.fetch;
+  let request = null;
+  global.fetch = async (_url, options) => {
+    request = JSON.parse(options.body);
+    return {
+      ok: true,
+      json: async () => ({
+        status: "completed",
+        model: "test-model",
+        output_text: JSON.stringify({
+          status: "bound",
+          componentId: "mystery_age",
+          semanticType: "age_at_departure",
+          factSource: "derived_fact.age_at_departure",
+          confidence: "high",
+          evidence: "The active local label asks for the traveller category on the flight date."
+        }),
+        usage: { input_tokens: 20, output_tokens: 12, total_tokens: 32 }
+      })
+    };
+  };
+  try {
+    const result = await resolveActiveComponentSemantics({
+      apiKey: "test-key",
+      model: "test-model",
+      observation: activeUnknownProfileObservation(),
+      traveler: { date_of_birth: "2003-05-31" }
+    });
+    const payload = JSON.parse(request.input[0].content[0].text);
+
+    assert.equal(payload.outputAuthority, "binding_hypothesis_only");
+    assert.equal(payload.interactionView.allowedSemanticBindings.some((binding) => (
+      binding.componentId === "mystery_age"
+      && binding.semanticType === "age_at_departure"
+      && binding.factSource === "derived_fact.age_at_departure"
+    )), true);
+    assert.equal(Object.hasOwn(result.resolution, "action"), false);
+    assert.equal(result.observation.page.controls[0].fieldType, "age_at_departure");
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
 
 test("authenticated empty model output is retried before being reported as unavailable", async () => {
   const previousFetch = global.fetch;
@@ -123,10 +295,14 @@ test("ambiguity selection exposes blocked context but schema permits only safe c
     const payload = JSON.parse(request.input[0].content[0].text);
     const schema = request.text.format.schema;
 
-    assert.equal(payload.contextCapabilities.length, 2);
-    assert.equal(payload.taskState.stage, "extras");
-    assert.deepEqual(payload.contextCapabilities.map((capability) => capability.selectable), [true, false]);
-    assert.equal(payload.contextCapabilities[1].policyStatus, "deny");
+    assert.equal(payload.interactionView.contractVersion, "interaction-view/v1");
+    assert.equal(payload.interactionView.components.length, 2);
+    assert.equal(payload.interactionView.stage, "extras");
+    assert.deepEqual(
+      payload.interactionView.components.flatMap((component) => component.actuators).map((actuator) => actuator.selectable),
+      [true, false]
+    );
+    assert.equal(payload.interactionView.components[1].actuators[0].blockedBy, "policy:deny");
     assert.deepEqual(payload.selectableCandidates.map((candidate) => candidate.candidateId), ["candidate_close"]);
     assert.deepEqual(schema.properties.candidateId.enum, ["candidate_close"]);
     assert.equal(schema.properties.candidateId.enum.includes("candidate_upgrade"), false);
@@ -226,9 +402,97 @@ test("candidate AI receives at most twenty related DOM controls and no screensho
     const content = request.input[0].content;
     const payload = JSON.parse(content.find((item) => item.type === "input_text").text);
     assert.equal(payload.selectableCandidates.length, 20);
-    assert.equal(payload.contextCapabilities.length, 20);
+    assert.equal(payload.interactionView.components.length, 20);
     assert.ok(Buffer.byteLength(JSON.stringify(payload), "utf8") < 24_000);
     assert.equal(content.some((item) => item.type === "input_image"), false);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("adaptive candidate AI compacts verbose surfaces before the hard packet boundary", async () => {
+  const previousFetch = global.fetch;
+  let request = null;
+  global.fetch = async (_url, options) => {
+    request = JSON.parse(options.body);
+    return {
+      ok: true,
+      json: async () => ({
+        status: "completed",
+        output_text: JSON.stringify({
+          candidateId: "candidate_visible_choice",
+          semanticOutcome: "satisfy_current_decision",
+          confidence: "medium"
+        })
+      })
+    };
+  };
+  const verboseCountryList = Array.from({ length: 260 }, (_, index) => (
+    `Country ${index + 1} (+${100 + index})`
+  )).join(" ");
+  const candidate = {
+    candidateId: "candidate_visible_choice",
+    capabilityId: "ctrl_visible_choice::choose",
+    controlId: "ctrl_visible_choice",
+    targetLabel: "Current reversible choice",
+    meaning: "current reversible choice",
+    type: "click",
+    operation: "choose",
+    risk: "safe",
+    selectable: true,
+    policyDecision: { allow: true, decision: "allow" }
+  };
+  try {
+    const result = await selectCandidate({
+      apiKey: "test-key",
+      model: "test-model",
+      goal: {
+        kind: "adaptive_surface",
+        goalId: "goal_adaptive_verbose",
+        semanticType: "phone_country_code",
+        semanticGoal: `Choose +386 from ${verboseCountryList}`,
+        desiredValue: "+386",
+        adaptiveEnvelope: {
+          contractVersion: "bounded-adaptive-surface/v1",
+          episodeId: "episode_verbose",
+          objective: `Choose +386 from ${verboseCountryList}`,
+          desiredValue: "+386",
+          surfaceId: "surface_country_list",
+          surfaceType: "dropdown",
+          allowedOperations: ["choose", "keyboard"],
+          forbiddenRisks: ["money", "payment", "legal"],
+          forbiddenEffects: ["select_paid_option", "submit_payment"],
+          remainingSteps: 5,
+          deadlineAt: Date.now() + 20_000
+        }
+      },
+      taskState: {
+        stage: "traveler_information",
+        foregroundSurface: {
+          id: "surface_country_list",
+          type: "dropdown",
+          label: verboseCountryList,
+          blocksBackground: true,
+          options: Array.from({ length: 260 }, (_, index) => ({ label: `Country ${index}` }))
+        },
+        currentGoal: {
+          goalId: "goal_adaptive_verbose",
+          semanticType: "phone_country_code",
+          semanticGoal: `Choose +386 from ${verboseCountryList}`
+        }
+      },
+      candidates: [candidate],
+      contextCapabilities: [candidate],
+      observation: { observationId: "obs_adaptive_verbose" },
+      screenshotDataUrl: "data:image/png;base64,AAAA"
+    });
+    const content = request.input[0].content;
+    const payload = JSON.parse(content.find((item) => item.type === "input_text").text);
+    assert.equal(result.candidateId, candidate.candidateId);
+    assert.ok(Buffer.byteLength(JSON.stringify(payload), "utf8") < 24_000);
+    assert.equal(payload.interactionView.currentGoal.semanticType, "phone_country_code");
+    assert.ok(payload.interactionView.foregroundSurface.label.length <= 240);
+    assert.ok(payload.interactionView.currentGoal.adaptiveEnvelope.objective.length <= 240);
   } finally {
     global.fetch = previousFetch;
   }

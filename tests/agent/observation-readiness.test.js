@@ -45,7 +45,7 @@ function shellObservation(id = "obs_shell") {
 test("post-navigation traveler shell waits beyond three observations until the wall-clock deadline", () => {
   const observation = shellObservation();
   const startedAt = 1_000_000;
-  const deadlineAt = startedAt + 20_000;
+  let deadlineAt = 0;
   let previous = {};
   for (let attempt = 1; attempt <= 6; attempt += 1) {
     const readiness = classifyObservationReadiness({
@@ -54,22 +54,22 @@ test("post-navigation traveler shell waits beyond three observations until the w
       readinessDeadlineAt: deadlineAt,
       nowMs: startedAt + (attempt * 1_000)
     });
+    if (!deadlineAt) deadlineAt = readiness.deadlineAt;
     assert.equal(readiness.classification, READINESS.TRANSIENT);
     assert.equal(readiness.attempts, attempt);
     assert.equal(readiness.deadlineAt, deadlineAt);
     assert.equal(readiness.handoffEligible, false);
     previous = readiness;
   }
-  const degraded = classifyObservationReadiness({
+  const controllerHandoff = classifyObservationReadiness({
     observation,
     previousReadiness: previous,
     readinessDeadlineAt: deadlineAt,
     nowMs: deadlineAt
   });
-  assert.equal(degraded.classification, READINESS.DEGRADED);
-  assert.equal(degraded.reason, "DESTINATION_CONTENT_MISSING_AT_READINESS_DEADLINE");
-  assert.equal(degraded.handoffEligible, true);
-  assert.equal(degraded.deadlineExpired, true);
+  assert.equal(controllerHandoff.classification, READINESS.READY);
+  assert.equal(controllerHandoff.reason, "STABLE_DESTINATION_CONTROLLER_HANDOFF");
+  assert.equal(controllerHandoff.handoffEligible, false);
 });
 
 test("hydrated traveler controls make the next observation ready", () => {
@@ -200,6 +200,169 @@ test("blank Kiwi seat destination remains transient when navigation evidence liv
   assert.equal(readiness.reason, "POST_NAVIGATION_DESTINATION_NOT_READY");
   assert.equal(readiness.evidence.expectedStage, "seats");
   assert.equal(readiness.handoffEligible, false);
+});
+
+test("a new destination receives a fresh readiness deadline", () => {
+  const traveler = shellObservation("obs_traveler_shell");
+  const old = classifyObservationReadiness({
+    observation: traveler,
+    nowMs: 1_000,
+    readinessTimeoutMs: 20_000
+  });
+  const seats = shellObservation("obs_seat_shell_new_destination");
+  seats.page = {
+    ...seats.page,
+    step: "seats",
+    url: "https://example.test/checkout/seats",
+    heading: "Seat selection",
+    text: "Seat selection is loading",
+    readiness: {
+      documentReadyState: "complete",
+      ariaBusy: false,
+      loadingIndicatorCount: 0,
+      mainTextLength: 25,
+      stableForMs: 300
+    }
+  };
+  const fresh = classifyObservationReadiness({
+    observation: seats,
+    previousReadiness: old,
+    readinessDeadlineAt: old.deadlineAt,
+    nowMs: 19_000,
+    readinessTimeoutMs: 20_000
+  });
+  assert.equal(fresh.classification, READINESS.TRANSIENT);
+  assert.equal(fresh.startedAt, 19_000);
+  assert.equal(fresh.deadlineAt, 39_000);
+  assert.equal(fresh.remainingMs, 20_000);
+});
+
+test("stable EasyJet-shaped seats reaches the controller before disabled Next", async () => {
+  const executable = (actuatorId) => ({
+    activate: {
+      actuatorId,
+      actuatorIds: [actuatorId],
+      actionability: {
+        executable: true,
+        revealable: false,
+        rendered: true,
+        visible: true,
+        enabled: true,
+        inCurrentSurface: true,
+        inViewport: true,
+        hitTested: true,
+        notOccluded: true,
+        targetable: true,
+        operationAuthorized: true,
+        operationProven: true,
+        code: "ACTIONABLE",
+        operation: "activate"
+      }
+    }
+  });
+  const safeSeat = {
+    controlId: "choose_seats_for_me",
+    label: "Choose seats for me",
+    accessibleName: "Choose seats for me",
+    semantic: "required_dropdown_choice",
+    risk: "safe_decline",
+    physicalEffect: "select_free_option",
+    surfaceId: "surface-page",
+    state: { disabled: false, selected: false },
+    representationLifecycle: { status: "active_rendered", active: true },
+    operations: executable("el_choose_seats_for_me")
+  };
+  const paidSeat = {
+    controlId: "seat_1a",
+    label: "1A Extra Legroom €39.49",
+    semantic: "add_paid_extra",
+    risk: "money",
+    structuredPrice: { amount: 39.49, currency: "EUR" },
+    surfaceId: "surface-page",
+    representationLifecycle: { status: "active_rendered", active: true },
+    operations: executable("el_seat_1a")
+  };
+  const observation = {
+    observationId: "obs_easyjet_stable_seats",
+    observationSnapshot: { snapshotHash: "hash_easyjet_stable_seats" },
+    page: {
+      step: "seats",
+      url: "https://www.easyjet.com/en/buy/seats",
+      heading: "Seat selection",
+      text: "For each passenger select a seat. If you don't select a seat, we'll automatically allocate your seats when you check in.",
+      semanticReadiness: "ready",
+      currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+      controls: [safeSeat, paidSeat],
+      decisionGroups: [],
+      validationIssues: [],
+      stageExit: {
+        continueObserved: true,
+        continueDisabled: true,
+        candidates: [{ controlId: "next_flight", status: "disabled", executable: false }]
+      },
+      summary: { fields: 0, controls: 110, decisionGroups: 0 },
+      readiness: {
+        documentReadyState: "complete",
+        ariaBusy: false,
+        loadingIndicatorCount: 0,
+        mainTextLength: 5409,
+        visibleMainCount: 1,
+        stableForMs: 2759
+      }
+    }
+  };
+  const readiness = classifyObservationReadiness({
+    observation,
+    navigationContext: {
+      action: { semanticIntent: "advance_checkout_stage", mechanicalEffect: "advance_checkout_stage" },
+      feedback: { navigationOccurred: true, pageChanged: true }
+    },
+    readinessDeadlineAt: 1,
+    nowMs: 50_000
+  });
+  assert.equal(readiness.classification, READINESS.READY);
+  assert.equal(readiness.reason, "STABLE_DESTINATION_CONTROLLER_READY");
+  assert.equal(readiness.evidence.controllerReady, true);
+
+  const state = createCheckoutSessionState({
+    goal: "Reach payment review",
+    travelerId: "trav_easyjet",
+    site: { host: "easyjet.com", url: observation.page.url }
+  });
+  state.lastAction = {
+    id: "act_continue_to_seats",
+    semanticIntent: "advance_checkout_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    feedback: { navigationOccurred: true, pageChanged: true }
+  };
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation,
+    transactionStore: {
+      isCurrentObservation: () => true,
+      reserveGovernedAction: () => ({ ok: true, signature: "easyjet-safe-seat" }),
+      recordActionEvent: () => {},
+      saveSession: () => {}
+    },
+    traveler: {
+      id: "trav_easyjet",
+      seat_policy: "random_assignment",
+      booking_rules: "No paid seats"
+    }
+  });
+  assert.equal(result.state.observationReadiness.classification, READINESS.READY);
+  assert.equal(result.state.taskState.currentGoal.kind, "adaptive_interaction");
+  assert.equal(result.clientDecision.action, "click", JSON.stringify({
+    decision: result.clientDecision,
+    readiness: result.state.observationReadiness,
+    taskState: result.state.taskState,
+    debug: result.debug
+  }));
+  assert.equal(result.clientDecision.targetId, "el_choose_seats_for_me");
+  assert.notEqual(result.clientDecision.action, "ask_user");
 });
 
 test("actionable seat confirmation owns readiness over executable background traveler controls", () => {
