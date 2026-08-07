@@ -2,7 +2,7 @@ const { test, expect } = require("@playwright/test");
 
 const API = `http://127.0.0.1:${Number(process.env.ATW_TEST_PORT || 4273)}/api`;
 
-function selectedBookingAcquisition(observationId) {
+function selectedBookingAcquisition(observationId, travelerId = "trav_selected_booking") {
   const itineraryEvidence = {
     segmentId: "segment_sjj_ist",
     source: "itinerary_owner",
@@ -32,14 +32,24 @@ function selectedBookingAcquisition(observationId) {
           evidence: itineraryEvidence
         }]
       },
-      travelers: [],
+      travelers: [{ travelerId, name: "Selected Traveler" }],
       currency: "EUR",
       basePrice: null,
       totalPrice: { amount: 362, currency: "EUR" },
-      fareBrand: "",
+      fareBrand: "Economy Light",
       selectedExtras: [],
       factEvidence: {
         itinerary: [itineraryEvidence],
+        fareBrand: {
+          source: "owned_fare_summary_line",
+          ownerKey: "fare:Economy Light",
+          role: "fare_brand",
+          ownerType: "selected_booking_summary",
+          qualification: "owned_fare_brand",
+          observationId,
+          confidence: 1,
+          authoritative: true
+        },
         totalPrice: {
           source: "owned_price_summary",
           ownerKey: "booking-total:SJJ-IST:362:EUR",
@@ -107,11 +117,12 @@ test("P0.2 one session handshake resumes the exact transaction and rejects repla
 
 test("selected flight facts enter the durable baseline before the passenger page hides them", async ({ request }) => {
   const observationId = `obs_selected_booking_${Date.now()}`;
+  const travelerId = `trav_selected_booking_${Date.now()}`;
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
-      traveler: { id: `trav_selected_booking_${Date.now()}`, date_of_birth: "2003-05-31" },
-      selectedBooking: selectedBookingAcquisition(observationId),
+      traveler: { id: travelerId, date_of_birth: "2003-05-31" },
+      selectedBooking: selectedBookingAcquisition(observationId, travelerId),
       page: {
         site: "example.test",
         url: "https://example.test/checkout/passengers",
@@ -132,6 +143,10 @@ test("selected flight facts enter the durable baseline before the passenger page
   expect(state.transactionInvariants.baselineObservationId).toBe(observationId);
   expect(state.transactionInvariants.baseline.totalPrice).toEqual({ amount: 362, currency: "EUR" });
   expect(state.transactionInvariants.baseline.currency).toBe("EUR");
+  expect(state.transactionInvariants.baseline.travelers).toEqual([
+    expect.objectContaining({ travelerId })
+  ]);
+  expect(state.transactionInvariants.baseline.fareBrand).toBe("Economy Light");
 
   const resumed = await request.post(`${API}/agent/session`, {
     data: {

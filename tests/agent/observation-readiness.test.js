@@ -61,15 +61,48 @@ test("post-navigation traveler shell waits beyond three observations until the w
     assert.equal(readiness.handoffEligible, false);
     previous = readiness;
   }
-  const controllerHandoff = classifyObservationReadiness({
+  const expired = classifyObservationReadiness({
     observation,
     previousReadiness: previous,
     readinessDeadlineAt: deadlineAt,
     nowMs: deadlineAt
   });
-  assert.equal(controllerHandoff.classification, READINESS.READY);
-  assert.equal(controllerHandoff.reason, "STABLE_DESTINATION_CONTROLLER_HANDOFF");
-  assert.equal(controllerHandoff.handoffEligible, false);
+  assert.equal(expired.classification, READINESS.DEGRADED);
+  assert.equal(expired.reason, "DESTINATION_READINESS_DEADLINE_EXPIRED_WHILE_LOADING");
+  assert.equal(expired.handoffEligible, true);
+});
+
+test("a text-rich 206ms post-navigation baggage frame remains transient", () => {
+  const observation = shellObservation("obs_easyjet_basket_animating");
+  observation.page = {
+    ...observation.page,
+    step: "extras",
+    url: "https://airline.test/checkout/cabin-bags",
+    heading: "Your current basket",
+    text: "Your current basket. Cabin bags 0. Skip bags.",
+    currentSurface: { id: "surface-page", type: "page" },
+    controls: [{
+      controlId: "skip_bags",
+      label: "Skip bags",
+      semantic: "decline_paid_extra",
+      physicalEffect: "advance_checkout_stage",
+      surfaceId: "surface-page",
+      operations: operation("el_skip_bags")
+    }],
+    summary: { fields: 0, controls: 1, decisionGroups: 1 },
+    readiness: {
+      documentReadyState: "complete",
+      ariaBusy: false,
+      loadingIndicatorCount: 0,
+      mainTextLength: 47,
+      visibleMainCount: 1,
+      stableForMs: 206
+    }
+  };
+  const readiness = classifyObservationReadiness({ observation });
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.reason, "POST_NAVIGATION_DESTINATION_NOT_READY");
+  assert.equal(readiness.evidence.stable, false);
 });
 
 test("hydrated traveler controls make the next observation ready", () => {

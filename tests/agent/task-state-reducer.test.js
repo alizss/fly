@@ -2254,6 +2254,11 @@ test("exact baggage groups decline cabin then checked baggage before Continue", 
   const cabinObservation = observation("obs_cabin", "missing", "", "missing", "");
   const cabinState = reduceTaskState({ observation: cabinObservation, userPolicy, traveler });
   assert.equal(cabinState.currentGoal.decisionGroupId, "cabin_baggage");
+  assert.equal(cabinState.currentGoal.contractVersion, "current-obligation/v1");
+  assert.equal(cabinState.currentGoal.authority, "task_state");
+  assert.equal(cabinState.currentGoal.owner.surfaceId, "surface-page");
+  assert.equal(cabinState.currentGoal.admission.status, "admitted");
+  assert.deepEqual(cabinState.currentGoal.candidateControlIds, ["cabin_none"]);
   assert.deepEqual(cabinState.currentGoal.eligibleAlternativeControlIds, ["cabin_none", "cabin_paid"]);
   assert.deepEqual(cabinState.currentGoal.freeAlternativeControlIds, ["cabin_none"]);
   const cabinCandidates = buildCurrentCandidateSet({
@@ -2300,6 +2305,8 @@ test("exact baggage groups decline cabin then checked baggage before Continue", 
   assert.equal(continueState.activeDecisions.length, 0);
   assert.equal(continueState.currentGoal.semanticType, "navigation");
   assert.deepEqual(continueState.currentGoal.actionableControlIds, ["continue"]);
+  assert.equal(continueState.currentGoal.semanticEffect, "advance_checkout_stage");
+  assert.deepEqual(continueState.currentGoal.candidateControlIds, ["continue"]);
 });
 
 test("seat-map traveler rows never become free-seat candidates", () => {

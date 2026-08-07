@@ -237,16 +237,16 @@ function capabilityKey(candidate = {}) {
     .join("::");
 }
 
-function relevantToVisibleSurface(goal = {}, candidate = {}, isGoalCandidate = false) {
-  if (goal.selectionMode === "ai_ambiguity" || goal.semanticType === "surface_ambiguity") return false;
-  if (new Set(goal.actionableControlIds || []).has(candidate.controlId)) return true;
-  if (isGoalCandidate) return true;
-  if (goal.kind === "profile_field" || goal.decisionGroupId) return false;
-  if (goal.semanticType === "navigation") {
-    const ids = new Set(goal.actionableControlIds || []);
-    return ids.has(candidate.controlId);
-  }
-  return false;
+function admittedByCurrentObligation(goal = {}, candidate = {}, isGoalCandidate = false) {
+  if ((goal.selectionMode === "ai_ambiguity" || goal.semanticType === "surface_ambiguity")
+    && goal.kind !== "adaptive_surface") return false;
+  if (goal.contractVersion !== "current-obligation/v1") return isGoalCandidate;
+  if (goal.admission?.status !== "admitted") return false;
+  if (new Set(goal.candidateControlIds || []).has(candidate.controlId)) return true;
+  // Portalled option children do not exist when the parent profile/adaptive
+  // obligation is admitted. Their goal-specific compiler may bind them after
+  // the surface opens, but unrelated contextual controls remain evidence only.
+  return isGoalCandidate && ["profile_field", "adaptive_surface"].includes(goal.kind);
 }
 
 function normalizedMeaning(value = "") {
@@ -505,15 +505,11 @@ function buildCurrentCandidateSet({
       // Selectable actions must belong to the authoritative obligation.
       // Other foreground controls remain model context only. Adaptive child
       // surfaces admit only an exact compatible option or its owned filter.
-      goalRelevant: goal.kind === "adaptive_surface"
-        ? adaptiveScore >= 70
-        : goal.kind === "profile_field"
-          ? allCapabilities.goalCandidateKeys.has(capabilityKey(candidate))
-          : relevantToVisibleSurface(
-              goal,
-              bound,
-              allCapabilities.goalCandidateKeys.has(capabilityKey(candidate))
-            ),
+      goalRelevant: admittedByCurrentObligation(
+        goal,
+        bound,
+        allCapabilities.goalCandidateKeys.has(capabilityKey(candidate))
+      ) && (goal.kind !== "adaptive_surface" || adaptiveScore >= 70),
       requiresApproval: exactProfileOption ? false : Boolean(bound.requiresApproval),
       expectedOutcome,
       pipelineContract,
@@ -588,12 +584,18 @@ function buildCurrentCandidateSet({
             : []
         }
       : null;
-    const policyDecision = evaluateActionPolicy(
-      candidatePolicyAction(goal, grounded, control, observation),
-      policyState,
-      traveler,
-      { ...(state.approvals || {}), ...approvals }
-    );
+    const consequential = /money|payment|legal|identity/.test(String(grounded.risk || bound.risk || ""));
+    // Context-only utility controls are perception evidence, not proposed
+    // actions. Running the complete transaction policy over hundreds of them
+    // duplicated final governance without changing selection.
+    const policyDecision = laneInput.goalRelevant || consequential
+      ? evaluateActionPolicy(
+          candidatePolicyAction(goal, grounded, control, observation),
+          policyState,
+          traveler,
+          { ...(state.approvals || {}), ...approvals }
+        )
+      : { allow: false, decision: "context_only", reason: "Not owned by the current semantic goal." };
     return {
       ...grounded,
       policyDecision,
@@ -750,19 +752,52 @@ function buildCurrentCandidateSet({
   )));
   const selectableIds = new Set(selectable.map((candidate) => candidate.candidateId));
   const recoveryIds = new Set(recoveryCandidates.map((candidate) => candidate.candidateId));
+  const annotatedContext = current.map((candidate) => ({
+    ...candidate,
+    capabilityId: capabilityKey(candidate),
+    policyStatus: candidate.policyDecision?.allow === true
+      ? (candidate.goalRelevant ? "allowed" : "context_only")
+      : String(candidate.policyDecision?.decision || "denied"),
+    selectable: selectableIds.has(candidate.candidateId),
+    recoverySelectable: recoveryIds.has(candidate.candidateId)
+  }));
+  const compactContextCapability = (candidate) => ({
+    candidateId: candidate.candidateId,
+    capabilityId: candidate.capabilityId,
+    controlId: candidate.controlId,
+    logicalControlId: candidate.logicalControlId,
+    targetId: candidate.targetId,
+    actuatorId: candidate.actuatorId,
+    targetLabel: candidate.targetLabel,
+    label: candidate.label,
+    type: candidate.type,
+    operation: candidate.operation,
+    interactionMethod: candidate.interactionMethod,
+    semantic: candidate.semantic,
+    semanticIntent: candidate.semanticIntent,
+    physicalEffect: candidate.physicalEffect,
+    mechanicalEffect: candidate.mechanicalEffect,
+    risk: candidate.risk,
+    goalRelevant: candidate.goalRelevant === true,
+    goalCandidate: candidate.goalCandidate === true,
+    executionChannel: candidate.executionChannel,
+    capabilityStatus: candidate.capabilityStatus,
+    policyStatus: candidate.policyStatus,
+    exclusionReason: candidate.exclusionReason,
+    selectable: candidate.selectable === true,
+    recoverySelectable: candidate.recoverySelectable === true
+  });
+  const contextCapabilities = annotatedContext.length <= 120
+    ? annotatedContext
+    : annotatedContext
+      .sort((left, right) => Number(right.goalRelevant || right.selectable || right.recoverySelectable) - Number(left.goalRelevant || left.selectable || left.recoverySelectable))
+      .slice(0, 120)
+      .map(compactContextCapability);
   return {
     ...binding,
     // Context is complete; selection is policy-safe. The model can understand
     // blocked controls without receiving their IDs in its selectable enum.
-    contextCapabilities: current.map((candidate) => ({
-      ...candidate,
-      capabilityId: capabilityKey(candidate),
-      policyStatus: candidate.policyDecision?.allow === true
-        ? (candidate.goalRelevant ? "allowed" : "context_only")
-        : String(candidate.policyDecision?.decision || "denied"),
-      selectable: selectableIds.has(candidate.candidateId),
-      recoverySelectable: recoveryIds.has(candidate.candidateId)
-    })),
+    contextCapabilities,
     excludedCandidates,
     candidates: selectable,
     recoveryCandidates

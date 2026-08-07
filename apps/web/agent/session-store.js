@@ -125,6 +125,100 @@ function redactedObservation(observation = {}) {
   return { ...observation, page };
 }
 
+function compactGoal(goal = null) {
+  if (!goal || typeof goal !== "object") return goal || null;
+  const {
+    candidateSet,
+    candidates,
+    contextCapabilities,
+    recoveryCandidates,
+    excludedCandidates,
+    capabilityContracts,
+    interactionView,
+    observation,
+    ...durable
+  } = goal;
+  return durable;
+}
+
+function compactDecision(decision = {}) {
+  const subject = decision.subject || {};
+  const observed = decision.observed || decision.observation || {};
+  return eventSummary({
+    decisionId: decision.decisionId,
+    decisionGroupId: decision.decisionGroupId,
+    decisionInstanceId: decision.decisionInstanceId,
+    requirementId: decision.requirementId,
+    canonicalOwnerId: decision.canonicalOwnerId,
+    family: decision.family,
+    kind: decision.kind,
+    semanticType: decision.semanticType,
+    status: decision.status,
+    outcome: decision.outcome,
+    completionReason: decision.completionReason,
+    required: decision.required,
+    requiresResolution: decision.requiresResolution,
+    optional: decision.optional,
+    selectedControlId: decision.selectedControlId,
+    selectedValue: decision.selectedValue,
+    desiredValue: decision.desiredValue,
+    currentValue: decision.currentValue,
+    surfaceId: decision.surfaceId,
+    subjectId: decision.subjectId,
+    subject: {
+      id: subject.id,
+      subjectId: subject.subjectId,
+      kind: subject.kind,
+      semanticType: subject.semanticType,
+      travelerIndex: subject.travelerIndex,
+      required: subject.required
+    },
+    observed: {
+      value: observed.value,
+      selectedValue: observed.selectedValue,
+      selectedControlId: observed.selectedControlId,
+      satisfied: observed.satisfied,
+      required: observed.required
+    }
+  });
+}
+
+function compactTaskState(taskState = null) {
+  if (!taskState || typeof taskState !== "object") return taskState || null;
+  const {
+    processAwareness,
+    semanticOwnershipResolutions,
+    semanticCompilation,
+    currentGoal,
+    canonicalDecisions,
+    observedDecisions,
+    ...durable
+  } = taskState;
+  return {
+    ...durable,
+    currentGoal: compactGoal(currentGoal),
+    canonicalDecisions: Array.isArray(canonicalDecisions)
+      ? canonicalDecisions.slice(-160).map(compactDecision)
+      : [],
+    observedDecisions: Array.isArray(observedDecisions)
+      ? observedDecisions.slice(-160).map(compactDecision)
+      : []
+  };
+}
+
+function compactSessionState(state = {}) {
+  const {
+    currentGoal,
+    currentObligation,
+    taskState,
+    ...durable
+  } = state;
+  return {
+    ...durable,
+    taskState: compactTaskState(taskState)
+  };
+}
+
 function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
   if (dbPath !== ":memory:") fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
@@ -206,8 +300,9 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     const existing = readTransaction.get(state.id);
     const at = nowIso();
     const saved = { ...state, updatedAt: state.updatedAt || at };
-    if (existing) updateTransaction.run(json(saved, {}), at, state.id);
-    else insertTransaction.run(state.id, json(saved, {}), state.createdAt || at, at);
+    const persisted = compactSessionState(saved);
+    if (existing) updateTransaction.run(json(persisted, {}), at, state.id);
+    else insertTransaction.run(state.id, json(persisted, {}), state.createdAt || at, at);
     return saved;
   }
 
@@ -571,6 +666,7 @@ const singleton = Object.fromEntries(DEFAULT_METHODS.map((method) => [
 module.exports = {
   ...singleton,
   createStore,
+  compactSessionState,
   getDefaultStore,
   DEFAULT_DB_PATH
 };

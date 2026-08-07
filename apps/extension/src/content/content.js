@@ -8926,7 +8926,18 @@
     activeObservationControlRegistry = registry;
     const register = (element, context, priority = null) => registry.register(element, context, priority);
 
-    const surface = activeSurface?.type && activeSurface.type !== "page" ? activeSurface : null;
+    // Only an exclusive foreground surface may own actuator actionability.
+    // A positioned/full-page container can be observed as a popover while the
+    // page is hydrating, but when it does not block the background the runtime
+    // current surface is still `surface-page`. Passing that contextual overlay
+    // into canonical control construction made the same visible, enabled CTA
+    // fail `inCurrentSurface` and disappear until a manual restart rebuilt the
+    // page without the transient overlay classification.
+    const surface = activeSurface?.type
+      && activeSurface.type !== "page"
+      && activeSurface.blocksBackground === true
+      ? activeSurface
+      : null;
     if (surface) {
       for (const item of [...(surface.options || []), ...(surface.buttons || [])]) {
         const source = elementById(item.id);
@@ -10986,6 +10997,107 @@
     });
   }
 
+  function boundedLocalClickMechanicAllowed(decision = {}) {
+    const operation = String(decision.operation || "").toLowerCase();
+    const risk = String(decision.risk || decision.targetSnapshot?.risk || "").toLowerCase();
+    const effect = String([
+      decision.intent,
+      decision.semanticEffect,
+      decision.physicalEffect,
+      decision.mechanicalEffect,
+      decision.targetSnapshot?.semantic
+    ].filter(Boolean).join(" ")).toLowerCase();
+    return ["open", "choose", "select", "activate"].includes(operation)
+      && !isStageExitDecision(decision)
+      && !/money|paid|payment|purchase|legal|consent|account|login|itinerary/.test(`${risk} ${effect}`);
+  }
+
+  function localMechanicReactionSnapshot(element) {
+    return JSON.stringify({
+      connected: Boolean(element?.isConnected),
+      expanded: element?.getAttribute?.("aria-expanded") || "",
+      checked: element?.getAttribute?.("aria-checked") || element?.checked || false,
+      selected: element?.getAttribute?.("aria-selected") || element?.selected || false,
+      value: element?.value || "",
+      text: String(element?.innerText || element?.textContent || "").replace(/\s+/g, " ").trim()
+    });
+  }
+
+  async function waitForLocalMechanicReaction(element, before, timeoutMs = 320) {
+    const startedAt = performance.now();
+    while (performance.now() - startedAt < timeoutMs) {
+      if (localMechanicReactionSnapshot(element) !== before) return true;
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    }
+    return localMechanicReactionSnapshot(element) !== before;
+  }
+
+  async function dispatchGovernedClickMechanic(element, decision = {}, meta = {}) {
+    const reactionBefore = localMechanicReactionSnapshot(element);
+    let choiceCommitResult = null;
+    let primary = { ok: true, method: decision.interactionMethod || "pointer_sequence" };
+    if (decision.interactionMethod === "native_click") {
+      primary = nativeElementClick(element, meta)
+        ? { ok: true, method: "native_click" }
+        : { ok: false, code: "NATIVE_CLICK_UNAVAILABLE", method: "native_click" };
+    } else if (decision.interactionMethod === "browser_trusted_input") {
+      primary = await trustedBrowserClick(element, { ...decision, ...meta });
+    } else if (decision.interactionMethod === "browser_trusted_choice") {
+      primary = await trustedBrowserChoice(element, { ...decision, ...meta });
+      if (primary?.ok === true) {
+        choiceCommitResult = await settleTrustedChoiceInteraction(element, { ...decision, ...meta });
+      }
+    } else {
+      userLikeClick(element, { ...meta, method: decision.interactionMethod || "pointer_sequence" });
+    }
+    if (primary?.ok !== true) return { ...primary, choiceCommitResult };
+
+    const mayFallback = boundedLocalClickMechanicAllowed(decision)
+      && !["browser_trusted_input", "browser_trusted_choice"].includes(decision.interactionMethod);
+    const reactionObserved = mayFallback
+      ? await waitForLocalMechanicReaction(element, reactionBefore)
+      : false;
+    if (!mayFallback || reactionObserved) {
+      return {
+        ok: true,
+        method: primary.method || decision.interactionMethod || "pointer_sequence",
+        choiceCommitResult,
+        reactionObserved
+      };
+    }
+
+    // Reuse the same fresh action lease and exact actuator. This is one local
+    // mechanic, not a new semantic decision or a silently rebound target.
+    const freshMap = pageStateStore.observe({ reason: "bounded_local_click_revalidate" }).map;
+    const freshTarget = resolveDecisionTarget(decision, freshMap);
+    const validation = freshTarget && freshTarget === element
+      ? validateResolvedTarget(decision, freshTarget, freshMap)
+      : { ok: false, code: "TARGET_DISAPPEARED" };
+    if (!validation.ok) {
+      return { ok: true, method: primary.method || decision.interactionMethod || "pointer_sequence", choiceCommitResult };
+    }
+    const fallback = await trustedBrowserClick(freshTarget, { ...decision, ...meta });
+    pushActionLedger({
+      actionId: meta.actionId || decision.actionId || decision.id || "",
+      observationId: meta.observationId || decision.observationId || "",
+      stage: "local_mechanic_fallback",
+      action: decision,
+      primaryMethod: primary.method || decision.interactionMethod || "pointer_sequence",
+      fallbackMethod: "browser_trusted_input",
+      fallbackCode: fallback?.code || ""
+    });
+    return {
+      // The primary mechanic was dispatched. An unavailable optional fallback
+      // must not rewrite that fact as a pre-dispatch failure; canonical
+      // verification below decides whether the action worked.
+      ok: true,
+      code: fallback?.ok === true ? "LOCAL_FALLBACK_DISPATCHED" : (fallback?.code || "LOCAL_FALLBACK_UNAVAILABLE"),
+      method: fallback?.ok === true ? "browser_trusted_input" : (primary.method || decision.interactionMethod || "pointer_sequence"),
+      fallbackUsed: fallback?.ok === true,
+      choiceCommitResult
+    };
+  }
+
   async function trustedBrowserChoice(element, decision = {}) {
     if (!element) return { ok: false, code: "CANONICAL_ACTUATOR_UNAVAILABLE" };
     const choiceLabel = String(decision.value || "").trim();
@@ -11964,14 +12076,11 @@
     const focusOwned = Boolean(document.activeElement && overlay.contains(document.activeElement));
     if (backdrop || (bodyLocked && focusOwned)) return true;
 
-    const rect = overlay.getBoundingClientRect();
-    const centerX = viewportWidth / 2;
-    const centerY = viewportHeight / 2;
-    const coversInteractionCenter = rect.left <= centerX
-      && rect.right >= centerX
-      && rect.top <= centerY
-      && rect.bottom >= centerY;
-    return coversInteractionCenter && overlayTopHitCount(overlay) > 0;
+    // Geometry is observation evidence, not ownership authority. Responsive
+    // checkout panels often cover the viewport while animating or hydrating;
+    // treating coverage alone as a modal hides the real stage exit. Only the
+    // explicit structural signals above may block the background.
+    return false;
   }
 
   function overlayText(element) {
@@ -15522,6 +15631,25 @@
     addAgentMessage("assistant", `Clicking: ${label}.`);
     await showAgentThought(element, "Exit", `Act: click ${label}`, "Checking whether the page advances.");
     flashElement(element);
+    const dispatch = await dispatchGovernedClickMechanic(element, governedDecision, {
+      actionId: options.actionId || agent.activeExecutionActionId || "",
+      observationId: options.observationId || agent.activeExecutionObservationId || "",
+      operation: governedDecision.operation || ""
+    });
+    if (dispatch?.ok !== true) {
+      await rejectMechanicalAction(
+        options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
+        options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
+        governedDecision,
+        {
+          code: dispatch?.code || "CLICK_DISPATCH_UNAVAILABLE",
+          message: "The governed stage-exit strategy was unavailable before dispatch.",
+          dispatched: false
+        },
+        element
+      );
+      return false;
+    }
     pushActionLedger({
       actionId: options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
       observationId: options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
@@ -15529,7 +15657,6 @@
       action: governedDecision,
       targetFingerprint: targetFingerprint(element, governedDecision)
     });
-    userLikeClick(element);
     await waitForUiSettle(700);
     const postActionObservation = await observePageStateAfterMutation("verify_advance", 900);
     let afterMap = postActionObservation.map;
@@ -16104,58 +16231,21 @@
       showAgentCursor(target, button?.label || "clicking");
       flashElement(target);
       rememberChoiceVisualStateBeforeDispatch(target, decision);
-      let choiceCommitResult = null;
-      if (decision.interactionMethod === "native_click") {
-        rememberCanonicalSelectionCommitment(target, decision);
-        nativeElementClick(target, {
-          actionId,
-          observationId: actionObservationId,
-          operation: decision.operation || ""
-        });
-      } else if (decision.interactionMethod === "browser_trusted_input") {
-        const trustedResult = await trustedBrowserClick(target, {
-          ...decision,
-          actionId,
-          observationId: actionObservationId
-        });
-        if (trustedResult?.ok !== true) {
-          await rejectMechanicalAction(actionId, actionObservationId, decision, {
-            code: trustedResult?.code || "TRUSTED_INPUT_UNAVAILABLE",
-            message: "The governed browser-level trusted-input strategy was unavailable before dispatch.",
-            dispatched: false
-          }, target);
-          return;
-        }
-        rememberCanonicalSelectionCommitment(target, decision);
-      } else if (decision.interactionMethod === "browser_trusted_choice") {
-        const trustedResult = await trustedBrowserChoice(target, {
-          ...decision,
-          actionId,
-          observationId: actionObservationId
-        });
-        if (trustedResult?.ok !== true) {
-          await rejectMechanicalAction(actionId, actionObservationId, decision, {
-            code: trustedResult?.code || "TRUSTED_INPUT_UNAVAILABLE",
-            message: "The governed browser-level choice episode was unavailable before dispatch.",
-            dispatched: false
-          }, target);
-          return;
-        }
-        rememberCanonicalSelectionCommitment(target, decision);
-        choiceCommitResult = await settleTrustedChoiceInteraction(target, {
-          ...decision,
-          actionId,
-          observationId: actionObservationId
-        });
-      } else {
-        rememberCanonicalSelectionCommitment(target, decision);
-        userLikeClick(target, {
-          actionId,
-          observationId: actionObservationId,
-          operation: decision.operation || "",
-          method: decision.interactionMethod || "pointer_sequence"
-        });
+      rememberCanonicalSelectionCommitment(target, decision);
+      const clickDispatch = await dispatchGovernedClickMechanic(target, decision, {
+        actionId,
+        observationId: actionObservationId,
+        operation: decision.operation || ""
+      });
+      if (clickDispatch?.ok !== true) {
+        await rejectMechanicalAction(actionId, actionObservationId, decision, {
+          code: clickDispatch?.code || "CLICK_DISPATCH_UNAVAILABLE",
+          message: "The governed click mechanic was unavailable before dispatch.",
+          dispatched: false
+        }, target);
+        return;
       }
+      let choiceCommitResult = clickDispatch.choiceCommitResult || null;
       const customChoiceEpisode = Boolean(
         !choiceCommitResult
         && !target.matches?.("input[type='checkbox'], input[type='radio']")
@@ -17704,6 +17794,8 @@
       rememberChoiceVisualStateBeforeDispatch,
       userLikeClick,
       nativeElementClick,
+      boundedLocalClickMechanicAllowed,
+      dispatchGovernedClickMechanic,
       trustedBrowserClick,
       trustedBrowserChoice,
       trustedBrowserKey,

@@ -30,9 +30,6 @@ const {
 } = require("./current-candidate-builder");
 const { governAction, RECOVERABLE_GROUNDING_CODES } = require("./action-governor");
 const { buildControlAliasIndex, resolveActionControl } = require("./control-alias-index");
-const {
-  profileGoalSatisfied
-} = require("./skill-expander");
 const { writeTrace } = require("./trace-store");
 const {
   advanceActionLifecycle,
@@ -61,7 +58,6 @@ const {
   semanticIntentForAction,
   normalizedActionSemantics
 } = require("./action-semantics");
-const { contextForPublishedGoal } = require("./task-action-context");
 const {
   reduceTaskState,
   verifiedCommerceObligationFromActionResult
@@ -1858,7 +1854,7 @@ function pendingActionSupersededByFreshPage(pending = null, observation = {}) {
 }
 
 function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) {
-  let currentGoal = state.taskState?.currentGoal || null;
+  const currentGoal = state.taskState?.currentGoal || null;
   let pendingAction = normalizePendingAction(state.pendingAction);
   let attemptedCandidateIds = [...(state.recoveryState?.attemptedCandidateIds || [])];
   let verifiedResults = [...(state.verifiedResults || [])];
@@ -1888,29 +1884,12 @@ function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) 
     pendingAction = null;
   }
 
-  if (currentGoal && profileGoalSatisfied(currentGoal, observation, traveler)) {
-    verifiedResults = [...verifiedResults, {
-      goalId: currentGoal.goalId,
-      candidateId: result.candidateId || "",
-      actionId: result.actionId || "",
-      observationId: observation.observationId || "",
-      browserVerified: true,
-      semanticPostconditionSatisfied: true,
-      desiredValue: currentGoal.desiredValue,
-      at: new Date().toISOString()
-    }].slice(-40);
-    currentGoal = null;
-    pendingAction = null;
-    attemptedCandidateIds = [];
-  }
-
   // Goal derivation moved to task-state-reducer. This function now records
   // action-result facts only and cannot publish or replace a goal.
   return withUpdate(state, {
     userPolicy: state.userPolicy || state.policySnapshot || {},
     transactionInvariants: state.transactionInvariants || state.invariantBaseline || null,
     currentObservation: compactCurrentObservation(observation),
-    currentGoal: state.taskState?.currentGoal || null,
     pendingAction,
     recoveryState: {
       ...(state.recoveryState || {}),
@@ -2041,8 +2020,6 @@ async function runLoopTurn({
     });
     const terminalState = withUpdate(state, {
       terminalGoalLatch: persistedTerminalLatch,
-      currentGoal: null,
-      currentObligation: null,
       pendingAction: null,
       lastAction: terminalAction,
       status: "ready_for_payment",
@@ -2460,7 +2437,6 @@ async function runLoopTurn({
   state = withUpdate(state, {
     taskState,
     currentStep: taskState.stage,
-    currentGoal: taskState.currentGoal,
     semanticOwnershipResolution,
     activeComponentGrounding,
     aiDecisionCache: {
@@ -2536,7 +2512,6 @@ async function runLoopTurn({
         ...(state.recoveryState || {}),
         attemptedCandidateIds: []
       },
-      currentGoal: taskState.currentGoal,
       status: "running"
     });
   }
@@ -2593,8 +2568,7 @@ async function runLoopTurn({
       : null;
     const reboundState = reboundGoal
       ? withUpdate(state, {
-          taskState: Object.freeze({ ...taskState, currentGoal: reboundGoal }),
-          currentGoal: reboundGoal
+          taskState: Object.freeze({ ...taskState, currentGoal: reboundGoal })
         })
       : state;
     if (!targetStatus.exists) {
@@ -2972,8 +2946,6 @@ async function runLoopTurn({
         taskState,
         terminalGoalLatch: taskState.terminalGoalLatch,
         currentStep: taskState.stage,
-        currentGoal: null,
-        currentObligation: null,
         pendingAction: null,
         lastAction: action,
         status: "awaiting_user"
@@ -3000,8 +2972,6 @@ async function runLoopTurn({
       taskState,
       terminalGoalLatch: taskState.terminalGoalLatch,
       currentStep: taskState.stage,
-      currentGoal: null,
-      currentObligation: null,
       pendingAction: null,
       lastAction: terminalAction,
       status: taskState.terminalStatus === "payment_review_reached" ? "ready_for_payment" : "complete",
@@ -3026,8 +2996,6 @@ async function runLoopTurn({
     const stoppedState = withUpdate(state, {
       taskState,
       currentStep: taskState.stage,
-      currentGoal: null,
-      currentObligation: null,
       pendingAction: null,
       lastAction: action,
       status: "awaiting_user"
@@ -3044,49 +3012,9 @@ async function runLoopTurn({
       }, latency, modelUsageFromMetas(model, []))
     };
   }
-  const currentObservedDecisionIds = new Set((taskState.observedDecisions || [])
-    .filter((decision) => taskState.foregroundSurface.type === "page"
-      ? decision.surfaceId === "surface-page" || decision.surfaceType === "page"
-      : decision.surfaceId === taskState.foregroundSurface.id || decision.decisionGroupId === taskState.foregroundSurface.decisionGroupId)
-    .map((decision) => decision.decisionGroupId));
-  const currentCompletedOutcome = taskState.completedOutcomes.find((outcome) => currentObservedDecisionIds.has(outcome.decisionGroupId)) || null;
-  const taskContext = publishedProfileGoal
-    ? contextForPublishedGoal({ state, observation, goal: publishedProfileGoal })
-    : Object.freeze({
-        obligationId: `task_state:${state.id || "session"}`,
-        observationId: observation.observationId || "",
-        userOutcome: Object.freeze(currentCompletedOutcome ? {
-          ...currentCompletedOutcome,
-          semanticFamily: currentCompletedOutcome.family || "decision",
-          desiredDisposition: "decline_paid",
-          status: "satisfied",
-          evidence: ["TaskState preserved the exact completed outcome."]
-        } : { status: "pending", evidence: [] }),
-        interfaceStatus: Object.freeze({
-          status: "resolve_current_goal",
-          surfaceId: taskState.foregroundSurface.id,
-          surfaceType: taskState.foregroundSurface.type,
-          blocksBackground: taskState.foregroundSurface.blocksBackground === true
-        }),
-        remainingGoal: taskState.currentGoal,
-        classifierEvidence: Object.freeze([])
-      });
-  const obligationEpisode = Object.freeze({
-    ...taskContext,
-    contractVersion: "current-obligation-episode/v1",
-    recovery: Object.freeze({
-      attempts: Number(state.recoveryState?.attempts || 0),
-      phase: String(state.recoveryState?.phase || "idle"),
-      attemptedCandidateIds: Object.freeze([...(state.recoveryState?.attemptedCandidateIds || [])]),
-      failedStrategies: Object.freeze([...(state.recoveryState?.failedStrategies || [])]),
-      failedStrategySignatures: Object.freeze([...(state.recoveryState?.failedStrategySignatures || [])]),
-      lastCode: String(state.recoveryState?.lastCode || "")
-    })
-  });
   let canonicalState = withUpdate(state, {
     taskState,
     currentStep: taskState.stage,
-    currentObligation: obligationEpisode
   });
   let canonicalGoal = taskState.currentGoal;
   if (!canonicalGoal) {
@@ -3121,8 +3049,6 @@ async function runLoopTurn({
           { semanticIntent: "report_active_requirement_unresolved" }
         );
     const stoppedState = withUpdate(canonicalState, {
-      currentGoal: null,
-      currentObligation: null,
       lastAction: action,
       status: internalMechanicalFailure ? "stopped" : "awaiting_user"
     });
@@ -3210,8 +3136,7 @@ async function runLoopTurn({
       canonicalGoal = taskState.currentGoal;
       canonicalFailedStrategies = [];
       canonicalState = withUpdate(canonicalState, {
-        taskState,
-        currentGoal: canonicalGoal
+        taskState
       });
       canonicalCandidateSet = groundedObservationCandidateSet(
         canonicalGoal,
@@ -3236,7 +3161,7 @@ async function runLoopTurn({
     })
   });
   canonicalGoal = taskState.currentGoal;
-  canonicalState = withUpdate(canonicalState, { taskState, currentGoal: canonicalGoal });
+  canonicalState = withUpdate(canonicalState, { taskState });
   const staleReboundCandidate = reusableStaleActionCandidate(
     state.fastStaleRecovery,
     canonicalGoal,
@@ -3316,7 +3241,6 @@ async function runLoopTurn({
         ...taskState,
         currentGoal: Object.freeze({ ...canonicalGoal, candidateSet: canonicalCandidateSet, candidates: [] })
       }),
-      currentGoal: { ...canonicalGoal, candidateSet: canonicalCandidateSet, candidates: [] },
       pendingAction: null,
       lastAction: action,
       status: requiresUserDecision ? "awaiting_user" : "stopped"
@@ -3335,7 +3259,7 @@ async function runLoopTurn({
       state: stoppedState,
       clientDecision: toClientDecision(action),
       debug: withLatencyDebug({
-        currentGoal: stoppedState.currentGoal,
+        currentGoal: stoppedState.taskState?.currentGoal || null,
         finalAction: action,
         stopCategory: profileFailureCode
           ? "profile_actuator_unresolved"
@@ -3549,7 +3473,6 @@ async function runLoopTurn({
             });
           const retryState = withUpdate(plannerRecovery.state, {
             taskState: Object.freeze({ ...taskState, currentGoal: retryGoal }),
-            currentGoal: retryGoal,
             pendingAction: null,
             lastAction: retryAction,
             status: "running"
@@ -3605,8 +3528,6 @@ async function runLoopTurn({
   state = withUpdate(canonicalState, {
     taskState,
     currentStep: taskState.stage,
-    currentObligation: obligationEpisode,
-    currentGoal: taskState.currentGoal
   });
   // Do not synchronously persist this intermediate planning snapshot. No
   // browser action has been governed or dispatched yet, and the authoritative
@@ -3614,7 +3535,7 @@ async function runLoopTurn({
   // a large candidate graph and dominated deterministic turn latency on the
   // multi-GB replay database.
 
-  // TaskState/currentObligation is the sole runtime requirement authority.
+  // TaskState is the sole runtime requirement authority.
   // The historical requirement reconciler remains exported only for replay
   // migration tests; it no longer feeds planning, governance, or live traces.
   const requirementLifecycle = [];

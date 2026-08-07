@@ -840,8 +840,8 @@ test("three sibling extras resolve as an exact decision-group queue before Conti
     ).toBe("click");
     expect(turn.clientDecision.targetLabel).toMatch(/no thanks/i);
     expect(turn.clientDecision.decisionGroupId).toBe(unresolved.decisionGroupId);
-    expect(turn.state.currentGoal.candidates.every((candidate) => candidate.decisionGroupId === unresolved.decisionGroupId)).toBe(true);
-    expect(turn.state.currentGoal.candidates.some((candidate) => /continue/i.test(candidate.targetLabel || ""))).toBe(false);
+    expect(turn.state.taskState.currentGoal.candidates.every((candidate) => candidate.decisionGroupId === unresolved.decisionGroupId)).toBe(true);
+    expect(turn.state.taskState.currentGoal.candidates.some((candidate) => /continue/i.test(candidate.targetLabel || ""))).toBe(false);
 
     completedGroupIds.push(unresolved.decisionGroupId);
     const executed = await executeAtomicBrowserDecision(page, turn.clientDecision, `obs_exact_groups_${index + 1}`);
@@ -1478,6 +1478,73 @@ test("cabin-bag scope, paid option, and free skip compile into one safe governed
   expect(executed.validation.ok, executed.validation.code).toBe(true);
   expect(executed.verification.ok, JSON.stringify(executed.verification, null, 2)).toBe(true);
   expect(await page.locator("#stage").textContent()).toBe("Hold luggage");
+});
+
+test("nonblocking popover-shaped checkout chrome cannot veto the page Skip bags actuator", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { font-family: sans-serif; margin: 0; }
+      .popover { position: absolute; inset: 0; min-height: 100vh; background: white; }
+      button { min-width: 120px; min-height: 40px; }
+    </style>
+    <main class="popover">
+      <h1>Add a large cabin bag to bring onboard</h1>
+      <section aria-label="Ali SIFRAR - Cabin bag allowance">
+        <label><input type="checkbox" checked> Same for all flights</label>
+        <p>Small under seat bag Included for all passengers</p>
+        <button type="button">Add large cabin bag for EUR 41.24</button>
+      </section>
+      <aside>
+        <h2>Your current basket</h2>
+        <p>Basket EUR 387.00 Price breakdown</p>
+        <button id="skip-bags" type="button">Skip bags &gt;</button>
+      </aside>
+    </main>
+  `);
+
+  const traveler = {
+    id: "trav_nonblocking_basket",
+    first_name: "Ali",
+    last_name: "SIFRAR",
+    baggage_preference: "No additional paid baggage",
+    booking_rules: "No paid baggage or extras"
+  };
+  await page.evaluate((profile) => window.__ATW_TEST__.setAppDataForTest({
+    travelers: [profile],
+    preferences: {}
+  }, profile.id), traveler);
+
+  const observation = await browserObservation(page, "obs_nonblocking_basket_skip");
+  expect(observation.page.currentSurface).toMatchObject({
+    id: "surface-page",
+    type: "page",
+    blocksBackground: false
+  });
+  expect(observation.page.surfaceStack).toEqual(expect.arrayContaining([
+    expect.objectContaining({ type: "popover", blocksBackground: false })
+  ]));
+
+  const skip = observation.page.controls.find((control) => /skip bags/i.test(control.label || ""));
+  expect(skip, JSON.stringify(observation.page.controls, null, 2)).toBeTruthy();
+  expect(skip.surfaceId).toBe("surface-page");
+  expect(skip.operations?.activate?.actionability).toMatchObject({
+    executable: true,
+    inCurrentSurface: true,
+    code: "ACTIONABLE"
+  });
+
+  const taskState = reduceTaskState({
+    observation,
+    traveler,
+    userPolicy: { bookingRules: traveler.booking_rules, baggage: traveler.baggage_preference }
+  });
+  const candidateSet = buildCurrentCandidateSet({
+    goal: taskState.currentGoal,
+    observation,
+    state: { taskState, approvals: {} },
+    traveler
+  });
+  expect(candidateSet.candidates.some((candidate) => candidate.controlId === skip.controlId)).toBe(true);
 });
 
 test("zero-quantity hold-bag counters remain offers and progress through Skip bags", async ({ page }) => {
@@ -7016,7 +7083,7 @@ test("real backend waits beyond three unchanged destination observations until t
         // Keep the shell alive for at least four backend cycles even on a
         // loaded CI machine; the contract under test is observation-count
         // independence, not a race against a 2.6 second browser timer.
-        }, 4_500);
+        }, 7_000);
       });
     </script>
   `);
@@ -12366,4 +12433,52 @@ test("/rf/start is classified as a new flight-search page despite stale extras c
   const map = await page.evaluate(() => window.__ATW_TEST__.buildPageMap());
   expect(page.url()).toContain("/rf/start");
   expect(map.step).toBe("flight_selection");
+});
+
+test("one reversible local mechanic retries an unchanged native opener with the same trusted actuator", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <label>Title <button id="title-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">Select title</button></label>
+    </main>
+  `);
+  const result = await page.evaluate(async () => {
+    const hooks = window.__ATW_TEST__;
+    const map = hooks.buildPageMap();
+    const control = map.controls.find((item) => item.label.includes("Select title"));
+    const target = document.getElementById("title-trigger");
+    const targetSnapshot = hooks.liveTargetSnapshot(target, map);
+    target.click = () => {};
+    window.__ATW_TEST_TRUSTED_INPUT__ = ({ element }) => {
+      element.setAttribute("aria-expanded", "true");
+      element.dataset.trustedFallback = "used";
+      return { ok: true };
+    };
+    const decision = {
+      action: "click",
+      actionId: "act_local_title",
+      observationId: "obs_local_title",
+      controlId: targetSnapshot.controlId,
+      targetId: targetSnapshot.id,
+      operation: "open",
+      interactionMethod: "native_click",
+      intent: "satisfy_semantic_goal",
+      semanticEffect: "open_surface",
+      risk: "safe",
+      targetSnapshot
+    };
+    const dispatched = await hooks.dispatchGovernedClickMechanic(target, decision, {
+      actionId: decision.actionId,
+      observationId: decision.observationId
+    });
+    return {
+      allowed: hooks.boundedLocalClickMechanicAllowed(decision),
+      dispatched,
+      expanded: target.getAttribute("aria-expanded"),
+      trustedFallback: target.dataset.trustedFallback
+    };
+  });
+  expect(result.allowed).toBe(true);
+  expect(result.dispatched).toMatchObject({ ok: true, fallbackUsed: true, method: "browser_trusted_input" });
+  expect(result.expanded).toBe("true");
+  expect(result.trustedFallback).toBe("used");
 });

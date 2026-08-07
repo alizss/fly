@@ -548,6 +548,62 @@ function completedChoiceSurfaceGoal(observation = {}, episode = {}) {
   });
 }
 
+function admittedControlIdsForGoal(goal = {}) {
+  const explicit = (goal.actionableControlIds || []).filter(Boolean);
+  if (explicit.length) return [...new Set(explicit)];
+  if (goal.policyChoiceBounded === true) {
+    return [...new Set((goal.policyAllowedControlIds || []).filter(Boolean))];
+  }
+  if (goal.kind === "profile_field") {
+    return [...new Set([
+      goal.controlId,
+      goal.componentBinding?.controlId,
+      ...(goal.componentBinding?.representationControlIds || []),
+      ...(goal.componentBinding?.stateControlIds || [])
+    ].filter(Boolean))];
+  }
+  return [...new Set((goal.eligibleAlternativeControlIds || []).filter(Boolean))];
+}
+
+function semanticEffectForGoal(goal = {}) {
+  if (goal.kind === "profile_field") return "set_field_value";
+  if (goal.semanticType === "navigation") return "advance_checkout_stage";
+  if (goal.semanticType === "completed_choice_surface") return "dismiss_surface";
+  if (["adaptive_surface", "adaptive_interaction"].includes(goal.kind)) return "safe_checkout_progress";
+  return clean(goal.desiredSemanticOutcome || goal.desiredPolicyOutcome || goal.desiredValue || "resolve_current_decision");
+}
+
+// TaskState's current goal is the Current Obligation Contract. Downstream
+// candidate construction may bind mechanics for this contract, but it may not
+// reinterpret whether the work is required, policy-compatible, or current.
+function publishCurrentObligation(goal = {}, observation = {}, surface = {}) {
+  const admittedControlIds = admittedControlIdsForGoal(goal);
+  const semanticType = lower(goal.semanticType);
+  const consequential = ["payment", "purchase", "legal"].some((token) => semanticType.includes(token));
+  return Object.freeze({
+    ...goal,
+    contractVersion: "current-obligation/v1",
+    authority: "task_state",
+    owner: Object.freeze({
+      observationId: observation.observationId || "",
+      surfaceId: goal.surfaceId || surface.id || "surface-page",
+      surfaceType: surface.type || "page",
+      surfaceClass: surface.surfaceClass || "unknown"
+    }),
+    objective: clean(goal.semanticGoal || "resolve the exact current checkout obligation"),
+    semanticEffect: semanticEffectForGoal(goal),
+    profileCompatible: !goal.ambiguity,
+    candidateControlIds: Object.freeze(admittedControlIds),
+    admission: Object.freeze({
+      authority: "task_state",
+      status: goal.ambiguity ? "blocked" : "admitted",
+      reason: goal.ambiguity?.code || "authoritative_current_obligation"
+    }),
+    successCondition: Object.freeze({ ...(goal.postcondition || goal.outcomeContract || {}) }),
+    riskClass: consequential ? "consequential" : "reversible"
+  });
+}
+
 function decisionEpisodeSurfaceKey(surface = {}) {
   return [
     clean(surface.type || "page").toLowerCase(),
@@ -2763,9 +2819,8 @@ function reduceTaskState({
       && episodeOwnsGoal(decisionEpisode, currentGoal)
       ? decisionEpisode
       : null;
-    currentGoal = Object.freeze({
+    currentGoal = publishCurrentObligation({
       ...currentGoal,
-      authority: "task_state",
       decisionInstanceId: activeEpisode?.decisionInstanceId || decisionInstanceKey(currentGoal, observation),
       canonicalOwnerId: activeEpisode?.canonicalOwnerId || activeEpisode?.decisionInstanceId || "",
       ...(activeEpisode
@@ -2781,7 +2836,7 @@ function reduceTaskState({
       surfaceSubgoalId: surfaceSubgoal?.subgoalId || "",
       parentOutcomeContract: stageOutcome.outcomeContract,
       outcomeContract: surfaceSubgoal?.outcomeContract || outcomeContractForGoal(currentGoal, observation)
-    });
+    }, observation, surface);
   }
   const semanticAchievements = [...completions.values()].map((completion) => Object.freeze({
     achievementId: clean(completion.instanceId || completion.decisionGroupId || completion.requirementId),

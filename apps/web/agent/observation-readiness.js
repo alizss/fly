@@ -5,12 +5,11 @@ const READINESS = Object.freeze({
   DEGRADED: "DEGRADED"
 });
 const DESTINATION_READINESS_TIMEOUT_MS = 20_000;
-const { decideStage, stageEvidence } = require("./task-state-reducer");
 const {
   controlBelongsToCurrentSurface,
   currentSurface
 } = require("./surface-contract");
-const { checkoutRelevantControl } = require("./adaptive-interaction");
+const MIN_DESTINATION_STABLE_MS = 400;
 
 function lower(value = "") {
   return String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
@@ -38,6 +37,24 @@ function foregroundReady(page = {}) {
   return surface.type !== "page" && executableControlsForCurrentSurface(page).length > 0;
 }
 
+function checkoutRelevantControl(control = {}) {
+  const evidence = lower([
+    canonicalSemantic(control),
+    control.label,
+    control.physicalEffect,
+    control.mechanicalEffect,
+    control.semanticEffect
+  ].filter(Boolean).join(" "));
+  return /continue|next|skip|decline|close|dismiss|select|choose|travell?er|passenger|contact|seat|bag|luggage|extra|insurance|payment|card|billing|submit/.test(evidence);
+}
+
+function paymentBoundaryObserved(page = {}) {
+  if (page.paymentBoundary?.boundaryObserved === true || page.terminalEvidence?.boundaryObserved === true) return true;
+  return executableControlsForCurrentSurface(page).some((control) => (
+    /card_number|card_expiry|card_cvc|payment_method|billing_address|submit_payment|submit_purchase|cc-number|cc-exp|cc-csc/.test(canonicalSemantic(control))
+  ));
+}
+
 function navigationShaped(observation = {}, previousReadiness = {}, navigationContext = {}) {
   const result = observation.lastActionResult || navigationContext.result || {};
   const feedback = result.feedback || navigationContext.feedback || {};
@@ -48,17 +65,14 @@ function navigationShaped(observation = {}, previousReadiness = {}, navigationCo
     || navigationContext
     || {};
   const lifecycle = navigationContext.lifecycle || {};
+  const landedOnPageSurface = currentSurface(observation.page || {}).type === "page";
   return Boolean(
     feedback.navigationOccurred
-    || feedback.pageChanged
-    || feedback.surfaceChanged
-    || feedback.progressChanged
-    || result.pageChanged
-    || /navigate|advance|continue|next|reobserve_after_transient/.test(lower(`${action.intent || ""} ${action.semanticIntent || ""}`))
-    || /advance_surface|advance_checkout_stage/.test(lower(action.mechanicalEffect || action.physicalEffect || ""))
-    || (lifecycle.navigation === true && lifecycle.closed !== true)
-    || lifecycle.awaitingDestination === true
-    || lifecycle.status === "waiting_for_destination"
+    || result.navigationOccurred
+    || (landedOnPageSurface && /advance_checkout_stage/.test(lower(action.mechanicalEffect || action.physicalEffect || "")))
+    || (landedOnPageSurface && lifecycle.navigation === true && lifecycle.closed !== true)
+    || (landedOnPageSurface && lifecycle.awaitingDestination === true)
+    || (landedOnPageSurface && lifecycle.status === "waiting_for_destination")
     || previousReadiness.classification === READINESS.TRANSIENT
     || previousReadiness.classification === READINESS.DEGRADED
   );
@@ -114,8 +128,7 @@ function visibleStage(page = {}) {
 }
 
 function expectedDestinationStage(page = {}) {
-  const checkoutEvidence = stageEvidence({ page });
-  if (checkoutEvidence.terminalEvidence?.boundaryObserved === true) return "payment";
+  if (paymentBoundaryObserved(page)) return "payment";
   const surface = currentSurface(page);
   const foregroundLabel = surface.type === "page" ? "" : lower(surface.label);
   if (/payment|billing|card details|pay now/.test(foregroundLabel)) return "payment";
@@ -124,7 +137,7 @@ function expectedDestinationStage(page = {}) {
   if (/extra|ancillar|baggage|bundle|insurance|protection/.test(foregroundLabel)) return "extras";
 
   const routed = routeStage(page.url || "");
-  const strongPaymentEvidence = checkoutEvidence.terminalEvidence?.boundaryObserved === true;
+  const strongPaymentEvidence = paymentBoundaryObserved(page);
   if (routed === "payment" && strongPaymentEvidence) return "payment";
 
   const visible = visibleStage(page);
@@ -145,9 +158,6 @@ function expectedDestinationStage(page = {}) {
   }
 
   if (routed) return routed;
-
-  const decided = decideStage({ page });
-  if (["payment", "traveler", "seats", "extras"].includes(decided.stage)) return decided.stage;
 
   const step = lower(page.step || page.pageStep || "unknown");
   if (/payment/.test(step)) return "payment";
@@ -193,8 +203,7 @@ function expectedStageContentMissing(page = {}) {
     );
   }
   if (stage === "payment") {
-    const evidence = stageEvidence({ page });
-    const terminalPaymentEvidence = evidence.terminalEvidence?.boundaryObserved === true;
+    const terminalPaymentEvidence = paymentBoundaryObserved(page);
     return !terminalPaymentEvidence
       && !has(/card_number|card_expiry|card_cvc|payment_method|billing_address|submit_payment|submit_purchase|cc-number|cc-exp|cc-csc/);
   }
@@ -227,11 +236,8 @@ function meaningfulDestinationCapability(page = {}, stage = "") {
 
 function readinessKey(observation = {}) {
   const page = observation.page || {};
-  const surface = page.currentSurface || page.activeSurface || {};
   return [
     lower(page.step || page.pageStep || "unknown"),
-    lower(surface.type || "page"),
-    lower(surface.id || "surface-page"),
     lower(page.url || observation.url || "")
   ].join("|");
 }
@@ -271,23 +277,21 @@ function classifyObservationReadiness({
     || facts.loadingTextEvidence === true
     || /\bplease\s+wait\b|\b(?:loading|fetching|preparing)\b.{0,80}\b(?:option|seat|fare|checkout|payment|travell?er|passenger|detail|trip)\b/.test(lower(`${page.heading || ""} ${page.text || ""}`));
   const incompleteStage = expectedStageContentMissing(page);
-  const semanticReadiness = page.semanticReadiness || page.semanticCompilation?.semanticReadiness || "";
-  const semanticUnresolved = semanticReadiness === "unresolved";
-  const usableForeground = foregroundReady(page) && !explicitLoading && !semanticUnresolved;
+  const usableForeground = foregroundReady(page) && !explicitLoading;
   const expectedStage = expectedDestinationStage(page);
-  const checkoutEvidence = stageEvidence(observation);
-  const strongPaymentEvidence = checkoutEvidence.terminalEvidence?.boundaryObserved === true;
+  const strongPaymentEvidence = paymentBoundaryObserved(page);
   const afterNavigation = navigationShaped(observation, previousReadiness, navigationContext);
-  const stable = facts.documentReadyState === "complete"
+  const hasReadinessEvidence = Boolean(
+    facts.documentReadyState
+    || facts.stableForMs != null
+    || facts.ariaBusy === true
+    || Number(facts.loadingIndicatorCount || 0) > 0
+  );
+  const stable = (!hasReadinessEvidence || facts.documentReadyState === "complete")
     && facts.ariaBusy !== true
     && Number(facts.loadingIndicatorCount || 0) === 0
-    && (
-      Number(facts.stableForMs || 0) >= 250
-      || Number(facts.mainTextLength || 0) > 0
-      || Number(facts.visibleMainCount || 0) > 0
-    );
-  const controllerReady = stable
-    && !explicitLoading
+    && (Number(facts.stableForMs || 0) >= MIN_DESTINATION_STABLE_MS || !hasReadinessEvidence);
+  const controllerReady = !explicitLoading
     && (strongPaymentEvidence || meaningfulDestinationCapability(page, expectedStage));
   const shellAfterNavigation = afterNavigation
     && !usableForeground
@@ -297,15 +301,21 @@ function classifyObservationReadiness({
       && Number(page.summary?.fields || 0) === 0
       && Number(page.summary?.decisionGroups || 0) === 0
     ));
-  const transient = explicitLoading || shellAfterNavigation;
+  // A changed destination cannot become actionable merely because some text
+  // or a temporarily positioned panel exists. Wait for one structurally
+  // settled frame before semantic planning is allowed to own the page.
+  const transient = explicitLoading
+    || (afterNavigation
+      && !stable
+      && !strongPaymentEvidence
+      && !(samePendingDestination && controllerReady))
+    || shellAfterNavigation;
   const evidence = Object.freeze({
     controls,
     incompleteStage,
     expectedStage,
     explicitLoading,
     strongPaymentEvidence,
-    semanticReadiness,
-    semanticUnresolved,
     controllerReady,
     unownedMaterialControls: page.semanticCompilation?.unownedMaterialControls || [],
     unresolvedDecisions: page.semanticCompilation?.unresolvedDecisions || [],
@@ -380,6 +390,7 @@ function classifyObservationReadiness({
 module.exports = {
   READINESS,
   DESTINATION_READINESS_TIMEOUT_MS,
+  MIN_DESTINATION_STABLE_MS,
   classifyObservationReadiness,
   expectedDestinationStage,
   expectedStageContentMissing,

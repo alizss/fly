@@ -1701,8 +1701,8 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
 
   assert.equal(turn.clientDecision.action, "click");
   assert.equal(turn.clientDecision.targetLabel, "Next");
-  assert.equal(turn.state.currentObligation.userOutcome.status, "satisfied");
-  assert.equal(turn.state.currentGoal.semanticType, "navigation");
+  assert.equal(turn.state.currentObligation, undefined);
+  assert.equal(turn.state.taskState.currentGoal.semanticType, "navigation");
   assert.equal(turn.debug.deterministic, true);
   assert.deepEqual(turn.debug.modelUsage.calls, []);
 });

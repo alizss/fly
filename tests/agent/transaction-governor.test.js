@@ -1955,7 +1955,7 @@ test("completed form reports unavailable navigation internally instead of asking
   assert.match(result.clientDecision.reason, /INTERNAL_READINESS_FAILURE/);
   assert.equal(result.state.status, "stopped");
   assert.equal("navigationSettling" in result.state, false);
-  assert.equal(result.state.currentObligation, null);
+  assert.equal(result.state.currentObligation, undefined);
   assert.equal(result.debug.userActionRequired, false);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   const traces = listTraces(dir, state.id);
@@ -2158,18 +2158,18 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
     site: { host: "example.test", url: observation.page.url }
   });
   state.id = "txn_visual_country";
-  state.currentGoal = deriveProfileGoal(observation, traveler);
-  state.currentGoal.candidates = candidatesForProfileGoal(state.currentGoal, observation, traveler);
+  const currentGoal = deriveProfileGoal(observation, traveler);
+  currentGoal.candidates = candidatesForProfileGoal(currentGoal, observation, traveler);
   state.taskState = {
     stage: "traveler_information",
-    currentGoal: state.currentGoal,
+    currentGoal,
     activeDecisions: [],
     validationBlockers: []
   };
-  const candidate = state.currentGoal.candidates.find((item) => item.type === "click_xy");
+  const candidate = currentGoal.candidates.find((item) => item.type === "click_xy");
   assert.ok(candidate);
   const scheduled = buildCurrentCandidateSet({
-    goal: state.currentGoal,
+    goal: currentGoal,
     observation,
     traveler,
     state: { taskState: state.taskState, approvals: {} }
@@ -2192,7 +2192,7 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
     turnId: "turn_visual_country_mismatch",
     action: {
       ...loopPrivate.bindTargetSnapshot(
-        actionForProfileCandidate(state.currentGoal, candidate, observation),
+        actionForProfileCandidate(currentGoal, candidate, observation),
         observation
       ),
       operation: "choose"
@@ -2208,7 +2208,7 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
     store,
     turnId: "turn_visual_country",
     action: loopPrivate.bindTargetSnapshot(
-      actionForProfileCandidate(state.currentGoal, candidate, observation),
+      actionForProfileCandidate(currentGoal, candidate, observation),
       observation
     )
   });
@@ -2222,13 +2222,14 @@ test("Unified semantic goal state survives a SQLite restart", () => {
   const { state } = fixture();
   const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222" };
   const observation = profileFormObservation();
-  state.currentGoal = deriveProfileGoal(observation, traveler);
-  state.currentGoal.candidates = candidatesForProfileGoal(state.currentGoal, observation, traveler);
+  const currentGoal = deriveProfileGoal(observation, traveler);
+  currentGoal.candidates = candidatesForProfileGoal(currentGoal, observation, traveler);
+  state.taskState = { stage: "traveler_information", currentGoal };
   state.pendingAction = {
     status: "governed",
     actionId: "act_email",
-    goalId: state.currentGoal.goalId,
-    candidateId: state.currentGoal.candidates[0].candidateId
+    goalId: currentGoal.goalId,
+    candidateId: currentGoal.candidates[0].candidateId
   };
   state.recoveryState = { ...state.recoveryState, attemptedCandidateIds: ["candidate_previous"] };
   state.verifiedResults = [{ goalId: "profile:prior:0", browserVerified: true }];
@@ -2237,8 +2238,9 @@ test("Unified semantic goal state survives a SQLite restart", () => {
   store.close();
   store = createStore({ dbPath });
   const restored = store.getSession(state.id);
-  assert.equal(restored.currentGoal.goalId, "profile:email:0");
-  assert.equal(restored.pendingAction.candidateId, state.currentGoal.candidates[0].candidateId);
+  assert.equal(restored.taskState.currentGoal.goalId, "profile:email:0");
+  assert.equal(restored.taskState.currentGoal.candidates, undefined);
+  assert.equal(restored.pendingAction.candidateId, currentGoal.candidates[0].candidateId);
   assert.deepEqual(restored.recoveryState.attemptedCandidateIds, ["candidate_previous"]);
   assert.equal(restored.verifiedResults[0].browserVerified, true);
   store.close();
@@ -2278,7 +2280,7 @@ test("Unified loop fills email then immediately advances to confirmation email",
     clientTurnId: "turn_email_first"
   });
   assert.equal(email.clientDecision.action, "type");
-  assert.equal(email.state.currentGoal.semanticType, "email");
+  assert.equal(email.state.taskState.currentGoal.semanticType, "email");
   assert.equal(email.clientDecision.value, traveler.email);
 
   const confirmationObservation = completeProfileObservation({
@@ -2306,7 +2308,7 @@ test("Unified loop fills email then immediately advances to confirmation email",
     clientTurnId: "turn_email_confirmation"
   });
   assert.equal(confirmation.clientDecision.action, "type");
-  assert.equal(confirmation.state.currentGoal.semanticType, "confirm_email");
+  assert.equal(confirmation.state.taskState.currentGoal.semanticType, "confirm_email");
   assert.equal(confirmation.clientDecision.value, traveler.email);
   assert.equal(confirmation.debug.modelUsage.calls.length, 0);
   store.close();
@@ -2362,8 +2364,9 @@ test("Unified semantic loop advances to the next profile goal without another mo
   assert.equal(result.clientDecision.expectedOutcome.type, "normalized_value_changed");
   assert.equal(result.clientDecision.expectedOutcome.expectedNormalizedValue, "40111222");
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.equal(result.state.currentGoal.semanticType, "phone");
-  assert.equal(result.state.verifiedResults.some((item) => item.goalId === "profile:email:0" && item.semanticPostconditionSatisfied), true);
+  assert.equal(result.state.taskState.currentGoal.semanticType, "phone");
+  assert.equal(result.state.verifiedResults.some((item) => item.goalId === "profile:email:0" && item.browserVerified), true);
+  assert.equal(result.state.verifiedResults.some((item) => item.semanticPostconditionSatisfied === true), false);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2475,7 +2478,7 @@ test("P0.4 blank traveler stage deterministically starts profile ownership befor
   assert.equal(result.clientDecision.goalId, "profile:email:0");
   assert.ok(result.clientDecision.candidateId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.equal(result.state.currentGoal.semanticType, "email");
+  assert.equal(result.state.taskState.currentGoal.semanticType, "email");
   assert.equal(result.state.pendingAction.candidateId, result.clientDecision.candidateId);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -2520,7 +2523,7 @@ test("P0.4 canonical profile readiness blocks baggage even without an active ski
     }
   });
 
-  assert.equal(state.currentGoal, null);
+  assert.equal(state.currentGoal, undefined);
   assert.equal(result.allow, false);
   assert.equal(result.code, "PROFILE_STAGE_NOT_READY");
   assert.match(result.reason, /Mobile number is invalid/);
@@ -2554,7 +2557,7 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(recovery.clientDecision.intent, "recover_target_viewport");
   assert.equal(recovery.clientDecision.needsApproval, false);
   assert.equal(recovery.debug.modelUsage.calls.length, 0);
-  assert.equal(recovery.state.currentGoal.semanticType, "email");
+  assert.equal(recovery.state.taskState.currentGoal.semanticType, "email");
   assert.equal(recovery.state.pendingAction.schemaVersion, 2);
   assert.equal(recovery.state.pendingAction.status, "needs_reveal");
 

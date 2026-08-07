@@ -48,8 +48,6 @@
  * @property {string} currentObservationId
  * @property {string} currentObservationHash
  * @property {Object|null} currentObservation
- * @property {Object|null} currentGoal
- * @property {Object|null} currentObligation
  * @property {Object|null} taskState
  * @property {Object|null} terminalGoalLatch
  * @property {Object} observationReadiness
@@ -97,8 +95,6 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
     currentStep: "unknown",
     currentObservation: null,
-    currentGoal: null,
-    currentObligation: null,
     taskState: null,
     terminalGoalLatch: null,
     observationReadiness: {
@@ -152,6 +148,11 @@ function withUpdate(state, patch) {
   delete merged.failedStrategyMemory;
   delete merged.blockedProfileGoalKeys;
   delete merged.blockedProfilePageStateHash;
+  // TaskState is the only semantic-goal authority. Historical root mirrors
+  // multiplied large candidate graphs and allowed consumers to read a stale
+  // goal after TaskState had advanced.
+  delete merged.currentGoal;
+  delete merged.currentObligation;
   return merged;
 }
 
