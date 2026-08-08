@@ -411,7 +411,7 @@ function transitionResult(result = {}, transition = null) {
     localExpectedOutcomeObserved: localPostconditionSatisfied,
     localOutcomeVerified,
     browserReportedVerified: result.verified === true,
-    completionAuthority: "task_state",
+    completionAuthority: "transition_evaluator",
     postconditionSatisfied: localPostconditionSatisfied,
     expectedOutcomeObserved: localPostconditionSatisfied,
     verified: localOutcomeVerified

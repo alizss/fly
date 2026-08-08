@@ -452,7 +452,11 @@ function descriptorOwnsActiveRequirement(descriptor = {}, page = {}) {
   const surface = authoritativeCurrentSurface(page);
   const renderingEvidence = Object.values(control.operations || {}).flatMap((capability) => (
     capability
-      ? [capability.actionability, ...Object.values(capability.actionabilityByActuator || {})]
+      ? [
+          capability.actionability,
+          ...Object.values(capability.actionabilityByActuator || {}),
+          ...(capability.exactActuators || []).map((actuator) => actuator.proof)
+        ]
       : []
   )).filter(Boolean);
   const explicitlyNotRendered = renderingEvidence.length > 0
@@ -506,10 +510,12 @@ function verifiedProfileComponentMatchesDescriptor(completion = {}, descriptor =
   );
 }
 
-function profileStageReadiness(observation = {}, traveler = {}, verifiedProfileComponents = []) {
+function profileStageReadiness(observation = {}, traveler = {}, verifiedProfileComponents = [], options = {}) {
   const page = observation.page || {};
   const fields = profileFieldsForPage(page);
-  const descriptors = fieldDescriptors(observation, traveler);
+  const descriptors = Array.isArray(options.descriptors)
+    ? options.descriptors
+    : fieldDescriptors(observation, traveler);
   const step = String(page.step || "").toLowerCase();
   const hasProfileControls = fields.some((field) => PROFILE_FIELDS.has(normalizeProfileFieldType(field.fieldType || field.field || "")));
   const profileStage = hasProfileControls || /traveler|traveller|passenger|contact|document/.test(step);
@@ -1007,7 +1013,18 @@ function descriptorFromPublishedProfileGoal(atom, observation = {}) {
     || atom.semanticGoal?.desiredValue
     || atom.expectedValue
     || "";
-  const expectedOutcome = atom.expectedOutcome || atom.postcondition || null;
+  // The admitted logical-field postcondition is the semantic success fact.
+  // An observed actuator may expose a narrower mechanical outcome (for
+  // example `control_selected`), but it must not replace that fact. Split
+  // state/actuator widgets often retain the canonical value on the logical
+  // component rather than the clicked presentation node.
+  const expectedOutcome = atom.postcondition || atom.expectedOutcome || null;
+  const freshCapabilityContracts = (agentContract.observedComponentContract(control, {
+    surfaceId: control.surfaceId || "surface-page"
+  }).capabilities || []).map((capability) => ({
+    ...capability,
+    expectedOutcome: expectedOutcome || {}
+  }));
   const componentBinding = atom.componentBinding || {
     logicalFieldId: atom.logicalFieldId || "",
     componentIdentity: atom.descriptorKey || `${atom.logicalFieldId || control.stableKey || control.controlId}:${atom.componentRole || "value"}`,
@@ -1030,7 +1047,9 @@ function descriptorFromPublishedProfileGoal(atom, observation = {}) {
     value: atom.expectedValue || desiredValue,
     observedRole: control.role || field.role || componentBinding.controlRole || "",
     observedCapabilities: control.capabilities || [],
-    capabilityContracts: atom.capabilityContracts || [],
+    // Capabilities are mechanics from the immutable current observation. They
+    // are rebuilt here and never persisted in CurrentObligation.
+    capabilityContracts: freshCapabilityContracts,
     requirementContract: atom.requirementContract || null,
     bindingContract: agentContract.canonicalPipelineContract({
       requirement: atom.requirementContract || {},
@@ -1045,7 +1064,11 @@ function descriptorFromPublishedProfileGoal(atom, observation = {}) {
     }),
     expectedOutcome,
     validationOwnership: atom.validationOwnership || null,
-    choiceLike: false,
+    choiceLike: Boolean(
+      atom.choiceLike
+      || control.choiceContract
+      || ["radio", "checkbox", "option"].includes(control.role || control.kind)
+    ),
     choiceTerms: [...(atom.choiceTerms || [])],
     currentNormalizedValue: control.state?.normalizedValue || "",
     desiredNormalizedValue: desiredValue,
@@ -1339,7 +1362,7 @@ function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}
       ...logicalExpectation
     };
   }
-  if (descriptor.observedOption && strategy.operation === "choose") {
+  if (descriptor.observedOption && strategy.operation === "choose" && !descriptor.choiceLike) {
     return {
       type: "normalized_value_changed",
       controlId: goalControl.controlId,
@@ -1526,9 +1549,11 @@ function strategyCandidatesForAtom(atom = {}, descriptor = null, observation = {
       candidate.interactionMethod || ""
     );
     candidate.capabilityStatus = capability.status;
-    candidate.expectedOutcome = capability.expectedOutcome
-      || descriptor.expectedOutcome
-      || expectedOutcomeForStrategy(atom, descriptor, candidate, observation);
+    // Capability contracts prove *how* the actuator can be operated. The
+    // profile obligation owns what must be true afterwards. Keeping the
+    // semantic postcondition authoritative avoids verifying a split widget
+    // against the clicked presentation node's generic mechanical outcome.
+    candidate.expectedOutcome = expectedOutcomeForStrategy(atom, descriptor, candidate, observation);
     candidate.pipelineContract = agentContract.canonicalPipelineContract({
       requirement: descriptor.requirementContract || {},
       component: descriptor.bindingContract?.component || {
@@ -1901,9 +1926,11 @@ function profileGoalForDescriptor(descriptor = {}, observation = {}, previousGoa
   };
 }
 
-function selectNextProfileRequirement(observation = {}, traveler = {}, currentGoal = null, verifiedProfileComponents = []) {
+function selectNextProfileRequirement(observation = {}, traveler = {}, currentGoal = null, verifiedProfileComponents = [], options = {}) {
   const page = observation.page || {};
-  const descriptors = fieldDescriptors(observation, traveler)
+  const descriptors = (Array.isArray(options.descriptors)
+    ? options.descriptors
+    : fieldDescriptors(observation, traveler))
     .filter((descriptor) => descriptorOwnsActiveRequirement(descriptor, page))
     .filter((descriptor) => !descriptor.hasValue)
     .filter((descriptor) => !(verifiedProfileComponents || []).some((completion) => (

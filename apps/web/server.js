@@ -8,6 +8,7 @@ const HOST = process.env.HOST || "127.0.0.1";
 const ROOT = path.resolve(__dirname, "../..");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = process.env.ATW_DATA_DIR || path.join(ROOT, "work");
+const DIAGNOSTIC_DIR = process.env.ATW_DIAGNOSTIC_DIR || DATA_DIR;
 const DB_FILE = process.env.ATW_PROFILE_DB || path.join(DATA_DIR, "air-travel-wallet-db.json");
 const MAX_OBSERVATION_BYTES = 5_500_000;
 const MAX_SCREENSHOT_UPLOAD_BYTES = 12_000_000;
@@ -19,6 +20,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const agentLoop = require("./agent/loop");
 const agentSessionStore = require("./agent/session-store");
 const agentTraceStore = require("./agent/trace-store");
+const { appendRotatingJsonLine, retentionConfig } = require("./agent/diagnostic-retention");
 const { prepareTransactionInvariants } = require("./agent/invariants");
 const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
 const { PAGE_SURFACE_ID, normalizeSurface } = require("./agent/surface-contract");
@@ -816,15 +818,27 @@ function mergeObservationRecords(previous = [], incoming = [], key, removedIds =
 
 function hydrateIncrementalAgentBody(body = {}) {
   const update = body.observationUpdate || {};
-  // Reference-only transport is not part of this backend contract. A stale
-  // extension must be forced through its existing full-resynchronization path;
-  // otherwise the empty reference shell can be admitted as the canonical page
-  // and erase every current control.
   if (update.mode === "reference" || body.page?.referenceOnly === true) {
-    const error = new Error("Reference-only observations require a full canonical resynchronization.");
-    error.code = "OBSERVATION_RESYNC_REQUIRED";
-    error.retryable = true;
-    throw error;
+    const sessionId = clampText(body.sessionId || "", 120);
+    const previous = sessionId ? agentSessionStore.getCurrentObservation(sessionId) : null;
+    const previousHash = String(previous?.observationSnapshot?.snapshotHash || previous?.page?.snapshotHash || "");
+    const requestedHash = String(update.baseSnapshotHash || body.page?.snapshotHash || "");
+    if (!previous?.page || !requestedHash || requestedHash !== previousHash) {
+      const error = new Error("Observation reference does not match the current immutable page.");
+      error.code = "OBSERVATION_RESYNC_REQUIRED";
+      error.retryable = true;
+      throw error;
+    }
+    return {
+      ...body,
+      transportMode: "observation_reference",
+      page: {
+        ...previous.page,
+        referenceOnly: false,
+        incremental: false,
+        snapshotHash: previousHash
+      }
+    };
   }
   if (update.mode !== "incremental" || body.page?.incremental !== true) return body;
   const sessionId = clampText(body.sessionId || "", 120);
@@ -1092,7 +1106,8 @@ function compactAgentPayload(rawBody) {
       deadlineAt: Number(body.destinationReadiness.deadlineAt || 0),
       attempts: Number(body.destinationReadiness.attempts || 0),
       backendWaits: Number(body.destinationReadiness.backendWaits || 0),
-      deadlineObservationSent: Boolean(body.destinationReadiness.deadlineObservationSent)
+      deadlineObservationSent: Boolean(body.destinationReadiness.deadlineObservationSent),
+      retryToken: clampText(body.destinationReadiness.retryToken, 180)
     } : null,
     userIntent: clampText(body.userIntent || "Complete checkout safely for the selected traveler.", 800),
     userMessage: clampText(body.userMessage || "", 800),
@@ -1310,13 +1325,20 @@ function compactAgentPayload(rawBody) {
 // The decision path: observe -> verify -> plan -> policy -> act, with canonical
 // session state and per-turn traces.
 async function decideAgentNextActionViaLoop(body) {
+  const serverTurnStartedAt = Date.now();
+  const compactionStartedAt = Date.now();
   const payload = compactAgentPayload(body);
+  const requestCompactionMs = Date.now() - compactionStartedAt;
   if (!payload.sessionId) throw new Error("DURABLE_SESSION_REQUIRED");
+  const sessionReadStartedAt = Date.now();
   let state = agentSessionStore.getSession(payload.sessionId);
+  const sessionReadMs = Date.now() - sessionReadStartedAt;
   if (!state) throw new Error("DURABLE_SESSION_NOT_FOUND");
+  const previousObservationReadStartedAt = Date.now();
   const previousObservation = state.currentObservationId
     ? agentSessionStore.getObservation(state.id, state.currentObservationId)
     : null;
+  const previousObservationReadMs = Date.now() - previousObservationReadStartedAt;
 
   const observation = {
     observationId: payload.observationId,
@@ -1331,7 +1353,9 @@ async function decideAgentNextActionViaLoop(body) {
   // The loop owns the single authoritative state commit for this turn. The
   // immutable observation row is recorded first so governance can reference
   // it, but recording it must not rewrite the full transaction state.
+  const observationWriteStartedAt = Date.now();
   agentSessionStore.recordObservation(state.id, observation, { updateSession: false });
+  const observationWriteMs = Date.now() - observationWriteStartedAt;
   // Previous browser evidence is read from the durable ledger and attached
   // only for this turn. It is not nested into the newly persisted observation.
   observation.previousObservation = previousObservation;
@@ -1369,11 +1393,12 @@ async function decideAgentNextActionViaLoop(body) {
   logAgent("loop turn start", { clientTurnId: payload.clientTurnId, observationId: payload.observationId, sessionId: state.id, site: payload.page?.site, step: state.currentStep, stallCount: state.stallCount || 0 });
 
   try {
+    const loopStartedAt = Date.now();
     const { state: nextState, clientDecision, debug } = await agentLoop.runLoopTurn({
       apiKey: OPENAI_API_KEY,
       model: AGENT_MODEL,
       recoveryModel: AGENT_RECOVERY_MODEL,
-      dataDir: DATA_DIR,
+      dataDir: DIAGNOSTIC_DIR,
       state,
       observation,
       traveler: payload.traveler,
@@ -1383,7 +1408,17 @@ async function decideAgentNextActionViaLoop(body) {
       transactionStore: agentSessionStore,
       clientTurnId: payload.clientTurnId
     });
-    const latency = debug?.latency || {};
+    const loopMs = Date.now() - loopStartedAt;
+    const serverLatency = {
+      ...(debug?.latency || {}),
+      server_request_compaction_ms: requestCompactionMs,
+      server_session_read_ms: sessionReadMs,
+      server_previous_observation_read_ms: previousObservationReadMs,
+      server_observation_write_ms: observationWriteMs,
+      server_loop_ms: loopMs,
+      server_turn_total_ms: Date.now() - serverTurnStartedAt
+    };
+    const latency = serverLatency;
     const modelUsage = debug?.modelUsage || {};
     logAgent("loop turn decision", {
       sessionId: nextState.id,
@@ -1414,12 +1449,22 @@ async function decideAgentNextActionViaLoop(body) {
       trace_write_ms: latency.trace_write_ms ?? null,
       final_state_persist_ms: latency.final_state_persist_ms ?? null,
       turn_total_ms: latency.turn_total_ms ?? null,
+      server_request_compaction_ms: latency.server_request_compaction_ms,
+      server_session_read_ms: latency.server_session_read_ms,
+      server_previous_observation_read_ms: latency.server_previous_observation_read_ms,
+      server_observation_write_ms: latency.server_observation_write_ms,
+      server_loop_ms: latency.server_loop_ms,
+      server_turn_total_ms: latency.server_turn_total_ms,
       input_tokens: modelUsage.input_tokens ?? null,
       output_tokens: modelUsage.output_tokens ?? null,
       model: modelUsage.model || AGENT_MODEL,
       reason: debug?.final?.reason || clientDecision.reason || ""
     });
-    return { ...clientDecision, sessionId: nextState.id, debug };
+    return {
+      ...clientDecision,
+      sessionId: nextState.id,
+      debug: { ...(debug || {}), latency: serverLatency }
+    };
   } catch (error) {
     logAgent("loop turn ERROR", { message: error.message });
     return aiUnavailableDecision(error.message);
@@ -1487,16 +1532,30 @@ function summarizeClientFlowLog(body) {
   };
 }
 
-function writeClientFlowLog(body) {
+async function writeClientFlowLog(body) {
   const sessionId = safeLogFilePart(body.sessionId || body.entry?.turnId || "no-session");
-  const dir = path.join(DATA_DIR, "agent-client-logs");
-  fs.mkdirSync(dir, { recursive: true });
+  const dir = path.join(DIAGNOSTIC_DIR, "agent-client-logs");
+  const summary = summarizeClientFlowLog(body);
   const row = {
     receivedAt: now(),
-    ...body
+    ...summary,
+    entry: {
+      seq: body.entry?.seq,
+      at: clampText(body.entry?.at || "", 80),
+      turnId: clampText(body.entry?.turnId || "", 80),
+      phase: clampText(body.entry?.phase || "unknown", 80),
+      payload: body.entry?.payload || null
+    }
   };
-  fs.appendFileSync(path.join(dir, `${sessionId}.jsonl`), `${JSON.stringify(row)}\n`);
-  return summarizeClientFlowLog(body);
+  // Diagnostic persistence must never monopolize the event loop that serves
+  // planner requests. The extension can emit several flow events around one
+  // action; synchronous appends made those otherwise best-effort logs visible
+  // as multi-second planner upload stalls.
+  await appendRotatingJsonLine(path.join(dir, `${sessionId}.jsonl`), row, {
+    config: retentionConfig(),
+    fallback: { receivedAt: row.receivedAt, ...summary, entry: { phase: row.entry.phase, truncated: true } }
+  });
+  return summary;
 }
 
 function summarizeActionLedgerRow(body = {}) {
@@ -1517,20 +1576,29 @@ function summarizeActionLedgerRow(body = {}) {
   };
 }
 
-function writeActionLedgerRow(body = {}) {
+async function writeActionLedgerRow(body = {}) {
   const transactionId = safeLogFilePart(body.transactionId || body.sessionId || body.turnId || "no-session");
-  const dir = path.join(DATA_DIR, "agent-ledger");
-  fs.mkdirSync(dir, { recursive: true });
+  const dir = path.join(DIAGNOSTIC_DIR, "agent-ledger");
+  const summary = summarizeActionLedgerRow(body);
   const row = {
     receivedAt: now(),
-    ...body
+    ...summary,
+    semanticEffect: clampText(body.semanticEffect || body.action?.semanticEffect || body.action?.physicalEffect || "", 100),
+    expectedOutcome: body.expectedOutcome ? {
+      type: clampText(body.expectedOutcome.type || "", 100),
+      decisionGroupId: clampText(body.expectedOutcome.decisionGroupId || "", 120),
+      requirementId: clampText(body.expectedOutcome.requirementId || "", 120)
+    } : null
   };
-  fs.appendFileSync(path.join(dir, `${transactionId}.jsonl`), `${JSON.stringify(row)}\n`);
+  await appendRotatingJsonLine(path.join(dir, `${transactionId}.jsonl`), row, {
+    config: retentionConfig(),
+    fallback: { receivedAt: row.receivedAt, ...summary, truncated: true }
+  });
   const realTransactionId = clampText(body.transactionId || body.sessionId || "", 120);
   if (realTransactionId && agentSessionStore.getSession(realTransactionId)) {
     agentSessionStore.recordActionEvent(realTransactionId, row);
   }
-  return summarizeActionLedgerRow(row);
+  return summary;
 }
 
 function bootstrapPayload(db) {
@@ -1641,14 +1709,14 @@ async function handleApi(req, res, pathname) {
 
   if (req.method === "POST" && pathname === "/api/agent/client-log") {
     const body = await readBody(req);
-    const summary = writeClientFlowLog(body);
+    const summary = await writeClientFlowLog(body);
     logAgent("client flow", summary);
     return sendJson(res, 200, { ok: true });
   }
 
   if (req.method === "POST" && pathname === "/api/agent/action-ledger") {
     const body = await readBody(req);
-    const summary = writeActionLedgerRow(body);
+    const summary = await writeActionLedgerRow(body);
     logAgent("action ledger", summary);
     return sendJson(res, 200, { ok: true });
   }
@@ -1666,17 +1734,32 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === "POST" && pathname === "/api/agent/next-action") {
-    const body = await readBody(req, { maxBytes: MAX_OBSERVATION_BYTES, tooLargeCode: "OBSERVATION_TOO_LARGE" });
-    const sessionId = clampText(body.sessionId || "", 120);
-    if (!sessionId) return sendJson(res, 409, { error: "A durable checkout session is required before planning.", code: "DURABLE_SESSION_REQUIRED" });
-    if (!agentSessionStore.getSession(sessionId)) {
-      return sendJson(res, 409, { error: "The checkout session no longer exists; refusing to create a replacement transaction.", code: "DURABLE_SESSION_NOT_FOUND" });
-    }
+    const requestStartedAt = Date.now();
+    let requestParseMs = 0;
+    let sessionLookupMs = 0;
+    let requestOutcome = "error";
     try {
+      const parseStartedAt = Date.now();
+      const body = await readBody(req, { maxBytes: MAX_OBSERVATION_BYTES, tooLargeCode: "OBSERVATION_TOO_LARGE" });
+      requestParseMs = Date.now() - parseStartedAt;
+      const sessionId = clampText(body.sessionId || "", 120);
+      if (!sessionId) {
+        requestOutcome = "durable_session_required";
+        return sendJson(res, 409, { error: "A durable checkout session is required before planning.", code: "DURABLE_SESSION_REQUIRED" });
+      }
+      const lookupStartedAt = Date.now();
+      const sessionExists = Boolean(agentSessionStore.getSession(sessionId));
+      sessionLookupMs = Date.now() - lookupStartedAt;
+      if (!sessionExists) {
+        requestOutcome = "durable_session_not_found";
+        return sendJson(res, 409, { error: "The checkout session no longer exists; refusing to create a replacement transaction.", code: "DURABLE_SESSION_NOT_FOUND" });
+      }
       const decision = await decideAgentNextActionViaLoop(body);
+      requestOutcome = "decision";
       return sendJson(res, 200, decision);
     } catch (error) {
       if (error.code === "OBSERVATION_RESYNC_REQUIRED") {
+        requestOutcome = "observation_resync_required";
         return sendJson(res, 409, {
           error: error.message,
           code: error.code,
@@ -1684,9 +1767,20 @@ async function handleApi(req, res, pathname) {
         });
       }
       if (/^DURABLE_SESSION_/.test(error.message || "")) {
+        requestOutcome = "durable_session_error";
         return sendJson(res, 409, { error: error.message, code: error.message });
       }
       throw error;
+    } finally {
+      // Always record the complete HTTP boundary, including readiness waits
+      // and early 409s; otherwise the slowest non-planning paths misleadingly
+      // report zero latency.
+      logAgent("next-action request timing", {
+        outcome: requestOutcome,
+        request_parse_ms: requestParseMs,
+        session_lookup_ms: sessionLookupMs,
+        request_total_ms: Date.now() - requestStartedAt
+      });
     }
   }
 

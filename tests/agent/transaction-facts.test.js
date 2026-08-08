@@ -2,9 +2,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
-const { governAction } = require("../../apps/web/agent/action-governor");
+const { governObservedAction: governAction } = require("./governance-test-helper");
 const { factsFromObservation, mergeCommerceSelections, normalizeFacts } = require("../../apps/web/agent/transaction-facts");
 const { explicitItineraryConflict, invariantDecision, prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
+const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
 
 function facts({
   completeness = "complete",
@@ -215,7 +216,7 @@ test("typed transaction evidence cannot silently fall back to value-only route o
   assert.equal(normalized.fareBrand, "");
 });
 
-test("current canonical decisions enrich transaction outcomes without erasing review rows", () => {
+test("authoritative transaction facts retain review outcomes without page-control reinterpretation", () => {
   const raw = facts();
   raw.selectedExtras = [{
     family: "seat",
@@ -237,6 +238,38 @@ test("current canonical decisions enrich transaction outcomes without erasing re
 
   assert.equal(observed.selectedExtras.length, 1);
   assert.equal(observed.selectedExtras.find((extra) => extra.family === "seat").outcome, "random_assignment");
+});
+
+test("a selected seat-map mode toggle cannot fabricate a paid selected extra", () => {
+  const seatMapMode = {
+    controlId: "seatmap_true",
+    decisionGroupId: "dg_seat_map_mode",
+    label: "Add to cart",
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: null,
+    selected: true,
+    state: { selected: true, checked: true, disabled: true },
+    operations: {}
+  };
+  const observed = factsFromObservation({ userPolicy: {} }, {
+    observationId: "obs_seat_map_mode_only",
+    page: {
+      step: "seats",
+      controls: [seatMapMode],
+      decisionGroups: [{
+        decisionGroupId: "dg_seat_map_mode",
+        sectionType: "seat",
+        status: "satisfied",
+        selectedControlId: seatMapMode.controlId,
+        alternatives: [seatMapMode]
+      }],
+      transactionFacts: { selectedExtras: [], currency: "EUR" }
+    }
+  }, { id: "trav_1", booking_rules: "No paid seats" });
+
+  assert.deepEqual(observed.selectedExtras, []);
 });
 
 test("a foreground child keeps its selected background opener provisional without wording rules", () => {
@@ -934,15 +967,9 @@ test("price evidence allows reconciliation while selected-extra policy still blo
     approvals: {},
     paymentState: {},
     taskState: {
-      currentGoal: { goalId: "goal_bundle", decisionGroupId: "dg_bundle", desiredPolicyOutcome: "selected_free_option" },
-      activeDecisions: [{
-        decisionGroupId: "dg_bundle",
-        status: "conflicted",
-        reopenEvidence: {
-          code: "EXACT_SELECTED_OPTION_PRICE_EXCEEDS_POLICY",
-          structuredPrice: { amount: 29, currency: "EUR" }
-        }
-      }]
+      currentObligation: currentObligationFromGoal({
+        goal: { goalId: "goal_bundle", decisionGroupId: "dg_bundle", desiredPolicyOutcome: "selected_free_option" }
+      })
     }
   };
   const correction = {

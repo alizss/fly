@@ -2,10 +2,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  reduceTaskState,
   verifiedCommerceObligationFromActionResult,
   verifiedProfileComponentFromActionResult
 } = require("../../apps/web/agent/task-state-reducer");
+const { reduceTaskState } = require("./task-state-replay-adapter");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
@@ -195,7 +195,7 @@ test("placeholder selects remain empty and disabled navigation identifies the so
   assert.equal(state.currentGoal, null);
 });
 
-test("a verified profile opener preserves its objective as one bounded adaptive surface episode", () => {
+test("a Turkish-shaped phone-code opener keeps surface continuity when child options repeat the profile semantic", () => {
   const surfaceId = "surface-country-options";
   const countryField = {
     ...control("country_code", {
@@ -212,7 +212,7 @@ test("a verified profile opener preserves its objective as one bounded adaptive 
     surfaceId,
     surfaceType: "portal",
     label: "Slovenia (+386)",
-    semantic: "choice",
+    semantic: "phone_country_code",
     kind: "option",
     role: "option",
     risk: "safe"
@@ -221,7 +221,7 @@ test("a verified profile opener preserves its objective as one bounded adaptive 
     surfaceId,
     surfaceType: "portal",
     label: "Türkiye (+90)",
-    semantic: "choice",
+    semantic: "phone_country_code",
     kind: "option",
     role: "option",
     risk: "safe"
@@ -463,6 +463,200 @@ test("a verified profile opener preserves its objective as one bounded adaptive 
   assert.equal(continued.currentGoal.kind, "adaptive_surface");
   assert.equal(continued.currentGoal.adaptiveEnvelope.remainingSteps, 5);
   assert.deepEqual(continued.currentGoal.adaptiveEnvelope.queryHistory, ["386"]);
+});
+
+test("a GoToGate-shaped editable country code keeps its obligation when typing reveals the exact option", () => {
+  const surfaceId = "surface-country-code-listbox";
+  const countryCode = {
+    ...control("country_code_editable", {
+      label: "Country code",
+      semantic: "phone_country_code",
+      kind: "select",
+      role: "editable_combobox"
+    }),
+    fieldType: "phone_country_code",
+    state: {
+      disabled: false,
+      required: false,
+      valuePresent: true,
+      normalizedValue: "+386",
+      valueText: "+386",
+      expanded: true,
+      selected: false
+    },
+    operations: { type: capability("type", "country_code_editable_node") }
+  };
+  const slovenia = {
+    ...control("country_code_slovenia", {
+      surfaceId,
+      surfaceType: "dropdown",
+      label: "Slovenia (+386)",
+      semantic: "choice",
+      kind: "option",
+      role: "option"
+    }),
+    state: {
+      disabled: false,
+      required: false,
+      valuePresent: false,
+      optionValue: "slovenia (+386)",
+      selected: false
+    },
+    operations: { choose: capability("choose", "country_code_slovenia_node") }
+  };
+  const observation = {
+    observationId: "obs_gotogate_country_code_filtered",
+    page: {
+      url: "https://example.test/checkout/traveler",
+      step: "traveler_information",
+      currentSurface: {
+        id: surfaceId,
+        type: "dropdown",
+        label: "Slovenia (+386)",
+        memberControlIds: [slovenia.controlId]
+      },
+      foreground: {
+        id: surfaceId,
+        type: "dropdown",
+        label: "Slovenia (+386)",
+        memberControlIds: [slovenia.controlId]
+      },
+      controls: [countryCode, slovenia],
+      fields: [{
+        controlId: countryCode.controlId,
+        field: "phone_country_code",
+        fieldType: "phone_country_code",
+        label: "Country code",
+        kind: "select",
+        role: "editable_combobox",
+        value: "+386",
+        hasValue: true,
+        required: false
+      }],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+  const previousGoal = {
+    kind: "profile_field",
+    goalId: "profile:phone_country_code:gotogate",
+    semanticGoal: "Set country code to +386",
+    semanticType: "phone_country_code",
+    desiredValue: "+386",
+    canonicalValue: "+386",
+    logicalFieldId: "traveler.phone_country_code",
+    subjectId: "traveler_1",
+    controlId: countryCode.controlId,
+    componentRole: "country_code",
+    componentBinding: { controlId: countryCode.controlId },
+    postcondition: { type: "logical_component_committed", expectedCanonicalValue: "+386" }
+  };
+  const actionResult = {
+    dispatched: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    // Production compaction keeps goalId on the receipt, not on the nested
+    // mechanical action. This exact shape regressed the live GoToGate run.
+    goalId: previousGoal.goalId,
+    expectedOutcome: {
+      type: "semantic_progress",
+      controlId: countryCode.controlId,
+      semanticType: "phone_country_code",
+      componentRole: "country_code",
+      expectedNormalizedValue: "+386",
+      interactionKind: "editable_combobox",
+      commitRequirement: "logical_component_committed"
+    },
+    action: {
+      operation: "type",
+      controlId: countryCode.controlId,
+      value: "+386"
+    }
+  };
+  const traveler = { phone_country_code: "+386" };
+
+  const closedCountryCode = {
+    ...countryCode,
+    state: {
+      ...countryCode.state,
+      normalizedValue: "+441481",
+      valueText: "+44-1481",
+      expanded: false
+    }
+  };
+  const closedObservation = {
+    observationId: "obs_gotogate_country_code_closed",
+    page: {
+      ...observation.page,
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: [countryCode.controlId] },
+      foreground: null,
+      controls: [closedCountryCode],
+      fields: [{
+        ...observation.page.fields[0],
+        value: "+44-1481",
+        hasValue: true,
+        state: closedCountryCode.state,
+        controlState: closedCountryCode.state
+      }]
+    }
+  };
+  const initialCandidates = buildCurrentCandidateSet({
+    goal: previousGoal,
+    observation: closedObservation,
+    traveler
+  });
+  const typedQuery = initialCandidates.candidates.find((candidate) => candidate.operation === "type");
+  assert.ok(typedQuery, JSON.stringify(initialCandidates, null, 2));
+  assert.equal(typedQuery.expectedOutcome.type, "semantic_progress");
+  assert.equal(typedQuery.expectedOutcome.interactionKind, "editable_combobox");
+  assert.equal(typedQuery.expectedOutcome.commitRequirement, "logical_component_committed");
+
+  const state = reduceTaskState({
+    previousTaskState: { currentGoal: previousGoal },
+    observation,
+    previousActionResult: actionResult,
+    traveler
+  });
+
+  assert.equal(state.currentGoal.kind, "adaptive_surface");
+  assert.equal(state.currentGoal.sourceGoalId, previousGoal.goalId);
+  assert.equal(state.currentGoal.adaptiveEnvelope.surfaceId, surfaceId);
+
+  const candidateSet = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    traveler,
+    state: { taskState: state, approvals: {} }
+  });
+  assert.equal(candidateSet.candidates.length, 1, JSON.stringify(candidateSet, null, 2));
+  assert.equal(candidateSet.candidates[0].controlId, slovenia.controlId);
+  assert.equal(candidateSet.candidates[0].operation, "choose");
+});
+
+test("an admitted profile obligation chooses direct mechanics without a model arbitration turn", () => {
+  const selected = loopPrivate.deterministicTaskCandidate({
+    candidates: [
+      {
+        candidateId: "country_keyboard",
+        operation: "keyboard",
+        risk: "uncertain",
+        physicalEffect: "set_field_value",
+        requiresJudgment: true,
+        requiresApproval: false
+      },
+      {
+        candidateId: "country_type",
+        operation: "type",
+        risk: "uncertain",
+        physicalEffect: "set_field_value",
+        requiresJudgment: true,
+        requiresApproval: false
+      }
+    ]
+  }, { kind: "profile_field" });
+
+  assert.equal(selected?.candidateId, "country_type");
 });
 
 test("disabled navigation queues multiple missing traveler facts instead of abandoning the form", () => {
@@ -1564,7 +1758,7 @@ test("grounded semantic ownership turns an ambiguous paid summary into the exact
   assert.equal(state.activeDecisions[0].family, "seat");
   assert.equal(state.currentGoal.decisionGroupId, "dg_selected_item");
   assert.deepEqual(state.currentGoal.freeAlternativeControlIds, ["remove_selected_item"]);
-  assert.equal(state.currentGoal.actionableControlIds, undefined);
+  assert.deepEqual(state.currentGoal.actionableControlIds, ["remove_selected_item"]);
 });
 
 test("fresh transaction-backed paid truth cannot remain satisfied when selected evidence is missing", () => {
@@ -1610,6 +1804,8 @@ test("fresh transaction-backed paid truth cannot remain satisfied when selected 
       transactionFacts: {
         selectedExtras: [{
           decisionGroupId: "dg_live_summary",
+          family: "extras",
+          subjectKey: "selected_item",
           label: "Selected item 23 EUR",
           disposition: "paid",
           priceAmount: 23,
@@ -2077,7 +2273,8 @@ test("unknown foreground publishes one bounded reversible goal and excludes cons
     traveler: {}
   }).candidates;
   assert.deepEqual(candidates.map((candidate) => candidate.controlId), ["safe_close"]);
-  assert.equal(candidates[0].expectedOutcome.type, "active_surface_dismissed");
+  assert.equal(candidates[0].localMechanicalPostcondition.type, "observable_change");
+  assert.equal(candidates[0].obligationSuccessCondition.type, "observable_change");
   assert.equal(candidates.some((candidate) => candidate.controlId === "paid_upgrade"), false);
 });
 
@@ -2206,7 +2403,7 @@ test("decision planning keeps unrelated surface controls as context and uses one
 
   assert.deepEqual(candidateSet.contextCapabilities.map((candidate) => candidate.controlId).sort(), ["close_help", "no_thanks", "paid_upgrade"]);
   assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "close_help").selectable, false);
-  assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "paid_upgrade").policyStatus, "deny");
+  assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "paid_upgrade").policyStatus, "context_only");
   assert.deepEqual(
     candidateSet.candidates.map((candidate) => candidate.controlId),
     ["no_thanks"],
@@ -2254,7 +2451,7 @@ test("exact baggage groups decline cabin then checked baggage before Continue", 
   const cabinObservation = observation("obs_cabin", "missing", "", "missing", "");
   const cabinState = reduceTaskState({ observation: cabinObservation, userPolicy, traveler });
   assert.equal(cabinState.currentGoal.decisionGroupId, "cabin_baggage");
-  assert.equal(cabinState.currentGoal.contractVersion, "current-obligation/v1");
+  assert.equal(cabinState.currentGoal.contractVersion, "current-obligation/v2");
   assert.equal(cabinState.currentGoal.authority, "task_state");
   assert.equal(cabinState.currentGoal.owner.surfaceId, "surface-page");
   assert.equal(cabinState.currentGoal.admission.status, "admitted");
@@ -3359,6 +3556,347 @@ test("a stale completed-extra episode cannot block its visible sibling queue", (
   assert.ok(state.activeDecisions.some((decision) => decision.decisionGroupId === "dg_sms"));
 });
 
+test("a current decision cycle remains routable while an exact fresh strategy exists", () => {
+  const free = control("seat_none", {
+    decisionGroupId: "dg_seat",
+    label: "Continue with random seat assignment",
+    semantic: "decline_paid_seat",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline",
+    kind: "radio",
+    role: "radio",
+    state: { checked: false, selected: false }
+  });
+  free.operations = { choose: capability("choose", "seat_none_node") };
+  const paid = control("seat_paid", {
+    decisionGroupId: "dg_seat",
+    label: "Choose a seat — 12 EUR",
+    semantic: "add_paid_seat",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: { amount: 12, currency: "EUR" },
+    kind: "radio",
+    role: "radio"
+  });
+  paid.operations = { choose: capability("choose", "seat_paid_node") };
+  const episode = {
+    episodeId: "seats:seat:dg_seat",
+    decisionInstanceId: "seats:seat:dg_seat:global",
+    canonicalOwnerId: "seats:seat:dg_seat:global",
+    family: "seat",
+    subjectKey: "seat",
+    parentDecisionGroupId: "dg_seat",
+    requirementId: "seats:seat-selection",
+    status: "blocked_cycle",
+    commitmentPhase: "option_pending",
+    semanticOutcomeKey: "missing||",
+    surfacePath: ["page|unknown|select seats"],
+    cycleCount: 2,
+    cycleDetected: true
+  };
+  const state = reduceTaskState({
+    previousTaskState: {
+      decisionEpisode: episode,
+      currentGoal: {
+        kind: "commerce_decision",
+        goalId: "decision:dg_seat",
+        decisionGroupId: "dg_seat",
+        parentDecisionGroupId: "dg_seat",
+        decisionEpisodeId: episode.episodeId
+      }
+    },
+    observation: {
+      observationId: "obs_same_seat_cycle",
+      observationSnapshot: { snapshotHash: "same_seat_cycle" },
+      page: {
+        step: "seats",
+        currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Select seats" },
+        controls: [free, paid],
+        decisionGroups: [{
+          decisionGroupId: "dg_seat",
+          requirementId: "seats:seat-selection",
+          surfaceId: "surface-page",
+          surfaceType: "page",
+          sectionType: "seat",
+          sectionLabel: "Select seats",
+          required: true,
+          status: "missing",
+          selectedControlId: "",
+          alternatives: [free, paid],
+          controls: [free, paid]
+        }],
+        validationIssues: []
+      }
+    },
+    userPolicy: { bookingRules: "No paid extras; accept random seat assignment" },
+    traveler: { booking_rules: "No paid extras; accept random seat assignment" }
+  });
+
+  assert.equal(state.ambiguityReason, "");
+  assert.equal(state.currentGoal?.decisionGroupId, "dg_seat");
+  assert.equal(state.currentGoal?.selectedControlId || "", "");
+  assert.ok(state.activeDecisions.some((decision) => decision.decisionGroupId === "dg_seat"));
+});
+
+test("GoToGate seat mode toggle yields to independently proven safe Next without treating Next as Skip", () => {
+  const noThanks = control("seatmap_false", {
+    decisionGroupId: "dg_seat_mode",
+    label: "No thanks",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline",
+    kind: "radio",
+    role: "radio",
+    state: { disabled: true, checked: false, selected: false }
+  });
+  noThanks.disabled = true;
+  noThanks.operations = {
+    choose: {
+      ...capability("choose", "seatmap_false_node"),
+      actionability: {
+        ...capability("choose", "seatmap_false_node").actionability,
+        enabled: false,
+        executable: false,
+        code: "ACTUATOR_DISABLED"
+      }
+    }
+  };
+  const paidMode = control("seatmap_true", {
+    decisionGroupId: "dg_seat_mode",
+    label: "Add to cart",
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    effectRole: "scope_toggle",
+    risk: "money",
+    kind: "radio",
+    role: "radio",
+    selected: true,
+    state: { disabled: true, checked: true, selected: true }
+  });
+  paidMode.disabled = true;
+  paidMode.effectRole = "scope_toggle";
+  paidMode.operations = noThanks.operations;
+  const back = control("back", {
+    decisionGroupId: "dg_seat_mode",
+    label: "Back",
+    semantic: "choice",
+    physicalEffect: "unknown"
+  });
+  const skip = control("skip_seat_selection", {
+    decisionGroupId: "dg_seat_mode",
+    label: "Skip seat selection",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline"
+  });
+  skip.operations = {
+    activate: {
+      ...capability("activate", "skip_seat_selection_node"),
+      actionability: {
+        ...capability("activate", "skip_seat_selection_node").actionability,
+        hitTested: false,
+        notOccluded: false,
+        executable: false,
+        code: "TARGET_NOT_ACTIONABLE"
+      }
+    }
+  };
+  const next = control("next", {
+    label: "Next",
+    semantic: "continue",
+    physicalEffect: "advance_checkout_stage",
+    risk: "safe_continue"
+  });
+  const state = reduceTaskState({
+    previousTaskState: { stage: "traveler_information" },
+    observation: {
+      observationId: "obs_gotogate_seats",
+      observationSnapshot: { snapshotHash: "gotogate_seats_unchanged" },
+      page: {
+        step: "seats",
+        url: "https://en-en.gotogate.com/rf/traveler-details",
+        heading: "Select your seats",
+        currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Seats" },
+        controls: [noThanks, paidMode, back, skip, next],
+        decisionGroups: [{
+          decisionGroupId: "dg_seat_mode",
+          requirementId: "seat:select-an-option",
+          surfaceId: "surface-page",
+          surfaceType: "page",
+          sectionType: "seat",
+          sectionLabel: "Select an option",
+          required: true,
+          status: "satisfied",
+          selectedControlId: "seatmap_true",
+          selectedEvidence: {
+            selected: true,
+            selectedControlId: "seatmap_true",
+            disposition: "paid",
+            effectRole: "scope_toggle"
+          },
+          alternatives: [noThanks, paidMode, back, skip],
+          controls: [noThanks, paidMode, back, skip]
+        }],
+        validationIssues: [],
+        stageExit: {
+          continueAllowed: true,
+          candidates: [{ controlId: "next", executable: true, status: "ready" }]
+        }
+      }
+    },
+    userPolicy: { bookingRules: "No paid seats; accept random assignment" },
+    traveler: { booking_rules: "No paid seats; accept random assignment", seat_policy: "random_assignment" }
+  });
+
+  assert.equal(state.stage, "seats");
+  assert.deepEqual(state.currentObligation?.admittedControlIds, ["next"]);
+  assert.notDeepEqual(state.currentObligation?.admittedControlIds, ["back"]);
+  assert.equal(state.currentGoal?.semanticType, "navigation");
+  assert.equal(state.ambiguityReason, "");
+  assert.equal(state.disposition.kind, "execute");
+  const candidateSet = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation: {
+      observationId: "obs_gotogate_seats",
+      page: {
+        step: "seats",
+        currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", label: "Seats" },
+        controls: [noThanks, paidMode, back, skip, next],
+        decisionGroups: [],
+        validationIssues: [],
+        stageExit: { continueAllowed: true, candidates: [{ controlId: "next", executable: true, status: "ready" }] }
+      }
+    },
+    traveler: { booking_rules: "No paid seats; accept random assignment", seat_policy: "random_assignment" },
+    state: { taskState: state, approvals: {} }
+  });
+  assert.equal(candidateSet.candidates.some((candidate) => candidate.controlId === "next"), true);
+  assert.equal(candidateSet.candidates.some((candidate) => candidate.controlId === "back"), false);
+});
+
+test("a genuine paid seat conflict never substitutes unrelated Next or Back for unavailable exact Skip", () => {
+  const paid = control("seat_12a", {
+    decisionGroupId: "dg_exact_seat",
+    label: "Seat 12A — 19 EUR",
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    structuredPrice: { amount: 19, currency: "EUR" },
+    selected: true,
+    state: { checked: true, selected: true }
+  });
+  paid.effectRole = "commerce_option";
+  const skip = control("skip_exact_seat", {
+    decisionGroupId: "dg_exact_seat",
+    label: "Skip seat selection",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline"
+  });
+  skip.operations.activate.actionability = {
+    ...skip.operations.activate.actionability,
+    visible: false,
+    hitTested: false,
+    notOccluded: false,
+    executable: false,
+    code: "TARGET_NOT_ACTIONABLE"
+  };
+  const back = control("seat_back_unrelated", {
+    label: "Back",
+    semantic: "navigation",
+    physicalEffect: "navigate_back"
+  });
+  const next = control("seat_next_unrelated", {
+    label: "Next",
+    semantic: "continue",
+    physicalEffect: "advance_checkout_stage",
+    risk: "safe_continue"
+  });
+  const observation = {
+    observationId: "obs_exact_skip_unavailable",
+    observationSnapshot: { snapshotHash: "hash_exact_skip_unavailable" },
+    page: {
+      step: "seats",
+      currentSurface: { id: "seat_modal", type: "modal", surfaceClass: "blocking_modal", blocksBackground: true },
+      controls: [paid, skip, back, next],
+      decisionGroups: [{
+        decisionGroupId: "dg_exact_seat",
+        requirementId: "seat:exact-selection",
+        surfaceId: "seat_modal",
+        surfaceType: "modal",
+        sectionType: "seat",
+        sectionLabel: "Select a seat",
+        required: true,
+        status: "satisfied",
+        selectedControlId: paid.controlId,
+        selectedEvidence: {
+          selected: true,
+          selectedControlId: paid.controlId,
+          ownerElementId: paid.stateElementId,
+          effectRole: "commerce_option",
+          disposition: "paid",
+          structuredPrice: { amount: 19, currency: "EUR" }
+        },
+        alternatives: [paid, skip],
+        controls: [paid, skip]
+      }],
+      validationIssues: [],
+      stageExit: {
+        continueAllowed: true,
+        candidates: [{ controlId: next.controlId, executable: true, status: "ready" }]
+      }
+    }
+  };
+  const traveler = { booking_rules: "No paid seats", seat_policy: "random_assignment" };
+  const state = reduceTaskState({ observation, traveler, userPolicy: { bookingRules: traveler.booking_rules } });
+  const admitted = state.currentObligation?.admittedControlIds || [];
+  assert.equal(admitted.includes(next.controlId), false, JSON.stringify(state.currentGoal, null, 2));
+  assert.equal(admitted.includes(back.controlId), false, JSON.stringify(state.currentGoal, null, 2));
+
+  const candidates = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    traveler,
+    state: { taskState: state, approvals: {} }
+  }).candidates;
+  assert.equal(candidates.some((candidate) => candidate.controlId === next.controlId), false);
+  assert.equal(candidates.some((candidate) => candidate.controlId === back.controlId), false);
+});
+
+test("TaskState grants one bounded re-observation token and then terminates an unchanged no-obligation surface", () => {
+  const page = {
+    step: "unknown",
+    currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", blocksBackground: false },
+    controls: [],
+    fields: [],
+    decisionGroups: [],
+    validationIssues: []
+  };
+  const first = reduceTaskState({
+    observation: {
+      observationId: "obs_reobserve_first",
+      observationSnapshot: { snapshotHash: "hash_reobserve_first" },
+      page
+    }
+  });
+  assert.equal(first.disposition.kind, "wait_reobserve", JSON.stringify(first.disposition, null, 2));
+  assert.match(first.disposition.retryToken, /^reobserve_/);
+  assert.equal(first.disposition.reobserveCount, 1);
+  assert.ok(first.disposition.reobserveDeadlineAt > first.disposition.reobserveStartedAt);
+
+  const second = reduceTaskState({
+    previousTaskState: first,
+    observation: {
+      observationId: "obs_reobserve_deadline",
+      observationSnapshot: { snapshotHash: "hash_reobserve_deadline" },
+      page
+    }
+  });
+  assert.equal(second.disposition.kind, "stop", JSON.stringify(second.disposition, null, 2));
+  assert.equal(second.disposition.reobserveCount, 2);
+  assert.equal(second.disposition.surfaceFingerprint, first.disposition.surfaceFingerprint);
+});
+
 test("payment review remains active until every verified decision is present in the transaction ledger", () => {
   const decisionInstanceId = "traveler_information:extras:airhelp:dg_airhelp:global";
   const outcome = {
@@ -3437,7 +3975,7 @@ test("payment review remains active until every verified decision is present in 
   assert.equal(accepted.outcomeCoverage.complete, true);
 });
 
-test("an unresolved active component owns profile readiness with one precise stop code", () => {
+test("unknown grounding remains diagnostic and cannot manufacture profile unready state", () => {
   const observation = {
     observationId: "obs_active_requirement_unresolved",
     observationSnapshot: { snapshotHash: "hash_active_requirement_unresolved" },
@@ -3462,8 +4000,9 @@ test("an unresolved active component owns profile readiness with one precise sto
   const taskState = reduceTaskState({ observation, traveler: {} });
 
   assert.equal(taskState.profileReadiness.profileStage, true);
-  assert.equal(taskState.profileReadiness.ready, false);
-  assert.equal(taskState.profileReadiness.blockedReasonCode, "ACTIVE_REQUIREMENT_UNRESOLVED");
+  assert.equal(taskState.profileReadiness.ready, true);
+  assert.equal(taskState.profileReadiness.blockedReasonCode, "");
+  assert.equal(taskState.profileReadiness.activeRequirementGrounding.status, "unknown");
   assert.equal(taskState.currentGoal, null);
 });
 

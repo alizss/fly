@@ -1,5 +1,6 @@
 const { deriveObservationGoal } = require("./observation-candidates");
 const { currentSurface } = require("./surface-contract");
+const { taskBindingGoal } = require("./authority-frames");
 
 const RESOLVED = new Set(["satisfied", "waived", "waived_by_policy"]);
 
@@ -93,7 +94,7 @@ function transitionResolvedOutcome(state = {}, transition = null, family = "unkn
   if (transition?.status !== "achieved") return false;
   const groupId = exactDecisionGroupId(goal);
   if (!groupId) return false;
-  const previousFamily = semanticFamily(state.taskState?.currentGoal || {});
+  const previousFamily = semanticFamily(taskBindingGoal(state.taskState || {}) || {});
   if (previousFamily !== family) return false;
   const action = state.lastAction || {};
   const actionGroupId = String(action.decisionGroupId || action.requirementId || action.expectedOutcome?.decisionGroupId || "");

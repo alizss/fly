@@ -1,5 +1,6 @@
 const { buildCanonicalDecisions } = require("./canonical-decision");
 const { normalizeProfileFieldType } = require("./logical-field");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 const TRANSACTION_CONTRACT_VERSION = "transaction-facts/v2";
 const COMMERCE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
@@ -298,21 +299,32 @@ function commerceSelectionsFromPage(page = {}, state = {}, traveler = {}) {
         )
       )
     ))
-    .map((decision) => normalizeExtra({
-      decisionGroupId: decision.decisionGroupId || decision.decisionId,
-      decisionInstanceId: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
-      decisionOwnerKey: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
-      canonicalOwnerId: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
-      sourceKind: "commerce_decision",
-      effectRole: decision.currentState?.effectRole,
-      family: decision.family || decision.subject?.family,
-      subjectKey: decision.subject?.key,
-      label: decision.currentState.selectedLabel,
-      disposition: decision.priceRisk?.selectedPaid ? "paid" : decision.currentOutcome || decision.status,
-      outcome: decision.currentOutcome || decision.status,
-      priceAmount: decision.priceRisk?.amount,
-      currency: decision.priceRisk?.currency
-    }))
+    .map((decision) => {
+      const selectedPaid = agentContract.isGenuineSelectedPaidItem({
+        decisionGroupId: decision.decisionGroupId || decision.decisionId,
+        selectedControlId: decision.currentState?.selectedControlId || decision.selectedControlId,
+        selected: decision.currentState?.selected === true,
+        effectRole: decision.currentState?.effectRole,
+        disposition: decision.currentOutcome,
+        priceAmount: decision.priceRisk?.amount,
+        semanticEffect: decision.priceRisk?.selectedPaid === true ? agentContract.SEMANTIC_EFFECT.SELECT_PAID_OPTION : ""
+      });
+      return normalizeExtra({
+        decisionGroupId: decision.decisionGroupId || decision.decisionId,
+        decisionInstanceId: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
+        decisionOwnerKey: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
+        canonicalOwnerId: decision.canonicalOwnerId || decision.decisionGroupId || decision.decisionId,
+        sourceKind: "commerce_decision",
+        effectRole: decision.currentState?.effectRole,
+        family: decision.family || decision.subject?.family,
+        subjectKey: decision.subject?.key,
+        label: decision.currentState.selectedLabel,
+        disposition: selectedPaid ? "paid" : decision.currentOutcome || decision.status,
+        outcome: decision.currentOutcome || decision.status,
+        priceAmount: selectedPaid ? decision.priceRisk?.amount : null,
+        currency: selectedPaid ? decision.priceRisk?.currency : ""
+      });
+    })
     .filter(Boolean)
     .slice(0, 40);
 }
@@ -326,6 +338,24 @@ function commerceSelectionsFromJournal(state = {}) {
       && entry?.decisionInstanceId
     ))
     .map((entry) => normalizeExtra(entry, entry.currency || ""))
+    .filter(Boolean);
+}
+
+function commerceSelectionsFromVerifiedObligations(state = {}) {
+  const obligations = state.verifiedCommerceObligations || [];
+  return (Array.isArray(obligations) ? obligations : [])
+    .filter((entry) => (
+      entry?.verified === true
+      && entry?.originKind === "verified_commerce_obligation"
+      && entry?.decisionInstanceId
+    ))
+    .map((entry) => normalizeExtra({
+      ...entry,
+      // Raw browser controls are not transaction authority. The exact
+      // governed action receipt is promoted into the same durable source kind
+      // as the canonical outcome journal before it can enter selectedExtras.
+      sourceKind: "verified_commerce_decision"
+    }, entry.currency || ""))
     .filter(Boolean);
 }
 
@@ -463,7 +493,9 @@ function normalizeFacts(raw = {}, { observationId = "", state = {}, traveler = {
   };
 }
 
-function factsFromObservation(state = {}, observation = {}, traveler = {}) {
+function factsFromObservation(state = {}, observation = {}, traveler = {}, {
+  authoritativeTransactionFacts = null
+} = {}) {
   const page = observation.page || {};
   const terminalReviewObserved = page.terminalEvidence?.boundaryObserved === true
     || page.terminalEvidence?.verified === true;
@@ -474,7 +506,9 @@ function factsFromObservation(state = {}, observation = {}, traveler = {}) {
     }, page))
     .map((group) => group.decisionGroupId || group.requirementId)
     .filter(Boolean));
-  const sourceRaw = page.transactionFacts && typeof page.transactionFacts === "object"
+  const sourceRaw = authoritativeTransactionFacts && typeof authoritativeTransactionFacts === "object"
+    ? authoritativeTransactionFacts
+    : page.transactionFacts && typeof page.transactionFacts === "object"
     ? page.transactionFacts
     : {
         itinerary: { completeness: "unknown", segments: [] },
@@ -506,18 +540,21 @@ function factsFromObservation(state = {}, observation = {}, traveler = {}) {
     ))
   };
   const normalized = normalizeFacts(raw, { observationId: observation.observationId || "", state, traveler });
-  const compiledSelections = commerceSelectionsFromPage(page, state, traveler);
   const episodeSelections = commerceSelectionFromEpisode(state);
   const journalSelections = commerceSelectionsFromJournal(state);
+  const verifiedObligationSelections = commerceSelectionsFromVerifiedObligations(state);
   return {
     ...normalized,
-    // Current controls may enrich the observation, but they must never erase
-    // review rows or previously compiled outcomes from the same page map.
+    // DecisionFrame transaction evidence and exact verified receipts are the
+    // only production commerce authorities. A selected checkbox/toggle in the
+    // current control graph is UI state, not proof that a paid item entered
+    // the booking. `commerceSelectionsFromPage` remains exported only for
+    // explicit diagnostic/replay adapters.
     selectedExtras: mergeCommerceSelections(
       normalized.selectedExtras,
       journalSelections,
       episodeSelections,
-      compiledSelections
+      verifiedObligationSelections
     )
   };
 }
@@ -532,6 +569,7 @@ module.exports = {
   commerceSelectionFromEpisode,
   commerceSelectionsFromJournal,
   commerceSelectionsFromPage,
+  commerceSelectionsFromVerifiedObligations,
   durableCommerceSelections,
   factsFromObservation,
   mergeCommerceSelections,

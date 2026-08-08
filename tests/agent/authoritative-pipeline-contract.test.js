@@ -3,12 +3,12 @@ const assert = require("node:assert/strict");
 
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
 const { resolveLogicalFields } = require("../../apps/web/agent/logical-field");
-const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
+const { reduceTaskState } = require("./task-state-replay-adapter");
 const {
   actionForCurrentCandidate,
   buildCurrentCandidateSet
 } = require("../../apps/web/agent/current-candidate-builder");
-const { governAction } = require("../../apps/web/agent/action-governor");
+const { governObservedAction: governAction } = require("./governance-test-helper");
 const { toClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 
@@ -39,6 +39,36 @@ function provenCapability(operation, actuatorId) {
     expectedOutcome: operation === "open" ? "options_surface_appeared" : "normalized_value_changed"
   };
 }
+
+test("one typed commerce authority rejects presentation state and accepts owned paid selection", () => {
+  const modeToggle = agentContract.classifySelectedCommerceTruth({
+    decisionGroupId: "seat_mode",
+    selectedControlId: "add_to_cart_mode",
+    selected: true,
+    effectRole: "presentation_mode",
+    disposition: "paid",
+    priceAmount: 19,
+    semanticEffect: "add_paid_extra"
+  });
+  assert.equal(modeToggle.ownedSelection, true);
+  assert.equal(modeToggle.paidOption, false);
+  assert.equal(modeToggle.selectedPaid, false);
+
+  const selectedSeat = agentContract.classifySelectedCommerceTruth({
+    decisionGroupId: "seat_choice",
+    selectedControlId: "seat_12a",
+    selected: true,
+    effectRole: "commerce_option",
+    priceAmount: 19,
+    semanticEffect: "add_paid_extra"
+  });
+  assert.equal(selectedSeat.ownedSelection, true);
+  assert.equal(selectedSeat.paidOption, true);
+  assert.equal(selectedSeat.selectedPaid, true);
+
+  assert.equal(agentContract.canonicalSemanticEffect("add_paid_extra"), "select_paid_option");
+  assert.equal(agentContract.canonicalSemanticEffect("remove_paid_selection"), "select_free_option");
+});
 
 test("raw exact commerce receipt is persisted before lifecycle can reinterpret parent progress", () => {
   const actionId = "act_raw_airhelp_decline";
@@ -192,7 +222,7 @@ function observation(controls, id = "obs_contract") {
   };
 }
 
-test("lossless observed control serialization preserves every semantic and proof property", () => {
+test("observed control serialization preserves one exact proof without duplicating the component graph", () => {
   const examples = [
     profileControl({ controlId: "split_day", name: "passengers.0.birthDay", fieldType: "date_of_birth", dateComponent: "day" }),
     profileControl({ controlId: "phone_code", name: "contact.phone_country_code", fieldType: "phone_country_code", operation: "select", role: "combobox", kind: "select" }),
@@ -217,18 +247,11 @@ test("lossless observed control serialization preserves every semantic and proof
     assert.equal(capability?.status, "proven_executable");
     assert.equal(capability?.strategies.length, 1);
     assert.ok(capability?.strategies[0].strategyId);
-    assert.equal(
-      serialized.componentContract.compositeControl.stateNode.nodeId,
-      control.stateElementId
-    );
-    assert.equal(
-      serialized.componentContract.compositeControl.visibleWidget.nodeId,
-      control.preferredActivationElementId
-    );
-    assert.deepEqual(
-      serialized.componentContract.compositeControl.activationCandidates,
-      control.actuators
-    );
+    const operation = serialized.operations[Object.keys(control.operations)[0]];
+    assert.equal(operation.exactActuators[0].actuatorId, control.preferredActivationElementId);
+    assert.equal(operation.exactActuators[0].proof.executable, true);
+    assert.equal(Object.hasOwn(operation, "actionabilityByActuator"), false);
+    assert.equal(Object.hasOwn(serialized.componentContract, "compositeControl"), false);
   }
 });
 

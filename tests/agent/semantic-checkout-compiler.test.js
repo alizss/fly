@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
 const { resolveProfileDecision } = require("../../apps/web/agent/policy-profile");
-const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
+const { reduceTaskState } = require("./task-state-replay-adapter");
 const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
 
 function executableControl({ controlId, targetId, label, x, testId = "", price = null, semantic = "selection_cta" }) {
@@ -276,4 +276,17 @@ test("unowned selection CTAs fail semantic readiness instead of becoming navigat
   const compiled = agentContract.compileSemanticCheckout(page);
   assert.equal(compiled.semanticReadiness, "unresolved");
   assert.equal(compiled.unownedMaterialControls[0].reason, "UNOWNED_SELECTION_CTA");
+});
+
+test("phone country-code choice compatibility tolerates repeated accessible labels", () => {
+  assert.equal(agentContract.profileChoiceValueCompatible(
+    "Slovenia (+386) Slovenia (+386)",
+    "+386",
+    "phone_country_code"
+  ), true);
+  assert.equal(agentContract.profileChoiceValueCompatible(
+    "Türkiye (+90)",
+    "+386",
+    "phone_country_code"
+  ), false);
 });

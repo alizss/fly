@@ -6,7 +6,7 @@ const {
 } = require("./skill-expander");
 const { currentSurface, controlBelongsToCurrentSurface } = require("./surface-contract");
 const { outcomeContractForGoal } = require("./action-semantics");
-const { decisionInstanceKey } = require("../../../packages/shared/agent-actions");
+const { decisionInstanceKey, semanticGoalKey } = require("../../../packages/shared/agent-actions");
 const {
   CONTROL_TYPES,
   buildCanonicalDecisions,
@@ -15,13 +15,20 @@ const {
 } = require("./canonical-decision");
 const { normalizeProfilePolicy, seatPolicyFrom } = require("./policy-profile");
 const { canonicalDecisionOwnerKey } = require("./transaction-facts");
-const { missingDerivedFactDependency } = require("./logical-field");
+const { canonicalOptionMatch, missingDerivedFactDependency } = require("./logical-field");
 const { adaptiveInteractionGoal } = require("./adaptive-interaction");
+const {
+  currentObligationFromGoal,
+  decisionFrameOwnsObservation,
+  taskBindingGoal
+} = require("./authority-frames");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 const COMPLETED = new Set(["satisfied", "waived", "waived_by_policy"]);
 const GOAL_CREATING = new Set(["active", "conflicted", "blocked"]);
 const DECISION_EPISODE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
+const TASK_STATE_REOBSERVE_DEADLINE_MS = 8_000;
+const taskStateReadModels = new WeakMap();
 
 function clean(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -29,6 +36,39 @@ function clean(value = "") {
 
 function lower(value = "") {
   return clean(value).toLowerCase();
+}
+
+function verificationDecisionRecord(decision = {}) {
+  const observed = decision.observed || decision.observation || {};
+  return Object.freeze({
+    decisionGroupId: clean(decision.decisionGroupId),
+    instanceId: clean(decision.instanceId || decision.decisionInstanceId),
+    requirementId: clean(decision.requirementId),
+    canonicalOwnerId: clean(decision.canonicalOwnerId),
+    family: clean(decision.family),
+    kind: clean(decision.kind),
+    semanticType: clean(decision.semanticType),
+    status: clean(decision.status),
+    surfaceId: clean(decision.surfaceId),
+    subjectId: clean(decision.subjectId),
+    selectedControlId: clean(decision.selectedControlId),
+    selectedValue: clean(decision.selectedValue),
+    completionReason: clean(decision.completionReason),
+    physicalControlIds: Object.freeze([...(decision.physicalControlIds || [])].map(clean).filter(Boolean).slice(0, 24)),
+    observed: Object.freeze({
+      value: observed.value ?? "",
+      selectedValue: observed.selectedValue ?? "",
+      selectedControlId: clean(observed.selectedControlId),
+      satisfied: observed.satisfied === true,
+      required: observed.required === true
+    })
+  });
+}
+
+function taskStateReadModel(taskState = null) {
+  return taskState && typeof taskState === "object"
+    ? taskStateReadModels.get(taskState) || null
+    : null;
 }
 
 function unblockedStageExitReady(page = {}) {
@@ -235,8 +275,9 @@ function stageEvidence(observation = {}) {
   const seatRoute = /(?:^|[\/#?&_-])seats?(?:[\/#?&=_-]|$)/.test(url);
   const extrasRoute = /\/(?:cabin-?bags?|hold-?bags?|bags?|baggage|luggage|extras?|ancillar(?:y|ies)|insurance|bundles?)(?:\/|$)/.test(url);
   const seat = seatRoute
+    || (page.decisionGroups || []).some((group) => decisionFamily(group) === "seat")
     || /seat_option|seat_map|seat_selection/.test(directControlText)
-    || /seat selection|reserve seating|seat map/.test(headingText)
+    || /seat selection|select (?:your )?seats?|reserve seating|seat map/.test(headingText)
     || (surface.type !== "page" && /seat|seating/.test(lower(surface.label)));
   const traveler = /(?:^|[\/#?&_-])(?:travell?er|passenger|contact)(?:[\/#?&=_-]|$)/.test(url)
     || /first_name|last_name|surname|full_name|email|phone|date_of_birth|dob|passport|nationality|traveler_title/.test(directControlText)
@@ -270,7 +311,20 @@ function stageEvidence(observation = {}) {
 
 function decideStage(observation = {}) {
   const evidence = stageEvidence(observation);
-  const surface = currentSurface(observation.page || {});
+  const page = observation.page || {};
+  const surface = currentSurface(page);
+  const declaredStep = lower(page.step || page.pageStep);
+  const declaredStage = /payment/.test(declaredStep)
+    ? "payment"
+    : /confirmation/.test(declaredStep)
+      ? "confirmation"
+      : /seat/.test(declaredStep)
+        ? "seats"
+        : /extra|bag|bundle|insurance|ancillar/.test(declaredStep)
+          ? "extras"
+          : /travell?er|passenger|contact/.test(declaredStep)
+            ? "traveler_information"
+            : "";
   const paymentDestination = evidence.terminalEvidence?.boundaryObserved === true;
   if (paymentDestination) return { stage: "payment", evidence };
   if (evidence.confirmation) return { stage: "confirmation", evidence };
@@ -281,6 +335,15 @@ function decideStage(observation = {}) {
   // "Seat selection" that remain visible throughout later bag pages.
   if (evidence.extrasRoute) return { stage: "extras", evidence };
   if (evidence.strongExtras) return { stage: "extras", evidence };
+  // The browser's current-step observation is evidence compiled into the one
+  // DecisionFrame, not a durable authority. When it agrees with active local
+  // evidence it outranks stale route text and disabled controls retained by a
+  // single-page checkout shell (for example /traveler-details on a seat step).
+  if (declaredStage === "seats" && evidence.seat) return { stage: "seats", evidence };
+  if (declaredStage === "extras" && evidence.extras) return { stage: "extras", evidence };
+  if (declaredStage === "traveler_information" && evidence.traveler) {
+    return { stage: "traveler_information", evidence };
+  }
   if (surface.type !== "page" && evidence.seat) return { stage: "seats", evidence };
   if (evidence.traveler) return { stage: "traveler_information", evidence };
   if (evidence.seat) return { stage: "seats", evidence };
@@ -323,7 +386,23 @@ function forwardControlIds(observation = {}) {
     const explicitStageExit = explicitStageExitIds.has(control.controlId)
       || explicitStageExitIds.has(control.stateElementId)
       || explicitStageExitIds.has(control.preferredActivationElementId);
-    return isTypedNavigationControl(control, { explicitStageExit });
+    const typedNavigation = isTypedNavigationControl(control, { explicitStageExit: false });
+    const state = control.state || {};
+    const alreadySelected = control.selected === true
+      || state.selected === true
+      || state.checked === true;
+    const choiceLike = /checkbox|radio|option|choice/.test(lower(
+      `${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`
+    ));
+    // A browser stage-exit heuristic may notice text such as "select this to
+    // continue" on a settled decline checkbox. That does not make the choice
+    // itself a navigation actuator. Exact typed navigation remains eligible;
+    // an explicit stage-exit fallback is admitted only for an unselected
+    // non-choice actuator such as Continue, Skip bags, or Proceed without
+    // seats. Choice settlement belongs to its decision obligation.
+    if (alreadySelected && !typedNavigation) return false;
+    if (choiceLike && !typedNavigation) return false;
+    return typedNavigation || explicitStageExit;
   }).map((control) => control.controlId).filter(Boolean);
 }
 
@@ -371,8 +450,12 @@ function optionPrice(control = {}) {
 
 function optionLooksPaid(control = {}) {
   if (optionLooksExplicitlyFree(control)) return false;
-  return Number(optionPrice(control)) > 0
-    || /money|payment|paid|purchase|premium|upgrade|add_paid/.test(lower(`${control.risk || ""} ${control.semantic || ""}`));
+  return agentContract.isPaidCommerceOption({
+    effectRole: control.effectRole,
+    priceAmount: optionPrice(control),
+    disposition: control.disposition,
+    semanticEffect: control.physicalEffect || control.semantic
+  });
 }
 
 function optionLooksExplicitlyFree(control = {}) {
@@ -384,12 +467,6 @@ function optionLooksExplicitlyFree(control = {}) {
 
 function optionIsBoundedChoice(control = {}) {
   return /radio|checkbox|option|choice/.test(lower(`${control.kind || ""} ${control.role || ""} ${control.semantic || ""}`));
-}
-
-function policyOutcomeAllowsStageExit(decision = {}) {
-  return /random_assignment|declin|skip|no_selection|without_selection|not_selected|keep_unselected/.test(
-    lower(decision.userIntent?.desiredOutcome || "")
-  );
 }
 
 function decisionOptionContract(decision = {}, observation = {}) {
@@ -467,7 +544,16 @@ function decisionOptionContract(decision = {}, observation = {}) {
 
 function goalForDecision(decision = {}, observation = {}, userPolicy = {}, traveler = {}) {
   const options = decisionOptionContract(decision, observation);
-  const desiredSemanticOutcome = decision.userIntent?.desiredOutcome || "";
+  const explicitDesiredOutcome = clean(decision.userIntent?.desiredOutcome);
+  const genericDesiredOutcome = !explicitDesiredOutcome
+    || ["selected", "selected_policy_allowed_option"].includes(explicitDesiredOutcome);
+  const desiredSemanticOutcome = genericDesiredOutcome && options.correctionControlIds.length
+    ? agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
+    : genericDesiredOutcome
+      && options.policyChoiceBounded
+      && options.freeControlIds.some((controlId) => options.policyAllowedControlIds.includes(controlId))
+      ? agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
+      : explicitDesiredOutcome;
   const desiredPolicyOutcome = desiredSemanticOutcome || "selected_policy_allowed_option";
   const observationId = observation.observationId || "observation";
   return Object.freeze({
@@ -563,45 +649,6 @@ function admittedControlIdsForGoal(goal = {}) {
     ].filter(Boolean))];
   }
   return [...new Set((goal.eligibleAlternativeControlIds || []).filter(Boolean))];
-}
-
-function semanticEffectForGoal(goal = {}) {
-  if (goal.kind === "profile_field") return "set_field_value";
-  if (goal.semanticType === "navigation") return "advance_checkout_stage";
-  if (goal.semanticType === "completed_choice_surface") return "dismiss_surface";
-  if (["adaptive_surface", "adaptive_interaction"].includes(goal.kind)) return "safe_checkout_progress";
-  return clean(goal.desiredSemanticOutcome || goal.desiredPolicyOutcome || goal.desiredValue || "resolve_current_decision");
-}
-
-// TaskState's current goal is the Current Obligation Contract. Downstream
-// candidate construction may bind mechanics for this contract, but it may not
-// reinterpret whether the work is required, policy-compatible, or current.
-function publishCurrentObligation(goal = {}, observation = {}, surface = {}) {
-  const admittedControlIds = admittedControlIdsForGoal(goal);
-  const semanticType = lower(goal.semanticType);
-  const consequential = ["payment", "purchase", "legal"].some((token) => semanticType.includes(token));
-  return Object.freeze({
-    ...goal,
-    contractVersion: "current-obligation/v1",
-    authority: "task_state",
-    owner: Object.freeze({
-      observationId: observation.observationId || "",
-      surfaceId: goal.surfaceId || surface.id || "surface-page",
-      surfaceType: surface.type || "page",
-      surfaceClass: surface.surfaceClass || "unknown"
-    }),
-    objective: clean(goal.semanticGoal || "resolve the exact current checkout obligation"),
-    semanticEffect: semanticEffectForGoal(goal),
-    profileCompatible: !goal.ambiguity,
-    candidateControlIds: Object.freeze(admittedControlIds),
-    admission: Object.freeze({
-      authority: "task_state",
-      status: goal.ambiguity ? "blocked" : "admitted",
-      reason: goal.ambiguity?.code || "authoritative_current_obligation"
-    }),
-    successCondition: Object.freeze({ ...(goal.postcondition || goal.outcomeContract || {}) }),
-    riskClass: consequential ? "consequential" : "reversible"
-  });
 }
 
 function decisionEpisodeSurfaceKey(surface = {}) {
@@ -935,7 +982,7 @@ function verifiedCommerceObligationFromActionResult(result = null, observationId
   const task = action.affordance?.task || {};
   const postcondition = verifiedCommercePostcondition(result) || {};
   const decisionEpisode = context.decisionEpisode || context.taskState?.decisionEpisode || null;
-  const currentGoal = context.currentGoal || context.taskState?.currentGoal || {};
+  const currentGoal = context.currentGoal || taskBindingGoal(context.taskState || {}) || {};
   const lineage = actionDecisionLineage(result, currentGoal, decisionEpisode || {});
   const actionSurfaceId = clean(
     postcondition.surfaceId
@@ -1073,7 +1120,7 @@ function decisionForVerifiedCommerceAction({
 } = {}) {
   const lineage = actionDecisionLineage(
     actionResult,
-    previousTaskState.currentGoal || {},
+    taskBindingGoal(previousTaskState) || {},
     decisionEpisode || previousTaskState.decisionEpisode || {}
   );
   const action = actionResult?.action || {};
@@ -1099,7 +1146,11 @@ function decisionForVerifiedCommerceAction({
   ].filter(Boolean);
   const decisions = [
     ...(Array.isArray(canonicalDecisions) ? canonicalDecisions : []),
-    ...(Array.isArray(previousTaskState.canonicalDecisions) ? previousTaskState.canonicalDecisions : [])
+    ...(Array.isArray(previousTaskState.verificationDecisionMemory)
+      ? previousTaskState.verificationDecisionMemory
+      : Array.isArray(previousTaskState.canonicalDecisions)
+        ? previousTaskState.canonicalDecisions
+        : [])
   ];
   return decisions.find((decision) => ownerIds.includes(clean(decision.decisionGroupId))) || null;
 }
@@ -1115,7 +1166,7 @@ function commerceOutcomeFromVerifiedAction({
   const postcondition = verifiedCommercePostcondition(actionResult);
   const lineage = actionDecisionLineage(
     actionResult,
-    previousTaskState.currentGoal || {},
+    taskBindingGoal(previousTaskState) || {},
     decisionEpisode || previousTaskState.decisionEpisode || {}
   );
   const decision = decisionForVerifiedCommerceAction({
@@ -1400,7 +1451,7 @@ function choiceDecisionEpisode({
   const lastAction = previousActionResult?.action || observation.lastActionResult?.action || null;
   const lastLineage = actionDecisionLineage(
     previousActionResult || observation.lastActionResult,
-    previousTaskState.currentGoal || {},
+    taskBindingGoal(previousTaskState) || {},
     previousRaw || {}
   );
   const previousParentDecisionGroupId = clean(previousRaw?.parentDecisionGroupId);
@@ -1941,6 +1992,62 @@ function verifiedReversibleSurfaceEntry(actionResult = {}) {
   );
 }
 
+function verifiedTypedChoiceSurfaceEntry({
+  actionResult = {},
+  previousGoal = {},
+  observation = {},
+  surface = {}
+} = {}) {
+  const action = actionResult.action || {};
+  const expected = actionResult.expectedOutcome || {};
+  const page = observation.page || {};
+  const desiredValue = previousGoal.desiredValue ?? previousGoal.canonicalValue ?? "";
+  const semanticType = clean(previousGoal.semanticType || previousGoal.sourceGoal?.semanticType);
+  const componentRole = clean(previousGoal.componentRole || previousGoal.sourceGoal?.componentRole || "value");
+  const goalControlId = clean(previousGoal.controlId || previousGoal.componentBinding?.controlId);
+  const actionControlId = clean(action.controlId || expected.controlId);
+  // Compact browser receipts keep the semantic goal ID at the receipt root;
+  // the nested mechanical action is intentionally smaller. Accept either
+  // location so persistence compaction cannot sever an active combobox from
+  // the exact option surface it just revealed.
+  const actionGoalId = clean(action.goalId || actionResult.goalId);
+  const actionBelongsToGoal = Boolean(
+    actionGoalId
+    && clean(previousGoal.goalId)
+    && actionGoalId === clean(previousGoal.goalId)
+  );
+  const controlIdentityMatches = !goalControlId || !actionControlId || goalControlId === actionControlId;
+  if (!(
+    actionResult.verified === true
+    && actionResult.expectedOutcomeObserved === true
+    && actionResult.postconditionSatisfied === true
+    && actionBelongsToGoal
+    && controlIdentityMatches
+    && action.operation === "type"
+    && expected.interactionKind === "editable_combobox"
+    && expected.commitRequirement === "logical_component_committed"
+    && surface.id
+    && surface.type !== "page"
+    && semanticType
+    && clean(desiredValue)
+  )) return false;
+
+  // Some searchable choice widgets open their listbox as the direct result of
+  // typing. The typed text is only a filter value, not a committed profile
+  // value. Preserve the exact parent obligation only when the fresh foreground
+  // surface contains a compatible choice actuator for that same value.
+  return (page.controls || []).some((control) => {
+    const operationNames = Object.keys(control.operations || {});
+    if (!controlBelongsToCurrentSurface(control, page)) return false;
+    if (!["option", "radio", "checkbox"].includes(lower(control.role || control.kind))
+      && !operationNames.some((operation) => ["choose", "select"].includes(operation))) return false;
+    return canonicalOptionMatch(semanticType, componentRole, desiredValue, {
+      value: control.state?.optionValue || control.state?.selectedValue || control.currentValue || "",
+      label: control.label || control.accessibleName || control.meaning || ""
+    });
+  });
+}
+
 function verifiedProfileComponentIdentity(value = {}) {
   return [
     clean(value.subjectId || "traveler_1"),
@@ -2069,11 +2176,19 @@ function verifiedProfileComponentMatchesDecision(completion = {}, decision = {})
 
 function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, observation = {}, surface = {} } = {}) {
   if (!surface.id || surface.type === "page") return null;
-  const previousGoal = previousTaskState.currentGoal || {};
+  const previousGoal = taskBindingGoal(previousTaskState) || {};
   const continuing = previousGoal.kind === "adaptive_surface"
     && previousGoal.adaptiveEnvelope?.surfaceId === surface.id;
   const entering = previousGoal.kind === "profile_field"
-    && verifiedReversibleSurfaceEntry(actionResult || {});
+    && (
+      verifiedReversibleSurfaceEntry(actionResult || {})
+      || verifiedTypedChoiceSurfaceEntry({
+        actionResult: actionResult || {},
+        previousGoal,
+        observation,
+        surface
+      })
+    );
   if (!continuing && !entering) return null;
 
   const sourceGoal = continuing
@@ -2120,7 +2235,14 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
       desiredValue: sourceGoal.desiredValue,
       canonicalValue: sourceGoal.canonicalValue,
       logicalFieldId: clean(sourceGoal.logicalFieldId),
+      subjectId: clean(sourceGoal.subjectId || "traveler_1"),
+      controlId: clean(sourceGoal.controlId || sourceGoal.componentBinding?.controlId),
       componentRole: clean(sourceGoal.componentRole),
+      componentBinding: Object.freeze({
+        controlId: clean(sourceGoal.componentBinding?.controlId || sourceGoal.controlId),
+        representationControlIds: Object.freeze([...(sourceGoal.componentBinding?.representationControlIds || [])]),
+        stateControlIds: Object.freeze([...(sourceGoal.componentBinding?.stateControlIds || [])])
+      }),
       choiceTerms: Object.freeze([...(sourceGoal.choiceTerms || [])].map(clean).filter(Boolean))
     }),
     semanticGoal: clean(sourceGoal.semanticGoal || `complete the current ${surface.label || "choice"}`),
@@ -2157,7 +2279,7 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
   });
 }
 
-function reduceTaskState({
+function reduceDecisionFrame({
   previousTaskState = {},
   observation = {},
   previousActionResult = null,
@@ -2166,19 +2288,17 @@ function reduceTaskState({
   traveler = {},
   transactionReview = null,
   parentObjective = null,
-  mechanicalEvidence = null
+  mechanicalEvidence = null,
+  decisionFrame = null
 } = {}) {
-  const rawPage = observation.page || {};
-  const semanticCompilation = agentContract.compileSemanticCheckout(rawPage);
-  const page = {
-    ...rawPage,
-    controls: semanticCompilation.controls,
-    decisionGroups: semanticCompilation.decisionGroups,
-    decisionContracts: semanticCompilation.decisionContracts,
-    semanticReadiness: semanticCompilation.semanticReadiness,
-    semanticCompilation
-  };
-  observation = { ...observation, page };
+  if (!decisionFrameOwnsObservation(decisionFrame, observation)) {
+    throw new Error("TASK_STATE_DECISION_FRAME_REQUIRED");
+  }
+  const authoritativeDecisionFrame = decisionFrame;
+  const semanticCompilation = authoritativeDecisionFrame.semanticCompilation;
+  observation = authoritativeDecisionFrame.observation;
+  const previousGoal = taskBindingGoal(previousTaskState) || {};
+  const page = observation.page || {};
   const normalizedProfilePolicy = userPolicy.profilePolicy || normalizeProfilePolicy({ userPolicy, traveler });
   const surface = currentSurface(page);
   const { stage, evidence: stageDecisionEvidence } = decideStage(observation);
@@ -2192,7 +2312,7 @@ function reduceTaskState({
   const verifiedAction = authoritativeActionResult?.action || {};
   const verifiedLineage = actionDecisionLineage(
     authoritativeActionResult,
-    previousTaskState.currentGoal || {},
+    previousGoal,
     previousTaskState.decisionEpisode || {}
   );
   const verifiedDecisionGroupId = clean(
@@ -2222,8 +2342,8 @@ function reduceTaskState({
       || verifiedAction.decisionInstanceId
       || verifiedLineage.decisionInstanceId
       || (
-        previousTaskState.currentGoal?.decisionGroupId === verifiedDecisionGroupId
-          ? previousTaskState.currentGoal.decisionInstanceId
+        previousGoal.decisionGroupId === verifiedDecisionGroupId
+          ? previousGoal.decisionInstanceId
           : ""
       )
       || verifiedDecisionGroupId
@@ -2234,12 +2354,12 @@ function reduceTaskState({
       requirementId: clean(
         authoritativeActionResult.requirementId
         || verifiedExpectedOutcome.requirementId
-        || previousTaskState.currentGoal?.requirementId
+        || previousGoal.requirementId
       ),
       surfaceId: clean(
         verifiedExpectedOutcome.surfaceId
         || authoritativeActionResult.targetSnapshot?.surfaceId
-        || previousTaskState.currentGoal?.surfaceId
+        || previousGoal.surfaceId
       ),
       status: "satisfied",
       selectedControlId: clean(
@@ -2387,11 +2507,12 @@ function reduceTaskState({
       };
       return priority(left) - priority(right);
     });
-  // Loop recovery is decision-local. A loop in one old decision must never
-  // erase a distinct, executable sibling such as AirHelp after insurance.
-  let routableActiveDecisions = decisionEpisode?.cycleDetected === true
-    ? activeDecisions.filter((decision) => !episodeOwnsDecision(decisionEpisode, decision))
-    : activeDecisions;
+  // Cycle evidence is diagnostic, not a second mechanical exhaustion
+  // authority. Failed-strategy memory owns whether a fresh actuator/method
+  // remains. Suppressing the current decision here used to stop before that
+  // recovery could try the next exact strategy. Stale episodes are already
+  // excluded by canonical ownership when they are absent from activeDecisions.
+  let routableActiveDecisions = activeDecisions;
   const suspendedDecisions = foreground
     ? canonicalDecisions.filter((decision) => decision.surfaceId !== surface.id && GOAL_CREATING.has(decision.status))
     : [];
@@ -2453,42 +2574,42 @@ function reduceTaskState({
   routableActiveDecisions = routableActiveDecisions.filter((decision) => !verifiedProfileComponents.some((completion) => (
     verifiedProfileComponentMatchesDecision(completion, decision)
   )));
-  const baseProfileReadiness = profileStageReadiness(profileObservation, traveler, verifiedProfileComponents);
+  const compiledProfileRequirements = authoritativeDecisionFrame.profileRequirements || [];
+  const baseProfileReadiness = profileStageReadiness(
+    profileObservation,
+    traveler,
+    verifiedProfileComponents,
+    { descriptors: compiledProfileRequirements }
+  );
   const missingDerivedFacts = Object.freeze((baseProfileReadiness.missingUserData || [])
     .map((item) => missingDerivedFactDependency(item.semanticType, traveler, {
       selectedBooking: transactionReview?.baseline || null
     }))
     .filter(Boolean));
   const activeRequirementGrounding = page.activeRequirementGrounding || null;
-  const groundingUnresolved = Boolean(
-    activeRequirementGrounding
-    && activeRequirementGrounding.status !== "bound"
-    && (activeRequirementGrounding.candidateComponentIds || []).length
-    && !unblockedStageExitReady(page)
-  );
   const profileSelection = profileEvaluationStage === "traveler_information"
     && baseProfileReadiness.profileStage
-    && (!baseProfileReadiness.ready || groundingUnresolved)
-      ? selectNextProfileRequirement(
+    && !baseProfileReadiness.ready
+        ? selectNextProfileRequirement(
           profileObservation,
           traveler,
-          previousTaskState.currentGoal,
-          verifiedProfileComponents
+          previousGoal,
+          verifiedProfileComponents,
+          { descriptors: compiledProfileRequirements }
         )
     : { goal: null, blockedFields: [], failureCode: "" };
   const profileReadiness = Object.freeze({
     ...baseProfileReadiness,
-    profileStage: baseProfileReadiness.profileStage || groundingUnresolved,
-    ready: groundingUnresolved ? false : baseProfileReadiness.ready,
     temporarilyBlockedFields: Object.freeze(profileSelection.blockedFields || []),
+    // A bounded model result is diagnostic binding evidence. It may refine an
+    // obligation already admitted by TaskState, but a negative/unknown answer
+    // cannot independently create work or make profile readiness false.
     activeRequirementGrounding,
     missingDerivedFacts,
     blockedReasonCode: missingDerivedFacts.length
       ? "SELECTED_BOOKING_FACT_MISSING"
       : baseProfileReadiness.missingUserData?.length
       ? "MISSING_PROFILE_DATA"
-      : groundingUnresolved
-      ? "ACTIVE_REQUIREMENT_UNRESOLVED"
       : profileSelection.failureCode || ""
   });
   const selectedProfileGoal = profileSelection.goal;
@@ -2604,10 +2725,7 @@ function reduceTaskState({
   let currentGoal = null;
   let ambiguityReason = "";
   if (terminalStatus === "active") {
-    if (decisionEpisode?.cycleDetected === true && !routableActiveDecisions.length) {
-      currentGoal = null;
-      ambiguityReason = "decision_episode_cycle_detected";
-    } else if (siteFailure) {
+    if (siteFailure) {
       // The foreground failure owns the page. Background traveler fields and
       // decisions remain durable facts, but they cannot create an action goal
       // until the failure surface is gone.
@@ -2619,14 +2737,14 @@ function reduceTaskState({
         : transactionReviewBlocked
           ? "transaction_review_incomplete"
           : "payment_review_boundary";
-    } else if (profileGoal && (!foreground || foregroundOwnsProfileGoal)) {
-      currentGoal = Object.freeze(profileGoal);
     } else if (adaptiveGoal) {
       // A verified reversible opener may reveal controls whose local labels no
       // longer repeat the parent profile field semantics. Preserve the exact
       // unfinished objective inside that one foreground surface instead of
       // erasing it and falling into a generic no-actuator stop.
       currentGoal = adaptiveGoal;
+    } else if (profileGoal && (!foreground || foregroundOwnsProfileGoal)) {
+      currentGoal = Object.freeze(profileGoal);
     } else if (profileReadiness.profileStage && !profileReadiness.ready && !profileGoal) {
       // An unresolved profile field with no executable actuator must not be
       // replaced by a navigation or unrelated surface goal. A fresh
@@ -2645,12 +2763,31 @@ function reduceTaskState({
       const viableDecisionCapabilities = decisionCapabilities.filter((control) => (
         viableControlIds.includes(control.controlId)
       ));
-      const policyStageExitIds = optionContract.policyChoiceBounded
-        && !optionContract.policyAllowedControlIds.length
-        && policyOutcomeAllowsStageExit(decision)
-        ? controlIds
-        : [];
-      if (!viableDecisionCapabilities.length && !policyStageExitIds.length && decisionCapabilities.length) {
+      const paidOnlyUnselectedDecision = Boolean(
+        optionContract.paidControlIds.length
+        && decision.priceRisk?.selectedPaid !== true
+        && optionContract.freeControlIds.length === 0
+        && optionContract.correctionControlIds.length === 0
+        && optionContract.policyAllowedControlIds.length === 0
+      );
+      const independentlyProvenPolicyExit = paidOnlyUnselectedDecision
+        && controlIds.length
+        && ["random_assignment", "declined_or_free", "no_insurance", "included_base_fare"].includes(
+          clean(decision.userIntent?.desiredOutcome || optionContract.desiredPolicyOutcome)
+        );
+      // A stage exit is never a substitute for an unavailable choice. UI mode
+      // toggles are filtered by typed commerce truth before reaching this
+      // branch; a genuine selected paid item must be reversed by its exact
+      // owned actuator. If no such actuator exists, bounded recovery owns the
+      // stop instead of silently treating Next or Back as Skip.
+      if (!viableDecisionCapabilities.length && independentlyProvenPolicyExit) {
+        // No paid item is selected and every unresolved option would add a
+        // charge. In this narrow state, an independently compiled current-
+        // surface stage exit is progress without selection, not a replacement
+        // actuator for Skip. A genuine selected-paid conflict can never enter
+        // this branch and still requires its exact reversal.
+        currentGoal = navigationGoal(observation, controlIds);
+      } else if (!viableDecisionCapabilities.length && decisionCapabilities.length) {
         const blockedGoal = goalForDecision(decision, observation, userPolicy, traveler);
         currentGoal = Object.freeze({
           ...blockedGoal,
@@ -2660,17 +2797,11 @@ function reduceTaskState({
           })
         });
         ambiguityReason = "no_policy_allowed_candidate";
-      } else if (!decisionCapabilities.length && !policyStageExitIds.length && surfaceCapabilities.length) {
+      } else if (!decisionCapabilities.length && surfaceCapabilities.length) {
         currentGoal = null;
         ambiguityReason = "no_goal_relevant_candidate";
       } else {
-        const decisionGoal = goalForDecision(decision, observation, userPolicy, traveler);
-        currentGoal = policyStageExitIds.length
-          ? Object.freeze({
-              ...decisionGoal,
-              actionableControlIds: Object.freeze([...new Set(policyStageExitIds)])
-            })
-          : decisionGoal;
+        currentGoal = goalForDecision(decision, observation, userPolicy, traveler);
       }
     } else if (decisionEpisode?.status === "completed_pending_surface_exit") {
       currentGoal = completedChoiceSurfaceGoal(observation, decisionEpisode);
@@ -2744,11 +2875,32 @@ function reduceTaskState({
   // to replace semantic work. When the exact TaskState-published goal has
   // exhausted its grounded strategies, TaskState alone may yield to one
   // consequence-gated adaptive goal on the same fresh surface.
+  const mechanicalEvidenceOwnsGoal = Boolean(
+    mechanicalEvidence?.kind === "goal_strategies_exhausted"
+    && (
+      !mechanicalEvidence.observationHash
+      || mechanicalEvidence.observationHash === (
+        observation.observationSnapshot?.snapshotHash || page.snapshotHash || ""
+      )
+    )
+    && (
+      mechanicalEvidence.goalId === currentGoal?.goalId
+      || (
+        mechanicalEvidence.semanticGoalKey
+        && mechanicalEvidence.semanticGoalKey === semanticGoalKey(currentGoal || {})
+      )
+      || (
+        mechanicalEvidence.decisionGroupId
+        && mechanicalEvidence.decisionGroupId === (
+          currentGoal?.decisionGroupId || currentGoal?.subject?.decisionGroupId
+        )
+      )
+    )
+  );
   if (
     terminalStatus === "active"
     && currentGoal
-    && mechanicalEvidence?.kind === "goal_strategies_exhausted"
-    && mechanicalEvidence.goalId === currentGoal.goalId
+    && mechanicalEvidenceOwnsGoal
     && !["profile_field", "adaptive_surface", "adaptive_interaction"].includes(currentGoal.kind)
     && !["payment", "legal"].includes(currentGoal.semanticType)
     && !siteFailure
@@ -2765,6 +2917,35 @@ function reduceTaskState({
       currentGoal = fallback;
       ambiguityReason = "";
     }
+  }
+  const unresolvedGroundingControlIds = new Set(
+    activeRequirementGrounding?.status !== "bound"
+      ? (activeRequirementGrounding?.candidateComponentIds || []).map(clean).filter(Boolean)
+      : []
+  );
+  const currentGoalFamily = lower(
+    currentGoal?.canonicalSubject?.family
+    || currentGoal?.subject?.family
+    || currentGoal?.family
+  );
+  const groundingOwnsCurrentGoal = Boolean(
+    currentGoal
+    && currentGoalFamily === "profile"
+    && (currentGoal.candidateControlIds || admittedControlIdsForGoal(currentGoal))
+      .some((controlId) => unresolvedGroundingControlIds.has(clean(controlId)))
+  );
+  if (groundingOwnsCurrentGoal) {
+    // Unknown grounding may block only the exact profile obligation that
+    // TaskState already admitted. It cannot make profile readiness false,
+    // preempt a sibling decision, or veto navigation from page-wide context.
+    currentGoal = Object.freeze({
+      ...currentGoal,
+      ambiguity: Object.freeze({
+        code: "ACTIVE_REQUIREMENT_UNRESOLVED",
+        reason: clean(activeRequirementGrounding.evidence || "The admitted profile component could not be bound to a supplied traveler fact.")
+      })
+    });
+    ambiguityReason = "active_requirement_unresolved";
   }
   if (!decisionEpisode && currentGoal?.decisionGroupId) {
     const parent = canonicalDecisions.find((decision) => decision.decisionGroupId === currentGoal.decisionGroupId) || null;
@@ -2819,7 +3000,7 @@ function reduceTaskState({
       && episodeOwnsGoal(decisionEpisode, currentGoal)
       ? decisionEpisode
       : null;
-    currentGoal = publishCurrentObligation({
+    currentGoal = Object.freeze({
       ...currentGoal,
       decisionInstanceId: activeEpisode?.decisionInstanceId || decisionInstanceKey(currentGoal, observation),
       canonicalOwnerId: activeEpisode?.canonicalOwnerId || activeEpisode?.decisionInstanceId || "",
@@ -2836,7 +3017,7 @@ function reduceTaskState({
       surfaceSubgoalId: surfaceSubgoal?.subgoalId || "",
       parentOutcomeContract: stageOutcome.outcomeContract,
       outcomeContract: surfaceSubgoal?.outcomeContract || outcomeContractForGoal(currentGoal, observation)
-    }, observation, surface);
+    });
   }
   const semanticAchievements = [...completions.values()].map((completion) => Object.freeze({
     achievementId: clean(completion.instanceId || completion.decisionGroupId || completion.requirementId),
@@ -2892,11 +3073,213 @@ function reduceTaskState({
     })
   });
 
-  return Object.freeze({
-    // Durable guidance only. Foreground capability selection happens from the
-    // fresh observation; these facts do not authorize or reject a click.
+  const currentObligation = currentObligationFromGoal({
+    goal: currentGoal,
+    decisionFrame: authoritativeDecisionFrame,
+    recoveryState: previousTaskState.recovery || previousTaskState.recoveryState || {}
+  });
+  const missingProfileFact = (profileReadiness.missingUserData || [])[0] || null;
+  const missingDerivedFact = (profileReadiness.missingDerivedFacts || [])[0] || null;
+  const authorizationConflict = activeDecisions.find((decision) => (
+    decision.reopenEvidence?.code === "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT"
+  )) || null;
+  const previousDisposition = previousTaskState.disposition || {};
+  const admittedMechanicsExhausted = Boolean(
+    mechanicalEvidenceOwnsGoal
+    && currentGoal
+    && (
+      mechanicalEvidence.goalId === currentGoal.goalId
+      || mechanicalEvidence.semanticGoalKey === semanticGoalKey(currentGoal)
+    )
+  );
+  const dispositionCode = clean(
+    siteFailure ? "SITE_FAILURE_OBSERVED"
+      : terminalStatus === "payment_review_reached" ? "PAYMENT_REVIEW_REACHED"
+      : terminalStatus === "checkout_left" ? "CHECKOUT_LEFT"
+      : transactionReviewBlocked ? "TRANSACTION_REVIEW_INCOMPLETE"
+      : authorizationConflict ? "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT"
+      : admittedMechanicsExhausted ? "STRATEGIES_EXHAUSTED"
+      : currentGoal?.ambiguity?.code ? currentGoal.ambiguity.code
+      : currentObligation ? "EXECUTE_CURRENT_OBLIGATION"
+      : missingDerivedFact ? "SELECTED_BOOKING_FACT_MISSING"
+      : missingProfileFact ? "MISSING_PROFILE_DATA"
+      : validationBlockers.length ? "ACTIVE_VALIDATION_BLOCKER"
+      : profileReadiness.blockedReasonCode ? profileReadiness.blockedReasonCode
+      : ambiguityReason ? ambiguityReason
+      : "NO_CURRENT_OBLIGATION"
+  );
+  const sameReobserveDisposition = Boolean(
+    previousDisposition.kind === "wait_reobserve"
+    && previousDisposition.code === dispositionCode
+    && previousDisposition.surfaceFingerprint === fingerprint
+  );
+  const reobserveCount = sameReobserveDisposition
+    ? Number(previousDisposition.reobserveCount || 0) + 1
+    : 1;
+  const reobserveStartedAt = sameReobserveDisposition
+    ? Number(previousDisposition.reobserveStartedAt || Date.now())
+    : Date.now();
+  const reobserveDeadlineAt = sameReobserveDisposition
+    ? Number(previousDisposition.reobserveDeadlineAt || (reobserveStartedAt + TASK_STATE_REOBSERVE_DEADLINE_MS))
+    : reobserveStartedAt + TASK_STATE_REOBSERVE_DEADLINE_MS;
+  const reobserveRetryToken = sameReobserveDisposition
+    ? clean(previousDisposition.retryToken)
+    : `reobserve_${stableSemanticToken(`${dispositionCode}:${fingerprint}`, 42)}_${reobserveStartedAt.toString(36)}`;
+  let disposition;
+  if (siteFailure) {
+    disposition = {
+      kind: "stop",
+      code: dispositionCode,
+      reason: clean(siteFailure.message || "The active checkout surface reports a site failure."),
+      userActionRequired: false
+    };
+  } else if (terminalStatus === "payment_review_reached") {
+    disposition = {
+      kind: "terminal",
+      code: dispositionCode,
+      reason: "The approved transaction is reconciled at payment review.",
+      userActionRequired: true
+    };
+  } else if (terminalStatus === "checkout_left") {
+    disposition = {
+      kind: "request_approval",
+      code: dispositionCode,
+      reason: "The browser left the active checkout and returned to flight search.",
+      userActionRequired: true
+    };
+  } else if (transactionReviewBlocked) {
+    disposition = {
+      kind: "request_approval",
+      code: dispositionCode,
+      reason: "Payment review is visible, but the approved transaction cannot yet be fully reconciled.",
+      userActionRequired: true,
+      details: Object.freeze({
+        missingFacts: Object.freeze([...(transactionReview?.missingFacts || []), ...(outcomeCoverage.complete ? [] : ["verified_decision_outcomes"])]),
+        contradictions: Object.freeze([...(transactionReview?.contradictions || [])])
+      })
+    };
+  } else if (authorizationConflict) {
+    disposition = {
+      kind: "request_approval",
+      code: dispositionCode,
+      reason: "A current paid selection conflicts with both the saved decline policy and an explicit item authorization.",
+      userActionRequired: true,
+      details: Object.freeze({
+        decisionGroupId: clean(authorizationConflict.decisionGroupId),
+        conflict: authorizationConflict.reopenEvidence
+          ? Object.freeze({ ...authorizationConflict.reopenEvidence })
+          : null
+      })
+    };
+  } else if (admittedMechanicsExhausted) {
+    disposition = {
+      kind: "stop",
+      code: dispositionCode,
+      reason: "The exact admitted obligation exhausted its bounded grounded mechanics without a verified result.",
+      obligationId: clean(currentGoal.goalId),
+      userActionRequired: false
+    };
+  } else if (currentGoal?.ambiguity) {
+    disposition = {
+      kind: "request_approval",
+      code: dispositionCode || "SEMANTIC_AMBIGUITY",
+      reason: clean(currentGoal.ambiguity.reason || "The current admitted checkout obligation is ambiguous."),
+      userActionRequired: true
+    };
+  } else if (currentObligation) {
+    disposition = {
+      kind: "execute",
+      code: dispositionCode,
+      reason: "Execute the exact current TaskState obligation.",
+      obligationId: currentObligation.obligationId,
+      userActionRequired: false
+    };
+  } else if (missingDerivedFact || missingProfileFact) {
+    disposition = {
+      kind: "request_input",
+      code: dispositionCode,
+      reason: missingDerivedFact
+        ? clean(missingDerivedFact.label || "A selected-booking fact required to derive traveler data is missing.")
+        : clean(missingProfileFact.label || missingProfileFact.semanticType || "Required traveler information is missing."),
+      field: clean(missingProfileFact?.semanticType),
+      fieldLabel: clean(missingProfileFact?.label || missingProfileFact?.semanticType),
+      missingDerivedFact: missingDerivedFact ? Object.freeze({ ...missingDerivedFact }) : null,
+      userActionRequired: true
+    };
+  } else if (validationBlockers.length) {
+    disposition = {
+      kind: "request_approval",
+      code: dispositionCode,
+      reason: "The active checkout surface reports validation that is not owned by an executable obligation.",
+      userActionRequired: true
+    };
+  } else if (["ACTIVE_REQUIREMENT_UNRESOLVED", "SEMANTIC_AMBIGUITY", "active_requirement_unresolved", "contradictory_or_validation_evidence"].includes(dispositionCode)) {
+    disposition = {
+      kind: "request_approval",
+      code: dispositionCode,
+      reason: "The active checkout requirement cannot be resolved deterministically from the fresh evidence.",
+      userActionRequired: true
+    };
+  } else if (reobserveCount === 1) {
+    disposition = {
+      kind: "wait_reobserve",
+      code: dispositionCode,
+      reason: "No executable obligation is proven yet; request a fresh settled observation before stopping.",
+      reobserveCount,
+      retryToken: reobserveRetryToken,
+      reobserveStartedAt,
+      reobserveDeadlineAt,
+      surfaceFingerprint: fingerprint,
+      userActionRequired: false
+    };
+  } else {
+    disposition = {
+      kind: "stop",
+      code: dispositionCode || "READINESS_DEADLINE_EXHAUSTED",
+      reason: "The same settled surface produced no executable obligation after the bounded re-observation deadline.",
+      reobserveCount,
+      surfaceFingerprint: fingerprint,
+      userActionRequired: false
+    };
+  }
+  disposition = Object.freeze(disposition);
+
+  const transactionReviewProjection = transactionReview ? Object.freeze({
+    ...transactionReview,
+    ready: transactionEvidenceReady,
+    missingFacts: Object.freeze([
+      ...(transactionReview.missingFacts || []),
+      ...(outcomeCoverage.complete ? [] : ["verified_decision_outcomes"])
+    ]),
+    outcomeCoverage
+  }) : null;
+  const readModel = Object.freeze({
+    paymentEvidence,
+    foregroundSurface: Object.freeze(surface),
+    surfaceClass,
+    siteFailure,
+    activeDecisions: Object.freeze(activeDecisions),
+    observedDecisions: Object.freeze(observedDecisions),
+    canonicalDecisions,
+    suspendedDecisions: Object.freeze(suspendedDecisions),
+    validationBlockers: Object.freeze(validationBlockers),
+    stageDecisionEvidence: Object.freeze(stageDecisionEvidence),
+    previousActionResult: previousActionResult || null,
+    ambiguityReason,
+    semanticOwnershipResolutions: Object.freeze(page.semanticOwnershipResolutions || []),
+    semanticReadiness: semanticCompilation.semanticReadiness,
+    semanticCompilation: Object.freeze({
+      unownedMaterialControls: Object.freeze(semanticCompilation.unownedMaterialControls || []),
+      unresolvedDecisions: Object.freeze(semanticCompilation.unresolvedDecisions || []),
+      currentExecutableObligations: Object.freeze(semanticCompilation.currentExecutableObligations || [])
+    }),
+    profileReadiness,
+    transactionReview: transactionReviewProjection,
+    processAwareness
+  });
+  const taskState = Object.freeze({
+    contractVersion: "task-state/v2",
     goal: Object.freeze({ id: "reach_payment_review", status: terminalGoalLatch.locked ? "completed" : "active" }),
-    completedRequirements: Object.freeze([...completions.values()].slice(-160)),
     userPreferences: Object.freeze({
       bookingRules: clean(userPolicy.bookingRules || traveler.booking_rules),
       extras: clean(userPolicy.extras),
@@ -2916,13 +3299,9 @@ function reduceTaskState({
       paymentSubmissionRequiresApproval: true,
       paymentCredentialsBlocked: true
     }),
-    paymentEvidence,
     terminalGoalLatch,
     checkoutBoundary,
     stage,
-    foregroundSurface: Object.freeze(surface),
-    surfaceClass,
-    siteFailure,
     transactionOutcome,
     stageOutcome,
     surfaceSubgoal,
@@ -2931,54 +3310,31 @@ function reduceTaskState({
     verifiedProfileComponents,
     outcomeJournal,
     outcomeCoverage,
-    activeDecisions: Object.freeze(activeDecisions),
-    observedDecisions: Object.freeze(observedDecisions),
-    canonicalDecisions,
     completedOutcomes: Object.freeze([...completions.values()].slice(-160)),
-    currentGoal,
+    verificationDecisionMemory: Object.freeze(canonicalDecisions.slice(-80).map(verificationDecisionRecord)),
+    currentObligation,
+    disposition,
+    decisionFrameId: authoritativeDecisionFrame.frameId,
     terminalStatus,
-    suspendedDecisions: Object.freeze(suspendedDecisions),
-    validationBlockers: Object.freeze(validationBlockers),
-    stageDecisionEvidence: Object.freeze(stageDecisionEvidence),
     surfaceFingerprint: fingerprint,
     meaningfulSurfaceChange,
-    // Surface changes are temporary children of the durable stage outcome.
-    // Recovery history is cleared only when that parent changes or completes,
-    // otherwise base→modal→base cycles would be forgotten.
     clearObsoleteRecovery: Boolean(
       (previousTaskState.stageOutcome?.outcomeId
         && previousTaskState.stageOutcome.outcomeId !== stageOutcome.outcomeId)
       || stageOutcome.status === "completed"
     ),
-    previousActionResult: previousActionResult || null,
-    ambiguityReason,
-    semanticOwnershipResolutions: Object.freeze(page.semanticOwnershipResolutions || []),
-    semanticReadiness: semanticCompilation.semanticReadiness,
-    semanticCompilation: Object.freeze({
-      unownedMaterialControls: Object.freeze(semanticCompilation.unownedMaterialControls || []),
-      unresolvedDecisions: Object.freeze(semanticCompilation.unresolvedDecisions || []),
-      currentExecutableObligations: Object.freeze(semanticCompilation.currentExecutableObligations || [])
-    }),
-    profileReadiness,
-    transactionReview: transactionReview ? Object.freeze({
-      ...transactionReview,
-      ready: transactionEvidenceReady,
-      missingFacts: Object.freeze([
-        ...(transactionReview.missingFacts || []),
-        ...(outcomeCoverage.complete ? [] : ["verified_decision_outcomes"])
-      ]),
-      outcomeCoverage
-    }) : null,
-    processAwareness,
     parentObjective: parentObjective || previousTaskState.parentObjective || null
   });
+  taskStateReadModels.set(taskState, readModel);
+  return taskState;
 }
 
 module.exports = {
   decideStage,
   durableOutcomeHierarchy,
   reconcileVerifiedProfileComponents,
-  reduceTaskState,
+  reduceDecisionFrame,
+  taskStateReadModel,
   surfaceClassFrom,
   stageEvidence,
   verifiedCommerceObligationFromActionResult,

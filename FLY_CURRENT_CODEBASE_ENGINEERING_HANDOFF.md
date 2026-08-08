@@ -1,5 +1,11 @@
 # Fly Current Codebase: Engineering Handoff
 
+> **Archived historical snapshot (2026-07-26).** This document predates the
+> `ObservationFrame/v2 → DecisionFrame/v2 → CurrentObligation/v2` production
+> cutover and must not be used as current architecture authority. Use
+> [`FLY_FINAL_ROADMAP.md`](./FLY_FINAL_ROADMAP.md), the current code, automated
+> replays, and fresh sanitized live traces instead.
+
 **Snapshot date:** 2026-07-26
 
 **Branch:** `dev`
@@ -16,7 +22,7 @@ Related planning documents:
 - [`P_AGENT_ARCHITECTURE_TRACKER.md`](./P_AGENT_ARCHITECTURE_TRACKER.md)
 - [`FLY_EXECUTION_TODO.md`](./FLY_EXECUTION_TODO.md)
 
-This file is the current engineering handoff. Running code and fresh traces remain the final truth when this document disagrees with an older plan or tracker.
+This file preserves the July engineering handoff for historical context only.
 
 ---
 

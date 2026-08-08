@@ -7,6 +7,8 @@ const {
   normalizeFacts
 } = require("./transaction-facts");
 const { controlBelongsToCurrentSurface } = require("./surface-contract");
+const { taskBindingGoal } = require("./authority-frames");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 function text(value, limit = 180) {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
@@ -306,8 +308,16 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
   });
 }
 
-function prepareTransactionInvariants(state = {}, observation = {}, traveler = {}) {
-  const observed = factsFromObservation(state, observation, traveler);
+function prepareTransactionInvariants(state = {}, observation = {}, traveler = {}, {
+  authoritativeTransactionFacts = null
+} = {}) {
+  const observed = authoritativeTransactionFacts
+    ? normalizeFacts(authoritativeTransactionFacts, {
+        observationId: observation.observationId || "",
+        state,
+        traveler
+      })
+    : factsFromObservation(state, observation, traveler);
   const admittedOutcomes = durableCommerceSelections(observed.selectedExtras);
   const existing = state.transactionInvariants;
   const at = new Date().toISOString();
@@ -468,12 +478,14 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
     || action.affordance?.physicalEffect
     || action.affordance?.effect
     || "";
-  const currentGoal = state.taskState?.currentGoal || {};
-  const conflict = (state.taskState?.activeDecisions || []).find((decision) => (
-    decision.decisionGroupId === decisionGroupId
-    && decision.status === "conflicted"
-    && /SELECTED_OPTION_(?:PRICE_EXCEEDS|CONTRADICTS)_POLICY/.test(String(decision.reopenEvidence?.code || ""))
-  ));
+  const currentGoal = taskBindingGoal(state.taskState || {}) || {};
+  const obligation = state.taskState?.currentObligation || {};
+  const obligationOwnsCorrection = Boolean(
+    obligation.subject?.decisionGroupId === decisionGroupId
+    && obligation.policyDecision?.status === "admitted"
+    && agentContract.canonicalSemanticEffect(obligation.desiredEffect)
+      === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
+  );
   const paidSelection = observedPaidExtraForDecision(observed, decisionGroupId);
   const exactGoal = Boolean(currentGoal.decisionGroupId && currentGoal.decisionGroupId === decisionGroupId);
   const exactTarget = Boolean(
@@ -515,7 +527,7 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
     && expected.intendedOutcome
     && expected.intendedOutcome !== "unknown"
   );
-  return Boolean(conflict && paidSelection && exactGoal && exactTarget && (exactFreeReversal || exactSelectorOpen || linkedSemanticCorrection));
+  return Boolean(obligationOwnsCorrection && paidSelection && exactGoal && exactTarget && (exactFreeReversal || exactSelectorOpen || linkedSemanticCorrection));
 }
 
 function groundedSafeReversalForExtra(extra = {}, observation = {}) {

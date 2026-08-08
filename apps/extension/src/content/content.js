@@ -168,6 +168,7 @@
     activePlannerRequest: null,
     destinationWait: null,
     destinationWaitTimer: null,
+    honoredReobserveRetryTokens: new Set(),
     lastSentMaterialHash: "",
     lastSentFeedbackKey: "",
     screenshotCache: new Map()
@@ -186,6 +187,7 @@
   const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
   const DESTINATION_RETRY_INTERVAL_MS = 300;
+  const DESTINATION_MUTATION_SETTLE_MS = 450;
   let selectedBookingCaptureTimer = null;
 
   function authoritativeSelectedBookingFacts(facts = null) {
@@ -1809,6 +1811,23 @@
     const liveControlId = live.controlId || element?.dataset?.atwControlId || "";
     const expectedDecisionGroupId = expected.decisionGroupId || decision.decisionGroupId || "";
     if (expectedDecisionGroupId && live.decisionGroupId && expectedDecisionGroupId !== live.decisionGroupId) {
+      const expectedActuatorIdentity = new Set([
+        expected.id,
+        expected.stateElementId,
+        expected.preferredActivationElementId,
+        expected.actuatorId
+      ].filter(validTargetId));
+      const liveActuatorIdentity = [
+        live.id,
+        live.stateElementId,
+        live.preferredActivationElementId
+      ].filter(validTargetId);
+      const exactCompiledControlLease = Boolean(
+        expectedControlId
+        && liveControlId
+        && expectedControlId === liveControlId
+        && liveActuatorIdentity.some((id) => expectedActuatorIdentity.has(id))
+      );
       const observationScopedOwnershipLink = Boolean(
         expected.semanticOwnershipLinkId
         && expected.policyCorrectionForDecisionGroupId
@@ -1817,11 +1836,13 @@
         && liveControlId
         && expectedControlId === liveControlId
       );
-      if (!observationScopedOwnershipLink) {
+      if (!observationScopedOwnershipLink && !exactCompiledControlLease) {
         return { ok: false, code: "TARGET_DECISION_GROUP_MISMATCH", expected, live };
       }
       warnings.push({
-        code: "TARGET_DECISION_GROUP_LINKED_ACROSS_SURFACES",
+        code: exactCompiledControlLease
+          ? "TARGET_DECISION_GROUP_RECOMPILED_FOR_EXACT_LEASE"
+          : "TARGET_DECISION_GROUP_LINKED_ACROSS_SURFACES",
         expectedDecisionGroupId,
         liveDecisionGroupId: live.decisionGroupId,
         semanticOwnershipLinkId: expected.semanticOwnershipLinkId
@@ -2108,6 +2129,135 @@
     });
   }
 
+  function compactFlowLogTarget(target = {}) {
+    if (!target || typeof target !== "object") return target || null;
+    return {
+      id: String(target.id || target.targetId || ""),
+      controlId: String(target.controlId || ""),
+      actuatorId: String(target.actuatorId || target.targetId || ""),
+      stableKey: compactText(target.stableKey || "", 240),
+      label: compactText(target.label || target.targetLabel || target.accessibleName || "", 240),
+      role: String(target.role || target.kind || ""),
+      semantic: String(target.semantic || target.fieldType || ""),
+      risk: String(target.risk || ""),
+      surfaceId: String(target.surfaceId || ""),
+      decisionGroupId: String(target.decisionGroupId || ""),
+      state: target.state ? {
+        selected: target.state.selected === true || target.state.checked === true,
+        valuePresent: target.state.valuePresent === true,
+        normalizedValue: compactText(target.state.normalizedValue || target.state.selectedValue || "", 160),
+        disabled: target.state.disabled === true,
+        expanded: target.state.expanded === true
+      } : null,
+      box: target.box || target.visualRegion || null
+    };
+  }
+
+  function compactFlowLogPage(page = {}) {
+    if (!page || typeof page !== "object") return page || null;
+    return {
+      site: String(page.site || ""),
+      url: compactText(page.url || "", 500),
+      step: String(page.step || ""),
+      snapshotHash: String(page.snapshotHash || page.observationSnapshot?.snapshotHash || ""),
+      currentSurface: page.currentSurface ? {
+        id: String(page.currentSurface.id || ""),
+        type: String(page.currentSurface.type || "page"),
+        label: compactText(page.currentSurface.label || "", 240),
+        blocksBackground: page.currentSurface.blocksBackground === true
+      } : null,
+      summary: page.summary ? {
+        fields: Number(page.summary.fields || 0),
+        controls: Number(page.summary.controls || 0),
+        decisionGroups: Number(page.summary.decisionGroups || 0),
+        errors: Number(page.summary.errors || 0),
+        paidChoices: Number(page.summary.paidChoices || 0),
+        pendingTasks: Number(page.summary.pendingTasks || 0),
+        continueAllowed: page.summary.continueAllowed === true,
+        priceText: compactText(page.summary.priceText || "", 100)
+      } : null,
+      errors: (page.errors || []).slice(0, 8).map((error) => compactText(
+        typeof error === "string" ? error : error.message || error.label || "",
+        240
+      ))
+    };
+  }
+
+  function compactFlowLogValue(value, key = "", depth = 0) {
+    if (value == null || typeof value === "number" || typeof value === "boolean") return value;
+    if (typeof value === "string") return compactText(value, 900);
+    if (depth >= 4) return "[bounded]";
+    if (key === "page" || key === "pageBefore" || key === "pageAfterAction") {
+      return compactFlowLogPage(value);
+    }
+    if (key === "targetSnapshot" || key === "target" || key === "resolved") {
+      return compactFlowLogTarget(value);
+    }
+    if (Array.isArray(value)) {
+      return value.slice(0, 24).map((item) => compactFlowLogValue(item, "", depth + 1));
+    }
+    if (typeof value !== "object") return compactText(String(value), 900);
+    const dropped = new Set([
+      "observation",
+      "previousObservation",
+      "beforeObservation",
+      "afterObservation",
+      "pageMap",
+      "controls",
+      "controlAliases",
+      "candidateSet",
+      "contextCapabilities",
+      "normalCandidates",
+      "recoveryCandidates",
+      "excludedCandidates",
+      "operations",
+      "actuators",
+      "strategies",
+      "exactActuators",
+      "actionabilityByActuator",
+      "targetabilityByActuator",
+      "visualRegions",
+      "backendDebug",
+      "debug",
+      "processAwareness",
+      "transactionReview",
+      "canonicalDecisions",
+      "observedDecisions",
+      "semanticCompilation",
+      "interactionView",
+      "screenshotDataUrl"
+    ]);
+    const compact = {};
+    for (const [childKey, childValue] of Object.entries(value).slice(0, 100)) {
+      if (dropped.has(childKey)) continue;
+      compact[childKey] = compactFlowLogValue(childValue, childKey, depth + 1);
+    }
+    return compact;
+  }
+
+  function compactFlowLogPayload(phase = "", payload = {}) {
+    const compact = compactFlowLogValue(payload, "", 0) || {};
+    if (JSON.stringify(compact).length <= 32_000) return compact;
+    const decision = payload.decision || {};
+    return {
+      truncated: true,
+      phase: String(phase || ""),
+      turnId: String(payload.turnId || ""),
+      observationId: String(payload.observationId || decision.observationId || ""),
+      actionId: String(payload.actionId || decision.actionId || decision.id || ""),
+      action: String(typeof payload.action === "string" ? payload.action : decision.action || ""),
+      intent: String(payload.intent || decision.intent || ""),
+      targetLabel: compactText(payload.targetLabel || decision.targetLabel || "", 240),
+      code: String(payload.code || payload.failureCode || payload.result?.code || ""),
+      reason: compactText(payload.reason || decision.reason || "", 500),
+      observationBytes: Number(payload.observationBytes || 0),
+      request_upload_ms: Number(payload.request_upload_ms || 0),
+      turn_total_ms: Number(payload.turn_total_ms || 0),
+      page: compactFlowLogPage(payload.page || payload.pageAfterAction || payload.pageBefore || {}),
+      targetSnapshot: compactFlowLogTarget(payload.targetSnapshot || decision.targetSnapshot || {})
+    };
+  }
+
   function sendActionLedger(row) {
     const apiBase = agent.apiBase || DEFAULT_API;
     fetch(`${apiBase}/agent/action-ledger`, {
@@ -2125,19 +2275,20 @@
   }
 
   function logFlow(phase, payload = {}) {
+    const diagnosticPayload = compactFlowLogPayload(phase, payload);
     const entry = {
       seq: agent.flowSeq + 1,
       at: new Date().toISOString(),
       turnId: payload.turnId || agent.activeTurnId || "",
       phase,
-      payload
+      payload: diagnosticPayload
     };
     agent.flowSeq += 1;
     agent.flowLog.push(entry);
     agent.flowLog = agent.flowLog.slice(-160);
-    logAgentEvent(`flow:${phase}`, payload);
+    logAgentEvent(`flow:${phase}`, diagnosticPayload);
     // eslint-disable-next-line no-console
-    console.debug("[atw-flow]", phase, payload);
+    console.debug("[atw-flow]", phase, diagnosticPayload);
     if (shouldSendFlowLog(phase)) sendFlowLog(entry);
     return entry;
   }
@@ -2159,7 +2310,7 @@
   function isDestinationReadinessDecision(decision = {}) {
     if (decision.action !== "wait") return false;
     const intent = `${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase();
-    return /wait_for_ready_observation|reobserve_after_transient_observation|reobserve_degraded_loading_destination|reobserve_after_grounding_rejection/.test(intent)
+    return /wait_for_ready_observation|reobserve_after_transient_observation|reobserve_degraded_loading_destination|reobserve_after_grounding_rejection|task_state_reobserve/.test(intent)
       || (decision.expectedPostconditions || []).some((postcondition) => (
         postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
       ));
@@ -2203,23 +2354,28 @@
     const existing = agent.destinationWait;
     const backendStartedAt = Number(decision.readinessStartedAt || 0);
     const backendDeadlineAt = Number(decision.readinessDeadlineAt || 0);
+    const taskStateWait = /task_state_reobserve/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
+    const retryToken = String(decision.reobserveRetryToken || "");
     agent.destinationWait = {
       status: "WAITING_FOR_DESTINATION",
+      kind: taskStateWait ? "current_surface" : "destination",
       startedAt: backendStartedAt > 0 ? backendStartedAt : (existing?.startedAt || now),
       deadlineAt: backendDeadlineAt > 0 ? backendDeadlineAt : (existing?.deadlineAt || (now + DESTINATION_WAIT_TIMEOUT_MS)),
       attempts: Number(existing?.attempts || 0),
       backendWaits: Number(existing?.backendWaits || 0) + 1,
-      wakeRequested: true,
+      wakeRequested: false,
       lastWakeReason: "backend_wait",
       lastMutationAt: Number(existing?.lastMutationAt || 0),
       deadlineObservationSent: Boolean(existing?.deadlineObservationSent),
       observationId: decision.observationId || existing?.observationId || "",
-      actionId: decision.actionId || decision.id || existing?.actionId || ""
+      actionId: decision.actionId || decision.id || existing?.actionId || "",
+      retryToken: retryToken || existing?.retryToken || ""
     };
-    agent.loopRerunQueued = true;
     setAgentActivity(
-      "Waiting for destination",
-      "Navigation completed, but the destination controls are still hydrating. I will continue automatically."
+      taskStateWait ? "Watching the current checkout surface" : "Waiting for destination",
+      taskStateWait
+        ? "No safe current actuator is available yet. I will resume on a material page change or stop at the bounded deadline."
+        : "Navigation completed, but the destination controls are still hydrating. I will continue automatically."
     );
     renderSidebar("agent");
     logFlow("destination_wait.enter", {
@@ -2233,6 +2389,12 @@
   function scheduleDestinationObservation(reason = "scheduled", delay = DESTINATION_RETRY_INTERVAL_MS) {
     const wait = agent.destinationWait;
     if (!wait || !agent.running) return false;
+    // DOM mutation is the only early wake-up. Replace the deadline timer with
+    // one settled material observation; unchanged timer polling is forbidden.
+    if (reason === "dom_mutation" && agent.destinationWaitTimer) {
+      clearTimeout(agent.destinationWaitTimer);
+      agent.destinationWaitTimer = null;
+    }
     wait.wakeRequested = true;
     wait.lastWakeReason = reason;
     if (reason === "dom_mutation") wait.lastMutationAt = Date.now();
@@ -2275,6 +2437,7 @@
   function resetAgentLoopLifecycle(reason = "reset") {
     agent.lifecycleId += 1;
     agent.loopRerunQueued = false;
+    agent.honoredReobserveRetryTokens.clear();
     clearDestinationWait(reason);
     abortActivePlannerRequest(reason);
     return agent.lifecycleId;
@@ -3463,7 +3626,27 @@
       return String(subjectKey || label || "selection").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 100);
     };
     const selectedExtras = decisionGroups
-      .filter((group) => group.status === "satisfied" && group.selectedLabel)
+      .filter((group) => {
+        if (group.status !== "satisfied" || !group.selectedLabel) return false;
+        const effectRole = group.selectedEvidence?.effectRole || group.effectRole || "";
+        if (["scope_toggle", "information_only", "navigation", "presentation_mode"].includes(effectRole)) return false;
+        const paidOption = AGENT_CONTRACT?.isPaidCommerceOption?.({
+          effectRole,
+          disposition: group.selectedEvidence?.disposition || group.selectedSemantic,
+          priceAmount: group.selectedEvidence?.structuredPrice?.amount,
+          semanticEffect: group.selectedEvidence?.semantic || group.selectedSemantic
+        }) === true;
+        return !paidOption || AGENT_CONTRACT?.isGenuineSelectedPaidItem?.({
+          decisionGroupId: group.decisionGroupId || group.requirementId,
+          selectedControlId: group.selectedControlId || group.selectedEvidence?.selectedControlId,
+          selectionOwnerId: group.selectedEvidence?.ownerElementId || group.semanticOwnership?.ownerElementId,
+          selected: group.selectedEvidence?.selected === true || Boolean(group.selectedControlId),
+          effectRole,
+          disposition: group.selectedEvidence?.disposition || group.selectedSemantic,
+          priceAmount: group.selectedEvidence?.structuredPrice?.amount,
+          semanticEffect: group.selectedEvidence?.semantic || group.selectedSemantic
+        }) === true;
+      })
       .map((group) => {
         const family = group.subject?.family || group.family || "";
         const subjectKey = outcomeSubject(family, group.selectedLabel || "", group.subject?.key || "");
@@ -3472,6 +3655,7 @@
           decisionGroupId: group.decisionGroupId || "",
           outcomeKey: family && subjectKey ? `${family}:${subjectKey}` : "",
           family,
+          effectRole: group.selectedEvidence?.effectRole || group.effectRole || "",
           subjectKey,
           label: group.selectedLabel || "",
           disposition,
@@ -5131,7 +5315,7 @@
     return "uncertain";
   }
 
-  const NON_ECONOMIC_EFFECT_ROLES = new Set(["scope_toggle", "information_only", "navigation"]);
+  const NON_ECONOMIC_EFFECT_ROLES = new Set(["scope_toggle", "information_only", "navigation", "presentation_mode"]);
 
   function canonicalDecisionEffectRole(control = {}) {
     const localMeaning = normalizeMatchText([
@@ -5155,6 +5339,13 @@
       control.sectionLabel
     ].filter(Boolean).join(" "));
     const shape = normalizeMatchText(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""} ${control.inputType || ""}`);
+    const disabledStateRepresentation = Boolean(
+      control.disabled === true
+      || control.logicalDisabled === true
+      || control.state?.disabled === true
+    ) && /radio|checkbox|switch|toggle/.test(shape)
+      && !control.structuredPrice;
+    if (disabledStateRepresentation) return "presentation_mode";
     if (/same for all|apply (?:this )?to all|both (?:flights|legs|journeys)|copy (?:to|for) all/.test(localMeaning)
       && /checkbox|switch|toggle|button/.test(shape)) return "scope_toggle";
     if (/decline paid extra|decline baggage|safe decline|select free option/.test(meaning)
@@ -7184,7 +7375,13 @@
       role: perceptionRole,
       domRole,
       inputType: stateElement.getAttribute?.("type") || "",
-      structuredPrice
+      structuredPrice,
+      disabled: state.disabled === true,
+      logicalDisabled: state.disabled === true && !Object.values(operations).some((capability) => (
+        capability?.actionability?.executable === true
+        || capability?.actionability?.revealable === true
+      )),
+      state
     });
     const economicStructuredPrice = NON_ECONOMIC_EFFECT_ROLES.has(effectRole) ? null : structuredPrice;
     const hasActionableActuator = Boolean(
@@ -7324,7 +7521,16 @@
       surfaceId: surface.id || "",
       surfaceType: surface.type || "page",
       surfaceLabel: surface.label || "",
-      globalChrome: isGlobalChromeControl(stateElement) || isGlobalChromeControl(element),
+      // A header/footer/sticky wrapper inside the active local checkout
+      // surface is local task mechanics, never site-wide chrome. Broad
+      // container shape may classify page controls only; otherwise a modal's
+      // exact Continue/Skip actuator is admitted by TaskState and then
+      // incorrectly discarded during mechanical binding.
+      globalChrome: !(
+        surface.type !== "page"
+        && surface.blocksBackground === true
+        && ["navigation", "free_decline"].includes(effectRole)
+      ) && (isGlobalChromeControl(stateElement) || isGlobalChromeControl(element)),
       stateElementId: elementId(stateElement),
       visibleWidgetElementId: elementId(wrapper || activationElement || stateElement),
       preferredActivationElementId: elementId(activationElement || stateElement),
@@ -9278,7 +9484,7 @@
       }));
   }
 
-  function buildStageExit(decisionGroups, fields, buttons, overlays, errors, step, controls = []) {
+  function buildStageExit(decisionGroups, fields, buttons, errors, step, controls = []) {
     const isUnboundSelectionCta = (control) => (
       /selection[_ -]?cta/.test(`${control?.semantic || ""} ${control?.semanticType || ""} ${control?.meaning || ""}`.toLowerCase())
       && !control?.choiceContract
@@ -9399,7 +9605,6 @@
     const unresolvedField = unfilledRequiredFields(fields)[0];
     if (unresolvedGroup) blockers.push(`unresolved decision: ${unresolvedGroup.sectionLabel || unresolvedGroup.requirementId || unresolvedGroup.decisionGroupId}`);
     if (unresolvedField) blockers.push(`required field: ${unresolvedField.label || unresolvedField.field || unresolvedField.controlId}`);
-    if (overlays.length) blockers.push("visible overlay/menu/modal");
     if (actionableCheckoutErrors(errors).length) blockers.push(`visible errors: ${actionableCheckoutErrors(errors).slice(0, 2).join("; ")}`);
     if (!continueObserved) blockers.push("Continue not observed");
     else if (continueDisabled) blockers.push("Continue is disabled");
@@ -9410,7 +9615,6 @@
         !continueDisabled &&
         !unresolvedGroup &&
         !unresolvedField &&
-        !overlays.length &&
         !actionableCheckoutErrors(errors).length &&
         !["payment", "confirmation"].includes(step)
       ),
@@ -9427,6 +9631,40 @@
             : "not_safely_actionable",
       blockers
     };
+  }
+
+  function buildAuthoritativeStageExit({
+    decisionGroups = [],
+    fields = [],
+    buttons = [],
+    errors = [],
+    step = "unknown",
+    controls = [],
+    currentSurface = { id: "surface-page", type: "page", blocksBackground: false }
+  } = {}) {
+    const stageExit = buildStageExit(decisionGroups, fields, buttons, errors, step, controls);
+    const contextualOverlayBlocker = (stageExit.blockers || []).includes("visible overlay/menu/modal");
+    const pageOwnsForeground = !currentSurface?.type
+      || currentSurface.type === "page"
+      || currentSurface.blocksBackground !== true;
+    // CurrentSurface is the sole foreground authority. The active surface
+    // cannot block its own stage exit, and a nonblocking contextual overlay
+    // cannot veto a page-owned actuator. Keep this assertion beside both full
+    // and incremental construction so the two paths cannot drift again.
+    if (pageOwnsForeground && contextualOverlayBlocker) {
+      const error = new Error("SURFACE_AUTHORITY_CONTRADICTION");
+      error.code = "SURFACE_AUTHORITY_CONTRADICTION";
+      throw error;
+    }
+    return Object.freeze({
+      ...stageExit,
+      surfaceAuthority: Object.freeze({
+        currentSurfaceId: currentSurface?.id || "surface-page",
+        currentSurfaceType: currentSurface?.type || "page",
+        blocksBackground: currentSurface?.blocksBackground === true,
+        authority: "current_surface"
+      })
+    });
   }
 
   function stageExitBlockers(map = buildPageMap(), decision = {}) {
@@ -10763,7 +11001,9 @@
     }
     if (expected.type === "current_surface_advanced") {
       const stepChanged = beforeMap.step !== afterMap.step;
-      const urlChanged = String(beforeMap.url || "") !== String(afterMap.url || location.href);
+      const beforeUrl = String(expected.beforeUrl || beforeMap.url || location.href);
+      const afterUrl = String(afterMap.url || location.href);
+      const urlChanged = beforeUrl !== afterUrl;
       const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged || (surfaceChanged && !overlayAppeared));
       return {
         ok,
@@ -10774,7 +11014,13 @@
     }
     if (expected.type === "checkout_stage_advanced") {
       const stepChanged = beforeMap.step !== afterMap.step;
-      const urlChanged = String(beforeMap.url || "") !== String(afterMap.url || location.href);
+      // The canonical page map intentionally does not need to duplicate the
+      // browser URL on every internal snapshot. Compare against the governed
+      // pre-action URL when it is supplied; treating a missing beforeMap.url
+      // as an empty string made every same-page click look like navigation.
+      const beforeUrl = String(expected.beforeUrl || beforeMap.url || location.href);
+      const afterUrl = String(afterMap.url || location.href);
+      const urlChanged = beforeUrl !== afterUrl;
       const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged);
       return {
         ok,
@@ -12076,10 +12322,40 @@
     const focusOwned = Boolean(document.activeElement && overlay.contains(document.activeElement));
     if (backdrop || (bodyLocked && focusOwned)) return true;
 
-    // Geometry is observation evidence, not ownership authority. Responsive
-    // checkout panels often cover the viewport while animating or hydrating;
-    // treating coverage alone as a modal hides the real stage exit. Only the
-    // explicit structural signals above may block the background.
+    // Some checkout panels are interaction-exclusive without exposing dialog
+    // or aria-modal markup. Admit them from combined mechanical evidence: the
+    // panel owns several top-hit points, contains a local resolution boundary,
+    // and occupies a material interaction region. Persistent edge chrome is
+    // filtered before this function, so geometry alone never grants ownership.
+    const rect = overlay.getBoundingClientRect();
+    const localActions = surfaceActionElements(overlay).filter(isVisible);
+    const ownsResolutionAction = localActions.some((element) => (
+      /^(?:next|continue|proceed|done|close(?: window)?|skip|back)\b/i.test(actionElementLabel(element))
+    ));
+    const materialRegion = rect.width >= viewportWidth * 0.32
+      && rect.height >= viewportHeight * 0.32
+      && rect.width * rect.height >= viewportWidth * viewportHeight * 0.16;
+    const backgroundActions = queryAllDeep(
+      "button, input:not([type='hidden']), select, textarea, [role='button'], [role='radio'], [role='checkbox'], [role='option']"
+    ).filter((element) => (
+      isVisible(element)
+      && !overlay.contains(element)
+      && !element.closest("#atw-sidebar, #atw-agent-cursor, .atw-section-outline")
+    ));
+    const suppressedBackgroundActions = backgroundActions.filter((element) => {
+      if (isDisabledLike(element)) return true;
+      const box = elementBox(element);
+      return Boolean(box && !pointBelongsToElement({ x: box.centerX, y: box.centerY }, element));
+    });
+    const backgroundInteractionSuppressed = backgroundActions.length > 0
+      && suppressedBackgroundActions.length / backgroundActions.length >= 0.75;
+    const interactionExclusive = overlayTopHitCount(overlay) >= 3
+      && localActions.length >= 2
+      && ownsResolutionAction
+      && materialRegion
+      && backgroundInteractionSuppressed;
+    if (interactionExclusive) return true;
+
     return false;
   }
 
@@ -13161,39 +13437,20 @@
       duplicateElementRekeyCount: duplicateElementRekeys.length,
       duplicateElementRekeys: duplicateElementRekeys.slice(0, 12)
     };
-    let decisionGroups = buildCanonicalDecisionGroups(sections, controls, activeSurface);
-    const semanticCompilation = AGENT_CONTRACT?.compileSemanticCheckout
-      ? AGENT_CONTRACT.compileSemanticCheckout({
-          step,
-          text,
-          fullText,
-          visibleText: fullText,
-          readiness: pageReadinessFacts(),
-          currentSurface: activeSurface,
-          controls,
-          decisionGroups
-        })
-      : {
-          semanticReadiness: "ready",
-          controls,
-          decisionGroups,
-          decisionContracts: [],
-          unownedMaterialControls: [],
-          unresolvedDecisions: [],
-          currentExecutableObligations: []
-        };
-    controls = semanticCompilation.controls;
-    decisionGroups = semanticCompilation.decisionGroups;
+    // ObservationFrame owns browser evidence and mechanics only. The shared
+    // semantic checkout compiler runs once on the backend while creating the
+    // immutable DecisionFrame; running it here created a second authority.
+    const decisionGroups = buildCanonicalDecisionGroups(sections, controls, activeSurface);
     const surfaceModel = buildSurfaceStack(activeSurface, sections, taskQueue, overlays, step);
-    const stageExit = buildStageExit(
+    const stageExit = buildAuthoritativeStageExit({
       decisionGroups,
       fields,
       buttons,
-      activeSurface.blocksBackground === true ? overlays : [],
       errors,
       step,
-      controls
-    );
+      controls,
+      currentSurface: surfaceModel.currentSurface
+    });
     const transactionFacts = transactionFactsEvidence({
       step,
       price,
@@ -13226,16 +13483,7 @@
       controlCollections,
       graphIntegrity,
       decisionGroups,
-      decisionContracts: semanticCompilation.decisionContracts,
-      semanticReadiness: semanticCompilation.semanticReadiness,
-      semanticCompilation: {
-        contractVersion: semanticCompilation.contractVersion || AGENT_CONTRACT?.CONTRACT_VERSION || "",
-        semanticReadiness: semanticCompilation.semanticReadiness,
-        unownedMaterialControls: semanticCompilation.unownedMaterialControls,
-        unresolvedDecisions: semanticCompilation.unresolvedDecisions,
-        currentExecutableObligations: semanticCompilation.currentExecutableObligations,
-        evidence: semanticCompilation.evidence || {}
-      },
+      decisionContracts: decisionGroups.map((group) => group.decisionContract).filter(Boolean),
       sections,
       taskQueue,
       stageExit,
@@ -13251,8 +13499,6 @@
         graphIntegrityResolvedConflicts: graphIntegrity.resolvedConflictCount,
         duplicateElementRekeys: graphIntegrity.duplicateElementRekeyCount,
         decisionGroups: decisionGroups.length,
-        semanticReadiness: semanticCompilation.semanticReadiness,
-        unownedMaterialControls: semanticCompilation.unownedMaterialControls.length,
         overlays: overlays.length,
         errors: errors.length,
         paidChoices: paidChoices.length,
@@ -13527,30 +13773,23 @@
       syncIncrementalControlModels(next, controlsById);
       syncRequiredProfileChoiceGroups(next.fields || [], next.controls || [], next.sections || []);
       next.decisionGroups = buildCanonicalDecisionGroups(next.sections || [], next.controls, next.currentSurface || {});
-      if (AGENT_CONTRACT?.compileSemanticCheckout) {
-        const semanticCompilation = AGENT_CONTRACT.compileSemanticCheckout({
-          ...next,
-          visibleText: next.fullText || next.text || ""
-        });
-        next.controls = semanticCompilation.controls;
-        next.decisionGroups = semanticCompilation.decisionGroups;
-        next.decisionContracts = semanticCompilation.decisionContracts;
-        next.semanticReadiness = semanticCompilation.semanticReadiness;
-        next.semanticCompilation = {
-          contractVersion: semanticCompilation.contractVersion,
-          semanticReadiness: semanticCompilation.semanticReadiness,
-          unownedMaterialControls: semanticCompilation.unownedMaterialControls,
-          unresolvedDecisions: semanticCompilation.unresolvedDecisions,
-          currentExecutableObligations: semanticCompilation.currentExecutableObligations,
-          evidence: semanticCompilation.evidence || {}
-        };
-      }
+      next.decisionContracts = next.decisionGroups
+        .map((group) => group.decisionContract)
+        .filter(Boolean);
       // transactionFacts.selectedExtras is the observation's canonical outcome
       // snapshot. Compact recovery may refresh controls and decisions, but it
       // must not replace that snapshot with only the choices still visible
       // after a rerender. The backend compiler safely enriches it from the
       // refreshed canonical decisions and the durable outcome ledger.
-      next.stageExit = buildStageExit(next.decisionGroups, next.fields, next.buttons, next.overlays, next.errors, next.step, next.controls);
+      next.stageExit = buildAuthoritativeStageExit({
+        decisionGroups: next.decisionGroups,
+        fields: next.fields,
+        buttons: next.buttons,
+        errors: next.errors,
+        step: next.step,
+        controls: next.controls,
+        currentSurface: next.currentSurface
+      });
       next.summary = {
         ...(next.summary || {}),
         fields: next.fields.length,
@@ -13558,8 +13797,6 @@
         buttons: next.buttons.length,
         controls: next.controls.length,
         decisionGroups: next.decisionGroups.length,
-        semanticReadiness: next.semanticReadiness || "ready",
-        unownedMaterialControls: next.semanticCompilation?.unownedMaterialControls?.length || 0,
         continueAllowed: next.stageExit.continueAllowed
       };
       return next;
@@ -15112,6 +15349,19 @@
     };
   }
 
+  function referenceObservationTransport(payload = {}) {
+    const update = payload.observationUpdate || {};
+    if (update.mode !== "reference" || !update.baseSnapshotHash) return payload;
+    return {
+      ...compactObservationActionContext(payload),
+      transportMode: "observation_reference",
+      page: {
+        referenceOnly: true,
+        snapshotHash: update.snapshotHash || update.baseSnapshotHash
+      }
+    };
+  }
+
   async function uploadObservationScreenshot(apiBase, { sessionId, observationId, screenshotDataUrl, signal }) {
     if (!screenshotDataUrl) return "";
     const response = await fetch(`${apiBase}/agent/screenshot`, {
@@ -15131,8 +15381,22 @@
   }
 
   async function postObservationWithSizeRecovery(apiBase, payload, signal) {
-    const fullPayload = boundedObservationTransport(compactObservationActionContext(payload));
-    let outgoing = incrementalObservationTransport(fullPayload);
+    const canonicalPayload = boundedObservationTransport(compactObservationActionContext(payload));
+    const referenceOnly = payload.observationUpdate?.mode === "reference";
+    const fullPayload = referenceOnly
+      ? {
+          ...canonicalPayload,
+          transportMode: "full_resynchronization",
+          observationUpdate: {
+            ...(canonicalPayload.observationUpdate || {}),
+            mode: "full_snapshot",
+            baseSnapshotHash: ""
+          }
+        }
+      : canonicalPayload;
+    let outgoing = referenceOnly
+      ? referenceObservationTransport(canonicalPayload)
+      : incrementalObservationTransport(fullPayload);
     let bytes = observationTransportBytes(outgoing);
     if (bytes > MAX_OBSERVATION_TRANSPORT_BYTES) {
       outgoing = smallerObservationTransport(outgoing);
@@ -15189,6 +15453,17 @@
     const destinationReadinessRetry = Boolean(
       agent.destinationWait?.status === "WAITING_FOR_DESTINATION"
     );
+    const reobserveRetryToken = String(agent.destinationWait?.retryToken || "");
+    const retryTokenAvailable = Boolean(
+      destinationReadinessRetry
+      && reobserveRetryToken
+      && !agent.honoredReobserveRetryTokens.has(reobserveRetryToken)
+    );
+    const unchangedObservation = Boolean(
+      agent.lastSentMaterialHash === materialHash
+      && agent.lastSentFeedbackKey === feedbackKey
+    );
+    const referenceRetryAuthorized = Boolean(retryTokenAvailable && unchangedObservation);
     if (
       !userMessage
       && !destinationReadinessRetry
@@ -15210,15 +15485,22 @@
     if (
       destinationReadinessRetry
       && !userMessage
-      && agent.lastSentMaterialHash === materialHash
-      && agent.lastSentFeedbackKey === feedbackKey
+      && unchangedObservation
+      && agent.destinationWait.deadlineObservationSent !== true
+      && !referenceRetryAuthorized
     ) {
-      logFlow("backend.request.unchanged_readiness_retry_allowed", {
+      logFlow("backend.request.unchanged_readiness_retry_suppressed", {
         materialHash,
         feedbackKey,
         attempts: agent.destinationWait.attempts,
         elapsedMs: Date.now() - agent.destinationWait.startedAt
       });
+      setAgentActivity(
+        "Waiting for page changes",
+        "The checkout state is unchanged. I will resume on a material page mutation or at the readiness deadline."
+      );
+      renderSidebar("agent");
+      return null;
     }
     if (agent.activePlannerRequest) {
       logFlow("backend.request.duplicate_suppressed", {
@@ -15313,14 +15595,19 @@
       });
       const requestStartedAt = performance.now();
       const canonicalPage = compactPageMap(map, observationId);
+      const observationMode = referenceRetryAuthorized
+        ? "reference"
+        : clientLatency.observation_mode || "full_snapshot";
       const observationPayload = {
         sessionId: agent.sessionId,
         clientTurnId: turnId,
         observationId,
         observationSnapshot,
         observationUpdate: {
-          mode: clientLatency.observation_mode || "full_snapshot",
-          baseSnapshotHash: clientLatency.base_snapshot_hash || "",
+          mode: observationMode,
+          baseSnapshotHash: referenceRetryAuthorized
+            ? materialHash
+            : clientLatency.base_snapshot_hash || "",
           snapshotHash: materialHash,
           diff: clientLatency.observation_diff || emptyPageStateDiff()
         },
@@ -15334,7 +15621,8 @@
           deadlineAt: agent.destinationWait.deadlineAt,
           attempts: agent.destinationWait.attempts,
           backendWaits: agent.destinationWait.backendWaits,
-          deadlineObservationSent: agent.destinationWait.deadlineObservationSent
+          deadlineObservationSent: agent.destinationWait.deadlineObservationSent,
+          retryToken: agent.destinationWait.retryToken || ""
         } : null,
 	      approvalState: {
 	        skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
@@ -15376,6 +15664,9 @@
       }
       agent.lastSentMaterialHash = materialHash;
       agent.lastSentFeedbackKey = feedbackKey;
+      if (referenceRetryAuthorized) {
+        agent.honoredReobserveRetryTokens.add(reobserveRetryToken);
+      }
       const requestUploadMs = Math.round(performance.now() - requestStartedAt);
       logFlow("backend.request.transport", {
         turnId,
@@ -16903,9 +17194,15 @@
     } finally {
       shouldRerun = finishAgentLoop(loopToken);
       if (agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
-        if (shouldRerun || agent.destinationWait.wakeRequested) {
-          scheduleDestinationObservation("active_loop_closed", DESTINATION_RETRY_INTERVAL_MS);
-        }
+        const remaining = Math.max(0, agent.destinationWait.deadlineAt - Date.now());
+        const materialWakePending = agent.destinationWait.wakeRequested === true
+          && agent.destinationWait.lastWakeReason === "dom_mutation";
+        // A material MutationObserver event may wake earlier. Otherwise send
+        // exactly one deadline observation instead of polling every interval.
+        scheduleDestinationObservation(
+          materialWakePending ? "dom_mutation" : "readiness_deadline",
+          materialWakePending ? DESTINATION_MUTATION_SETTLE_MS : remaining
+        );
       } else if (shouldRerun) {
         setTimeout(() => processCheckoutAgent(), 0);
       }
@@ -17657,7 +17954,7 @@
       });
       if (pageChanged && externalPageMutation) scheduleSelectedBookingCapture("dom_mutation");
       if (pageChanged && agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
-        scheduleDestinationObservation("dom_mutation", 0);
+        scheduleDestinationObservation("dom_mutation", DESTINATION_MUTATION_SETTLE_MS);
       }
       if (!pageChanged || renderTimer) return;
       renderTimer = setTimeout(() => {
@@ -17729,6 +18026,7 @@
         loopRerunQueued: agent.loopRerunQueued,
         activeLoopRunId: agent.activeLoopRunId,
         destinationWait: agent.destinationWait ? { ...agent.destinationWait } : null,
+        honoredReobserveRetryTokens: [...agent.honoredReobserveRetryTokens],
         destinationWaitTimerActive: Boolean(agent.destinationWaitTimer),
         activePlannerRequest: agent.activePlannerRequest ? {
           turnId: agent.activePlannerRequest.turnId,
@@ -17755,10 +18053,12 @@
       observationNeedsScreenshot,
       compactActionResultForTransport,
       compactObservationActionContext,
+      compactFlowLogPayload,
       boundedObservationTransport,
       boundHighCardinalityActionElements,
       smallerObservationTransport,
       incrementalObservationTransport,
+      referenceObservationTransport,
       uploadObservationScreenshot,
       postObservationWithSizeRecovery,
       prepareScreenshotAnnotations,

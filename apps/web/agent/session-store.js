@@ -4,9 +4,11 @@ const { DatabaseSync } = require("node:sqlite");
 
 const { createCheckoutSessionState, withUpdate } = require("../../../packages/shared/agent-state");
 const { actionSignature, actuatorSignature, normalizeAction, semanticGoalKey } = require("../../../packages/shared/agent-actions");
+const { taskBindingGoal } = require("./authority-frames");
 
+const LEGACY_REPLAY_DB_PATH = path.resolve(__dirname, "../../../work/agent-transactions.sqlite");
 const DEFAULT_DB_PATH = process.env.ATW_TRANSACTION_DB
-  || path.resolve(__dirname, "../../../work/agent-transactions.sqlite");
+  || path.resolve(__dirname, "../../../work/agent-transactions-v2.sqlite");
 
 function json(value, fallback = null) {
   try {
@@ -42,6 +44,8 @@ function eventSummary(value, depth = 0) {
     "page",
     "controls",
     "candidateSet",
+    "candidates",
+    "recoveryCandidates",
     "contextCapabilities",
     "screenshotDataUrl",
     // These collections are observation-local execution evidence. Persisting
@@ -125,22 +129,6 @@ function redactedObservation(observation = {}) {
   return { ...observation, page };
 }
 
-function compactGoal(goal = null) {
-  if (!goal || typeof goal !== "object") return goal || null;
-  const {
-    candidateSet,
-    candidates,
-    contextCapabilities,
-    recoveryCandidates,
-    excludedCandidates,
-    capabilityContracts,
-    interactionView,
-    observation,
-    ...durable
-  } = goal;
-  return durable;
-}
-
 function compactDecision(decision = {}) {
   const subject = decision.subject || {};
   const observed = decision.observed || decision.observation || {};
@@ -183,39 +171,195 @@ function compactDecision(decision = {}) {
   });
 }
 
+function compactCurrentObligation(obligation = null) {
+  if (!obligation || typeof obligation !== "object") return obligation || null;
+  const goal = taskBindingGoal({ currentObligation: obligation }) || {};
+  return {
+    ...obligation,
+    // Only the minimum restart continuity needed to rebuild fresh mechanics.
+    // Candidate graphs, page controls, policy projections and verifier state
+    // remain observation-local and are never copied into the session row.
+    bindingResume: {
+      semanticType: goal.semanticType || obligation.subject?.semanticType || "",
+      family: goal.family || obligation.subject?.family || "",
+      subjectId: goal.subjectId || obligation.subject?.subjectId || "global",
+      decisionGroupId: goal.decisionGroupId || obligation.subject?.decisionGroupId || "",
+      requirementId: goal.requirementId || obligation.subject?.requirementId || "",
+      logicalFieldId: goal.logicalFieldId || obligation.subject?.logicalFieldId || "",
+      controlId: goal.controlId || obligation.admittedControlIds?.[0] || "",
+      componentRole: goal.componentRole || "value",
+      desiredValue: goal.desiredValue ?? obligation.desiredValue ?? "",
+      canonicalValue: goal.canonicalValue ?? goal.desiredValue ?? obligation.desiredValue ?? "",
+      choiceLike: goal.choiceLike === true,
+      selectionMode: goal.selectionMode || "",
+      choiceTerms: Array.isArray(goal.choiceTerms) ? goal.choiceTerms.slice(0, 24) : [],
+      dateCodec: goal.dateCodec ? eventSummary(goal.dateCodec) : null,
+      adaptiveEnvelope: goal.adaptiveEnvelope ? eventSummary(goal.adaptiveEnvelope) : null
+    }
+  };
+}
+
 function compactTaskState(taskState = null) {
   if (!taskState || typeof taskState !== "object") return taskState || null;
-  const {
-    processAwareness,
-    semanticOwnershipResolutions,
-    semanticCompilation,
-    currentGoal,
-    canonicalDecisions,
-    observedDecisions,
-    ...durable
-  } = taskState;
+  const verificationDecisionMemory = taskState.verificationDecisionMemory || taskState.canonicalDecisions;
   return {
-    ...durable,
-    currentGoal: compactGoal(currentGoal),
-    canonicalDecisions: Array.isArray(canonicalDecisions)
-      ? canonicalDecisions.slice(-160).map(compactDecision)
-      : [],
-    observedDecisions: Array.isArray(observedDecisions)
-      ? observedDecisions.slice(-160).map(compactDecision)
+    contractVersion: String(taskState.contractVersion || "task-state/v2"),
+    goal: eventSummary(taskState.goal || null),
+    userPreferences: eventSummary(taskState.userPreferences || {}),
+    safetyRestrictions: eventSummary(taskState.safetyRestrictions || {}),
+    terminalGoalLatch: eventSummary(taskState.terminalGoalLatch || null),
+    checkoutBoundary: eventSummary(taskState.checkoutBoundary || null),
+    stage: String(taskState.stage || "unknown"),
+    transactionOutcome: eventSummary(taskState.transactionOutcome || null),
+    stageOutcome: eventSummary(taskState.stageOutcome || null),
+    surfaceSubgoal: eventSummary(taskState.surfaceSubgoal || null),
+    decisionEpisode: eventSummary(taskState.decisionEpisode || null),
+    verifiedCommerceObligations: eventSummary(taskState.verifiedCommerceObligations || []),
+    verifiedProfileComponents: eventSummary(taskState.verifiedProfileComponents || []),
+    outcomeJournal: eventSummary(taskState.outcomeJournal || []),
+    outcomeCoverage: eventSummary(taskState.outcomeCoverage || null),
+    completedOutcomes: eventSummary(taskState.completedOutcomes || []),
+    currentObligation: compactCurrentObligation(taskState.currentObligation),
+    disposition: eventSummary(taskState.disposition || null),
+    decisionFrameId: String(taskState.decisionFrameId || ""),
+    terminalStatus: String(taskState.terminalStatus || "active"),
+    surfaceFingerprint: String(taskState.surfaceFingerprint || ""),
+    meaningfulSurfaceChange: taskState.meaningfulSurfaceChange === true,
+    clearObsoleteRecovery: taskState.clearObsoleteRecovery === true,
+    parentObjective: eventSummary(taskState.parentObjective || null),
+    verificationDecisionMemory: Array.isArray(verificationDecisionMemory)
+      ? verificationDecisionMemory.slice(-80).map(compactDecision)
       : []
   };
 }
 
-function compactSessionState(state = {}) {
-  const {
-    currentGoal,
-    currentObligation,
-    taskState,
-    ...durable
-  } = state;
+function compactTransactionInvariants(envelope = null) {
+  if (!envelope || typeof envelope !== "object") return envelope || null;
   return {
-    ...durable,
-    taskState: compactTaskState(taskState)
+    version: envelope.version,
+    baseline: eventSummary(envelope.baseline || null),
+    current: eventSummary(envelope.current || null),
+    outcomeLedger: eventSummary(envelope.outcomeLedger || []),
+    reviewFacts: eventSummary(envelope.reviewFacts || null),
+    baselineStatus: String(envelope.baselineStatus || ""),
+    baselineObservationId: String(envelope.baselineObservationId || ""),
+    approvedAt: String(envelope.approvedAt || ""),
+    // Price/itinerary history is needed for consequence checks, but sixty full
+    // transaction graphs are not. Keep only a bounded recent safety window.
+    evidence: Array.isArray(envelope.evidence)
+      ? envelope.evidence.slice(-8).map((entry) => ({
+          observationId: String(entry.observationId || ""),
+          observedAt: String(entry.observedAt || ""),
+          facts: {
+            totalPrice: eventSummary(entry.facts?.totalPrice || null),
+            currency: String(entry.facts?.currency || entry.facts?.totalPrice?.currency || "")
+          }
+        }))
+      : [],
+    // Review is deterministically rebuilt from baseline/current/outcomes on
+    // the next observation; persisting it copied the same transaction graph.
+    review: null
+  };
+}
+
+function compactRecoveryState(recovery = null) {
+  if (!recovery || typeof recovery !== "object") return recovery || null;
+  const compactFailure = (entry = {}) => ({
+    goalKey: String(entry.goalKey || ""),
+    semanticGoalKey: String(entry.semanticGoalKey || ""),
+    decisionInstanceId: String(entry.decisionInstanceId || ""),
+    strategySignature: String(entry.strategySignature || entry.actuatorSignature || ""),
+    controlId: String(entry.controlId || ""),
+    stableControlKey: String(entry.stableControlKey || ""),
+    targetId: String(entry.targetId || ""),
+    capability: String(entry.capability || entry.operation || ""),
+    operation: String(entry.operation || entry.capability || ""),
+    semanticEffect: String(entry.semanticEffect || ""),
+    observationId: String(entry.observationId || ""),
+    pageStateHash: String(entry.pageStateHash || ""),
+    actuatorStableKey: String(entry.actuatorStableKey || ""),
+    surfaceInstanceKey: String(entry.surfaceInstanceKey || ""),
+    targetLocalStateKey: String(entry.targetLocalStateKey || ""),
+    failureCount: Number(entry.failureCount || 0),
+    code: String(entry.code || "")
+  });
+  return {
+    attempts: Number(recovery.attempts || 0),
+    phase: String(recovery.phase || "idle"),
+    stateHash: String(recovery.stateHash || ""),
+    attemptedCandidateIds: Array.isArray(recovery.attemptedCandidateIds)
+      ? recovery.attemptedCandidateIds.slice(-40).map(String)
+      : [],
+    failedStrategies: Array.isArray(recovery.failedStrategies)
+      ? recovery.failedStrategies.slice(-80).map(compactFailure)
+      : [],
+    failedStrategySignatures: Array.isArray(recovery.failedStrategySignatures)
+      ? recovery.failedStrategySignatures.slice(-80).map(String)
+      : [],
+    // This tiny sample is durable recovery state, not page perception. It is
+    // required to distinguish a genuinely stuck reveal from measurable
+    // viewport progress after a restart/round trip.
+    lastRevealSample: recovery.lastRevealSample && typeof recovery.lastRevealSample === "object"
+      ? {
+          observationId: String(recovery.lastRevealSample.observationId || ""),
+          exists: recovery.lastRevealSample.exists === true,
+          inViewport: recovery.lastRevealSample.inViewport === true,
+          distanceToViewport: Number.isFinite(Number(recovery.lastRevealSample.distanceToViewport))
+            ? Number(recovery.lastRevealSample.distanceToViewport)
+            : null,
+          measurableProgress: recovery.lastRevealSample.measurableProgress === true
+        }
+      : null,
+    lastCode: String(recovery.lastCode || ""),
+    updatedAt: String(recovery.updatedAt || "")
+  };
+}
+
+function compactPendingAction(pending = null) {
+  if (!pending || typeof pending !== "object") return pending || null;
+  return eventSummary({
+    ...pending,
+    originalAction: pending.originalAction ? governedActionSummary(pending.originalAction) : undefined,
+    semanticGoal: pending.semanticGoal ? eventSummary(pending.semanticGoal) : undefined,
+    candidate: pending.candidate ? eventSummary(pending.candidate) : undefined
+  });
+}
+
+function compactSessionState(state = {}) {
+  // This is an allowlist, not a blacklist. Browser controls, observations,
+  // candidate graphs, model caches, read models, and diagnostic projections
+  // are reconstructed from the immutable current observation each turn.
+  return {
+    id: String(state.id || ""),
+    status: String(state.status || "running"),
+    goal: String(state.goal || ""),
+    travelerId: String(state.travelerId || ""),
+    travelerIds: eventSummary(state.travelerIds || []),
+    userPolicy: eventSummary(state.userPolicy || {}),
+    sessionProfileOverrides: eventSummary(state.sessionProfileOverrides || {}),
+    pendingUserInput: eventSummary(state.pendingUserInput || null),
+    site: eventSummary(state.site || {}),
+    currentStep: String(state.currentStep || "unknown"),
+    approvals: eventSummary(state.approvals || {}),
+    lastAction: state.lastAction ? governedActionSummary(state.lastAction) : null,
+    failures: eventSummary((state.failures || []).slice(-80)),
+    currentObservationId: String(state.currentObservationId || ""),
+    currentObservationHash: String(state.currentObservationHash || ""),
+    taskState: compactTaskState(state.taskState),
+    terminalGoalLatch: eventSummary(state.terminalGoalLatch || null),
+    observationReadiness: eventSummary(state.observationReadiness || null),
+    pendingAction: compactPendingAction(state.pendingAction),
+    actionLifecycle: eventSummary(state.actionLifecycle || null),
+    fastStaleRecovery: eventSummary(state.fastStaleRecovery || null),
+    recoveryState: compactRecoveryState(state.recoveryState),
+    verifiedResults: eventSummary((state.verifiedResults || []).slice(-160)),
+    pendingMechanicalEvidence: eventSummary(state.pendingMechanicalEvidence || null),
+    transactionInvariants: compactTransactionInvariants(state.transactionInvariants),
+    paymentState: eventSummary(state.paymentState || {}),
+    confirmationState: eventSummary(state.confirmationState || {}),
+    stallCount: Math.max(0, Number(state.stallCount || 0)),
+    createdAt: String(state.createdAt || ""),
+    updatedAt: String(state.updatedAt || "")
   };
 }
 
@@ -514,7 +658,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       at: String(result.at || nowIso()),
       actionSignature: actionSignature(action),
       actuatorSignature: signature,
-      goalKey: semanticGoalKey(action.affordance?.task ? action : (state.taskState?.currentGoal || action)),
+      goalKey: semanticGoalKey(action.affordance?.task ? action : (taskBindingGoal(state.taskState || {}) || action)),
       decisionInstanceId: action.decisionInstanceId,
       actionId: String(result.actionId || action.id || ""),
       observationId: String(result.observationId || ""),
@@ -552,7 +696,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
         const dispatched = result.dispatched === true || result.executed === true;
         const status = dispatched ? "dispatched" : "rejected_before_dispatch";
         advanceGovernedAction(actionId, ["allowed", "approved", "dispatched"], status, result);
-        recordActionEvent(updated.id, {
+        insertActionEventRow(updated.id, {
           actionId,
           observationId: String(result.observationId || ""),
           stage: status,
@@ -567,22 +711,43 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     }
   }
 
-  function recordActionEvent(transactionId, event = {}) {
-    if (!transactionId) return null;
-    const at = String(event.at || nowIso());
-    const outcome = db.prepare(`
+  const insertActionEvent = db.prepare(`
       INSERT INTO action_events(transaction_id, action_id, turn_id, observation_id, stage, payload_json, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `);
+
+  function insertActionEventRow(transactionId, event = {}) {
+    const at = String(event?.at || nowIso());
+    const outcome = insertActionEvent.run(
       transactionId,
-      String(event.actionId || ""),
-      String(event.turnId || ""),
-      String(event.observationId || ""),
-      String(event.stage || "event"),
-      json(eventSummary(event), {}),
+      String(event?.actionId || ""),
+      String(event?.turnId || ""),
+      String(event?.observationId || ""),
+      String(event?.stage || "event"),
+      json(eventSummary(event || {}), {}),
       at
     );
     return Number(outcome.lastInsertRowid);
+  }
+
+  function recordActionEvents(transactionId, events = []) {
+    if (!transactionId || !Array.isArray(events) || !events.length) return [];
+    const ids = [];
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const event of events) {
+        ids.push(insertActionEventRow(transactionId, event));
+      }
+      db.exec("COMMIT");
+      return ids;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  function recordActionEvent(transactionId, event = {}) {
+    return recordActionEvents(transactionId, [event])[0] || null;
   }
 
   function reconstructTransaction(transactionId) {
@@ -629,6 +794,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     getGovernedAction,
     recordActionResult,
     recordActionEvent,
+    recordActionEvents,
     reconstructTransaction,
     close
   };
@@ -655,6 +821,7 @@ const DEFAULT_METHODS = [
   "getGovernedAction",
   "recordActionResult",
   "recordActionEvent",
+  "recordActionEvents",
   "reconstructTransaction"
 ];
 
@@ -668,5 +835,9 @@ module.exports = {
   createStore,
   compactSessionState,
   getDefaultStore,
-  DEFAULT_DB_PATH
+  DEFAULT_DB_PATH,
+  // The multi-GB V1 evidence store is intentionally never migrated or
+  // rewritten by the V2 runtime. Replay tooling may opt into this explicit
+  // path, while all fresh live sessions use the compact V2 database above.
+  LEGACY_REPLAY_DB_PATH
 };

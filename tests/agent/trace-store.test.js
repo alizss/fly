@@ -5,6 +5,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { writeTrace } = require("../../apps/web/agent/trace-store");
+const {
+  appendRotatingJsonLine,
+  diagnosticsWritable,
+  pruneTraceRoot,
+  retentionConfig
+} = require("../../apps/web/agent/diagnostic-retention");
 
 test("trace persistence stores one compact observation and references prior evidence by identity", () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fly-trace-"));
@@ -70,6 +76,63 @@ test("trace persistence stores one compact observation and references prior evid
     assert.equal(record.observation.page.text, undefined);
     assert.equal(record.debug.taskState.currentGoal.candidateSet, undefined);
     assert.ok(Buffer.byteLength(raw) < 180_000, `trace was ${Buffer.byteLength(raw)} bytes`);
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic retention caps ordinary trace sessions while preserving the current and pinned evidence", () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fly-retention-"));
+  const root = path.join(dataDir, "agent-traces");
+  try {
+    const oldDir = path.join(root, "old_session");
+    const currentDir = path.join(root, "current_session");
+    const pinnedDir = path.join(root, "accepted_canary");
+    for (const dir of [oldDir, currentDir, pinnedDir]) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(oldDir, "old.json"), "old");
+    fs.writeFileSync(path.join(currentDir, "current.json"), "current");
+    fs.writeFileSync(path.join(pinnedDir, ".pinned"), "accepted");
+    fs.writeFileSync(path.join(pinnedDir, "canary.json"), "canary");
+    const oldTime = new Date(Date.now() - 10_000);
+    fs.utimesSync(oldDir, oldTime, oldTime);
+
+    const config = {
+      ...retentionConfig({}),
+      traceSessions: 0,
+      traceAgeMs: 60_000,
+      traceSessionBytes: 1024,
+      traceSessionFiles: 4
+    };
+    const result = pruneTraceRoot(root, { preserveSessionId: "current_session", config });
+    assert.equal(fs.existsSync(oldDir), false);
+    assert.equal(fs.existsSync(currentDir), true);
+    assert.equal(fs.existsSync(pinnedDir), true);
+    assert.equal(fs.existsSync(path.join(pinnedDir, ".pinned")), true);
+    assert.equal(result.removedSessions.includes(oldDir), true);
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic JSONL rotates to a bounded number of compact files and fails open on low disk", async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fly-log-rotation-"));
+  const filePath = path.join(dataDir, "session.jsonl");
+  try {
+    const config = {
+      ...retentionConfig({}),
+      minFreeBytes: 1,
+      logFileBytes: 220,
+      logSegments: 3,
+      logFiles: 10,
+      logAgeMs: 60_000
+    };
+    for (let index = 0; index < 12; index += 1) {
+      await appendRotatingJsonLine(filePath, { index, payload: "x".repeat(70) }, { config });
+    }
+    const files = fs.readdirSync(dataDir).filter((name) => name.startsWith("session.jsonl"));
+    assert.ok(files.length <= 3, JSON.stringify(files));
+    assert.ok(files.every((name) => fs.statSync(path.join(dataDir, name)).size <= config.logFileBytes));
+    assert.equal(diagnosticsWritable(dataDir, { ...config, minFreeBytes: Number.MAX_SAFE_INTEGER }), false);
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }

@@ -5,10 +5,16 @@ const { callStructured } = require("../../apps/web/agent/openai-client");
 const {
   activeUnknownComponents,
   applySemanticBinding,
+  unknownComponentsForObligation,
   resolveActiveComponentSemantics
 } = require("../../apps/web/agent/active-component-grounding");
-const { resolveSemanticOwnership, selectCandidate } = require("../../apps/web/agent/select-candidate");
-const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
+const { selectCandidate } = require("../../apps/web/agent/select-candidate");
+const {
+  resolveSemanticOwnership,
+  reusableSemanticOwnershipDecision,
+  semanticOwnershipCacheEntry
+} = require("./legacy-semantic-ownership-adapter");
+const { reduceTaskState } = require("./task-state-replay-adapter");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
@@ -58,8 +64,49 @@ function activeUnknownProfileObservation() {
 }
 
 test("active semantic grounding admits only the current lifecycle representation", () => {
-  const components = activeUnknownComponents(activeUnknownProfileObservation());
+  const components = activeUnknownComponents(activeUnknownProfileObservation(), {
+    admittedControlIds: ["mystery_age"]
+  });
   assert.deepEqual(components.map((component) => component.controlId), ["mystery_age"]);
+});
+
+test("unknown grounding can block only its exact admitted profile obligation", () => {
+  const observation = activeUnknownProfileObservation();
+  const preliminary = reduceTaskState({
+    observation,
+    traveler: { date_of_birth: "2003-05-31" }
+  });
+  const admitted = unknownComponentsForObligation(observation, preliminary.currentGoal);
+  assert.deepEqual(admitted.map((component) => component.controlId), ["mystery_age"]);
+
+  const groundedObservation = {
+    ...observation,
+    page: {
+      ...observation.page,
+      activeRequirementGrounding: {
+        contractVersion: "active-component-semantic-grounding/v1",
+        status: "unknown",
+        reasonCode: "ACTIVE_REQUIREMENT_UNRESOLVED",
+        candidateComponentIds: ["mystery_age"],
+        evidence: "The exact admitted component does not expose enough traveler semantics."
+      }
+    }
+  };
+  const finalState = reduceTaskState({
+    observation: groundedObservation,
+    traveler: { date_of_birth: "2003-05-31" }
+  });
+  const candidateSet = buildCurrentCandidateSet({
+    goal: finalState.currentGoal,
+    observation: groundedObservation,
+    traveler: { date_of_birth: "2003-05-31" },
+    state: { taskState: finalState, approvals: {} }
+  });
+
+  assert.equal(finalState.currentGoal.admission.status, "blocked");
+  assert.equal(finalState.currentGoal.ambiguity.code, "ACTIVE_REQUIREMENT_UNRESOLVED");
+  assert.equal(finalState.profileReadiness.ready, true);
+  assert.deepEqual(candidateSet.candidates, []);
 });
 
 test("an unblocked executable stage exit suppresses unknown-component grounding authority", () => {
@@ -73,7 +120,9 @@ test("an unblocked executable stage exit suppresses unknown-component grounding 
     candidates: [{ controlId: "continue", status: "ready", executable: true }]
   };
 
-  assert.deepEqual(activeUnknownComponents(observation), []);
+  assert.deepEqual(activeUnknownComponents(observation, {
+    admittedControlIds: ["mystery_age"]
+  }), []);
 });
 
 test("disabled navigation does not promote a generic container into an active semantic requirement", () => {
@@ -103,7 +152,9 @@ test("disabled navigation does not promote a generic container into an active se
     operations: {}
   }];
 
-  assert.deepEqual(activeUnknownComponents(observation), []);
+  assert.deepEqual(activeUnknownComponents(observation, {
+    admittedControlIds: ["passenger_container"]
+  }), []);
 });
 
 test("bounded semantic grounding can only apply an exact supplied binding tuple", () => {
@@ -136,7 +187,7 @@ test("bounded semantic grounding can only apply an exact supplied binding tuple"
   assert.equal(rejected.page.activeRequirementGrounding.reasonCode, "ACTIVE_REQUIREMENT_UNRESOLVED");
 });
 
-test("pre-goal grounding sends a binding-only InteractionView and returns no browser action", async () => {
+test("obligation-scoped grounding sends a binding-only InteractionView and returns no browser action", async () => {
   const previousFetch = global.fetch;
   let request = null;
   global.fetch = async (_url, options) => {
@@ -163,7 +214,8 @@ test("pre-goal grounding sends a binding-only InteractionView and returns no bro
       apiKey: "test-key",
       model: "test-model",
       observation: activeUnknownProfileObservation(),
-      traveler: { date_of_birth: "2003-05-31" }
+      traveler: { date_of_birth: "2003-05-31" },
+      admittedControlIds: ["mystery_age"]
     });
     const payload = JSON.parse(request.input[0].content[0].text);
 
@@ -178,6 +230,95 @@ test("pre-goal grounding sends a binding-only InteractionView and returns no bro
   } finally {
     global.fetch = previousFetch;
   }
+});
+
+test("a GoToGate paid bundle cannot enter profile grounding ahead of its admitted free decline", () => {
+  const choiceCapability = (controlId) => ({
+    choose: {
+      actuatorId: controlId,
+      status: "executable",
+      strategies: [{ method: "native_click" }],
+      actionability: {
+        executable: true,
+        rendered: true,
+        visible: true,
+        hitTested: true,
+        notOccluded: true
+      }
+    }
+  });
+  const paid = [29, 41, 46].map((amount, index) => ({
+    controlId: `bundle_paid_${index}`,
+    surfaceId: "surface-page",
+    role: "radio",
+    kind: "radio",
+    label: `Bundle ${amount} EUR`,
+    semantic: "add_paid_extra",
+    physicalEffect: "select_paid_option",
+    risk: "money",
+    required: true,
+    representationLifecycle: { status: "active_rendered", active: true },
+    state: { valuePresent: false, selected: false, checked: false, required: true },
+    structuredPrice: { amount, currency: "EUR" },
+    operations: choiceCapability(`bundle_paid_${index}`)
+  }));
+  const decline = {
+    controlId: "bundle_no_thanks",
+    surfaceId: "surface-page",
+    role: "checkbox",
+    kind: "checkbox",
+    label: "No, thanks — continue without bundle",
+    semantic: "decline_paid_extra",
+    physicalEffect: "select_free_option",
+    risk: "safe_decline",
+    required: false,
+    representationLifecycle: { status: "active_rendered", active: true },
+    state: { valuePresent: false, selected: false, checked: false },
+    operations: choiceCapability("bundle_no_thanks")
+  };
+  const observation = {
+    observationId: "obs_gotogate_bundle_after_profile",
+    page: {
+      url: "https://en-en.gotogate.com/rf/traveler-details",
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [...paid, decline],
+      fields: [],
+      validationIssues: [],
+      decisionGroups: [{
+        decisionGroupId: "gotogate_bundle",
+        requirementId: "bundle:travel_essentials",
+        surfaceId: "surface-page",
+        sectionType: "bundle",
+        sectionLabel: "Add a bundle with your travel essentials",
+        required: false,
+        status: "optional",
+        alternatives: [...paid, decline].map((control) => ({
+          controlId: control.controlId,
+          label: control.label,
+          semantic: control.semantic,
+          physicalEffect: control.physicalEffect,
+          risk: control.risk,
+          structuredPrice: control.structuredPrice || null,
+          selected: false
+        }))
+      }]
+    }
+  };
+  const taskState = reduceTaskState({
+    observation,
+    userPolicy: { bookingRules: "No support bundles and no paid extras." },
+    traveler: { booking_rules: "No support bundles and no paid extras." }
+  });
+
+  assert.deepEqual(
+    activeUnknownComponents(observation, { admittedControlIds: paid.map((control) => control.controlId) })
+      .map((control) => control.controlId),
+    paid.map((control) => control.controlId)
+  );
+  assert.deepEqual(taskState.currentGoal.candidateControlIds, [decline.controlId]);
+  assert.equal(taskState.currentGoal.canonicalSubject.family, "extras");
+  assert.deepEqual(unknownComponentsForObligation(observation, taskState.currentGoal), []);
 });
 
 test("authenticated empty model output is retried before being reported as unavailable", async () => {
@@ -638,7 +779,7 @@ test("semantic ambiguity can only resolve an observed decision group and its own
   }
 });
 
-test("transaction facts trigger semantic ownership when live decision fields are missing", async () => {
+test("diagnostic semantic grounding cannot manufacture a transaction conflict", async () => {
   const previousFetch = global.fetch;
   let request = null;
   global.fetch = async (_url, options) => {
@@ -792,7 +933,7 @@ test("transaction facts trigger semantic ownership when live decision fields are
       traveler,
       state: { taskState, approvals: {} }
     });
-    assert.equal(taskState.activeDecisions[0].status, "conflicted");
+    assert.equal(taskState.activeDecisions[0].status, "active");
     assert.equal(taskState.currentGoal.decisionGroupId, "dg_live_paid_summary");
     assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["ctrl_live_reversal"]);
     assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_live_advance").selectable, false);
@@ -965,13 +1106,13 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
       traveler
     );
     const ownershipCache = {
-      semanticOwnership: loopPrivate.semanticOwnershipCacheEntry(
+      semanticOwnership: semanticOwnershipCacheEntry(
         resolved.observation,
         ownershipPolicyFingerprint,
         resolved.resolution
       )
     };
-    const reusedOwnership = loopPrivate.reusableSemanticOwnershipDecision(
+    const reusedOwnership = reusableSemanticOwnershipDecision(
       ownershipCache,
       { ...before, observationId: "obs_cross_surface_reobserved" },
       ownershipPolicyFingerprint
@@ -1000,7 +1141,7 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
       actionForCurrentCandidate(taskState.currentGoal, candidateSet.candidates[0], resolved.observation),
       resolved.observation
     );
-    assert.equal(correctionAction.decisionGroupId, "dg_A");
+    assert.equal(correctionAction.decisionGroupId, "dg_A", JSON.stringify({ goal: taskState.currentGoal, candidate: candidateSet.candidates[0], action: correctionAction }));
     assert.equal(correctionAction.targetSnapshot.decisionGroupId, "dg_B");
     assert.equal(correctionAction.targetSnapshot.policyCorrectionForDecisionGroupId, "dg_A");
     assert.equal(correctionAction.expectedOutcome.semanticOwnershipLinkId, link.linkId);
@@ -1047,12 +1188,11 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
       browserResult: { actionId: correctionAction.id, dispatched: true, verified: true },
       afterObservation: afterCorrection
     });
-    assert.equal(transition.localMechanicalResult.effect, "unknown");
+    assert.equal(transition.localMechanicalResult.effect, "select_free_option");
     assert.equal(transition.localMechanicalResult.verified, true);
     assert.equal(transition.currentObligationResult.completed, true);
-    assert.equal(transition.postcondition.evidence.beforePaid, true);
-    assert.equal(transition.postcondition.evidence.afterPaid, false);
-    assert.equal(transition.postcondition.evidence.chargeCleared, true);
+    assert.equal(transition.postcondition.evidence.selectedChargeRemoved, true);
+    assert.equal(transition.diff.priceChanged.to.amount, 100);
 
     const afterState = reduceTaskState({
       previousTaskState: taskState,

@@ -53,7 +53,7 @@
  * @property {Object} observationReadiness
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
- * @property {{semanticOwnership?: Object, candidateSelection?: Object}|null} aiDecisionCache
+ * @property {{candidateSelection?: Object}|null} aiDecisionCache
  * @property {Object|null} fastStaleRecovery
  * @property {Object} recoveryState
  * @property {Object[]} verifiedResults

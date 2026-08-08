@@ -5,6 +5,12 @@
 
 const fs = require("fs");
 const path = require("path");
+const {
+  diagnosticsWritable,
+  pruneFiles,
+  retentionConfig,
+  scheduleTraceRootRetention
+} = require("./diagnostic-retention");
 
 function sessionDir(baseDir, sessionId) {
   return path.join(baseDir, "agent-traces", String(sessionId || "unknown"));
@@ -151,6 +157,16 @@ function compactValue(value, depth = 0) {
 function writeTrace(baseDir, sessionId, turn) {
   const dir = sessionDir(baseDir, sessionId);
   ensureDir(dir);
+  const config = retentionConfig();
+  if (!diagnosticsWritable(dir, config)) {
+    pruneFiles(dir, {
+      maxBytes: config.traceSessionBytes,
+      maxFiles: config.traceSessionFiles,
+      maxAgeMs: config.traceAgeMs
+    });
+    scheduleTraceRootRetention(path.dirname(dir), { preserveSessionId: String(sessionId || "unknown"), config });
+    return { jsonPath: null, screenshotPath: null, skipped: true, reason: "LOW_DISK_SPACE" };
+  }
   const turnId = String(turn.turnId || Date.now());
 
   let screenshotPath = null;
@@ -182,7 +198,35 @@ function writeTrace(baseDir, sessionId, turn) {
   };
   fs.writeFileSync(jsonPath, JSON.stringify(record, null, 2));
 
+  pruneFiles(dir, {
+    maxBytes: config.traceSessionBytes,
+    maxFiles: config.traceSessionFiles,
+    maxAgeMs: config.traceAgeMs
+  });
+  scheduleTraceRootRetention(path.dirname(dir), { preserveSessionId: String(sessionId || "unknown"), config });
+
   return { jsonPath, screenshotPath };
+}
+
+// Planning must never wait for diagnostic serialization or filesystem IO.
+// Keep the synchronous writer for replay/tests, but production turns enqueue
+// an immutable reference and let the next event-loop tick compact and write it.
+function enqueueTrace(baseDir, sessionId, turn) {
+  const queuedAt = Date.now();
+  setImmediate(() => {
+    try {
+      writeTrace(baseDir, sessionId, turn);
+    } catch (error) {
+      // Diagnostics are deliberately non-authoritative. A trace failure must
+      // not rewrite an otherwise valid checkout decision into an agent stop.
+      console.error("agent trace write failed", {
+        sessionId: String(sessionId || "unknown"),
+        turnId: String(turn?.turnId || ""),
+        error: error?.message || String(error)
+      });
+    }
+  });
+  return { queued: true, queuedAt };
 }
 
 function listTraces(baseDir, sessionId) {
@@ -201,4 +245,4 @@ function listTraces(baseDir, sessionId) {
     .filter(Boolean);
 }
 
-module.exports = { writeTrace, listTraces, sessionDir, compactObservation, compactValue };
+module.exports = { writeTrace, enqueueTrace, listTraces, sessionDir, compactObservation, compactValue };

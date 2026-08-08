@@ -17,6 +17,8 @@ const {
   deriveAuthoritativeTaskContext
 } = require("../../apps/web/agent/task-action-context");
 const { candidateSelectionSchemaFor } = require("../../apps/web/agent/schemas");
+const { currentObligationFromGoal, taskBindingGoal } = require("../../apps/web/agent/authority-frames");
+const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 function actionableCapability(operation, actuatorId, { inViewport = true } = {}) {
   const actionability = {
@@ -139,6 +141,54 @@ test("authoritative transition records exact free selection as fresh visible pro
   );
   assert.equal(receipt.actionId, "act_1");
   assert.equal(receipt.decisionInstanceId, "seats:extras:seat-decline:dg_seat:global");
+});
+
+test("matching browser-verified stage advancement cannot be rewritten as no effect", () => {
+  const before = observation("browser_stage_before", {
+    step: "traveler_information",
+    url: "https://example.test/travelers",
+    currentSurface: { id: "surface-page", type: "page", label: "Travelers" }
+  });
+  const action = {
+    id: "act_continue_verified",
+    observationId: before.observationId,
+    controlId: "ctrl_continue",
+    type: "click",
+    mechanicalEffect: "advance_checkout_stage",
+    expectedOutcome: { type: "checkout_stage_advanced", controlId: "ctrl_continue" }
+  };
+  const browserResult = {
+    actionId: action.id,
+    observationId: before.observationId,
+    dispatched: true,
+    executed: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    expectedOutcome: action.expectedOutcome,
+    feedback: { outcomeVerified: true, navigationOccurred: true, surfaceChanged: true },
+    action
+  };
+  // Transport compaction may leave the backend comparison without a useful
+  // page diff even though the browser already verified the exact contract.
+  const after = observation("browser_stage_after", { ...before.page }, browserResult);
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: action,
+    browserResult,
+    afterObservation: after
+  });
+  assert.equal(transition.status, "progressed");
+  assert.equal(transition.currentObligationResult.completed, true);
+  assert.equal(transition.localMechanicalResult.verified, true);
+
+  const advanced = advanceActionLifecycle({
+    state: { lastAction: action },
+    observation: after,
+    previousObservation: before
+  });
+  assert.notEqual(advanced.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
+  assert.equal(advanced.observation.lastActionResult.verified, true);
 });
 
 test("child confirmation verifies the selected free outcome on its parent decision", () => {
@@ -451,7 +501,7 @@ test("closed action lifecycle does not claim a later page mutation", () => {
   assert.equal(second.observation.lastActionResult.causality.code, "ACTION_CAUSAL_WINDOW_CLOSED");
 });
 
-test("loop resolves ambiguous paid ownership before publishing the exact Remove action", async () => {
+test("DecisionFrame paid truth publishes the exact Remove action without a pre-TaskState ownership model", async () => {
   const previousFetch = global.fetch;
   let modelCalls = 0;
   global.fetch = async () => {
@@ -572,12 +622,12 @@ test("loop resolves ambiguous paid ownership before publishing the exact Remove 
       clientTurnId: "turn_semantic_owner"
     });
 
-    assert.equal(modelCalls, 1);
+    assert.equal(modelCalls, 0);
     assert.equal(turn.clientDecision.action, "click");
     assert.equal(turn.clientDecision.controlId, "ctrl_remove");
     assert.notEqual(turn.clientDecision.controlId, "ctrl_next");
-    assert.equal(turn.state.taskState.activeDecisions[0].family, "seat");
-    assert.equal(turn.state.taskState.currentGoal.decisionGroupId, "dg_selected_item");
+    assert.equal(turn.state.taskState.currentObligation.subject.decisionGroupId, "dg_selected_item");
+    assert.equal(turn.state.taskState.currentObligation.subject.family, "extras");
   } finally {
     global.fetch = previousFetch;
   }
@@ -647,6 +697,81 @@ test("an unrelated fresh paid selection is an intervening mutation, not progress
   assert.equal(lifecycle.lifecycle.status, "observed");
   assert.equal(lifecycle.directive, "rebuild_candidates");
   assert.equal(lifecycle.lifecycle.resultCode, "INTERVENING_EXTERNAL_MUTATION");
+});
+
+test("a newly exposed destination decision cannot make verified navigation simultaneously fail", () => {
+  const before = observation("traveler_before_seats", {
+    step: "traveler_information",
+    currentSurface: { id: "surface-page", type: "page", label: "Traveler information" },
+    controls: [{ controlId: "ctrl_continue", label: "Continue", semantic: "continue", surfaceId: "surface-page" }],
+    decisionGroups: [],
+    price: { amount: 208, currency: "EUR" }
+  });
+  const action = {
+    id: "act_continue_to_seats",
+    type: "click",
+    intent: "navigate_stage",
+    semanticIntent: "advance_checkout_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    controlId: "ctrl_continue",
+    targetSnapshot: { controlId: "ctrl_continue", surfaceId: "surface-page" },
+    expectedOutcome: { type: "checkout_stage_advanced", controlId: "ctrl_continue", mustNotIncreasePrice: true },
+    risk: "safe"
+  };
+  const browserResult = {
+    actionId: action.id,
+    action,
+    expectedOutcome: action.expectedOutcome,
+    dispatched: true,
+    executed: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    outcome: { ok: true, code: "CHECKOUT_STAGE_ADVANCED" },
+    feedback: { dispatched: true, navigationOccurred: true, surfaceChanged: true, outcomeVerified: true }
+  };
+  const after = observation("seat_destination", {
+    step: "seats",
+    currentSurface: { id: "seat_panel", type: "popover", blocksBackground: true, label: "Reserve seating" },
+    controls: [{ controlId: "ctrl_next", label: "Next", semantic: "continue", surfaceId: "seat_panel" }],
+    decisionGroups: [{
+      decisionGroupId: "dg_new_seat_mode",
+      sectionType: "seat",
+      status: "conflicted",
+      selectedControlId: "ctrl_seat_paid_shell",
+      selectedLabel: "Add to cart",
+      selectedEvidence: {
+        selected: true,
+        disposition: "paid",
+        selectedControlId: "ctrl_seat_paid_shell"
+      }
+    }],
+    price: { amount: 208, currency: "EUR" }
+  }, browserResult);
+
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: action,
+    browserResult,
+    afterObservation: after,
+    navigationContext: { destinationReady: true }
+  });
+  assert.equal(transition.causality, null);
+  assert.equal(transition.status, "achieved");
+
+  const state = createCheckoutSessionState({ goal: "Reach payment without paid extras", travelerId: "trav_destination" });
+  state.lastAction = action;
+  state.pendingAction = pendingActionRecord({ action, goal: { goalId: "goal_continue" }, status: "ready" });
+  const lifecycle = advanceActionLifecycle({
+    state,
+    observation: after,
+    previousObservation: before,
+    observationReadiness: { classification: "READY" }
+  });
+  assert.equal(lifecycle.lifecycle.status, "verified");
+  assert.equal(lifecycle.lifecycle.verified, true);
+  assert.equal(lifecycle.lifecycle.transitionStatus, "achieved");
+  assert.notEqual(lifecycle.lifecycle.resultCode, "INTERVENING_EXTERNAL_MUTATION");
 });
 
 test("DOB transition requires the exact canonical date and no owned validation error", () => {
@@ -905,7 +1030,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
   const state = {
     currentGoal: { goalId: "goal_flex", semanticType: "flexible_ticket" },
     taskState: {
-      currentGoal: { goalId: "goal_flex", semanticType: "flexible_ticket" }
+      currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_flex", semanticType: "flexible_ticket" } })
     },
     lastAction: {
       id: "act_open",
@@ -929,7 +1054,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
   assert.equal(applied.state.aiDecisionCache, null);
 
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, after),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), after),
     ["click:open:ctrl_flex:,"]
   );
   const changedPage = {
@@ -938,7 +1063,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
     observationSnapshot: { snapshotHash: "hash_after_changed" }
   };
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, changedPage),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), changedPage),
     ["click:open:ctrl_flex:,"]
   );
   const changedTarget = observation("after_target_changed", {
@@ -946,7 +1071,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
     controls: [{ controlId: "ctrl_flex", label: "Flexible ticket", state: { expanded: true } }]
   });
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, changedTarget),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), changedTarget),
     []
   );
 });
@@ -976,7 +1101,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   const state = {
     currentGoal: { goalId: "goal_title", semanticType: "title" },
     taskState: {
-      currentGoal: { goalId: "goal_title", semanticType: "title" }
+      currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_title", semanticType: "title" } })
     },
     lastAction: action,
     recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] },
@@ -992,7 +1117,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   assert.equal(applied.state.recoveryState.failedStrategies[0].failureCount, 1);
   assert.equal(applied.state.aiDecisionCache, null);
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, after),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), after),
     [signature]
   );
 
@@ -1004,7 +1129,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
     ]
   });
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, state.currentGoal, unrelatedProgress),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), unrelatedProgress),
     [signature]
   );
 });
@@ -1327,7 +1452,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
   assert.equal(skip.physicalEffect, "select_free_option");
   assert.equal(skip.expectedOutcome.type, "exact_free_option_selected");
   assert.equal(next.controlId, "ctrl_next");
-  assert.equal(firstSet.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_next").outcomeCompatibility, "context_only");
+  assert.equal(firstSet.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_next").outcomeCompatibility, "obligation_admitted");
 
   const dispatchedSkip = { ...skip, id: "act_skip" };
   const unchanged = observation("typed_unchanged", before.page, result(dispatchedSkip.id));
@@ -1436,7 +1561,7 @@ test("sibling paid-extra groups form an exact work queue and broad family comple
   assert.equal(reconciled.find((item) => item.decisionGroupId === "dg_lost_baggage").status, "missing");
   assert.equal(reconciled.find((item) => item.decisionGroupId === "dg_premium_support").status, "missing");
 
-  const completions = loopPrivate.exactDecisionCompletionRecords([], reconciled, current.observationId);
+  const completions = legacyRequirementReplay.exactDecisionCompletionRecords([], reconciled, current.observationId);
   assert.deepEqual(completions, [{
     surfaceId: "surface-page",
     decisionGroupId: "dg_airhelp",
@@ -1522,7 +1647,7 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
   });
   state.id = "txn_72_seats";
   state.approvals.skipPaidExtrasApproved = true;
-  state.requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  state.requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], current);
   state.activeRequirements = state.requirements;
   state.currentObservation = { observationId: current.observationId, observationHash: current.observationSnapshot.snapshotHash };
   state.taskState = {
@@ -1633,7 +1758,7 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
   });
   state.id = "txn_completed_seat";
   state.approvals.skipPaidExtrasApproved = true;
-  state.requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  state.requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], current);
   state.activeRequirements = state.requirements;
   state.currentObligation = {
     userOutcome: {
@@ -1702,7 +1827,7 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
   assert.equal(turn.clientDecision.action, "click");
   assert.equal(turn.clientDecision.targetLabel, "Next");
   assert.equal(turn.state.currentObligation, undefined);
-  assert.equal(turn.state.taskState.currentGoal.semanticType, "navigation");
+  assert.equal(turn.state.taskState.currentObligation.subject.semanticType, "navigation");
   assert.equal(turn.debug.deterministic, true);
   assert.deepEqual(turn.debug.modelUsage.calls, []);
 });
@@ -1889,7 +2014,7 @@ test("invalid planner output retries the immutable candidate set without browser
   });
   state.id = "txn_invalid_planner";
   state.approvals.skipPaidExtrasApproved = true;
-  state.requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  state.requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], current);
   state.activeRequirements = state.requirements;
   const store = {
     isCurrentObservation: (_transactionId, observationId, observationHash) => (
@@ -1956,7 +2081,7 @@ test("only contradictory current browser evidence can reopen a completed policy 
       alternatives: [paidControl]
     }]
   });
-  const requirements = loopPrivate.requirementsWithDecisionGroups([], current);
+  const requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], current);
   const state = {
     id: "txn_paid_contradiction",
     goal: "Proceed without paid seats",

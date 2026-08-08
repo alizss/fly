@@ -204,9 +204,9 @@ function optionContractIsCoherent(control = {}) {
   if (Number.isFinite(amount) && amount === 0 && controlEffect === "select_paid_option") return false;
   const declaredFree = controlEffect === "select_free_option"
     || contractEffect === "select_free_option"
-    || /select_free_option|decline_paid_extra|safe_decline/.test(
-      `${control.semantic || ""} ${control.risk || ""}`.toLowerCase()
-    )
+    || agentContract.canonicalSemanticEffect(control.semantic)
+      === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
+    || /safe_decline/.test(`${control.risk || ""}`.toLowerCase())
     || (Number.isFinite(amount) && amount === 0);
   if (declaredFree && exactActuatorHasPositivePrice(control)) return false;
   return true;
@@ -258,7 +258,8 @@ function controlsForGoal(page = {}, goal = {}) {
     policyAllowedIds.has(control.controlId)
     && isObservedSafeProgressControl(control)
   )).map((control) => control.controlId);
-  const policyExactIds = goal.desiredPolicyOutcome === "selected_free_option"
+  const policyExactIds = agentContract.canonicalSemanticEffect(goal.desiredPolicyOutcome)
+    === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
     ? [...new Set([...provenFreeIds, ...provenSafeProgressIds])]
     : goal.policyChoiceBounded === true
       ? goal.policyAllowedControlIds
@@ -368,7 +369,8 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       if (!targetId) continue;
       const interpretedFree = freeAlternativeIds.has(control.controlId)
         && (
-          goal.desiredPolicyOutcome === "selected_free_option"
+          agentContract.canonicalSemanticEffect(goal.desiredPolicyOutcome)
+            === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
           || goal.policyChoiceBounded === true
         );
       const interpretedPaid = paidAlternativeIds.has(control.controlId);
@@ -450,7 +452,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         physicalEffect,
         policyOutcome: completesChoiceSurface
           ? "completed_decision_surface_dismissed"
-          : semanticCorrection ? "proposed_policy_correction" : (interpretedFree ? "selected_free_option" : (interpretedPaid ? "selected_paid_option" : "selected_policy_allowed_option")),
+          : semanticCorrection ? "proposed_policy_correction" : (interpretedFree ? agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION : (interpretedPaid ? agentContract.SEMANTIC_EFFECT.SELECT_PAID_OPTION : "selected_policy_allowed_option")),
         intendedOutcome: semanticCorrection?.intendedOutcome || (
           interpretedFree ? (goal.desiredSemanticOutcome || "") : ""
         ),

@@ -7,8 +7,7 @@ const {
   visualRegionsMatch
 } = require("../../../packages/shared/agent-actions");
 const { classifyGraphConflicts, resolveActionControl, selectedActionGraphConflicts } = require("./control-alias-index");
-const { profileStageReadiness } = require("./skill-expander");
-const { invariantDecision, prepareTransactionInvariants } = require("./invariants");
+const { invariantDecision } = require("./invariants");
 const { PAGE_SURFACE_ID, controlBelongsToCurrentSurface, currentSurface, currentSurfaceId } = require("./surface-contract");
 const { approveActionLifecycle, proposeActionLifecycle, rejectActionLifecycle } = require("./action-lifecycle");
 const {
@@ -20,6 +19,7 @@ const {
   semanticIntentForAction
 } = require("./action-semantics");
 const agentContract = require("../../extension/src/shared/agent-contract");
+const { taskBindingGoal } = require("./authority-frames");
 
 const DOM_MUTATIONS = new Set(["click", "type", "select", "keypress"]);
 const COMPOUND_MUTATIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
@@ -127,14 +127,21 @@ function canonicalActionSurfaceId(action = {}) {
   return String(action.targetSnapshot?.surfaceId || "");
 }
 
-function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = []) {
-  const goal = state.taskState?.currentGoal;
+function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = [], preparedCandidateSet = null) {
+  const goal = taskBindingGoal(state.taskState || {});
   if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   // An action with no candidate claim is an ownership violation. Let the
   // ownership check below report that precise prerequisite error; candidate
   // exactness applies once a candidateId is actually presented.
   if (!action.candidateId) return null;
-  const candidateSet = goal.candidateSet || null;
+  const candidateSet = preparedCandidateSet || null;
+  if (!candidateSet) {
+    return recoverable(
+      "CURRENT_CANDIDATE_SET_REQUIRED",
+      "Governance requires the turn-local candidate set for the authoritative Current Obligation.",
+      checks
+    );
+  }
   if (candidateSet) {
     const currentObservationId = observation.observationId || "";
     const currentObservationHash = observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "";
@@ -149,7 +156,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
       );
     }
   }
-  const candidates = candidateSet?.candidates || goal.candidates || [];
+  const candidates = candidateSet.candidates || [];
   const candidate = candidates.find((item) => item.candidateId === action.candidateId);
   const candidateAffordance = candidate?.affordance || {};
   const actionAffordance = action.affordance || {};
@@ -187,7 +194,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
 }
 
 function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
-  const goal = state.taskState?.currentGoal;
+  const goal = taskBindingGoal(state.taskState || {});
   if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   if (action.candidateId && action.goalId === goal.goalId) return null;
   const control = canonicalControlForAction(action, page) || {};
@@ -199,7 +206,7 @@ function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks 
 }
 
 function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, checks = []) {
-  const goal = state.taskState?.currentGoal || {};
+  const goal = taskBindingGoal(state.taskState || {}) || {};
   if (!["adaptive_surface", "adaptive_interaction"].includes(goal.kind)
     || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   const envelope = goal.adaptiveEnvelope || {};
@@ -258,7 +265,7 @@ function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, chec
 
 function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, checks = []) {
   if (action.mechanicalHypothesis !== true) return null;
-  const goal = state.taskState?.currentGoal || {};
+  const goal = taskBindingGoal(state.taskState || {}) || {};
   const envelope = action.discoveryEnvelope || {};
   const currentSurfaceId = currentObservationSurfaceId(observation);
   const effect = [
@@ -324,32 +331,6 @@ function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, c
   }
   pass(checks, "PRE_SURFACE_DISCOVERY_VALID", `${envelope.logicalControlId}:${envelope.actuatorId}`);
   return null;
-}
-
-function actionTargetsLaterCheckoutWork(action = {}, page = {}) {
-  if (!DOM_MUTATIONS.has(action.type)) return false;
-  if (["satisfy_field", "open_profile_choice"].includes(action.intent)) return false;
-  const control = canonicalControlForAction(action, page) || {};
-  const section = String(control.sectionType || "").toLowerCase();
-  const semantic = String(control.semantic || action.intent || "").toLowerCase();
-  return /baggage|bundle|extra|seat|cancellation|insurance|flexible|continue|navigation|payment|purchase/.test(`${section} ${semantic}`)
-    || ["navigate_stage", "decline_optional_extra", "resolve_active_surface"].includes(action.intent);
-}
-
-function incompleteProfileStageBlocks(action = {}, observation = {}, traveler = {}, state = {}) {
-  const taskState = state.taskState || null;
-  if (taskState) {
-    const ownsProfileGoal = taskState.stage === "traveler_information"
-      && taskState.currentGoal?.kind === "profile_field";
-    return ownsProfileGoal && actionTargetsLaterCheckoutWork(action, observation.page || {})
-      ? (taskState.profileReadiness || { ready: false, unresolvedKnown: [], unresolvedRequired: [], visibleErrors: [] })
-      : null;
-  }
-  // Migration-only fallback for persisted sessions created before TaskState.
-  const readiness = profileStageReadiness(observation, traveler);
-  return !readiness.ready && actionTargetsLaterCheckoutWork(action, observation.page || {})
-    ? readiness
-    : null;
 }
 
 function validateCanonicalTarget(action, observation, checks, executionLane = "") {
@@ -527,11 +508,36 @@ function validateVisualFallback(action, observation, checks) {
   return null;
 }
 
-function governAction({ action: rawAction, state: rawState, observation, traveler = {}, approvals = {}, store, turnId = "" }) {
+function governAction({
+  action: rawAction,
+  state: rawState,
+  observation,
+  traveler = {},
+  approvals = {},
+  store,
+  turnId = "",
+  preparedInvariantContext = null,
+  preparedCandidateSet = null
+}) {
   const checks = [];
   const action = normalizeAction(rawAction || {});
-  const invariantContext = prepareTransactionInvariants(rawState, observation, traveler);
-  let state = invariantContext.state;
+  const preparedContextCurrent = Boolean(
+    preparedInvariantContext?.envelope
+    && preparedInvariantContext?.observation?.observationId === observation?.observationId
+    && (
+      !observation?.observationSnapshot?.snapshotHash
+      || preparedInvariantContext.observation?.observationSnapshot?.snapshotHash
+        === observation.observationSnapshot.snapshotHash
+    )
+  );
+  const invariantContext = preparedContextCurrent ? preparedInvariantContext : null;
+  let state = preparedContextCurrent
+    ? {
+        ...rawState,
+        transactionInvariants: invariantContext.state?.transactionInvariants
+          || rawState.transactionInvariants
+      }
+    : rawState;
   const record = (stage, payload = {}) => store?.recordActionEvent?.(state.id, {
     actionId: action.id || "",
     observationId: action.observationId || observation?.observationId || "",
@@ -547,6 +553,17 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   };
   record("proposed", { result: { ok: null } });
   state = { ...state, actionLifecycle: proposeActionLifecycle(action, observation) };
+  if (!preparedContextCurrent) {
+    return denied({
+      ...fail(
+        "GOVERNANCE_CONTEXT_REQUIRED",
+        "The governor requires transaction facts prepared for this exact immutable observation.",
+        checks
+      ),
+      action,
+      state
+    });
+  }
   if (!action.id || !action.observationId || !action.observationHash) {
     return denied({ ...fail("ACTION_IDENTITY_MISSING", "Action id, observation id, and observation hash are required.", checks), action, state });
   }
@@ -585,7 +602,13 @@ function governAction({ action: rawAction, state: rawState, observation, travele
     `${graphConflicts.actionable.length} unrelated actionable conflict(s); ${graphConflicts.diagnostic.length} diagnostic conflict(s) preserved`
   );
 
-  const goalCandidateFailure = currentGoalCandidateFailure(action, state, observation, checks);
+  const goalCandidateFailure = currentGoalCandidateFailure(
+    action,
+    state,
+    observation,
+    checks,
+    preparedCandidateSet
+  );
   if (goalCandidateFailure) {
     return denied({
       ...goalCandidateFailure,
@@ -671,7 +694,7 @@ function governAction({ action: rawAction, state: rawState, observation, travele
   }
 
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
-    const goal = state.taskState?.currentGoal || {};
+    const goal = taskBindingGoal(state.taskState || {}) || {};
     const contract = goal.outcomeContract || outcomeContractForGoal(goal, observation);
     const parentContract = state.taskState?.stageOutcome?.outcomeContract || goal.parentOutcomeContract || contract;
     const explicitMechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || action.physicalEffect || "";
@@ -708,25 +731,10 @@ function governAction({ action: rawAction, state: rawState, observation, travele
       `${compatibility.status}:${compatibility.reason}:${parentContract.taskOutcome}/${contract.taskOutcome}:${mechanicalEffect}:${semanticIntent}`);
   }
 
-  const profileReadiness = incompleteProfileStageBlocks(action, observation, traveler, state);
-  if (profileReadiness) {
-    const blockers = [
-      ...profileReadiness.unresolvedKnown.map((item) => item.label),
-      ...profileReadiness.unresolvedRequired.map((item) => item.label),
-      ...profileReadiness.visibleErrors
-    ].filter(Boolean).slice(0, 5);
-    return denied({
-      ...fail(
-        "PROFILE_STAGE_NOT_READY",
-        `Traveler/contact readiness blocks later checkout work${blockers.length ? `: ${blockers.join("; ")}` : "."}`,
-        checks
-      ),
-      action,
-      state,
-      profileReadiness
-    });
-  }
-  pass(checks, "PROFILE_STAGE_READY_OR_ACTION_SCOPED");
+  // TaskState has already admitted exactly one CurrentObligation. The
+  // governor verifies that action's exact binding and consequences; it does
+  // not independently reconstruct profile-stage completeness.
+  pass(checks, "TASK_STATE_OBLIGATION_ALREADY_ADMITTED");
 
   const targetFailure = validateCanonicalTarget(action, observation, checks, executionLane)
     || validateVisualFallback(action, observation, checks);
@@ -812,8 +820,6 @@ module.exports = {
     currentGoalOwnershipFailure,
     adaptiveEnvelopeFailure,
     preSurfaceDiscoveryFailure,
-    incompleteProfileStageBlocks,
-    actionTargetsLaterCheckoutWork,
     validateCanonicalTarget,
     validateVisualFallback
   },

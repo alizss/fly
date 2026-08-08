@@ -1,6 +1,7 @@
 "use strict";
 
 const { resolveProfileDecision } = require("./policy-profile");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 const CONTROL_TYPES = Object.freeze({
   VALUE_FIELD: "value_field",
@@ -328,7 +329,7 @@ function transitionFor(control = {}, alternative = {}) {
     capability?.actionability?.executable === true || capability?.actionability?.revealable === true
   ))?.[0] || "";
   const effectRole = clean(control.effectRole || alternative.effectRole || "unknown");
-  const nonEconomic = ["scope_toggle", "information_only", "navigation"].includes(effectRole);
+  const nonEconomic = ["scope_toggle", "information_only", "navigation", "presentation_mode"].includes(effectRole);
   const price = nonEconomic ? null : (control.structuredPrice || alternative.structuredPrice || (
     optionPrice(control) !== null ? { amount: optionPrice(control), currency: clean(control.currency) } : null
   ));
@@ -392,7 +393,9 @@ function deferredChoiceCommitment({
   decisionEpisode = null
 } = {}) {
   const surface = page.currentSurface || {};
-  if (!selected || !selectedTransition?.paid || !surface.type || surface.type === "page") return false;
+  const presentationPaidState = selectedTransition?.effectRole === "presentation_mode"
+    && paid({ ...selected, semantic: selectedTransition.semantic });
+  if (!selected || (!selectedTransition?.paid && !presentationPaidState) || !surface.type || surface.type === "page") return false;
   const sourceSurfaceId = clean(selected.surfaceId || group.surfaceId || "surface-page");
   if (sourceSurfaceId === clean(surface.id)) return false;
 
@@ -469,18 +472,23 @@ function canonicalDecisionForGroup({
   )) || null;
   const selectedEvidence = group.selectedEvidence || null;
   const selectedEffectRole = clean(selectedEvidence?.effectRole || selectedTransition?.effectRole || "unknown");
-  const selectedIsEconomic = !["scope_toggle", "information_only", "navigation"].includes(selectedEffectRole);
-  const evidencePaid = Boolean(
-    selectedIsEconomic && ((transactionSelection && (
-      Number(transactionSelection.priceAmount) > 0
-      || /paid|money|selected_paid/.test(lower(transactionSelection.disposition))
-    ))
-    || (selectedEvidence?.selected === true && (
-      selectedEvidence.disposition === "paid"
-      || Number(selectedEvidence.structuredPrice?.amount) > 0
-      || /paid|money|purchase/.test(lower(`${selectedEvidence.risk || ""} ${selectedEvidence.semantic || ""}`))
-    )))
-  );
+  const selectedIsEconomic = !["scope_toggle", "information_only", "navigation", "presentation_mode"].includes(selectedEffectRole);
+  const paidTruth = agentContract.classifySelectedCommerceTruth({
+    decisionGroupId: id,
+    selectedControlId: selectedId,
+    selected: Boolean(selected || selectedEvidence?.selected === true || transactionSelection),
+    selectionOwnerId: selectedEvidence?.ownerElementId
+      || group.semanticOwnership?.ownerElementId
+      || group.semanticOwnership?.controlId,
+    transactionOwned: Boolean(transactionSelection && clean(transactionSelection.decisionGroupId) === id),
+    effectRole: selectedEffectRole,
+    disposition: transactionSelection?.disposition || selectedEvidence?.disposition,
+    priceAmount: transactionSelection?.priceAmount
+      ?? selectedEvidence?.structuredPrice?.amount
+      ?? selectedTransition?.price?.amount,
+    semanticEffect: selectedTransition?.physicalEffect || selectedTransition?.semantic || selectedEvidence?.semantic
+  });
+  const evidencePaid = Boolean(selectedIsEconomic && paidTruth.selectedPaid);
   let intent = exactUserIntent(subject, group, transitions, userPolicy, traveler);
   const discoveryControlIds = new Set(controls.filter((control) => (
     executable(control)
@@ -518,11 +526,14 @@ function canonicalDecisionForGroup({
     selectedTransition,
     decisionEpisode
   });
+  const selectedControlOutcome = selectedOutcome(selected, transitions, controlType);
   const currentOutcome = optionPending
     ? "option_pending"
     : evidencePaid && !explicitlyFree(selectedTransition || {}) && intent.match !== "exact"
     ? "paid_affirmative"
-    : selectedOutcome(selected, transitions, controlType);
+    : selectedControlOutcome === "paid_affirmative"
+      ? "selected"
+      : selectedControlOutcome;
   const commitmentPhase = optionPending
     ? "option_pending"
     : currentOutcome === "paid_affirmative"
@@ -741,7 +752,7 @@ function canonicalDecisionForGroup({
     commitmentPhase,
     availableTransitions: Object.freeze(transitions),
     priceRisk: Object.freeze({
-      selectedPaid: Boolean(commitmentPhase === "committed_paid"),
+      selectedPaid: evidencePaid,
       observedPaidIntent: Boolean(evidencePaid && !explicitlyFree(selectedTransition || {})),
       amount: selectedIsEconomic ? (selectedTransition?.price?.amount
         ?? selectedEvidence?.structuredPrice?.amount

@@ -17,6 +17,42 @@ npm run dev
 
 Open `http://localhost:4173`.
 
+## Durable and diagnostic storage
+
+Fly keeps authoritative checkout state in SQLite and treats traces, browser
+flow logs, screenshots, and JSONL ledgers as disposable diagnostics.
+
+- Current transaction database: `work/agent-transactions-v2.sqlite`
+- Diagnostic traces: `work/agent-traces`
+- Client flow logs: `work/agent-client-logs`
+- Diagnostic action ledger: `work/agent-ledger`
+
+Diagnostics rotate automatically. Ordinary trace sessions retain 14 days and
+the newest 50 sessions, with a 64 MB/160-file cap per session. JSONL logs rotate
+at 20 MB and retain at most three segments per active file. When available disk
+space falls below 2 GB, Fly drops diagnostic writes instead of stopping the
+checkout.
+
+Pin an important trace by creating an empty `.pinned` file inside its session
+directory. Run the retention policy manually with:
+
+```bash
+npm run diagnostics:prune
+```
+
+Storage locations can be separated without changing the agent:
+
+```bash
+ATW_TRANSACTION_DB=/Volumes/FlyData/agent-transactions-v2.sqlite \
+ATW_DIAGNOSTIC_DIR=/Volumes/FlyData/diagnostics \
+npm run dev
+```
+
+`ATW_TRANSACTION_DB` can point to an external volume for SQLite. For a hosted
+deployment, compact transaction facts belong in Postgres/Supabase, while large
+diagnostics and screenshots belong in object storage with lifecycle expiry.
+They should not be stored as large rows in the transactional database.
+
 ## Install the extension locally
 
 1. Open Chrome Extensions.

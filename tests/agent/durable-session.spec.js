@@ -429,7 +429,7 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
   });
   const body = await response.json();
   expect(response.status(), JSON.stringify(body)).toBe(200);
-  expect(body.debug.taskState.transactionReview.baseline).toMatchObject({
+  expect(body.debug.transactionReview.baseline).toMatchObject({
     itinerary: {
       segments: [{
         origin: "LHR",
@@ -452,7 +452,7 @@ test("transaction fact ownership evidence survives HTTP compaction into the dura
       }
     }
   });
-  expect(body.debug.taskState.transactionReview.baselineStatus).toBe("approved");
+  expect(body.debug.transactionReview.baselineStatus).toBe("approved");
 });
 
 test("authoritative terminal evidence survives HTTP compaction without payment capabilities", async ({ request }) => {
@@ -499,13 +499,13 @@ test("authoritative terminal evidence survives HTTP compaction without payment c
   });
   const body = await response.json();
   expect(response.status(), JSON.stringify(body)).toBe(200);
-  expect(body.debug.taskState.paymentEvidence).toMatchObject({
+  expect(body.debug.paymentEvidence).toMatchObject({
     boundaryObserved: true,
     contractVersion: "terminal-evidence/v1",
     signals: { route: true, progress: true, form: true, method: true, review: true },
     paymentActionsAllowed: false
   });
-  expect(body.debug.taskState.stageDecisionEvidence.terminalEvidence).toMatchObject({
+  expect(body.debug.stageDecisionEvidence.terminalEvidence).toMatchObject({
     boundaryObserved: true,
     evidenceOnly: true,
     evidenceSources: expect.arrayContaining([
@@ -902,27 +902,49 @@ test("incremental observation transport reconstructs the canonical page and reje
   expect(stale.status()).toBe(409);
   expect(await stale.json()).toMatchObject({ code: "OBSERVATION_RESYNC_REQUIRED", retryable: true });
 
-  const unsupportedReference = await request.post(`${API}/agent/next-action`, {
+  const referenceId = `obs_reference_retry_${Date.now()}`;
+  const reference = await request.post(`${API}/agent/next-action`, {
     data: {
       sessionId: session.id,
-      observationId: `obs_reference_unsupported_${Date.now()}`,
-      observationSnapshot: { snapshotHash: "hash_reference_unsupported" },
+      observationId: referenceId,
+      observationSnapshot: { snapshotHash: nextHash },
       observationUpdate: {
         mode: "reference",
-        baseSnapshotHash: "hash_incremental_delta",
-        snapshotHash: "hash_incremental_delta",
+        baseSnapshotHash: nextHash,
+        snapshotHash: nextHash,
+        material: false,
         diff: {}
       },
       page: {
-        incremental: true,
         referenceOnly: true,
-        snapshotHash: "hash_incremental_delta",
-        controls: []
-      }
+        snapshotHash: nextHash
+      },
+      destinationReadiness: { retryToken: "retry_current_surface_once" }
     }
   });
-  expect(unsupportedReference.status()).toBe(409);
-  expect(await unsupportedReference.json()).toMatchObject({
+  expect(reference.status(), await reference.text()).toBe(200);
+  const referencedTransaction = await (await request.get(`${API}/agent/transaction/${session.id}`)).json();
+  expect(referencedTransaction.currentObservation.observationId).toBe(referenceId);
+  expect(referencedTransaction.currentObservation.page.controls).toHaveLength(3);
+  expect(referencedTransaction.currentObservation.page.controls.some((control) => control.controlId === unchangedControl.controlId)).toBe(true);
+
+  const staleReference = await request.post(`${API}/agent/next-action`, {
+    data: {
+      sessionId: session.id,
+      observationId: `obs_reference_stale_${Date.now()}`,
+      observationSnapshot: { snapshotHash: "hash_reference_stale" },
+      observationUpdate: {
+        mode: "reference",
+        baseSnapshotHash: "wrong_reference_base",
+        snapshotHash: "hash_reference_stale",
+        material: false,
+        diff: {}
+      },
+      page: { referenceOnly: true, snapshotHash: "hash_reference_stale" }
+    }
+  });
+  expect(staleReference.status()).toBe(409);
+  expect(await staleReference.json()).toMatchObject({
     code: "OBSERVATION_RESYNC_REQUIRED",
     retryable: true
   });

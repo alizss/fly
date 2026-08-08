@@ -43,6 +43,149 @@
     READY: "ready",
     TERMINAL: "terminal"
   });
+  const SEMANTIC_EFFECT = Object.freeze({
+    SET_FIELD_VALUE: "set_field_value",
+    SELECT_FREE_OPTION: "select_free_option",
+    SELECT_PAID_OPTION: "select_paid_option",
+    DECLINE_PAID_EXTRA: "decline_paid_extra",
+    REMOVE_PAID_SELECTION: "remove_paid_selection",
+    RANDOM_ASSIGNMENT: "random_assignment",
+    ADVANCE_CHECKOUT_STAGE: "advance_checkout_stage",
+    DISMISS_SURFACE: "dismiss_surface",
+    SAFE_CHECKOUT_PROGRESS: "safe_checkout_progress",
+    UNKNOWN: "unknown"
+  });
+  const SEMANTIC_EFFECT_ALIASES = Object.freeze({
+    selected_free_option: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
+    select_free_alternative: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
+    decline_paid_extra: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
+    remove_paid_selection: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
+    safe_decline: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
+    decline_baggage: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
+    free_or_no_extra: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
+    selected_paid_option: SEMANTIC_EFFECT.SELECT_PAID_OPTION,
+    add_paid_extra: SEMANTIC_EFFECT.SELECT_PAID_OPTION,
+    choose_paid_option: SEMANTIC_EFFECT.SELECT_PAID_OPTION,
+    selected_paid_extra: SEMANTIC_EFFECT.SELECT_PAID_OPTION,
+    advance: SEMANTIC_EFFECT.ADVANCE_CHECKOUT_STAGE,
+    next_stage: SEMANTIC_EFFECT.ADVANCE_CHECKOUT_STAGE
+  });
+
+  function canonicalSemanticEffect(value = "") {
+    const normalized = String(value || "").toLowerCase().replace(/[\s-]+/g, "_").trim();
+    return SEMANTIC_EFFECT_ALIASES[normalized] || normalized || SEMANTIC_EFFECT.UNKNOWN;
+  }
+
+  function semanticEffectSatisfies(desiredEffect = "", observedEffect = "") {
+    const desired = canonicalSemanticEffect(desiredEffect);
+    const observed = canonicalSemanticEffect(observedEffect);
+    if (desired === observed) return true;
+    const compatible = {
+      [SEMANTIC_EFFECT.RANDOM_ASSIGNMENT]: [SEMANTIC_EFFECT.SELECT_FREE_OPTION]
+    };
+    return (compatible[desired] || []).includes(observed);
+  }
+
+  const NON_COMMERCE_EFFECT_ROLES = Object.freeze(new Set([
+    "scope_toggle",
+    "information_only",
+    "navigation",
+    "presentation_mode"
+  ]));
+
+  function commerceNumber(value) {
+    if (value == null || value === "" || typeof value === "object") return null;
+    const parsed = Number(String(value).replace(",", ".").replace(/[^0-9.-]/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function commerceToken(value = "") {
+    return String(value || "").toLowerCase().replace(/[\s-]+/g, "_").trim();
+  }
+
+  // Typed prospective commerce classification. UI labels are intentionally
+  // excluded: a seat-map mode toggle cannot become a paid transaction merely
+  // because its copy contains a price or "add to cart".
+  function isPaidCommerceOption(value = {}) {
+    const effectRole = commerceToken(value.effectRole || value.selectionRole);
+    if (NON_COMMERCE_EFFECT_ROLES.has(effectRole)) return false;
+    const amount = commerceNumber(
+      value.priceAmount
+      ?? value.amount
+      ?? value.structuredPrice?.amount
+      ?? value.price?.amount
+    );
+    const disposition = commerceToken(value.disposition || value.outcome);
+    const semanticEffect = canonicalSemanticEffect(
+      value.semanticEffect || value.physicalEffect || value.mechanicalEffect || value.semantic
+    );
+    if (["free", "declined", "decline_free_no_extra", "included", "waived"].includes(disposition)) return false;
+    return Number(amount) > 0
+      || disposition === "paid"
+      || semanticEffect === SEMANTIC_EFFECT.SELECT_PAID_OPTION;
+  }
+
+  // One authority for observed paid truth. A paid-looking representation is
+  // a selected commerce item only when fresh evidence owns both the decision
+  // and the selected control.
+  function classifySelectedCommerceTruth(value = {}) {
+    const decisionGroupId = String(
+      value.decisionGroupId || value.requirementId || value.ownerId || ""
+    ).trim();
+    const selectedControlId = String(
+      value.selectedControlId || value.controlId || value.selectedEvidence?.selectedControlId || ""
+    ).trim();
+    const selectionOwnerId = String(
+      value.selectionOwnerId
+      || value.ownerElementId
+      || value.selectedEvidence?.ownerElementId
+      || ""
+    ).trim();
+    const selected = value.selected === true
+      || value.checked === true
+      || value.currentState?.selected === true
+      || value.selectedEvidence?.selected === true;
+    const effectRole = commerceToken(
+      value.effectRole
+      || value.currentState?.effectRole
+      || value.selectedEvidence?.effectRole
+    );
+    const transactionOwned = value.transactionOwned === true;
+    const ownedSelection = Boolean(
+      decisionGroupId
+      && selected
+      && (selectedControlId || selectionOwnerId || transactionOwned)
+    );
+    const paidOption = isPaidCommerceOption({
+      ...value,
+      effectRole,
+      priceAmount: value.priceAmount
+        ?? value.amount
+        ?? value.priceRisk?.amount
+        ?? value.selectedEvidence?.structuredPrice?.amount,
+      disposition: value.disposition
+        ?? value.outcome
+        ?? value.selectedEvidence?.disposition,
+      semanticEffect: value.semanticEffect
+        ?? value.physicalEffect
+        ?? value.selectedEvidence?.semantic
+    });
+    return Object.freeze({
+      selectedPaid: Boolean(ownedSelection && paidOption),
+      selected: Boolean(selected),
+      ownedSelection,
+      paidOption,
+      decisionGroupId,
+      selectedControlId,
+      selectionOwnerId,
+      transactionOwned,
+      effectRole: effectRole || "unknown"
+    });
+  }
+
+  function isGenuineSelectedPaidItem(value = {}) {
+    return classifySelectedCommerceTruth(value).selectedPaid;
+  }
   const DECISION_AVAILABILITY = Object.freeze({
     ACTIVE: "active",
     REVEALABLE: "revealable",
@@ -905,11 +1048,17 @@
         const control = controlsById.get(option.controlId);
         if (!control) continue;
         const alternative = (group.alternatives || []).find((item) => item.controlId === option.controlId) || {};
+        const controlShape = normalizedText(
+          `${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`
+        ).toLowerCase();
         const ownsLogicalField = Boolean(
           control.fieldType
           || control.field
           || control.logicalFieldId
-          || control.componentContract?.logicalIdentity
+          || (
+            control.componentContract?.logicalIdentity
+            && /textbox|input|textarea|combobox|select|spinbutton|date/.test(controlShape)
+          )
         );
         Object.assign(control, {
           decisionGroupId: group.decisionGroupId,
@@ -1158,6 +1307,7 @@
     ].map((id) => text(id, 160)).filter(Boolean))];
     const actionabilityByActuator = Object.fromEntries(actuatorIds.map((actuatorId) => {
       const raw = capability.actionabilityByActuator?.[actuatorId]
+        || (capability.exactActuators || []).find((item) => item.actuatorId === actuatorId)?.proof
         || (capability.actuatorId === actuatorId ? capability.actionability : null)
         || {};
       return [actuatorId, normalizedActionability(raw, operation)];
@@ -1436,6 +1586,34 @@
         status: strategy.status
       }))
     }));
+    const compactOperations = Object.fromEntries(Object.entries(operations).map(([operation, capability]) => [
+      operation,
+      {
+        capabilityId: capability.capabilityId,
+        operation: capability.operation,
+        status: capability.status,
+        actuatorId: capability.actuatorId,
+        actuatorIds: capability.actuatorIds,
+        exactActuators: (capability.exactActuators || []).map((actuator) => ({
+          actuatorId: actuator.actuatorId,
+          status: actuator.status,
+          proof: actuator.proof
+        })),
+        actionability: capability.actionability,
+        strategies: (capability.strategies || []).map((strategy) => ({
+          strategyId: strategy.strategyId,
+          operation: strategy.operation,
+          actuatorId: strategy.actuatorId,
+          method: strategy.method,
+          actionType: strategy.actionType,
+          keys: strategy.keys,
+          status: strategy.status,
+          expectedOutcome: strategy.expectedOutcome
+        })),
+        expectedOutcome: capability.expectedOutcome || null,
+        recovery: capability.recovery || null
+      }
+    ]));
     return {
       ...serialized,
       contractVersion: CONTRACT_VERSION,
@@ -1444,10 +1622,16 @@
       // identity plus a compact capability index instead of serializing the
       // same proof graph a second and third time.
       componentContract: {
-        ...componentIdentityContract,
+        contractVersion: componentIdentityContract.contractVersion,
+        logicalIdentity: componentIdentityContract.logicalIdentity,
+        componentIdentity: componentIdentityContract.componentIdentity,
+        componentRole: componentIdentityContract.componentRole,
+        controlIdentity: componentIdentityContract.controlIdentity,
+        currentCanonicalValue: componentIdentityContract.currentCanonicalValue,
+        desiredCanonicalValue: componentIdentityContract.desiredCanonicalValue,
         capabilities: capabilityIndex
       },
-      operations,
+      operations: compactOperations,
       observedOptions,
       currentCanonicalValue: componentContract.currentCanonicalValue,
       validationOwnership
@@ -1815,7 +1999,15 @@
     const desired = String(desiredValue || "").replace(/\s+/g, " ").trim().toLowerCase();
     if (!actual || !desired) return false;
     if (actual === desired) return true;
-    if (String(semanticType || "").toLowerCase() !== "age_at_departure") return false;
+    const normalizedSemanticType = String(semanticType || "").toLowerCase();
+    if (normalizedSemanticType === "phone_country_code") {
+      const desiredDigits = desired.replace(/\D/g, "");
+      const observedCodes = actual.match(/\+?\d[\d\s().-]*/g) || [];
+      return Boolean(desiredDigits && observedCodes.some((code) => (
+        code.replace(/\D/g, "") === desiredDigits
+      )));
+    }
+    if (normalizedSemanticType !== "age_at_departure") return false;
     const desiredBounds = ageChoiceBounds(desired);
     const actualBounds = ageChoiceBounds(actual);
     if (!desiredBounds || desiredBounds.minimum !== desiredBounds.maximum || !actualBounds) return false;
@@ -1831,10 +2023,16 @@
     EXECUTION_LANE,
     DECISION_KIND,
     SEMANTIC_READINESS,
+    SEMANTIC_EFFECT,
     DECISION_AVAILABILITY,
     PROFILE_FIELD_ALIAS_GROUPS,
     PROFILE_FIELD_ALIASES,
     PROFILE_FIELD_TYPES,
+    canonicalSemanticEffect,
+    semanticEffectSatisfies,
+    isPaidCommerceOption,
+    classifySelectedCommerceTruth,
+    isGenuineSelectedPaidItem,
     canonicalProfileFieldType,
     cloneSerializable,
     operationAvailability,

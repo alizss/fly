@@ -8,7 +8,7 @@ const {
   PlannerContractError,
   resolvePlannerSelection,
   selectFromImmutableCandidateSet
-} = require("../../apps/web/agent/verify-and-plan");
+} = require("./legacy-planner-replay-adapter");
 const {
   modelObservationContext,
   semanticActionContext,
@@ -31,6 +31,8 @@ const {
   canonicalizeUserPolicy,
   seatPolicyFrom
 } = require("../../apps/web/agent/policy-profile");
+const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 test("seat preference aliases normalize once into canonical seatPolicy", () => {
   const canonical = canonicalizeUserPolicy({
@@ -166,9 +168,7 @@ test("viewport recovery never rebinds a stale fare action to the sole control on
       graphIntegrity: { ok: true, conflicts: [] }
     }
   };
-  const state = {
-    taskState: {
-      currentGoal: {
+  const staleFareGoal = {
         goalId: "goal_saver",
         semanticGoal: "resolve fare package",
         semanticType: "fare_package",
@@ -179,7 +179,10 @@ test("viewport recovery never rebinds a stale fare action to the sole control on
         freeAlternativeControlIds: ["ctrl_saver"],
         paidAlternativeControlIds: ["ctrl_standard", "ctrl_flexi"],
         observationId: "obs_fare"
-      }
+  };
+  const state = {
+    taskState: {
+      currentObligation: currentObligationFromGoal({ goal: staleFareGoal })
     },
     approvals: {}
   };
@@ -416,17 +419,18 @@ test("governor rejects an expired candidate-set envelope before target execution
   observation.page.controls[1].visualRegion.inViewport = true;
   const goal = deriveObservationGoal(observation, []);
   const candidateSet = __private.groundedObservationCandidateSet(goal, observation);
-  const candidate = candidateSet.candidates[0];
-  const action = __private.bindTargetSnapshot(actionForObservationCandidate(goal, candidate, observation), observation);
+  const candidate = candidateSet.normalCandidates[0];
+  const action = __private.bindTargetSnapshot(actionForCurrentCandidate(goal, candidate, observation), observation);
+  const expiredGoal = {
+    ...goal,
+    candidateSet: { ...candidateSet, observationHash: "expired_hash" },
+    candidates: candidateSet.candidates
+  };
   const failure = governorPrivate.currentGoalCandidateFailure(action, {
     taskState: {
-      currentGoal: {
-        ...goal,
-        candidateSet: { ...candidateSet, observationHash: "expired_hash" },
-        candidates: candidateSet.candidates
-      }
+      currentObligation: currentObligationFromGoal({ goal: expiredGoal })
     }
-  }, observation, []);
+  }, observation, [], { ...candidateSet, observationHash: "expired_hash" });
 
   assert.equal(failure.allow, false);
   assert.equal(failure.decision, "recoverable");
@@ -554,41 +558,11 @@ test("the server-owned semantic affordance is unchanged from candidate through a
   const candidate = candidateSet.candidates[0];
   const action = actionForCurrentCandidate(goal, candidate, observation);
 
-  assert.deepEqual(candidate.affordance, {
-    stableKey: "seat_preference.random.free",
-    meaning: "free random seat",
-    structuredPrice: { amount: 0, currency: "EUR" },
-    risk: "safe",
-    task: {
-      goalId: goal.goalId,
-      semanticType: goal.semanticType,
-      desiredValue: goal.desiredValue,
-      decisionGroupId: "dg_seat",
-      requirementId: "dg_seat",
-      outcomeContract: candidate.outcomeContract
-    },
-    capability: "choose",
-    actuator: {
-      stableKey: "seat_preference.random.free:actuator:choose",
-      targetId: "el_random_label",
-      controlId: "ctrl_random",
-      proven: true,
-      source: "canonical_operation"
-    },
-    effect: "select_free_option",
-    physicalEffect: "select_free_option",
-    mechanicalEffect: "select_free_option",
-    semanticIntent: "select_policy_safe_option",
-    expectedPostconditions: [candidate.expectedOutcome],
-    postcondition: candidate.expectedOutcome,
-    policy: {
-      allow: true,
-      decision: "allow",
-      reason: "Typed target contract identifies this as declining/skipping an optional extra."
-    }
-  });
   assert.deepEqual(action.affordance, candidate.affordance);
-  assert.equal(action.affordance.postcondition.type, "exact_free_option_selected");
+  assert.equal(candidate.affordance.mechanicalEffect, "select_option");
+  assert.equal(candidate.affordance.semanticIntent, "perform_current_obligation");
+  assert.equal(candidate.affordance.policy.decision, "obligation_admitted");
+  assert.deepEqual(candidate.obligationSuccessCondition, candidate.outcomeContract);
 });
 
 test("surface ambiguity is diagnostic context and never an executable goal", () => {
@@ -940,7 +914,7 @@ test("P0.10 derives one canonical requirement per decision group and drops dupli
     }
   ];
 
-  const requirements = __private.requirementsWithDecisionGroups(classified, observation);
+  const requirements = legacyRequirementReplay.requirementsWithDecisionGroups(classified, observation);
 
   assert.equal(requirements.some((req) => req.id === "choice_baggage_duplicate"), false);
   assert.equal(requirements.some((req) => req.id === "field_email"), true);
@@ -950,7 +924,7 @@ test("P0.10 derives one canonical requirement per decision group and drops dupli
 
 test("P0.8 rejects evidence from another decision group", () => {
   const observation = observationWithGroups();
-  const [baggageRequirement] = __private.requirementsWithDecisionGroups([], observation)
+  const [baggageRequirement] = legacyRequirementReplay.requirementsWithDecisionGroups([], observation)
     .filter((req) => req.id === "dg_baggage");
 
   const wrongGroupUpdate = {
@@ -966,17 +940,17 @@ test("P0.8 rejects evidence from another decision group", () => {
   };
 
   assert.equal(
-    __private.updateEvidenceMatchesRequirement(wrongGroupUpdate, baggageRequirement, observation),
+    legacyRequirementReplay.updateEvidenceMatchesRequirement(wrongGroupUpdate, baggageRequirement, observation),
     false
   );
 });
 
 test("P0.8 deterministic current decision-group state outranks stale verifier claims", () => {
   const observation = observationWithGroups();
-  const requirements = __private.requirementsWithDecisionGroups([], observation);
+  const requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], observation);
   const flexRequirement = requirements.find((req) => req.id === "dg_flexible_ticket");
 
-  const reconciled = __private.reconcileRequirements([flexRequirement], {
+  const reconciled = legacyRequirementReplay.reconcileRequirements([flexRequirement], {
     requirementUpdates: [
       {
         requirementId: "dg_flexible_ticket",
@@ -994,7 +968,7 @@ test("P0.8 deterministic current decision-group state outranks stale verifier cl
 
 test("P0.10 fails closed when a choice requirement has no canonical decision group", () => {
   const observation = { observationId: "obs_current", page: { decisionGroups: [], controls: [] } };
-  const [requirement] = __private.requirementsWithDecisionGroups([{
+  const [requirement] = legacyRequirementReplay.requirementsWithDecisionGroups([{
     id: "model_baggage_choice",
     type: "baggage_decision",
     label: "Checked baggage",
@@ -1010,7 +984,7 @@ test("P0.10 fails closed when a choice requirement has no canonical decision gro
   assert.equal(requirement.required, true);
   assert.equal(requirement.confidence, 0);
   assert.match(requirement.evidence.join(" "), /CANONICAL_DECISION_GROUP_MISSING/);
-  assert.equal(__private.updateEvidenceMatchesRequirement({
+  assert.equal(legacyRequirementReplay.updateEvidenceMatchesRequirement({
     requirementId: requirement.id,
     proposedStatus: "satisfied",
     observationId: "obs_current",
@@ -1036,7 +1010,7 @@ test("a fresh exact zero-price decline remains satisfied when legacy canonical m
       }
     }
   };
-  const [requirement] = __private.requirementsWithDecisionGroups([{
+  const [requirement] = legacyRequirementReplay.requirementsWithDecisionGroups([{
     id: "dg_optional_ticket",
     decisionGroupId: "dg_optional_ticket",
     type: "paid_extra_decision",
@@ -1056,7 +1030,7 @@ test("a fresh exact zero-price decline remains satisfied when legacy canonical m
 
 test("Continue policy treats TaskState and legacy requirements as guidance, not click authority", () => {
   const observation = observationWithGroups();
-  const requirements = __private.requirementsWithDecisionGroups([], observation);
+  const requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], observation);
   const continueAction = {
     type: "click",
     targetLabel: "Continue",
@@ -1426,7 +1400,7 @@ test("P0.7/P0.9 resolves every canonical alias to one logical control", () => {
     assert.equal(bound.targetSnapshot.decisionGroupId, "dg_baggage", aliasId);
   }
 
-  assert.equal(__private.controlDecisionGroupId("atw-bag-wrapper", observation.page), "dg_baggage");
+  assert.equal(legacyRequirementReplay.controlDecisionGroupId("atw-bag-wrapper", observation.page), "dg_baggage");
 });
 
 test("P0.7/P0.9 fails closed when one alias is owned by incompatible controls", () => {
@@ -1506,7 +1480,7 @@ test("P0.10 live selected dropdown group state survives stale missing model clai
     }
   ];
 
-  const requirements = __private.requirementsWithDecisionGroups(classified, observation);
+  const requirements = legacyRequirementReplay.requirementsWithDecisionGroups(classified, observation);
   const flex = requirements.find((req) => req.id === "dg_flexible_ticket");
 
   assert.equal(requirements.some((req) => req.id === "model_flex_missing"), false);
@@ -1582,9 +1556,9 @@ test("P1.4 foreground decline requires active surface dismissal instead of gener
 test("P0.11 builds authoritative lifecycle requirements with explicit scope and interface state", () => {
   const observation = observationWithGroups();
   observation.page.step = "traveler_information";
-  const rawRequirements = __private.requirementsWithDecisionGroups([], observation);
+  const rawRequirements = legacyRequirementReplay.requirementsWithDecisionGroups([], observation);
 
-  const lifecycle = __private.canonicalRequirementLifecycle(rawRequirements, observation, [], {
+  const lifecycle = legacyRequirementReplay.canonicalRequirementLifecycle(rawRequirements, observation, [], {
     booking_rules: "no extras no seats"
   }, "traveler_information");
   const flex = lifecycle.find((item) => item.requirementId === "dg_flexible_ticket");
@@ -1602,8 +1576,8 @@ test("P0.11 builds authoritative lifecycle requirements with explicit scope and 
 test("P0.11 stale scoped requirements leave the active planning view", () => {
   const firstObservation = observationWithGroups();
   firstObservation.page.step = "traveler_information";
-  const firstRequirements = __private.requirementsWithDecisionGroups([], firstObservation);
-  const firstLifecycle = __private.canonicalRequirementLifecycle(firstRequirements, firstObservation, [], {
+  const firstRequirements = legacyRequirementReplay.requirementsWithDecisionGroups([], firstObservation);
+  const firstLifecycle = legacyRequirementReplay.canonicalRequirementLifecycle(firstRequirements, firstObservation, [], {
     booking_rules: "no extras no seats"
   }, "traveler_information");
 
@@ -1617,10 +1591,10 @@ test("P0.11 stale scoped requirements leave the active planning view", () => {
       sections: []
     }
   };
-  const secondLifecycle = __private.canonicalRequirementLifecycle([], secondObservation, firstLifecycle, {
+  const secondLifecycle = legacyRequirementReplay.canonicalRequirementLifecycle([], secondObservation, firstLifecycle, {
     booking_rules: "no extras no seats"
   }, "seats");
-  const active = __private.activeRequirementView(secondLifecycle);
+  const active = legacyRequirementReplay.activeRequirementView(secondLifecycle);
 
   assert.equal(secondLifecycle.some((item) => item.lifecycleStatus === "stale"), true);
   assert.equal(active.some((item) => item.requirementId === "dg_flexible_ticket"), false);

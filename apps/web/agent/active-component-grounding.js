@@ -67,15 +67,21 @@ function unblockedStageExitReady(page = {}) {
   return Boolean(readyCandidate && !(exit.blockers || []).length);
 }
 
-function activeUnknownComponents(observation = {}) {
+function activeUnknownComponents(observation = {}, { admittedControlIds = [] } = {}) {
   const page = observation.page || {};
   if (!PROFILE_STAGE.test(String(page.step || ""))) return [];
+  const admitted = new Set((admittedControlIds || []).map(String).filter(Boolean));
+  // Semantic grounding is not a page scanner. TaskState must first admit one
+  // exact Current Obligation; only controls owned by that obligation may be
+  // considered for a profile binding hypothesis.
+  if (!admitted.size) return [];
   // Grounding is semantic evidence for an already admitted unknown
   // requirement, never an independent source of work. A fresh executable
   // stage exit with no blockers proves that dormant/optional unknown controls
   // do not own the current task.
   if (unblockedStageExitReady(page)) return [];
   return (page.controls || []).filter((control) => {
+    if (!admitted.has(String(control.controlId || ""))) return false;
     const lifecycle = control.representationLifecycle || {};
     const explicitlyActive = lifecycle.active === true || lifecycle.status === "active_rendered";
     if (!explicitlyActive || !controlBelongsToCurrentSurface(control, page)) return false;
@@ -105,6 +111,21 @@ function activeUnknownComponents(observation = {}) {
     if (!unresolved || (!locallyRequired && !ownsValidation) || genericContainer) return false;
     return operationCapabilities(control).length > 0;
   }).slice(0, MAX_GROUNDING_COMPONENTS);
+}
+
+function unknownComponentsForObligation(observation = {}, obligation = null) {
+  if (!obligation || typeof obligation !== "object") return [];
+  if (obligation.authority !== "task_state"
+    || obligation.admission?.status !== "admitted") return [];
+  const family = clean(
+    obligation.canonicalSubject?.family
+    || obligation.subject?.family
+    || obligation.family
+  ).toLowerCase();
+  if (family !== "profile") return [];
+  return activeUnknownComponents(observation, {
+    admittedControlIds: obligation.candidateControlIds || []
+  });
 }
 
 function availableSemanticFacts(traveler = {}, context = {}) {
@@ -211,9 +232,10 @@ async function resolveActiveComponentSemantics({
   traveler = {},
   transactionReview = null,
   screenshotDataUrl = "",
-  attemptedStrategies = []
+  attemptedStrategies = [],
+  admittedControlIds = []
 } = {}) {
-  const components = activeUnknownComponents(observation);
+  const components = activeUnknownComponents(observation, { admittedControlIds });
   if (!components.length) return { observation, resolution: null, meta: null };
   const facts = availableSemanticFacts(traveler, {
     page: observation.page || {},
@@ -298,6 +320,7 @@ async function resolveActiveComponentSemantics({
 
 module.exports = {
   activeUnknownComponents,
+  unknownComponentsForObligation,
   availableSemanticFacts,
   applySemanticBinding,
   resolveActiveComponentSemantics

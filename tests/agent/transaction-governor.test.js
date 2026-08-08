@@ -6,7 +6,8 @@ const path = require("path");
 
 const { createStore } = require("../../apps/web/agent/session-store");
 const { listTraces } = require("../../apps/web/agent/trace-store");
-const { governAction, __private: governorPrivate } = require("../../apps/web/agent/action-governor");
+const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
+const { governObservedAction: governAction } = require("./governance-test-helper");
 const {
   profileStageReadiness,
   selectNextProfileRequirement,
@@ -20,10 +21,11 @@ const { encodeDateForField } = require("../../apps/web/agent/date-field-codec");
 const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
-const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
+const { reduceTaskState } = require("./task-state-replay-adapter");
 const { deriveObservationGoal } = require("../../apps/web/agent/observation-candidates");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { semanticGoalKey } = require("../../packages/shared/agent-actions");
+const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
 
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
   return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
@@ -58,21 +60,22 @@ function actionableCapability(operation, actuatorId, { inViewport = true, actuat
 
 test("bounded adaptive episodes admit only local reversible mechanics", () => {
   const surfaceId = "surface-country-list";
+  const adaptiveGoal = {
+    kind: "adaptive_surface",
+    goalId: "adaptive-country-code",
+    adaptiveEnvelope: {
+      episodeId: "episode-country-code",
+      surfaceId,
+      allowedOperations: ["choose", "type", "keyboard"],
+      forbiddenRisks: ["money", "payment", "legal"],
+      forbiddenEffects: ["select_paid_option", "advance_checkout_stage"],
+      remainingSteps: 4,
+      deadlineAt: Date.now() + 10_000
+    }
+  };
   const state = {
     taskState: {
-      currentGoal: {
-        kind: "adaptive_surface",
-        goalId: "adaptive-country-code",
-        adaptiveEnvelope: {
-          episodeId: "episode-country-code",
-          surfaceId,
-          allowedOperations: ["choose", "type", "keyboard"],
-          forbiddenRisks: ["money", "payment", "legal"],
-          forbiddenEffects: ["select_paid_option", "advance_checkout_stage"],
-          remainingSteps: 4,
-          deadlineAt: Date.now() + 10_000
-        }
-      }
+      currentObligation: currentObligationFromGoal({ goal: adaptiveGoal })
     }
   };
   const observation = {
@@ -93,8 +96,7 @@ test("bounded adaptive episodes admit only local reversible mechanics", () => {
   const interactionState = {
     ...state,
     taskState: {
-      ...state.taskState,
-      currentGoal: { ...state.taskState.currentGoal, kind: "adaptive_interaction" }
+      currentObligation: currentObligationFromGoal({ goal: { ...adaptiveGoal, kind: "adaptive_interaction" } })
     }
   };
   assert.equal(governorPrivate.adaptiveEnvelopeFailure({
@@ -137,11 +139,11 @@ test("pre-surface discovery admits one exact reversible opener and rejects seman
   const surfaceId = "surface-page";
   const state = {
     taskState: {
-      currentGoal: {
+      currentObligation: currentObligationFromGoal({ goal: {
         kind: "profile_field",
         goalId: "profile:title:0",
         semanticType: "title"
-      }
+      } })
     }
   };
   const observation = { page: { currentSurface: { id: surfaceId, type: "page" } } };
@@ -300,7 +302,7 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
   store.saveSession(state);
   store.recordObservation(state.id, observation);
 
-  const result = await runLoopTurn({
+  const exhaustedTurn = await runLoopTurn({
     apiKey: "",
     model: "must-not-be-called",
     dataDir: dir,
@@ -311,10 +313,34 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
     clientTurnId: "turn_false_bag_exhausted"
   });
 
-  assert.equal(result.clientDecision.action, "click", result.clientDecision.reason);
+  assert.equal(exhaustedTurn.clientDecision.action, "wait", exhaustedTurn.clientDecision.reason);
+  assert.equal(exhaustedTurn.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
+  const reobserved = {
+    ...observation,
+    observationId: "obs_false_bag_reobserved",
+    observationSnapshot: { snapshotHash: observation.observationSnapshot.snapshotHash }
+  };
+  store.recordObservation(state.id, reobserved);
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: exhaustedTurn.state,
+    observation: reobserved,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_false_bag_adaptive"
+  });
+
+  assert.equal(result.clientDecision.action, "click", JSON.stringify({
+    reason: result.clientDecision.reason,
+    currentGoal: result.state.taskState?.currentGoal,
+    currentObligation: result.state.taskState?.currentObligation,
+    pendingMechanicalEvidence: result.state.pendingMechanicalEvidence
+  }, null, 2));
   assert.equal(result.clientDecision.controlId, skip.controlId);
-  assert.equal(result.state.taskState.currentGoal.kind, "adaptive_interaction");
-  assert.equal(result.state.taskState.currentGoal.authority, "task_state");
+  assert.equal(result.state.taskState.currentObligation.kind, "adaptive_interaction");
+  assert.equal(result.state.taskState.currentObligation.authority, "task_state");
   assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1404,13 +1430,13 @@ test("an exhausted Title actuator cannot make the loop skip to Nationality", asy
     clientTurnId: "turn_reschedule_title_to_nationality"
   });
 
-  assert.equal(loopResult.clientDecision.action, "stop", JSON.stringify({
+  assert.equal(loopResult.clientDecision.action, "wait", JSON.stringify({
     action: loopResult.clientDecision.action,
     controlId: loopResult.clientDecision.controlId,
-    semanticType: loopResult.state.taskState.currentGoal?.semanticType
+    semanticType: loopResult.state.taskState.currentObligation?.subject?.semanticType
   }));
-  assert.equal(loopResult.state.taskState.currentGoal.semanticType, "title");
-  assert.match(loopResult.clientDecision.reason, /^STRATEGIES_EXHAUSTED:/);
+  assert.equal(loopResult.state.taskState.currentObligation.subject.semanticType, "title");
+  assert.equal(loopResult.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
   assert.equal(loopResult.debug.modelUsage.calls.length, 0);
 
   store.close();
@@ -1562,8 +1588,8 @@ test("profile goal selection preserves the first unresolved semantic obligation"
     transactionStore: store,
     clientTurnId: "turn_all_profile_actuators_blocked"
   });
-  assert.equal(loopResult.clientDecision.action, "stop");
-  assert.match(loopResult.clientDecision.reason, /^MISSING_EXECUTABLE_ACTUATOR:/);
+  assert.equal(loopResult.clientDecision.action, "wait");
+  assert.equal(loopResult.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
   assert.equal(loopResult.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1950,14 +1976,15 @@ test("completed form reports unavailable navigation internally instead of asking
     clientTurnId: "turn_unavailable_navigation"
   });
 
-  assert.equal(result.clientDecision.action, "stop");
-  assert.equal(result.clientDecision.intent, "internal_readiness_failure");
-  assert.match(result.clientDecision.reason, /INTERNAL_READINESS_FAILURE/);
-  assert.equal(result.state.status, "stopped");
+  assert.equal(result.clientDecision.action, "wait");
+  assert.equal(result.clientDecision.intent, "task_state_reobserve");
+  assert.match(result.clientDecision.reason, /no_goal_relevant_candidate/);
+  assert.equal(result.state.status, "running");
   assert.equal("navigationSettling" in result.state, false);
   assert.equal(result.state.currentObligation, undefined);
   assert.equal(result.debug.userActionRequired, false);
   assert.equal(result.debug.modelUsage.calls.length, 0);
+  await new Promise((resolve) => setImmediate(resolve));
   const traces = listTraces(dir, state.id);
   assert.equal(traces.length, 1);
   store.close();
@@ -2224,7 +2251,10 @@ test("Unified semantic goal state survives a SQLite restart", () => {
   const observation = profileFormObservation();
   const currentGoal = deriveProfileGoal(observation, traveler);
   currentGoal.candidates = candidatesForProfileGoal(currentGoal, observation, traveler);
-  state.taskState = { stage: "traveler_information", currentGoal };
+  state.taskState = {
+    stage: "traveler_information",
+    currentObligation: currentObligationFromGoal({ goal: currentGoal })
+  };
   state.pendingAction = {
     status: "governed",
     actionId: "act_email",
@@ -2238,8 +2268,8 @@ test("Unified semantic goal state survives a SQLite restart", () => {
   store.close();
   store = createStore({ dbPath });
   const restored = store.getSession(state.id);
-  assert.equal(restored.taskState.currentGoal.goalId, "profile:email:0");
-  assert.equal(restored.taskState.currentGoal.candidates, undefined);
+  assert.equal(restored.taskState.currentGoal, undefined);
+  assert.equal(restored.taskState.currentObligation.obligationId, "profile:email:0");
   assert.equal(restored.pendingAction.candidateId, currentGoal.candidates[0].candidateId);
   assert.deepEqual(restored.recoveryState.attemptedCandidateIds, ["candidate_previous"]);
   assert.equal(restored.verifiedResults[0].browserVerified, true);
@@ -2279,8 +2309,8 @@ test("Unified loop fills email then immediately advances to confirmation email",
     transactionStore: store,
     clientTurnId: "turn_email_first"
   });
-  assert.equal(email.clientDecision.action, "type");
-  assert.equal(email.state.taskState.currentGoal.semanticType, "email");
+  assert.equal(email.clientDecision.action, "type", JSON.stringify({ decision: email.clientDecision, debug: email.debug }));
+  assert.equal(email.state.taskState.currentObligation.subject.semanticType, "email");
   assert.equal(email.clientDecision.value, traveler.email);
 
   const confirmationObservation = completeProfileObservation({
@@ -2308,7 +2338,7 @@ test("Unified loop fills email then immediately advances to confirmation email",
     clientTurnId: "turn_email_confirmation"
   });
   assert.equal(confirmation.clientDecision.action, "type");
-  assert.equal(confirmation.state.taskState.currentGoal.semanticType, "confirm_email");
+  assert.equal(confirmation.state.taskState.currentObligation.subject.semanticType, "confirm_email");
   assert.equal(confirmation.clientDecision.value, traveler.email);
   assert.equal(confirmation.debug.modelUsage.calls.length, 0);
   store.close();
@@ -2364,7 +2394,7 @@ test("Unified semantic loop advances to the next profile goal without another mo
   assert.equal(result.clientDecision.expectedOutcome.type, "normalized_value_changed");
   assert.equal(result.clientDecision.expectedOutcome.expectedNormalizedValue, "40111222");
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.equal(result.state.taskState.currentGoal.semanticType, "phone");
+  assert.equal(result.state.taskState.currentObligation.subject.semanticType, "phone");
   assert.equal(result.state.verifiedResults.some((item) => item.goalId === "profile:email:0" && item.browserVerified), true);
   assert.equal(result.state.verifiedResults.some((item) => item.semanticPostconditionSatisfied === true), false);
   store.close();
@@ -2478,18 +2508,20 @@ test("P0.4 blank traveler stage deterministically starts profile ownership befor
   assert.equal(result.clientDecision.goalId, "profile:email:0");
   assert.ok(result.clientDecision.candidateId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.equal(result.state.taskState.currentGoal.semanticType, "email");
+  assert.equal(result.state.taskState.currentObligation.subject.semanticType, "email");
   assert.equal(result.state.pendingAction.candidateId, result.clientDecision.candidateId);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.4 canonical profile readiness blocks baggage even without an active skill plan", () => {
+test("current-surface authority blocks unrelated baggage without a legacy readiness fallback", () => {
   const { dir, dbPath } = tempDb();
   const { state, observation: baggageFixture } = fixture();
   const observation = profileFormObservation({ observationId: "obs_profile_error", emailFilled: true, phoneFilled: true });
   observation.page.errors = ["Mobile number is invalid"];
   observation.page.controls.push(baggageFixture.page.controls[0]);
+  const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222", booking_rules: "no extras" };
+  state.taskState = reduceTaskState({ observation, traveler });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -2497,7 +2529,7 @@ test("P0.4 canonical profile readiness blocks baggage even without an active ski
   const result = governAction({
     state,
     observation,
-    traveler: { id: "trav_1", email: "ali@example.test", phone: "+38640111222", booking_rules: "no extras" },
+    traveler,
     store,
     turnId: "turn_profile_error_gate",
     action: {
@@ -2523,10 +2555,9 @@ test("P0.4 canonical profile readiness blocks baggage even without an active ski
     }
   });
 
-  assert.equal(state.currentGoal, undefined);
+  assert.equal(state.taskState.currentGoal?.candidates, undefined);
   assert.equal(result.allow, false);
-  assert.equal(result.code, "PROFILE_STAGE_NOT_READY");
-  assert.match(result.reason, /Mobile number is invalid/);
+  assert.equal(result.code, "TARGET_OUTSIDE_CURRENT_SURFACE");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2557,7 +2588,7 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(recovery.clientDecision.intent, "recover_target_viewport");
   assert.equal(recovery.clientDecision.needsApproval, false);
   assert.equal(recovery.debug.modelUsage.calls.length, 0);
-  assert.equal(recovery.state.taskState.currentGoal.semanticType, "email");
+  assert.equal(recovery.state.taskState.currentObligation.subject.semanticType, "email");
   assert.equal(recovery.state.pendingAction.schemaVersion, 2);
   assert.equal(recovery.state.pendingAction.status, "needs_reveal");
 
@@ -2892,7 +2923,8 @@ test("fresh paid conflict preempts a pending navigation action and dispatches th
   assert.equal(result.clientDecision.controlId, "ctrl_bundle_free");
   assert.equal(result.clientDecision.intent, "decline_optional_extra");
   assert.notEqual(result.state.pendingAction.originalAction.id, "act_pending_continue");
-  assert.equal(result.state.taskState.activeDecisions[0].status, "conflicted");
+  assert.equal(result.state.taskState.currentObligation.subject.decisionGroupId, "dg_bundle");
+  assert.match(result.state.taskState.currentObligation.desiredEffect, /decline|remove|select_free/);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -3011,7 +3043,7 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.7 user handoff occurs only after bounded genuine viewport failures", async () => {
+test("P0.7 bounded genuine viewport failure returns to TaskState for the final disposition", async () => {
   const { dir, dbPath } = tempDb();
   const { state, observation } = fixture();
   observation.page.viewport = { width: 1200, height: 800 };
@@ -3062,9 +3094,23 @@ test("P0.7 user handoff occurs only after bounded genuine viewport failures", as
     clientTurnId: "turn_viewport_genuine_failure"
   });
 
-  assert.equal(result.clientDecision.action, "ask_user");
+  assert.equal(result.clientDecision.action, "wait");
   assert.equal(result.state.pendingAction, null);
-  assert.equal(result.state.status, "awaiting_user");
+  assert.equal(result.state.status, "running");
+  assert.equal(result.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
+
+  const final = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: dir,
+    state: result.state,
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_viewport_genuine_failure_disposition"
+  });
+  assert.equal(final.clientDecision.action, "stop");
+  assert.equal(final.state.taskState.disposition.code, "STRATEGIES_EXHAUSTED");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

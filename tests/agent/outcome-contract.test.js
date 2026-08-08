@@ -2,8 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { buildCurrentCandidateSet, actionForCurrentCandidate } = require("../../apps/web/agent/current-candidate-builder");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
-const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
-const { governAction } = require("../../apps/web/agent/action-governor");
+const { reduceTaskState } = require("./task-state-replay-adapter");
+const { governObservedAction: governAction } = require("./governance-test-helper");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 
 function capability(operation, actuatorId) {
@@ -123,15 +123,15 @@ test("same-label modal close and checkout submit remain safe selectable foregrou
 
   assert.equal(close.physicalEffect, "dismiss_surface");
   assert.equal(close.mechanicalEffect, "dismiss_surface");
-  assert.equal(close.semanticIntent, "close_review");
-  assert.equal(close.expectedPostconditions.some((condition) => condition.type === "durable_objective_progress" && condition.status === "no_progress"), true);
+  assert.equal(close.semanticIntent, "perform_current_obligation");
+  assert.equal(close.obligationSuccessCondition.taskOutcome, "payment_review_reached");
   assert.equal(close.selectable, true);
-  assert.equal(close.outcomeCompatibility, "context_only");
+  assert.equal(close.outcomeCompatibility, "obligation_admitted");
   assert.equal(close.exclusionReason, "");
   assert.equal(submit.physicalEffect, "advance_checkout_stage");
   assert.equal(submit.mechanicalEffect, "advance_checkout_stage");
-  assert.equal(submit.semanticIntent, "continue_to_payment");
-  assert.equal(submit.expectedPostconditions.some((condition) => condition.type === "payment_review_evidence"), true);
+  assert.equal(submit.semanticIntent, "perform_current_obligation");
+  assert.equal(submit.obligationSuccessCondition.taskOutcome, "payment_review_reached");
   assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["close", "submit"]);
 });
 
@@ -213,7 +213,7 @@ test("opening a warning modal is verified intermediate progress, never checkout 
   assert.equal(transition.postcondition.satisfied, false);
   assert.deepEqual(transition.physicalResult.effect, "open_surface");
   assert.equal(transition.taskOutcomeCompleted, false);
-  assert.equal(transition.completionAuthority, "task_state");
+  assert.equal(transition.completionAuthority, "transition_evaluator");
 });
 
 test("closing a review modal cannot prove payment review was reached", () => {
@@ -511,10 +511,10 @@ test("seat-warning Continue carries separate mechanical, semantic, and postcondi
   assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["warning_continue"]);
   const candidate = candidateSet.candidates[0];
   assert.equal(candidate.mechanicalEffect, "dismiss_surface");
-  assert.equal(candidate.semanticIntent, "confirm_continue_without_seats");
-  assert.equal(candidate.outcomeCompatibility, "compatible");
-  assert.equal(candidate.expectedPostconditions.some((condition) => condition.type === "surface_absent"), true);
-  assert.equal(candidate.expectedPostconditions.some((condition) => condition.type === "seat_policy_outcome"), true);
+  assert.equal(candidate.semanticIntent, "advance_checkout_stage");
+  assert.equal(candidate.outcomeCompatibility, "obligation_admitted");
+  assert.deepEqual(candidate.obligationSuccessCondition, taskState.currentGoal.successCondition);
+  assert.deepEqual(candidate.expectedPostconditions, [candidate.localMechanicalPostcondition]);
 
   const after = observation("obs_seat_warning_closed", {
     step: "seats",

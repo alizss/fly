@@ -1,7 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { test, expect } = require("@playwright/test");
-const { governAction } = require("../../apps/web/agent/action-governor");
+const { governObservedAction: governAction } = require("./governance-test-helper");
 const {
   fieldDescriptors,
   selectNextProfileRequirement,
@@ -18,15 +18,17 @@ const {
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
 const { advanceActionLifecycle, pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { sanitizedActionHistory } = require("../../apps/web/agent/model-context");
-const { resolvePlannerSelection } = require("../../apps/web/agent/verify-and-plan");
+const { resolvePlannerSelection } = require("./legacy-planner-replay-adapter");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
-const { reduceTaskState } = require("../../apps/web/agent/task-state-reducer");
+const { reduceTaskState } = require("./task-state-replay-adapter");
 const { prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
 const { classifyObservationReadiness, READINESS } = require("../../apps/web/agent/observation-readiness");
-const { resolveSemanticOwnership } = require("../../apps/web/agent/select-candidate");
+const { resolveSemanticOwnership } = require("./legacy-semantic-ownership-adapter");
 const { resolveLogicalFields, logicalFieldSatisfied } = require("../../apps/web/agent/logical-field");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { actuatorSignature, semanticGoalKey } = require("../../packages/shared/agent-actions");
+const { compileDecisionFrame, currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
   return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
@@ -235,14 +237,27 @@ async function browserObservation(page, observationId) {
 async function executeAtomicBrowserDecision(page, decision, resultObservationId) {
   return page.evaluate(async ({ governed, nextObservationId }) => {
     const hooks = window.__ATW_TEST__;
-    const beforeMap = hooks.buildPageMap();
+    // Keep the pre-action observation immutable even when the incremental
+    // observer refreshes its internal cache after a DOM mutation.
+    const beforeMap = JSON.parse(JSON.stringify(hooks.buildPageMap()));
     hooks.prepareScreenshotAnnotations(beforeMap, governed.observationId);
     let target = null;
     let validation = null;
     let choiceCommit = null;
+    // An expected outcome is a pre-dispatch contract. Building it after the
+    // event would let the resulting URL/surface become its own baseline and
+    // make genuine transitions unverifiable.
+    let expectedOutcome = governed.expectedOutcome || null;
+    const bindPreDispatchUrl = (outcome) => ({
+      ...(outcome || {}),
+      beforeUrl: outcome?.beforeUrl || beforeMap.url || location.href
+    });
+    if (expectedOutcome) expectedOutcome = bindPreDispatchUrl(expectedOutcome);
     if (governed.action === "click_xy") {
       const hit = document.elementFromPoint(governed.x, governed.y);
       target = hit;
+      expectedOutcome ||= hooks.expectedOutcomeForDecision(governed, beforeMap, target);
+      expectedOutcome = bindPreDispatchUrl(expectedOutcome);
       validation = hooks.validateVisualCoordinateTarget(governed, hit, beforeMap);
       if (validation.ok) {
         target = validation.dispatchTarget || hit;
@@ -250,6 +265,8 @@ async function executeAtomicBrowserDecision(page, decision, resultObservationId)
       }
     } else {
       target = hooks.resolveDecisionTarget(governed, beforeMap);
+      expectedOutcome ||= hooks.expectedOutcomeForDecision(governed, beforeMap, target);
+      expectedOutcome = bindPreDispatchUrl(expectedOutcome);
       validation = target
         ? hooks.validateResolvedTarget(governed, target, beforeMap)
         : { ok: false, code: "CANONICAL_ACTUATOR_UNAVAILABLE" };
@@ -291,9 +308,16 @@ async function executeAtomicBrowserDecision(page, decision, resultObservationId)
         if (!fieldResult.ok) validation = { ok: false, code: "FIELD_VALUE_NOT_VERIFIED", fieldResult };
       }
     }
+    // Production always binds browser-local baselines and the final governor
+    // authorization around the server-owned obligation postcondition. Keep
+    // replay execution identical instead of passing the raw backend outcome
+    // directly to the verifier.
+    expectedOutcome = bindPreDispatchUrl(hooks.expectedOutcomeForDecision({
+      ...governed,
+      expectedOutcome
+    }, beforeMap, target));
     await new Promise((resolve) => setTimeout(resolve, 80));
     let afterMap = hooks.buildPageMap();
-    const expectedOutcome = governed.expectedOutcome || hooks.expectedOutcomeForDecision(governed, beforeMap, target);
     let localVerification = validation.ok
       ? hooks.verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target)
       : { ok: false, code: validation.code, message: "Browser validation rejected the action.", evidence: {} };
@@ -840,8 +864,18 @@ test("three sibling extras resolve as an exact decision-group queue before Conti
     ).toBe("click");
     expect(turn.clientDecision.targetLabel).toMatch(/no thanks/i);
     expect(turn.clientDecision.decisionGroupId).toBe(unresolved.decisionGroupId);
-    expect(turn.state.taskState.currentGoal.candidates.every((candidate) => candidate.decisionGroupId === unresolved.decisionGroupId)).toBe(true);
-    expect(turn.state.taskState.currentGoal.candidates.some((candidate) => /continue/i.test(candidate.targetLabel || ""))).toBe(false);
+    expect(turn.state.taskState.currentGoal).toBeUndefined();
+    expect(turn.state.taskState.currentObligation).toMatchObject({
+      contractVersion: "current-obligation/v2",
+      subject: { decisionGroupId: unresolved.decisionGroupId }
+    });
+    expect(turn.state.taskState.currentObligation.admittedControlIds).toContain(turn.clientDecision.controlId);
+    const continueControlIds = observation.page.controls
+      .filter((control) => /continue/i.test(control.label || ""))
+      .map((control) => control.controlId);
+    expect(turn.state.taskState.currentObligation.admittedControlIds.some(
+      (controlId) => continueControlIds.includes(controlId)
+    )).toBe(false);
 
     completedGroupIds.push(unresolved.decisionGroupId);
     const executed = await executeAtomicBrowserDecision(page, turn.clientDecision, `obs_exact_groups_${index + 1}`);
@@ -1068,7 +1102,7 @@ async function executeUnifiedCandidate({ page, store, state, goal, candidate, ob
   return { action, browser };
 }
 
-test("Unified currentGoal loop executes server candidates selected only by candidateId", async ({ page }) => {
+test("Unified CurrentObligation loop executes turn-local server candidates selected only by candidateId", async ({ page }) => {
   const traveler = { id: "trav_combo", phone: "+38670328922", nationality: "Slovenia" };
   for (const variant of [
     { name: "direct_type", operation: "type", value: "+386" },
@@ -1395,7 +1429,7 @@ test("cabin-bag scope, paid option, and free skip compile into one safe governed
         document.getElementById("stage").textContent = "Hold luggage";
         document.getElementById("skip-bags").remove();
         document.body.dataset.stage = "hold-luggage";
-        history.pushState({}, "", "/checkout/hold-luggage");
+        location.hash = "hold-luggage";
       });
     </script>
   `);
@@ -1760,13 +1794,14 @@ test("split state and actuator nodes compile into one owned traveler-title decis
     targetId: mr.operations.choose.actuatorId
   });
 
+  const selectedAction = actionForProfileCandidate(goal, candidates[0], observation);
   const selected = await executeAtomicBrowserDecision(
     page,
-    toClientDecision(actionForProfileCandidate(goal, candidates[0], observation)),
+    toClientDecision(selectedAction),
     "obs_split_title_selected"
   );
   expect(selected.result.dispatched).toBe(true);
-  expect(selected.verification.ok).toBe(true);
+  expect(selected.verification.ok, JSON.stringify(selected.verification)).toBe(true);
   expect(resolveLogicalFields(selected.observation.page, profile)
     .find((field) => field.semanticType === "title")?.currentCanonicalValue).toBe("mr");
 });
@@ -1870,7 +1905,6 @@ test("stage exit preserves every Continue representation and advances through th
   await page.evaluate(() => {
     document.getElementById("working-continue").addEventListener("click", () => {
       window.__workingContinueClicked = true;
-      history.pushState({}, "", "/checkout/seats");
       document.getElementById("stage-heading").textContent = "Seat selection";
     });
   });
@@ -1943,7 +1977,6 @@ test("agent-owned UI is transparent to governed site hit-testing and dispatch", 
     sidebar.replaceChildren(cover);
     document.getElementById("site-continue").addEventListener("click", () => {
       window.__selfOccludedContinueClicked = true;
-      history.pushState({}, "", "/checkout/seats");
       document.getElementById("stage-heading").textContent = "Seat selection";
     });
     window.__ATW_TEST_TRUSTED_INPUT__ = ({ element, x, y }) => {
@@ -3177,9 +3210,10 @@ test("one exact custom-control actuator advances through method-aware retry and 
     candidateSet: firstSet,
     candidates: firstSet.candidates
   };
+  const firstObligation = currentObligationFromGoal({ goal });
   state = {
     ...state,
-    taskState: { ...initialTaskState, currentGoal: firstAuthoritativeGoal },
+    taskState: { ...initialTaskState, currentObligation: firstObligation },
     currentGoal: firstAuthoritativeGoal,
     currentObservation: {
       observationId: initial.observationId,
@@ -3213,7 +3247,7 @@ test("one exact custom-control actuator advances through method-aware retry and 
   expect(nativeResult.verification.ok).toBe(false);
   const failedLifecycle = loopPrivate.applyTransitionStatus({
     ...governedNative.state,
-    taskState: { ...initialTaskState, currentGoal: firstAuthoritativeGoal },
+    taskState: { ...initialTaskState, currentObligation: firstObligation },
     currentGoal: firstAuthoritativeGoal,
     lastAction: governedNative.action,
     recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] }
@@ -3273,7 +3307,10 @@ test("one exact custom-control actuator advances through method-aware retry and 
     goal,
     retryObservation
   );
-  expect(failedSignatures).toEqual([actuatorSignature(nativeAction)]);
+  expect(failedSignatures, JSON.stringify({
+    stored: failedLifecycle.state.recoveryState.failedStrategies,
+    retryGoal: goal
+  })).toEqual([actuatorSignature(nativeAction)]);
   const pointerSet = loopPrivate.groundedObservationCandidateSet(goal, retryObservation, failedSignatures, {
     state: { ...failedLifecycle.state, taskState: retryTaskState, approvals: {} },
     traveler,
@@ -3690,8 +3727,7 @@ test("verified EasyJet-shaped age opener retains age ownership and selects the c
   expect(surfaceTask.currentGoal).toMatchObject({
     kind: "adaptive_surface",
     semanticType: "age_at_departure",
-    desiredValue: "23",
-    sourceGoal: { semanticType: "age_at_departure", desiredValue: "23" }
+    desiredValue: "23"
   });
 
   // The live site does not repeat the derived age on the child surface. The
@@ -3699,8 +3735,7 @@ test("verified EasyJet-shaped age opener retains age ownership and selects the c
   // that 23 belongs to the freshly observed 18+ option.
   const codecOnlyGoal = {
     ...surfaceTask.currentGoal,
-    choiceTerms: [],
-    sourceGoal: { ...surfaceTask.currentGoal.sourceGoal, choiceTerms: [] }
+    choiceTerms: []
   };
   const optionSet = buildCurrentCandidateSet({
     goal: codecOnlyGoal,
@@ -4635,7 +4670,7 @@ test("stage exit distinguishes an observed disabled Continue from navigation tha
   expect(missing.blockers).toContain("Continue not observed");
 });
 
-test("destination readiness and stale-grounding waits use the durable unchanged-observation retry lifecycle", async ({ page }) => {
+test("destination, grounding, and TaskState waits share one mutation-or-deadline lifecycle", async ({ page }) => {
   await loadProducer(page);
   const now = Date.now();
   const result = await page.evaluate(({ startedAt, deadlineAt }) => {
@@ -4663,24 +4698,64 @@ test("destination readiness and stale-grounding waits use the durable unchanged-
       observationId: "obs_navigation_settling",
       actionId: "act_navigation_settling"
     };
+    const taskStateDecision = {
+      ...decision,
+      intent: "task_state_reobserve",
+      reobserveRetryToken: "retry_current_surface_once"
+    };
     const recognized = hooks.isDestinationReadinessDecision(decision);
     const groundingRecoveryRecognized = hooks.isDestinationReadinessDecision({
       action: "wait",
       intent: "reobserve_after_grounding_rejection"
     });
-    hooks.beginDestinationWait(decision);
+    const taskStateRecognized = hooks.isDestinationReadinessDecision({
+      action: "wait",
+      intent: "task_state_reobserve"
+    });
+    hooks.beginDestinationWait(taskStateDecision);
     const state = hooks.agentLoopState();
+    const map = hooks.buildPageMap();
+    const compact = hooks.compactPageMap(map, "obs_navigation_settling");
+    const fullPayload = {
+      sessionId: "session_navigation_settling",
+      observationId: "obs_navigation_settling",
+      observationUpdate: {
+        mode: "reference",
+        baseSnapshotHash: compact.snapshotHash,
+        snapshotHash: compact.snapshotHash,
+        material: false
+      },
+      page: compact,
+      destinationReadiness: { retryToken: "retry_current_surface_once" }
+    };
+    const referencePayload = hooks.referenceObservationTransport(fullPayload);
     hooks.clearDestinationWait("test_complete");
     hooks.setAgentRunningForTest(false);
-    return { recognized, groundingRecoveryRecognized, state };
+    return {
+      recognized,
+      groundingRecoveryRecognized,
+      taskStateRecognized,
+      state,
+      referencePayload,
+      fullBytes: hooks.observationTransportBytes(fullPayload),
+      referenceBytes: hooks.observationTransportBytes(referencePayload)
+    };
   }, { startedAt: now, deadlineAt: now + 8_000 });
 
   expect(result.recognized).toBe(true);
   expect(result.groundingRecoveryRecognized).toBe(true);
+  expect(result.taskStateRecognized).toBe(true);
   expect(result.state.destinationWait.status).toBe("WAITING_FOR_DESTINATION");
   expect(result.state.destinationWait.startedAt).toBe(now);
   expect(result.state.destinationWait.deadlineAt).toBe(now + 8_000);
   expect(result.state.destinationWait.backendWaits).toBe(1);
+  expect(result.state.destinationWait.retryToken).toBe("retry_current_surface_once");
+  expect(result.referencePayload).toMatchObject({
+    transportMode: "observation_reference",
+    page: { referenceOnly: true },
+    destinationReadiness: { retryToken: "retry_current_surface_once" }
+  });
+  expect(result.referenceBytes).toBeLessThan(result.fullBytes / 2);
 });
 
 test("closed ARIA combobox with owned options exposes and verifies one trusted choice", async ({ page }) => {
@@ -5755,7 +5830,7 @@ test("GoToGate-shaped payment review is terminal evidence without payment capabi
     navigationContext: { lifecycle: { awaitingDestination: true, status: "waiting_for_destination" } }
   });
   expect(readiness.classification).toBe(READINESS.READY);
-  expect(readiness.evidence.strongPaymentEvidence).toBe(true);
+  expect(readiness.evidence.strongPaymentEvidence).toBeUndefined();
 
   const task = reduceTaskState({
     observation,
@@ -5803,7 +5878,7 @@ test("progressive payment entry compiles FROM/TO itinerary and outranks a generi
     navigationContext: { lifecycle: { awaitingDestination: true, status: "waiting_for_destination" } }
   });
   expect(readiness.classification).toBe(READINESS.READY);
-  expect(readiness.evidence.strongPaymentEvidence).toBe(true);
+  expect(readiness.evidence.strongPaymentEvidence).toBeUndefined();
 });
 
 test("persistent selected-booking total stays authoritative while an insurance offer stays option-local", async ({ page }) => {
@@ -5955,7 +6030,7 @@ test("hosted payment widget with opaque native inputs contributes owned terminal
     navigationContext: { lifecycle: { awaitingDestination: true, status: "waiting_for_destination" } }
   });
   expect(readiness.classification).toBe(READINESS.READY);
-  expect(readiness.evidence.strongPaymentEvidence).toBe(true);
+  expect(readiness.evidence.strongPaymentEvidence).toBeUndefined();
 });
 
 test("hidden future hosted payment markup does not become terminal evidence", async ({ page }) => {
@@ -6216,6 +6291,7 @@ test("commercial CTA cards bind option price and policy selects the included far
         }
       });
       document.querySelector('[data-testid="fareTypesSaverButton"]').addEventListener("click", () => {
+        location.hash = "cancellation-protection";
         document.querySelector('[aria-label="Fare packages"]').outerHTML = \`
           <section aria-label="Cancellation protection">
             <h2>Protect your trip?</h2>
@@ -6337,7 +6413,14 @@ test("absolute fare totals compile to one base fare and exact profile-compatible
     </main>
   `);
 
-  const observation = await browserObservation(page, "obs_absolute_fare_totals");
+  const rawObservation = await browserObservation(page, "obs_absolute_fare_totals");
+  // The browser publishes evidence/mechanics only. Absolute-fare comparison
+  // is owned by the one backend DecisionFrame compiler.
+  expect(rawObservation.page.controls
+    .filter((control) => /continue with (?:saver|standard|flexi)/i.test(control.label || ""))
+    .map((control) => control.structuredPrice || null)).toEqual([null, null, null]);
+  const decisionFrame = compileDecisionFrame({ observation: rawObservation });
+  const observation = decisionFrame.observation;
   const controls = ["saver", "standard", "flexi"].map((name) =>
     observation.page.controls.find((control) => new RegExp(`continue with ${name}`, "i").test(control.label || ""))
   );
@@ -6355,7 +6438,7 @@ test("absolute fare totals compile to one base fare and exact profile-compatible
   expect(new Set(controls.map((control) => control.decisionGroupId)).size).toBe(1);
 
   const traveler = { booking_rules: "No paid extras or add-ons" };
-  const taskState = reduceTaskState({ observation, traveler });
+  const taskState = reduceTaskState({ observation, traveler, decisionFrame });
   expect(taskState.currentGoal.desiredSemanticOutcome).toBe("included_base_fare");
   expect(taskState.currentGoal.policyAllowedControlIds).toEqual([controls[0].controlId]);
 
@@ -6425,8 +6508,10 @@ test("a completed fare decision retires when its DOM remains inside an inactive 
   `);
 
   const traveler = { booking_rules: "No paid extras, add-ons, or insurance" };
-  const before = await browserObservation(page, "obs_retained_fare_before");
-  const beforeTaskState = reduceTaskState({ observation: before, traveler });
+  const rawBefore = await browserObservation(page, "obs_retained_fare_before");
+  const beforeDecisionFrame = compileDecisionFrame({ observation: rawBefore, traveler });
+  const before = beforeDecisionFrame.observation;
+  const beforeTaskState = reduceTaskState({ observation: before, traveler, decisionFrame: beforeDecisionFrame });
   const beforeCandidates = buildCurrentCandidateSet({
     goal: beforeTaskState.currentGoal,
     observation: before,
@@ -6443,6 +6528,7 @@ test("a completed fare decision retires when its DOM remains inside an inactive 
   );
   const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_retained_fare_after");
   expect(executed.validation.ok, executed.validation.code).toBe(true);
+  expect(executed.result.expectedOutcome?.policyAuthorized, JSON.stringify(toClientDecision(action), null, 2)).toBe(true);
   expect(executed.verification.ok, JSON.stringify(executed.verification, null, 2)).toBe(true);
 
   const retainedSaver = executed.observation.page.controls.find((control) => control.controlId === saver.controlId);
@@ -6456,18 +6542,21 @@ test("a completed fare decision retires when its DOM remains inside an inactive 
     (group.alternatives || []).some((option) => option.controlId === saver.controlId)
   ))).toBe(false);
 
+  const afterDecisionFrame = compileDecisionFrame({ observation: executed.observation, traveler });
+  const afterObservation = afterDecisionFrame.observation;
   const afterTaskState = reduceTaskState({
     previousTaskState: beforeTaskState,
-    observation: executed.observation,
+    observation: afterObservation,
     previousActionResult: executed.result,
-    traveler
+    traveler,
+    decisionFrame: afterDecisionFrame
   });
   expect(afterTaskState.completedOutcomes.some((outcome) => (
     outcome.decisionGroupId === beforeTaskState.currentGoal.decisionGroupId
   ))).toBe(true);
   const afterCandidates = buildCurrentCandidateSet({
     goal: afterTaskState.currentGoal,
-    observation: executed.observation,
+    observation: afterObservation,
     traveler,
     state: { taskState: afterTaskState, approvals: {} }
   });
@@ -7059,7 +7148,7 @@ test("slow destination hydration wakes the durable client wait and fills email w
   expect(state.sidebarText).not.toContain("Waiting for you");
 });
 
-test("real backend waits beyond three unchanged destination observations until traveler controls hydrate", async ({ page, request }) => {
+test("real backend suppresses unchanged destination observations and wakes on traveler-form mutation", async ({ page, request }) => {
   await page.goto("http://127.0.0.1:4273/checkout/extras");
   await loadHtmlProducer(page, `
     <main id="checkout">
@@ -7080,9 +7169,8 @@ test("real backend waits beyond three unchanged destination observations until t
             '<h1>Traveller information</h1><label>Email <input id="traveler-email" name="email" type="email" required></label>';
           window.__realDestinationLifecycle.hydrated = true;
           window.__realDestinationLifecycle.hydratedAt = Date.now();
-        // Keep the shell alive for at least four backend cycles even on a
-        // loaded CI machine; the contract under test is observation-count
-        // independence, not a race against a 2.6 second browser timer.
+        // Keep the shell alive long enough to prove that unchanged polling is
+        // suppressed and the material hydration mutation owns the next wake.
         }, 7_000);
       });
     </script>
@@ -7154,13 +7242,8 @@ test("real backend waits beyond three unchanged destination observations until t
 
   expect(state.lifecycle.continueClicks).toBe(1);
   expect(state.lifecycle.hydrated).toBe(true);
-  expect(shellRequests.length).toBeGreaterThan(3);
+  expect(shellRequests.length).toBe(1);
   expect(new Set(shellRequests.map(({ body }) => body.observationSnapshot?.snapshotHash)).size).toBe(1);
-  // The first shell observation creates the backend-owned deadline; every
-  // subsequent client retry must carry that exact deadline back.
-  const retryDeadlines = shellRequests.slice(1).map(({ body }) => Number(body.destinationReadiness?.deadlineAt || 0));
-  expect(retryDeadlines.every((deadline) => deadline > 0)).toBe(true);
-  expect(new Set(retryDeadlines).size).toBe(1);
   expect(state.loop.destinationWait).toBeNull();
   expect(state.loop.destinationWaitTimerActive).toBe(false);
 });
@@ -7650,6 +7733,92 @@ test("P1.4 Next treats an unexpected popup as verified intermediate progress wit
   });
 });
 
+test("same-page navigation cannot verify from an absent map URL or visual churn alone", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Select seats</h1>
+      <button id="seat-next" type="button">Next</button>
+    </main>
+  `);
+
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const observed = hooks.buildPageMap();
+    const before = { ...observed };
+    const after = { ...observed };
+    delete before.url;
+    delete after.url;
+    return hooks.verifyExpectedOutcome({
+      type: "checkout_stage_advanced",
+      beforeUrl: location.href
+    }, before, after, document.getElementById("seat-next"));
+  });
+
+  expect(result.ok).toBe(false);
+  expect(result.code).toBe("CHECKOUT_STAGE_NOT_ADVANCED");
+  expect(result.evidence.stepChanged).toBe(false);
+  expect(result.evidence.urlChanged).toBe(false);
+  expect(result.feedback).toMatchObject({
+    targetReacted: false,
+    progressChanged: false,
+    navigationOccurred: false,
+    outcomeVerified: false
+  });
+});
+
+test("client flow diagnostics stay bounded instead of retransmitting the observation graph", async ({ page }) => {
+  await loadHtmlProducer(page, `<main><button type="button">Continue</button></main>`);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const controls = Array.from({ length: 120 }, (_, index) => ({
+      controlId: `ctrl_${index}`,
+      label: `Choice ${index}`,
+      operations: {
+        activate: {
+          actuatorId: `node_${index}`,
+          actionabilityByActuator: {
+            [`node_${index}`]: { rendered: true, visible: true, executable: true }
+          },
+          strategies: Array.from({ length: 8 }, (__, strategy) => ({
+            method: `method_${strategy}`,
+            proof: { text: "x".repeat(2_000) }
+          }))
+        }
+      }
+    }));
+    const compact = hooks.compactFlowLogPayload("backend.response", {
+      turnId: "turn_large",
+      observationId: "obs_large",
+      actionId: "act_large",
+      decision: {
+        actionId: "act_large",
+        action: "click",
+        targetLabel: "Continue",
+        targetSnapshot: { controlId: "ctrl_continue", label: "Continue", operations: controls[0].operations }
+      },
+      backendDebug: { taskState: { canonicalDecisions: controls } },
+      page: {
+        site: "test",
+        url: location.href,
+        step: "seats",
+        controls,
+        summary: { controls: controls.length, decisionGroups: 1 }
+      }
+    });
+    return {
+      compact,
+      bytes: new TextEncoder().encode(JSON.stringify(compact)).length
+    };
+  });
+
+  expect(result.bytes).toBeLessThan(32_000);
+  expect(result.compact.turnId).toBe("turn_large");
+  expect(result.compact.observationId).toBe("obs_large");
+  expect(result.compact.actionId).toBe("act_large");
+  expect(JSON.stringify(result.compact)).not.toContain("canonicalDecisions");
+  expect(JSON.stringify(result.compact)).not.toContain("actionabilityByActuator");
+});
+
 test("a persistent modal verifies internal marker advancement instead of requiring disappearance", async ({ page }) => {
   await loadHtmlProducer(page, `
     <section id="persistent-flow" role="dialog" aria-modal="true" aria-labelledby="persistent-title">
@@ -7943,7 +8112,11 @@ test("reused modal progress plus a manual paid selection is reconciled and check
   const correctionTurn = await nextTurn(interfered, "turn_reused_modal_correction");
   expect(correctionTurn.clientDecision.action).toBe("click");
   expect(correctionTurn.clientDecision.controlId).not.toBe(firstTurn.clientDecision.controlId);
-  expect(correctionTurn.state.taskState.activeDecisions[0]).toMatchObject({ status: "conflicted" });
+  expect(correctionTurn.state.taskState.currentObligation).toMatchObject({
+    subject: { decisionGroupId: expect.any(String) },
+    desiredEffect: expect.stringMatching(/remove|free|decline/),
+    policyDecision: expect.objectContaining({ status: "admitted", profileCompatible: true })
+  });
   const correction = await executeAtomicBrowserDecision(page, correctionTurn.clientDecision, "obs_reused_modal_corrected");
   expect(correction.verification.ok, correction.verification.code).toBe(true);
   expect(await page.locator("#service-free").isChecked()).toBe(true);
@@ -8029,7 +8202,8 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
         });
         document.getElementById("continue").addEventListener("click", () => {
           document.body.dataset.stage = "continued";
-          document.querySelector("h1").textContent = "Payment review";
+          location.hash = "payment";
+          document.querySelector("h1").textContent = "Payment details";
           document.getElementById("continue").hidden = true;
         });
       })();
@@ -8048,7 +8222,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   const history = [];
 
   const prepare = (observation) => {
-    const requirements = loopPrivate.requirementsWithDecisionGroups([], observation);
+    const requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], observation);
     const taskState = reduceTaskState({
       previousTaskState: state.taskState || {},
       observation,
@@ -8228,7 +8402,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
     "obs_replay_flexible_chosen"
   );
   observation = chosen.observation;
-  expect(chosen.verification.code).toBe("EXACT_FREE_OPTION_VERIFIED");
+  expect(chosen.verification.code).toMatch(/EXACT_FREE_OPTION_VERIFIED|POLICY_SAFE_CHOICE_ADVANCED/);
   expect(chosen.verification.evidence.selectedControlId).toBe(chosen.verification.evidence.expectedControlId);
   expect(chosen.verification.evidence.semanticDispositionVerified).toBe(true);
   expect(chosen.verification.evidence.paidAlternativesSelected).toEqual([]);
@@ -8236,6 +8410,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   expect(chosen.verification.evidence.ownedValidationErrors).toEqual([]);
   expect(await page.locator("#flex-options").isVisible()).toBe(false);
   expect(await page.locator("#flex-opener").textContent()).toContain("None of the passengers");
+  expect(await page.locator("body").getAttribute("data-stage")).toBeNull();
 
   await executeCandidate(
     observation,
@@ -8516,6 +8691,146 @@ test("GoToGate-shaped foreground seat inventory shares the structural collection
   expect(result.randomBuildMs, JSON.stringify(result)).toBeLessThan(3_000);
   expect(result.explicit.optionCount).toBeGreaterThan(240);
   expect(result.explicit.collections).toEqual([]);
+});
+
+test("GoToGate-shaped non-ARIA seat panel becomes the exclusive current surface", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { font-family: sans-serif; margin: 0; }
+      main { padding: 32px; }
+      main button, main input { margin: 8px; }
+      #seat-panel {
+        position: fixed;
+        left: 22vw;
+        top: 5vh;
+        width: 56vw;
+        height: 88vh;
+        z-index: 40;
+        padding: 24px;
+        overflow: auto;
+        background: white;
+        box-shadow: 0 0 0 9999px rgba(0, 0, 0, .45);
+      }
+      #seat-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+      #seat-panel footer { position: sticky; bottom: 0; display: flex; gap: 12px; background: white; padding: 16px 0; }
+    </style>
+    <main>
+      <h1>Traveller information</h1>
+      <input value="Ali" disabled>
+      <button type="button" disabled>Continue</button>
+      <label><input type="radio" name="seatmap" checked disabled> Add to cart</label>
+      <label><input type="radio" name="seatmap" disabled> No thanks</label>
+    </main>
+    <div id="seat-panel" aria-label="Reserve seating">
+      <button id="close-seat" type="button">Close window</button>
+      <h2>Reserve seating Antalya – Istanbul</h2>
+      <p>Flight 1 of 2 (AYT - SAW)</p>
+      <p>Ali SIFRAR — Not selected</p>
+      <label><input id="seat-mode-paid" type="radio" name="current-seat-mode" checked disabled> Add to cart</label>
+      <label><input id="seat-mode-free" type="radio" name="current-seat-mode" disabled> No thanks</label>
+      <div id="seat-grid">
+        ${Array.from({ length: 36 }, (_, index) => `<button type="button">Seat ${index + 1} — 9 EUR</button>`).join("")}
+      </div>
+      <button id="hidden-skip" type="button" style="display:none">Skip seat selection</button>
+      <footer>
+        <button id="seat-back" type="button">Back</button>
+        <button id="seat-next" type="button">Next</button>
+      </footer>
+    </div>
+  `);
+
+  const traveler = {
+    id: "trav_non_aria_seat",
+    seat_policy: "random_assignment",
+    booking_rules: "No paid seats"
+  };
+  const result = await page.evaluate((profile) => {
+    const hooks = window.__ATW_TEST__;
+    hooks.setAppDataForTest({
+      travelers: [profile]
+    }, profile.id);
+    const full = hooks.observePageState({ forceFull: true, reason: "gotogate_integrated_full" });
+    const map = full.map;
+    const compact = hooks.compactPageMap(map, "obs_non_aria_seat");
+    const next = map.controls.find((control) => control.label === "Next");
+    const backgroundContinue = map.controls.find((control) => control.label === "Continue");
+    const paidMode = map.controls.find((control) => /add to cart/i.test(control.label || "") && control.surfaceId === map.currentSurface.id);
+    hooks.notePageEvent({ type: "change", target: document.getElementById("seat-next") });
+    const incremental = hooks.observePageState({ reason: "gotogate_integrated_incremental" });
+    const referencePayload = hooks.referenceObservationTransport({
+      sessionId: "session_non_aria_seat",
+      observationId: "obs_non_aria_seat_reference",
+      observationUpdate: {
+        mode: "reference",
+        baseSnapshotHash: incremental.snapshotHash,
+        snapshotHash: incremental.snapshotHash,
+        material: false
+      },
+      page: hooks.compactPageMap(incremental.map, "obs_non_aria_seat_reference")
+    });
+    return {
+      step: map.step,
+      currentSurface: map.currentSurface,
+      fullStageExit: map.stageExit,
+      incrementalMode: incremental.mode,
+      incrementalStageExit: incremental.map.stageExit,
+      transportBytes: hooks.observationTransportBytes({ page: compact }),
+      referenceBytes: hooks.observationTransportBytes(referencePayload),
+      paidMode: paidMode ? {
+        effectRole: paidMode.effectRole,
+        selected: paidMode.selected === true || paidMode.state?.checked === true
+      } : null,
+      selectedExtras: map.transactionFacts?.selectedExtras || [],
+      next: next ? {
+        surfaceId: next.surfaceId,
+        executable: Object.values(next.operations || {}).some((operation) => operation.actionability?.executable === true)
+      } : null,
+      backgroundContinue: backgroundContinue ? { surfaceId: backgroundContinue.surfaceId } : null
+    };
+  }, traveler);
+
+  expect(result.step).toBe("seats");
+  expect(result.currentSurface).toMatchObject({
+    type: "popover",
+    blocksBackground: true
+  });
+  expect(result.currentSurface.id).not.toBe("surface-page");
+  expect(result.fullStageExit.surfaceAuthority).toMatchObject({
+    currentSurfaceId: result.currentSurface.id,
+    blocksBackground: true
+  });
+  expect(result.incrementalMode).toBe("incremental");
+  expect(result.incrementalStageExit.surfaceAuthority).toEqual(result.fullStageExit.surfaceAuthority);
+  expect(result.incrementalStageExit.blockers).not.toContain("visible overlay/menu/modal");
+  expect(result.transportBytes).toBeLessThan(500_000);
+  expect(result.referenceBytes).toBeLessThan(2_000);
+  expect(result.paidMode).toEqual({ effectRole: "presentation_mode", selected: true });
+  expect(result.selectedExtras.some((item) => item.decisionGroupId && /add to cart/i.test(item.label || ""))).toBe(false);
+  expect(result.next).toEqual({
+    surfaceId: result.currentSurface.id,
+    executable: true
+  });
+  expect(result.backgroundContinue?.surfaceId).toBe("surface-page");
+
+  const observation = await browserObservation(page, "obs_non_aria_seat_contract");
+  const taskState = reduceTaskState({
+    observation,
+    traveler,
+    userPolicy: { bookingRules: traveler.booking_rules, seatPolicy: traveler.seat_policy }
+  });
+  const candidates = buildCurrentCandidateSet({
+    goal: taskState.currentGoal,
+    observation,
+    traveler,
+    state: { taskState, approvals: {} }
+  }).candidates;
+  const next = observation.page.controls.find((control) => control.label === "Next");
+  expect(taskState.disposition.kind).toBe("execute");
+  expect(taskState.currentObligation?.admittedControlIds).toContain(next.controlId);
+  expect(
+    candidates.some((candidate) => candidate.controlId === next.controlId),
+    JSON.stringify({ goal: taskState.currentGoal, obligation: taskState.currentObligation, candidates, next }, null, 2)
+  ).toBe(true);
 });
 
 test("nested seat chooser keeps parent paid intent pending and grounds the exact free decline", async ({ page }) => {
@@ -9578,7 +9893,7 @@ test("final safe checkout replay advances completed traveler through both seat l
   const actions = [];
 
   const execute = async (observation, matcher, nextObservationId) => {
-    const requirements = loopPrivate.requirementsWithDecisionGroups([], observation);
+    const requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], observation);
     const taskState = reduceTaskState({
       previousTaskState: state.taskState || {},
       observation,
@@ -9668,7 +9983,7 @@ test("final safe checkout replay advances completed traveler through both seat l
   expect(freeControl.surfaceId).toBe(observation.page.currentSurface.id);
   expect(observation.page.currentSurface.memberControlIds).toContain(freeControl.controlId);
 
-  const rejectionRequirements = loopPrivate.requirementsWithDecisionGroups([], observation);
+  const rejectionRequirements = legacyRequirementReplay.requirementsWithDecisionGroups([], observation);
   const rejectionTaskState = reduceTaskState({
     previousTaskState: state.taskState || {},
     observation,
@@ -11742,9 +12057,7 @@ test("cross-surface paid ownership resolves an unknown foreground correction and
     const executed = await executeAtomicBrowserDecision(page, toClientDecision(action), "obs_cross_surface_live_repaired");
     expect(executed.validation.ok, executed.validation.code).toBe(true);
     expect(executed.verification.ok, JSON.stringify(executed.verification)).toBe(true);
-    expect(executed.verification.evidence.beforeConflict).toBe(true);
-    expect(executed.verification.evidence.afterConflict).toBe(false);
-    expect(executed.verification.evidence.chargeCleared).toBe(true);
+    expect(executed.verification.evidence.selectedChargeRemoved).toBe(true);
     expect(executed.observation.page.transactionFacts.selectedExtras).toEqual([]);
     expect(await page.locator("#paid-line").count()).toBe(0);
 
@@ -11910,7 +12223,7 @@ test("authoritative actionability excludes an occluded ghost and completes popup
   const traveler = { id: "trav_actionability", booking_rules: "no paid extras" };
 
   const executeCurrent = async (before, label, nextObservationId) => {
-    const requirements = loopPrivate.requirementsWithDecisionGroups([], before);
+    const requirements = legacyRequirementReplay.requirementsWithDecisionGroups([], before);
     const taskState = reduceTaskState({
       previousTaskState: state.taskState || {},
       observation: before,
@@ -12169,15 +12482,15 @@ test("live-shaped review modal keeps grounded safe controls selectable and submi
   expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === close.controlId)).toMatchObject({
     selectable: true,
     mechanicalEffect: "dismiss_surface",
-    semanticIntent: "close_review",
-    outcomeCompatibility: "context_only"
+    semanticIntent: "advance_checkout_stage",
+    outcomeCompatibility: "obligation_admitted"
   });
   expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === edit.controlId).selectable).toBe(false);
   const submitCandidate = candidateSet.candidates.find((candidate) => candidate.controlId === submit.controlId);
   expect(submitCandidate).toMatchObject({
     mechanicalEffect: "advance_checkout_stage",
-    semanticIntent: "continue_to_payment",
-    outcomeCompatibility: "compatible"
+    semanticIntent: "advance_checkout_stage",
+    outcomeCompatibility: "obligation_admitted"
   });
 
   const action = actionForCurrentCandidate(reviewTaskState.currentGoal, submitCandidate, reviewObservation);
@@ -12290,7 +12603,7 @@ test("Kiwi-shaped seat shell ignores persistent extras query parameters and resu
   expect(shell.page.step).toBe("seats");
   expect(shell.page.readiness.loadingTextEvidence).toBe(true);
   expect(transient.classification).toBe(READINESS.TRANSIENT);
-  expect(transient.evidence.expectedStage).toBe("seats");
+  expect(transient.evidence.expectedStage).toBeUndefined();
 
   await page.evaluate(() => {
     document.getElementById("seat-loading").remove();
@@ -12315,7 +12628,7 @@ test("Kiwi-shaped seat shell ignores persistent extras query parameters and resu
   expect(ready.classification).toBe(READINESS.READY);
 });
 
-test("semantic readiness follows shell to partial to usable content across checkout stages", async ({ page }) => {
+test("mechanical readiness does not reinterpret shell meaning across checkout stages", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main id="destination"><h1>Checkout</h1></main>
   `);
@@ -12380,7 +12693,7 @@ test("semantic readiness follows shell to partial to usable content across check
     };
     const shellReadiness = classifyObservationReadiness({ observation: shell });
     expect(await page.locator("#destination button").count()).toBeGreaterThan(4);
-    expect(shellReadiness.classification).toBe(READINESS.TRANSIENT);
+    expect(shellReadiness.classification).toBe(READINESS.READY);
 
     await page.evaluate(({ heading }) => {
       document.getElementById("destination").innerHTML = `
@@ -12396,7 +12709,7 @@ test("semantic readiness follows shell to partial to usable content across check
       observation: partial,
       previousReadiness: shellReadiness
     });
-    expect(partialReadiness.classification).toBe(READINESS.TRANSIENT);
+    expect(partialReadiness.classification).toBe(READINESS.READY);
 
     await page.evaluate(({ heading, complete }) => {
       document.getElementById("destination").innerHTML = `<h1>${heading}</h1>${complete}`;
@@ -12415,9 +12728,7 @@ test("semantic readiness follows shell to partial to usable content across check
       ready.classification,
       `${scenario.stage}: ${JSON.stringify({ evidence: ready.evidence, controls: complete.page.controls })}`
     ).toBe(READINESS.READY);
-    expect(ready.evidence.expectedStage).toBe(
-      scenario.stage === "traveler_information" ? "traveler" : scenario.stage
-    );
+    expect(ready.evidence.expectedStage).toBeUndefined();
   }
 });
 

@@ -246,6 +246,7 @@ function normalizeAction(raw = {}) {
     readinessStartedAt: Number.isFinite(Number(raw.readinessStartedAt)) ? Number(raw.readinessStartedAt) : 0,
     readinessDeadlineAt: Number.isFinite(Number(raw.readinessDeadlineAt)) ? Number(raw.readinessDeadlineAt) : 0,
     readinessAttempts: Number.isFinite(Number(raw.readinessAttempts)) ? Number(raw.readinessAttempts) : 0,
+    reobserveRetryToken: raw.reobserveRetryToken ? String(raw.reobserveRetryToken).slice(0, 180) : "",
     reason: String(raw.reason || "").slice(0, 500),
     requirementId: raw.requirementId ? String(raw.requirementId) : "",
     risk: RISK_LEVELS.has(raw.risk) ? raw.risk : "uncertain",

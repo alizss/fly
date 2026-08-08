@@ -1,4 +1,5 @@
 const { isCandidateGrounded } = require("../../../packages/shared/agent-actions");
+const agentContract = require("../../extension/src/shared/agent-contract");
 
 const INTERACTION_ROLES = new Set(["choice", "command", "opener", "navigation", "field"]);
 const SEMANTIC_EFFECTS = new Set(["select", "waive", "open", "advance", "set_value"]);
@@ -243,7 +244,8 @@ function assessOutcomeCompatibility({
       return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "warning_confirmation_preserves_resolved_seat_policy" };
     }
     if (mechanicalEffect === "open_surface") return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "opens_exact_decision_options" };
-    if (goal.desiredPolicyOutcome === "selected_free_option"
+    if (agentContract.canonicalSemanticEffect(goal.desiredPolicyOutcome)
+      === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
       && !(goal.freeAlternativeControlIds || []).length
       && ["advance_surface", "advance_checkout_stage"].includes(mechanicalEffect)) {
       return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "safe_forward_action_completes_policy_constraint_without_fake_selection" };
@@ -541,11 +543,16 @@ function buildSemanticAffordance({ candidate = {}, control = {}, goal = {}, post
   const capability = String(candidate.operation || candidate.type || "activate");
   const actuatorId = String(candidate.targetId || "");
   const structuredPrice = candidate.structuredPrice || control.structuredPrice || null;
-  const outcomeContract = outcomeContractForGoal(goal, {
+  const outcomeContract = goal.successCondition || goal.outcomeContract || outcomeContractForGoal(goal, {
     page: { currentSurface: { type: candidate.surfaceType || control.surfaceType || "page" } }
   });
-  const physicalEffect = predictPhysicalEffect({ semantics, control, candidate, goal: { ...goal, outcomeContract } });
-  const semanticIntent = candidate.semanticIntent || semanticIntentForAction({
+  const physicalEffect = candidate.mechanicalEffect
+    || candidate.physicalEffect
+    || predictPhysicalEffect({ semantics, control, candidate, goal: { ...goal, outcomeContract } });
+  const semanticIntent = candidate.semanticIntent
+    || goal.semanticEffect
+    || goal.desiredSemanticOutcome
+    || semanticIntentForAction({
     mechanicalEffect: physicalEffect,
     control,
     candidate,

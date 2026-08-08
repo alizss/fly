@@ -103,13 +103,21 @@ function reversibleUnexpectedChange(action = {}, code = "", beforePage = {}, aft
 
 function groupHasPaidSelection(group = {}, page = {}) {
   const evidence = group.selectedEvidence || {};
-  if (evidence.disposition === "free") return false;
-  if (evidence.disposition === "paid" || Number(evidence.structuredPrice?.amount) > 0) return true;
   const selectedControlId = group.selectedControlId || evidence.selectedControlId || "";
   const selectedControl = controlById(page, selectedControlId) || {};
-  const meaning = text(`${evidence.semantic || ""} ${evidence.risk || ""} ${selectedControl.semantic || ""} ${selectedControl.risk || ""}`);
-  return /paid|money|purchase|premium|upgrade/.test(meaning)
-    && !/decline|free|remove|skip|without|none/.test(meaning);
+  return agentContract.isGenuineSelectedPaidItem({
+    decisionGroupId: group.decisionGroupId || group.requirementId,
+    selectedControlId,
+    selectionOwnerId: evidence.ownerElementId || group.semanticOwnership?.ownerElementId,
+    selected: evidence.selected === true
+      || selectedControl.selected === true
+      || selectedControl.state?.selected === true
+      || selectedControl.state?.checked === true,
+    effectRole: evidence.effectRole || selectedControl.effectRole,
+    disposition: evidence.disposition,
+    priceAmount: evidence.structuredPrice?.amount ?? selectedControl.structuredPrice?.amount,
+    semanticEffect: selectedControl.physicalEffect || evidence.semantic || selectedControl.semantic
+  });
 }
 
 function selectedTruth(group = {}) {
@@ -178,9 +186,20 @@ function interveningPaidMutation(beforePage = {}, afterPage = {}, action = {}) {
     .filter((group) => groupHasPaidSelection(group, beforePage))
     .map((group) => group.decisionGroupId || group.requirementId)
     .filter(Boolean));
+  const beforeDecisionIds = new Set((beforePage.decisionGroups || [])
+    .map((group) => group.decisionGroupId || group.requirementId)
+    .filter(Boolean));
   const newlyPaid = (afterPage.decisionGroups || []).filter((group) => {
     const id = group.decisionGroupId || group.requirementId || "";
-    return id && !beforePaid.has(id) && groupHasPaidSelection(group, afterPage);
+    // A decision first exposed by the destination surface is fresh TaskState
+    // evidence, not proof that the navigation action selected it. Only a
+    // stable decision owner that changed inside the causal window can make the
+    // action lifecycle fail as an intervening mutation. Price/transaction
+    // guards independently catch consequential destination changes.
+    return id
+      && beforeDecisionIds.has(id)
+      && !beforePaid.has(id)
+      && groupHasPaidSelection(group, afterPage);
   });
   if (!newlyPaid.length) return null;
   const externallyOwned = newlyPaid.filter((group) => (
@@ -569,6 +588,39 @@ function destinationProgressFromOrigin(afterObservation = {}, navigationContext 
   };
 }
 
+function exactBrowserVerification(browserResult = {}, expected = {}, action = {}) {
+  const browserExpected = browserResult.expectedOutcome
+    || (browserResult.expectedPostconditions || []).find((condition) => condition?.type === expected.type)
+    || null;
+  const expectedControlId = String(expected.controlId || action.controlId || action.targetSnapshot?.controlId || "");
+  const browserControlId = String(
+    browserExpected?.controlId
+    || browserResult.action?.controlId
+    || browserResult.targetSnapshot?.controlId
+    || ""
+  );
+  const actionMatches = !browserResult.actionId
+    || !action.id
+    || String(browserResult.actionId) === String(action.id);
+  const typeMatches = Boolean(browserExpected?.type && browserExpected.type === expected.type);
+  const controlMatches = !expectedControlId || !browserControlId || expectedControlId === browserControlId;
+  const failed = Boolean(
+    browserResult.failureCode
+    || browserResult.outcome?.ok === false
+    || browserResult.feedback?.outcomeVerified === false
+  );
+  return Boolean(
+    actionMatches
+    && typeMatches
+    && controlMatches
+    && !failed
+    && browserResult.dispatched === true
+    && browserResult.verified === true
+    && browserResult.expectedOutcomeObserved === true
+    && browserResult.postconditionSatisfied === true
+  );
+}
+
 function evaluatePostcondition(
   expected = {},
   action = {},
@@ -585,6 +637,24 @@ function evaluatePostcondition(
   let afterControl = controlById(afterPage, controlId);
   const type = expected.type || "observable_change";
   const semantics = normalizedActionSemantics(action, { expectedOutcome: expected });
+
+  // The browser owns exact post-action verification because it observes the
+  // real DOM before and after dispatch. Backend transition analysis adds
+  // parent-stage/transaction consequences; it must not redefine the same
+  // matching local proof as failure merely because transport compaction or a
+  // destination frame changed the later diff.
+  if (exactBrowserVerification(browserResult, { ...expected, type }, action)) {
+    return {
+      type,
+      satisfied: true,
+      evidence: {
+        browserVerified: true,
+        actionId: browserResult.actionId || action.id || "",
+        controlId,
+        feedback: browserResult.feedback || null
+      }
+    };
+  }
 
   if (type === "policy_conflict_resolved") {
     const resolved = policyConflictResolution(expected, action, beforePage, afterPage);
@@ -982,6 +1052,12 @@ function evaluateTransition({
   ) {
     status = "achieved";
     nextDirective = "advance_goal";
+  } else if (currentObligationResult.completed) {
+    // Exact local completion is final for the current obligation even when
+    // the durable parent checkout has only progressed. Keep the two facts
+    // separate while ensuring recovery never records the actuator as failed.
+    status = "progressed";
+    nextDirective = "rebuild_from_fresh_observation";
   } else if (dispatched && postcondition.satisfied !== true && unchangedMaterialState) {
     // A new observation id or browser acknowledgement is not progress. The
     // expected user-visible result must exist in a materially changed state.
@@ -1031,7 +1107,11 @@ function evaluateTransition({
     surfaceTaskOutcome: outcomeContract.taskOutcome,
     taskOutcome: durableObjectiveProgress.taskOutcome || outcomeContract.taskOutcome,
     taskOutcomeCompleted: durableObjectiveProgress.completed,
-    completionAuthority: "task_state"
+    // Browser verification is local execution evidence. This evaluator is
+    // the single authority that decides whether the exact CurrentObligation
+    // postcondition completed; TaskState only consumes that verified fact on
+    // the next reduction.
+    completionAuthority: "transition_evaluator"
   };
 }
 
