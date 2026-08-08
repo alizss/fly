@@ -1,6 +1,9 @@
-const { deriveObservationGoal } = require("./observation-candidates");
-const { currentSurface } = require("./surface-contract");
-const { currentObligation, mechanicsForObligation } = require("./authority-frames");
+// Historical goal/outcome reconciliation retained only for replay coverage.
+// Production compiles DecisionFrame once and reduces it through TaskState.
+const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
+const { currentSurface } = require("../../apps/web/agent/surface-contract");
+const { currentObligation } = require("../../apps/web/agent/authority-frames");
+const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 
 const RESOLVED = new Set(["satisfied", "waived", "waived_by_policy"]);
 
@@ -44,6 +47,10 @@ function declinePolicyApplies(traveler = {}, state = {}, family = "unknown") {
     || state.approvals?.skipPaidExtrasApproved === true;
 }
 
+function exactDecisionGroupId(goal = {}) {
+  return String(goal.decisionGroupId || goal.requirementId || "");
+}
+
 function requirementForGoal(requirements = [], goal = {}) {
   const ids = new Set([goal.requirementId, goal.decisionGroupId].filter(Boolean));
   return requirements.find((item) => ids.has(item.id) || ids.has(item.requirementId) || ids.has(item.decisionGroupId)) || null;
@@ -77,11 +84,7 @@ function selectedPaidContradiction(observation = {}, goal = {}, family = "unknow
   } : null;
 }
 
-function exactDecisionGroupId(goal = {}) {
-  return String(goal.decisionGroupId || goal.requirementId || "");
-}
-
-function previousResolvedOutcome(state = {}, family = "unknown", goal = {}) {
+function previousResolvedOutcome(state = {}, goal = {}) {
   const groupId = exactDecisionGroupId(goal);
   if (!groupId) return null;
   return (state.taskState?.completedOutcomes || []).find((item) => (
@@ -94,9 +97,7 @@ function transitionResolvedOutcome(state = {}, transition = null, family = "unkn
   if (transition?.status !== "achieved") return false;
   const groupId = exactDecisionGroupId(goal);
   if (!groupId) return false;
-  const previousFamily = semanticFamily(
-    mechanicsForObligation(currentObligation(state.taskState || {})) || {}
-  );
+  const previousFamily = semanticFamily(legacyGoalFromObligation(currentObligation(state.taskState || {})) || {});
   if (previousFamily !== family) return false;
   const action = state.lastAction || {};
   const actionGroupId = String(action.decisionGroupId || action.requirementId || action.expectedOutcome?.decisionGroupId || "");
@@ -109,7 +110,7 @@ function transitionResolvedOutcome(state = {}, transition = null, family = "unkn
 function nextGoalAfterExactOutcome(observation = {}, requirements = [], completedDecisionGroupId = "") {
   if (!completedDecisionGroupId) return deriveObservationGoal(observation, requirements);
   const page = observation.page || {};
-  const adjustedObservation = {
+  return deriveObservationGoal({
     ...observation,
     page: {
       ...page,
@@ -119,8 +120,7 @@ function nextGoalAfterExactOutcome(observation = {}, requirements = [], complete
           : group
       ))
     }
-  };
-  return deriveObservationGoal(adjustedObservation, requirements);
+  }, requirements);
 }
 
 function navigationGoal(observation = {}, family = "unknown", completedDecisionGroupId = "") {
@@ -144,22 +144,15 @@ function navigationGoal(observation = {}, family = "unknown", completedDecisionG
 }
 
 function deriveAuthoritativeTaskContext({
-  state = {},
-  observation = {},
-  requirements = [],
-  traveler = {},
-  transition = null
+  state = {}, observation = {}, requirements = [], traveler = {}, transition = null
 } = {}) {
   const observedGoal = deriveObservationGoal(observation, requirements);
   const surface = currentSurface(observation.page || {});
   const observedRequirement = requirementForGoal(requirements, observedGoal);
-  const family = semanticFamily({
-    ...observedGoal,
-    label: `${observedGoal.sectionLabel || ""} ${surface.label || ""}`
-  });
+  const family = semanticFamily({ ...observedGoal, label: `${observedGoal.sectionLabel || ""} ${surface.label || ""}` });
   const declineByPolicy = declinePolicyApplies(traveler, state, family);
   const contradiction = declineByPolicy ? selectedPaidContradiction(observation, observedGoal, family) : null;
-  const previouslyResolved = declineByPolicy ? previousResolvedOutcome(state, family, observedGoal) : null;
+  const previouslyResolved = declineByPolicy ? previousResolvedOutcome(state, observedGoal) : null;
   const observedGroup = (observation.page?.decisionGroups || []).find((group) => (
     group.decisionGroupId === observedGoal.decisionGroupId
     || group.requirementId === observedGoal.requirementId
@@ -204,11 +197,7 @@ function deriveAuthoritativeTaskContext({
         sectionType: contradiction.sectionType,
         sectionLabel: contradiction.sectionLabel,
         surfaceId: contradiction.surfaceId,
-        postcondition: {
-          type: "requirement_status",
-          requirementId: contradiction.requirementId,
-          status: "satisfied"
-        }
+        postcondition: { type: "requirement_status", requirementId: contradiction.requirementId, status: "satisfied" }
       }
     : outcomeSatisfied && nextObservedGoal.decisionGroupId
       ? nextObservedGoal
@@ -226,37 +215,6 @@ function deriveAuthoritativeTaskContext({
       blocksBackground: surface.blocksBackground === true
     }),
     remainingGoal: Object.freeze(remainingGoal),
-    classifierEvidence: Object.freeze([])
-  });
-}
-
-function withClassifierEvidence(context = {}, classification = {}) {
-  const evidence = [classification.summary, ...(classification.uncertainties || [])].filter(Boolean).map(String).slice(0, 8);
-  return Object.freeze({ ...context, classifierEvidence: Object.freeze(evidence) });
-}
-
-function contextForPublishedGoal({ state = {}, observation = {}, goal = {} } = {}) {
-  const surface = currentSurface(observation.page || {});
-  const family = semanticFamily(goal);
-  return Object.freeze({
-    obligationId: `obligation:${family}:${state.id || "session"}`,
-    observationId: observation.observationId || "",
-    userOutcome: Object.freeze({
-      semanticFamily: family,
-      desiredDisposition: goal.desiredValue || "satisfied",
-      status: "pending",
-      satisfiedBy: "",
-      decisionGroupId: goal.decisionGroupId || "",
-      contradiction: null,
-      evidence: []
-    }),
-    interfaceStatus: Object.freeze({
-      status: "resolve_current_outcome",
-      surfaceId: surface.id || "",
-      surfaceType: surface.type || "page",
-      blocksBackground: surface.blocksBackground === true
-    }),
-    remainingGoal: Object.freeze(goal),
     classifierEvidence: Object.freeze([])
   });
 }
@@ -283,11 +241,4 @@ function applyAuthoritativeOutcomeToRequirements(requirements = [], context = {}
   });
 }
 
-module.exports = {
-  applyAuthoritativeOutcomeToRequirements,
-  deriveAuthoritativeTaskContext,
-  contextForPublishedGoal,
-  semanticFamily,
-  nextGoalAfterExactOutcome,
-  withClassifierEvidence
-};
+module.exports = { applyAuthoritativeOutcomeToRequirements, deriveAuthoritativeTaskContext };

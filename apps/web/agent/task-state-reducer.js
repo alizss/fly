@@ -8,8 +8,8 @@ const { outcomeContractForGoal } = require("./action-semantics");
 const { decisionInstanceKey, semanticGoalKey } = require("../../../packages/shared/agent-actions");
 const {
   CONTROL_TYPES,
-  canonicalDecisionForGroup,
-  isTypedNavigationControl
+  isTypedNavigationControl,
+  resolveCanonicalDecision
 } = require("./canonical-decision");
 const { normalizeProfilePolicy, seatPolicyFrom } = require("./policy-profile");
 const { canonicalDecisionOwnerKey } = require("./transaction-facts");
@@ -18,9 +18,9 @@ const { adaptiveInteractionGoal } = require("./adaptive-interaction");
 const {
   currentObligation,
   currentObligationFromGoal,
-  decisionFrameOwnsObservation,
-  mechanicsForObligation
+  decisionFrameOwnsObservation
 } = require("./authority-frames");
+const { obligationField } = require("./current-obligation");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 const COMPLETED = new Set(["satisfied", "waived", "waived_by_policy"]);
@@ -30,7 +30,7 @@ const TASK_STATE_REOBSERVE_DEADLINE_MS = 8_000;
 const taskStateReadModels = new WeakMap();
 
 function taskMechanics(taskState = {}) {
-  return mechanicsForObligation(currentObligation(taskState)) || {};
+  return currentObligation(taskState) || {};
 }
 
 function clean(value = "") {
@@ -782,18 +782,18 @@ function actionDecisionLineage(result = null, fallbackGoal = {}, fallbackEpisode
     requirementId: explicitRequirementId
   });
   const fallbackInstanceId = clean(
-    fallbackGoal.decisionInstanceId
-    || fallbackGoal.canonicalOwnerId
+    obligationField(fallbackGoal, "decisionInstanceId")
+    || obligationField(fallbackGoal, "canonicalOwnerId")
     || fallbackEpisode.decisionInstanceId
     || fallbackEpisode.canonicalOwnerId
   );
   const fallbackLineage = Object.freeze({
-    decisionEpisodeId: clean(fallbackGoal.decisionEpisodeId || fallbackEpisode.episodeId),
+    decisionEpisodeId: clean(obligationField(fallbackGoal, "decisionEpisodeId") || fallbackEpisode.episodeId),
     decisionInstanceId: fallbackInstanceId,
     canonicalOwnerId: fallbackInstanceId,
-    parentDecisionGroupId: clean(fallbackGoal.parentDecisionGroupId || fallbackEpisode.parentDecisionGroupId),
-    decisionGroupId: clean(fallbackGoal.decisionGroupId || fallbackEpisode.parentDecisionGroupId),
-    requirementId: clean(fallbackGoal.requirementId || fallbackEpisode.requirementId)
+    parentDecisionGroupId: clean(obligationField(fallbackGoal, "parentDecisionGroupId") || fallbackEpisode.parentDecisionGroupId),
+    decisionGroupId: clean(obligationField(fallbackGoal, "decisionGroupId") || fallbackEpisode.parentDecisionGroupId),
+    requirementId: clean(obligationField(fallbackGoal, "requirementId") || fallbackEpisode.requirementId)
   });
   const decisionInstanceId = clean(
     explicitInstanceId
@@ -1961,10 +1961,10 @@ const ADAPTIVE_SURFACE_MAX_STEPS = 6;
 const ADAPTIVE_SURFACE_DEADLINE_MS = 20_000;
 
 function boundedAdaptiveQueryHypotheses(goal = {}) {
-  const desired = clean(goal.desiredValue || goal.canonicalValue);
+  const desired = clean(obligationField(goal, "desiredValue") || obligationField(goal, "canonicalValue"));
   const terms = [
-    ...(goal.choiceTerms || []),
-    ...(goal.options || []).flatMap((option) => [option?.label, option?.value]),
+    ...(obligationField(goal, "choiceTerms") || []),
+    ...(obligationField(goal, "options") || []).flatMap((option) => [option?.label, option?.value]),
     desired
   ].map(clean).filter(Boolean);
   const digits = desired.replace(/\D/g, "");
@@ -2004,10 +2004,10 @@ function verifiedTypedChoiceSurfaceEntry({
   const action = actionResult.action || {};
   const expected = actionResult.expectedOutcome || {};
   const page = observation.page || {};
-  const desiredValue = previousGoal.desiredValue ?? previousGoal.canonicalValue ?? "";
-  const semanticType = clean(previousGoal.semanticType || previousGoal.sourceGoal?.semanticType);
-  const componentRole = clean(previousGoal.componentRole || previousGoal.sourceGoal?.componentRole || "value");
-  const goalControlId = clean(previousGoal.controlId || previousGoal.componentBinding?.controlId);
+  const desiredValue = obligationField(previousGoal, "desiredValue") ?? obligationField(previousGoal, "canonicalValue") ?? "";
+  const semanticType = clean(obligationField(previousGoal, "semanticType") || obligationField(previousGoal, "sourceGoal")?.semanticType);
+  const componentRole = clean(obligationField(previousGoal, "componentRole") || obligationField(previousGoal, "sourceGoal")?.componentRole || "value");
+  const goalControlId = clean(obligationField(previousGoal, "controlId") || obligationField(previousGoal, "componentBinding")?.controlId);
   const actionControlId = clean(action.controlId || expected.controlId);
   // Compact browser receipts keep the semantic goal ID at the receipt root;
   // the nested mechanical action is intentionally smaller. Accept either
@@ -2016,8 +2016,8 @@ function verifiedTypedChoiceSurfaceEntry({
   const actionGoalId = clean(action.goalId || actionResult.goalId);
   const actionBelongsToGoal = Boolean(
     actionGoalId
-    && clean(previousGoal.goalId)
-    && actionGoalId === clean(previousGoal.goalId)
+    && clean(obligationField(previousGoal, "goalId"))
+    && actionGoalId === clean(obligationField(previousGoal, "goalId"))
   );
   const controlIdentityMatches = !goalControlId || !actionControlId || goalControlId === actionControlId;
   if (!(
@@ -2180,9 +2180,9 @@ function verifiedProfileComponentMatchesDecision(completion = {}, decision = {})
 function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, observation = {}, surface = {} } = {}) {
   if (!surface.id || surface.type === "page") return null;
   const previousGoal = taskMechanics(previousTaskState);
-  const continuing = previousGoal.kind === "adaptive_surface"
-    && previousGoal.adaptiveEnvelope?.surfaceId === surface.id;
-  const entering = previousGoal.kind === "profile_field"
+  const continuing = obligationField(previousGoal, "kind") === "adaptive_surface"
+    && obligationField(previousGoal, "adaptiveEnvelope")?.surfaceId === surface.id;
+  const entering = obligationField(previousGoal, "kind") === "profile_field"
     && (
       verifiedReversibleSurfaceEntry(actionResult || {})
       || verifiedTypedChoiceSurfaceEntry({
@@ -2195,9 +2195,9 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
   if (!continuing && !entering) return null;
 
   const sourceGoal = continuing
-    ? (previousGoal.sourceGoal || previousGoal)
+    ? (obligationField(previousGoal, "sourceGoal") || previousGoal)
     : previousGoal;
-  const priorEnvelope = continuing ? previousGoal.adaptiveEnvelope || {} : {};
+  const priorEnvelope = continuing ? obligationField(previousGoal, "adaptiveEnvelope") || {} : {};
   const priorQueryHistory = Array.isArray(priorEnvelope.queryHistory)
     ? priorEnvelope.queryHistory.map(clean).filter(Boolean)
     : [];
@@ -2211,7 +2211,7 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
     completedQuery
   ].filter(Boolean))].slice(-ADAPTIVE_SURFACE_MAX_STEPS);
   const consumedStep = continuing
-    && actionResult?.action?.goalId === previousGoal.goalId
+    && actionResult?.action?.goalId === obligationField(previousGoal, "goalId")
     && actionResult?.dispatched !== false
       ? 1
       : 0;
@@ -2222,45 +2222,55 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
   const deadlineAt = Number(priorEnvelope.deadlineAt || (now + ADAPTIVE_SURFACE_DEADLINE_MS));
   if (remainingSteps <= 0 || deadlineAt <= now) return null;
 
-  const sourceGoalId = clean(sourceGoal.sourceGoalId || sourceGoal.goalId);
+  const sourceGoalId = clean(obligationField(sourceGoal, "sourceGoalId") || obligationField(sourceGoal, "goalId"));
   const episodeId = clean(priorEnvelope.episodeId)
     || `${sourceGoalId || observation.observationId || "profile"}:surface:${surface.id}`;
   return Object.freeze({
-    ...sourceGoal,
     kind: "adaptive_surface",
     goalId: `${episodeId}:step:${ADAPTIVE_SURFACE_MAX_STEPS - remainingSteps + 1}`,
     sourceGoalId,
+    semanticType: clean(obligationField(sourceGoal, "semanticType")),
+    desiredValue: obligationField(sourceGoal, "desiredValue"),
+    canonicalValue: obligationField(sourceGoal, "canonicalValue"),
+    logicalFieldId: clean(obligationField(sourceGoal, "logicalFieldId")),
+    subjectId: clean(obligationField(sourceGoal, "subjectId") || "traveler_1"),
+    controlId: clean(obligationField(sourceGoal, "controlId")),
+    componentRole: clean(obligationField(sourceGoal, "componentRole")),
+    componentBinding: obligationField(sourceGoal, "componentBinding") || null,
+    requirementContract: obligationField(sourceGoal, "requirementContract") || null,
+    validationOwnership: obligationField(sourceGoal, "validationOwnership") || null,
+    choiceTerms: Object.freeze([...(obligationField(sourceGoal, "choiceTerms") || [])]),
     sourceGoal: Object.freeze({
-      kind: sourceGoal.kind || "profile_field",
+      kind: obligationField(sourceGoal, "kind") || "profile_field",
       goalId: sourceGoalId,
-      semanticGoal: clean(sourceGoal.semanticGoal),
-      semanticType: clean(sourceGoal.semanticType),
-      desiredValue: sourceGoal.desiredValue,
-      canonicalValue: sourceGoal.canonicalValue,
-      logicalFieldId: clean(sourceGoal.logicalFieldId),
-      subjectId: clean(sourceGoal.subjectId || "traveler_1"),
-      controlId: clean(sourceGoal.controlId || sourceGoal.componentBinding?.controlId),
-      componentRole: clean(sourceGoal.componentRole),
+      semanticGoal: clean(obligationField(sourceGoal, "semanticGoal")),
+      semanticType: clean(obligationField(sourceGoal, "semanticType")),
+      desiredValue: obligationField(sourceGoal, "desiredValue"),
+      canonicalValue: obligationField(sourceGoal, "canonicalValue"),
+      logicalFieldId: clean(obligationField(sourceGoal, "logicalFieldId")),
+      subjectId: clean(obligationField(sourceGoal, "subjectId") || "traveler_1"),
+      controlId: clean(obligationField(sourceGoal, "controlId") || obligationField(sourceGoal, "componentBinding")?.controlId),
+      componentRole: clean(obligationField(sourceGoal, "componentRole")),
       componentBinding: Object.freeze({
-        controlId: clean(sourceGoal.componentBinding?.controlId || sourceGoal.controlId),
-        representationControlIds: Object.freeze([...(sourceGoal.componentBinding?.representationControlIds || [])]),
-        stateControlIds: Object.freeze([...(sourceGoal.componentBinding?.stateControlIds || [])])
+        controlId: clean(obligationField(sourceGoal, "componentBinding")?.controlId || obligationField(sourceGoal, "controlId")),
+        representationControlIds: Object.freeze([...(obligationField(sourceGoal, "componentBinding")?.representationControlIds || [])]),
+        stateControlIds: Object.freeze([...(obligationField(sourceGoal, "componentBinding")?.stateControlIds || [])])
       }),
-      choiceTerms: Object.freeze([...(sourceGoal.choiceTerms || [])].map(clean).filter(Boolean))
+      choiceTerms: Object.freeze([...(obligationField(sourceGoal, "choiceTerms") || [])].map(clean).filter(Boolean))
     }),
-    semanticGoal: clean(sourceGoal.semanticGoal || `complete the current ${surface.label || "choice"}`),
+    semanticGoal: clean(obligationField(sourceGoal, "semanticGoal") || `complete the current ${surface.label || "choice"}`),
     selectionMode: "ai_ambiguity",
     surfaceId: surface.id,
     observationId: observation.observationId || "",
-    postcondition: sourceGoal.postcondition || {
+    postcondition: obligationField(sourceGoal, "postcondition") || {
       type: "profile_requirement_satisfied",
-      semanticType: clean(sourceGoal.semanticType)
+      semanticType: clean(obligationField(sourceGoal, "semanticType"))
     },
     adaptiveEnvelope: Object.freeze({
-      contractVersion: "bounded-adaptive-surface/v1",
+      kind: "bounded_adaptive_surface",
       episodeId,
-      objective: clean(sourceGoal.semanticGoal),
-      desiredValue: sourceGoal.desiredValue,
+      objective: clean(obligationField(sourceGoal, "semanticGoal")),
+      desiredValue: obligationField(sourceGoal, "desiredValue"),
       queryHypotheses: priorEnvelope.queryHypotheses
         || boundedAdaptiveQueryHypotheses(sourceGoal),
       queryHistory: Object.freeze(queryHistory),
@@ -2345,8 +2355,8 @@ function reduceDecisionFrame({
       || verifiedAction.decisionInstanceId
       || verifiedLineage.decisionInstanceId
       || (
-        previousGoal.decisionGroupId === verifiedDecisionGroupId
-          ? previousGoal.decisionInstanceId
+        obligationField(previousGoal, "decisionGroupId") === verifiedDecisionGroupId
+          ? obligationField(previousGoal, "decisionInstanceId")
           : ""
       )
       || verifiedDecisionGroupId
@@ -2357,12 +2367,12 @@ function reduceDecisionFrame({
       requirementId: clean(
         authoritativeActionResult.requirementId
         || verifiedExpectedOutcome.requirementId
-        || previousGoal.requirementId
+        || obligationField(previousGoal, "requirementId")
       ),
       surfaceId: clean(
         verifiedExpectedOutcome.surfaceId
         || authoritativeActionResult.targetSnapshot?.surfaceId
-        || previousGoal.surfaceId
+        || obligationField(previousGoal, "surfaceId")
       ),
       status: "satisfied",
       selectedControlId: clean(
@@ -2375,7 +2385,7 @@ function reduceDecisionFrame({
       observationId: observation.observationId || ""
     });
   }
-  const observedDecisions = (page.decisionGroups || []).filter((group) => groupId(group)).map((group) => {
+  const observedDecisions = (authoritativeDecisionFrame.commerceEntities || []).filter((group) => groupId(group)).map((group) => {
     const instanceId = decisionInstanceKey(group, observation);
     const previousGroupCompletion = [...(previousTaskState.completedOutcomes || [])]
       .reverse()
@@ -2397,7 +2407,7 @@ function reduceDecisionFrame({
       ? previousGroupCompletion
       : null;
     const previousCompletion = completions.get(instanceId) || sameSurfaceCompletion;
-    const normalizedDecision = canonicalDecisionForGroup({
+    const normalizedDecision = resolveCanonicalDecision({
       group,
       page,
       previousCompletion,
@@ -2881,7 +2891,7 @@ function reduceDecisionFrame({
       )
     )
     && (
-      mechanicalEvidence.goalId === currentGoal?.goalId
+      mechanicalEvidence.goalId === obligationField(currentGoal, "goalId")
       || (
         mechanicalEvidence.semanticGoalKey
         && mechanicalEvidence.semanticGoalKey === semanticGoalKey(currentGoal || {})
@@ -2889,7 +2899,7 @@ function reduceDecisionFrame({
       || (
         mechanicalEvidence.decisionGroupId
         && mechanicalEvidence.decisionGroupId === (
-          currentGoal?.decisionGroupId || currentGoal?.subject?.decisionGroupId
+          obligationField(currentGoal, "decisionGroupId") || currentGoal?.subject?.decisionGroupId
         )
       )
     )
@@ -2898,8 +2908,8 @@ function reduceDecisionFrame({
     terminalStatus === "active"
     && currentGoal
     && mechanicalEvidenceOwnsGoal
-    && !["profile_field", "adaptive_surface", "adaptive_interaction"].includes(currentGoal.kind)
-    && !["payment", "legal"].includes(currentGoal.semanticType)
+    && !["profile_field", "adaptive_surface", "adaptive_interaction"].includes(obligationField(currentGoal, "kind"))
+    && !["payment", "legal"].includes(obligationField(currentGoal, "semanticType"))
     && !siteFailure
     && !paymentReviewBoundary.observed
   ) {
@@ -2923,12 +2933,12 @@ function reduceDecisionFrame({
   const currentGoalFamily = lower(
     currentGoal?.canonicalSubject?.family
     || currentGoal?.subject?.family
-    || currentGoal?.family
+    || obligationField(currentGoal, "family")
   );
   const groundingOwnsCurrentGoal = Boolean(
     currentGoal
     && currentGoalFamily === "profile"
-    && (currentGoal.candidateControlIds || admittedControlIdsForGoal(currentGoal))
+    && (obligationField(currentGoal, "candidateControlIds") || admittedControlIdsForGoal(currentGoal))
       .some((controlId) => unresolvedGroundingControlIds.has(clean(controlId)))
   );
   if (groundingOwnsCurrentGoal) {
@@ -2944,8 +2954,8 @@ function reduceDecisionFrame({
     });
     ambiguityReason = "active_requirement_unresolved";
   }
-  if (!decisionEpisode && currentGoal?.decisionGroupId) {
-    const parent = canonicalDecisions.find((decision) => decision.decisionGroupId === currentGoal.decisionGroupId) || null;
+  if (!decisionEpisode && obligationField(currentGoal, "decisionGroupId")) {
+    const parent = canonicalDecisions.find((decision) => decision.decisionGroupId === obligationField(currentGoal, "decisionGroupId")) || null;
     const family = episodeFamilyForDecision(parent);
     if (parent && family) {
       const subjectKey = episodeSubjectKeyForDecision(parent);
@@ -2959,7 +2969,7 @@ function reduceDecisionFrame({
         subjectKey,
         parentDecisionGroupId: parent.decisionGroupId,
         requirementId: clean(parent.requirementId),
-        intendedOutcome: clean(currentGoal.desiredSemanticOutcome || currentGoal.desiredPolicyOutcome || "selected_policy_allowed_option"),
+        intendedOutcome: clean(obligationField(currentGoal, "desiredSemanticOutcome") || obligationField(currentGoal, "desiredPolicyOutcome") || "selected_policy_allowed_option"),
         selectedControlId: clean(parent.selectedControlId),
         parentStatus: clean(parent.status || "active"),
         status: COMPLETED.has(parent.status) ? "completed" : "active",
@@ -3057,7 +3067,7 @@ function reduceDecisionFrame({
       surfaceClass
     }),
     currentObjective: clean(
-      currentGoal?.semanticGoal
+      obligationField(currentGoal, "semanticGoal")
       || (transactionReviewBlocked ? "verify the final transaction" : "reach verified payment review")
     ),
     achievements: Object.freeze(achievements),
@@ -3085,7 +3095,7 @@ function reduceDecisionFrame({
     mechanicalEvidenceOwnsGoal
     && currentGoal
     && (
-      mechanicalEvidence.goalId === currentGoal.goalId
+      mechanicalEvidence.goalId === obligationField(currentGoal, "goalId")
       || mechanicalEvidence.semanticGoalKey === semanticGoalKey(currentGoal)
     )
   );
@@ -3096,7 +3106,7 @@ function reduceDecisionFrame({
       : transactionReviewBlocked ? "TRANSACTION_REVIEW_INCOMPLETE"
       : authorizationConflict ? "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT"
       : admittedMechanicsExhausted ? "STRATEGIES_EXHAUSTED"
-      : currentGoal?.ambiguity?.code ? currentGoal.ambiguity.code
+      : obligationField(currentGoal, "ambiguity")?.code ? obligationField(currentGoal, "ambiguity").code
       : currentObligation ? "EXECUTE_CURRENT_OBLIGATION"
       : missingDerivedFact ? "SELECTED_BOOKING_FACT_MISSING"
       : missingProfileFact ? "MISSING_PROFILE_DATA"
@@ -3173,14 +3183,14 @@ function reduceDecisionFrame({
       kind: "stop",
       code: dispositionCode,
       reason: "The exact admitted obligation exhausted its bounded grounded mechanics without a verified result.",
-      obligationId: clean(currentGoal.goalId),
+      obligationId: clean(obligationField(currentGoal, "goalId")),
       userActionRequired: false
     };
-  } else if (currentGoal?.ambiguity) {
+  } else if (obligationField(currentGoal, "ambiguity")) {
     disposition = {
       kind: "request_approval",
       code: dispositionCode || "SEMANTIC_AMBIGUITY",
-      reason: clean(currentGoal.ambiguity.reason || "The current admitted checkout obligation is ambiguous."),
+      reason: clean(obligationField(currentGoal, "ambiguity").reason || "The current admitted checkout obligation is ambiguous."),
       userActionRequired: true
     };
   } else if (currentObligation) {

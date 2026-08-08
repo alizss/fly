@@ -280,7 +280,7 @@ function commerceSelectionsFromJournal(state = {}) {
 }
 
 function commerceSelectionsFromVerifiedObligations(state = {}) {
-  const obligations = state.verifiedCommerceObligations || [];
+  const obligations = state.taskState?.verifiedCommerceObligations || [];
   return (Array.isArray(obligations) ? obligations : [])
     .filter((entry) => (
       entry?.verified === true

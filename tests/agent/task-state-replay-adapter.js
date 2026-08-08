@@ -5,9 +5,9 @@
 const {
   compileDecisionFrame,
   currentObligationFromGoal,
-  decisionFrameOwnsObservation,
-  mechanicsForObligation
+  decisionFrameOwnsObservation
 } = require("../../apps/web/agent/authority-frames");
+const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 const { reduceDecisionFrame, taskStateReadModel } = require("../../apps/web/agent/task-state-reducer");
 
 function reduceTaskState(args = {}) {
@@ -32,7 +32,7 @@ function reduceTaskState(args = {}) {
   return Object.freeze({
     ...result,
     ...(taskStateReadModel(result) || {}),
-    currentGoal: mechanicsForObligation(result.currentObligation)
+    currentGoal: legacyGoalFromObligation(result.currentObligation)
   });
 }
 

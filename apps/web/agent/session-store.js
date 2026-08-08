@@ -4,7 +4,7 @@ const { DatabaseSync } = require("node:sqlite");
 
 const { createCheckoutSessionState, withUpdate } = require("../../../packages/shared/agent-state");
 const { actionSignature, actuatorSignature, normalizeAction, semanticGoalKey } = require("../../../packages/shared/agent-actions");
-const { currentObligation, mechanicsForObligation } = require("./authority-frames");
+const { currentObligation } = require("./authority-frames");
 
 const LEGACY_REPLAY_DB_PATH = path.resolve(__dirname, "../../../work/agent-transactions.sqlite");
 const DEFAULT_DB_PATH = process.env.ATW_TRANSACTION_DB
@@ -174,9 +174,11 @@ function compactDecision(decision = {}) {
 
 function compactCurrentObligation(obligation = null) {
   if (!obligation || typeof obligation !== "object") return obligation || null;
-  // Mechanics are observation-local. A resumed session must recompile them
-  // from the fresh DecisionFrame instead of reviving a partial shadow goal.
-  const { mechanics: _turnLocalMechanics, bindingResume: _legacyBindingResume, ...durable } = obligation;
+  // The obligation is already the compact durable semantic contract. Fresh
+  // controls and actuator candidates remain exclusively observation-local.
+  // Drop the pre-v2 mechanics shadow if an old in-memory fixture/session still
+  // carries it; the structured binding is the only supported continuation.
+  const { mechanics: _legacyMechanics, ...durable } = obligation;
   return durable;
 }
 
@@ -277,6 +279,7 @@ function compactRecoveryState(recovery = null) {
     failedStrategySignatures: Array.isArray(recovery.failedStrategySignatures)
       ? recovery.failedStrategySignatures.slice(-80).map(String)
       : [],
+    staleRebind: eventSummary(recovery.staleRebind || null),
     // This tiny sample is durable recovery state, not page perception. It is
     // required to distinguish a genuinely stuck reveal from measurable
     // viewport progress after a restart/round trip.
@@ -321,6 +324,7 @@ function compactExecutionEpisode(state = {}) {
     attemptedStrategies: eventSummary(recovery?.failedStrategies || []),
     attemptedStrategySignatures: eventSummary(recovery?.failedStrategySignatures || []),
     attemptedCandidateIds: eventSummary(recovery?.attemptedCandidateIds || []),
+    staleRebind: eventSummary(recovery?.staleRebind || null),
     attempts: Math.max(0, Number(recovery?.attempts || 0)),
     remainingAttempts: Math.max(0, Number(obligation?.recoveryBudget?.remainingAttempts || 0)),
     stateHash: String(recovery?.stateHash || ""),
@@ -455,6 +459,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
         attemptedCandidateIds: episode.attemptedCandidateIds || [],
         failedStrategies: episode.attemptedStrategies || [],
         failedStrategySignatures: episode.attemptedStrategySignatures || [],
+        staleRebind: episode.staleRebind || null,
         lastCode: episode.lastCode || "",
         lastRevealSample: episode.lastRevealSample || null,
         updatedAt: episode.updatedAt || ""
@@ -462,8 +467,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       parsed.pendingMechanicalEvidence = episode.mechanicalEvidence || null;
     }
     delete parsed.executionEpisode;
-    delete parsed.fastStaleRecovery;
-    parsed.currentStep = parsed.taskState?.stage || parsed.currentStep || "unknown";
+    delete parsed.currentStep;
     return parsed;
   }
 
@@ -710,7 +714,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       actuatorSignature: signature,
       goalKey: semanticGoalKey(action.affordance?.task
         ? action
-        : (mechanicsForObligation(currentObligation(state.taskState || {})) || action)),
+        : (currentObligation(state.taskState || {}) || action)),
       decisionInstanceId: action.decisionInstanceId,
       actionId: String(result.actionId || action.id || ""),
       observationId: String(result.observationId || ""),

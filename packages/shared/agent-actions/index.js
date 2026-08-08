@@ -28,8 +28,6 @@
  * @property {Object} [discoveryEnvelope]
  * @property {string} [logicalControlId]
  * @property {string} [actuatorId]
- * @property {string} [skillPlanId]
- * @property {string} [skillAtomId]
  * @property {string} [controlId]
  * @property {string} [decisionGroupId]
  * @property {string} [targetId]
@@ -187,6 +185,16 @@ function normalizeAction(raw = {}) {
     semanticOwnershipLinkId: raw.semanticOwnershipLinkId ? String(raw.semanticOwnershipLinkId).slice(0, 260) : "",
     policyCorrectionForDecisionGroupId: raw.policyCorrectionForDecisionGroupId ? String(raw.policyCorrectionForDecisionGroupId).slice(0, 140) : "",
     goalId: raw.goalId ? String(raw.goalId).slice(0, 200) : "",
+    semanticOwner: raw.semanticOwner && typeof raw.semanticOwner === "object"
+      ? {
+          stage: String(raw.semanticOwner.stage || "").slice(0, 120),
+          family: String(raw.semanticOwner.family || "").slice(0, 120),
+          subjectId: String(raw.semanticOwner.subjectId || "global").slice(0, 160),
+          passengerId: String(raw.semanticOwner.passengerId || "").slice(0, 160),
+          segmentId: String(raw.semanticOwner.segmentId || "").slice(0, 160),
+          repeatedInstance: String(raw.semanticOwner.repeatedInstance || "").slice(0, 900)
+        }
+      : null,
     decisionInstanceId: raw.decisionInstanceId ? String(raw.decisionInstanceId).slice(0, 900) : "",
     candidateId: raw.candidateId ? String(raw.candidateId).slice(0, 240) : "",
     candidateClass: ["proven_action", "mechanical_hypothesis"].includes(raw.candidateClass)
@@ -200,8 +208,6 @@ function normalizeAction(raw = {}) {
       ? String(raw.logicalControlId).slice(0, 160)
       : (raw.controlId ? String(raw.controlId).slice(0, 160) : ""),
     actuatorId: normalizeTargetId(raw.actuatorId || raw.targetId),
-    skillPlanId: raw.skillPlanId ? String(raw.skillPlanId).slice(0, 160) : "",
-    skillAtomId: raw.skillAtomId ? String(raw.skillAtomId).slice(0, 200) : "",
     controlId: raw.controlId ? String(raw.controlId).slice(0, 140) : (raw.targetSnapshot?.controlId ? String(raw.targetSnapshot.controlId).slice(0, 140) : ""),
     decisionGroupId: raw.decisionGroupId ? String(raw.decisionGroupId).slice(0, 140) : (raw.targetSnapshot?.decisionGroupId ? String(raw.targetSnapshot.decisionGroupId).slice(0, 140) : ""),
     targetId: normalizeTargetId(raw.targetId),
@@ -254,6 +260,71 @@ function normalizeAction(raw = {}) {
   };
 }
 
+function createActionLease(action = {}) {
+  const targetSnapshot = action.targetSnapshot || null;
+  const successCondition = action.expectedOutcome || action.expectedPostconditions?.[0] || null;
+  const semanticOwner = action.semanticOwner && typeof action.semanticOwner === "object"
+    ? { ...action.semanticOwner }
+    : {
+        stage: "",
+        family: "",
+        subjectId: "global",
+        passengerId: "",
+        segmentId: "",
+        repeatedInstance: action.decisionInstanceId || action.requirementId || action.decisionGroupId || ""
+      };
+  return Object.freeze({
+    contractVersion: "action-lease/v1",
+    actionId: action.id || "",
+    observation: Object.freeze({
+      id: action.observationId || "",
+      hash: action.observationHash || ""
+    }),
+    obligationId: action.goalId || "",
+    semanticOwner: Object.freeze(semanticOwner),
+    // Migration-only scalar for existing browser receipts. New code uses the
+    // structured owner above; it is removed when the receipt boundary moves
+    // to ActionResult/v2.
+    semanticOwnerId: semanticOwner.repeatedInstance || "",
+    candidateId: action.candidateId || "",
+    target: Object.freeze({
+      controlId: action.controlId || targetSnapshot?.controlId || "",
+      actuatorId: action.actuatorId || action.targetId || "",
+      surfaceId: targetSnapshot?.surfaceId || action.surfaceId || "",
+      decisionGroupId: action.decisionGroupId || targetSnapshot?.decisionGroupId || "",
+      snapshot: targetSnapshot
+    }),
+    mechanic: Object.freeze({
+      actionType: action.type,
+      operation: action.operation || "",
+      method: action.interactionMethod || "",
+      effect: action.mechanicalEffect || action.physicalEffect || "",
+      value: action.value || action.targetLabel || "",
+      keys: action.keys || "",
+      x: action.x,
+      y: action.y,
+      scrollY: action.scrollY,
+      visualRegion: action.visualRegion || null,
+      exactOption: action.exactOption || action.pipelineContract?.component?.exactOption || null,
+      boundedRecovery: action.boundedRecovery === true
+    }),
+    expected: Object.freeze({
+      intent: action.intent || "",
+      semanticEffect: action.semanticEffect || action.semanticIntent || "",
+      interactionRole: action.interactionRole || "",
+      evidence: action.expectedEvidence || "",
+      policyAuthorization: Object.freeze({
+        allow: action.affordance?.policy?.allow === true,
+        decision: String(action.affordance?.policy?.decision || "")
+      }),
+      successCondition,
+      postconditions: action.expectedPostconditions || (successCondition ? [successCondition] : [])
+    }),
+    capabilityProof: action.pipelineContract || null,
+    risk: action.risk || "uncertain"
+  });
+}
+
 /**
  * Stable identity for one physical actuator attempt.
  * Values and key payloads do not make a retry distinct; only its target,
@@ -292,7 +363,13 @@ function actuatorSignature(action = {}) {
 
 function semanticGoalKey(source = {}) {
   const goal = source.affordance?.task || source.currentGoal || source;
-  const stableScope = goal.semanticType
+  const obligation = goal.contractVersion === "current-obligation/v2" ? goal : null;
+  const component = obligation?.binding?.component || {};
+  const subject = obligation?.subject || {};
+  const stableScope = subject.semanticType
+    || component.semanticType
+    || subject.family
+    || goal.semanticType
     || goal.sectionType
     || goal.semanticGoal
     || goal.requirementId
@@ -301,11 +378,11 @@ function semanticGoalKey(source = {}) {
   const normalize = (value) => String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
   return [
     stableScope,
-    goal.logicalFieldId || "",
-    goal.subjectId || "",
-    goal.componentRole || "",
-    goal.desiredValue || "",
-    Number.isFinite(Number(goal.ordinal)) ? `ordinal:${Number(goal.ordinal)}` : ""
+    component.logicalFieldId || subject.logicalFieldId || goal.logicalFieldId || "",
+    subject.subjectId || goal.subjectId || "",
+    component.role || goal.componentRole || "",
+    obligation?.desiredValue || goal.desiredValue || "",
+    Number.isFinite(Number(component.ordinal ?? goal.ordinal)) ? `ordinal:${Number(component.ordinal ?? goal.ordinal)}` : ""
   ]
     .map(normalize)
     .join("|");
@@ -322,10 +399,14 @@ function normalizedInstanceFact(value = "") {
 function decisionInstanceKey(source = {}, observation = {}) {
   const page = observation.page || {};
   const goal = source.affordance?.task || source.currentGoal || source;
+  const obligation = goal.contractVersion === "current-obligation/v2" ? goal : null;
+  const obligationSubject = obligation?.subject || {};
+  const obligationComponent = obligation?.binding?.component || {};
   const target = source.targetSnapshot || {};
   const decisionGroupId = String(
     source.policyCorrectionForDecisionGroupId
     || source.decisionGroupId
+    || obligationSubject.decisionGroupId
     || goal.decisionGroupId
     || target.policyCorrectionForDecisionGroupId
     || target.decisionGroupId
@@ -344,6 +425,7 @@ function decisionInstanceKey(source = {}, observation = {}) {
     || group.travelerId
     || group.passengerOrdinal
     || group.travelerOrdinal
+    || obligationSubject.passengerId
     || goal.passengerId
     || goal.travelerId
     || progress.passengerOrdinal
@@ -357,7 +439,7 @@ function decisionInstanceKey(source = {}, observation = {}) {
     group.selectedEvidence?.selectedLabel || group.selectedLabel || goal.selectedLabel
   ].filter(Boolean).join("|");
   return JSON.stringify({
-    stage: normalizedInstanceFact(page.step || page.pageStep || goal.stage || "unknown"),
+    stage: normalizedInstanceFact(page.step || page.pageStep || obligationSubject.stage || goal.stage || "unknown"),
     surface: normalizedInstanceFact([
       surface.id || target.surfaceId || group.surfaceId || "surface-page",
       surface.type || target.surfaceType || group.surfaceType || "page",
@@ -372,9 +454,9 @@ function decisionInstanceKey(source = {}, observation = {}) {
       progress.segment
     ].filter(Boolean).join("|")),
     passenger: normalizedInstanceFact(passenger),
-    decisionGroup: normalizedInstanceFact(decisionGroupId || group.requirementId || goal.requirementId),
-    logicalField: normalizedInstanceFact(goal.logicalFieldId || ""),
-    componentRole: normalizedInstanceFact(goal.componentRole || ""),
+    decisionGroup: normalizedInstanceFact(decisionGroupId || group.requirementId || obligationSubject.requirementId || goal.requirementId),
+    logicalField: normalizedInstanceFact(obligationComponent.logicalFieldId || obligationSubject.logicalFieldId || goal.logicalFieldId || ""),
+    componentRole: normalizedInstanceFact(obligationComponent.role || goal.componentRole || ""),
     selectedItem: normalizedInstanceFact(selected)
   });
 }
@@ -385,6 +467,7 @@ function actionSignature(action) {
 }
 
 module.exports = {
+  createActionLease,
   normalizeAction,
   normalizeVisualRegion,
   visualRegionsMatch,

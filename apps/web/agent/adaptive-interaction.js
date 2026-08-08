@@ -3,7 +3,6 @@
 const { controlBelongsToCurrentSurface, currentSurface } = require("./surface-contract");
 const { SEAT_POLICIES, seatPolicyFrom } = require("./policy-profile");
 
-const CONTRACT_VERSION = "consequence-gated-adaptive-interaction/v1";
 const ALLOWED_OPERATIONS = Object.freeze(["open", "choose", "activate", "keyboard"]);
 const FORBIDDEN_RISKS = Object.freeze(["money", "paid", "payment", "legal", "destructive"]);
 const FORBIDDEN_EFFECTS = Object.freeze([
@@ -170,7 +169,6 @@ function adaptiveInteractionGoal({
   const controlIds = [...new Set(controls.map((control) => control.controlId).filter(Boolean))];
   const objective = interactionObjective({ observation, userPolicy, traveler });
   return Object.freeze({
-    contractVersion: CONTRACT_VERSION,
     goalId: `${observation.observationId || "observation"}:adaptive_interaction`,
     kind: "adaptive_interaction",
     selectionMode: "bounded_adaptive",
@@ -201,7 +199,7 @@ function adaptiveInteractionGoal({
       completionEvidence: Object.freeze(["fresh_surface_state", "observable_change"])
     }),
     adaptiveEnvelope: Object.freeze({
-      contractVersion: CONTRACT_VERSION,
+      kind: "bounded_adaptive_interaction",
       episodeId: `${observation.observationId || "observation"}:${surface.id || "surface-page"}`,
       objective,
       surfaceId: surface.id || "surface-page",
@@ -218,7 +216,6 @@ function adaptiveInteractionGoal({
 }
 
 module.exports = {
-  CONTRACT_VERSION,
   adaptiveInteractionGoal,
   checkoutRelevantControl,
   interactionObjective,

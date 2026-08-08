@@ -39,7 +39,6 @@
  * @property {string} travelerId
  * @property {string[]} travelerIds
  * @property {{host: string, url: string, sellerName?: string}} site
- * @property {CheckoutStep} currentStep
  * @property {ApprovalState} approvals
  * @property {import("../agent-actions").AgentAction|null} lastAction
  * @property {Object|null} lastVerification
@@ -53,7 +52,6 @@
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
  * @property {{candidateSelection?: Object}|null} aiDecisionCache
- * @property {Object|null} fastStaleRecovery
  * @property {Object} recoveryState
  * @property {Object[]} verifiedResults
  * @property {Object} userPolicy
@@ -91,7 +89,6 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     sessionProfileOverrides: {},
     pendingUserInput: null,
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
-    currentStep: "unknown",
     currentObservation: null,
     taskState: null,
     observationReadiness: {
@@ -105,7 +102,6 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     pendingAction: null,
     actionLifecycle: null,
     aiDecisionCache: null,
-    fastStaleRecovery: null,
     recoveryState: {
       attempts: 0,
       phase: "idle",

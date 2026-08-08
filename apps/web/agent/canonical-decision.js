@@ -10,7 +10,6 @@ const CONTROL_TYPES = Object.freeze({
   NAVIGATION_ACTION: "navigation_action"
 });
 
-const CONTRACT_VERSION = "canonical-decision/v1";
 const COMPLETED = new Set(["satisfied", "waived", "waived_by_policy"]);
 
 function clean(value = "") {
@@ -727,7 +726,6 @@ function canonicalDecisionForGroup({
   }
 
   return Object.freeze({
-    contractVersion: CONTRACT_VERSION,
     decisionId: id,
     decisionGroupId: id,
     requirementId: clean(group.requirementId || id),
@@ -780,6 +778,11 @@ function canonicalDecisionForGroup({
   });
 }
 
+// DecisionFrame owns discovery of the semantic entity. TaskState calls this
+// resolver only to reconcile that admitted entity with user policy and
+// durable completion history; it must not create entities from raw controls.
+const resolveCanonicalDecision = canonicalDecisionForGroup;
+
 function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
   if (!control.controlId || ownedControlIds.has(control.controlId)) return null;
   // Lifecycle admission is authoritative. Dormant login, signup, future-step,
@@ -792,7 +795,6 @@ function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
   const semantic = lower(`${control.fieldType || ""} ${control.field || ""} ${control.semantic || ""} ${control.meaning || ""}`);
   if (/continue|next|proceed|advance|done|finish|navigation/.test(semantic)) {
     return Object.freeze({
-      contractVersion: CONTRACT_VERSION,
       decisionId: `control:${control.controlId}`,
       subject: Object.freeze({ key: "checkout_navigation", label: clean(control.label || "Continue"), family: "navigation" }),
       controlType: CONTROL_TYPES.NAVIGATION_ACTION,
@@ -816,7 +818,6 @@ function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
     const value = meaningfulControlValue(control);
     const required = control.required === true || control.state?.required === true;
     return Object.freeze({
-      contractVersion: CONTRACT_VERSION,
       decisionId: `control:${control.controlId}`,
       subject: Object.freeze({
         key: slug(control.fieldType || control.field || control.semantic || control.controlId),
@@ -873,10 +874,10 @@ function buildCanonicalDecisions({
 }
 
 module.exports = {
-  CONTRACT_VERSION,
   CONTROL_TYPES,
   buildCanonicalDecisions,
   canonicalDecisionForGroup,
+  resolveCanonicalDecision,
   exactSubject,
   exactUserIntent,
   explicitlyDormantRepresentation,

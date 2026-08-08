@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const { evaluateActionPolicy } = require("../../packages/shared/policy");
 const { __private } = require("../../apps/web/agent/loop");
+const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
 const {
   PlannerContractError,
@@ -14,17 +15,17 @@ const {
   semanticActionContext,
   sanitizedActionHistory,
   sanitizedFailureHistory
-} = require("../../apps/web/agent/model-context");
+} = require("./legacy-model-context-adapter");
 const { compactWholePageMarkdown } = require("../../apps/web/agent/observation-markdown");
 const { conciseActionFeedback, diffObservations, formatObservationDiffMarkdown } = require("../../apps/web/agent/observation-diff");
 const {
   actionForObservationCandidate,
   allRequiredDecisionGroupsResolved,
-  deriveObservationGoal,
   rawObservationCandidates
 } = require("../../apps/web/agent/observation-candidates");
+const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { canonicalizePageSurface, currentSurface, surfaceBinding } = require("../../apps/web/agent/surface-contract");
-const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { decisionInstanceKey } = require("../../packages/shared/agent-actions");
 const {
   SEAT_POLICIES,
@@ -386,7 +387,7 @@ test("fresh observation candidates expose only current canonical flexible-ticket
   };
   const goal = deriveObservationGoal(closed, []);
   const candidates = rawObservationCandidates(closed, goal);
-  const candidateSet = __private.groundedObservationCandidateSet(goal, closed);
+  const candidateSet = groundedObservationCandidateSet(goal, closed);
 
   assert.equal(goal.semanticGoal, "resolve Flexible Ticket");
   assert.equal(candidates.length, 1);
@@ -418,7 +419,7 @@ test("governor rejects an expired candidate-set envelope before target execution
   };
   observation.page.controls[1].visualRegion.inViewport = true;
   const goal = deriveObservationGoal(observation, []);
-  const candidateSet = __private.groundedObservationCandidateSet(goal, observation);
+  const candidateSet = groundedObservationCandidateSet(goal, observation);
   const candidate = candidateSet.normalCandidates[0];
   const action = __private.bindTargetSnapshot(actionForCurrentCandidate(goal, candidate, observation), observation);
   const expiredGoal = {
@@ -560,7 +561,7 @@ test("the server-owned semantic affordance is unchanged from candidate through a
 
   assert.deepEqual(action.affordance, candidate.affordance);
   assert.equal(candidate.affordance.mechanicalEffect, "select_option");
-  assert.equal(candidate.affordance.semanticIntent, "perform_current_obligation");
+  assert.equal(candidate.affordance.semanticIntent, "resolve_current_decision");
   assert.equal(candidate.affordance.policy.decision, "obligation_admitted");
   assert.deepEqual(candidate.obligationSuccessCondition, candidate.outcomeContract);
 });

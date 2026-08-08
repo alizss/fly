@@ -57,7 +57,7 @@ function summarizeAgentSession(session) {
     id: session.id,
     status: session.status,
     goal: session.goal,
-    currentStage: session.taskState?.stage || session.currentStep,
+    currentStage: session.taskState?.stage || "unknown",
     travelerName: "",
     approvals: session.approvals,
     completedFields: [],
@@ -97,7 +97,6 @@ function createAgentSession(body = {}) {
       baggagePreference: clampText(traveler.baggage_preference, 120),
       paymentPreference: clampText(traveler.payment_preference, 120)
     }, traveler),
-    currentStep: normalizeStep(body.page?.step || state.currentStep || "unknown"),
     approvals: {
       ...state.approvals,
       skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
@@ -140,10 +139,7 @@ function reportAgentResult(body = {}) {
       : ["ask_user", "stop"].includes(result.type)
         ? "awaiting_user"
         : checkoutState.status;
-  return agentSessionStore.recordActionResult(checkoutState.id, result, {
-    currentStep: normalizeStep(body.page?.step || checkoutState.currentStep || "unknown"),
-    status
-  });
+  return agentSessionStore.recordActionResult(checkoutState.id, result, { status });
 }
 
 function encryptSensitive(value) {
@@ -1401,7 +1397,7 @@ async function decideAgentNextActionViaLoop(body) {
     }
   });
 
-  logAgent("loop turn start", { clientTurnId: payload.clientTurnId, observationId: payload.observationId, sessionId: state.id, site: payload.page?.site, step: state.currentStep, stallCount: state.stallCount || 0 });
+  logAgent("loop turn start", { clientTurnId: payload.clientTurnId, observationId: payload.observationId, sessionId: state.id, site: payload.page?.site, step: payload.page?.step || state.taskState?.stage || "unknown", stallCount: state.stallCount || 0 });
 
   try {
     const loopStartedAt = Date.now();

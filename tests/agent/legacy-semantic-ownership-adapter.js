@@ -1,7 +1,8 @@
 const { callStructured } = require("../../apps/web/agent/openai-client");
 const { currentSurface, controlBelongsToCurrentSurface } = require("../../apps/web/agent/surface-contract");
 const { seatPolicyFrom } = require("../../apps/web/agent/policy-profile");
-const { currentObligation, mechanicsForObligation } = require("../../apps/web/agent/authority-frames");
+const { currentObligation } = require("../../apps/web/agent/authority-frames");
+const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 
 const OWNERSHIP_FAMILIES = ["seat", "baggage", "bundle", "insurance", "extras", "unknown"];
 const OWNERSHIP_REQUIREMENTS = ["required", "optional", "unknown"];
@@ -235,7 +236,7 @@ function semanticOwnershipPayload(observation = {}, groups = [], userPolicy = {}
   )).slice(0, MAX_RELATED_MODEL_CONTROLS).map(compactOwnershipControl);
   const groupIds = new Set(groups.map((group) => clean(group.decisionGroupId || group.requirementId)));
   const relatedSectionIds = new Set(controls.map((control) => clean(control.sectionId)).filter(Boolean));
-  const bindingGoal = mechanicsForObligation(currentObligation(taskState));
+  const bindingGoal = legacyGoalFromObligation(currentObligation(taskState));
   const compactGoal = bindingGoal ? {
     goalId: clean(bindingGoal.goalId),
     semanticType: clean(bindingGoal.semanticType),

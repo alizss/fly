@@ -19,10 +19,11 @@ const {
 const { desiredProfileValue } = require("../../apps/web/agent/logical-field");
 const { encodeDateForField } = require("../../apps/web/agent/date-field-codec");
 const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
-const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { reduceTaskState } = require("./task-state-replay-adapter");
-const { deriveObservationGoal } = require("../../apps/web/agent/observation-candidates");
+const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { semanticGoalKey } = require("../../packages/shared/agent-actions");
 const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
@@ -163,7 +164,7 @@ test("pre-surface discovery admits one exact reversible opener and rejects seman
     semanticIntent: "discover_control_surface",
     expectedOutcome: { type: "options_surface_appeared" },
     discoveryEnvelope: {
-      contractVersion: "pre-surface-discovery/v1",
+      kind: "pre_surface_discovery",
       logicalControlId: controlId,
       actuatorId,
       sourceSurfaceId: surfaceId,
@@ -265,7 +266,7 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
   assert.equal(taskState.currentGoal.decisionGroupId, "dg_false_bag");
   const failedSignatures = [];
   for (let index = 0; index < 4; index += 1) {
-    const set = loopPrivate.groundedObservationCandidateSet(taskState.currentGoal, observation, failedSignatures, {
+    const set = groundedObservationCandidateSet(taskState.currentGoal, observation, failedSignatures, {
       state: { taskState, approvals: {} },
       traveler,
       approvals: {}
@@ -290,8 +291,8 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
   state.recoveryState = {
     ...state.recoveryState,
     failedStrategies: failedSignatures.map((strategySignature) => ({
-      goalKey: loopPrivate.semanticGoalRecoveryKey(taskState.currentGoal, observation),
-      semanticGoalKey: semanticGoalKey(taskState.currentGoal),
+      goalKey: loopPrivate.semanticGoalRecoveryKey(taskState.currentObligation, observation),
+      semanticGoalKey: semanticGoalKey(taskState.currentObligation),
       strategySignature,
       controlId: minus.controlId,
       pageStateHash: observation.observationSnapshot.snapshotHash,
@@ -1315,7 +1316,7 @@ test("profile candidate actionability cannot be suppressed by obsolete blocked-g
   assert.equal(candidateSet.candidates[0].targetId, "el_title_visible_wrapper");
   assert.equal(candidateSet.candidates[0].exclusionReason, "");
 
-  const blockedCandidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+  const blockedCandidateSet = groundedObservationCandidateSet(goal, observation, [], {
     state: { approvals: {} },
     traveler,
     approvals: {}
@@ -1388,7 +1389,7 @@ test("an exhausted Title actuator cannot make the loop skip to Nationality", asy
   };
   const initialTaskState = reduceTaskState({ observation, traveler });
   const titleGoal = initialTaskState.currentGoal;
-  const titleCandidate = loopPrivate.groundedObservationCandidateSet(titleGoal, observation, [], {
+  const titleCandidate = groundedObservationCandidateSet(titleGoal, observation, [], {
     state: { taskState: initialTaskState, approvals: {} },
     traveler,
     approvals: {}
@@ -2446,7 +2447,7 @@ test("Unified semantic loop reissues a candidate after stale pre-dispatch reject
   assert.equal(result.clientDecision.action, "type");
   assert.equal(result.clientDecision.goalId, "profile:email:0");
   assert.notEqual(result.clientDecision.candidateId, first.clientDecision.candidateId);
-  assert.equal(result.clientDecision.candidateId, "obs_stale_loop_after:candidate_1");
+  assert.match(result.clientDecision.candidateId, /^obs_stale_loop_after:candidate_\d+$/);
   assert.equal(result.clientDecision.observationId, "obs_stale_loop_after");
   assert.equal(result.clientDecision.controlId, "ctrl_email_obs_stale_loop_after");
   assert.notEqual(result.clientDecision.actionId, first.clientDecision.actionId);

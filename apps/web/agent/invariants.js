@@ -7,7 +7,8 @@ const {
   normalizeFacts
 } = require("./transaction-facts");
 const { controlBelongsToCurrentSurface } = require("./surface-contract");
-const { currentObligation, mechanicsForObligation } = require("./authority-frames");
+const { currentObligation } = require("./authority-frames");
+const { obligationField } = require("./current-obligation");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 function text(value, limit = 180) {
@@ -478,7 +479,7 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
     || action.affordance?.physicalEffect
     || action.affordance?.effect
     || "";
-  const currentGoal = mechanicsForObligation(currentObligation(state.taskState || {})) || {};
+  const currentGoal = currentObligation(state.taskState || {}) || {};
   const obligation = state.taskState?.currentObligation || {};
   const obligationOwnsCorrection = Boolean(
     obligation.subject?.decisionGroupId === decisionGroupId
@@ -487,7 +488,10 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
       === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
   );
   const paidSelection = observedPaidExtraForDecision(observed, decisionGroupId);
-  const exactGoal = Boolean(currentGoal.decisionGroupId && currentGoal.decisionGroupId === decisionGroupId);
+  const exactGoal = Boolean(
+    obligationField(currentGoal, "decisionGroupId")
+    && obligationField(currentGoal, "decisionGroupId") === decisionGroupId
+  );
   const exactTarget = Boolean(
     decisionGroupId
     && targetControlId

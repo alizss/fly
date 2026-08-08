@@ -7,9 +7,10 @@ const { reduceTaskState } = require("./task-state-replay-adapter");
 const {
   actionForCurrentCandidate,
   buildCurrentCandidateSet
-} = require("../../apps/web/agent/current-candidate-builder");
+} = require("./legacy-mechanics-binding-adapter");
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const { toClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 
 function provenCapability(operation, actuatorId) {
@@ -105,7 +106,7 @@ test("raw exact commerce receipt is persisted before lifecycle can reinterpret p
       }
     }
   };
-  const state = loopPrivate.recordRawVerifiedCommerceReceipt(
+  const receipt = loopPrivate.rawVerifiedCommerceReceipt(
     createCheckoutSessionState({ travelerId: "trav_raw_receipt" }),
     {
       observationId: "obs_raw_airhelp",
@@ -114,9 +115,8 @@ test("raw exact commerce receipt is persisted before lifecycle can reinterpret p
     }
   );
 
-  assert.equal(state.verifiedCommerceObligations.length, 1);
-  assert.equal(state.verifiedCommerceObligations[0].actionId, actionId);
-  assert.equal(state.verifiedCommerceObligations[0].decisionInstanceId, canonicalOwnerId);
+  assert.equal(receipt.actionId, actionId);
+  assert.equal(receipt.decisionInstanceId, canonicalOwnerId);
 
   // Parent checkout status is free to progress later; the receipt is already
   // immutable and no longer depends on those rewritten booleans.
@@ -127,12 +127,12 @@ test("raw exact commerce receipt is persisted before lifecycle can reinterpret p
     postconditionSatisfied: false,
     taskProgressStatus: "progressed"
   };
-  const unchanged = loopPrivate.recordRawVerifiedCommerceReceipt(state, {
+  const unchanged = loopPrivate.rawVerifiedCommerceReceipt({}, {
     observationId: "obs_after_parent_progress",
     lastActionResult: rewritten,
     page: { step: "traveler_information" }
   });
-  assert.deepEqual(unchanged.verifiedCommerceObligations, state.verifiedCommerceObligations);
+  assert.equal(unchanged, null);
 });
 
 function profileControl({
@@ -360,7 +360,7 @@ test("one requirement-component-capability contract remains identical through go
   const taskState = reduceTaskState({ observation: observed, traveler });
   assert.equal(taskState.currentGoal.semanticType, "title");
 
-  const grounded = loopPrivate.groundedObservationCandidateSet(taskState.currentGoal, observed, [], {
+  const grounded = groundedObservationCandidateSet(taskState.currentGoal, observed, [], {
     state: { taskState, approvals: {} },
     traveler,
     approvals: {}
@@ -792,7 +792,7 @@ test("target binding preserves the exact bounded-recovery actuator instead of su
     gender: "male"
   };
   const taskState = reduceTaskState({ observation: observed, traveler });
-  const grounded = loopPrivate.groundedObservationCandidateSet(
+  const grounded = groundedObservationCandidateSet(
     taskState.currentGoal,
     observed,
     [],

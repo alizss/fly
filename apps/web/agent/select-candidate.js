@@ -2,15 +2,16 @@ const { callStructured } = require("./openai-client");
 const { candidateSelectionSchemaFor } = require("./schemas");
 const { currentSurface } = require("./surface-contract");
 const { diffObservations } = require("./observation-diff");
+const { obligationField } = require("./current-obligation");
 
 const MAX_RELATED_MODEL_CONTROLS = 20;
 const CANDIDATE_MODEL_PACKET_BYTES = 24_000;
 
 const INSTRUCTIONS = [
   "Interpret only the current foreground surface, then select exactly one supplied candidateId and one semanticOutcome.",
-  "Context capabilities describe every grounded control on the current surface, including blocked controls.",
+  "Context capabilities describe only mechanics admitted for the current obligation; unrelated surface controls are intentionally absent.",
   "Selectable candidates are grounded, actionable, and policy-safe. Choose only from selectableCandidates.",
-  "A mechanical_hypothesis is one reversible, exact-actuator discovery action. Use it only to reveal the current goal's owned child surface; never treat it as semantic completion.",
+  "A mechanical_hypothesis is one reversible, exact-actuator discovery action. Use it only to reveal the current obligation's owned child surface; never treat it as semantic completion.",
   "After one mechanical hypothesis the browser must reobserve. Do not infer or emit a second action.",
   "When adaptiveEnvelope is present, remain inside its exact surface, operations, risk limits, step budget, and semantic objective.",
   "Do not invent targets, values, keys, geometry, or another action.",
@@ -193,13 +194,13 @@ function compileInteractionView({
     observationId: clean(observation.observationId),
     stage: clean(taskState.stage || "unknown"),
     foregroundSurface: compactSurfaceForCandidateModel(currentSurface(observation.page || {})),
-    currentGoal: {
-      goalId: clean(goal.goalId),
-      semanticType: clean(goal.semanticType),
-      desiredCanonicalValue: clipped(goal.desiredValue || goal.canonicalValue, 120),
-      postcondition: compactPostconditionForCandidateModel(goal.postcondition),
-      outcomeContract: compactOutcomeContractForCandidateModel(goal.outcomeContract),
-      adaptiveEnvelope: compactAdaptiveEnvelopeForCandidateModel(goal.adaptiveEnvelope)
+    currentObligation: {
+      obligationId: clean(obligationField(goal, "goalId")),
+      semanticType: clean(obligationField(goal, "semanticType")),
+      desiredCanonicalValue: clipped(obligationField(goal, "desiredValue") || obligationField(goal, "canonicalValue"), 120),
+      successCondition: compactPostconditionForCandidateModel(obligationField(goal, "successCondition") || obligationField(goal, "postcondition")),
+      outcomeContract: compactOutcomeContractForCandidateModel(obligationField(goal, "outcomeContract")),
+      adaptiveEnvelope: compactAdaptiveEnvelopeForCandidateModel(obligationField(goal, "adaptiveEnvelope"))
     },
     components: [...componentById.values()].map((component) => ({
       ...component,

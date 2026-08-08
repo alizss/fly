@@ -130,7 +130,7 @@ function compileDecisionFrame({
     semanticCompilation: compilation,
     profileRequirements: freezeArray(profileRequirements),
     standaloneDecisions: freezeArray(standaloneDecisions),
-    commerceDecisions: compilation.decisionGroups || [],
+    commerceEntities: freezeArray(compilation.decisionGroups || []),
     navigationOpportunity: page.stageExit || null,
     transactionFacts,
     terminalEvidence: page.terminalEvidence || null,
@@ -169,10 +169,14 @@ function admittedControlIds(goal = {}) {
 
 function obligationSubject(goal = {}) {
   return Object.freeze({
+    stage: clean(goal.stage || goal.owner?.stage),
     family: clean(goal.canonicalSubject?.family || goal.subject?.family || goal.family || goal.sectionType),
     key: clean(goal.canonicalSubject?.key || goal.subject?.key || goal.subjectKey || goal.semanticType),
     semanticType: clean(goal.semanticType),
     subjectId: clean(goal.subjectId || "global"),
+    passengerId: clean(goal.canonicalSubject?.passengerId || goal.passengerId || goal.travelerId),
+    segmentId: clean(goal.canonicalSubject?.segmentId || goal.segmentId),
+    repeatedInstance: clean(goal.canonicalSubject?.repeatedInstance || goal.decisionInstanceId),
     decisionGroupId: clean(goal.decisionGroupId),
     requirementId: clean(goal.requirementId),
     logicalFieldId: clean(goal.logicalFieldId)
@@ -207,63 +211,68 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null, recovery
     || goal.adaptiveEnvelope?.remainingSteps
     || 3
   ));
-  const mechanics = Object.freeze({
-    semanticType: clean(goal.semanticType),
-    descriptorKey: clean(goal.descriptorKey),
-    ordinal: Number.isFinite(Number(goal.ordinal)) ? Number(goal.ordinal) : null,
-    logicalStructure: clean(goal.logicalStructure),
-    label: clean(goal.label),
-    field: clean(goal.field),
-    family: clean(goal.family),
-    sectionType: clean(goal.sectionType),
-    subjectId: clean(goal.subjectId || "global"),
-    decisionGroupId: clean(goal.decisionGroupId),
-    requirementId: clean(goal.requirementId),
-    logicalFieldId: clean(goal.logicalFieldId),
-    controlId: clean(goal.controlId),
-    sourceGoalId: clean(goal.sourceGoalId),
-    completedDecisionGroupId: clean(goal.completedDecisionGroupId),
-    parentSelectedControlId: clean(goal.parentSelectedControlId),
-    parentDecisionGroupId: clean(goal.parentDecisionGroupId),
-    policyCorrectionForDecisionGroupId: clean(goal.policyCorrectionForDecisionGroupId),
-    semanticOwnershipLinkId: clean(goal.semanticOwnershipLinkId),
-    intendedOutcome: clean(goal.intendedOutcome),
-    desiredPolicyOutcome: clean(goal.desiredPolicyOutcome),
-    desiredSemanticOutcome: clean(goal.desiredSemanticOutcome),
-    decisionEpisodeId: clean(goal.decisionEpisodeId),
-    decisionInstanceId: clean(goal.decisionInstanceId),
-    canonicalOwnerId: clean(goal.canonicalOwnerId),
-    parentExpectedSelectedControlId: clean(goal.parentExpectedSelectedControlId),
-    decisionEpisodeStatus: clean(goal.decisionEpisodeStatus),
-    transactionOutcomeId: clean(goal.transactionOutcomeId),
-    stageOutcomeId: clean(goal.stageOutcomeId),
-    surfaceSubgoalId: clean(goal.surfaceSubgoalId),
-    componentRole: clean(goal.componentRole),
-    desiredValue: goal.desiredValue ?? "",
-    canonicalValue: goal.canonicalValue ?? goal.desiredValue ?? "",
-    inputValue: goal.inputValue ?? "",
-    expectedValue: goal.expectedValue ?? goal.inputValue ?? "",
-    expectedNormalizedValue: goal.expectedNormalizedValue ?? goal.desiredValue ?? "",
-    expectedCanonicalValue: goal.expectedCanonicalValue ?? goal.canonicalValue ?? goal.desiredValue ?? "",
-    choiceLike: goal.choiceLike === true,
-    selectionMode: clean(goal.selectionMode),
-    policyChoiceBounded: goal.policyChoiceBounded === true,
-    choiceTerms: freezeArray(goal.choiceTerms),
-    freeAlternativeControlIds: freezeArray(goal.freeAlternativeControlIds),
-    paidAlternativeControlIds: freezeArray(goal.paidAlternativeControlIds),
-    eligibleAlternativeControlIds: freezeArray(goal.eligibleAlternativeControlIds),
-    surfaceExitControlIds: freezeArray(goal.surfaceExitControlIds),
-    componentBinding: goal.componentBinding ? Object.freeze({ ...goal.componentBinding }) : null,
-    requirementContract: goal.requirementContract ? Object.freeze({ ...goal.requirementContract }) : null,
-    expectedOutcome: goal.expectedOutcome ? Object.freeze({ ...goal.expectedOutcome }) : null,
-    postcondition: goal.postcondition ? Object.freeze({ ...goal.postcondition }) : null,
-    parentOutcomeContract: goal.parentOutcomeContract ? Object.freeze({ ...goal.parentOutcomeContract }) : null,
-    surfaceExitOwnership: goal.surfaceExitOwnership ? Object.freeze({ ...goal.surfaceExitOwnership }) : null,
-    validationOwnership: goal.validationOwnership ? Object.freeze({ ...goal.validationOwnership }) : null,
-    dateCodec: goal.dateCodec ? Object.freeze({ ...goal.dateCodec }) : null,
-    codecError: goal.codecError ? Object.freeze({ ...goal.codecError }) : null,
-    reconciliation: goal.reconciliation ? Object.freeze({ ...goal.reconciliation }) : null,
-    adaptiveEnvelope: goal.adaptiveEnvelope ? Object.freeze({ ...goal.adaptiveEnvelope }) : null
+  const binding = Object.freeze({
+    component: Object.freeze({
+      semanticType: clean(goal.semanticType),
+      descriptorKey: clean(goal.descriptorKey),
+      ordinal: Number.isFinite(Number(goal.ordinal)) ? Number(goal.ordinal) : null,
+      logicalStructure: clean(goal.logicalStructure),
+      label: clean(goal.label),
+      field: clean(goal.field),
+      logicalFieldId: clean(goal.logicalFieldId),
+      controlId: clean(goal.controlId),
+      role: clean(goal.componentRole),
+      desiredValue: goal.desiredValue ?? "",
+      canonicalValue: goal.canonicalValue ?? goal.desiredValue ?? "",
+      inputValue: goal.inputValue ?? "",
+      expectedValue: goal.expectedValue ?? goal.inputValue ?? "",
+      expectedNormalizedValue: goal.expectedNormalizedValue ?? goal.desiredValue ?? "",
+      expectedCanonicalValue: goal.expectedCanonicalValue ?? goal.canonicalValue ?? goal.desiredValue ?? "",
+      choiceLike: goal.choiceLike === true,
+      componentContract: goal.componentBinding ? Object.freeze({ ...goal.componentBinding }) : null,
+      requirementContract: goal.requirementContract ? Object.freeze({ ...goal.requirementContract }) : null,
+      localPostcondition: goal.expectedOutcome ? Object.freeze({ ...goal.expectedOutcome }) : null,
+      semanticPostcondition: goal.postcondition ? Object.freeze({ ...goal.postcondition }) : null,
+      validationOwnership: goal.validationOwnership ? Object.freeze({ ...goal.validationOwnership }) : null,
+      dateCodec: goal.dateCodec ? Object.freeze({ ...goal.dateCodec }) : null,
+      codecError: goal.codecError ? Object.freeze({ ...goal.codecError }) : null,
+      reconciliation: goal.reconciliation ? Object.freeze({ ...goal.reconciliation }) : null
+    }),
+    choice: Object.freeze({
+      mode: clean(goal.selectionMode),
+      policyBounded: goal.policyChoiceBounded === true,
+      terms: freezeArray(goal.choiceTerms),
+      freeControlIds: freezeArray(goal.freeAlternativeControlIds),
+      paidControlIds: freezeArray(goal.paidAlternativeControlIds),
+      eligibleControlIds: freezeArray(goal.eligibleAlternativeControlIds),
+      semanticCorrectionControlIds: freezeArray(goal.semanticCorrectionControlIds)
+    }),
+    surface: Object.freeze({
+      sectionType: clean(goal.sectionType),
+      exitControlIds: freezeArray(goal.surfaceExitControlIds),
+      completedDecisionGroupId: clean(goal.completedDecisionGroupId),
+      parentSelectedControlId: clean(goal.parentSelectedControlId),
+      parentDecisionGroupId: clean(goal.parentDecisionGroupId),
+      parentExpectedSelectedControlId: clean(goal.parentExpectedSelectedControlId),
+      exitOwnership: goal.surfaceExitOwnership ? Object.freeze({ ...goal.surfaceExitOwnership }) : null,
+      parentOutcome: goal.parentOutcomeContract ? Object.freeze({ ...goal.parentOutcomeContract }) : null
+    }),
+    lineage: Object.freeze({
+      sourceObligationId: clean(goal.sourceGoalId),
+      policyCorrectionDecisionGroupId: clean(goal.policyCorrectionForDecisionGroupId),
+      semanticOwnershipLinkId: clean(goal.semanticOwnershipLinkId),
+      intendedOutcome: clean(goal.intendedOutcome),
+      desiredPolicyOutcome: clean(goal.desiredPolicyOutcome),
+      desiredSemanticOutcome: clean(goal.desiredSemanticOutcome),
+      decisionEpisodeId: clean(goal.decisionEpisodeId),
+      decisionInstanceId: clean(goal.decisionInstanceId),
+      canonicalOwnerId: clean(goal.canonicalOwnerId),
+      decisionEpisodeStatus: clean(goal.decisionEpisodeStatus),
+      transactionOutcomeId: clean(goal.transactionOutcomeId),
+      stageOutcomeId: clean(goal.stageOutcomeId),
+      surfaceSubgoalId: clean(goal.surfaceSubgoalId)
+    }),
+    adaptive: goal.adaptiveEnvelope ? Object.freeze({ ...goal.adaptiveEnvelope }) : null
   });
   const obligation = {
     contractVersion: CURRENT_OBLIGATION_VERSION,
@@ -294,61 +303,13 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null, recovery
       remainingAttempts: Math.max(0, maxAttempts - Number(recoveryState.attempts || 0))
     })
   };
-  // This is the one turn-local mechanics input for the admitted obligation.
-  // It is explicit instead of hidden in a WeakMap, and the durable session
-  // compactor deliberately drops it. A resumed turn recompiles it from the
-  // fresh DecisionFrame before any actuator can be leased.
-  obligation.mechanics = mechanics;
+  obligation.binding = binding;
   return Object.freeze(obligation);
 }
 
 function currentObligation(taskState = {}) {
   const obligation = taskState?.currentObligation || null;
   return obligation?.contractVersion === CURRENT_OBLIGATION_VERSION ? obligation : null;
-}
-
-function mechanicsForObligation(obligation = null) {
-  if (!obligation || obligation.contractVersion !== CURRENT_OBLIGATION_VERSION) return null;
-  const subject = obligation.subject || {};
-  const mechanics = obligation.mechanics || {};
-  return Object.freeze({
-    ...mechanics,
-    // These names are the direct mechanics-binder view of the obligation.
-    // They are derived here rather than stored as a second goal authority.
-    obligationId: obligation.obligationId,
-    goalId: obligation.obligationId,
-    kind: obligation.kind,
-    objective: obligation.objective,
-    semanticGoal: obligation.objective,
-    desiredEffect: obligation.desiredEffect,
-    semanticEffect: obligation.desiredEffect,
-    desiredValue: obligation.desiredValue,
-    admittedControlIds: obligation.admittedControlIds,
-    candidateControlIds: obligation.admittedControlIds,
-    actionableControlIds: obligation.admittedControlIds,
-    policyAllowedControlIds: obligation.admittedControlIds,
-    policyDecision: obligation.policyDecision,
-    admission: Object.freeze({
-      status: obligation.policyDecision?.status,
-      reason: obligation.policyDecision?.reason
-    }),
-    profileCompatible: obligation.policyDecision?.profileCompatible !== false,
-    risk: obligation.risk,
-    riskClass: obligation.risk,
-    successCondition: obligation.successCondition,
-    outcomeContract: obligation.successCondition,
-    recoveryBudget: obligation.recoveryBudget,
-    observationId: obligation.observationId,
-    observationHash: obligation.observationHash,
-    surfaceId: obligation.surfaceId,
-    subject,
-    semanticType: subject.semanticType || "",
-    family: subject.family || "",
-    subjectId: subject.subjectId || "global",
-    decisionGroupId: subject.decisionGroupId || "",
-    requirementId: subject.requirementId || "",
-    logicalFieldId: mechanics.logicalFieldId || subject.logicalFieldId || ""
-  });
 }
 
 module.exports = {
@@ -359,6 +320,5 @@ module.exports = {
   createObservationFrame,
   currentObligation,
   currentObligationFromGoal,
-  decisionFrameOwnsObservation,
-  mechanicsForObligation
+  decisionFrameOwnsObservation
 };

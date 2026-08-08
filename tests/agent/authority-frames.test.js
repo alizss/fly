@@ -13,7 +13,7 @@ const {
 } = require("../../apps/web/agent/authority-frames");
 const { reduceTaskState } = require("./task-state-replay-adapter");
 const { reduceDecisionFrame, taskStateReadModel } = require("../../apps/web/agent/task-state-reducer");
-const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { bindMechanics, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
 
 function actionable(operation, actuatorId) {
@@ -110,6 +110,8 @@ test("V2 frames compile once and publish one small mechanics-binding obligation"
   assert.equal(taskState.currentObligation.contractVersion, CURRENT_OBLIGATION_VERSION);
   assert.equal(taskState.currentObligation.authority, "task_state");
   assert.equal(taskState.currentObligation.bindingContract, undefined);
+  assert.equal(taskState.currentObligation.mechanics, undefined);
+  assert.ok(taskState.currentObligation.binding);
   assert.equal(taskState.currentObligation.subject.decisionGroupId, "dg_baggage");
   assert.deepEqual(taskState.currentObligation.admittedControlIds, ["bag_none"]);
   assert.equal(taskState.currentGoal.candidateSet, undefined);
@@ -121,15 +123,20 @@ test("V2 frames compile once and publish one small mechanics-binding obligation"
   assert.equal(productionTaskState.processAwareness, undefined);
   assert.ok(Array.isArray(taskStateReadModel(productionTaskState).canonicalDecisions));
 
-  const candidateSet = buildCurrentCandidateSet({
-    goal: taskState.currentGoal,
+  const candidateSet = bindMechanics({
     obligation: taskState.currentObligation,
+    decisionFrame,
     observation: decisionFrame.observation,
     state: { taskState, approvals: {} },
     traveler: { booking_rules: "No paid baggage or extras" }
   });
   assert.equal(candidateSet.obligationId, taskState.currentObligation.obligationId);
   assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["bag_none"]);
+  assert.throws(() => bindMechanics({
+    obligation: taskState.currentObligation,
+    decisionFrame: { ...decisionFrame, observationHash: "stale_hash" },
+    observation: decisionFrame.observation
+  }), /BIND_MECHANICS_DECISION_FRAME_MISMATCH/);
 });
 
 test("a decision obligation cannot admit navigation that its success condition cannot satisfy", () => {
@@ -176,11 +183,15 @@ test("production runtime contains one semantic compiler and one TaskState reduct
   const browser = fs.readFileSync(path.join(root, "apps/extension/src/content/content.js"), "utf8");
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
   const candidateBinder = fs.readFileSync(path.join(root, "apps/web/agent/select-candidate.js"), "utf8");
+  const ambiguityResolver = fs.readFileSync(path.join(root, "apps/web/agent/ambiguity-resolver.js"), "utf8");
   const governor = fs.readFileSync(path.join(root, "apps/web/agent/action-governor.js"), "utf8");
   const schemas = fs.readFileSync(path.join(root, "apps/web/agent/schemas.js"), "utf8");
   assert.equal((browser.match(/compileSemanticCheckout\s*\(/g) || []).length, 0);
   assert.equal((loop.match(/compileDecisionFrame\s*\(/g) || []).length, 1);
   assert.equal((loop.match(/reduceDecisionFrame\s*\(/g) || []).length, 1);
+  assert.equal(/\bselectCandidate\b|\bresolveActiveComponentSemantics\b/.test(loop), false);
+  assert.equal((ambiguityResolver.match(/require\("\.\/select-candidate"\)/g) || []).length, 1);
+  assert.equal((ambiguityResolver.match(/require\("\.\/active-component-grounding"\)/g) || []).length, 1);
   assert.equal(/resolveSemanticOwnership|reusableSemanticOwnershipDecision/.test(`${loop}\n${candidateBinder}`), false);
   assert.equal(/activeDecisions|profileReadiness/.test(candidateBinder), false);
   assert.equal(/prepareTransactionInvariants|profileStageReadiness/.test(governor), false);

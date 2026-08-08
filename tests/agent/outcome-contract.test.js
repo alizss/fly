@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { buildCurrentCandidateSet, actionForCurrentCandidate } = require("../../apps/web/agent/current-candidate-builder");
+const { buildCurrentCandidateSet, actionForCurrentCandidate } = require("./legacy-mechanics-binding-adapter");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { reduceTaskState } = require("./task-state-replay-adapter");
 const { governObservedAction: governAction } = require("./governance-test-helper");
@@ -123,14 +123,14 @@ test("same-label modal close and checkout submit remain safe selectable foregrou
 
   assert.equal(close.physicalEffect, "dismiss_surface");
   assert.equal(close.mechanicalEffect, "dismiss_surface");
-  assert.equal(close.semanticIntent, "perform_current_obligation");
+  assert.equal(close.semanticIntent, "resolve_current_decision");
   assert.equal(close.obligationSuccessCondition.taskOutcome, "payment_review_reached");
   assert.equal(close.selectable, true);
   assert.equal(close.outcomeCompatibility, "obligation_admitted");
   assert.equal(close.exclusionReason, "");
   assert.equal(submit.physicalEffect, "advance_checkout_stage");
   assert.equal(submit.mechanicalEffect, "advance_checkout_stage");
-  assert.equal(submit.semanticIntent, "perform_current_obligation");
+  assert.equal(submit.semanticIntent, "resolve_current_decision");
   assert.equal(submit.obligationSuccessCondition.taskOutcome, "payment_review_reached");
   assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["close", "submit"]);
 });

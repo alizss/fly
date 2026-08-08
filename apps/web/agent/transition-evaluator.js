@@ -539,6 +539,7 @@ function policyConflictResolution(expected = {}, action = {}, beforePage = {}, a
       explicitUnselectedState,
       groupSelectionCleared,
       chargeCleared,
+      selectedChargeRemoved: chargeCleared,
       unrelatedSelectionChanges: unrelated,
       validation
     }
@@ -910,6 +911,9 @@ function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}) {
     return { effect: "open_surface", verified: true, evidence: { modalOpened: true } };
   }
   if (postcondition.satisfied && postcondition.type === "exact_free_option_selected") {
+    return { effect: "select_free_option", verified: true, evidence: postcondition.evidence };
+  }
+  if (postcondition.satisfied && postcondition.type === "policy_conflict_resolved") {
     return { effect: "select_free_option", verified: true, evidence: postcondition.evidence };
   }
   if (postcondition.satisfied && postcondition.type === "control_selected") {

@@ -6,7 +6,7 @@ const {
   verifiedProfileComponentFromActionResult
 } = require("../../apps/web/agent/task-state-reducer");
 const { reduceTaskState } = require("./task-state-replay-adapter");
-const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 
@@ -1293,7 +1293,7 @@ test("medical cancellation wording resolves as insurance and outranks paid marke
   assert.equal(state.observedDecisions[0].subject.key, "travel_insurance");
   assert.equal(state.currentGoal.decisionGroupId, "medical_cancellation_choice");
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["no_medical_cancellation"]);
-  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "lock_price").goalRelevant, false);
+  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "lock_price"), undefined);
 });
 
 test("marketing prose containing finish your booking is not navigation", () => {
@@ -1664,7 +1664,7 @@ test("a proven paid conflict with a current-surface reversal outranks navigation
     state: { taskState: state, approvals: {} }
   });
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [reverse.controlId]);
-  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === navigate.controlId).selectable, false);
+  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === navigate.controlId), undefined);
 });
 
 test("an unknown optional manual selection invalidates the old completion without blocking navigation", () => {
@@ -1831,7 +1831,7 @@ test("fresh transaction-backed paid truth cannot remain satisfied when selected 
     state: { taskState: state, approvals: {} }
   });
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [reversal.controlId]);
-  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === navigation.controlId).selectable, false);
+  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === navigation.controlId), undefined);
 });
 
 test("decline policy is scoped to the matching optional family", () => {
@@ -2401,9 +2401,9 @@ test("decision planning keeps unrelated surface controls as context and uses one
     traveler: { booking_rules: "no paid extras" }
   });
 
-  assert.deepEqual(candidateSet.contextCapabilities.map((candidate) => candidate.controlId).sort(), ["close_help", "no_thanks", "paid_upgrade"]);
-  assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "close_help").selectable, false);
-  assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "paid_upgrade").policyStatus, "context_only");
+  assert.deepEqual(candidateSet.contextCapabilities.map((candidate) => candidate.controlId), ["no_thanks"]);
+  assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "close_help"), undefined);
+  assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "paid_upgrade"), undefined);
   assert.deepEqual(
     candidateSet.candidates.map((candidate) => candidate.controlId),
     ["no_thanks"],
@@ -2573,8 +2573,8 @@ test("seat-map traveler rows never become free-seat candidates", () => {
   });
 
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["next_leg"]);
-  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "traveler_row").selectable, false);
-  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "paid_seat_1e").selectable, false);
+  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "traveler_row"), undefined);
+  assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "paid_seat_1e"), undefined);
 });
 
 test("one decision episode closes a selected parent dropdown after child confirmation without reselecting it", () => {

@@ -1,5 +1,11 @@
-const { compactWholePageMarkdown } = require("./observation-markdown");
-const { conciseActionFeedback, diffObservations, formatObservationDiffMarkdown } = require("./observation-diff");
+// Historical model-context projections retained only for replay assertions.
+// Production uses InteractionView through the single ambiguity resolver.
+const { compactWholePageMarkdown } = require("../../apps/web/agent/observation-markdown");
+const {
+  conciseActionFeedback,
+  diffObservations,
+  formatObservationDiffMarkdown
+} = require("../../apps/web/agent/observation-diff");
 
 function text(value, fallback = "") {
   return String(value ?? fallback).slice(0, 300);

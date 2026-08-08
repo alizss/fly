@@ -11,22 +11,19 @@
 // previous action did, then plan+policy-check the next one.
 //
 // Zero model calls when task/policy filtering leaves one obvious safe action.
-// Ambiguous turns use at most two: classification plus combined verify/plan.
-// The original 3-call version measured 15-30+ seconds per turn in practice,
+// Ambiguous turns use at most one closed ambiguity-resolution call.
+// Earlier multi-call versions measured 15-30+ seconds per turn in practice,
 // which is a real cost for a product whose whole point is being fast.
 
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 const {
-  selectCandidate
-} = require("./select-candidate");
-const {
-  unknownComponentsForObligation,
-  resolveActiveComponentSemantics
+  unknownComponentsForObligation
 } = require("./active-component-grounding");
+const { resolveAmbiguity } = require("./ambiguity-resolver");
 const {
   actionForCurrentCandidate,
-  buildCurrentCandidateSet
+  bindMechanics
 } = require("./current-candidate-builder");
 const { governAction, RECOVERABLE_GROUNDING_CODES } = require("./action-governor");
 const { buildControlAliasIndex, resolveActionControl } = require("./control-alias-index");
@@ -43,6 +40,7 @@ const {
 } = require("./action-lifecycle");
 const {
   normalizeAction,
+  createActionLease,
   actuatorSignature,
   decisionInstanceKey,
   isCandidateGrounded,
@@ -73,12 +71,12 @@ const { canonicalizeUserPolicy, seatPolicyFrom } = require("./policy-profile");
 const {
   compileDecisionFrame,
   createObservationFrame,
-  currentObligation,
-  mechanicsForObligation
+  currentObligation
 } = require("./authority-frames");
+const { obligationField, semanticOwner } = require("./current-obligation");
 
 function taskMechanics(taskState = {}) {
-  return mechanicsForObligation(currentObligation(taskState)) || {};
+  return currentObligation(taskState) || {};
 }
 
 function bufferedDiagnosticStore(store = null) {
@@ -161,8 +159,6 @@ function viewportRecoveryAction(blockedAction = {}, observation = {}, recoveryCo
     observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
     type: "scroll",
     intent: "recover_target_viewport",
-    skillPlanId: blockedAction.skillPlanId || "",
-    skillAtomId: blockedAction.skillAtomId || "",
     controlId: blockedAction.controlId || blockedAction.targetSnapshot?.controlId || "",
     targetId: blockedAction.targetId || blockedAction.targetSnapshot?.id || "",
     targetLabel: blockedAction.targetLabel || blockedAction.targetSnapshot?.label || "",
@@ -247,12 +243,12 @@ function rebindPendingRecoveryAction(pending = {}, observation = {}, state = {},
     expectedOutcome: null,
     reason: `Rebound pending governed action after viewport recovery: ${original.reason || original.intent || original.type || "action"}.`
   }), observation);
-  if (!authoritativeGoal?.goalId) {
+  if (!obligationField(authoritativeGoal, "goalId")) {
     return { action: direct, candidateSet: null, candidate: pending.candidate || null };
   }
 
-  const reboundSet = buildCurrentCandidateSet({
-    goal: authoritativeGoal,
+  const reboundSet = bindMechanics({
+    obligation: currentObligation(state.taskState || {}),
     observation,
     traveler,
     state,
@@ -268,17 +264,17 @@ function rebindPendingRecoveryAction(pending = {}, observation = {}, state = {},
       && candidate.operation === previous.operation
   )) || null;
   const profileSemantic = String(
-    authoritativeGoal.kind === "profile_field"
-      ? (authoritativeGoal.field || authoritativeGoal.semanticType || "")
-      : authoritativeGoal.semanticType || ""
+    obligationField(authoritativeGoal, "kind") === "profile_field"
+      ? (obligationField(authoritativeGoal, "field") || obligationField(authoritativeGoal, "semanticType") || "")
+      : obligationField(authoritativeGoal, "semanticType") || ""
   ).toLowerCase();
-  const profileRecovery = authoritativeGoal.kind === "profile_field"
+  const profileRecovery = obligationField(authoritativeGoal, "kind") === "profile_field"
     || /^(?:email|confirm_email|phone|phone_country_code|first_name|given_names|middle_name|last_name|second_last_name|full_name|title|gender|date_of_birth|place_of_birth|nationality|country_of_residence|document_type|passport_number|document_number|issuing_country|document_issue_date|passport_expiry|document_expiry|address_line1|address_line2|city|state|postal_code|country)$/.test(profileSemantic);
   const semanticProfileCandidate = profileRecovery
     ? (reboundSet.candidates || []).find((candidate) => (
         candidate.operation === (previous.operation || original.operation)
-        && String(candidate.semanticGoal || authoritativeGoal.semanticGoal || "").toLowerCase()
-          === String(previous.semanticGoal || authoritativeGoal.semanticGoal || "").toLowerCase()
+        && String(candidate.semanticGoal || obligationField(authoritativeGoal, "semanticGoal") || "").toLowerCase()
+          === String(previous.semanticGoal || obligationField(authoritativeGoal, "semanticGoal") || "").toLowerCase()
         && String(candidate.decisionGroupId || "") === String(previous.decisionGroupId || original.decisionGroupId || "")
       )) || null
     : null;
@@ -338,7 +334,7 @@ function observationDecisionHash(observation = {}) {
 }
 
 function decisionConflictId(goal = {}) {
-  return String(goal.decisionGroupId || goal.requirementId || goal.goalId || "");
+  return String(obligationField(goal, "decisionGroupId") || obligationField(goal, "requirementId") || obligationField(goal, "goalId") || "");
 }
 
 function candidateIntendedOutcome(candidate = {}, selection = {}) {
@@ -352,7 +348,7 @@ function candidateSelectionCacheEntry({ observation = {}, goal = {}, candidate =
     observationHash: observationDecisionHash(observation),
     policyFingerprint,
     conflictId: decisionConflictId(goal),
-    goalId: String(goal.goalId || ""),
+    goalId: String(obligationField(goal, "goalId") || ""),
     candidateId: String(candidate.candidateId),
     controlId: String(candidate.controlId),
     stableControlIdentity: String(candidate.affordance?.stableKey || candidate.stableKey || candidate.controlId),
@@ -367,7 +363,7 @@ function reusableCandidateSelection(cache = null, observation = {}, goal = {}, c
   const entry = cache?.candidateSelection;
   if (!entry || entry.observationHash !== observationDecisionHash(observation)) return null;
   if (entry.policyFingerprint !== policyFingerprint) return null;
-  if (entry.conflictId !== decisionConflictId(goal) || entry.goalId !== String(goal.goalId || "")) return null;
+  if (entry.conflictId !== decisionConflictId(goal) || entry.goalId !== String(obligationField(goal, "goalId") || "")) return null;
   const candidate = (candidateSet.candidates || []).find((item) => (
     String(item.affordance?.stableKey || item.stableKey || item.controlId) === entry.stableControlIdentity
     && String(item.operation || item.type || "") === entry.operation
@@ -394,7 +390,7 @@ function staleActionRecoveryEntry(action = {}, candidate = {}, goal = {}, policy
   return Object.freeze({
     code,
     conflictId: decisionConflictId(goal),
-    goalId: String(goal.goalId || action.goalId || ""),
+    goalId: String(obligationField(goal, "goalId") || action.goalId || ""),
     stableControlIdentity,
     operation: String(candidate.operation || action.operation || action.type || ""),
     intendedOutcome: candidateIntendedOutcome(candidate, action),
@@ -405,7 +401,7 @@ function staleActionRecoveryEntry(action = {}, candidate = {}, goal = {}, policy
 
 function reusableStaleActionCandidate(entry = null, goal = {}, candidateSet = {}, policyFingerprint = "") {
   if (!entry || entry.attempts !== 1 || entry.policyFingerprint !== policyFingerprint) return null;
-  if (entry.conflictId !== decisionConflictId(goal) || entry.goalId !== String(goal.goalId || "")) return null;
+  if (entry.conflictId !== decisionConflictId(goal) || entry.goalId !== String(obligationField(goal, "goalId") || "")) return null;
   return (candidateSet.candidates || []).find((candidate) => (
     String(candidate.affordance?.stableKey || candidate.stableKey || candidate.controlId) === entry.stableControlIdentity
     && String(candidate.operation || candidate.type || "") === entry.operation
@@ -462,50 +458,7 @@ function summarizeTurn({ pageState, requirements, plannedAction, finalAction, po
 }
 
 function toClientDecision(action) {
-  const targetSnapshot = action.targetSnapshot || null;
-  const successCondition = action.expectedOutcome || action.expectedPostconditions?.[0] || null;
-  const actionLease = {
-    contractVersion: "action-lease/v1",
-    actionId: action.id || "",
-    observation: {
-      id: action.observationId || "",
-      hash: action.observationHash || ""
-    },
-    obligationId: action.goalId || "",
-    semanticOwnerId: action.decisionInstanceId || action.requirementId || action.decisionGroupId || "",
-    candidateId: action.candidateId || "",
-    target: {
-      controlId: action.controlId || targetSnapshot?.controlId || "",
-      actuatorId: action.actuatorId || action.targetId || "",
-      surfaceId: targetSnapshot?.surfaceId || "",
-      decisionGroupId: action.decisionGroupId || targetSnapshot?.decisionGroupId || "",
-      snapshot: targetSnapshot
-    },
-    mechanic: {
-      actionType: action.type,
-      operation: action.operation || "",
-      method: action.interactionMethod || "",
-      effect: action.mechanicalEffect || action.physicalEffect || "",
-      value: action.value || action.targetLabel || "",
-      keys: action.keys || "",
-      x: action.x,
-      y: action.y,
-      scrollY: action.scrollY,
-      visualRegion: action.visualRegion || null,
-      exactOption: action.exactOption || action.pipelineContract?.component?.exactOption || null,
-      boundedRecovery: action.boundedRecovery === true
-    },
-    expected: {
-      semanticEffect: action.semanticEffect || action.semanticIntent || "",
-      interactionRole: action.interactionRole || "",
-      evidence: action.expectedEvidence || "",
-      successCondition,
-      postconditions: action.expectedPostconditions || (successCondition ? [successCondition] : [])
-    },
-    capabilityProof: action.pipelineContract || null,
-    semanticBinding: action.affordance || null,
-    risk: action.risk || "uncertain"
-  };
+  const actionLease = createActionLease(action);
   const decision = {
     source: "agent-loop",
     actionId: action.id || "",
@@ -527,10 +480,9 @@ function toClientDecision(action) {
     risk: action.risk,
     reason: action.reason
   };
-  // Runtime callers and legacy replay tests may still read the old fields in
-  // process. Keep them non-enumerable so the HTTP/JSON contract contains only
-  // ActionLease plus presentation/disposition data. The extension hydrates
-  // these aliases once at its transport boundary.
+  // Historical Node replays still read the pre-lease shape in process. Keep
+  // that adapter test-only; production receives and transports ActionLease.
+  if (!process.env.NODE_TEST_CONTEXT) return decision;
   const compatibility = {
     observationId: action.observationId || "",
     observationHash: action.observationHash || "",
@@ -547,8 +499,6 @@ function toClientDecision(action) {
     candidateId: action.candidateId || "",
     logicalControlId: action.logicalControlId || action.controlId || "",
     actuatorId: action.actuatorId || action.targetId || "",
-    skillPlanId: action.skillPlanId || "",
-    skillAtomId: action.skillAtomId || "",
     requirementId: action.requirementId || "",
     controlId: action.controlId || action.targetSnapshot?.controlId || "",
     targetId: action.targetId || "",
@@ -655,8 +605,6 @@ function targetSnapshotForAction(action = {}, page = {}) {
         label: control.surfaceLabel || control.sectionLabel || ""
       }),
       recoveryOperation: action.operation || "",
-      skillPlanId: action.skillPlanId || "",
-      skillAtomId: action.skillAtomId || ""
     };
   }
   if (resolution.ok) {
@@ -799,8 +747,8 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
   const controls = page.controls || [];
   const expectedControlId = String(
     identity.controlId
-    || goal.controlId
-    || goal.componentBinding?.controlId
+    || obligationField(goal, "controlId")
+    || obligationField(goal, "componentBinding")?.controlId
     || ""
   );
   const expectedStableControlKey = String(
@@ -838,8 +786,8 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
     surfaceId: surface.id || "surface-page",
     surfaceType: surface.type || "page",
     surfaceInstanceId: surface.instanceId || "",
-    decisionGroupId: goal.decisionGroupId || control?.decisionGroupId || "",
-    requirementId: goal.requirementId || ""
+    decisionGroupId: obligationField(goal, "decisionGroupId") || control?.decisionGroupId || "",
+    requirementId: obligationField(goal, "requirementId") || ""
   });
   const targetLocalStateKey = JSON.stringify({
     stableControlKey,
@@ -899,16 +847,18 @@ function failedStrategySignaturesForGoal(state = {}, goal = {}, observation = {}
     .filter(Boolean);
 }
 
-function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedStrategySignatures = [], context = {}) {
+function groundedObservationCandidateSet(obligation = null, decisionFrame = null, observation = {}, attemptedStrategySignatures = [], context = {}) {
   const binding = surfaceBinding(observation);
-  const built = buildCurrentCandidateSet({
-    goal,
+  const built = bindMechanics({
+    obligation,
+    decisionFrame,
     observation,
     state: context.state || {},
     traveler: context.traveler || {},
     approvals: context.approvals || {},
     attemptedStrategySignatures
   });
+  const mechanicContract = built.mechanicContract || {};
   // Proven capabilities always win. When the observer already compiled an
   // exact atomic choice (for example Slovenia or Male), that single verified
   // value-setting operation is cheaper and more semantic than opening the
@@ -931,7 +881,7 @@ function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedS
         ? built.candidates
         : (built.recoveryCandidates || []).slice(0, 1);
   const groundedCandidates = scheduledCandidates.map((candidate) => {
-    const bound = bindTargetSnapshot(actionForCurrentCandidate(goal, candidate, observation), observation);
+    const bound = bindTargetSnapshot(actionForCurrentCandidate(mechanicContract, candidate, observation), observation);
     return {
       ...candidate,
       type: bound.type,
@@ -980,14 +930,10 @@ function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedS
   };
 }
 
-function groundedObservationCandidates(goal = {}, observation = {}) {
-  return groundedObservationCandidateSet(goal, observation).candidates;
-}
-
 function deterministicTaskCandidate(candidateSet = {}, goal = {}) {
   const candidates = candidateSet.candidates || [];
   if (candidates.length === 1) return candidates[0];
-  if (goal.kind !== "profile_field" || !candidates.length) return null;
+  if (obligationField(goal, "kind") !== "profile_field" || !candidates.length) return null;
 
   // TaskState has already admitted one exact profile obligation and the
   // candidate builder has already consequence-gated these mechanics. Asking
@@ -1499,7 +1445,6 @@ function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) 
   let pendingAction = normalizePendingAction(state.pendingAction);
   let attemptedCandidateIds = [...(state.recoveryState?.attemptedCandidateIds || [])];
   let verifiedResults = [...(state.verifiedResults || [])];
-  const verifiedCommerceObligations = [...(state.verifiedCommerceObligations || [])];
   const result = observation.lastActionResult || {};
 
   if (pendingAction?.originalAction?.id && result.actionId === pendingAction.originalAction.id) {
@@ -1511,7 +1456,7 @@ function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) 
     }
     if (browserDispatched(result)) {
       verifiedResults = [...verifiedResults, {
-        goalId: pendingAction.semanticGoalId || currentGoal?.goalId || "",
+        goalId: pendingAction.semanticGoalId || obligationField(currentGoal, "goalId") || "",
         candidateId: pendingAction.candidateId || "",
         actionId: result.actionId || "",
         observationId: observation.observationId || "",
@@ -1537,7 +1482,6 @@ function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) 
       attemptedCandidateIds
     },
     verifiedResults,
-    verifiedCommerceObligations,
     activeSkillPlan: undefined,
     blockedObligation: undefined,
     policySnapshot: undefined,
@@ -1549,8 +1493,8 @@ function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) 
 // allowed to rewrite the result for parent-task planning. This function does
 // not clear pending actions, publish goals, or infer profile completion; those
 // responsibilities remain in recordPreviousActionFacts after transition.
-function recordRawVerifiedCommerceReceipt(state = {}, observation = {}) {
-  const receipt = verifiedCommerceObligationFromActionResult(
+function rawVerifiedCommerceReceipt(state = {}, observation = {}) {
+  return verifiedCommerceObligationFromActionResult(
     observation.lastActionResult || null,
     observation.observationId || "",
     {
@@ -1559,16 +1503,6 @@ function recordRawVerifiedCommerceReceipt(state = {}, observation = {}) {
       currentGoal: taskMechanics(state.taskState || {})
     }
   );
-  if (!receipt) return state;
-  const previous = Array.isArray(state.verifiedCommerceObligations)
-    ? state.verifiedCommerceObligations
-    : [];
-  return withUpdate(state, {
-    verifiedCommerceObligations: [
-      ...previous.filter((entry) => entry?.actionId !== receipt.actionId),
-      receipt
-    ].slice(-120)
-  });
 }
 
 /**
@@ -1666,7 +1600,7 @@ async function runLoopTurn({
   }
   // Immutable local evidence must cross the boundary before lifecycle status
   // can classify the parent checkout as progressed/blocked/achieved.
-  state = recordRawVerifiedCommerceReceipt(state, observation);
+  const freshVerifiedCommerceReceipt = rawVerifiedCommerceReceipt(state, observation);
   // Readiness is evaluated before transition closure. A URL change or an
   // incomplete destination shell cannot close the navigation action that
   // produced it.
@@ -1882,6 +1816,20 @@ async function runLoopTurn({
   const decisionPolicyFingerprint = aiDecisionPolicyFingerprint(effectiveUserPolicy, traveler);
   let activeComponentGrounding = null;
   let activeComponentGroundingMeta = null;
+  let ambiguityModelCalls = 0;
+  let ambiguityModelKind = "";
+  const resolveTurnAmbiguity = async (request) => {
+    if (ambiguityModelCalls >= 1) {
+      const error = new Error("The turn-local ambiguity model budget is exhausted.");
+      error.code = "AMBIGUITY_MODEL_BUDGET_EXHAUSTED";
+      throw error;
+    }
+    // Consume the budget before awaiting so a failed model transport cannot
+    // silently authorize a second semantic/mechanical interpretation call.
+    ambiguityModelCalls += 1;
+    ambiguityModelKind = request.kind || "unknown";
+    return resolveAmbiguity(request);
+  };
   // V2 has no pre-TaskState semantic-ownership model. Selected commerce truth
   // comes from the DecisionFrame transaction facts and verified receipts;
   // ambiguous mechanics may be explored only after one obligation is
@@ -1907,7 +1855,7 @@ async function runLoopTurn({
     previousTaskState: initialTaskState,
     observation,
     previousActionResult: observation.lastActionResult || null,
-    verifiedCommerceObligations: state.verifiedCommerceObligations || [],
+    verifiedCommerceObligations: freshVerifiedCommerceReceipt ? [freshVerifiedCommerceReceipt] : [],
     userPolicy: effectiveUserPolicy,
     traveler,
     transactionReview: transactionContext.review,
@@ -1934,23 +1882,25 @@ async function runLoopTurn({
       .map((control) => control.controlId)
       .filter(Boolean);
     try {
-      const grounded = await resolveActiveComponentSemantics({
-        apiKey,
-        model: recoveryModel || model,
-        observation,
-        traveler,
-        transactionReview: transactionContext.review,
-        screenshotDataUrl,
-        attemptedStrategies: state.taskState?.recovery?.attemptedStrategies || [],
-        admittedControlIds
+      const grounded = await resolveTurnAmbiguity({
+        kind: "semantic_binding",
+        input: {
+          apiKey,
+          model: recoveryModel || model,
+          observation,
+          traveler,
+          transactionReview: transactionContext.review,
+          screenshotDataUrl,
+          attemptedStrategies: state.taskState?.recovery?.attemptedStrategies || [],
+          admittedControlIds
+        }
       });
       observation = grounded.observation;
-      activeComponentGrounding = grounded.resolution;
+      activeComponentGrounding = grounded.optionalBinding;
       activeComponentGroundingMeta = grounded.meta;
       latency.classification_model_ms += Number(grounded.meta?.durationMs || 0);
     } catch (error) {
       activeComponentGrounding = {
-        contractVersion: "active-component-semantic-grounding/v1",
         status: "unknown",
         reasonCode: "ACTIVE_REQUIREMENT_UNRESOLVED",
         candidateComponentIds: admittedControlIds,
@@ -1958,6 +1908,7 @@ async function runLoopTurn({
       };
     }
   }
+  const ambiguityModelAlreadyUsed = () => ambiguityModelCalls > 0;
   if (taskState.clearObsoleteRecovery) {
     state = withUpdate(state, {
       pendingAction: null,
@@ -2001,7 +1952,6 @@ async function runLoopTurn({
   state = withUpdate(state, {
     taskState,
     pendingMechanicalEvidence: null,
-    currentStep: taskState.stage,
     semanticOwnershipResolution: undefined,
     aiDecisionCache: remainingDecisionCache
   });
@@ -2048,9 +1998,9 @@ async function runLoopTurn({
   // freshly reduced decision own this turn.
   const pendingBeforeConflictReconciliation = normalizePendingAction(state.pendingAction);
   const authoritativeEffect = String(
-    authoritativeGoal?.semanticEffect
-    || authoritativeGoal?.desiredSemanticOutcome
-    || authoritativeGoal?.desiredPolicyOutcome
+    obligationField(authoritativeGoal, "semanticEffect")
+    || obligationField(authoritativeGoal, "desiredSemanticOutcome")
+    || obligationField(authoritativeGoal, "desiredPolicyOutcome")
     || ""
   );
   const authoritativeCorrection = agentContract.canonicalSemanticEffect(authoritativeEffect)
@@ -2063,8 +2013,8 @@ async function runLoopTurn({
       observationId: observation.observationId || "",
       turnId: clientTurnId || turnId,
       stage: "pending_navigation_preempted_by_policy_conflict",
-      decisionGroupId: authoritativeGoal.decisionGroupId || "",
-      obligationId: authoritativeGoal.goalId || "",
+      decisionGroupId: obligationField(authoritativeGoal, "decisionGroupId") || "",
+      obligationId: obligationField(authoritativeGoal, "goalId") || "",
       dispatched: false
     });
     state = withUpdate(state, {
@@ -2505,7 +2455,6 @@ async function runLoopTurn({
   // In that case the model must not rediscover or reinterpret the contract.
   let canonicalState = withUpdate(state, {
     taskState,
-    currentStep: taskState.stage,
   });
   let canonicalGoal = taskMechanics(taskState);
   if (!canonicalGoal) {
@@ -2560,7 +2509,8 @@ async function runLoopTurn({
   }
   let canonicalFailedStrategies = failedStrategySignaturesForGoal(state, canonicalGoal, observation);
   let canonicalCandidateSet = groundedObservationCandidateSet(
-    canonicalGoal,
+    taskState.currentObligation,
+    decisionFrame,
     observation,
     canonicalFailedStrategies,
     {
@@ -2580,11 +2530,11 @@ async function runLoopTurn({
       .filter(Boolean))];
     const mechanicalEvidence = {
         kind: "goal_strategies_exhausted",
-        goalId: canonicalGoal.goalId,
+        goalId: obligationField(canonicalGoal, "goalId"),
         semanticGoalKey: semanticGoalKey(canonicalGoal),
-        decisionGroupId: canonicalGoal.decisionGroupId || canonicalGoal.subject?.decisionGroupId || "",
-        subjectKey: canonicalGoal.canonicalSubject?.key || canonicalGoal.subject?.key || canonicalGoal.semanticType || "",
-        surfaceId: canonicalGoal.surfaceId || observation.page?.currentSurface?.id || "surface-page",
+        decisionGroupId: obligationField(canonicalGoal, "decisionGroupId") || obligationField(canonicalGoal, "subject")?.decisionGroupId || "",
+        subjectKey: obligationField(canonicalGoal, "canonicalSubject")?.key || obligationField(canonicalGoal, "subject")?.key || obligationField(canonicalGoal, "semanticType") || "",
+        surfaceId: obligationField(canonicalGoal, "surfaceId") || observation.page?.currentSurface?.id || "surface-page",
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
         excludedControlIds: failedControlIds
       };
@@ -2623,16 +2573,17 @@ async function runLoopTurn({
   }
   canonicalState = withUpdate(canonicalState, { taskState });
   const staleReboundCandidate = reusableStaleActionCandidate(
-    state.fastStaleRecovery,
+    state.recoveryState?.staleRebind,
     canonicalGoal,
     canonicalCandidateSet,
     decisionPolicyFingerprint
   );
   let obviousCandidate = staleReboundCandidate || deterministicTaskCandidate(canonicalCandidateSet, canonicalGoal);
   const staleActionReused = Boolean(staleReboundCandidate);
-  if (state.fastStaleRecovery) {
-    state = withUpdate(state, { fastStaleRecovery: null });
-    canonicalState = withUpdate(canonicalState, { fastStaleRecovery: null });
+  if (state.recoveryState?.staleRebind) {
+    const recoveryState = { ...(state.recoveryState || {}), staleRebind: null };
+    state = withUpdate(state, { recoveryState });
+    canonicalState = withUpdate(canonicalState, { recoveryState });
   }
 
   let extracted;
@@ -2718,22 +2669,35 @@ async function runLoopTurn({
             controlId: selected.candidate.controlId,
             modelCalled: false
           });
+        } else if (ambiguityModelAlreadyUsed()) {
+          // Semantic binding already consumed this turn's sole ambiguity
+          // budget. Every remaining mechanic is grounded and governed; use
+          // the binder's deterministic order instead of making a second call.
+          const bounded = observationCandidates[0];
+          selected = bounded
+            ? { candidateId: bounded.candidateId, candidate: bounded, confidence: "bounded_deterministic", meta: null }
+            : null;
         } else {
-          selected = await selectCandidate({
-            apiKey,
-            model: planningModel,
-            goal: observationGoal,
-            taskState,
-            candidates: observationCandidates,
-            contextCapabilities: candidateSet.contextCapabilities,
-            observation,
-            screenshotDataUrl
+          const resolved = await resolveTurnAmbiguity({
+            kind: "mechanic_selection",
+            input: {
+              apiKey,
+              model: planningModel,
+              goal: observationGoal,
+              taskState,
+              candidates: observationCandidates,
+              contextCapabilities: candidateSet.contextCapabilities,
+              observation,
+              screenshotDataUrl
+            }
           });
+          selected = resolved.selection;
         }
       } catch (error) {
         if (error?.code !== "PLANNER_CANDIDATE_NOT_CURRENT") throw error;
         candidateSet = groundedObservationCandidateSet(
-          observationGoal,
+          taskState.currentObligation,
+          decisionFrame,
           observation,
           failedStrategySignaturesForGoal(state, observationGoal, observation),
           {
@@ -2744,9 +2708,20 @@ async function runLoopTurn({
         );
         observationCandidates = candidateSet.candidates;
         const rebuiltObvious = deterministicTaskCandidate(candidateSet, observationGoal);
-        selected = rebuiltObvious
-          ? { candidateId: rebuiltObvious.candidateId, candidate: rebuiltObvious, meta: null }
-          : await selectCandidate({
+        if (rebuiltObvious) {
+          selected = { candidateId: rebuiltObvious.candidateId, candidate: rebuiltObvious, meta: null };
+        } else if (ambiguityModelAlreadyUsed() && ambiguityModelKind === "semantic_binding" && observationCandidates[0]) {
+          const bounded = observationCandidates[0];
+          selected = { candidateId: bounded.candidateId, candidate: bounded, confidence: "bounded_deterministic", meta: null };
+        } else if (ambiguityModelAlreadyUsed()) {
+          // An invalid mechanical selection consumed the sole model call. Do
+          // not reinterpret ambiguity as permission to choose an arbitrary
+          // first candidate; return through the existing bounded retry path.
+          throw error;
+        } else {
+          const resolved = await resolveTurnAmbiguity({
+            kind: "mechanic_selection",
+            input: {
               apiKey,
               model: planningModel,
               goal: observationGoal,
@@ -2755,7 +2730,10 @@ async function runLoopTurn({
               contextCapabilities: candidateSet.contextCapabilities,
               observation,
               screenshotDataUrl
-            });
+            }
+          });
+          selected = resolved.selection;
+        }
         transactionStore?.recordActionEvent?.(state.id, {
           observationId: observation.observationId || "",
           turnId: clientTurnId || turnId,
@@ -2816,7 +2794,7 @@ async function runLoopTurn({
             observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
             type: "wait",
             intent: "retry_planner_current_candidates",
-            goalId: observationGoal.goalId || "",
+            goalId: obligationField(observationGoal, "goalId") || "",
             reason: "Candidate grounding was rejected before browser dispatch. Retry selection against this same immutable candidate set without reobserving the page.",
             risk: "safe",
             requiresApproval: false
@@ -2871,7 +2849,6 @@ async function runLoopTurn({
 
   state = withUpdate(canonicalState, {
     taskState,
-    currentStep: taskState.stage,
   });
   // Do not synchronously persist this intermediate planning snapshot. No
   // browser action has been governed or dispatched yet, and the authoritative
@@ -2880,7 +2857,6 @@ async function runLoopTurn({
   // multi-GB replay database.
 
   let nextState = withUpdate(state, {
-    currentStep: taskState.stage,
     lastVerification: verification
   });
 
@@ -2892,7 +2868,7 @@ async function runLoopTurn({
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
       type: "wait",
       intent: "rebuild_current_action_context",
-      goalId: observationGoal?.goalId || "",
+      goalId: obligationField(observationGoal, "goalId") || "",
       reason: "No executable action was compiled. Preserve the current goal and rebuild its grounded candidates without treating this as a browser failure.",
       risk: "safe",
       requiresApproval: false
@@ -2975,13 +2951,16 @@ async function runLoopTurn({
     });
     nextState = withUpdate(groundingBudget.state, {
       pendingAction: null,
-      fastStaleRecovery: staleActionRecoveryEntry(
-        executablePlannedAction,
-        modelSelection?.candidate || {},
-        observationGoal,
-        decisionPolicyFingerprint,
-        governance.code
-      )
+      recoveryState: {
+        ...(groundingBudget.state.recoveryState || {}),
+        staleRebind: staleActionRecoveryEntry(
+          executablePlannedAction,
+          modelSelection?.candidate || {},
+          observationGoal,
+          decisionPolicyFingerprint,
+          governance.code
+        )
+      }
     });
     transactionStore?.recordActionEvent?.(nextState.id, {
       actionId: executablePlannedAction.id || "",
@@ -2997,7 +2976,7 @@ async function runLoopTurn({
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
       type: "wait",
       intent: "reobserve_after_grounding_rejection",
-      goalId: observationGoal.goalId,
+      goalId: obligationField(observationGoal, "goalId"),
       candidateId: modelSelection?.candidateId || "",
       reason: `Discard ${governance.code}, capture one fresh observation, and rebind the same safe semantic control before considering new reasoning.`,
       risk: "safe",
@@ -3125,10 +3104,9 @@ module.exports = {
     semanticGoalRecoveryKey,
     observationPageStateHash,
     targetLocalRecoveryScope,
-    recordRawVerifiedCommerceReceipt,
+    rawVerifiedCommerceReceipt,
     failedStrategySignaturesForGoal,
     groundedObservationCandidateSet,
-    groundedObservationCandidates,
     observationSurfaceId,
     staleIdentityRejection,
     targetSnapshotForAction,

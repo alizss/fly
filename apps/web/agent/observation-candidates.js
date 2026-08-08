@@ -4,6 +4,8 @@ const { controlBelongsToCurrentSurface, currentSurface, surfaceBinding } = requi
 const { deriveActionSemantics } = require("./action-semantics");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
+const { obligationField } = require("./current-obligation");
+
 function slug(value = "") {
   return String(value || "")
     .toLowerCase()
@@ -25,13 +27,13 @@ function normalizedRisk(risk = "", operation = "", structuredPrice = null) {
 }
 
 function adaptiveMechanicalQuery(goal = {}, control = {}) {
-  const envelope = goal.adaptiveEnvelope || {};
+  const envelope = obligationField(goal, "adaptiveEnvelope") || {};
   const tried = new Set((envelope.queryHistory || []).map((value) => String(value || "").trim()).filter(Boolean));
-  const desired = String(goal.desiredValue ?? goal.canonicalValue ?? "").trim();
+  const desired = String(obligationField(goal, "desiredValue") ?? obligationField(goal, "canonicalValue") ?? "").trim();
   const digits = desired.replace(/\D/g, "");
   const hypotheses = envelope.queryHypotheses?.length
     ? envelope.queryHypotheses
-    : [digits && digits !== desired ? digits : "", ...(goal.choiceTerms || []), desired];
+    : [digits && digits !== desired ? digits : "", ...(obligationField(goal, "choiceTerms") || []), desired];
   const current = String(
     control.state?.normalizedValue
     || control.currentValue
@@ -39,10 +41,6 @@ function adaptiveMechanicalQuery(goal = {}, control = {}) {
   ).trim();
   return [...new Set(hypotheses.map((value) => String(value || "").trim()).filter(Boolean))]
     .find((value) => !tried.has(value) && value !== current) || "";
-}
-
-function semanticGoalForGroup(group = {}) {
-  return `resolve ${group.sectionLabel || group.sectionType || group.requirementId || "current decision"}`;
 }
 
 function requiredDecisionGroupsForCurrentSurface(page = {}) {
@@ -69,58 +67,6 @@ function allRequiredDecisionGroupsResolved(page = {}, resolvedDecisionGroupIds =
   return unresolvedRequiredDecisionGroups(page, resolvedDecisionGroupIds).length === 0;
 }
 
-function deriveObservationGoal(observation = {}, requirements = []) {
-  const page = observation.page || {};
-  const groups = page.decisionGroups || [];
-  const surface = currentSurface(page);
-  const foreground = surface.type !== "page" ? surface : null;
-  const unresolvedGroups = groups.filter((group) => !["satisfied", "waived", "waived_by_policy"].includes(group.status));
-  const group = (foreground
-    ? unresolvedGroups.find((item) => item.surfaceId === foreground.id || item.decisionGroupId === foreground.decisionGroupId)
-    : null)
-    || unresolvedGroups.find((item) => item.required)
-    || unresolvedGroups[0]
-    || null;
-  const observationId = observation.observationId || "observation";
-  if (group) {
-    const semanticGoal = semanticGoalForGroup(group);
-    return {
-      goalId: `${observationId}:goal:${slug(group.decisionGroupId || semanticGoal)}`,
-      semanticGoal,
-      semanticType: group.sectionType || group.requirementId || "decision",
-      desiredValue: "satisfied",
-      decisionGroupId: group.decisionGroupId || "",
-      surfaceId: group.surfaceId || "",
-      requirementId: group.decisionGroupId || group.requirementId || "",
-      sectionId: group.sectionId || "",
-      sectionType: group.sectionType || "",
-      sectionLabel: group.sectionLabel || "",
-      observationId,
-      postcondition: {
-        type: "requirement_status",
-        requirementId: group.decisionGroupId || group.requirementId || "",
-        status: "satisfied"
-      }
-    };
-  }
-
-  const missing = (requirements || []).find((requirement) => requirement.required && !["satisfied", "waived_by_policy"].includes(requirement.status));
-  const paymentVisible = /payment/.test(`${page.step || ""} ${missing?.type || ""}`.toLowerCase());
-  return {
-    goalId: `${observationId}:goal:${paymentVisible ? "payment_review" : "continue"}`,
-    semanticGoal: paymentVisible ? "review before payment" : "continue checkout",
-    semanticType: paymentVisible ? "payment_review" : "navigation",
-    desiredValue: paymentVisible ? "final_review" : "next_stage",
-    decisionGroupId: "",
-    requirementId: missing?.id || "",
-    sectionId: "",
-    sectionType: "",
-    sectionLabel: "",
-    observationId,
-    postcondition: { type: paymentVisible ? "final_review" : "stage_exit_or_feedback" }
-  };
-}
-
 function operationActionType(operation = "") {
   if (["open", "choose", "activate"].includes(operation)) return "click";
   if (operation === "type") return "type";
@@ -144,7 +90,7 @@ function intentFor(control = {}, operation = "", goal = {}) {
   // inherited from the surrounding section. This keeps a plain Next/Continue
   // button navigational without treating arbitrary nearby prose as an action.
   if (/\b(?:continue|next|proceed|advance)\b|navigation|safe_continue/.test(meaning)) return "navigate_stage";
-  if (/navigation/.test(String(goal.semanticType || "").toLowerCase())) return "navigate_stage";
+  if (/navigation/.test(String(obligationField(goal, "semanticType") || "").toLowerCase())) return "navigate_stage";
   if (control.surfaceType && control.surfaceType !== "page") return "resolve_active_surface";
   return "choose_option";
 }
@@ -231,58 +177,64 @@ function controlsForGoal(page = {}, goal = {}) {
     return !isGlobalSiteChromeControl(control)
       && optionContractIsCoherent(control)
       && (
-        goal.kind === "adaptive_interaction"
+        obligationField(goal, "kind") === "adaptive_interaction"
         || !(/selection[_ -]?cta/.test(meaning) && !control.choiceContract)
       );
   });
-  if (goal.semanticType === "completed_choice_surface") {
-    const exactIds = new Set((goal.actionableControlIds || []).filter(Boolean));
+  if (obligationField(goal, "semanticType") === "completed_choice_surface") {
+    const exactIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
     return controls.filter((control) => exactIds.has(control.controlId));
   }
-  if (goal.kind === "adaptive_interaction") {
-    const exactIds = new Set((goal.actionableControlIds || []).filter(Boolean));
+  if (obligationField(goal, "kind") === "adaptive_interaction") {
+    const exactIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
     return controls.filter((control) => exactIds.has(control.controlId));
   }
-  if (goal.semanticType === "surface_ambiguity" || goal.selectionMode === "ai_ambiguity") {
+  if (obligationField(goal, "semanticType") === "surface_ambiguity" || obligationField(goal, "selectionMode") === "ai_ambiguity") {
     // Selected values are current state, not executable alternatives. If the
     // selected outcome still needs confirmation, its child surface owns the
     // next action; if it is complete, TaskState publishes the exact surface
     // exit instead of offering the same option again.
     return controls.filter((control) => !controlIsCurrentlySelected(control));
   }
-  const policyAllowedIds = new Set((goal.policyAllowedControlIds || []).filter(Boolean));
-  const provenFreeIds = (goal.freeAlternativeControlIds || []).filter((controlId) => (
+  const policyAllowedIds = new Set((obligationField(goal, "policyAllowedControlIds") || []).filter(Boolean));
+  const provenFreeIds = (obligationField(goal, "freeAlternativeControlIds") || []).filter((controlId) => (
     !policyAllowedIds.size || policyAllowedIds.has(controlId)
   ));
   const provenSafeProgressIds = controls.filter((control) => (
     policyAllowedIds.has(control.controlId)
     && isObservedSafeProgressControl(control)
   )).map((control) => control.controlId);
-  const policyExactIds = agentContract.canonicalSemanticEffect(goal.desiredPolicyOutcome)
+  // A correction opener is an admitted intermediate mechanic for the same
+  // obligation. It need not itself be the eventual free option; opening its
+  // owned choice surface is how that option becomes observable.
+  const correctionIds = (obligationField(goal, "semanticCorrectionControlIds") || []).filter((controlId) => (
+    !policyAllowedIds.size || policyAllowedIds.has(controlId)
+  ));
+  const policyExactIds = agentContract.canonicalSemanticEffect(obligationField(goal, "desiredPolicyOutcome"))
     === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
-    ? [...new Set([...provenFreeIds, ...provenSafeProgressIds])]
-    : goal.policyChoiceBounded === true
-      ? goal.policyAllowedControlIds
-      : goal.eligibleAlternativeControlIds;
+    ? [...new Set([...provenFreeIds, ...provenSafeProgressIds, ...correctionIds])]
+    : obligationField(goal, "policyChoiceBounded") === true
+      ? obligationField(goal, "policyAllowedControlIds")
+      : obligationField(goal, "eligibleAlternativeControlIds");
   const exactEligibleIds = new Set((policyExactIds || []).filter(Boolean));
-  if (goal.decisionGroupId && goal.policyChoiceBounded === true && exactEligibleIds.size === 0) {
+  if (obligationField(goal, "decisionGroupId") && obligationField(goal, "policyChoiceBounded") === true && exactEligibleIds.size === 0) {
     return [];
   }
-  if (goal.decisionGroupId && exactEligibleIds.size) {
+  if (obligationField(goal, "decisionGroupId") && exactEligibleIds.size) {
     return controls.filter((control) => exactEligibleIds.has(control.controlId));
   }
-  const group = (page.decisionGroups || []).find((item) => item.decisionGroupId === goal.decisionGroupId) || null;
+  const group = (page.decisionGroups || []).find((item) => item.decisionGroupId === obligationField(goal, "decisionGroupId")) || null;
   if (!group) {
-    const directlyOwned = goal.decisionGroupId
-      ? controls.filter((control) => control.decisionGroupId === goal.decisionGroupId)
+    const directlyOwned = obligationField(goal, "decisionGroupId")
+      ? controls.filter((control) => control.decisionGroupId === obligationField(goal, "decisionGroupId"))
       : [];
     if (directlyOwned.length) return directlyOwned;
-    const authoritativeNavigationIds = new Set((goal.actionableControlIds || []).filter(Boolean));
-    if (goal.semanticType === "navigation" && authoritativeNavigationIds.size) {
+    const authoritativeNavigationIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
+    if (obligationField(goal, "semanticType") === "navigation" && authoritativeNavigationIds.size) {
       return controls.filter((control) => authoritativeNavigationIds.has(control.controlId));
     }
-    const completedDecisionGroupId = String(goal.completedDecisionGroupId || "");
-    if (goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [completedDecisionGroupId])) return [];
+    const completedDecisionGroupId = String(obligationField(goal, "completedDecisionGroupId") || "");
+    if (obligationField(goal, "semanticType") === "navigation" && !allRequiredDecisionGroupsResolved(page, [completedDecisionGroupId])) return [];
     return controls.filter((control) => {
       const text = `${control.semantic || ""} ${control.risk || ""} ${control.meaning || ""} ${control.label || ""}`.toLowerCase();
       if (/selection[_ -]?cta/.test(text) && !control.choiceContract) return false;
@@ -319,8 +271,8 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   const foreground = surface.type !== "page" ? surface : null;
   const ambiguousControlIds = conflictedControlIds(page);
   const parentSurfaceControlIds = new Set(
-    goal.semanticType === "completed_choice_surface"
-      ? (goal.actionableControlIds || []).filter(Boolean)
+    obligationField(goal, "semanticType") === "completed_choice_surface"
+      ? (obligationField(goal, "actionableControlIds") || []).filter(Boolean)
       : []
   );
   const controls = controlsForGoal(page, goal).filter((control) => (
@@ -331,10 +283,10 @@ function rawObservationCandidates(observation = {}, goal = {}) {
     )
   ));
   const raw = [];
-  const freeAlternativeIds = new Set((goal.freeAlternativeControlIds || []).filter(Boolean));
-  const paidAlternativeIds = new Set((goal.paidAlternativeControlIds || []).filter(Boolean));
-  const semanticCorrectionIds = new Set((goal.semanticCorrectionControlIds || []).filter(Boolean));
-  const adaptiveSurface = goal.kind === "adaptive_surface";
+  const freeAlternativeIds = new Set((obligationField(goal, "freeAlternativeControlIds") || []).filter(Boolean));
+  const paidAlternativeIds = new Set((obligationField(goal, "paidAlternativeControlIds") || []).filter(Boolean));
+  const semanticCorrectionIds = new Set((obligationField(goal, "semanticCorrectionControlIds") || []).filter(Boolean));
+  const adaptiveSurface = obligationField(goal, "kind") === "adaptive_surface";
 
   for (const control of controls) {
     const usable = Object.entries(control.operations || {}).flatMap(([operation, rawCapability]) => {
@@ -359,7 +311,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         ? adaptiveMechanicalQuery(goal, control)
         : "";
       if (adaptiveSurface && operation === "type" && !mechanicalQuery) continue;
-      const completesChoiceSurface = goal.semanticType === "completed_choice_surface"
+      const completesChoiceSurface = obligationField(goal, "semanticType") === "completed_choice_surface"
         && parentSurfaceControlIds.has(control.controlId);
       if (completesChoiceSurface && !["activate", "open"].includes(operation)) continue;
       const actionability = strategy.proof || capability.actionability || {};
@@ -369,23 +321,23 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       if (!targetId) continue;
       const interpretedFree = freeAlternativeIds.has(control.controlId)
         && (
-          agentContract.canonicalSemanticEffect(goal.desiredPolicyOutcome)
+          agentContract.canonicalSemanticEffect(obligationField(goal, "desiredPolicyOutcome"))
             === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
-          || goal.policyChoiceBounded === true
+          || obligationField(goal, "policyChoiceBounded") === true
         );
       const interpretedPaid = paidAlternativeIds.has(control.controlId);
-      const paidAuthorization = interpretedPaid && goal.authorization?.authorizationId
-        ? goal.authorization
+      const paidAuthorization = interpretedPaid && obligationField(goal, "authorization")?.authorizationId
+        ? obligationField(goal, "authorization")
         : null;
       const semanticCorrection = semanticCorrectionIds.has(control.controlId)
         ? ((page.semanticOwnershipLinks || []).find((link) => (
             link.status === "resolved"
-            && link.sourceDecisionGroupId === goal.decisionGroupId
+            && link.sourceDecisionGroupId === obligationField(goal, "decisionGroupId")
             && link.correctionControlId === control.controlId
           )) || (opensChoiceControlFor(control, operation) ? {
             linkId: "",
-            sourceDecisionGroupId: goal.decisionGroupId,
-            correctionDecisionGroupId: control.decisionGroupId || goal.decisionGroupId,
+            sourceDecisionGroupId: obligationField(goal, "decisionGroupId"),
+            correctionDecisionGroupId: control.decisionGroupId || obligationField(goal, "decisionGroupId"),
             correctionControlId: control.controlId,
             intendedOutcome: "open_correction_surface"
           } : null))
@@ -412,7 +364,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
             ? (
                 control.physicalEffect === "advance_checkout_stage"
                 || !foreground
-                || goal.semanticType === "payment_review"
+                || obligationField(goal, "semanticType") === "payment_review"
                   ? "advance_checkout_stage"
                   : "advance_surface"
               )
@@ -445,7 +397,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
           : deriveActionSemantics({ control, operation, type: actionType, goal });
       raw.push({
         candidateId: "",
-        semanticGoal: goal.semanticGoal,
+        semanticGoal: obligationField(goal, "semanticGoal"),
         semantic: completesChoiceSurface
           ? "dismiss_completed_choice_surface"
           : opensChoiceControl ? "open_choice_control" : (interpretedFree ? "select_free_option" : (control.semantic || operation)),
@@ -454,7 +406,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
           ? "completed_decision_surface_dismissed"
           : semanticCorrection ? "proposed_policy_correction" : (interpretedFree ? agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION : (interpretedPaid ? agentContract.SEMANTIC_EFFECT.SELECT_PAID_OPTION : "selected_policy_allowed_option")),
         intendedOutcome: semanticCorrection?.intendedOutcome || (
-          interpretedFree ? (goal.desiredSemanticOutcome || "") : ""
+          interpretedFree ? (obligationField(goal, "desiredSemanticOutcome") || "") : ""
         ),
         semanticOwnershipLinkId: semanticCorrection?.linkId || "",
         policyCorrectionForDecisionGroupId: semanticCorrection?.sourceDecisionGroupId || "",
@@ -473,35 +425,35 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         actionability,
         ...semantics,
         controlId: control.controlId,
-        decisionGroupId: goal.decisionGroupId || control.decisionGroupId || "",
+        decisionGroupId: obligationField(goal, "decisionGroupId") || control.decisionGroupId || "",
         targetId,
         targetLabel: control.label || control.accessibleName || control.semantic || operation,
-        requirementId: goal.requirementId || "",
+        requirementId: obligationField(goal, "requirementId") || "",
         intent: candidateIntent,
         expectedOutcome: adaptiveSurface && operation === "type" ? {
           type: "semantic_progress",
           controlId: control.controlId,
-          semanticType: goal.semanticType || "",
+          semanticType: obligationField(goal, "semanticType") || "",
           previousValue: String(control.state?.normalizedValue || control.currentValue || ""),
           expectedNormalizedValue: mechanicalQuery,
-          canonicalTarget: String(goal.desiredValue ?? goal.canonicalValue ?? ""),
+          canonicalTarget: String(obligationField(goal, "desiredValue") ?? obligationField(goal, "canonicalValue") ?? ""),
           surfaceId: surface.id || "",
           mustNotIncreasePrice: true
         } : completesChoiceSurface ? {
           type: "active_surface_dismissed",
           controlId: control.controlId,
-          decisionGroupId: goal.parentDecisionGroupId || goal.decisionGroupId || "",
+          decisionGroupId: obligationField(goal, "parentDecisionGroupId") || obligationField(goal, "decisionGroupId") || "",
           previousSurfaceId: surface.id || "",
           surfaceId: surface.id || "",
-          parentDecisionGroupId: goal.parentDecisionGroupId || goal.decisionGroupId || "",
-          parentExpectedSelectedControlId: goal.parentSelectedControlId || "",
-          decisionEpisodeId: goal.decisionEpisodeId || "",
+          parentDecisionGroupId: obligationField(goal, "parentDecisionGroupId") || obligationField(goal, "decisionGroupId") || "",
+          parentExpectedSelectedControlId: obligationField(goal, "parentSelectedControlId") || "",
+          decisionEpisodeId: obligationField(goal, "decisionEpisodeId") || "",
           mustNotIncreasePrice: true
         } : semanticCorrection ? {
           type: semanticCorrection.intendedOutcome === "open_correction_surface"
             ? "options_surface_appeared"
             : "policy_conflict_resolved",
-          decisionGroupId: goal.decisionGroupId,
+          decisionGroupId: obligationField(goal, "decisionGroupId"),
           controlId: control.controlId,
           semanticOwnershipLinkId: semanticCorrection.linkId,
           correctionDecisionGroupId: semanticCorrection.correctionDecisionGroupId || control.decisionGroupId || "",
@@ -509,11 +461,11 @@ function rawObservationCandidates(observation = {}, goal = {}) {
           beforePriceAmount: Number.isFinite(Number(page.price?.amount)) ? Number(page.price.amount) : null,
           beforePriceText: page.priceText || "",
           mustNotIncreasePrice: true
-        } : (goal.parentDecisionGroupId && interpretedFree ? {
+        } : (obligationField(goal, "parentDecisionGroupId") && interpretedFree ? {
           type: "exact_free_option_selected",
-          parentDecisionGroupId: goal.parentDecisionGroupId,
-          parentExpectedSelectedControlId: goal.parentExpectedSelectedControlId || "",
-          decisionEpisodeId: goal.decisionEpisodeId || "",
+          parentDecisionGroupId: obligationField(goal, "parentDecisionGroupId"),
+          parentExpectedSelectedControlId: obligationField(goal, "parentExpectedSelectedControlId") || "",
+          decisionEpisodeId: obligationField(goal, "decisionEpisodeId") || "",
           childSurfaceId: surface.id || "",
           requireChildSurfaceDismissed: true,
           mustNotIncreasePrice: true
@@ -524,10 +476,10 @@ function rawObservationCandidates(observation = {}, goal = {}) {
         value: adaptiveSurface && operation === "type"
           ? mechanicalQuery
           : adaptiveSurface && operation === "select"
-            ? String(goal.desiredValue ?? goal.canonicalValue ?? "")
+            ? String(obligationField(goal, "desiredValue") ?? obligationField(goal, "canonicalValue") ?? "")
           : "",
         canonicalTarget: adaptiveSurface
-          ? String(goal.desiredValue ?? goal.canonicalValue ?? "")
+          ? String(obligationField(goal, "desiredValue") ?? obligationField(goal, "canonicalValue") ?? "")
           : "",
         mechanicalHypothesis: mechanicalQuery,
         keys: strategy.keys || (operation === "keyboard" ? "ArrowDown" : ""),
@@ -538,12 +490,12 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   }
 
   if (!raw.length
-    && goal.semanticType !== "surface_ambiguity"
-    && !(goal.semanticType === "navigation" && !allRequiredDecisionGroupsResolved(page, [goal.completedDecisionGroupId]))) {
-    const paymentReview = goal.semanticType === "payment_review";
+    && obligationField(goal, "semanticType") !== "surface_ambiguity"
+    && !(obligationField(goal, "semanticType") === "navigation" && !allRequiredDecisionGroupsResolved(page, [obligationField(goal, "completedDecisionGroupId")]))) {
+    const paymentReview = obligationField(goal, "semanticType") === "payment_review";
     raw.push({
       candidateId: "",
-      semanticGoal: goal.semanticGoal,
+      semanticGoal: obligationField(goal, "semanticGoal"),
       semantic: paymentReview ? "final_review" : "ask_user",
       type: paymentReview ? "final_review" : "ask_user",
       operation: paymentReview ? "review" : "handoff",
@@ -551,10 +503,10 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       semanticEffect: "advance",
       expectedEvidence: "progress_changed",
       controlId: "",
-      decisionGroupId: goal.decisionGroupId || "",
+      decisionGroupId: obligationField(goal, "decisionGroupId") || "",
       targetId: "",
       targetLabel: "",
-      requirementId: goal.requirementId || "",
+      requirementId: obligationField(goal, "requirementId") || "",
       intent: paymentReview ? "final_review" : "ask_user",
       risk: paymentReview ? "payment" : "uncertain",
       requiresApproval: true,
@@ -583,7 +535,7 @@ function actionForObservationCandidate(goal = {}, candidate = {}, observation = 
     type: candidate.type,
     intent: candidate.intent,
     operation: candidate.operation,
-    goalId: goal.goalId,
+    goalId: obligationField(goal, "goalId"),
     candidateId: candidate.candidateId,
     controlId: candidate.controlId,
     decisionGroupId: candidate.decisionGroupId,
@@ -614,7 +566,6 @@ module.exports = {
   allRequiredDecisionGroupsResolved,
   actionForObservationCandidate,
   buildObservationCandidateSet,
-  deriveObservationGoal,
   requiredDecisionGroupsForCurrentSurface,
   unresolvedRequiredDecisionGroups,
   rawObservationCandidates

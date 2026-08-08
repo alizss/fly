@@ -10,14 +10,16 @@ const {
   candidatesForProfileGoal,
   actionForProfileCandidate
 } = require("../../apps/web/agent/skill-expander");
-const { runLoopTurn, toClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { runLoopTurn: runRawLoopTurn, toClientDecision: toRawClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { executableDecisionFromActionLease } = require("./action-lease-replay-adapter");
+const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const {
-  actionForObservationCandidate,
-  deriveObservationGoal
+  actionForObservationCandidate
 } = require("../../apps/web/agent/observation-candidates");
-const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
+const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { advanceActionLifecycle, pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
-const { sanitizedActionHistory } = require("../../apps/web/agent/model-context");
+const { sanitizedActionHistory } = require("./legacy-model-context-adapter");
 const { resolvePlannerSelection } = require("./legacy-planner-replay-adapter");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { reduceTaskState } = require("./task-state-replay-adapter");
@@ -33,6 +35,18 @@ const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
   return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
+}
+
+function toClientDecision(action = {}) {
+  return executableDecisionFromActionLease(toRawClientDecision(action));
+}
+
+async function runLoopTurn(args = {}) {
+  const turn = await runRawLoopTurn(args);
+  return {
+    ...turn,
+    clientDecision: executableDecisionFromActionLease(turn.clientDecision)
+  };
 }
 
 const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "seat-baggage.html");
@@ -2180,7 +2194,7 @@ test("semantic completeness admits only the unfinished phone component before ex
   expect(adaptiveSet.contextCapabilities.some((candidate) => (
     candidate.selectable === true && !/slovenia|386/i.test(candidate.targetLabel)
   ))).toBe(false);
-  const scheduledHiddenSet = loopPrivate.groundedObservationCandidateSet(
+  const scheduledHiddenSet = groundedObservationCandidateSet(
     adaptiveTask.currentGoal,
     opened.observation,
     [],
@@ -3019,7 +3033,7 @@ test("Title visual recovery remains grounded through TaskState, governor, dispat
   expect(builtTitleCandidate?.targetId).toBe("");
   expect(builtTitleCandidate?.visualRegion?.observationId).toBe(observation.observationId);
 
-  const groundedCandidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+  const groundedCandidateSet = groundedObservationCandidateSet(goal, observation, [], {
     state: { taskState, approvals: {} },
     traveler,
     approvals: {}
@@ -3196,7 +3210,7 @@ test("one exact custom-control actuator advances through method-aware retry and 
   const initialTaskState = reduceTaskState({ observation: initial, traveler });
   let goal = initialTaskState.currentGoal || deriveProfileGoal(initial, traveler);
   expect(goal).toBeTruthy();
-  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, initial, [], {
+  const firstSet = groundedObservationCandidateSet(goal, initial, [], {
     state: { taskState: initialTaskState, approvals: {} },
     traveler,
     approvals: {}
@@ -3320,7 +3334,7 @@ test("one exact custom-control actuator advances through method-aware retry and 
     stored: failedLifecycle.state.recoveryState.failedStrategies,
     retryGoal: goal
   })).toEqual([actuatorSignature(nativeAction)]);
-  const pointerSet = loopPrivate.groundedObservationCandidateSet(goal, retryObservation, failedSignatures, {
+  const pointerSet = groundedObservationCandidateSet(goal, retryObservation, failedSignatures, {
     state: { ...failedLifecycle.state, taskState: retryTaskState, approvals: {} },
     traveler,
     approvals: {}
@@ -3454,7 +3468,7 @@ test("bounded recovery advances from synthetic open methods to one governed trus
       mechanicalHypothesis: true,
       executionChannel: "bounded_recovery",
       discoveryEnvelope: {
-        contractVersion: "pre-surface-discovery/v1",
+        kind: "pre_surface_discovery",
         logicalControlId: candidate.controlId,
         actuatorId: candidate.targetId,
         remainingSteps: 1
@@ -3580,7 +3594,7 @@ test("split hidden title state settles one EasyJet-shaped adaptive episode witho
     selectionMode: "ai_ambiguity",
     surfaceId: observation.page.currentSurface.id,
     adaptiveEnvelope: {
-      contractVersion: "bounded-adaptive-surface/v1",
+      kind: "bounded_adaptive_surface",
       objective: titleGoal.semanticGoal,
       desiredValue: "mr",
       surfaceId: observation.page.currentSurface.id,
@@ -4361,7 +4375,7 @@ test("opaque native choice completes open and select as one trusted episode", as
     interactionMethod: "browser_trusted_choice",
     value: "Male"
   });
-  const scheduledSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+  const scheduledSet = groundedObservationCandidateSet(goal, observation, [], {
     state: { taskState: { currentGoal: goal }, approvals: {} },
     traveler,
     approvals: {}
@@ -4530,7 +4544,7 @@ test("large country dropdown preserves and selects the profile match beyond the 
   expect(nationality.risk).not.toBe("money");
 
   const goal = deriveProfileGoal(observation, traveler);
-  const scheduledSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+  const scheduledSet = groundedObservationCandidateSet(goal, observation, [], {
     state: { taskState: { currentGoal: goal }, approvals: {} },
     traveler,
     approvals: {}
@@ -4591,7 +4605,7 @@ test("native nationality select executes the exact compiled option instead of a 
 
   const observation = await browserObservation(page, "obs_exact_nationality_initial");
   const goal = deriveProfileGoal(observation, traveler);
-  const scheduledSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+  const scheduledSet = groundedObservationCandidateSet(goal, observation, [], {
     state: { taskState: { currentGoal: goal }, approvals: {} },
     traveler,
     approvals: {}
@@ -6748,7 +6762,7 @@ test("seat-map traveler summary stays context while Next is the only safe select
   expect(travelerControl).toBeTruthy();
   expect(nextControl).toBeTruthy();
   expect(taskState.currentGoal.freeAlternativeControlIds || []).not.toContain(travelerControl.controlId);
-  expect(candidateSet.contextCapabilities.some((capability) => capability.controlId === travelerControl.controlId)).toBe(true);
+  expect(candidateSet.contextCapabilities.some((capability) => capability.controlId === travelerControl.controlId)).toBe(false);
   expect(candidateSet.candidates.map((candidate) => candidate.controlId), JSON.stringify({
     goal: {
       semanticType: taskState.currentGoal.semanticType,
@@ -8250,7 +8264,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
       }))
     }, null, 2)).toBeTruthy();
     const scopedState = { ...state, taskState };
-    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+    const candidateSet = groundedObservationCandidateSet(goal, observation, [], {
       state: scopedState,
       traveler,
       approvals: state.approvals
@@ -9923,7 +9937,7 @@ test("final safe checkout replay advances completed traveler through both seat l
       }))
     }, null, 2)).toBeTruthy();
     const scopedState = { ...state, taskState };
-    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+    const candidateSet = groundedObservationCandidateSet(goal, observation, [], {
       state: scopedState,
       traveler,
       approvals: state.approvals
@@ -10004,7 +10018,7 @@ test("final safe checkout replay advances completed traveler through both seat l
     traveler
   });
   const rejectionGoal = rejectionTaskState.currentGoal;
-  const rejectionSet = loopPrivate.groundedObservationCandidateSet(rejectionGoal, observation, [], {
+  const rejectionSet = groundedObservationCandidateSet(rejectionGoal, observation, [], {
     state: { ...state, taskState: rejectionTaskState },
     traveler,
     approvals: state.approvals
@@ -10230,7 +10244,7 @@ test("checkpoint checkout reaches payment through review without paid, close, ca
         operations: control.operations
       }))
     }, null, 2)).toBeTruthy();
-    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, observation, [], {
+    const candidateSet = groundedObservationCandidateSet(goal, observation, [], {
       state: { ...state, taskState }, traveler, approvals: state.approvals
     });
     const authoritativeGoal = { ...goal, candidateSet, candidates: candidateSet.candidates };
@@ -10507,7 +10521,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
       })),
       completedOutcomes: taskState.completedOutcomes
     }, null, 2)).toBeTruthy();
-    const candidateSet = loopPrivate.groundedObservationCandidateSet(taskState.currentGoal, observation, [], {
+    const candidateSet = groundedObservationCandidateSet(taskState.currentGoal, observation, [], {
       state, traveler, approvals: state.approvals
     });
     const authoritativeGoal = { ...taskState.currentGoal, candidateSet, candidates: candidateSet.candidates };
@@ -12058,7 +12072,7 @@ test("cross-surface paid ownership resolves an unknown foreground correction and
     });
     expect(taskState.currentGoal.decisionGroupId).toBe(sourceGroupId);
     expect(candidateSet.candidates.map((candidate) => candidate.controlId)).toEqual([removeId]);
-    expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === nextId).selectable).toBe(false);
+    expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === nextId)).toBeUndefined();
 
     const action = loopPrivate.bindTargetSnapshot(
       actionForCurrentCandidate(taskState.currentGoal, candidateSet.candidates[0], observation),
@@ -12245,7 +12259,7 @@ test("authoritative actionability excludes an occluded ghost and completes popup
     });
     const goal = taskState.currentGoal;
     const scopedState = { ...state, taskState, requirements, activeRequirements: requirements };
-    const candidateSet = loopPrivate.groundedObservationCandidateSet(goal, before, [], { state: scopedState, traveler, approvals: state.approvals });
+    const candidateSet = groundedObservationCandidateSet(goal, before, [], { state: scopedState, traveler, approvals: state.approvals });
     const candidate = candidateSet.candidates.find((item) => item.targetLabel === label);
     expect(candidate, JSON.stringify(candidateSet)).toBeTruthy();
     state = {
@@ -12278,7 +12292,7 @@ test("authoritative actionability excludes an occluded ghost and completes popup
   expect(real).toBeTruthy();
   const initialTaskState = reduceTaskState({ observation, userPolicy: state.approvals, traveler });
   const initialGoal = initialTaskState.currentGoal;
-  const initialCandidates = loopPrivate.groundedObservationCandidateSet(initialGoal, observation, [], {
+  const initialCandidates = groundedObservationCandidateSet(initialGoal, observation, [], {
     state: { ...state, taskState: initialTaskState },
     traveler,
     approvals: state.approvals
@@ -12324,8 +12338,8 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
 
   const before = await browserObservation(page, "obs_memory_before");
   const taskState = reduceTaskState({ observation: before });
-  const goal = taskState.currentGoal;
-  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, before, [], {
+  const goal = taskState.currentObligation;
+  const firstSet = groundedObservationCandidateSet(goal, before, [], {
     state: { taskState }
   });
   const dead = firstSet.candidates.find((candidate) => candidate.targetLabel === "Next");
@@ -12353,10 +12367,10 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     observation: rerendered,
     previousActionResult: rerendered.lastActionResult || null
   });
-  const rerenderedGoal = rerenderedTaskState.currentGoal;
+  const rerenderedGoal = rerenderedTaskState.currentObligation;
   const firstFailureSignatures = loopPrivate.failedStrategySignaturesForGoal(failed.state, rerenderedGoal, rerendered);
   expect(firstFailureSignatures).toHaveLength(1);
-  const firstRetrySet = loopPrivate.groundedObservationCandidateSet(rerenderedGoal, rerendered, firstFailureSignatures, {
+  const firstRetrySet = groundedObservationCandidateSet(rerenderedGoal, rerendered, firstFailureSignatures, {
     state: { taskState: rerenderedTaskState }
   });
   const distinctMethodRetry = firstRetrySet.candidates.find((candidate) => candidate.targetLabel === "Next");
@@ -12384,7 +12398,7 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     rerenderedGoal,
     distinctMethodExecution.observation
   );
-  const secondRetrySet = loopPrivate.groundedObservationCandidateSet(
+  const secondRetrySet = groundedObservationCandidateSet(
     rerenderedGoal,
     distinctMethodExecution.observation,
     secondFailureSignatures,
@@ -12417,7 +12431,7 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
   });
   const nextInstanceFailures = loopPrivate.failedStrategySignaturesForGoal(
     progressed.state,
-    nextInstanceTaskState.currentGoal,
+    nextInstanceTaskState.currentObligation,
     nextInstanceObservation
   );
   expect(nextInstanceFailures).toEqual([]);
@@ -12497,7 +12511,7 @@ test("live-shaped review modal keeps grounded safe controls selectable and submi
     semanticIntent: "advance_checkout_stage",
     outcomeCompatibility: "obligation_admitted"
   });
-  expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === edit.controlId).selectable).toBe(false);
+  expect(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === edit.controlId)).toBeUndefined();
   const submitCandidate = candidateSet.candidates.find((candidate) => candidate.controlId === submit.controlId);
   expect(submitCandidate).toMatchObject({
     mechanicalEffect: "advance_checkout_stage",

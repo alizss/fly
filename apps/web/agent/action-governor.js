@@ -19,7 +19,8 @@ const {
   semanticIntentForAction
 } = require("./action-semantics");
 const agentContract = require("../../extension/src/shared/agent-contract");
-const { currentObligation, mechanicsForObligation } = require("./authority-frames");
+const { currentObligation } = require("./authority-frames");
+const { obligationField } = require("./current-obligation");
 
 const DOM_MUTATIONS = new Set(["click", "type", "select", "keypress"]);
 const COMPOUND_MUTATIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
@@ -52,7 +53,7 @@ const RECOVERABLE_GROUNDING_CODES = new Set([
 ]);
 
 function taskMechanics(taskState = {}) {
-  return mechanicsForObligation(currentObligation(taskState)) || {};
+  return currentObligation(taskState) || {};
 }
 
 function fail(code, reason, checks = [], decision = "blocked_by_safety") {
@@ -133,7 +134,7 @@ function canonicalActionSurfaceId(action = {}) {
 
 function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = [], preparedCandidateSet = null) {
   const goal = taskMechanics(state.taskState || {});
-  if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
+  if (!obligationField(goal, "goalId") || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   // An action with no candidate claim is an ownership violation. Let the
   // ownership check below report that precise prerequisite error; candidate
   // exactness applies once a candidateId is actually presented.
@@ -171,7 +172,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
       && actionAffordance.actuator?.proven === true
       && isDeepStrictEqual(candidateAffordance, actionAffordance);
   const exact = Boolean(candidate)
-    && action.goalId === goal.goalId
+    && action.goalId === obligationField(goal, "goalId")
     && candidate.type === action.type
     && candidate.operation === action.operation
     && candidate.controlId === action.controlId
@@ -199,21 +200,21 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
 
 function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
   const goal = taskMechanics(state.taskState || {});
-  if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
-  if (action.candidateId && action.goalId === goal.goalId) return null;
+  if (!obligationField(goal, "goalId") || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
+  if (action.candidateId && action.goalId === obligationField(goal, "goalId")) return null;
   const control = canonicalControlForAction(action, page) || {};
   return fail(
     "CURRENT_GOAL_UNRESOLVED",
-    `The current semantic goal ${goal.label || goal.semanticType}=${goal.desiredValue} must complete or exhaust its finite recovery budget before ${control.label || action.targetLabel || action.intent || action.type}.`,
+    `The current semantic goal ${obligationField(goal, "label") || obligationField(goal, "semanticType")}=${obligationField(goal, "desiredValue")} must complete or exhaust its finite recovery budget before ${control.label || action.targetLabel || action.intent || action.type}.`,
     checks
   );
 }
 
 function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, checks = []) {
   const goal = taskMechanics(state.taskState || {});
-  if (!["adaptive_surface", "adaptive_interaction"].includes(goal.kind)
+  if (!["adaptive_surface", "adaptive_interaction"].includes(obligationField(goal, "kind"))
     || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
-  const envelope = goal.adaptiveEnvelope || {};
+  const envelope = obligationField(goal, "adaptiveEnvelope") || {};
   const observationSurfaceId = currentObservationSurfaceId(observation);
   const targetSurfaceId = canonicalActionSurfaceId(action);
   if (!observationSurfaceId
@@ -250,7 +251,7 @@ function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, chec
     action.intent,
     action.targetSnapshot?.semantic
   ].filter(Boolean).join(" ").toLowerCase();
-  const profileChildSurface = goal.kind === "adaptive_surface";
+  const profileChildSurface = obligationField(goal, "kind") === "adaptive_surface";
   if ((envelope.forbiddenEffects || []).some((item) => effect.includes(String(item).toLowerCase()))
     || (profileChildSurface && action.intent === "navigate_stage")
     || (profileChildSurface && action.interactionRole === "navigation")
@@ -280,8 +281,8 @@ function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, c
     action.targetSnapshot?.semantic
   ].filter(Boolean).join(" ").toLowerCase();
   if (
-    goal.kind !== "profile_field"
-    || envelope.contractVersion !== "pre-surface-discovery/v1"
+    obligationField(goal, "kind") !== "profile_field"
+    || envelope.kind !== "pre_surface_discovery"
     || action.candidateClass !== "mechanical_hypothesis"
     || action.boundedRecovery !== true
     || action.capabilityStatus !== agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
@@ -699,8 +700,8 @@ function governAction({
 
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
     const goal = taskMechanics(state.taskState || {});
-    const contract = goal.outcomeContract || outcomeContractForGoal(goal, observation);
-    const parentContract = state.taskState?.stageOutcome?.outcomeContract || goal.parentOutcomeContract || contract;
+    const contract = obligationField(goal, "outcomeContract") || outcomeContractForGoal(goal, observation);
+    const parentContract = state.taskState?.stageOutcome?.outcomeContract || obligationField(goal, "parentOutcomeContract") || contract;
     const explicitMechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || action.physicalEffect || "";
     const mechanicalEffect = explicitMechanicalEffect || predictPhysicalEffect({
       semantics: normalizedActionSemantics(action, { control: action.targetSnapshot || {}, goal, expectedOutcome: action.expectedOutcome }),

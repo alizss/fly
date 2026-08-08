@@ -160,7 +160,6 @@ function withGroundingState(observation = {}, grounding = {}) {
     page: {
       ...(observation.page || {}),
       activeRequirementGrounding: {
-        contractVersion: "active-component-semantic-grounding/v1",
         ...grounding
       }
     }
@@ -193,7 +192,6 @@ function applySemanticBinding(observation = {}, resolution = {}, bindings = []) 
             confidence: resolution.confidence === "high" ? 0.95 : 0.82,
             evidence: [clean(resolution.evidence, 400)],
             semanticGrounding: {
-              contractVersion: "semantic-binding/v1",
               factSource: binding.factSource
             }
           }
@@ -211,7 +209,6 @@ function applySemanticBinding(observation = {}, resolution = {}, bindings = []) 
       controls,
       fields,
       activeRequirementGrounding: {
-        contractVersion: "active-component-semantic-grounding/v1",
         status: "bound",
         componentId: binding.componentId,
         semanticType: binding.semanticType,

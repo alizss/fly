@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
 const { resolveProfileDecision } = require("../../apps/web/agent/policy-profile");
 const { reduceTaskState } = require("./task-state-replay-adapter");
-const { buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 
 function executableControl({ controlId, targetId, label, x, testId = "", price = null, semantic = "selection_cta" }) {
   const box = { x, y: 723, width: 200, height: 44, centerX: x + 100, centerY: 745, inViewport: true };

@@ -15,7 +15,7 @@ const {
   semanticOwnershipCacheEntry
 } = require("./legacy-semantic-ownership-adapter");
 const { reduceTaskState } = require("./task-state-replay-adapter");
-const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("../../apps/web/agent/current-candidate-builder");
+const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 
@@ -594,7 +594,7 @@ test("adaptive candidate AI compacts verbose surfaces before the hard packet bou
         semanticGoal: `Choose +386 from ${verboseCountryList}`,
         desiredValue: "+386",
         adaptiveEnvelope: {
-          contractVersion: "bounded-adaptive-surface/v1",
+          kind: "bounded_adaptive_surface",
           episodeId: "episode_verbose",
           objective: `Choose +386 from ${verboseCountryList}`,
           desiredValue: "+386",
@@ -631,9 +631,9 @@ test("adaptive candidate AI compacts verbose surfaces before the hard packet bou
     const payload = JSON.parse(content.find((item) => item.type === "input_text").text);
     assert.equal(result.candidateId, candidate.candidateId);
     assert.ok(Buffer.byteLength(JSON.stringify(payload), "utf8") < 24_000);
-    assert.equal(payload.interactionView.currentGoal.semanticType, "phone_country_code");
+    assert.equal(payload.interactionView.currentObligation.semanticType, "phone_country_code");
     assert.ok(payload.interactionView.foregroundSurface.label.length <= 240);
-    assert.ok(payload.interactionView.currentGoal.adaptiveEnvelope.objective.length <= 240);
+    assert.ok(payload.interactionView.currentObligation.adaptiveEnvelope.objective.length <= 240);
   } finally {
     global.fetch = previousFetch;
   }
@@ -936,7 +936,7 @@ test("diagnostic semantic grounding cannot manufacture a transaction conflict", 
     assert.equal(taskState.activeDecisions[0].status, "active");
     assert.equal(taskState.currentGoal.decisionGroupId, "dg_live_paid_summary");
     assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["ctrl_live_reversal"]);
-    assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_live_advance").selectable, false);
+    assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_live_advance"), undefined);
   } finally {
     global.fetch = previousFetch;
   }
@@ -1135,7 +1135,7 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
     assert.equal(taskState.currentGoal.decisionGroupId, "dg_A");
     assert.equal(taskState.activeDecisions[0].status, "conflicted");
     assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["ctrl_remove"]);
-    assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_next").selectable, false);
+    assert.equal(candidateSet.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_next"), undefined);
 
     const correctionAction = loopPrivate.bindTargetSnapshot(
       actionForCurrentCandidate(taskState.currentGoal, candidateSet.candidates[0], resolved.observation),

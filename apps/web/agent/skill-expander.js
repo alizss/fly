@@ -23,7 +23,6 @@ const {
 } = require("./logical-field");
 const { profileFieldLabel } = require("./profile-context");
 
-const COMPOUND_ACTIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
 const PLACEHOLDER_FIELD_VALUE = /^(?:choose|select|please select|select one(?: option)?|please choose|month|day|year|title|gender|nationality|country)$/i;
 const NON_BLOCKING_PROFILE_FIELDS = new Set([
   "middle_name",
@@ -83,6 +82,8 @@ const PROFILE_FIELD_ORDER = [
   "meal_preference",
   "special_assistance"
 ];
+
+const { obligationField } = require("./current-obligation");
 
 function meaningfulObservedFieldValue(field = {}, control = {}) {
   const state = control.state || field.controlState || {};
@@ -229,17 +230,6 @@ function inferredProfileBlockers(page = {}, fields = [], traveler = {}) {
 
 function ownedCurrentSurface(page = {}) {
   return authoritativeCurrentSurface(page);
-}
-
-function planScope(observation = {}) {
-  const page = observation.page || {};
-  const surface = ownedCurrentSurface(page);
-  return {
-    stage: String(page.step || "unknown"),
-    surfaceId: String(surface?.id || ""),
-    surfaceType: String(surface?.type || "page"),
-    surfaceLabel: String(surface?.label || "").slice(0, 240)
-  };
 }
 
 const PROFILE_COMPONENT_DEPENDENCIES = new Map([
@@ -590,98 +580,6 @@ function profileStageReadiness(observation = {}, traveler = {}, verifiedProfileC
   };
 }
 
-function atomFromDescriptor(planId, descriptor, observationId) {
-  const desiredNormalizedValue = descriptor.desiredNormalizedValue
-    || canonicalLogicalValue(descriptor.semanticType, descriptor.value);
-  return {
-    atomId: `${planId}:${descriptor.key}`,
-    descriptorKey: descriptor.key,
-    kind: "profile_field",
-    semanticType: descriptor.semanticType,
-    ordinal: descriptor.ordinal,
-    logicalFieldId: descriptor.logicalFieldId || "",
-    subjectId: descriptor.subjectId || "traveler_1",
-    componentRole: descriptor.componentRole || "value",
-    label: descriptor.label,
-    semanticGoal: {
-      semanticType: descriptor.semanticType,
-      desiredValue: desiredNormalizedValue || descriptor.value || ""
-    },
-    postcondition: {
-      type: DATE_FIELDS.has(descriptor.semanticType) ? "date_value_committed" : "normalized_value_changed",
-      expectedValue: desiredNormalizedValue || descriptor.value || "",
-      expectedCanonicalValue: descriptor.canonicalValue || "",
-      dateCodec: descriptor.dateCodec || null
-    },
-    valueRef: `profile://${descriptor.semanticType}`,
-    expectedValue: descriptor.value,
-    expectedNormalizedValue: desiredNormalizedValue,
-    expectedCanonicalValue: descriptor.canonicalValue || "",
-    dateCodec: descriptor.dateCodec || null,
-    choiceTerms: descriptor.choiceTerms || [],
-    strategyHistory: [],
-    maxStrategyAttempts: 3,
-    status: descriptor.hasValue ? "satisfied" : "pending",
-    attempts: 0,
-    lastActionId: "",
-    lastControlId: "",
-    createdObservationId: observationId,
-    completedObservationId: descriptor.hasValue ? observationId : "",
-    completionSource: descriptor.hasValue ? "current_observation" : ""
-  };
-}
-
-function createSkillPlan(action, observation = {}, traveler = {}) {
-  if (!COMPOUND_ACTIONS.has(action?.type)) return null;
-  const planId = uid("skill");
-  const observationId = String(observation.observationId || "");
-  const atoms = fieldDescriptors(observation, traveler)
-    .filter(descriptorHasActiveRepresentation)
-    .map((descriptor) => atomFromDescriptor(planId, descriptor, observationId));
-  return {
-    planId,
-    skillType: action.type,
-    parentActionId: String(action.id || ""),
-    status: atoms.some((atom) => atom.status === "pending") ? "running" : "complete",
-    scope: planScope(observation),
-    atoms,
-    createdObservationId: observationId,
-    lastObservedObservationId: observationId,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    completedAt: atoms.some((atom) => atom.status === "pending") ? "" : new Date().toISOString(),
-    suspendedReason: ""
-  };
-}
-
-function clonePlan(plan = {}) {
-  return {
-    ...plan,
-    scope: { ...(plan.scope || {}) },
-    atoms: (plan.atoms || []).map((atom) => ({
-      ...atom,
-      semanticGoal: { ...(atom.semanticGoal || {}) },
-      postcondition: { ...(atom.postcondition || {}) },
-      choiceTerms: [...(atom.choiceTerms || [])],
-      strategyHistory: [...(atom.strategyHistory || [])]
-    }))
-  };
-}
-
-function currentProfileSkillAtom(plan = {}) {
-  return (plan.atoms || []).find((atom) => !["complete", "satisfied"].includes(atom.status)) || null;
-}
-
-function suspendPlan(plan, reason, observationId = "") {
-  return {
-    ...plan,
-    status: "suspended",
-    suspendedReason: String(reason || "Skill execution became ambiguous.").slice(0, 500),
-    lastObservedObservationId: observationId || plan.lastObservedObservationId || "",
-    updatedAt: new Date().toISOString()
-  };
-}
-
 function validationIssueMessage(issue = {}) {
   if (typeof issue === "string") return issue;
   return String(issue.message || issue.text || issue.label || "");
@@ -706,299 +604,6 @@ function scopedValidationIssues(page = {}, scope = {}) {
     if (issue.surfaceId) return surfaceIds.has(String(issue.surfaceId));
     return false;
   });
-}
-
-function blockedObligationForPlan(plan = {}, observation = {}, traveler = {}, existing = null, blocker = {}) {
-  const context = skillRecoveryContext(plan, observation, traveler, { blockedObligation: existing });
-  if (!context?.atomId || !context?.controlId) return null;
-  const sameOwner = existing
-    && existing.owner?.skillPlanId === context.planId
-    && existing.owner?.atomId === context.atomId;
-  const at = new Date().toISOString();
-  const attemptedStrategyIds = new Set([
-    ...(sameOwner ? existing.attempts || [] : []),
-    ...(sameOwner ? existing.rejectedBeforeDispatch || [] : [])
-  ].map((attempt) => attempt.strategyId).filter(Boolean));
-  const supportedStrategies = (context.supportedStrategies || [])
-    .filter((strategy) => !attemptedStrategyIds.has(strategy.strategyId));
-  return {
-    obligationId: sameOwner ? existing.obligationId : `blocked:${context.planId}:${context.atomId}`,
-    kind: "skill_atom_recovery",
-    owner: {
-      skillPlanId: context.planId,
-      atomId: context.atomId,
-      skillType: context.skillType,
-      semanticType: context.semanticType,
-      ordinal: context.ordinal
-    },
-    scope: {
-      stage: String(observation.page?.step || ""),
-      surfaceId: String(authoritativeCurrentSurface(observation.page || {}).id || "")
-    },
-    control: {
-      controlId: context.controlId,
-      label: context.controlLabel || context.label,
-      semanticType: context.semanticType
-    },
-    semanticGoal: { ...(context.semanticGoal || {}) },
-    postcondition: { ...(context.expectedPostcondition || {}) },
-    supportedStrategies: supportedStrategies.map((strategy) => ({ ...strategy })),
-    blocker: {
-      code: String(blocker.code || existing?.blocker?.code || "ACTUATOR_UNPROVEN"),
-      message: String(blocker.message || plan.suspendedReason || context.suspendedReason || "The owned atomic operation has no proven actuator.").slice(0, 500),
-      observationId: String(observation.observationId || ""),
-      at
-    },
-    expectedResult: {
-      type: "normalized_value_changed",
-      controlId: context.controlId,
-      expectedNormalizedValue: context.expectedNormalizedValue || ""
-    },
-    attempts: sameOwner ? [...(existing.attempts || [])] : [],
-    proofs: sameOwner ? [...(existing.proofs || [])] : [],
-    status: "blocked",
-    finalStatus: sameOwner ? existing.finalStatus || "pending" : "pending",
-    finalReason: sameOwner ? existing.finalReason || "" : "",
-    createdAt: sameOwner ? existing.createdAt || at : at,
-    updatedAt: at
-  };
-}
-
-function expectedSuccessCode(expectedType = "") {
-  return {
-    options_surface_appeared: "OPTIONS_SURFACE_APPEARED",
-    normalized_value_changed: "NORMALIZED_VALUE_VERIFIED",
-    date_value_committed: "DATE_VALUE_VERIFIED",
-    field_value_changed: "FIELD_VALUE_VERIFIED",
-    control_selected: "CONTROL_SELECTED",
-    semantic_progress: "SEMANTIC_PROGRESS_OBSERVED"
-  }[expectedType] || "";
-}
-
-function exactRecoveryProof(obligation = {}, result = {}) {
-  const pending = obligation.pendingAction || {};
-  const expected = pending.expectedOutcome || {};
-  const resultExpected = result.expectedOutcome || {};
-  const outcomeCode = resultCode(result);
-  const expectedCode = expectedSuccessCode(expected.type);
-  const resultControlId = String(result.controlId || result.action?.controlId || result.targetSnapshot?.controlId || resultExpected.controlId || "");
-  return Boolean(
-    browserDispatched(result)
-    && result.verified === true
-    && result.skillPlanId === obligation.owner?.skillPlanId
-    && result.skillAtomId === obligation.owner?.atomId
-    && resultControlId === pending.controlId
-    && result.operation === pending.operation
-    && resultExpected.type === expected.type
-    && String(resultExpected.controlId || "") === String(expected.controlId || "")
-    && (!expectedCode || outcomeCode === expectedCode)
-  );
-}
-
-function recordBlockedObligationAttempt(obligation = {}, action = {}) {
-  if (!obligation?.obligationId || !["click", "type", "select", "click_xy", "keypress"].includes(action.type)) return obligation;
-  const at = new Date().toISOString();
-  return {
-    ...obligation,
-    status: "governed",
-    pendingAction: {
-      strategyId: actionSignatureForStrategy(action),
-      actionId: action.id || "",
-      observationId: action.observationId || "",
-      controlId: action.controlId || "",
-      targetId: action.targetId || "",
-      visualRegion: action.visualRegion || null,
-      operation: action.operation || "",
-      actionType: action.type || "",
-      interactionMethod: action.interactionMethod || "",
-      value: action.value || "",
-      keys: action.keys || "",
-      expectedOutcome: action.expectedOutcome || null,
-      status: "governed",
-      at
-    },
-    updatedAt: at
-  };
-}
-
-function actionSignatureForStrategy(action = {}) {
-  const targetIdentity = ["type", "select", "keypress"].includes(action.type || "")
-    ? ""
-    : action.targetId || "";
-  return [
-    action.type || "",
-    action.operation || "",
-    targetIdentity,
-    action.interactionMethod || "",
-    action.value || "",
-    action.keys || "",
-    action.visualRegion ? `${action.visualRegion.x || 0},${action.visualRegion.y || 0}` : ""
-  ].join(":");
-}
-
-function reconcileBlockedObligationResult(obligation = {}, result = {}) {
-  if (!obligation?.obligationId || !result?.actionId) return { obligation, exact: false };
-  const pending = obligation.pendingAction?.actionId === result.actionId ? obligation.pendingAction : null;
-  if (!pending) return { obligation, exact: false };
-  const dispatched = browserDispatched(result);
-  const completedAt = new Date().toISOString();
-  const attempts = dispatched ? [
-    ...(obligation.attempts || []),
-    {
-      ...pending,
-      attempt: (obligation.attempts || []).length + 1,
-      status: result.verified === true ? "verified" : "failed",
-      resultCode: resultCode(result) || "",
-      completedAt
-    }
-  ] : [...(obligation.attempts || [])];
-  const rejectedBeforeDispatch = dispatched ? [...(obligation.rejectedBeforeDispatch || [])] : [
-    ...(obligation.rejectedBeforeDispatch || []),
-    {
-      ...pending,
-      status: "rejected_before_dispatch",
-      resultCode: resultCode(result) || "",
-      completedAt
-    }
-  ];
-  const exact = exactRecoveryProof(obligation, result);
-  const proof = exact ? {
-    skillPlanId: result.skillPlanId,
-    atomId: result.skillAtomId,
-    controlId: obligation.control?.controlId || "",
-    operation: result.operation,
-    expectedOutcome: result.expectedOutcome,
-    outcomeCode: resultCode(result),
-    actionId: result.actionId,
-    observationId: result.observationId || "",
-    at: new Date().toISOString()
-  } : null;
-  return {
-    exact,
-    obligation: {
-      ...obligation,
-      attempts,
-      rejectedBeforeDispatch,
-      pendingAction: null,
-      proofs: proof ? [...(obligation.proofs || []), proof] : [...(obligation.proofs || [])],
-      status: exact ? "progressed" : "blocked",
-      updatedAt: new Date().toISOString()
-    }
-  };
-}
-
-const REISSUABLE_STALE_RESULT_CODES = new Set([
-  "OBSERVATION_HASH_MISMATCH",
-  "STALE_OBSERVATION",
-  "PAGE_CHANGED_BEFORE_ACTION",
-  "TARGET_OBSERVATION_DRIFT"
-]);
-
-function resultCode(result = {}) {
-  return String(result?.outcome?.code || result?.code || result?.result?.code || "");
-}
-
-function shouldReissueUnexecutedAtom(result = {}) {
-  return !browserDispatched(result) && REISSUABLE_STALE_RESULT_CODES.has(resultCode(result));
-}
-
-function browserDispatched(result = {}) {
-  return result.dispatched === true || result.executed === true || result.verified === true;
-}
-
-function reconcileDispatchedAtom(plan, lastActionResult = {}, observationId = "") {
-  const dispatched = plan.atoms.find((atom) => ["proposed", "governed", "dispatched"].includes(atom.status));
-  if (!dispatched) return { plan, ambiguous: false };
-  const resultActionId = String(lastActionResult?.actionId || "");
-  if (!resultActionId || resultActionId !== dispatched.lastActionId) {
-    return {
-      plan: suspendPlan(plan, `No exact result was received for skill atom ${dispatched.atomId}.`, observationId),
-      ambiguous: true
-    };
-  }
-  if (!browserDispatched(lastActionResult)) {
-    const stale = shouldReissueUnexecutedAtom(lastActionResult);
-    if (!stale && dispatched.lastStrategyId) {
-      dispatched.strategyHistory = [
-        ...(dispatched.strategyHistory || []),
-        {
-          strategyId: dispatched.lastStrategyId,
-          operation: dispatched.lastOperation || "",
-          targetId: dispatched.lastTargetId || "",
-          value: dispatched.lastStrategyValue || "",
-          keys: dispatched.lastStrategyKeys || "",
-          status: "rejected_before_dispatch",
-          resultCode: resultCode(lastActionResult) || "ACTION_NOT_DISPATCHED",
-          observationId,
-          at: new Date().toISOString()
-        }
-      ].slice(-20);
-    }
-    dispatched.lastRejectedActionId = dispatched.lastActionId;
-    dispatched.lastRejectedObservationId = dispatched.lastObservationId || "";
-    dispatched.lastRejectionCode = resultCode(lastActionResult);
-    dispatched.lastActionId = "";
-    dispatched.lastControlId = "";
-    dispatched.lastObservationId = "";
-    dispatched.reissueCount = Number(dispatched.reissueCount || 0) + 1;
-    if (stale) {
-      dispatched.status = "pending";
-      return { plan, ambiguous: false, reissue: true, rejectedBeforeDispatch: true };
-    }
-    dispatched.status = "pending";
-    return { plan, ambiguous: false, rejectedBeforeDispatch: true, recovery: true };
-  }
-  dispatched.attempts = Number(dispatched.attempts || 0) + 1;
-  dispatched.lastDispatchedActionId = dispatched.lastActionId;
-  dispatched.strategyHistory = [
-    ...(dispatched.strategyHistory || []),
-    {
-      strategyId: dispatched.lastStrategyId || "",
-      operation: dispatched.lastOperation || lastActionResult.operation || "",
-      targetId: dispatched.lastTargetId || "",
-      value: dispatched.lastStrategyValue || "",
-      keys: dispatched.lastStrategyKeys || "",
-      status: lastActionResult.verified === true ? "verified_intermediate" : "failed",
-      resultCode: resultCode(lastActionResult) || (lastActionResult.verified === true ? "VERIFIED" : "OUTCOME_NOT_VERIFIED"),
-      observationId,
-      at: new Date().toISOString()
-    }
-  ].slice(-20);
-  if (lastActionResult.verified !== true) {
-    const code = resultCode(lastActionResult) || "OUTCOME_NOT_VERIFIED";
-    if (Number(dispatched.attempts || 0) < Number(dispatched.maxStrategyAttempts || 4)) {
-      dispatched.status = "pending";
-      dispatched.lastFailedActionId = dispatched.lastActionId;
-      dispatched.lastFailureCode = code;
-      dispatched.lastActionId = "";
-      dispatched.lastControlId = "";
-      dispatched.lastObservationId = "";
-      dispatched.recoveryCount = Number(dispatched.recoveryCount || 0) + 1;
-      return { plan, ambiguous: false, recovery: true };
-    }
-    return {
-      plan: suspendPlan(plan, `Skill atom ${dispatched.atomId} failed exact verification (${code}).`, observationId),
-      ambiguous: true
-    };
-  }
-  dispatched.status = "pending";
-  dispatched.lastProgressObservationId = observationId;
-  dispatched.lastActionId = "";
-  dispatched.lastControlId = "";
-  dispatched.lastObservationId = "";
-  dispatched.verificationCode = String(lastActionResult?.outcome?.code || "VERIFIED");
-  return { plan, ambiguous: false, progress: true };
-}
-
-function extendPlan(plan, observation = {}, traveler = {}) {
-  const observationId = String(observation.observationId || "");
-  const existing = new Set((plan.atoms || []).map((atom) => atom.descriptorKey || `${atom.semanticType}:${atom.ordinal}`));
-  for (const descriptor of fieldDescriptors(observation, traveler).filter(descriptorHasActiveRepresentation)) {
-    if (existing.has(descriptor.key)) continue;
-    plan.atoms.push(atomFromDescriptor(plan.planId, descriptor, observationId));
-    existing.add(descriptor.key);
-  }
-  return plan;
 }
 
 function descriptorFromPublishedProfileGoal(atom, observation = {}) {
@@ -1164,138 +769,6 @@ function descriptorForAtom(atom, observation = {}, traveler = {}, {
     };
   }
   return base;
-}
-
-function skillRecoveryContext(plan = {}, observation = {}, traveler = {}, state = {}) {
-  const atom = currentProfileSkillAtom(plan);
-  if (!atom) return null;
-  const descriptor = descriptorForAtom(atom, observation, traveler);
-  const control = descriptor?.goalControl || descriptor?.control || null;
-  const supportedStrategies = strategyCandidatesForAtom(atom, descriptor, observation);
-  const page = observation.page || {};
-  const accessibilityCandidates = (page.accessibility?.controls || [])
-    .filter((item) => item.controlId === control?.controlId)
-    .slice(0, 12);
-  const browserHitTargets = supportedStrategies.flatMap((strategy) => strategy.targetIds || []).slice(0, 12);
-  const screenshotTargets = (page.screenshotAnnotations || [])
-    .filter((item) => item.controlId === control?.controlId)
-    .slice(0, 12);
-  const failedDispatchedAttempts = (state.failures || [])
-    .filter((failure) => failure.controlId === control?.controlId)
-    .slice(-12);
-  return {
-    observationId: observation.observationId || "",
-    planId: plan.planId || "",
-    skillType: plan.skillType || "",
-    atomId: atom.atomId || "",
-    semanticType: atom.semanticType || "",
-    ordinal: Number(atom.ordinal || 0),
-    label: atom.label || descriptor?.label || atom.semanticType || "",
-    semanticGoal: atom.semanticGoal || {
-      semanticType: atom.semanticType || "",
-      desiredValue: atom.expectedNormalizedValue || atom.expectedValue || ""
-    },
-    desiredValue: atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue || atom.expectedValue || "",
-    currentValue: control?.state?.normalizedValue || control?.state?.valueText || "",
-    expectedPostcondition: atom.postcondition || {
-      type: "normalized_value_changed",
-      expectedValue: atom.expectedNormalizedValue || ""
-    },
-    expectedNormalizedValue: atom.expectedNormalizedValue || "",
-    choiceTerms: atom.choiceTerms || [],
-    controlId: control?.controlId || "",
-    controlLabel: control?.label || descriptor?.label || "",
-    state: control?.state || null,
-    canonicalControl: control,
-    observedCapabilities: control?.capabilities || [],
-    supportedStrategies,
-    accessibilityCandidates,
-    browserHitTargets,
-    screenshotTargets,
-    boundedVisualRegions: supportedStrategies.flatMap((strategy) => strategy.visualRegion ? [strategy.visualRegion] : []),
-    currentSurface: ownedCurrentSurface(page),
-    foregroundOwnership: page.foreground || null,
-    failedDispatchedAttempts,
-    validationErrors: scopedValidationIssues(page, {
-      controlIds: new Set([control?.controlId].filter(Boolean)),
-      sectionIds: new Set([control?.sectionId].filter(Boolean)),
-      sectionTypes: new Set([String(control?.sectionType || "").toLowerCase()].filter(Boolean)),
-      surfaceIds: new Set([control?.surfaceId].filter(Boolean))
-    }),
-    risk: control?.risk || "safe",
-    hasValue: Boolean(descriptor?.hasValue),
-    suspendedReason: plan.suspendedReason || ""
-  };
-}
-
-function resumeSuspendedSkillPlan(rawPlan, observation = {}, traveler = {}, lastActionResult = {}, blockedObligation = null) {
-  const plan = clonePlan(rawPlan);
-  if (plan.status !== "suspended") return { plan, resumable: plan.status === "running", context: skillRecoveryContext(plan, observation, traveler) };
-  const context = skillRecoveryContext(plan, observation, traveler);
-  const atom = currentProfileSkillAtom(plan);
-  if (!atom || !context) return { plan, resumable: false, context };
-
-  const exactRecoveryResult = Boolean(
-    blockedObligation
-    && (
-      exactRecoveryProof(blockedObligation, lastActionResult)
-      || (blockedObligation.proofs || []).some((proof) => proof.actionId === lastActionResult.actionId)
-    )
-  );
-  if (exactRecoveryResult) {
-    const recoveredAttempt = (blockedObligation.attempts || []).findLast?.((attempt) => attempt.actionId === lastActionResult.actionId)
-      || (blockedObligation.attempts || []).slice(-1)[0];
-    if (recoveredAttempt?.strategyId) {
-      atom.strategyHistory = [
-        ...(atom.strategyHistory || []),
-        {
-          strategyId: recoveredAttempt.strategyId,
-          operation: recoveredAttempt.operation || "",
-          targetId: recoveredAttempt.targetId || "",
-          value: recoveredAttempt.value || "",
-          keys: recoveredAttempt.keys || "",
-          status: "verified_intermediate",
-          resultCode: recoveredAttempt.resultCode || resultCode(lastActionResult),
-          observationId: observation.observationId || "",
-          at: new Date().toISOString()
-        }
-      ].slice(-20);
-    }
-    atom.status = "pending";
-    atom.recoveredObservationId = observation.observationId || "";
-  } else {
-    return { plan, resumable: false, context };
-  }
-
-  atom.lastActionId = "";
-  atom.lastControlId = "";
-  atom.lastObservationId = "";
-  plan.status = "running";
-  plan.suspendedReason = "";
-  plan.lastObservedObservationId = observation.observationId || plan.lastObservedObservationId || "";
-  plan.updatedAt = new Date().toISOString();
-  return { plan, atom, resumable: true, context: skillRecoveryContext(plan, observation, traveler) };
-}
-
-function scopeInterruption(plan, observation = {}) {
-  const current = planScope(observation);
-  if (plan.scope?.stage && current.stage && plan.scope.stage !== current.stage) {
-    return { complete: true, reason: `Checkout stage changed from ${plan.scope.stage} to ${current.stage}.` };
-  }
-  const plannedSurface = plan.scope?.surfaceId || "";
-  const currentSurface = current.surfaceId || "";
-  const activeCustomChoice = (plan.atoms || []).find((atom) => atom.status === "pending"
-    && (atom.choiceTerms || []).length);
-  if (activeCustomChoice && currentSurface) return null;
-  if (plannedSurface !== currentSurface) {
-    return {
-      complete: false,
-      reason: currentSurface
-        ? `A new foreground surface interrupted the ${plan.skillType} skill.`
-        : `The foreground surface for the ${plan.skillType} skill disappeared.`
-    };
-  }
-  return null;
 }
 
 function strategyKey(strategy = {}) {
@@ -1780,81 +1253,44 @@ function strategyCandidatesForAtom(atom = {}, descriptor = null, observation = {
   return boundedCandidates;
 }
 
-function atomicActionForStrategy(plan, atom, descriptor, strategy, observation = {}) {
-  const control = descriptor.control;
-  const actionId = uid("act_skill");
-  atom.lastStrategyId = strategy.strategyId;
-  atom.lastOperation = strategy.operation;
-  atom.lastTargetId = strategy.targetId || "";
-  atom.lastStrategyValue = strategy.value || "";
-  atom.lastStrategyKeys = strategy.keys || "";
-  return normalizeAction({
-    id: actionId,
-    observationId: observation.observationId || "",
-    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-    type: strategy.actionType,
-    intent: "satisfy_semantic_goal",
-    operation: strategy.operation,
-    skillPlanId: plan.planId,
-    skillAtomId: atom.atomId,
-    controlId: control.controlId,
-    decisionGroupId: control.decisionGroupId || "",
-    targetId: strategy.targetId || "",
-    interactionMethod: strategy.interactionMethod || "",
-    boundedRecovery: strategy.boundedRecovery === true,
-    exactOption: strategy.exactOption || descriptor.exactOption || descriptor.bindingContract?.component?.exactOption || null,
-    targetLabel: control.label || descriptor.label || descriptor.semanticType,
-    value: strategy.value || "",
-    keys: strategy.keys || "",
-    x: strategy.visualRegion?.centerX,
-    y: strategy.visualRegion?.centerY,
-    visualRegion: strategy.visualRegion || null,
-    risk: "safe",
-    requiresApproval: false,
-    reason: `Atomic ${plan.skillType} strategy ${strategy.operation} for semantic goal ${atom.semanticType}=${atom.semanticGoal?.desiredValue || atom.expectedNormalizedValue}.`,
-    targetSnapshot: null,
-    expectedOutcome: strategy.expectedOutcome
-  });
-}
-
 function semanticGoalAtom(goal = {}, attemptedCandidateIds = []) {
   return {
-    atomId: goal.goalId || "",
-    kind: goal.kind || "profile_field",
-    descriptorKey: goal.descriptorKey || "",
-    semanticType: goal.semanticType || "",
-    ordinal: Number(goal.ordinal || 0),
-    logicalFieldId: goal.logicalFieldId || "",
-    subjectId: goal.subjectId || "traveler_1",
-    componentRole: goal.componentRole || "value",
-    label: goal.label || goal.semanticType || "",
+    atomId: obligationField(goal, "goalId") || "",
+    kind: obligationField(goal, "kind") || "profile_field",
+    descriptorKey: obligationField(goal, "descriptorKey") || "",
+    semanticType: obligationField(goal, "semanticType") || "",
+    ordinal: Number(obligationField(goal, "ordinal") || 0),
+    logicalFieldId: obligationField(goal, "logicalFieldId") || "",
+    subjectId: obligationField(goal, "subjectId") || "traveler_1",
+    componentRole: obligationField(goal, "componentRole") || "value",
+    label: obligationField(goal, "label") || obligationField(goal, "semanticType") || "",
     semanticGoal: {
-      semanticType: goal.semanticType || "",
-      desiredValue: goal.desiredValue || ""
+      semanticType: obligationField(goal, "semanticType") || "",
+      desiredValue: obligationField(goal, "desiredValue") || ""
     },
     postcondition: {
-      type: goal.postcondition?.type || "normalized_value_changed",
-      expectedValue: goal.postcondition?.expectedValue || goal.desiredValue || "",
-      expectedCanonicalValue: goal.postcondition?.expectedCanonicalValue || goal.canonicalValue || "",
-      dateCodec: goal.postcondition?.dateCodec || goal.dateCodec || null
+      type: obligationField(goal, "postcondition")?.type || "normalized_value_changed",
+      expectedValue: obligationField(goal, "postcondition")?.expectedValue || obligationField(goal, "desiredValue") || "",
+      expectedCanonicalValue: obligationField(goal, "postcondition")?.expectedCanonicalValue || obligationField(goal, "canonicalValue") || "",
+      dateCodec: obligationField(goal, "postcondition")?.dateCodec || obligationField(goal, "dateCodec") || null
     },
-    expectedValue: goal.inputValue || goal.desiredValue || "",
-    expectedNormalizedValue: goal.desiredValue || "",
-    expectedCanonicalValue: goal.canonicalValue || "",
-    dateCodec: goal.dateCodec || null,
-    codecError: goal.codecError || null,
-    ambiguity: goal.ambiguity || null,
-    logicalStructure: goal.logicalStructure || "scalar",
-    label: goal.label || goal.semanticType || "",
-    instructions: [...(goal.instructions || [])],
-    options: [...(goal.options || [])],
-    controlId: goal.controlId || goal.componentBinding?.controlId || "",
-    requirementContract: goal.requirementContract || null,
-    componentBinding: goal.componentBinding || null,
-    capabilityContracts: [...(goal.capabilityContracts || [])],
-    validationOwnership: goal.validationOwnership || null,
-    expectedOutcome: goal.expectedOutcome || goal.postcondition || null,
-    choiceTerms: [...(goal.choiceTerms || [])],
+    expectedValue: obligationField(goal, "inputValue") || obligationField(goal, "desiredValue") || "",
+    expectedNormalizedValue: obligationField(goal, "desiredValue") || "",
+    expectedCanonicalValue: obligationField(goal, "canonicalValue") || "",
+    dateCodec: obligationField(goal, "dateCodec") || null,
+    codecError: obligationField(goal, "codecError") || null,
+    ambiguity: obligationField(goal, "ambiguity") || null,
+    logicalStructure: obligationField(goal, "logicalStructure") || "scalar",
+    label: obligationField(goal, "label") || obligationField(goal, "semanticType") || "",
+    instructions: [...(obligationField(goal, "instructions") || [])],
+    options: [...(obligationField(goal, "options") || [])],
+    controlId: obligationField(goal, "controlId") || obligationField(goal, "componentBinding")?.controlId || "",
+    requirementContract: obligationField(goal, "requirementContract") || null,
+    componentBinding: obligationField(goal, "componentBinding") || null,
+    capabilityContracts: [...(obligationField(goal, "capabilityContracts") || [])],
+    validationOwnership: obligationField(goal, "validationOwnership") || null,
+    expectedOutcome: obligationField(goal, "expectedOutcome") || obligationField(goal, "postcondition") || null,
+    choiceTerms: [...(obligationField(goal, "choiceTerms") || [])],
     strategyHistory: (attemptedCandidateIds || []).map((strategyId) => ({
       strategyId,
       status: "attempted"
@@ -1967,33 +1403,33 @@ function selectNextProfileRequirement(observation = {}, traveler = {}, currentGo
 }
 
 function profileGoalSatisfied(goal = {}, observation = {}, traveler = {}) {
-  if (!goal?.goalId) return false;
+  if (!obligationField(goal, "goalId")) return false;
   const verification = verifyLogicalField(observation.page || {}, {
-    logicalFieldId: goal.logicalFieldId || "",
-    subjectId: goal.subjectId || "traveler_1",
-    semanticType: goal.semanticType || "",
-    componentRole: goal.componentRole || "value",
-    controlId: goal.controlId || "",
-    expectedComponentValue: goal.desiredValue || "",
-    expectedCanonicalValue: goal.canonicalValue || ""
+    logicalFieldId: obligationField(goal, "logicalFieldId") || "",
+    subjectId: obligationField(goal, "subjectId") || "traveler_1",
+    semanticType: obligationField(goal, "semanticType") || "",
+    componentRole: obligationField(goal, "componentRole") || "value",
+    controlId: obligationField(goal, "controlId") || "",
+    expectedComponentValue: obligationField(goal, "desiredValue") || "",
+    expectedCanonicalValue: obligationField(goal, "canonicalValue") || ""
   });
   if (!verification.logicalField) return false;
-  if (goal.reconciliation) {
+  if (obligationField(goal, "reconciliation")) {
     const commit = verification.component?.control?.commitState || {};
     return Boolean(
       commit.status === "settled"
       && commit.popupClosed === true
       && commit.focusSettled === true
-      && Number(commit.attempts || 0) > Number(goal.reconciliation.priorCommitAttempts || 0)
+      && Number(commit.attempts || 0) > Number(obligationField(goal, "reconciliation").priorCommitAttempts || 0)
     );
   }
-  return goal.logicalStructure === "composite"
+  return obligationField(goal, "logicalStructure") === "composite"
     ? verification.componentResult.satisfied
     : verification.componentResult.satisfied && verification.logicalFieldResult.satisfied;
 }
 
 function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, attemptedCandidateIds = [], options = {}) {
-  if (!goal?.goalId) return [];
+  if (!obligationField(goal, "goalId")) return [];
   const descriptor = descriptorForSemanticGoal(goal, observation, traveler, {
     // TaskState already compiled the semantic type and desired value. This
     // layer only rebinds that contract to the current exact actuator.
@@ -2022,7 +1458,7 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
   const atom = semanticGoalAtom(goal, attemptedCandidateIds);
   const mapped = strategyCandidatesForAtom(atom, descriptor, observation).map((strategy) => ({
     candidateId: strategy.strategyId,
-    goalId: goal.goalId,
+    goalId: obligationField(goal, "goalId"),
     type: strategy.actionType,
     operation: strategy.operation,
     ...deriveActionSemantics({
@@ -2071,19 +1507,19 @@ function actionForProfileCandidate(goal = {}, candidate = {}, observation = {}) 
     type: candidate.type,
     intent: "satisfy_semantic_goal",
     operation: candidate.operation,
-    goalId: goal.goalId,
+    goalId: obligationField(goal, "goalId"),
     candidateId: candidate.candidateId,
     candidateClass: candidate.candidateClass || "proven_action",
     mechanicalHypothesis: candidate.mechanicalHypothesis === true,
     discoveryEnvelope: candidate.discoveryEnvelope || null,
-    logicalControlId: candidate.logicalControlId || candidate.controlId || goal.controlId || "",
+    logicalControlId: candidate.logicalControlId || candidate.controlId || obligationField(goal, "controlId") || "",
     actuatorId: candidate.actuatorId || candidate.targetId || "",
-    controlId: candidate.controlId || goal.controlId || "",
+    controlId: candidate.controlId || obligationField(goal, "controlId") || "",
     targetId: candidate.targetId || "",
     interactionMethod: candidate.interactionMethod || "",
     boundedRecovery: candidate.boundedRecovery === true,
     exactOption: candidate.exactOption || candidate.pipelineContract?.component?.exactOption || null,
-    targetLabel: goal.label || goal.semanticType || "",
+    targetLabel: obligationField(goal, "label") || obligationField(goal, "semanticType") || "",
     value: candidate.value || "",
     keys: candidate.keys || "",
     x: candidate.visualRegion
@@ -2103,7 +1539,7 @@ function actionForProfileCandidate(goal = {}, candidate = {}, observation = {}) 
     affordance: candidate.affordance || null,
     risk: "safe",
     requiresApproval: false,
-    reason: `Execute candidate ${candidate.candidateId} for ${goal.semanticType}=${goal.desiredValue}.`
+    reason: `Execute candidate ${candidate.candidateId} for ${obligationField(goal, "semanticType")}=${obligationField(goal, "desiredValue")}.`
   });
 }
 

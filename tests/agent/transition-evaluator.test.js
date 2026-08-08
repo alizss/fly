@@ -10,21 +10,22 @@ const {
   pendingActionRecord
 } = require("../../apps/web/agent/action-lifecycle");
 const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { allRequiredSatisfied, missingRequired, normalizeRequirement } = require("../../packages/shared/requirements");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const {
   applyAuthoritativeOutcomeToRequirements,
   deriveAuthoritativeTaskContext
-} = require("../../apps/web/agent/task-action-context");
+} = require("./legacy-task-action-context");
 const { candidateSelectionSchemaFor } = require("../../apps/web/agent/schemas");
 const {
   currentObligation,
-  currentObligationFromGoal,
-  mechanicsForObligation
+  currentObligationFromGoal
 } = require("../../apps/web/agent/authority-frames");
+const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 
 function taskMechanics(taskState = {}) {
-  return mechanicsForObligation(currentObligation(taskState));
+  return currentObligation(taskState);
 }
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
@@ -1453,7 +1454,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
       priceHistory: []
     }
   };
-  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, before, [], taskStateContext);
+  const firstSet = groundedObservationCandidateSet(goal, before, [], taskStateContext);
   const skip = firstSet.candidates.find((candidate) => candidate.controlId === "ctrl_skip");
   const next = firstSet.candidates.find((candidate) => candidate.controlId === "ctrl_next");
 
@@ -1472,7 +1473,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.directive, "try_distinct_capability");
 
-  const retrySet = loopPrivate.groundedObservationCandidateSet(
+  const retrySet = groundedObservationCandidateSet(
     goal,
     unchanged,
     applied.state.recoveryState.failedStrategySignatures,
@@ -1665,8 +1666,8 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
     completedOutcomes: [{ decisionGroupId: groupId, surfaceId, status: "satisfied", selectedControlId: skip.controlId }]
   };
 
-  const goal = require("../../apps/web/agent/observation-candidates").deriveObservationGoal(current, state.requirements);
-  const firstSet = loopPrivate.groundedObservationCandidateSet(goal, current, [], { state, traveler, approvals: state.approvals });
+  const goal = require("./legacy-observation-goal-adapter").deriveObservationGoal(current, state.requirements);
+  const firstSet = groundedObservationCandidateSet(goal, current, [], { state, traveler, approvals: state.approvals });
   assert.deepEqual(firstSet.candidates.map((candidate) => candidate.targetLabel), ["Next"]);
   state.currentGoal = goal;
   state.recoveryState = { ...state.recoveryState, failedStrategies: [], failedStrategySignatures: [] };
@@ -1795,7 +1796,7 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
   const authoritativeRequirements = applyAuthoritativeOutcomeToRequirements(state.requirements, context);
   assert.equal(authoritativeRequirements[0].status, "waived_by_policy");
 
-  const candidateSet = loopPrivate.groundedObservationCandidateSet(
+  const candidateSet = groundedObservationCandidateSet(
     context.remainingGoal,
     current,
     [],
@@ -2053,7 +2054,7 @@ test("invalid planner output retries the immutable candidate set without browser
       transactionStore: store,
       clientTurnId: "turn_invalid_planner"
     });
-    assert.equal(calls, 2);
+    assert.equal(calls, 1);
     assert.equal(turn.clientDecision.action, "wait");
     assert.equal(turn.clientDecision.intent, "retry_planner_current_candidates");
     assert.equal(turn.state.status, "running");
