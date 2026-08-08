@@ -1566,26 +1566,6 @@
       validationOwnership,
       ...componentIdentityContract
     } = componentContract;
-    const capabilityIndex = capabilities.map((capability) => ({
-      capabilityId: capability.capabilityId,
-      operation: capability.operation,
-      status: capability.status,
-      actuatorId: capability.actuatorId,
-      actuatorIds: capability.actuatorIds,
-      exactActuators: (capability.exactActuators || []).map((actuator) => ({
-        actuatorId: actuator.actuatorId,
-        status: actuator.status
-      })),
-      strategies: (capability.strategies || []).map((strategy) => ({
-        strategyId: strategy.strategyId,
-        operation: strategy.operation,
-        actuatorId: strategy.actuatorId,
-        method: strategy.method,
-        actionType: strategy.actionType,
-        keys: strategy.keys,
-        status: strategy.status
-      }))
-    }));
     const compactOperations = Object.fromEntries(Object.entries(operations).map(([operation, capability]) => [
       operation,
       {
@@ -1628,8 +1608,7 @@
         componentRole: componentIdentityContract.componentRole,
         controlIdentity: componentIdentityContract.controlIdentity,
         currentCanonicalValue: componentIdentityContract.currentCanonicalValue,
-        desiredCanonicalValue: componentIdentityContract.desiredCanonicalValue,
-        capabilities: capabilityIndex
+        desiredCanonicalValue: componentIdentityContract.desiredCanonicalValue
       },
       operations: compactOperations,
       observedOptions,

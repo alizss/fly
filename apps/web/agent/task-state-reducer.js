@@ -1,5 +1,4 @@
 const {
-  fieldDescriptors,
   profileStageReadiness,
   selectNextProfileRequirement,
   verifiedProfileComponentMatchesDescriptor
@@ -9,7 +8,6 @@ const { outcomeContractForGoal } = require("./action-semantics");
 const { decisionInstanceKey, semanticGoalKey } = require("../../../packages/shared/agent-actions");
 const {
   CONTROL_TYPES,
-  buildCanonicalDecisions,
   canonicalDecisionForGroup,
   isTypedNavigationControl
 } = require("./canonical-decision");
@@ -18,9 +16,10 @@ const { canonicalDecisionOwnerKey } = require("./transaction-facts");
 const { canonicalOptionMatch, missingDerivedFactDependency } = require("./logical-field");
 const { adaptiveInteractionGoal } = require("./adaptive-interaction");
 const {
+  currentObligation,
   currentObligationFromGoal,
   decisionFrameOwnsObservation,
-  taskBindingGoal
+  mechanicsForObligation
 } = require("./authority-frames");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
@@ -29,6 +28,10 @@ const GOAL_CREATING = new Set(["active", "conflicted", "blocked"]);
 const DECISION_EPISODE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
 const TASK_STATE_REOBSERVE_DEADLINE_MS = 8_000;
 const taskStateReadModels = new WeakMap();
+
+function taskMechanics(taskState = {}) {
+  return mechanicsForObligation(currentObligation(taskState)) || {};
+}
 
 function clean(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -982,7 +985,7 @@ function verifiedCommerceObligationFromActionResult(result = null, observationId
   const task = action.affordance?.task || {};
   const postcondition = verifiedCommercePostcondition(result) || {};
   const decisionEpisode = context.decisionEpisode || context.taskState?.decisionEpisode || null;
-  const currentGoal = context.currentGoal || taskBindingGoal(context.taskState || {}) || {};
+  const currentGoal = context.currentGoal || taskMechanics(context.taskState || {});
   const lineage = actionDecisionLineage(result, currentGoal, decisionEpisode || {});
   const actionSurfaceId = clean(
     postcondition.surfaceId
@@ -1120,7 +1123,7 @@ function decisionForVerifiedCommerceAction({
 } = {}) {
   const lineage = actionDecisionLineage(
     actionResult,
-    taskBindingGoal(previousTaskState) || {},
+    taskMechanics(previousTaskState),
     decisionEpisode || previousTaskState.decisionEpisode || {}
   );
   const action = actionResult?.action || {};
@@ -1166,7 +1169,7 @@ function commerceOutcomeFromVerifiedAction({
   const postcondition = verifiedCommercePostcondition(actionResult);
   const lineage = actionDecisionLineage(
     actionResult,
-    taskBindingGoal(previousTaskState) || {},
+    taskMechanics(previousTaskState),
     decisionEpisode || previousTaskState.decisionEpisode || {}
   );
   const decision = decisionForVerifiedCommerceAction({
@@ -1451,7 +1454,7 @@ function choiceDecisionEpisode({
   const lastAction = previousActionResult?.action || observation.lastActionResult?.action || null;
   const lastLineage = actionDecisionLineage(
     previousActionResult || observation.lastActionResult,
-    taskBindingGoal(previousTaskState) || {},
+    taskMechanics(previousTaskState),
     previousRaw || {}
   );
   const previousParentDecisionGroupId = clean(previousRaw?.parentDecisionGroupId);
@@ -2110,8 +2113,8 @@ function verifiedProfileComponentFromActionResult(actionResult = null, observati
   return Object.freeze(completion);
 }
 
-function verifiedProfileComponentContradicted(completion = {}, observation = {}, traveler = {}) {
-  const matching = fieldDescriptors(observation, traveler).filter((descriptor) => (
+function verifiedProfileComponentContradicted(completion = {}, descriptors = []) {
+  const matching = descriptors.filter((descriptor) => (
     verifiedProfileComponentMatchesDescriptor(completion, descriptor)
     || Boolean(
       completion.logicalFieldId
@@ -2143,7 +2146,7 @@ function verifiedProfileComponentContradicted(completion = {}, observation = {},
   });
 }
 
-function reconcileVerifiedProfileComponents(previous = [], admitted = null, observation = {}, traveler = {}) {
+function reconcileVerifiedProfileComponents(previous = [], admitted = null, descriptors = []) {
   const components = new Map();
   for (const completion of Array.isArray(previous) ? previous : []) {
     if (completion?.contractVersion === "verified-profile-component/v1" && completion?.status === "verified") {
@@ -2152,7 +2155,7 @@ function reconcileVerifiedProfileComponents(previous = [], admitted = null, obse
   }
   if (admitted) components.set(admitted.completionId, admitted);
   for (const [completionId, completion] of components.entries()) {
-    if (verifiedProfileComponentContradicted(completion, observation, traveler)) components.delete(completionId);
+    if (verifiedProfileComponentContradicted(completion, descriptors)) components.delete(completionId);
   }
   return Object.freeze([...components.values()].slice(-80));
 }
@@ -2176,7 +2179,7 @@ function verifiedProfileComponentMatchesDecision(completion = {}, decision = {})
 
 function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, observation = {}, surface = {} } = {}) {
   if (!surface.id || surface.type === "page") return null;
-  const previousGoal = taskBindingGoal(previousTaskState) || {};
+  const previousGoal = taskMechanics(previousTaskState);
   const continuing = previousGoal.kind === "adaptive_surface"
     && previousGoal.adaptiveEnvelope?.surfaceId === surface.id;
   const entering = previousGoal.kind === "profile_field"
@@ -2297,7 +2300,7 @@ function reduceDecisionFrame({
   const authoritativeDecisionFrame = decisionFrame;
   const semanticCompilation = authoritativeDecisionFrame.semanticCompilation;
   observation = authoritativeDecisionFrame.observation;
-  const previousGoal = taskBindingGoal(previousTaskState) || {};
+  const previousGoal = taskMechanics(previousTaskState);
   const page = observation.page || {};
   const normalizedProfilePolicy = userPolicy.profilePolicy || normalizeProfilePolicy({ userPolicy, traveler });
   const surface = currentSurface(page);
@@ -2433,12 +2436,7 @@ function reduceDecisionFrame({
   const observedPhysicalControlIds = new Set(observedDecisions.flatMap((decision) => (
     decision.physicalControlIds || []
   )));
-  const canonicalControlDecisions = buildCanonicalDecisions({
-    page: { ...page, decisionGroups: [] },
-    userPolicy,
-    traveler,
-    decisionEpisode: previousTaskState.decisionEpisode || null
-  }).filter((decision) => (
+  const canonicalControlDecisions = (authoritativeDecisionFrame.standaloneDecisions || []).filter((decision) => (
     !(decision.physicalControlIds || []).some((controlId) => observedPhysicalControlIds.has(controlId))
   )).map((decision) => Object.freeze({
     ...decision,
@@ -2562,8 +2560,7 @@ function reduceDecisionFrame({
   const verifiedProfileComponents = reconcileVerifiedProfileComponents(
     previousTaskState.verifiedProfileComponents,
     admittedVerifiedProfileComponent,
-    profileObservation,
-    traveler
+    authoritativeDecisionFrame.profileRequirements || []
   );
   // Canonical semantic verification is the only completion authority. Once
   // it verifies an exact component, blank framework shells cannot recreate a

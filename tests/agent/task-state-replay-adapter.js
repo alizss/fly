@@ -3,10 +3,10 @@
 // hidden semantic compilation or V1 currentGoal recovery.
 
 const {
-  bindingGoalFromObligation,
   compileDecisionFrame,
   currentObligationFromGoal,
-  decisionFrameOwnsObservation
+  decisionFrameOwnsObservation,
+  mechanicsForObligation
 } = require("../../apps/web/agent/authority-frames");
 const { reduceDecisionFrame, taskStateReadModel } = require("../../apps/web/agent/task-state-reducer");
 
@@ -32,7 +32,7 @@ function reduceTaskState(args = {}) {
   return Object.freeze({
     ...result,
     ...(taskStateReadModel(result) || {}),
-    currentGoal: bindingGoalFromObligation(result.currentObligation)
+    currentGoal: mechanicsForObligation(result.currentObligation)
   });
 }
 

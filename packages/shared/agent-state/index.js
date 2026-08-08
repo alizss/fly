@@ -49,7 +49,6 @@
  * @property {string} currentObservationHash
  * @property {Object|null} currentObservation
  * @property {Object|null} taskState
- * @property {Object|null} terminalGoalLatch
  * @property {Object} observationReadiness
  * @property {Object|null} pendingAction
  * @property {Object|null} actionLifecycle
@@ -62,7 +61,6 @@
  * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}|null} pendingUserInput
  * @property {Object|null} transactionInvariants
  * @property {Object} paymentState
- * @property {Object} confirmationState
  * @property {string} createdAt
  * @property {string} updatedAt
  */
@@ -96,7 +94,6 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     currentStep: "unknown",
     currentObservation: null,
     taskState: null,
-    terminalGoalLatch: null,
     observationReadiness: {
       classification: "READY",
       key: "",
@@ -130,7 +127,6 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     currentObservationHash: "",
     transactionInvariants: null,
     paymentState: { status: "not_authorized", authorizationId: "", attempts: 0, lastAttemptAt: "" },
-    confirmationState: { status: "not_confirmed", reference: "", confirmedAt: "" },
     createdAt: at,
     updatedAt: at
   };

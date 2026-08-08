@@ -240,9 +240,9 @@ test("TaskState consumes the compiled contract and schedules only the profile-re
     traveler: {}
   });
   assert.equal(state.semanticReadiness, "ready");
-  assert.equal(state.currentGoal.semanticType, "fare_package");
-  assert.deepEqual(state.currentGoal.policyAllowedControlIds, ["ctrl_button_hco73sm"]);
-  assert.equal(state.currentGoal.authorization.maximumAmount, 700);
+  assert.equal(state.currentObligation.subject.semanticType, "fare_package");
+  assert.deepEqual(state.currentObligation.admittedControlIds, ["ctrl_button_hco73sm"]);
+  assert.equal(state.currentObligation.policyDecision.authorization.maximumAmount, 700);
 });
 
 test("blocking seat confirmation is reconstructed as a profile-resolved foreground choice", () => {

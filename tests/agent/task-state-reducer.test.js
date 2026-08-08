@@ -1169,9 +1169,9 @@ test("an actionable blank optional profile representation cannot outrank a ready
   assert.equal(state.observedDecisions[0].status, "waived");
   assert.equal(state.observedDecisions[0].requiresResolution, false);
   assert.equal(state.profileReadiness.ready, true, JSON.stringify(state.profileReadiness, null, 2));
-  assert.equal(state.currentGoal.semanticType, "navigation", JSON.stringify(state.currentGoal, null, 2));
-  assert.equal(state.currentGoal.authority, "task_state");
-  assert.deepEqual(state.currentGoal.actionableControlIds, [forward.controlId]);
+  assert.equal(state.currentObligation.subject.semanticType, "navigation", JSON.stringify(state.currentObligation, null, 2));
+  assert.equal(state.currentObligation.authority, "task_state");
+  assert.deepEqual(state.currentObligation.admittedControlIds, [forward.controlId]);
 });
 
 test("a profile-resolved exclusive insurance choice is completed before real navigation", () => {
@@ -2451,10 +2451,10 @@ test("exact baggage groups decline cabin then checked baggage before Continue", 
   const cabinObservation = observation("obs_cabin", "missing", "", "missing", "");
   const cabinState = reduceTaskState({ observation: cabinObservation, userPolicy, traveler });
   assert.equal(cabinState.currentGoal.decisionGroupId, "cabin_baggage");
-  assert.equal(cabinState.currentGoal.contractVersion, "current-obligation/v2");
-  assert.equal(cabinState.currentGoal.authority, "task_state");
-  assert.equal(cabinState.currentGoal.owner.surfaceId, "surface-page");
-  assert.equal(cabinState.currentGoal.admission.status, "admitted");
+  assert.equal(cabinState.currentObligation.contractVersion, "current-obligation/v2");
+  assert.equal(cabinState.currentObligation.authority, "task_state");
+  assert.equal(cabinState.currentObligation.surfaceId, "surface-page");
+  assert.equal(cabinState.currentObligation.policyDecision.status, "admitted");
   assert.deepEqual(cabinState.currentGoal.candidateControlIds, ["cabin_none"]);
   assert.deepEqual(cabinState.currentGoal.eligibleAlternativeControlIds, ["cabin_none", "cabin_paid"]);
   assert.deepEqual(cabinState.currentGoal.freeAlternativeControlIds, ["cabin_none"]);

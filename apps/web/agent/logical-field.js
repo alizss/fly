@@ -616,10 +616,13 @@ function representationIdentity(control = {}, field = {}) {
 }
 
 function mechanicalOperationsForControl(control = {}) {
+  const serializedOperations = Object.keys(control.operations || {});
   return [...new Set([
     ...operationsFor(control),
     ...Object.entries(control.recovery || {}).filter(([, value]) => Boolean(value)).map(([operation]) => operation),
-    ...(control.componentContract?.capabilities || []).map((capability) => capability.operation).filter(Boolean)
+    ...(serializedOperations.length
+      ? []
+      : (control.componentContract?.capabilities || []).map((capability) => capability.operation).filter(Boolean))
   ])];
 }
 
@@ -629,9 +632,9 @@ function representationIsStateOnly(control = {}) {
   const box = control.visualRegion || control.box || {};
   const hasArea = Number(box.width) > 0 && Number(box.height) > 0;
   const hasRecoveryMechanic = Object.values(control.recovery || {}).some(Boolean)
-    || (control.componentContract?.capabilities || []).some((capability) => (
+    || (!Object.keys(control.operations || {}).length && (control.componentContract?.capabilities || []).some((capability) => (
       capability.status !== agentContract.CAPABILITY_STATUS.UNAVAILABLE
-    ));
+    )));
   const mechanicallyInert = operations.length === 0
     || control.state?.disabled === true
     || control.disabled === true

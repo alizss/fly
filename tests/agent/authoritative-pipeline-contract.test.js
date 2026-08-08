@@ -242,8 +242,7 @@ test("observed control serialization preserves one exact proof without duplicati
     assert.deepEqual(serialized.dateField, control.dateField);
     assert.deepEqual(serialized.actuators, control.actuators);
     assert.equal(serialized.componentContract.controlIdentity.controlId, control.controlId);
-    const capability = serialized.componentContract.capabilities
-      .find((item) => item.operation === Object.keys(control.operations)[0]);
+    const capability = serialized.operations[Object.keys(control.operations)[0]];
     assert.equal(capability?.status, "proven_executable");
     assert.equal(capability?.strategies.length, 1);
     assert.ok(capability?.strategies[0].strategyId);
@@ -436,7 +435,8 @@ test("geometry never becomes proven and modal Dismiss/Advance remain separate ou
     }
   };
   const serialized = agentContract.serializeObservedControl(visual);
-  const recovery = serialized.componentContract.capabilities.find((item) => item.operation === "open");
+  const recovery = agentContract.observedComponentContract(serialized).capabilities
+    .find((item) => item.operation === "open");
   assert.equal(recovery.status, "unproven_experiment");
   assert.equal(agentContract.isNormalExecutableContract(agentContract.canonicalPipelineContract({
     capability: recovery

@@ -19,7 +19,7 @@ const {
   semanticIntentForAction
 } = require("./action-semantics");
 const agentContract = require("../../extension/src/shared/agent-contract");
-const { taskBindingGoal } = require("./authority-frames");
+const { currentObligation, mechanicsForObligation } = require("./authority-frames");
 
 const DOM_MUTATIONS = new Set(["click", "type", "select", "keypress"]);
 const COMPOUND_MUTATIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
@@ -50,6 +50,10 @@ const RECOVERABLE_GROUNDING_CODES = new Set([
   "TARGET_OUTSIDE_CURRENT_SURFACE",
   "CONTROL_GRAPH_SELECTED_ACTION_AMBIGUOUS"
 ]);
+
+function taskMechanics(taskState = {}) {
+  return mechanicsForObligation(currentObligation(taskState)) || {};
+}
 
 function fail(code, reason, checks = [], decision = "blocked_by_safety") {
   return { allow: false, decision, code, reason, checks: [...checks, { code, ok: false }] };
@@ -128,7 +132,7 @@ function canonicalActionSurfaceId(action = {}) {
 }
 
 function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = [], preparedCandidateSet = null) {
-  const goal = taskBindingGoal(state.taskState || {});
+  const goal = taskMechanics(state.taskState || {});
   if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   // An action with no candidate claim is an ownership violation. Let the
   // ownership check below report that precise prerequisite error; candidate
@@ -194,7 +198,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
 }
 
 function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
-  const goal = taskBindingGoal(state.taskState || {});
+  const goal = taskMechanics(state.taskState || {});
   if (!goal?.goalId || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   if (action.candidateId && action.goalId === goal.goalId) return null;
   const control = canonicalControlForAction(action, page) || {};
@@ -206,7 +210,7 @@ function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks 
 }
 
 function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, checks = []) {
-  const goal = taskBindingGoal(state.taskState || {}) || {};
+  const goal = taskMechanics(state.taskState || {});
   if (!["adaptive_surface", "adaptive_interaction"].includes(goal.kind)
     || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   const envelope = goal.adaptiveEnvelope || {};
@@ -265,7 +269,7 @@ function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, chec
 
 function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, checks = []) {
   if (action.mechanicalHypothesis !== true) return null;
-  const goal = taskBindingGoal(state.taskState || {}) || {};
+  const goal = taskMechanics(state.taskState || {});
   const envelope = action.discoveryEnvelope || {};
   const currentSurfaceId = currentObservationSurfaceId(observation);
   const effect = [
@@ -694,7 +698,7 @@ function governAction({
   }
 
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
-    const goal = taskBindingGoal(state.taskState || {}) || {};
+    const goal = taskMechanics(state.taskState || {});
     const contract = goal.outcomeContract || outcomeContractForGoal(goal, observation);
     const parentContract = state.taskState?.stageOutcome?.outcomeContract || goal.parentOutcomeContract || contract;
     const explicitMechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || action.physicalEffect || "";

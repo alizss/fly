@@ -2,7 +2,6 @@ const { callStructured } = require("./openai-client");
 const { candidateSelectionSchemaFor } = require("./schemas");
 const { currentSurface } = require("./surface-contract");
 const { diffObservations } = require("./observation-diff");
-const { taskBindingGoal } = require("./authority-frames");
 
 const MAX_RELATED_MODEL_CONTROLS = 20;
 const CANDIDATE_MODEL_PACKET_BYTES = 24_000;

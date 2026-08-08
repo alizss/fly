@@ -24,7 +24,7 @@ const {
 } = require("../../../packages/shared/agent-actions");
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { canonicalOptionMatch } = require("./logical-field");
-const { CURRENT_OBLIGATION_VERSION, bindingGoalFromObligation } = require("./authority-frames");
+const { CURRENT_OBLIGATION_VERSION, mechanicsForObligation } = require("./authority-frames");
 
 function candidateOperation(candidate = {}) {
   return candidate.authorizedOperation
@@ -394,9 +394,10 @@ function buildCurrentCandidateSet({
   attemptedCandidateIds = [],
   attemptedStrategySignatures = []
 } = {}) {
-  // V2 is authoritative whenever present. `goal` remains only as a direct
-  // standalone builder input for focused mechanics tests and replay tools.
-  goal = bindingGoalFromObligation(obligation) || goal || {};
+  // The obligation is authoritative whenever present. `goal` remains only as
+  // a standalone test/replay input; production binding consumes the explicit
+  // obligation mechanics and never reconstructs a hidden semantic goal.
+  goal = mechanicsForObligation(obligation) || goal || {};
   const binding = surfaceBinding(observation);
   const page = observation.page || {};
   const attempted = new Set(attemptedCandidateIds || []);

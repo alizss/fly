@@ -302,9 +302,13 @@ test("a structured missing traveler answer crosses HTTP and resumes the exact fi
   expect(second.status(), JSON.stringify(resumed)).toBe(200);
   expect(resumed).toMatchObject({
     action: "select",
-    controlId: "ctrl_nationality",
-    targetId: "nationality_select",
-    value: "TR"
+    actionLease: {
+      target: {
+        controlId: "ctrl_nationality",
+        actuatorId: "nationality_select"
+      },
+      mechanic: { value: "TR" }
+    }
   });
 });
 

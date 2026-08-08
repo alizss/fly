@@ -4,11 +4,12 @@ const { DatabaseSync } = require("node:sqlite");
 
 const { createCheckoutSessionState, withUpdate } = require("../../../packages/shared/agent-state");
 const { actionSignature, actuatorSignature, normalizeAction, semanticGoalKey } = require("../../../packages/shared/agent-actions");
-const { taskBindingGoal } = require("./authority-frames");
+const { currentObligation, mechanicsForObligation } = require("./authority-frames");
 
 const LEGACY_REPLAY_DB_PATH = path.resolve(__dirname, "../../../work/agent-transactions.sqlite");
 const DEFAULT_DB_PATH = process.env.ATW_TRANSACTION_DB
   || path.resolve(__dirname, "../../../work/agent-transactions-v2.sqlite");
+const MAX_UNREFERENCED_OBSERVATIONS_PER_SESSION = 12;
 
 function json(value, fallback = null) {
   try {
@@ -173,30 +174,10 @@ function compactDecision(decision = {}) {
 
 function compactCurrentObligation(obligation = null) {
   if (!obligation || typeof obligation !== "object") return obligation || null;
-  const goal = taskBindingGoal({ currentObligation: obligation }) || {};
-  return {
-    ...obligation,
-    // Only the minimum restart continuity needed to rebuild fresh mechanics.
-    // Candidate graphs, page controls, policy projections and verifier state
-    // remain observation-local and are never copied into the session row.
-    bindingResume: {
-      semanticType: goal.semanticType || obligation.subject?.semanticType || "",
-      family: goal.family || obligation.subject?.family || "",
-      subjectId: goal.subjectId || obligation.subject?.subjectId || "global",
-      decisionGroupId: goal.decisionGroupId || obligation.subject?.decisionGroupId || "",
-      requirementId: goal.requirementId || obligation.subject?.requirementId || "",
-      logicalFieldId: goal.logicalFieldId || obligation.subject?.logicalFieldId || "",
-      controlId: goal.controlId || obligation.admittedControlIds?.[0] || "",
-      componentRole: goal.componentRole || "value",
-      desiredValue: goal.desiredValue ?? obligation.desiredValue ?? "",
-      canonicalValue: goal.canonicalValue ?? goal.desiredValue ?? obligation.desiredValue ?? "",
-      choiceLike: goal.choiceLike === true,
-      selectionMode: goal.selectionMode || "",
-      choiceTerms: Array.isArray(goal.choiceTerms) ? goal.choiceTerms.slice(0, 24) : [],
-      dateCodec: goal.dateCodec ? eventSummary(goal.dateCodec) : null,
-      adaptiveEnvelope: goal.adaptiveEnvelope ? eventSummary(goal.adaptiveEnvelope) : null
-    }
-  };
+  // Mechanics are observation-local. A resumed session must recompile them
+  // from the fresh DecisionFrame instead of reviving a partial shadow goal.
+  const { mechanics: _turnLocalMechanics, bindingResume: _legacyBindingResume, ...durable } = obligation;
+  return durable;
 }
 
 function compactTaskState(taskState = null) {
@@ -325,6 +306,31 @@ function compactPendingAction(pending = null) {
   });
 }
 
+function compactExecutionEpisode(state = {}) {
+  const obligation = state.taskState?.currentObligation || null;
+  const recovery = compactRecoveryState(state.recoveryState);
+  const lifecycle = eventSummary(state.actionLifecycle || null);
+  const pending = compactPendingAction(state.pendingAction);
+  if (!obligation && !pending && !lifecycle && !recovery?.attempts && !state.pendingMechanicalEvidence) return null;
+  return {
+    contractVersion: "execution-episode/v1",
+    obligationId: String(obligation?.obligationId || pending?.semanticGoalId || ""),
+    leasedAction: pending,
+    status: String(lifecycle?.status || recovery?.phase || (pending ? "leased" : "idle")),
+    lifecycle,
+    attemptedStrategies: eventSummary(recovery?.failedStrategies || []),
+    attemptedStrategySignatures: eventSummary(recovery?.failedStrategySignatures || []),
+    attemptedCandidateIds: eventSummary(recovery?.attemptedCandidateIds || []),
+    attempts: Math.max(0, Number(recovery?.attempts || 0)),
+    remainingAttempts: Math.max(0, Number(obligation?.recoveryBudget?.remainingAttempts || 0)),
+    stateHash: String(recovery?.stateHash || ""),
+    lastCode: String(recovery?.lastCode || ""),
+    lastRevealSample: eventSummary(recovery?.lastRevealSample || null),
+    mechanicalEvidence: eventSummary(state.pendingMechanicalEvidence || null),
+    updatedAt: String(recovery?.updatedAt || state.updatedAt || "")
+  };
+}
+
 function compactSessionState(state = {}) {
   // This is an allowlist, not a blacklist. Browser controls, observations,
   // candidate graphs, model caches, read models, and diagnostic projections
@@ -339,24 +345,17 @@ function compactSessionState(state = {}) {
     sessionProfileOverrides: eventSummary(state.sessionProfileOverrides || {}),
     pendingUserInput: eventSummary(state.pendingUserInput || null),
     site: eventSummary(state.site || {}),
-    currentStep: String(state.currentStep || "unknown"),
     approvals: eventSummary(state.approvals || {}),
     lastAction: state.lastAction ? governedActionSummary(state.lastAction) : null,
     failures: eventSummary((state.failures || []).slice(-80)),
     currentObservationId: String(state.currentObservationId || ""),
     currentObservationHash: String(state.currentObservationHash || ""),
     taskState: compactTaskState(state.taskState),
-    terminalGoalLatch: eventSummary(state.terminalGoalLatch || null),
     observationReadiness: eventSummary(state.observationReadiness || null),
-    pendingAction: compactPendingAction(state.pendingAction),
-    actionLifecycle: eventSummary(state.actionLifecycle || null),
-    fastStaleRecovery: eventSummary(state.fastStaleRecovery || null),
-    recoveryState: compactRecoveryState(state.recoveryState),
+    executionEpisode: compactExecutionEpisode(state),
     verifiedResults: eventSummary((state.verifiedResults || []).slice(-160)),
-    pendingMechanicalEvidence: eventSummary(state.pendingMechanicalEvidence || null),
     transactionInvariants: compactTransactionInvariants(state.transactionInvariants),
     paymentState: eventSummary(state.paymentState || {}),
-    confirmationState: eventSummary(state.confirmationState || {}),
     stallCount: Math.max(0, Number(state.stallCount || 0)),
     createdAt: String(state.createdAt || ""),
     updatedAt: String(state.updatedAt || "")
@@ -436,7 +435,36 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
   function getSession(sessionId) {
     if (!sessionId) return null;
     const row = readTransaction.get(String(sessionId));
-    return row ? parse(row.state_json, null) : null;
+    const parsed = row ? parse(row.state_json, null) : null;
+    if (!parsed) return null;
+    // One-time read migration for sessions written before TaskState became
+    // the sole terminal/stage authority.
+    if (parsed.terminalGoalLatch && !parsed.taskState?.terminalGoalLatch) {
+      parsed.taskState = { ...(parsed.taskState || {}), terminalGoalLatch: parsed.terminalGoalLatch };
+    }
+    delete parsed.terminalGoalLatch;
+    delete parsed.confirmationState;
+    const episode = parsed.executionEpisode || null;
+    if (episode) {
+      parsed.pendingAction = episode.leasedAction || null;
+      parsed.actionLifecycle = episode.lifecycle || null;
+      parsed.recoveryState = {
+        attempts: Math.max(0, Number(episode.attempts || 0)),
+        phase: episode.status || "idle",
+        stateHash: episode.stateHash || "",
+        attemptedCandidateIds: episode.attemptedCandidateIds || [],
+        failedStrategies: episode.attemptedStrategies || [],
+        failedStrategySignatures: episode.attemptedStrategySignatures || [],
+        lastCode: episode.lastCode || "",
+        lastRevealSample: episode.lastRevealSample || null,
+        updatedAt: episode.updatedAt || ""
+      };
+      parsed.pendingMechanicalEvidence = episode.mechanicalEvidence || null;
+    }
+    delete parsed.executionEpisode;
+    delete parsed.fastStaleRecovery;
+    parsed.currentStep = parsed.taskState?.stage || parsed.currentStep || "unknown";
+    return parsed;
   }
 
   function saveSession(state) {
@@ -490,6 +518,28 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
         String(observation.page?.step || ""),
         json(payload, {}),
         nowIso()
+      );
+      // Retain immutable observations that back governed actions plus a small
+      // recent diagnostic window. Historical full DOM graphs are not durable
+      // transaction state and previously caused unbounded SQLite growth.
+      db.prepare(`
+        DELETE FROM observations
+        WHERE transaction_id = ?
+          AND is_current = 0
+          AND observation_id NOT IN (
+            SELECT observation_id FROM governed_actions WHERE transaction_id = ?
+          )
+          AND observation_id NOT IN (
+            SELECT observation_id FROM observations
+            WHERE transaction_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+          )
+      `).run(
+        transactionId,
+        transactionId,
+        transactionId,
+        MAX_UNREFERENCED_OBSERVATIONS_PER_SESSION
       );
       const currentState = updateSession ? getSession(transactionId) : null;
       if (currentState) {
@@ -658,7 +708,9 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       at: String(result.at || nowIso()),
       actionSignature: actionSignature(action),
       actuatorSignature: signature,
-      goalKey: semanticGoalKey(action.affordance?.task ? action : (taskBindingGoal(state.taskState || {}) || action)),
+      goalKey: semanticGoalKey(action.affordance?.task
+        ? action
+        : (mechanicsForObligation(currentObligation(state.taskState || {})) || action)),
       decisionInstanceId: action.decisionInstanceId,
       actionId: String(result.actionId || action.id || ""),
       observationId: String(result.observationId || ""),

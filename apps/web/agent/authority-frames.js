@@ -1,11 +1,11 @@
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { factsFromObservation } = require("./transaction-facts");
 const { fieldDescriptors } = require("./skill-expander");
+const { buildCanonicalDecisions } = require("./canonical-decision");
 
 const OBSERVATION_FRAME_VERSION = "observation-frame/v2";
 const DECISION_FRAME_VERSION = "decision-frame/v2";
 const CURRENT_OBLIGATION_VERSION = "current-obligation/v2";
-const obligationBindings = new WeakMap();
 
 function clean(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -114,6 +114,12 @@ function compileDecisionFrame({
   // TaskState may reconcile them with durable verified outcomes, but must not
   // rediscover field meaning from the DOM a second time.
   const profileRequirements = fieldDescriptors(compiledObservation, traveler);
+  const standaloneDecisions = buildCanonicalDecisions({
+    page: { ...page, decisionGroups: [] },
+    userPolicy: {},
+    traveler: {},
+    decisionEpisode: null
+  });
   return Object.freeze({
     contractVersion: DECISION_FRAME_VERSION,
     frameId: `${sourceFrame.observationId || "observation"}:${sourceFrame.observationHash || "unhashed"}:decision-v2`,
@@ -123,6 +129,7 @@ function compileDecisionFrame({
     observation: compiledObservation,
     semanticCompilation: compilation,
     profileRequirements: freezeArray(profileRequirements),
+    standaloneDecisions: freezeArray(standaloneDecisions),
     commerceDecisions: compilation.decisionGroups || [],
     navigationOpportunity: page.stageExit || null,
     transactionFacts,
@@ -200,7 +207,7 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null, recovery
     || goal.adaptiveEnvelope?.remainingSteps
     || 3
   ));
-  const bindingContract = Object.freeze({
+  const mechanics = Object.freeze({
     semanticType: clean(goal.semanticType),
     descriptorKey: clean(goal.descriptorKey),
     ordinal: Number.isFinite(Number(goal.ordinal)) ? Number(goal.ordinal) : null,
@@ -287,71 +294,71 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null, recovery
       remainingAttempts: Math.max(0, maxAttempts - Number(recoveryState.attempts || 0))
     })
   };
-  // Mechanics metadata is turn-local and deliberately not part of the
-  // enumerable/persisted CurrentObligation contract. The public contract now
-  // contains only task authority, policy, success and recovery facts.
-  obligationBindings.set(obligation, bindingContract);
+  // This is the one turn-local mechanics input for the admitted obligation.
+  // It is explicit instead of hidden in a WeakMap, and the durable session
+  // compactor deliberately drops it. A resumed turn recompiles it from the
+  // fresh DecisionFrame before any actuator can be leased.
+  obligation.mechanics = mechanics;
   return Object.freeze(obligation);
 }
 
-function bindingGoalFromObligation(obligation = null) {
+function currentObligation(taskState = {}) {
+  const obligation = taskState?.currentObligation || null;
+  return obligation?.contractVersion === CURRENT_OBLIGATION_VERSION ? obligation : null;
+}
+
+function mechanicsForObligation(obligation = null) {
   if (!obligation || obligation.contractVersion !== CURRENT_OBLIGATION_VERSION) return null;
-  const binding = obligationBindings.get(obligation)
-    || obligation.bindingResume
-    || {
-      semanticType: obligation.subject?.semanticType || "",
-      family: obligation.subject?.family || "",
-      subjectId: obligation.subject?.subjectId || "global",
-      decisionGroupId: obligation.subject?.decisionGroupId || "",
-      requirementId: obligation.subject?.requirementId || "",
-      logicalFieldId: obligation.subject?.logicalFieldId || "",
-      controlId: obligation.admittedControlIds?.[0] || "",
-      desiredValue: obligation.desiredValue ?? "",
-      canonicalValue: obligation.desiredValue ?? ""
-    };
+  const subject = obligation.subject || {};
+  const mechanics = obligation.mechanics || {};
   return Object.freeze({
+    ...mechanics,
+    // These names are the direct mechanics-binder view of the obligation.
+    // They are derived here rather than stored as a second goal authority.
+    obligationId: obligation.obligationId,
     goalId: obligation.obligationId,
-    contractVersion: obligation.contractVersion,
-    authority: obligation.authority,
     kind: obligation.kind,
-    semanticGoal: obligation.objective,
     objective: obligation.objective,
+    semanticGoal: obligation.objective,
+    desiredEffect: obligation.desiredEffect,
     semanticEffect: obligation.desiredEffect,
-    desiredSemanticOutcome: obligation.desiredEffect,
-    desiredPolicyOutcome: obligation.desiredEffect,
     desiredValue: obligation.desiredValue,
+    admittedControlIds: obligation.admittedControlIds,
     candidateControlIds: obligation.admittedControlIds,
     actionableControlIds: obligation.admittedControlIds,
     policyAllowedControlIds: obligation.admittedControlIds,
-    admission: obligation.policyDecision,
-    authorization: obligation.policyDecision?.authorization || null,
-    ambiguity: obligation.policyDecision?.ambiguity || null,
+    policyDecision: obligation.policyDecision,
+    admission: Object.freeze({
+      status: obligation.policyDecision?.status,
+      reason: obligation.policyDecision?.reason
+    }),
+    profileCompatible: obligation.policyDecision?.profileCompatible !== false,
+    risk: obligation.risk,
     riskClass: obligation.risk,
     successCondition: obligation.successCondition,
     outcomeContract: obligation.successCondition,
-    owner: Object.freeze({
-      observationId: obligation.observationId,
-      surfaceId: obligation.surfaceId
-    }),
+    recoveryBudget: obligation.recoveryBudget,
+    observationId: obligation.observationId,
+    observationHash: obligation.observationHash,
     surfaceId: obligation.surfaceId,
-    canonicalSubject: obligation.subject,
-    subject: obligation.subject,
-    ...binding
+    subject,
+    semanticType: subject.semanticType || "",
+    family: subject.family || "",
+    subjectId: subject.subjectId || "global",
+    decisionGroupId: subject.decisionGroupId || "",
+    requirementId: subject.requirementId || "",
+    logicalFieldId: mechanics.logicalFieldId || subject.logicalFieldId || ""
   });
-}
-
-function taskBindingGoal(taskState = {}) {
-  return bindingGoalFromObligation(taskState.currentObligation);
 }
 
 module.exports = {
   CURRENT_OBLIGATION_VERSION,
   DECISION_FRAME_VERSION,
   OBSERVATION_FRAME_VERSION,
-  bindingGoalFromObligation,
   compileDecisionFrame,
   createObservationFrame,
+  currentObligation,
   currentObligationFromGoal,
   decisionFrameOwnsObservation,
-  taskBindingGoal
+  mechanicsForObligation
 };

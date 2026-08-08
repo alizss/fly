@@ -28,6 +28,7 @@ const { resolveLogicalFields, logicalFieldSatisfied } = require("../../apps/web/
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { actuatorSignature, semanticGoalKey } = require("../../packages/shared/agent-actions");
 const { compileDecisionFrame, currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const agentContract = require("../../apps/extension/src/shared/agent-contract");
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
@@ -237,6 +238,7 @@ async function browserObservation(page, observationId) {
 async function executeAtomicBrowserDecision(page, decision, resultObservationId) {
   return page.evaluate(async ({ governed, nextObservationId }) => {
     const hooks = window.__ATW_TEST__;
+    governed = hooks.decisionFromActionLease(governed);
     // Keep the pre-action observation immutable even when the incremental
     // observer refreshes its internal cache after a DOM mutation.
     const beforeMap = JSON.parse(JSON.stringify(hooks.buildPageMap()));
@@ -490,6 +492,7 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
 
   const firstMovement = await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
+    decision = hooks.decisionFromActionLease(decision);
     const map = hooks.buildPageMap();
     const target = hooks.resolveDecisionTarget({ ...decision, action: "click" }, map);
     const scroller = document.getElementById("bundle-scroll");
@@ -541,6 +544,7 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
 
   await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
+    decision = hooks.decisionFromActionLease(decision);
     const map = hooks.buildPageMap();
     const target = hooks.resolveDecisionTarget(decision, map)
       || document.querySelector(`[data-atw-element-id="${CSS.escape(decision.targetId || "")}"]`)
@@ -680,6 +684,7 @@ test("resolved extras preserve one offscreen Continue through reveal, fresh obse
   if (secondTurn.clientDecision.action === "scroll") {
     await page.evaluate((decision) => {
       const hooks = window.__ATW_TEST__;
+      decision = hooks.decisionFromActionLease(decision);
       const map = hooks.buildPageMap();
       const target = hooks.resolveDecisionTarget(decision, map);
       hooks.scrollElementWithinNearestContainer(target, {
@@ -722,6 +727,7 @@ test("resolved extras preserve one offscreen Continue through reveal, fresh obse
 
   await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
+    decision = hooks.decisionFromActionLease(decision);
     const map = hooks.buildPageMap();
     const target = hooks.resolveDecisionTarget(decision, map);
     hooks.scrollElementWithinNearestContainer(target, {
@@ -906,6 +912,7 @@ test("three sibling extras resolve as an exact decision-group queue before Conti
 
   await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
+    decision = hooks.decisionFromActionLease(decision);
     const map = hooks.buildPageMap();
     const target = hooks.resolveDecisionTarget(decision, map);
     hooks.scrollElementWithinNearestContainer(target, {
@@ -2986,7 +2993,8 @@ test("Title visual recovery remains grounded through TaskState, governor, dispat
   expect(titleControl.state.disabled).toBe(true);
   expect(titleControl.operations.open).toBeFalsy();
   expect(titleControl.contractVersion).toBe("agent-contract/v1");
-  expect(titleControl.componentContract.capabilities.find((capability) => capability.operation === "open")?.status)
+  expect(agentContract.observedComponentContract(titleControl).capabilities
+    .find((capability) => capability.operation === "open")?.status)
     .toBe("unproven_experiment");
   expect(titleControl.recovery.open.regions).toHaveLength(1);
   expect(titleControl.recovery.open.regions[0].observationId).toBe(observation.observationId);
@@ -3256,6 +3264,7 @@ test("one exact custom-control actuator advances through method-aware retry and 
   expect(failedLifecycle.state.recoveryState.failedStrategies).toHaveLength(1);
   const unchangedRepeat = await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
+    decision = hooks.decisionFromActionLease(decision);
     const initialMap = hooks.buildPageMap();
     const target = hooks.resolveDecisionTarget(decision, initialMap);
     const sameTargetState = hooks.repeatGuardFor(target, "same failed strategy", decision, initialMap);
@@ -3343,6 +3352,7 @@ test("one exact custom-control actuator advances through method-aware retry and 
   );
   expect(await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
+    decision = hooks.decisionFromActionLease(decision);
     const map = hooks.buildPageMap();
     return hooks.repeatGuardFor(
       hooks.resolveDecisionTarget(decision, map),
@@ -4036,10 +4046,10 @@ test("live-shaped optional blank age state cannot reopen over an executable Cont
   });
 
   expect(taskState.profileReadiness.ready).toBe(true);
-  expect(taskState.currentGoal).toMatchObject({
+  expect(taskState.currentObligation).toMatchObject({
     authority: "task_state",
-    semanticType: "navigation",
-    desiredValue: "next_stage"
+    desiredValue: "next_stage",
+    subject: { semanticType: "navigation" }
   });
   expect(taskState.currentGoal.actionableControlIds).toEqual([continueControl.controlId]);
 });
@@ -9754,11 +9764,13 @@ test("large canonical observation uploads screenshot separately and reaches a gr
   expect(transport.surfaceUsesIdsOnly).toBe(true);
   expect(transport.decision, JSON.stringify({ currentSurface: transport.currentSurface, emailControl: transport.emailControl, decision: transport.decision })).toMatchObject({
     sessionId: session.id,
-    observationId: transport.observationId,
     action: "type",
-    intent: "satisfy_semantic_goal"
+    actionLease: {
+      observation: { id: transport.observationId },
+      mechanic: { actionType: "type" }
+    }
   });
-  expect(transport.decision.candidateId).toBeTruthy();
+  expect(transport.decision.actionLease.candidateId).toBeTruthy();
   expect(transport.emailControl).toMatchObject({
     contractVersion: "agent-contract/v1",
     componentContract: {
@@ -9766,7 +9778,7 @@ test("large canonical observation uploads screenshot separately and reaches a gr
       controlIdentity: { controlId: transport.emailControl.controlId }
     }
   });
-  expect(transport.decision.pipelineContract).toMatchObject({
+  expect(transport.decision.actionLease.capabilityProof).toMatchObject({
     contractVersion: "agent-contract/v1",
     requirement: { semanticType: "email" },
     component: { controlId: transport.emailControl.controlId },

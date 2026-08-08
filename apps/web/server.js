@@ -27,6 +27,10 @@ const { PAGE_SURFACE_ID, normalizeSurface } = require("./agent/surface-contract"
 const { normalizeCanonicalDate } = require("./agent/date-field-codec");
 const { canonicalizeUserPolicy, seatPolicyFrom } = require("./agent/policy-profile");
 const agentContract = require("../extension/src/shared/agent-contract");
+const {
+  normalizeSelectedBooking,
+  transactionFactsFromSelectedBooking
+} = require("../../packages/shared/selected-booking");
 
 function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
@@ -102,7 +106,14 @@ function createAgentSession(body = {}) {
       priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
     }
   });
-  const selectedBooking = validatedSelectedBookingAcquisition(body.selectedBooking);
+  const explicitSelectedBooking = normalizeSelectedBooking(body.selectedBookingContract);
+  const selectedBooking = explicitSelectedBooking
+    ? {
+        observationId: explicitSelectedBooking.selectionId,
+        sourceUrl: explicitSelectedBooking.sourceUrl,
+        facts: transactionFactsFromSelectedBooking(explicitSelectedBooking)
+      }
+    : validatedSelectedBookingAcquisition(body.selectedBooking);
   if (selectedBooking) {
     updated = prepareTransactionInvariants(updated, {
       observationId: selectedBooking.observationId,

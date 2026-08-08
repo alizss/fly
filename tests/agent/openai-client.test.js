@@ -76,7 +76,7 @@ test("unknown grounding can block only its exact admitted profile obligation", (
     observation,
     traveler: { date_of_birth: "2003-05-31" }
   });
-  const admitted = unknownComponentsForObligation(observation, preliminary.currentGoal);
+  const admitted = unknownComponentsForObligation(observation, preliminary.currentObligation);
   assert.deepEqual(admitted.map((component) => component.controlId), ["mystery_age"]);
 
   const groundedObservation = {
@@ -103,8 +103,8 @@ test("unknown grounding can block only its exact admitted profile obligation", (
     state: { taskState: finalState, approvals: {} }
   });
 
-  assert.equal(finalState.currentGoal.admission.status, "blocked");
-  assert.equal(finalState.currentGoal.ambiguity.code, "ACTIVE_REQUIREMENT_UNRESOLVED");
+  assert.equal(finalState.currentObligation.policyDecision.status, "blocked");
+  assert.equal(finalState.currentObligation.policyDecision.ambiguity.code, "ACTIVE_REQUIREMENT_UNRESOLVED");
   assert.equal(finalState.profileReadiness.ready, true);
   assert.deepEqual(candidateSet.candidates, []);
 });
@@ -316,9 +316,9 @@ test("a GoToGate paid bundle cannot enter profile grounding ahead of its admitte
       .map((control) => control.controlId),
     paid.map((control) => control.controlId)
   );
-  assert.deepEqual(taskState.currentGoal.candidateControlIds, [decline.controlId]);
-  assert.equal(taskState.currentGoal.canonicalSubject.family, "extras");
-  assert.deepEqual(unknownComponentsForObligation(observation, taskState.currentGoal), []);
+  assert.deepEqual(taskState.currentObligation.admittedControlIds, [decline.controlId]);
+  assert.equal(taskState.currentObligation.subject.family, "extras");
+  assert.deepEqual(unknownComponentsForObligation(observation, taskState.currentObligation), []);
 });
 
 test("authenticated empty model output is retried before being reported as unavailable", async () => {

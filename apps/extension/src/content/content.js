@@ -2816,7 +2816,7 @@
 
   async function startAgentSession(resumeSessionId = "") {
     try {
-      const settings = await storageGet(["apiBase"]);
+      const settings = await storageGet(["apiBase", "selectedBookingContract"]);
       const currentBookingCapture = captureSelectedBookingFromMap(agent.pageMap);
       const selectedBooking = readSelectedBookingAcquisition() || currentBookingCapture;
       const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/session`, {
@@ -2828,6 +2828,7 @@
           goal: agent.userGoal || "Complete this flight checkout safely with one-click assistance.",
           userIntent: userIntentText(),
           traveler: traveler(),
+          selectedBookingContract: settings.selectedBookingContract || null,
           selectedBooking,
           page: compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
         })
@@ -14901,7 +14902,7 @@
     return new Blob([JSON.stringify(payload)]).size;
   }
 
-  const MAX_ACTION_RESULT_TRANSPORT_BYTES = 96_000;
+  const MAX_ACTION_RESULT_TRANSPORT_BYTES = 16_000;
   const OMITTED_ACTION_TRANSPORT_KEYS = new Set([
     "map",
     "page",
@@ -14998,7 +14999,7 @@
     return {
       ...payload,
       actionHistory: Array.isArray(payload.actionHistory)
-        ? payload.actionHistory.slice(-12).map(compactActionResultForTransport).filter(Boolean)
+        ? payload.actionHistory.slice(-3).map(compactActionResultForTransport).filter(Boolean)
         : [],
       lastActionResult: compactActionResultForTransport(payload.lastActionResult)
     };
@@ -15440,6 +15441,49 @@
     });
   }
 
+  function decisionFromActionLease(rawDecision = {}) {
+    const lease = rawDecision.actionLease || null;
+    if (lease?.contractVersion !== "action-lease/v1") return rawDecision;
+    return {
+      ...rawDecision,
+      actionId: lease.actionId || rawDecision.actionId || "",
+      observationId: lease.observation?.id || "",
+      observationHash: lease.observation?.hash || "",
+      action: lease.mechanic?.actionType || rawDecision.action || "stop",
+      intent: lease.expected?.semanticEffect || rawDecision.action || "",
+      operation: lease.mechanic?.operation || "",
+      mechanicalEffect: lease.mechanic?.effect || "",
+      physicalEffect: lease.mechanic?.effect || "",
+      interactionRole: lease.expected?.interactionRole || "",
+      semanticEffect: lease.expected?.semanticEffect || "",
+      expectedEvidence: lease.expected?.evidence || "",
+      semanticIntent: lease.expected?.semanticEffect || "",
+      expectedPostconditions: lease.expected?.postconditions || [],
+      goalId: lease.obligationId || "",
+      decisionInstanceId: lease.semanticOwnerId || "",
+      candidateId: lease.candidateId || "",
+      logicalControlId: lease.target?.controlId || "",
+      controlId: lease.target?.controlId || "",
+      actuatorId: lease.target?.actuatorId || "",
+      targetId: lease.target?.actuatorId || "",
+      targetSnapshot: lease.target?.snapshot || null,
+      decisionGroupId: lease.target?.decisionGroupId || lease.target?.snapshot?.decisionGroupId || "",
+      expectedOutcome: lease.expected?.successCondition || null,
+      affordance: lease.semanticBinding || null,
+      pipelineContract: lease.capabilityProof || null,
+      interactionMethod: lease.mechanic?.method || "",
+      boundedRecovery: lease.mechanic?.boundedRecovery === true,
+      exactOption: lease.mechanic?.exactOption || null,
+      value: lease.mechanic?.value || "",
+      keys: lease.mechanic?.keys || "",
+      x: lease.mechanic?.x,
+      y: lease.mechanic?.y,
+      scrollY: lease.mechanic?.scrollY,
+      visualRegion: lease.mechanic?.visualRegion || null,
+      risk: lease.risk || rawDecision.risk || "uncertain"
+    };
+  }
+
   async function requestAgentDecision(map, userMessage = "", clientLatency = {}, loopToken = {}, userResponse = null) {
     const turnId = nextFlowId("turn");
     const observationId = nextFlowId("obs");
@@ -15645,7 +15689,7 @@
       };
       const transport = await postObservationWithSizeRecovery(apiBase, observationPayload, request.controller.signal);
       const response = transport.response;
-      const decision = await response.json();
+      const decision = decisionFromActionLease(await response.json());
       if (!agent.sessionId || !decision.sessionId || decision.sessionId !== agent.sessionId) {
         throw new Error("backend did not preserve the active durable checkout session");
       }
@@ -18053,6 +18097,7 @@
       observationNeedsScreenshot,
       compactActionResultForTransport,
       compactObservationActionContext,
+      decisionFromActionLease,
       compactFlowLogPayload,
       boundedObservationTransport,
       boundHighCardinalityActionElements,

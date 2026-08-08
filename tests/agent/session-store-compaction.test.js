@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { createStore } = require("../../apps/web/agent/session-store");
+const { compactSessionState, createStore } = require("../../apps/web/agent/session-store");
 const { createCheckoutSessionState, withUpdate } = require("../../packages/shared/agent-state");
 
 test("session persistence keeps semantic facts and removes ephemeral candidate graphs", () => {
@@ -113,4 +113,68 @@ test("compact persistence preserves the target-local identity required to suppre
     failureCount: 2,
     code: "TRANSITION_NO_EFFECT"
   });
+});
+
+test("one durable execution episode replaces parallel lifecycle and recovery copies", () => {
+  const state = withUpdate(createCheckoutSessionState({ goal: "Reach payment review" }), {
+    taskState: {
+      stage: "extras",
+      currentObligation: {
+        contractVersion: "current-obligation/v2",
+        obligationId: "obligation_skip_bags",
+        recoveryBudget: { remainingAttempts: 2 },
+        mechanics: { candidateControlIds: ["skip_bags"], legacyGoalGraph: { large: true } }
+      }
+    },
+    pendingAction: {
+      semanticGoalId: "obligation_skip_bags",
+      originalAction: { id: "action_skip_bags", type: "click", controlId: "skip_bags" }
+    },
+    actionLifecycle: { status: "dispatched", actionId: "action_skip_bags" },
+    recoveryState: {
+      phase: "execution_no_effect",
+      attempts: 1,
+      failedStrategySignatures: ["trusted:activate:skip_bags"]
+    },
+    pendingMechanicalEvidence: { kind: "goal_strategies_exhausted", controlId: "skip_bags" }
+  });
+
+  const compacted = compactSessionState(state);
+
+  assert.equal(compacted.pendingAction, undefined);
+  assert.equal(compacted.actionLifecycle, undefined);
+  assert.equal(compacted.recoveryState, undefined);
+  assert.equal(compacted.pendingMechanicalEvidence, undefined);
+  assert.equal(compacted.taskState.currentObligation.mechanics, undefined);
+  assert.equal(compacted.executionEpisode.contractVersion, "execution-episode/v1");
+  assert.equal(compacted.executionEpisode.obligationId, "obligation_skip_bags");
+  assert.equal(compacted.executionEpisode.status, "dispatched");
+  assert.equal(compacted.executionEpisode.leasedAction.originalAction.id, "action_skip_bags");
+  assert.deepEqual(compacted.executionEpisode.lifecycle, { status: "dispatched", actionId: "action_skip_bags" });
+  assert.deepEqual(compacted.executionEpisode.attemptedStrategySignatures, ["trusted:activate:skip_bags"]);
+  assert.equal(compacted.executionEpisode.attempts, 1);
+  assert.equal(compacted.executionEpisode.remainingAttempts, 2);
+  assert.deepEqual(compacted.executionEpisode.mechanicalEvidence, {
+    kind: "goal_strategies_exhausted",
+    controlId: "skip_bags"
+  });
+});
+
+test("observation persistence retains only a bounded unreferenced window", () => {
+  const store = createStore({ dbPath: ":memory:" });
+  const state = createCheckoutSessionState({ goal: "Reach payment review" });
+  store.saveSession(state);
+
+  for (let index = 0; index < 30; index += 1) {
+    store.recordObservation(state.id, {
+      observationId: `observation_${index}`,
+      observationSnapshot: { snapshotHash: `hash_${index}` },
+      page: { url: `https://example.test/checkout/${index}`, step: "extras", controls: [] }
+    }, { updateSession: false });
+  }
+
+  const replay = store.reconstructTransaction(state.id);
+  assert.equal(replay.observations.length, 12);
+  assert.equal(replay.currentObservation.observationId, "observation_29");
+  store.close();
 });

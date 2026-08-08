@@ -17,7 +17,15 @@ const {
   deriveAuthoritativeTaskContext
 } = require("../../apps/web/agent/task-action-context");
 const { candidateSelectionSchemaFor } = require("../../apps/web/agent/schemas");
-const { currentObligationFromGoal, taskBindingGoal } = require("../../apps/web/agent/authority-frames");
+const {
+  currentObligation,
+  currentObligationFromGoal,
+  mechanicsForObligation
+} = require("../../apps/web/agent/authority-frames");
+
+function taskMechanics(taskState = {}) {
+  return mechanicsForObligation(currentObligation(taskState));
+}
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 function actionableCapability(operation, actuatorId, { inViewport = true } = {}) {
@@ -1054,7 +1062,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
   assert.equal(applied.state.aiDecisionCache, null);
 
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), after),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), after),
     ["click:open:ctrl_flex:,"]
   );
   const changedPage = {
@@ -1063,7 +1071,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
     observationSnapshot: { snapshotHash: "hash_after_changed" }
   };
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), changedPage),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), changedPage),
     ["click:open:ctrl_flex:,"]
   );
   const changedTarget = observation("after_target_changed", {
@@ -1071,7 +1079,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
     controls: [{ controlId: "ctrl_flex", label: "Flexible ticket", state: { expanded: true } }]
   });
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), changedTarget),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), changedTarget),
     []
   );
 });
@@ -1117,7 +1125,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   assert.equal(applied.state.recoveryState.failedStrategies[0].failureCount, 1);
   assert.equal(applied.state.aiDecisionCache, null);
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), after),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), after),
     [signature]
   );
 
@@ -1129,7 +1137,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
     ]
   });
   assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskBindingGoal(state.taskState), unrelatedProgress),
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), unrelatedProgress),
     [signature]
   );
 });

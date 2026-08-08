@@ -7,7 +7,7 @@ const {
   normalizeFacts
 } = require("./transaction-facts");
 const { controlBelongsToCurrentSurface } = require("./surface-contract");
-const { taskBindingGoal } = require("./authority-frames");
+const { currentObligation, mechanicsForObligation } = require("./authority-frames");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 function text(value, limit = 180) {
@@ -478,7 +478,7 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
     || action.affordance?.physicalEffect
     || action.affordance?.effect
     || "";
-  const currentGoal = taskBindingGoal(state.taskState || {}) || {};
+  const currentGoal = mechanicsForObligation(currentObligation(state.taskState || {})) || {};
   const obligation = state.taskState?.currentObligation || {};
   const obligationOwnsCorrection = Boolean(
     obligation.subject?.decisionGroupId === decisionGroupId

@@ -70,7 +70,16 @@ const {
   profileFieldLabel
 } = require("./profile-context");
 const { canonicalizeUserPolicy, seatPolicyFrom } = require("./policy-profile");
-const { compileDecisionFrame, createObservationFrame, taskBindingGoal } = require("./authority-frames");
+const {
+  compileDecisionFrame,
+  createObservationFrame,
+  currentObligation,
+  mechanicsForObligation
+} = require("./authority-frames");
+
+function taskMechanics(taskState = {}) {
+  return mechanicsForObligation(currentObligation(taskState)) || {};
+}
 
 function bufferedDiagnosticStore(store = null) {
   if (!store?.recordActionEvents || !store?.saveSession) return store;
@@ -227,7 +236,7 @@ function pendingRevealAction(blockedAction = {}, recoveryAttempts = 1, candidate
 
 function rebindPendingRecoveryAction(pending = {}, observation = {}, state = {}, traveler = {}) {
   const original = pending.originalAction || {};
-  const authoritativeGoal = taskBindingGoal(state.taskState || {});
+  const authoritativeGoal = taskMechanics(state.taskState || {});
   const direct = bindTargetSnapshot(normalizeAction({
     ...original,
     id: `act_rebind_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
@@ -453,13 +462,78 @@ function summarizeTurn({ pageState, requirements, plannedAction, finalAction, po
 }
 
 function toClientDecision(action) {
-  // Bridge back to the shape the (unmodified) extension executor expects.
-  return {
+  const targetSnapshot = action.targetSnapshot || null;
+  const successCondition = action.expectedOutcome || action.expectedPostconditions?.[0] || null;
+  const actionLease = {
+    contractVersion: "action-lease/v1",
+    actionId: action.id || "",
+    observation: {
+      id: action.observationId || "",
+      hash: action.observationHash || ""
+    },
+    obligationId: action.goalId || "",
+    semanticOwnerId: action.decisionInstanceId || action.requirementId || action.decisionGroupId || "",
+    candidateId: action.candidateId || "",
+    target: {
+      controlId: action.controlId || targetSnapshot?.controlId || "",
+      actuatorId: action.actuatorId || action.targetId || "",
+      surfaceId: targetSnapshot?.surfaceId || "",
+      decisionGroupId: action.decisionGroupId || targetSnapshot?.decisionGroupId || "",
+      snapshot: targetSnapshot
+    },
+    mechanic: {
+      actionType: action.type,
+      operation: action.operation || "",
+      method: action.interactionMethod || "",
+      effect: action.mechanicalEffect || action.physicalEffect || "",
+      value: action.value || action.targetLabel || "",
+      keys: action.keys || "",
+      x: action.x,
+      y: action.y,
+      scrollY: action.scrollY,
+      visualRegion: action.visualRegion || null,
+      exactOption: action.exactOption || action.pipelineContract?.component?.exactOption || null,
+      boundedRecovery: action.boundedRecovery === true
+    },
+    expected: {
+      semanticEffect: action.semanticEffect || action.semanticIntent || "",
+      interactionRole: action.interactionRole || "",
+      evidence: action.expectedEvidence || "",
+      successCondition,
+      postconditions: action.expectedPostconditions || (successCondition ? [successCondition] : [])
+    },
+    capabilityProof: action.pipelineContract || null,
+    semanticBinding: action.affordance || null,
+    risk: action.risk || "uncertain"
+  };
+  const decision = {
     source: "agent-loop",
     actionId: action.id || "",
+    action: action.type,
+    actionLease,
+    candidateClass: action.candidateClass || "proven_action",
+    mechanicalHypothesis: action.mechanicalHypothesis === true,
+    discoveryEnvelope: action.discoveryEnvelope || null,
+    targetLabel: action.targetLabel || "",
+    capabilityStatus: action.capabilityStatus || "",
+    executionChannel: action.executionChannel || "",
+    inputRequest: action.inputRequest || null,
+    readinessStartedAt: Number(action.readinessStartedAt || 0),
+    readinessDeadlineAt: Number(action.readinessDeadlineAt || 0),
+    readinessAttempts: Number(action.readinessAttempts || 0),
+    reobserveRetryToken: action.reobserveRetryToken || "",
+    message: action.reason || "Working on the next step.",
+    needsApproval: action.requiresApproval,
+    risk: action.risk,
+    reason: action.reason
+  };
+  // Runtime callers and legacy replay tests may still read the old fields in
+  // process. Keep them non-enumerable so the HTTP/JSON contract contains only
+  // ActionLease plus presentation/disposition data. The extension hydrates
+  // these aliases once at its transport boundary.
+  const compatibility = {
     observationId: action.observationId || "",
     observationHash: action.observationHash || "",
-    action: action.type,
     intent: action.intent || "",
     operation: action.operation || "",
     interactionRole: action.interactionRole || "",
@@ -471,9 +545,6 @@ function toClientDecision(action) {
     goalId: action.goalId || "",
     decisionInstanceId: action.decisionInstanceId || "",
     candidateId: action.candidateId || "",
-    candidateClass: action.candidateClass || "proven_action",
-    mechanicalHypothesis: action.mechanicalHypothesis === true,
-    discoveryEnvelope: action.discoveryEnvelope || null,
     logicalControlId: action.logicalControlId || action.controlId || "",
     actuatorId: action.actuatorId || action.targetId || "",
     skillPlanId: action.skillPlanId || "",
@@ -481,33 +552,30 @@ function toClientDecision(action) {
     requirementId: action.requirementId || "",
     controlId: action.controlId || action.targetSnapshot?.controlId || "",
     targetId: action.targetId || "",
-    targetLabel: action.targetLabel || "",
     targetSnapshot: action.targetSnapshot || null,
     decisionGroupId: action.decisionGroupId || action.targetSnapshot?.decisionGroupId || "",
     expectedOutcome: action.expectedOutcome || null,
     affordance: action.affordance || null,
     pipelineContract: action.pipelineContract || null,
-    capabilityStatus: action.capabilityStatus || "",
-    executionChannel: action.executionChannel || "",
     interactionMethod: action.interactionMethod || "",
     boundedRecovery: action.boundedRecovery === true,
     exactOption: action.exactOption || action.pipelineContract?.component?.exactOption || null,
     value: action.value || action.targetLabel || "",
-    inputRequest: action.inputRequest || null,
     x: action.x,
     y: action.y,
     visualRegion: action.visualRegion || null,
     scrollY: action.scrollY,
-    keys: action.keys || "",
-    readinessStartedAt: Number(action.readinessStartedAt || 0),
-    readinessDeadlineAt: Number(action.readinessDeadlineAt || 0),
-    readinessAttempts: Number(action.readinessAttempts || 0),
-    reobserveRetryToken: action.reobserveRetryToken || "",
-    message: action.reason || "Working on the next step.",
-    needsApproval: action.requiresApproval,
-    risk: action.risk,
-    reason: action.reason
+    keys: action.keys || ""
   };
+  Object.defineProperties(decision, Object.fromEntries(
+    Object.entries(compatibility).map(([key, value]) => [key, {
+      value,
+      enumerable: false,
+      configurable: false,
+      writable: false
+    }])
+  ));
+  return decision;
 }
 
 function normalizeText(value = "") {
@@ -987,7 +1055,7 @@ function applyTransitionStatus(
   const governedAction = state.lastAction?.id === advanced.lifecycle.actionId
     ? state.lastAction
     : pending?.originalAction || observation.lastActionResult?.action || {};
-  const authoritativeGoal = taskBindingGoal(state.taskState || {}) || {};
+  const authoritativeGoal = taskMechanics(state.taskState || {});
   const signature = candidateStrategySignature(authoritativeGoal, governedAction);
   const decisionObservation = previousObservation?.observationId ? previousObservation : observation;
   const decisionInstanceId = governedAction.decisionInstanceId
@@ -1427,7 +1495,7 @@ function pendingActionSupersededByFreshPage(pending = null, observation = {}) {
 }
 
 function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) {
-  const currentGoal = taskBindingGoal(state.taskState || {});
+  const currentGoal = taskMechanics(state.taskState || {});
   let pendingAction = normalizePendingAction(state.pendingAction);
   let attemptedCandidateIds = [...(state.recoveryState?.attemptedCandidateIds || [])];
   let verifiedResults = [...(state.verifiedResults || [])];
@@ -1488,7 +1556,7 @@ function recordRawVerifiedCommerceReceipt(state = {}, observation = {}) {
     {
       taskState: state.taskState || {},
       decisionEpisode: state.taskState?.decisionEpisode || null,
-      currentGoal: taskBindingGoal(state.taskState || {})
+      currentGoal: taskMechanics(state.taskState || {})
     }
   );
   if (!receipt) return state;
@@ -1566,7 +1634,7 @@ async function runLoopTurn({
   // immediately before TaskState reduces the exact DecisionFrame once.
   let observationFrame = null;
   let decisionFrame = null;
-  const persistedTerminalLatch = state.terminalGoalLatch || state.taskState?.terminalGoalLatch || null;
+  const persistedTerminalLatch = state.taskState?.terminalGoalLatch || null;
   if (persistedTerminalLatch?.locked === true
     && persistedTerminalLatch.terminalStatus === "payment_review_reached") {
     const terminalAction = normalizeAction({
@@ -1579,7 +1647,6 @@ async function runLoopTurn({
       requiresApproval: true
     });
     const terminalState = withUpdate(state, {
-      terminalGoalLatch: persistedTerminalLatch,
       pendingAction: null,
       lastAction: terminalAction,
       status: "ready_for_payment",
@@ -1829,10 +1896,7 @@ async function runLoopTurn({
     authoritativeTransactionFacts: decisionFrame.transactionFacts
   });
   state = transactionContext.state;
-  const initialTaskState = {
-    ...(state.taskState || {}),
-    terminalGoalLatch: state.terminalGoalLatch || state.taskState?.terminalGoalLatch || null
-  };
+  const initialTaskState = state.taskState || {};
   const parentObjective = {
     goal: state.goal || "Complete this checkout safely to payment review.",
     bookingRules: traveler.booking_rules || state.userPolicy?.bookingRules || "",
@@ -1852,7 +1916,7 @@ async function runLoopTurn({
     mechanicalEvidence: state.pendingMechanicalEvidence || null
   });
   const taskReadModel = taskStateReadModel(taskState) || {};
-  const authoritativeGoal = taskBindingGoal(taskState);
+  const authoritativeGoal = taskMechanics(taskState);
   latency.task_state_ms = Date.now() - taskStateStartedAt;
 
   // TaskState admits the Current Obligation before a model may hypothesize a
@@ -1863,7 +1927,7 @@ async function runLoopTurn({
   // TaskState, change transaction facts, or publish another obligation.
   const admittedUnknownComponents = unknownComponentsForObligation(
     observation,
-    authoritativeGoal
+    taskState.currentObligation
   );
   if (admittedUnknownComponents.length) {
     const admittedControlIds = admittedUnknownComponents
@@ -2388,9 +2452,6 @@ async function runLoopTurn({
       lastAction: action,
       status,
       pendingUserInput: taskDisposition.kind === "request_input" ? action.inputRequest || null : null,
-      terminalGoalLatch: taskDisposition.kind === "terminal"
-        ? taskState.terminalGoalLatch
-        : state.terminalGoalLatch,
       paymentState: taskDisposition.kind === "terminal"
         ? { ...(state.paymentState || {}), status: "review_reached" }
         : state.paymentState
@@ -2446,7 +2507,7 @@ async function runLoopTurn({
     taskState,
     currentStep: taskState.stage,
   });
-  let canonicalGoal = taskBindingGoal(taskState);
+  let canonicalGoal = taskMechanics(taskState);
   if (!canonicalGoal) {
     const reason = "TASK_STATE_CONTRACT_VIOLATION: an execute disposition did not include a CurrentObligation.";
     const action = normalizeAction({
