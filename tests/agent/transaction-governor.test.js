@@ -9,24 +9,42 @@ const { listTraces } = require("../../apps/web/agent/trace-store");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const {
-  profileStageReadiness,
   selectNextProfileRequirement,
   profileGoalSatisfied,
   candidatesForProfileGoal,
-  actionForProfileCandidate,
-  normalizeProfileFieldType
-} = require("../../apps/web/agent/skill-expander");
+  actionForProfileCandidate
+} = require("../../apps/web/agent/profile-mechanics");
+const {
+  normalizeProfileFieldType,
+  profileStageReadiness
+} = require("../../apps/web/agent/profile-requirements");
 const { desiredProfileValue } = require("../../apps/web/agent/logical-field");
 const { encodeDateForField } = require("../../apps/web/agent/date-field-codec");
-const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { runLoopTurn: runRawLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { executableDecisionFromActionLease } = require("./action-lease-replay-adapter");
 const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
-const { pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
+const { leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { reduceTaskState } = require("./task-state-replay-adapter");
 const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { semanticGoalKey } = require("../../packages/shared/agent-actions");
 const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const {
+  leasedAction,
+  lifecycle,
+  mechanicalEvidence,
+  recovery,
+  withExecutionFixture
+} = require("./execution-episode-test-adapter");
+
+async function runLoopTurn(args = {}) {
+  const result = await runRawLoopTurn(args);
+  return {
+    ...result,
+    clientDecision: executableDecisionFromActionLease(result.clientDecision)
+  };
+}
 
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
   return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
@@ -280,7 +298,7 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
   assert.ok(failedSignatures.length >= 2);
 
   const { dir, dbPath } = tempDb();
-  const state = createCheckoutSessionState({
+  let state = createCheckoutSessionState({
     goal: "Reach payment review without paid baggage",
     travelerId: traveler.id,
     site: { host: "example.test", url: observation.page.url }
@@ -288,8 +306,8 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
   state.id = "txn_false_bag_exhausted";
   state.taskState = taskState;
   state.currentGoal = taskState.currentGoal;
-  state.recoveryState = {
-    ...state.recoveryState,
+  state = withExecutionFixture(state, { recovery: {
+    ...recovery(state),
     failedStrategies: failedSignatures.map((strategySignature) => ({
       goalKey: loopPrivate.semanticGoalRecoveryKey(taskState.currentObligation, observation),
       semanticGoalKey: semanticGoalKey(taskState.currentObligation),
@@ -298,7 +316,7 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
       pageStateHash: observation.observationSnapshot.snapshotHash,
       failureCount: 1
     }))
-  };
+  } });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -315,7 +333,7 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
   });
 
   assert.equal(exhaustedTurn.clientDecision.action, "wait", exhaustedTurn.clientDecision.reason);
-  assert.equal(exhaustedTurn.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
+  assert.equal(mechanicalEvidence(exhaustedTurn.state).kind, "goal_strategies_exhausted");
   const reobserved = {
     ...observation,
     observationId: "obs_false_bag_reobserved",
@@ -337,7 +355,7 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
     reason: result.clientDecision.reason,
     currentGoal: result.state.taskState?.currentGoal,
     currentObligation: result.state.taskState?.currentObligation,
-    pendingMechanicalEvidence: result.state.pendingMechanicalEvidence
+    mechanicalEvidence: mechanicalEvidence(result.state)
   }, null, 2));
   assert.equal(result.clientDecision.controlId, skip.controlId);
   assert.equal(result.state.taskState.currentObligation.kind, "adaptive_interaction");
@@ -569,9 +587,9 @@ test("P0.6 governor allows one current canonical safe action and rejects its dup
   };
   const allowed = governAction({ action, state, observation, traveler: { id: "trav_1", booking_rules: "no extras" }, store, turnId: "turn_1" });
   assert.equal(allowed.allow, true);
-  assert.equal(allowed.state.actionLifecycle.status, "approved");
-  assert.equal(allowed.state.actionLifecycle.approved, true);
-  assert.equal(allowed.state.actionLifecycle.dispatched, false);
+  assert.equal(lifecycle(allowed.state).status, "approved");
+  assert.equal(lifecycle(allowed.state).approved, true);
+  assert.equal(lifecycle(allowed.state).dispatched, false);
   const duplicate = governAction({ action: { ...action, id: "act_safe_2" }, state: allowed.state, observation, traveler: { id: "trav_1", booking_rules: "no extras" }, store, turnId: "turn_2" });
   assert.equal(duplicate.allow, false);
   assert.equal(duplicate.code, "DUPLICATE_ACTION_ATTEMPT");
@@ -701,8 +719,7 @@ test("persisted failed-actuator diagnostics do not veto backend-scheduled retrie
   });
 
   const failedState = store.getSession(state.id);
-  assert.equal(failedState.failures.length, 1);
-  assert.equal(failedState.failures[0].targetId, "el_decline");
+  assert.equal(failedState.failures, undefined);
 
   const repeatedAction = {
     id: "act_repeat_failed",
@@ -1398,7 +1415,7 @@ test("an exhausted Title actuator cannot make the loop skip to Nationality", asy
   assert.equal(titleCandidate.controlId.includes("title_0"), true);
 
   const { dir, dbPath } = tempDb();
-  const state = createCheckoutSessionState({
+  let state = createCheckoutSessionState({
     goal: "Complete traveler information",
     travelerId: traveler.id,
     site: { host: "example.test", url: observation.page.url }
@@ -1406,8 +1423,8 @@ test("an exhausted Title actuator cannot make the loop skip to Nationality", asy
   state.id = "txn_reschedule_title_to_nationality";
   state.taskState = initialTaskState;
   state.currentGoal = titleGoal;
-  state.recoveryState = {
-    ...state.recoveryState,
+  state = withExecutionFixture(state, { recovery: {
+    ...recovery(state),
     failedStrategies: [{
       goalKey: loopPrivate.semanticGoalRecoveryKey(titleGoal, observation),
       semanticGoalKey: semanticGoalKey(titleGoal),
@@ -1415,7 +1432,7 @@ test("an exhausted Title actuator cannot make the loop skip to Nationality", asy
       pageStateHash: observation.observationSnapshot.snapshotHash,
       failureCount: 1
     }]
-  };
+  } });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -1437,7 +1454,7 @@ test("an exhausted Title actuator cannot make the loop skip to Nationality", asy
     semanticType: loopResult.state.taskState.currentObligation?.subject?.semanticType
   }));
   assert.equal(loopResult.state.taskState.currentObligation.subject.semanticType, "title");
-  assert.equal(loopResult.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
+  assert.equal(mechanicalEvidence(loopResult.state).kind, "goal_strategies_exhausted");
   assert.equal(loopResult.debug.modelUsage.calls.length, 0);
 
   store.close();
@@ -1590,7 +1607,7 @@ test("profile goal selection preserves the first unresolved semantic obligation"
     clientTurnId: "turn_all_profile_actuators_blocked"
   });
   assert.equal(loopResult.clientDecision.action, "wait");
-  assert.equal(loopResult.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
+  assert.equal(mechanicalEvidence(loopResult.state).kind, "goal_strategies_exhausted");
   assert.equal(loopResult.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -2247,7 +2264,7 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
 
 test("Unified semantic goal state survives a SQLite restart", () => {
   const { dir, dbPath } = tempDb();
-  const { state } = fixture();
+  let { state } = fixture();
   const traveler = { id: "trav_1", email: "ali@example.test", phone: "+38640111222" };
   const observation = profileFormObservation();
   const currentGoal = deriveProfileGoal(observation, traveler);
@@ -2256,14 +2273,13 @@ test("Unified semantic goal state survives a SQLite restart", () => {
     stage: "traveler_information",
     currentObligation: currentObligationFromGoal({ goal: currentGoal })
   };
-  state.pendingAction = {
+  state = withExecutionFixture(state, { leasedAction: {
     status: "governed",
     actionId: "act_email",
     goalId: currentGoal.goalId,
     candidateId: currentGoal.candidates[0].candidateId
-  };
-  state.recoveryState = { ...state.recoveryState, attemptedCandidateIds: ["candidate_previous"] };
-  state.verifiedResults = [{ goalId: "profile:prior:0", browserVerified: true }];
+  } });
+  state = withExecutionFixture(state, { recovery: { ...recovery(state), attemptedCandidateIds: ["candidate_previous"] } });
   let store = createStore({ dbPath });
   store.saveSession(state);
   store.close();
@@ -2271,9 +2287,9 @@ test("Unified semantic goal state survives a SQLite restart", () => {
   const restored = store.getSession(state.id);
   assert.equal(restored.taskState.currentGoal, undefined);
   assert.equal(restored.taskState.currentObligation.obligationId, "profile:email:0");
-  assert.equal(restored.pendingAction.candidateId, currentGoal.candidates[0].candidateId);
-  assert.deepEqual(restored.recoveryState.attemptedCandidateIds, ["candidate_previous"]);
-  assert.equal(restored.verifiedResults[0].browserVerified, true);
+  assert.equal(leasedAction(restored).candidateId, currentGoal.candidates[0].candidateId);
+  assert.deepEqual(recovery(restored).attemptedCandidateIds, ["candidate_previous"]);
+  assert.equal(restored.verifiedResults, undefined);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2389,15 +2405,14 @@ test("Unified semantic loop advances to the next profile goal without another mo
   });
   assert.equal(result.clientDecision.action, "type");
   assert.equal(result.clientDecision.controlId, "ctrl_phone_obs_form_resume");
-  assert.equal(result.clientDecision.goalId, "profile:phone:0");
+  assert.equal(result.clientDecision.obligationId, "profile:phone:0");
   assert.equal(result.clientDecision.observationId, "obs_form_resume");
   assert.match(result.clientDecision.actionId, /^act_goal_/);
   assert.equal(result.clientDecision.expectedOutcome.type, "normalized_value_changed");
   assert.equal(result.clientDecision.expectedOutcome.expectedNormalizedValue, "40111222");
   assert.equal(result.debug.modelUsage.calls.length, 0);
   assert.equal(result.state.taskState.currentObligation.subject.semanticType, "phone");
-  assert.equal(result.state.verifiedResults.some((item) => item.goalId === "profile:email:0" && item.browserVerified), true);
-  assert.equal(result.state.verifiedResults.some((item) => item.semanticPostconditionSatisfied === true), false);
+  assert.equal(result.state.verifiedResults, undefined);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2445,14 +2460,14 @@ test("Unified semantic loop reissues a candidate after stale pre-dispatch reject
   });
 
   assert.equal(result.clientDecision.action, "type");
-  assert.equal(result.clientDecision.goalId, "profile:email:0");
+  assert.equal(result.clientDecision.obligationId, "profile:email:0");
   assert.notEqual(result.clientDecision.candidateId, first.clientDecision.candidateId);
   assert.match(result.clientDecision.candidateId, /^obs_stale_loop_after:candidate_\d+$/);
   assert.equal(result.clientDecision.observationId, "obs_stale_loop_after");
   assert.equal(result.clientDecision.controlId, "ctrl_email_obs_stale_loop_after");
   assert.notEqual(result.clientDecision.actionId, first.clientDecision.actionId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
-  assert.deepEqual(result.state.recoveryState.attemptedCandidateIds, []);
+  assert.deepEqual(recovery(result.state).attemptedCandidateIds, []);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2506,11 +2521,11 @@ test("P0.4 blank traveler stage deterministically starts profile ownership befor
   assert.equal(result.clientDecision.action, "type");
   assert.equal(result.clientDecision.controlId, "ctrl_email_obs_profile_owner");
   assert.equal(result.clientDecision.intent, "satisfy_semantic_goal");
-  assert.equal(result.clientDecision.goalId, "profile:email:0");
+  assert.equal(result.clientDecision.obligationId, "profile:email:0");
   assert.ok(result.clientDecision.candidateId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   assert.equal(result.state.taskState.currentObligation.subject.semanticType, "email");
-  assert.equal(result.state.pendingAction.candidateId, result.clientDecision.candidateId);
+  assert.equal(leasedAction(result.state).candidateId, result.clientDecision.candidateId);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2590,8 +2605,8 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(recovery.clientDecision.needsApproval, false);
   assert.equal(recovery.debug.modelUsage.calls.length, 0);
   assert.equal(recovery.state.taskState.currentObligation.subject.semanticType, "email");
-  assert.equal(recovery.state.pendingAction.schemaVersion, 2);
-  assert.equal(recovery.state.pendingAction.status, "needs_reveal");
+  assert.equal(leasedAction(recovery.state).contractVersion, "leased-action/v1");
+  assert.equal(leasedAction(recovery.state).status, "needs_reveal");
 
   const fresh = profileFormObservation({ observationId: "obs_profile_scrolled" });
   fresh.page.viewport = { width: 1200, height: 800 };
@@ -2619,7 +2634,7 @@ test("P0.4/P0.7 offscreen profile atom scrolls, reobserves, and rebinds without 
   assert.equal(rebound.clientDecision.controlId, "ctrl_email_obs_profile_scrolled");
   assert.equal(rebound.clientDecision.observationId, "obs_profile_scrolled");
   assert.equal(rebound.debug.modelUsage.calls.length, 0);
-  assert.notEqual(rebound.clientDecision.actionId, recovery.state.pendingAction.originalAction.id);
+  assert.notEqual(rebound.clientDecision.actionId, leasedAction(recovery.state).originalAction.id);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2721,10 +2736,10 @@ test("P0.4 hidden optional profile controls do not reopen a completed current fo
 
 test("P0.7 a pending ordinary action rebinds after viewport recovery without a model call", async () => {
   const { dir, dbPath } = tempDb();
-  const { state, observation } = fixture();
+  let { state, observation } = fixture();
   const traveler = { id: "trav_1", booking_rules: "no extras" };
   const pending = pendingDeclineContext(observation, state, traveler);
-  state.pendingAction = pendingActionRecord({
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
     status: "needs_reveal",
     recoveryAttempts: 1,
     action: {
@@ -2741,7 +2756,7 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
     },
     goal: pending.goal,
     candidate: pending.candidate
-  });
+  }) });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -2761,9 +2776,9 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
   assert.equal(result.clientDecision.controlId, "ctrl_decline");
   assert.equal(result.clientDecision.targetId, "el_decline");
   assert.equal(result.clientDecision.expectedOutcome.type, "exact_free_option_selected");
-  assert.equal(result.state.pendingAction.schemaVersion, 2);
-  assert.equal(result.state.pendingAction.status, "ready");
-  assert.equal(result.state.pendingAction.originalAction.id, result.clientDecision.actionId);
+  assert.equal(leasedAction(result.state).contractVersion, "leased-action/v1");
+  assert.equal(leasedAction(result.state).status, "ready");
+  assert.equal(leasedAction(result.state).originalAction.id, result.clientDecision.actionId);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -2771,8 +2786,8 @@ test("P0.7 a pending ordinary action rebinds after viewport recovery without a m
 
 test("authoritative lifecycle waits for browser evidence before deriving or planning another goal", async () => {
   const { dir, dbPath } = tempDb();
-  const { state, observation } = fixture();
-  state.pendingAction = pendingActionRecord({
+  let { state, observation } = fixture();
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
     status: "ready",
     action: {
       id: "act_pending_click",
@@ -2785,7 +2800,7 @@ test("authoritative lifecycle waits for browser evidence before deriving or plan
     },
     candidate: null,
     goal: { goalId: "goal_decline_baggage" }
-  });
+  }) });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -2803,7 +2818,7 @@ test("authoritative lifecycle waits for browser evidence before deriving or plan
 
   assert.equal(result.clientDecision.action, "wait");
   assert.equal(result.clientDecision.intent, "await_pending_action_result");
-  assert.equal(result.state.pendingAction.originalAction.id, "act_pending_click");
+  assert.equal(leasedAction(result.state).originalAction.id, "act_pending_click");
   assert.equal(result.debug.resumedBeforePlanning, true);
   assert.deepEqual(result.debug.modelUsage.calls, []);
   store.close();
@@ -2812,7 +2827,7 @@ test("authoritative lifecycle waits for browser evidence before deriving or plan
 
 test("fresh paid conflict preempts a pending navigation action and dispatches the exact safe reversal", async () => {
   const { dir, dbPath } = tempDb();
-  const { state, observation } = fixture();
+  let { state, observation } = fixture();
   const traveler = { id: "trav_1", booking_rules: "decline all paid extras" };
   observation.page.controls = [
     {
@@ -2889,7 +2904,7 @@ test("fresh paid conflict preempts a pending navigation action and dispatches th
       { controlId: "ctrl_bundle_free", label: "None", semantic: "decline_paid_extra", risk: "safe_decline" }
     ]
   }];
-  state.pendingAction = pendingActionRecord({
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
     status: "ready",
     action: {
       id: "act_pending_continue",
@@ -2904,7 +2919,7 @@ test("fresh paid conflict preempts a pending navigation action and dispatches th
       risk: "safe"
     },
     goal: { goalId: "goal_continue", semanticType: "navigation" }
-  });
+  }) });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -2923,7 +2938,7 @@ test("fresh paid conflict preempts a pending navigation action and dispatches th
   assert.equal(result.clientDecision.action, "click");
   assert.equal(result.clientDecision.controlId, "ctrl_bundle_free");
   assert.equal(result.clientDecision.intent, "decline_optional_extra");
-  assert.notEqual(result.state.pendingAction.originalAction.id, "act_pending_continue");
+  assert.notEqual(leasedAction(result.state).originalAction.id, "act_pending_continue");
   assert.equal(result.state.taskState.currentObligation.subject.decisionGroupId, "dg_bundle");
   assert.match(result.state.taskState.currentObligation.desiredEffect, /decline|remove|select_free/);
   assert.equal(result.debug.modelUsage.calls.length, 0);
@@ -2933,7 +2948,7 @@ test("fresh paid conflict preempts a pending navigation action and dispatches th
 
 test("P0.7 a still-offscreen ordinary action receives one more governed scroll", async () => {
   const { dir, dbPath } = tempDb();
-  const { state, observation } = fixture();
+  let { state, observation } = fixture();
   observation.page.controls[0].visualRegion = {
     x: 100,
     y: 1300,
@@ -2943,7 +2958,7 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
   };
   const traveler = { id: "trav_1", booking_rules: "no extras" };
   const pending = pendingDeclineContext(observation, state, traveler);
-  state.pendingAction = pendingActionRecord({
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
     status: "needs_reveal",
     recoveryAttempts: 1,
     action: {
@@ -2960,7 +2975,7 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
     },
     goal: pending.goal,
     candidate: pending.candidate
-  });
+  }) });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -2978,7 +2993,7 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
 
   assert.equal(result.clientDecision.action, "scroll");
   assert.equal(result.clientDecision.intent, "recover_target_viewport");
-  assert.equal(result.state.pendingAction.recoveryAttempts, 2);
+  assert.equal(leasedAction(result.state).recoveryAttempts, 2);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -2986,12 +3001,12 @@ test("P0.7 a still-offscreen ordinary action receives one more governed scroll",
 
 test("P0.7 measurable viewport progress resets the genuine-failure budget", async () => {
   const { dir, dbPath } = tempDb();
-  const { state, observation } = fixture();
+  let { state, observation } = fixture();
   observation.page.viewport = { width: 1200, height: 800 };
   observation.page.controls[0].visualRegion = { x: 100, y: 1200, width: 180, height: 40, inViewport: false };
   const traveler = { id: "trav_1", booking_rules: "no extras" };
   const pending = pendingDeclineContext(observation, state, traveler);
-  state.recoveryState = {
+  state = withExecutionFixture(state, { recovery: {
     attempts: 2,
     phase: "reveal",
     stateHash: "",
@@ -3002,8 +3017,8 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
       inViewport: false,
       distanceToViewport: 900
     }
-  };
-  state.pendingAction = pendingActionRecord({
+  } });
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
     status: "needs_reveal",
     recoveryAttempts: 2,
     action: {
@@ -3019,7 +3034,7 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
     },
     goal: pending.goal,
     candidate: pending.candidate
-  });
+  }) });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -3037,21 +3052,21 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
 
   assert.equal(result.clientDecision.action, "scroll");
   assert.equal(result.clientDecision.expectedOutcome.attempt, 1);
-  assert.equal(result.state.pendingAction.recoveryAttempts, 1);
-  assert.equal(result.state.recoveryState.attempts, 0);
-  assert.equal(result.state.recoveryState.lastRevealSample.measurableProgress, true);
+  assert.equal(leasedAction(result.state).recoveryAttempts, 1);
+  assert.equal(recovery(result.state).attempts, 0);
+  assert.equal(recovery(result.state).lastRevealSample.measurableProgress, true);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("P0.7 bounded genuine viewport failure returns to TaskState for the final disposition", async () => {
   const { dir, dbPath } = tempDb();
-  const { state, observation } = fixture();
+  let { state, observation } = fixture();
   observation.page.viewport = { width: 1200, height: 800 };
   observation.page.controls[0].visualRegion = { x: 100, y: 1280, width: 180, height: 40, inViewport: false };
   const traveler = { id: "trav_1", booking_rules: "no extras" };
   const pending = pendingDeclineContext(observation, state, traveler);
-  state.recoveryState = {
+  state = withExecutionFixture(state, { recovery: {
     attempts: 2,
     phase: "reveal",
     stateHash: "",
@@ -3062,8 +3077,8 @@ test("P0.7 bounded genuine viewport failure returns to TaskState for the final d
       inViewport: false,
       distanceToViewport: 500
     }
-  };
-  state.pendingAction = pendingActionRecord({
+  } });
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
     status: "needs_reveal",
     recoveryAttempts: 2,
     action: {
@@ -3079,7 +3094,7 @@ test("P0.7 bounded genuine viewport failure returns to TaskState for the final d
     },
     goal: pending.goal,
     candidate: pending.candidate
-  });
+  }) });
   const store = createStore({ dbPath });
   store.saveSession(state);
   store.recordObservation(state.id, observation);
@@ -3096,9 +3111,9 @@ test("P0.7 bounded genuine viewport failure returns to TaskState for the final d
   });
 
   assert.equal(result.clientDecision.action, "wait");
-  assert.equal(result.state.pendingAction, null);
+  assert.equal(leasedAction(result.state), null);
   assert.equal(result.state.status, "running");
-  assert.equal(result.state.pendingMechanicalEvidence.kind, "goal_strategies_exhausted");
+  assert.equal(mechanicalEvidence(result.state).kind, "goal_strategies_exhausted");
 
   const final = await runLoopTurn({
     apiKey: "",

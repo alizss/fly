@@ -10,6 +10,7 @@ const { classifyGraphConflicts, resolveActionControl, selectedActionGraphConflic
 const { invariantDecision } = require("./invariants");
 const { PAGE_SURFACE_ID, controlBelongsToCurrentSurface, currentSurface, currentSurfaceId } = require("./surface-contract");
 const { approveActionLifecycle, proposeActionLifecycle, rejectActionLifecycle } = require("./action-lifecycle");
+const { executionEpisodeFor, recoveryFacts, stateWithExecutionEpisode } = require("./execution-episode");
 const {
   assessOutcomeCompatibility,
   expectedPostconditionsForAction,
@@ -85,14 +86,14 @@ function executionLaneForAction(action = {}, control = {}, observation = {}, str
     });
     const baseCapability = observed.capabilities.find((capability) => capability.operation === action.operation) || {};
     const selectedStrategy = (baseCapability.strategies || []).find((strategy) => (
-      strategy.actuatorId === action.targetId
+      strategy.actuatorId === action.actuatorId
       && (!action.interactionMethod || strategy.method === action.interactionMethod)
     )) || null;
     const exactActuator = (baseCapability.exactActuators || [])
-      .find((actuator) => actuator.actuatorId === action.targetId);
+      .find((actuator) => actuator.actuatorId === action.actuatorId);
     pipelineContract = agentContract.canonicalPipelineContract({
       requirement: {
-        requirementId: action.requirementId || action.goalId || action.decisionGroupId || "",
+        requirementId: action.requirementId || action.obligationId || action.decisionGroupId || "",
         semanticType: action.targetSnapshot?.semantic || action.intent || ""
       },
       component: {
@@ -103,7 +104,7 @@ function executionLaneForAction(action = {}, control = {}, observation = {}, str
       },
       capability: {
         ...baseCapability,
-        actuatorId: action.targetId || baseCapability.actuatorId || "",
+        actuatorId: action.actuatorId || baseCapability.actuatorId || "",
         selectedStrategy,
         status: exactActuator?.status || baseCapability.status,
         proof: exactActuator?.proof || baseCapability.proof || null
@@ -172,11 +173,11 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
       && actionAffordance.actuator?.proven === true
       && isDeepStrictEqual(candidateAffordance, actionAffordance);
   const exact = Boolean(candidate)
-    && action.goalId === obligationField(goal, "goalId")
+    && action.obligationId === obligationField(goal, "goalId")
     && candidate.type === action.type
     && candidate.operation === action.operation
     && candidate.controlId === action.controlId
-    && String(candidate.targetId || "") === String(action.targetId || "")
+    && String(candidate.targetId || "") === String(action.actuatorId || "")
     && (!["type", "select"].includes(action.type) || String(candidate.value || "") === String(action.value || ""))
     && (action.type !== "keypress" || String(candidate.keys || "") === String(action.keys || ""))
     && (action.type !== "click_xy" || visualRegionsMatch(candidate.visualRegion || {}, action.visualRegion || {}))
@@ -188,9 +189,23 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
     && String(action.expectedOutcome?.controlId || "") === String(candidate.expectedOutcome?.controlId || "")
     && isDeepStrictEqual(action.pipelineContract || null, candidate.pipelineContract || null);
   if (!exact) {
+    const mismatchFields = !candidate ? ["candidate"] : [
+      ["obligationId", action.obligationId, obligationField(goal, "goalId")],
+      ["type", action.type, candidate.type],
+      ["operation", action.operation, candidate.operation],
+      ["controlId", action.controlId, candidate.controlId],
+      ["actuatorId", action.actuatorId, candidate.targetId],
+      ["interactionRole", action.interactionRole, candidate.interactionRole],
+      ["semanticEffect", action.semanticEffect, candidate.semanticEffect],
+      ["expectedEvidence", action.expectedEvidence, candidate.expectedEvidence],
+      ["expectedOutcome.type", action.expectedOutcome?.type, candidate.expectedOutcome?.type],
+      ["expectedOutcome.controlId", action.expectedOutcome?.controlId, candidate.expectedOutcome?.controlId],
+      ["affordance", affordanceExact, true],
+      ["pipelineContract", isDeepStrictEqual(action.pipelineContract || null, candidate.pipelineContract || null), true]
+    ].filter(([, actual, expected]) => actual !== expected).map(([field]) => field);
     return recoverable(
       "CURRENT_GOAL_CANDIDATE_MISMATCH",
-      "The executable action is not the server-grounded candidate selected for the current semantic goal.",
+      `The executable action is not the server-grounded candidate selected for the current semantic goal (${mismatchFields.join(", ") || "payload"}).`,
       checks
     );
   }
@@ -201,7 +216,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
 function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
   const goal = taskMechanics(state.taskState || {});
   if (!obligationField(goal, "goalId") || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
-  if (action.candidateId && action.goalId === obligationField(goal, "goalId")) return null;
+  if (action.candidateId && action.obligationId === obligationField(goal, "goalId")) return null;
   const control = canonicalControlForAction(action, page) || {};
   return fail(
     "CURRENT_GOAL_UNRESOLVED",
@@ -246,8 +261,8 @@ function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, chec
   }
   const effect = [
     action.mechanicalEffect,
-    action.physicalEffect,
-    action.semanticIntent,
+    action.mechanicalEffect,
+    action.intent,
     action.intent,
     action.targetSnapshot?.semantic
   ].filter(Boolean).join(" ").toLowerCase();
@@ -275,8 +290,8 @@ function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, c
   const currentSurfaceId = currentObservationSurfaceId(observation);
   const effect = [
     action.mechanicalEffect,
-    action.physicalEffect,
-    action.semanticIntent,
+    action.mechanicalEffect,
+    action.intent,
     action.intent,
     action.targetSnapshot?.semantic
   ].filter(Boolean).join(" ").toLowerCase();
@@ -298,8 +313,7 @@ function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, c
     || envelope.sourceSurfaceId !== currentSurfaceId
     || envelope.logicalControlId !== (action.logicalControlId || action.controlId)
     || envelope.logicalControlId !== action.controlId
-    || envelope.actuatorId !== (action.actuatorId || action.targetId)
-    || envelope.actuatorId !== action.targetId
+    || envelope.actuatorId !== action.actuatorId
   ) {
     return recoverable(
       "DISCOVERY_BINDING_STALE",
@@ -552,12 +566,15 @@ function governAction({
     ...payload
   });
   const denied = (result) => {
-    state = { ...state, actionLifecycle: rejectActionLifecycle(state.actionLifecycle, result) };
+    state = stateWithExecutionEpisode(
+      state,
+      rejectActionLifecycle(executionEpisodeFor(state), result)
+    );
     record("blocked", { result: { ok: false, code: result.code, reason: result.reason, checks: result.checks || checks } });
     return { ...result, state };
   };
   record("proposed", { result: { ok: null } });
-  state = { ...state, actionLifecycle: proposeActionLifecycle(action, observation) };
+  state = stateWithExecutionEpisode(state, proposeActionLifecycle(action, observation));
   if (!preparedContextCurrent) {
     return denied({
       ...fail(
@@ -662,7 +679,7 @@ function governAction({
       });
     }
     const control = canonicalControlForAction(action, observation.page || {}) || {};
-    const strategyAlreadyFailed = new Set(state.recoveryState?.failedStrategySignatures || [])
+    const strategyAlreadyFailed = new Set(recoveryFacts(state).failedStrategySignatures || [])
       .has(actuatorSignature(action));
     executionLane = agentContract.classifyExecutionLane({
       action,
@@ -702,14 +719,14 @@ function governAction({
     const goal = taskMechanics(state.taskState || {});
     const contract = obligationField(goal, "outcomeContract") || outcomeContractForGoal(goal, observation);
     const parentContract = state.taskState?.stageOutcome?.outcomeContract || obligationField(goal, "parentOutcomeContract") || contract;
-    const explicitMechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || action.physicalEffect || "";
+    const explicitMechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || "";
     const mechanicalEffect = explicitMechanicalEffect || predictPhysicalEffect({
       semantics: normalizedActionSemantics(action, { control: action.targetSnapshot || {}, goal, expectedOutcome: action.expectedOutcome }),
       control: action.targetSnapshot || {},
       candidate: action,
       goal
     });
-    const semanticIntent = action.semanticIntent || semanticIntentForAction({
+    const semanticIntent = action.intent || semanticIntentForAction({
       mechanicalEffect,
       control: action.targetSnapshot || {},
       candidate: action,
@@ -774,7 +791,6 @@ function governAction({
   }
   const governedMechanicalEffect = String(
     action.mechanicalEffect
-    || action.physicalEffect
     || action.affordance?.mechanicalEffect
     || action.affordance?.physicalEffect
     || action.affordance?.effect
@@ -810,7 +826,10 @@ function governAction({
     pass(checks, "DUPLICATE_ACTION_GUARD", reservation.signature);
   }
 
-  state = { ...state, actionLifecycle: approveActionLifecycle(state.actionLifecycle) };
+  state = stateWithExecutionEpisode(
+    state,
+    approveActionLifecycle(executionEpisodeFor(state))
+  );
   record("governed", { result: { ok: true, code: "ALLOWED", checks } });
   return { allow: true, decision: "allowed", code: "ALLOWED", reason: policy.reason, checks, action, state, policy };
 }

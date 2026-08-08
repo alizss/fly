@@ -42,18 +42,14 @@
  * @property {ApprovalState} approvals
  * @property {import("../agent-actions").AgentAction|null} lastAction
  * @property {Object|null} lastVerification
- * @property {AgentFailure[]} failures
  * @property {string[]} traceIds
  * @property {string} currentObservationId
  * @property {string} currentObservationHash
  * @property {Object|null} currentObservation
  * @property {Object|null} taskState
  * @property {Object} observationReadiness
- * @property {Object|null} pendingAction
- * @property {Object|null} actionLifecycle
+ * @property {Object} executionEpisode
  * @property {{candidateSelection?: Object}|null} aiDecisionCache
- * @property {Object} recoveryState
- * @property {Object[]} verifiedResults
  * @property {Object} userPolicy
  * @property {Object} sessionProfileOverrides
  * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}|null} pendingUserInput
@@ -99,25 +95,26 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
       reason: "",
       evidence: null
     },
-    pendingAction: null,
-    actionLifecycle: null,
-    aiDecisionCache: null,
-    recoveryState: {
+    executionEpisode: {
+      contractVersion: "execution-episode/v2",
+      obligationId: "",
+      leasedAction: null,
+      status: "idle",
+      actionId: "",
       attempts: 0,
       phase: "idle",
-      stateHash: "",
       attemptedCandidateIds: [],
       failedStrategies: [],
       failedStrategySignatures: [],
       lastCode: "",
-      lastRevealSample: null,
+      remainingAttempts: 0,
+      deadlineAt: 0,
       updatedAt: ""
     },
-    verifiedResults: [],
+    aiDecisionCache: null,
     approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalApproved: false, priceIncreaseApproved: false },
     lastAction: null,
     lastVerification: null,
-    failures: [],
     traceIds: [],
     currentObservationId: "",
     currentObservationHash: "",
@@ -129,7 +126,12 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
 }
 
 function withUpdate(state, patch) {
-  const merged = { ...state, ...patch, updatedAt: nowIso() };
+  const update = { ...(patch || {}) };
+  const merged = { ...state, ...update, updatedAt: nowIso() };
+  delete merged.pendingAction;
+  delete merged.actionLifecycle;
+  delete merged.recoveryState;
+  delete merged.pendingMechanicalEvidence;
   // One obligation-owned recovery state is authoritative. Remove historical
   // scheduler/diagnostic fields whenever a session advances so old persisted
   // sessions cannot reactivate competing runtime paths.

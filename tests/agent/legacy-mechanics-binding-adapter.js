@@ -1,15 +1,17 @@
 // Historical replay adapter for fixtures that still construct goal-shaped
 // inputs. Production binding accepts only CurrentObligation.
 const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
-const { rawObservationCandidates } = require("../../apps/web/agent/observation-candidates");
+const { rawObservationCandidates: bindRawObservationCandidates } = require("../../apps/web/agent/observation-candidates");
+const { actionForObservationCandidate: bindActionForObservationCandidate } = require("../../apps/web/agent/observation-candidates");
 const {
-  actionForCurrentCandidate,
+  actionForCurrentCandidate: bindActionForCurrentCandidate,
   bindMechanics
 } = require("../../apps/web/agent/current-candidate-builder");
 
 function obligationForLegacyGoal(goal = {}, observation = {}) {
   if (goal?.contractVersion === "current-obligation/v2") return goal;
-  const discoveredControlIds = [...new Set(rawObservationCandidates(observation, goal)
+  const seed = currentObligationFromGoal({ goal });
+  const discoveredControlIds = [...new Set(bindRawObservationCandidates(observation, seed)
     .map((candidate) => candidate.controlId)
     .filter(Boolean))];
   return currentObligationFromGoal({
@@ -20,6 +22,18 @@ function obligationForLegacyGoal(goal = {}, observation = {}) {
         : discoveredControlIds
     }
   });
+}
+
+function rawObservationCandidates(observation = {}, goal = {}) {
+  return bindRawObservationCandidates(observation, obligationForLegacyGoal(goal, observation));
+}
+
+function actionForCurrentCandidate(goal = {}, candidate = {}, observation = {}) {
+  return bindActionForCurrentCandidate(obligationForLegacyGoal(goal, observation), candidate, observation);
+}
+
+function actionForObservationCandidate(goal = {}, candidate = {}, observation = {}) {
+  return bindActionForObservationCandidate(obligationForLegacyGoal(goal, observation), candidate, observation);
 }
 
 function buildCurrentCandidateSet({
@@ -44,17 +58,7 @@ function buildCurrentCandidateSet({
 }
 
 function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedStrategySignatures = [], context = {}) {
-  const discoveredControlIds = [...new Set(rawObservationCandidates(observation, goal)
-    .map((candidate) => candidate.controlId)
-    .filter(Boolean))];
-  const obligation = currentObligationFromGoal({
-    goal: {
-      ...goal,
-      candidateControlIds: goal.candidateControlIds?.length
-        ? goal.candidateControlIds
-        : discoveredControlIds
-    }
-  });
+  const obligation = obligationForLegacyGoal(goal, observation);
   const { __private } = require("../../apps/web/agent/loop");
   return __private.groundedObservationCandidateSet(
     obligation,
@@ -67,7 +71,9 @@ function groundedObservationCandidateSet(goal = {}, observation = {}, attemptedS
 
 module.exports = {
   actionForCurrentCandidate,
+  actionForObservationCandidate,
   bindMechanics,
   buildCurrentCandidateSet,
-  groundedObservationCandidateSet
+  groundedObservationCandidateSet,
+  rawObservationCandidates
 };

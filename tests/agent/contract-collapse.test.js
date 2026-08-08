@@ -13,11 +13,11 @@ test("ActionLease is the sole enumerable execution contract at the HTTP boundary
     type: "click",
     observationId: "obs_1",
     observationHash: "hash_1",
-    goalId: "obligation_1",
+    obligationId: "obligation_1",
     decisionInstanceId: "owner_1",
     candidateId: "candidate_1",
     controlId: "control_1",
-    targetId: "actuator_1",
+    actuatorId: "actuator_1",
     operation: "activate",
     interactionMethod: "trusted",
     semanticEffect: "advance_checkout_stage",
@@ -26,9 +26,8 @@ test("ActionLease is the sole enumerable execution contract at the HTTP boundary
     reason: "Continue"
   });
 
-  // In-process legacy readers still work during the boundary migration.
-  assert.equal(decision.controlId, "control_1");
-  assert.equal(decision.operation, "activate");
+  assert.equal(decision.controlId, undefined);
+  assert.equal(decision.operation, undefined);
   const transported = JSON.parse(JSON.stringify(decision));
   assert.equal(transported.controlId, undefined);
   assert.equal(transported.operation, undefined);

@@ -128,7 +128,7 @@ function actionTargetAliases(action = {}) {
   return [
     action.controlId,
     action.stableKey,
-    action.targetId,
+    action.actuatorId,
     action.visualRef,
     target.controlId,
     target.stableKey,

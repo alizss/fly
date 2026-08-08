@@ -1,8 +1,10 @@
 const {
+  selectNextProfileRequirement
+} = require("./profile-mechanics");
+const {
   profileStageReadiness,
-  selectNextProfileRequirement,
   verifiedProfileComponentMatchesDescriptor
-} = require("./skill-expander");
+} = require("./profile-requirements");
 const { currentSurface, controlBelongsToCurrentSurface } = require("./surface-contract");
 const { outcomeContractForGoal } = require("./action-semantics");
 const { decisionInstanceKey, semanticGoalKey } = require("../../../packages/shared/agent-actions");
@@ -1016,7 +1018,7 @@ function verifiedCommerceObligationFromActionResult(result = null, observationId
     || action.targetSnapshot?.decisionGroupId
     || result.targetSnapshot?.decisionGroupId
   );
-  const semantic = lower(`${task.semanticType || ""} ${action.semanticIntent || result.semanticIntent || ""}`);
+  const semantic = lower(`${task.semanticType || ""} ${action.intent || result.semanticIntent || ""}`);
   const family = clean(episodeOwnsReceipt ? decisionEpisode.family : "") || (/seat/.test(semantic)
     ? "seat"
     : /bag|luggage/.test(semantic)
@@ -1075,7 +1077,7 @@ function verifiedCommerceObligationFromActionResult(result = null, observationId
       mechanicalEffect,
       expectedOutcomeType: clean(postcondition.type),
       expectedDisposition: clean(postcondition.expectedDisposition),
-      semanticIntent: clean(action.semanticIntent || result.semanticIntent)
+      semanticIntent: clean(action.intent || result.semanticIntent)
     })
   });
 }
@@ -2013,7 +2015,7 @@ function verifiedTypedChoiceSurfaceEntry({
   // the nested mechanical action is intentionally smaller. Accept either
   // location so persistence compaction cannot sever an active combobox from
   // the exact option surface it just revealed.
-  const actionGoalId = clean(action.goalId || actionResult.goalId);
+  const actionGoalId = clean(action.obligationId || actionResult.obligationId || actionResult.goalId);
   const actionBelongsToGoal = Boolean(
     actionGoalId
     && clean(obligationField(previousGoal, "goalId"))
@@ -3082,8 +3084,7 @@ function reduceDecisionFrame({
 
   const currentObligation = currentObligationFromGoal({
     goal: currentGoal,
-    decisionFrame: authoritativeDecisionFrame,
-    recoveryState: previousTaskState.recovery || previousTaskState.recoveryState || {}
+    decisionFrame: authoritativeDecisionFrame
   });
   const missingProfileFact = (profileReadiness.missingUserData || [])[0] || null;
   const missingDerivedFact = (profileReadiness.missingDerivedFacts || [])[0] || null;

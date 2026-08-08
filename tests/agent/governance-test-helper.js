@@ -16,7 +16,9 @@ function replayCandidateSet(state = {}, observation = {}, action = null) {
       || visualRegionsMatch(candidate.visualRegion || {}, action.visualRegion || {})
     )
   ))) {
-    candidates = candidates.map((candidate) => candidate.candidateId === action.candidateId ? action : candidate);
+    candidates = candidates.map((candidate) => candidate.candidateId === action.candidateId
+      ? { ...action, targetId: candidate.targetId || action.actuatorId || "" }
+      : candidate);
   }
   return {
     observationId: observation.observationId || "",

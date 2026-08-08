@@ -71,7 +71,6 @@ function priceIncreased(beforePage = {}, afterPage = {}) {
 
 function actionEffect(action = {}) {
   return action.mechanicalEffect
-    || action.physicalEffect
     || action.affordance?.mechanicalEffect
     || action.affordance?.physicalEffect
     || action.affordance?.effect
@@ -80,7 +79,7 @@ function actionEffect(action = {}) {
 
 function crossesIrreversibleBoundary(action = {}) {
   const effect = actionEffect(action);
-  const meaning = text(`${action.type || ""} ${action.intent || ""} ${action.semanticIntent || ""} ${action.risk || ""}`);
+  const meaning = text(`${action.type || ""} ${action.intent || ""} ${action.risk || ""}`);
   const risk = text(action.risk || "");
   return ["select_paid_option", "enter_payment_credentials", "submit_purchase"].includes(effect)
     || ["payment", "purchase", "irreversible"].includes(risk)
@@ -159,7 +158,6 @@ function interveningPaidMutation(beforePage = {}, afterPage = {}, action = {}) {
     || action.affordance?.task?.decisionGroupId
     || "";
   const effect = action.mechanicalEffect
-    || action.physicalEffect
     || action.affordance?.mechanicalEffect
     || action.affordance?.physicalEffect
     || action.affordance?.effect
@@ -408,7 +406,7 @@ function policySafeChoiceTransition(expected = {}, action = {}, beforePage = {},
   );
   const meaning = text([
     expected.expectedDisposition,
-    action.semanticIntent,
+    action.intent,
     action.mechanicalEffect,
     beforeControl.physicalEffect,
     beforeControl.semantic,
@@ -906,7 +904,7 @@ function evaluatePostcondition(
 }
 
 function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}) {
-  const predictedEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || action.physicalEffect || "unknown";
+  const predictedEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || "unknown";
   if (diff.modalOpened) {
     return { effect: "open_surface", verified: true, evidence: { modalOpened: true } };
   }
@@ -946,7 +944,7 @@ function currentObligationResultFor(action = {}, postcondition = {}, localMechan
     || meaningfulDiff(diff)
   );
   return Object.freeze({
-    outcomeId: action.affordance?.task?.surfaceSubgoalId || action.goalId || "",
+    outcomeId: action.affordance?.task?.surfaceSubgoalId || action.obligationId || "",
     taskOutcome,
     status: completed ? "completed" : (progress ? "progress" : "no_progress"),
     completed,
@@ -1100,8 +1098,8 @@ function evaluateTransition({
     interactionRole: actionSemantics.interactionRole,
     semanticEffect: actionSemantics.semanticEffect,
     expectedEvidence: actionSemantics.expectedEvidence,
-    predictedMechanicalEffect: governedAction.mechanicalEffect || governedAction.affordance?.mechanicalEffect || governedAction.affordance?.physicalEffect || governedAction.affordance?.effect || governedAction.physicalEffect || "unknown",
-    predictedPhysicalEffect: governedAction.mechanicalEffect || governedAction.affordance?.mechanicalEffect || governedAction.affordance?.physicalEffect || governedAction.affordance?.effect || governedAction.physicalEffect || "unknown",
+    predictedMechanicalEffect: governedAction.mechanicalEffect || governedAction.affordance?.mechanicalEffect || governedAction.affordance?.physicalEffect || governedAction.affordance?.effect || "unknown",
+    predictedPhysicalEffect: governedAction.mechanicalEffect || governedAction.affordance?.mechanicalEffect || governedAction.affordance?.physicalEffect || governedAction.affordance?.effect || "unknown",
     localMechanicalResult,
     currentObligationResult,
     durableObjectiveProgress,

@@ -1,9 +1,21 @@
 const { evaluateTransition } = require("./transition-evaluator");
 const { decideStage } = require("./task-state-reducer");
-const { actuatorSignature, decisionInstanceKey } = require("../../../packages/shared/agent-actions");
+const {
+  actionFromLease,
+  actuatorSignature,
+  createActionLease,
+  decisionInstanceKey
+} = require("../../../packages/shared/agent-actions");
+const {
+  executionEpisodeFor,
+  leasedActionFor,
+  recoveryFacts,
+  stateWithExecutionEpisode,
+  stateWithRecoveryFacts
+} = require("./execution-episode");
 
 const MAX_RECOVERY_ATTEMPTS = 3;
-const PENDING_ACTION_SCHEMA_VERSION = 2;
+const LEASED_ACTION_VERSION = "leased-action/v1";
 
 const FAILURE_CODE_ALIASES = Object.freeze({
   TARGET_OUTSIDE_FOREGROUND: "TARGET_OUTSIDE_CURRENT_SURFACE"
@@ -29,12 +41,11 @@ function wasDispatched(result = {}) {
   return result.dispatched === true || result.executed === true;
 }
 
-function pendingActionRecord({ action = {}, candidate = null, goal = {}, status = "ready", recoveryAttempts = 0 } = {}) {
-  return {
-    schemaVersion: PENDING_ACTION_SCHEMA_VERSION,
-    originalAction: action,
-    semanticGoal: goal,
-    semanticGoalId: action.goalId || goal.goalId || "",
+function leasedActionRecord({ action = {}, candidate = null, goal = {}, status = "ready", recoveryAttempts = 0 } = {}) {
+  const record = {
+    contractVersion: LEASED_ACTION_VERSION,
+    actionLease: createActionLease(action),
+    obligationId: action.obligationId || goal.obligationId || goal.goalId || "",
     candidateId: action.candidateId || candidate?.candidateId || "",
     candidateStableKey: candidate?.affordance?.stableKey || candidate?.stableKey || action.affordance?.stableKey || "",
     capability: candidate?.operation || action.operation || action.type || "",
@@ -43,20 +54,49 @@ function pendingActionRecord({ action = {}, candidate = null, goal = {}, status 
     sourceObservationId: action.observationId || "",
     sourceObservationHash: action.observationHash || "",
     recoveryAttempts: Number(recoveryAttempts || 0),
-    candidate,
+    candidateIdentity: candidate ? {
+      candidateId: candidate.candidateId || action.candidateId || "",
+      stableKey: candidate.affordance?.stableKey || candidate.stableKey || action.affordance?.stableKey || "",
+      operation: candidate.operation || action.operation || action.type || "",
+      semanticGoal: candidate.semanticGoal || "",
+      decisionGroupId: candidate.decisionGroupId || action.decisionGroupId || "",
+      controlId: candidate.controlId || action.controlId || "",
+      actuatorId: candidate.actuatorId || candidate.targetId || action.actuatorId || "",
+      interactionMethod: candidate.interactionMethod || action.interactionMethod || ""
+    } : null,
     createdAt: new Date().toISOString()
   };
+  Object.defineProperty(record, "originalAction", {
+    value: action,
+    enumerable: false,
+    configurable: false,
+    writable: false
+  });
+  return record;
 }
 
-function normalizePendingAction(pending = null) {
+function normalizeLeasedAction(pending = null) {
   if (!pending || typeof pending !== "object") return null;
-  if (pending.schemaVersion === PENDING_ACTION_SCHEMA_VERSION && pending.originalAction?.id) return pending;
-  // One-way durable-session migration. Runtime code only emits v2 records.
+  if (pending.contractVersion === LEASED_ACTION_VERSION && pending.actionLease?.actionId) {
+    if (pending.originalAction?.id) return pending;
+    const action = actionFromLease(pending.actionLease);
+    if (!action?.id) return null;
+    const hydrated = { ...pending };
+    Object.defineProperty(hydrated, "originalAction", {
+      value: action,
+      enumerable: false,
+      configurable: false,
+      writable: false
+    });
+    return hydrated;
+  }
+  // One-way durable-session migration. Runtime code only emits
+  // leased-action/v1 records containing ActionLease/v1.
   const action = pending.action || pending.recoveryOfAction || {};
-  return pendingActionRecord({
+  return leasedActionRecord({
     action: { ...action, id: pending.actionId || action.id || "" },
-    candidate: pending.candidate || null,
-    goal: pending.goal || { goalId: pending.goalId || "" },
+    candidate: pending.candidateIdentity || pending.candidate || null,
+    goal: { obligationId: pending.obligationId || pending.goalId || "" },
     status: pending.type === "viewport_rebind" || pending.status === "viewport_recovery" || pending.status === "rebind"
       ? "needs_reveal"
       : (pending.status === "approved" ? "ready" : (pending.status || "ready")),
@@ -64,8 +104,8 @@ function normalizePendingAction(pending = null) {
   });
 }
 
-function pendingActionNeedsResult(state = {}, observation = {}) {
-  const pending = normalizePendingAction(state.pendingAction);
+function leasedActionNeedsResult(state = {}, observation = {}) {
+  const pending = normalizeLeasedAction(leasedActionFor(state));
   const actionId = pending?.originalAction?.id || "";
   if (!actionId || pending.status === "needs_reveal") return false;
   return String(observation.lastActionResult?.actionId || "") !== actionId;
@@ -74,14 +114,13 @@ function pendingActionNeedsResult(state = {}, observation = {}) {
 function navigationAction(action = {}) {
   const effect = String(
     action.mechanicalEffect
-      || action.physicalEffect
       || action.affordance?.mechanicalEffect
       || action.affordance?.physicalEffect
       || action.affordance?.effect
       || ""
   ).toLowerCase();
   const expected = String(action.expectedOutcome?.type || "").toLowerCase();
-  const intent = String(`${action.intent || ""} ${action.semanticIntent || ""}`).toLowerCase();
+  const intent = String(action.intent || "").toLowerCase();
   return /advance_surface|advance_checkout_stage/.test(effect)
     || /current_surface_advanced|checkout_stage_advanced|stage_exit/.test(expected)
     || /navigate|advance|continue|next/.test(intent);
@@ -149,25 +188,22 @@ function rejectActionLifecycle(lifecycle = {}, result = {}) {
   };
 }
 
-function recoveryStateFor(state = {}) {
-  const existing = state.recoveryState || {};
-  const migratedAttempts = Math.max(
-    Number(state.groundingRecoveryAttempts || state.staleRecoveryAttempts || 0),
-    Number(state.executionRecoveryAttempts || 0),
-    Number(state.uncertainTransitionCount || 0)
-  );
+function executionRecoveryFor(state = {}) {
+  const existing = recoveryFacts(state);
   return {
-    attempts: Number(existing.attempts ?? migratedAttempts),
+    attempts: Number(existing.attempts || 0),
     phase: String(existing.phase || "idle"),
-    stateHash: String(existing.stateHash || state.unchangedStateHash || ""),
-    attemptedCandidateIds: [...(existing.attemptedCandidateIds || state.attemptedCandidateIds || [])].slice(-24),
-    failedStrategies: [...(existing.failedStrategies || state.failedStrategyMemory || [])].slice(-80),
-    failedStrategySignatures: [...(existing.failedStrategySignatures || state.unchangedStateFailedStrategySignatures || [])],
+    stateHash: String(existing.stateHash || ""),
+    attemptedCandidateIds: [...(existing.attemptedCandidateIds || [])].slice(-24),
+    failedStrategies: [...(existing.failedStrategies || [])].slice(-80),
+    failedStrategySignatures: [...(existing.failedStrategySignatures || [])],
     lastCode: String(existing.lastCode || ""),
     lastRevealSample: existing.lastRevealSample || null,
     outcomeId: String(existing.outcomeId || ""),
     decisionInstanceId: String(existing.decisionInstanceId || ""),
     transitionTrail: [...(existing.transitionTrail || [])].slice(-12),
+    remainingAttempts: Math.max(0, Number(existing.remainingAttempts || 0)),
+    deadlineAt: Math.max(0, Number(existing.deadlineAt || 0)),
     updatedAt: existing.updatedAt || ""
   };
 }
@@ -189,7 +225,7 @@ function semanticStateKey(observation = {}) {
 function registerParentTransition(state = {}, action = {}, transition = {}, beforeObservation = {}, afterObservation = {}) {
   const outcomeId = String(transition.parentProgress?.outcomeId || "");
   if (!outcomeId || transition.parentProgress?.completed === true) return state;
-  const recovery = recoveryStateFor(state);
+  const recovery = executionRecoveryFor(state);
   const from = semanticStateKey(beforeObservation);
   const to = semanticStateKey(afterObservation);
   const strategySignature = actuatorSignature(action);
@@ -208,7 +244,7 @@ function registerParentTransition(state = {}, action = {}, transition = {}, befo
     strategySignature,
     parentProgress: transition.parentProgress.status
   }].slice(-12);
-  return stateWithRecovery(state, {
+  return stateWithExecutionRecovery(state, {
     ...recovery,
     outcomeId,
     transitionTrail,
@@ -220,27 +256,12 @@ function registerParentTransition(state = {}, action = {}, transition = {}, befo
   });
 }
 
-function stateWithRecovery(state = {}, recoveryState = {}) {
-  const {
-    groundingRecoveryAttempts: _groundingRecoveryAttempts,
-    staleRecoveryAttempts: _staleRecoveryAttempts,
-    executionRecoveryAttempts: _executionRecoveryAttempts,
-    uncertainTransitionCount: _uncertainTransitionCount,
-    unchangedStateHash: _unchangedStateHash,
-    unchangedStateFailedStrategySignatures: _unchangedStateFailedStrategySignatures,
-    attemptedCandidateIds: _attemptedCandidateIds,
-    failedStrategyMemory: _failedStrategyMemory,
-    blockedProfileGoalKeys: _blockedProfileGoalKeys,
-    blockedProfilePageStateHash: _blockedProfilePageStateHash,
-    navigationSettling: _navigationSettling,
-    legacyRequirementsDiagnostic: _legacyRequirementsDiagnostic,
-    ...rest
-  } = state;
-  return { ...rest, recoveryState };
+function stateWithExecutionRecovery(state = {}, recovery = {}) {
+  return stateWithRecoveryFacts(state, recovery);
 }
 
-function updateRecoveryState(state = {}, event = {}) {
-  const previous = recoveryStateFor(state);
+function updateExecutionRecovery(state = {}, event = {}) {
+  const previous = executionRecoveryFor(state);
   const next = { ...previous, updatedAt: new Date().toISOString() };
   const kind = String(event.kind || "none");
   const code = String(event.code || "");
@@ -298,9 +319,11 @@ function updateRecoveryState(state = {}, event = {}) {
     classification = "uncertain";
   }
 
+  next.remainingAttempts = Math.max(0, MAX_RECOVERY_ATTEMPTS - next.attempts);
+
   return {
-    state: stateWithRecovery(state, next),
-    recoveryState: next,
+    state: stateWithExecutionRecovery(state, next),
+    recovery: next,
     classification,
     code,
     exhausted: next.attempts >= MAX_RECOVERY_ATTEMPTS
@@ -308,7 +331,7 @@ function updateRecoveryState(state = {}, event = {}) {
 }
 
 function recoverBeforeDispatch({ state = {}, action = {}, code = "PRE_DISPATCH_REJECTION" } = {}) {
-  const recovery = updateRecoveryState(state, { kind: "grounding_rejection", code });
+  const recovery = updateExecutionRecovery(state, { kind: "grounding_rejection", code });
   const lifecycle = {
     ...proposeActionLifecycle(action, { observationId: action.observationId || "" }),
     status: "rejected_before_dispatch",
@@ -316,10 +339,7 @@ function recoverBeforeDispatch({ state = {}, action = {}, code = "PRE_DISPATCH_R
   };
   return {
     ...recovery,
-    state: {
-      ...recovery.state,
-      actionLifecycle: lifecycle
-    },
+    state: stateWithExecutionEpisode(recovery.state, lifecycle),
     lifecycle,
     directive: "rebuild_candidates"
   };
@@ -328,7 +348,7 @@ function recoverBeforeDispatch({ state = {}, action = {}, code = "PRE_DISPATCH_R
 function lifecycleAction(state = {}, result = {}) {
   const resultAction = result.action || {};
   if (state.lastAction?.id && state.lastAction.id === result.actionId) return state.lastAction;
-  const pending = normalizePendingAction(state.pendingAction);
+  const pending = normalizeLeasedAction(leasedActionFor(state));
   if (pending?.originalAction?.id === result.actionId) return pending.originalAction;
   return {
     ...resultAction,
@@ -338,12 +358,12 @@ function lifecycleAction(state = {}, result = {}) {
 }
 
 function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
-  const previous = state.actionLifecycle || {};
+  const previous = executionEpisodeFor(state);
   const sameAction = previous.actionId && previous.actionId === (result.actionId || action.id);
   return {
     actionId: result.actionId || action.id || previous.actionId || "",
     observationId: action.observationId || result.observationId || previous.observationId || "",
-    candidateId: action.candidateId || normalizePendingAction(state.pendingAction)?.candidateId || previous.candidateId || "",
+    candidateId: action.candidateId || normalizeLeasedAction(leasedActionFor(state))?.candidateId || previous.candidateId || "",
     status: sameAction ? previous.status : "proposed",
     approved: sameAction ? previous.approved === true : true,
     dispatched: sameAction ? previous.dispatched === true : false,
@@ -432,7 +452,7 @@ function advanceActionLifecycle({
     return { state, observation, lifecycle: null, transition: null, directive: "continue" };
   }
 
-  const previousLifecycle = state.actionLifecycle || {};
+  const previousLifecycle = executionEpisodeFor(state);
   const samePreviouslyObservedAction = Boolean(
     previousLifecycle.actionId
     && previousLifecycle.actionId === (result.actionId || action.id)
@@ -463,7 +483,7 @@ function advanceActionLifecycle({
       resultCode: canonicalFailureCode(result)
     };
     return {
-      state: { ...state, actionLifecycle: lifecycle },
+      state: stateWithExecutionEpisode(state, lifecycle),
       observation: {
         ...observation,
         lastActionResult: {
@@ -522,7 +542,7 @@ function advanceActionLifecycle({
       transitionStatus: "uncertain"
     };
     return {
-      state: { ...state, actionLifecycle: lifecycle },
+      state: stateWithExecutionEpisode(state, lifecycle),
       observation: {
         ...observation,
         lastActionResult: {
@@ -540,7 +560,7 @@ function advanceActionLifecycle({
   }
 
   const code = canonicalFailureCode(result);
-  let recovery = { state, recoveryState: recoveryStateFor(state), exhausted: false };
+  let recovery = { state, recovery: executionRecoveryFor(state), exhausted: false };
   let lifecycle = baseLifecycle(state, observation, action, result);
   let transition = null;
   let directive = "continue";
@@ -551,7 +571,7 @@ function advanceActionLifecycle({
       lifecycle = { ...lifecycle, status: "unsafe", closed: true, awaitingClarification: false, resultCode: code };
       directive = "stop_for_safety";
     } else {
-      recovery = updateRecoveryState(state, { kind: "grounding_rejection", code: code || "PRE_DISPATCH_REJECTION" });
+      recovery = updateExecutionRecovery(state, { kind: "grounding_rejection", code: code || "PRE_DISPATCH_REJECTION" });
       lifecycle = { ...lifecycle, status: "rejected_before_dispatch", closed: true, awaitingClarification: false, resultCode: code || "PRE_DISPATCH_REJECTION" };
       directive = "rebuild_candidates";
     }
@@ -583,11 +603,11 @@ function advanceActionLifecycle({
     });
     const observed = true;
     if (transition.status === "achieved") {
-      recovery = updateRecoveryState(state, { kind: "verified", code });
+      recovery = updateExecutionRecovery(state, { kind: "verified", code });
       lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, awaitingDestination: false, destinationReadiness: observationReadiness, transitionStatus: "achieved", resultCode: code };
       directive = "advance_goal";
     } else if (transition.status === "progressed") {
-      recovery = updateRecoveryState(state, { kind: "meaningful_progress", code });
+      recovery = updateExecutionRecovery(state, { kind: "meaningful_progress", code });
       lifecycle = {
         ...lifecycle,
         status: "observed",
@@ -615,7 +635,7 @@ function advanceActionLifecycle({
       const reconciliationCode = rebuildFromCurrentState
         ? (transition.causality?.code || "FRESH_STATE_RECONCILIATION_REQUIRED")
         : code;
-      recovery = updateRecoveryState(state, {
+      recovery = updateExecutionRecovery(state, {
         kind: "meaningful_progress",
         code: reconciliationCode
       });
@@ -647,7 +667,7 @@ function advanceActionLifecycle({
       const signature = actuatorSignature(action);
       const decisionInstanceId = action.decisionInstanceId
         || decisionInstanceKey(action, previousObservation || observation);
-      recovery = updateRecoveryState(state, {
+      recovery = updateExecutionRecovery(state, {
         kind: "execution_no_effect",
         code: "TRANSITION_NO_EFFECT",
         stateHash,
@@ -663,7 +683,7 @@ function advanceActionLifecycle({
       lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "unsafe", resultCode: code };
       directive = "stop_for_safety";
     } else {
-      recovery = updateRecoveryState(state, { kind: "uncertain", code });
+      recovery = updateExecutionRecovery(state, { kind: "uncertain", code });
       lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: false, awaitingClarification: true, transitionStatus: "uncertain", resultCode: code };
       directive = "reobserve_rebind";
     }
@@ -672,7 +692,7 @@ function advanceActionLifecycle({
   const parentTrackedState = transition
     ? registerParentTransition(recovery.state, action, transition, previousObservation || {}, observation)
     : recovery.state;
-  const nextState = { ...parentTrackedState, actionLifecycle: lifecycle };
+  const nextState = stateWithExecutionEpisode(parentTrackedState, lifecycle);
   return {
     state: nextState,
     observation: { ...observation, lastActionResult: transitionResult(result, transition), transitionEvaluation: transition || undefined },
@@ -688,14 +708,14 @@ module.exports = {
   approveActionLifecycle,
   advanceActionLifecycle,
   canonicalFailureCode,
-  normalizePendingAction,
-  pendingActionNeedsResult,
-  pendingActionRecord,
-  PENDING_ACTION_SCHEMA_VERSION,
+  normalizeLeasedAction,
+  leasedActionNeedsResult,
+  leasedActionRecord,
+  LEASED_ACTION_VERSION,
   proposeActionLifecycle,
   recoverBeforeDispatch,
-  recoveryStateFor,
+  executionRecoveryFor,
   rejectActionLifecycle,
-  updateRecoveryState,
+  updateExecutionRecovery,
   wasDispatched
 };

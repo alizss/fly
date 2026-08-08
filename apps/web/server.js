@@ -72,7 +72,6 @@ function summarizeAgentSession(session) {
       missing: (session.taskState?.activeDecisions || []).filter((decision) => decision.required === true).length
         + (session.taskState?.validationBlockers || []).length
     },
-    failures: session.failures || [],
     events: []
   };
 }

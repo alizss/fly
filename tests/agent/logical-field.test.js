@@ -10,11 +10,11 @@ const {
   verifyLogicalField
 } = require("../../apps/web/agent/logical-field");
 const {
-  fieldDescriptors,
   selectNextProfileRequirement,
   candidatesForProfileGoal,
   profileGoalSatisfied
-} = require("../../apps/web/agent/skill-expander");
+} = require("../../apps/web/agent/profile-mechanics");
+const { fieldDescriptors } = require("../../apps/web/agent/profile-requirements");
 const { evaluatePostcondition } = require("../../apps/web/agent/transition-evaluator");
 const { semanticGoalKey, decisionInstanceKey } = require("../../packages/shared/agent-actions");
 

@@ -89,6 +89,15 @@ function obligationField(obligation = null, field = "") {
   }
 }
 
+function currentObligationValue(obligation = null, field = "") {
+  if (!isCurrentObligation(obligation)) {
+    const error = new Error("CURRENT_OBLIGATION_REQUIRED");
+    error.code = "CURRENT_OBLIGATION_REQUIRED";
+    throw error;
+  }
+  return obligationField(obligation, field);
+}
+
 function semanticOwner(obligation = null) {
   if (!isCurrentObligation(obligation)) return null;
   const subject = obligation.subject || {};
@@ -105,6 +114,7 @@ function semanticOwner(obligation = null) {
 
 module.exports = {
   CURRENT_OBLIGATION_VERSION,
+  currentObligationValue,
   isCurrentObligation,
   obligationField,
   semanticOwner

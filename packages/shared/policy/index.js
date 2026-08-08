@@ -76,7 +76,6 @@ function looksLikePaidExtraSelection(action) {
   const target = action.targetSnapshot || {};
   const typedEffect = String(
     action.mechanicalEffect
-    || action.physicalEffect
     || action.affordance?.mechanicalEffect
     || action.affordance?.physicalEffect
     || action.affordance?.effect

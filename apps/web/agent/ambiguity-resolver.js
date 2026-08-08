@@ -1,4 +1,7 @@
-const { resolveActiveComponentSemantics } = require("./active-component-grounding");
+const {
+  resolveActiveComponentSemantics,
+  unknownComponentsForObligation
+} = require("./active-component-grounding");
 const { selectCandidate } = require("./select-candidate");
 
 // One production model boundary for bounded ambiguity. The caller may request
@@ -29,4 +32,7 @@ async function resolveAmbiguity(request = {}) {
   throw error;
 }
 
-module.exports = { resolveAmbiguity };
+module.exports = {
+  resolveAmbiguity,
+  unknownComponentsForObligation
+};

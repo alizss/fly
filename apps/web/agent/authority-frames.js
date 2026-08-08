@@ -1,6 +1,6 @@
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { factsFromObservation } = require("./transaction-facts");
-const { fieldDescriptors } = require("./skill-expander");
+const { fieldDescriptors } = require("./profile-requirements");
 const { buildCanonicalDecisions } = require("./canonical-decision");
 
 const OBSERVATION_FRAME_VERSION = "observation-frame/v2";
@@ -201,16 +201,11 @@ function assertObligationConformance({ goal = {}, controls = [], successConditio
   }
 }
 
-function currentObligationFromGoal({ goal = null, decisionFrame = null, recoveryState = {} } = {}) {
+function currentObligationFromGoal({ goal = null, decisionFrame = null } = {}) {
   if (!goal) return null;
   const controls = admittedControlIds(goal);
   const successCondition = goal.successCondition || goal.postcondition || goal.outcomeContract || {};
   assertObligationConformance({ goal, controls, successCondition });
-  const maxAttempts = Math.max(1, Number(
-    goal.recoveryBudget?.maxAttempts
-    || goal.adaptiveEnvelope?.remainingSteps
-    || 3
-  ));
   const binding = Object.freeze({
     component: Object.freeze({
       semanticType: clean(goal.semanticType),
@@ -296,12 +291,7 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null, recovery
       reason: clean(goal.admission?.reason || goal.ambiguity?.code || "authoritative_current_obligation")
     }),
     risk: clean(goal.riskClass || goal.risk || "reversible"),
-    successCondition: Object.freeze({ ...successCondition }),
-    recoveryBudget: Object.freeze({
-      maxAttempts,
-      attemptedStrategies: Number(recoveryState.attempts || 0),
-      remainingAttempts: Math.max(0, maxAttempts - Number(recoveryState.attempts || 0))
-    })
+    successCondition: Object.freeze({ ...successCondition })
   };
   obligation.binding = binding;
   return Object.freeze(obligation);

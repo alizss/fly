@@ -5,7 +5,7 @@ const {
 const {
   actionForProfileCandidate,
   candidatesForProfileGoal
-} = require("./skill-expander");
+} = require("./profile-mechanics");
 const {
   controlBelongsToCurrentSurface,
   surfaceBinding
@@ -25,7 +25,7 @@ const {
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { canonicalOptionMatch } = require("./logical-field");
 const { CURRENT_OBLIGATION_VERSION } = require("./authority-frames");
-const { obligationField, semanticOwner } = require("./current-obligation");
+const { currentObligationValue: obligationField, semanticOwner } = require("./current-obligation");
 
 function candidateOperation(candidate = {}) {
   return candidate.authorizedOperation
@@ -312,25 +312,9 @@ function allCurrentCapabilityCandidates(goal = {}, observation = {}, traveler = 
   const goalCandidates = obligationField(goal, "kind") === "profile_field"
     ? candidatesForProfileGoal(goal, observation, traveler, [], { includeAlternates: true })
     : buildObservationCandidateSet(goal, observation).candidates;
-  const contextGoal = {
-    ...goal,
-    kind: "",
-    semanticType: "surface_ambiguity",
-    selectionMode: "ai_ambiguity",
-    decisionGroupId: "",
-    requirementId: "",
-    eligibleAlternativeControlIds: [],
-    freeAlternativeControlIds: [],
-    paidAlternativeControlIds: []
-  };
-  const surfaceCandidates = buildObservationCandidateSet(contextGoal, observation).candidates;
-  const byCapability = new Map(surfaceCandidates.map((candidate) => [capabilityKey(candidate), candidate]));
-  // Goal-specific candidates replace the contextual version of the same
-  // capability so their typed postcondition remains authoritative.
-  for (const candidate of goalCandidates) byCapability.set(capabilityKey(candidate), candidate);
   return {
     goalCandidateKeys: new Set(goalCandidates.map(capabilityKey)),
-    candidates: [...byCapability.values()]
+    candidates: goalCandidates
   };
 }
 
@@ -386,19 +370,15 @@ function localMechanicalEffect(goal = {}, candidate = {}, control = {}) {
 }
 
 function buildCurrentCandidateSet({
-  goal = null,
+  obligation,
   observation = {},
   traveler = {},
   state = {},
   approvals = {},
-  obligation = state.taskState?.currentObligation || null,
   attemptedCandidateIds = [],
   attemptedStrategySignatures = []
 } = {}) {
-  // The obligation is authoritative whenever present. `goal` remains only as
-  // a standalone test/replay input; production binding consumes the explicit
-  // obligation mechanics and never reconstructs a hidden semantic goal.
-  goal = obligation || goal || {};
+  const goal = obligation;
   const binding = surfaceBinding(observation);
   const page = observation.page || {};
   const attempted = new Set(attemptedCandidateIds || []);
@@ -440,7 +420,7 @@ function buildCurrentCandidateSet({
     const profileChoiceQuery = obligationField(goal, "kind") === "profile_field"
       && control.role === "editable_combobox"
       && ["type", "keyboard"].includes(candidateOperation(bound));
-    const observedAdaptiveEffect = normalizedMeaning(bound.physicalEffect || control.physicalEffect || "unknown");
+    const observedAdaptiveEffect = normalizedMeaning(bound.mechanicalEffect || bound.physicalEffect || control.physicalEffect || "unknown");
     const physicalEffect = profileChoiceQuery
       ? "filter_options"
       : adaptiveExactMatch || exactProfileOption
@@ -510,7 +490,7 @@ function buildCurrentCandidateSet({
     const compiledExpectedOutcome = compileTypedExpectedOutcome({
       ...bound,
       expectedOutcome: exactComponentExpectedOutcome,
-      physicalEffect,
+      mechanicalEffect: physicalEffect,
       goal: { ...goal, outcomeContract }
     }, page);
     const expectedOutcome = adaptiveExactMatch || exactProfileOption ? {
@@ -830,7 +810,6 @@ function buildCurrentCandidateSet({
   return {
     ...binding,
     obligationId: obligation?.obligationId || obligationField(goal, "goalId") || "",
-    mechanicContract: goal,
     // Context is complete; selection is policy-safe. The model can understand
     // blocked controls without receiving their IDs in its selectable enum.
     contextCapabilities,
@@ -874,10 +853,10 @@ function bindMechanics({
   });
 }
 
-function actionForCurrentCandidate(goal = {}, candidate = {}, observation = {}) {
-  const action = obligationField(goal, "kind") === "profile_field"
-    ? actionForProfileCandidate(goal, candidate, observation)
-    : actionForObservationCandidate(goal, candidate, observation);
+function actionForCurrentCandidate(obligation = {}, candidate = {}, observation = {}) {
+  const action = obligationField(obligation, "kind") === "profile_field"
+    ? actionForProfileCandidate(obligation, candidate, observation)
+    : actionForObservationCandidate(obligation, candidate, observation);
   const semanticOwnershipLinkId = candidate.semanticOwnershipLinkId
     || candidate.expectedOutcome?.semanticOwnershipLinkId
     || action.semanticOwnershipLinkId
@@ -888,7 +867,7 @@ function actionForCurrentCandidate(goal = {}, candidate = {}, observation = {}) 
     || "";
   return {
     ...action,
-    semanticOwner: semanticOwner(goal),
+    semanticOwner: semanticOwner(obligation),
     semanticOwnershipLinkId,
     policyCorrectionForDecisionGroupId,
     candidateId: candidate.candidateId,
@@ -896,16 +875,15 @@ function actionForCurrentCandidate(goal = {}, candidate = {}, observation = {}) 
     mechanicalHypothesis: candidate.mechanicalHypothesis === true || action.mechanicalHypothesis === true,
     discoveryEnvelope: candidate.discoveryEnvelope || action.discoveryEnvelope || null,
     logicalControlId: candidate.logicalControlId || candidate.controlId || action.logicalControlId || action.controlId || "",
-    actuatorId: candidate.actuatorId || candidate.targetId || action.actuatorId || action.targetId || "",
+    actuatorId: candidate.actuatorId || candidate.targetId || action.actuatorId || "",
     observationId: candidate.observationId || action.observationId,
     observationHash: candidate.observationHash || action.observationHash,
     surfaceId: candidate.surfaceId || action.surfaceId || "",
     interactionRole: candidate.interactionRole || action.interactionRole || "",
-    semanticEffect: candidate.semanticEffect || action.semanticEffect || "",
+    semanticEffect: candidate.semanticEffect || candidate.semanticIntent || action.semanticEffect || "",
     expectedEvidence: candidate.expectedEvidence || action.expectedEvidence || "",
-    physicalEffect: candidate.physicalEffect || candidate.affordance?.physicalEffect || action.affordance?.physicalEffect || "",
     mechanicalEffect: candidate.mechanicalEffect || candidate.physicalEffect || candidate.affordance?.mechanicalEffect || action.affordance?.mechanicalEffect || "",
-    semanticIntent: candidate.semanticIntent || action.semanticIntent || action.intent || "",
+    intent: action.intent || "",
     expectedPostconditions: candidate.expectedPostconditions || action.expectedPostconditions || (candidate.expectedOutcome ? [candidate.expectedOutcome] : []),
     localMechanicalPostcondition: candidate.localMechanicalPostcondition || candidate.expectedOutcome || action.expectedOutcome || null,
     obligationSuccessCondition: candidate.obligationSuccessCondition || candidate.outcomeContract || action.obligationSuccessCondition || null,

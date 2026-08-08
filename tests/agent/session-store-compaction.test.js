@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const { compactSessionState, createStore } = require("../../apps/web/agent/session-store");
 const { createCheckoutSessionState, withUpdate } = require("../../packages/shared/agent-state");
+const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 
 test("session persistence keeps semantic facts and removes ephemeral candidate graphs", () => {
   const store = createStore({ dbPath: ":memory:" });
@@ -64,8 +65,8 @@ test("session persistence keeps semantic facts and removes ephemeral candidate g
 
 test("compact persistence preserves the target-local identity required to suppress a failed strategy", () => {
   const store = createStore({ dbPath: ":memory:" });
-  const state = withUpdate(createCheckoutSessionState({ goal: "Reach payment review" }), {
-    recoveryState: {
+  const state = withExecutionFixture(createCheckoutSessionState({ goal: "Reach payment review" }), {
+    recovery: {
       phase: "execution_no_effect",
       attempts: 1,
       failedStrategies: [{
@@ -92,7 +93,7 @@ test("compact persistence preserves the target-local identity required to suppre
   });
 
   store.saveSession(state);
-  const [failure] = store.getSession(state.id).recoveryState.failedStrategies;
+  const [failure] = recovery(store.getSession(state.id)).failedStrategies;
 
   assert.deepEqual(failure, {
     goalKey: "seat-selection@seat-surface",
@@ -116,27 +117,28 @@ test("compact persistence preserves the target-local identity required to suppre
 });
 
 test("one durable execution episode replaces parallel lifecycle and recovery copies", () => {
-  const state = withUpdate(createCheckoutSessionState({ goal: "Reach payment review" }), {
+  const state = withExecutionFixture(withUpdate(createCheckoutSessionState({ goal: "Reach payment review" }), {
     taskState: {
       stage: "extras",
       currentObligation: {
         contractVersion: "current-obligation/v2",
         obligationId: "obligation_skip_bags",
-        recoveryBudget: { remainingAttempts: 2 },
         mechanics: { candidateControlIds: ["skip_bags"], legacyGoalGraph: { large: true } }
       }
-    },
-    pendingAction: {
+    }
+  }), {
+    leasedAction: {
       semanticGoalId: "obligation_skip_bags",
       originalAction: { id: "action_skip_bags", type: "click", controlId: "skip_bags" }
     },
-    actionLifecycle: { status: "dispatched", actionId: "action_skip_bags" },
-    recoveryState: {
+    lifecycle: { status: "dispatched", actionId: "action_skip_bags" },
+    recovery: {
       phase: "execution_no_effect",
       attempts: 1,
+      remainingAttempts: 2,
       failedStrategySignatures: ["trusted:activate:skip_bags"]
     },
-    pendingMechanicalEvidence: { kind: "goal_strategies_exhausted", controlId: "skip_bags" }
+    mechanicalEvidence: { kind: "goal_strategies_exhausted", controlId: "skip_bags" }
   });
 
   const compacted = compactSessionState(state);
@@ -146,12 +148,13 @@ test("one durable execution episode replaces parallel lifecycle and recovery cop
   assert.equal(compacted.recoveryState, undefined);
   assert.equal(compacted.pendingMechanicalEvidence, undefined);
   assert.equal(compacted.taskState.currentObligation.mechanics, undefined);
-  assert.equal(compacted.executionEpisode.contractVersion, "execution-episode/v1");
+  assert.equal(compacted.executionEpisode.contractVersion, "execution-episode/v2");
   assert.equal(compacted.executionEpisode.obligationId, "obligation_skip_bags");
   assert.equal(compacted.executionEpisode.status, "dispatched");
-  assert.equal(compacted.executionEpisode.leasedAction.originalAction.id, "action_skip_bags");
-  assert.deepEqual(compacted.executionEpisode.lifecycle, { status: "dispatched", actionId: "action_skip_bags" });
-  assert.deepEqual(compacted.executionEpisode.attemptedStrategySignatures, ["trusted:activate:skip_bags"]);
+  assert.equal(compacted.executionEpisode.leasedAction.originalAction, undefined);
+  assert.equal(compacted.executionEpisode.leasedAction.actionLease.actionId, "action_skip_bags");
+  assert.equal(compacted.executionEpisode.leasedAction.actionLease.contractVersion, "action-lease/v1");
+  assert.deepEqual(compacted.executionEpisode.failedStrategySignatures, ["trusted:activate:skip_bags"]);
   assert.equal(compacted.executionEpisode.attempts, 1);
   assert.equal(compacted.executionEpisode.remainingAttempts, 2);
   assert.deepEqual(compacted.executionEpisode.mechanicalEvidence, {

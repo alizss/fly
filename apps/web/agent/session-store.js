@@ -3,8 +3,11 @@ const path = require("path");
 const { DatabaseSync } = require("node:sqlite");
 
 const { createCheckoutSessionState, withUpdate } = require("../../../packages/shared/agent-state");
-const { actionSignature, actuatorSignature, normalizeAction, semanticGoalKey } = require("../../../packages/shared/agent-actions");
-const { currentObligation } = require("./authority-frames");
+const {
+  actionSignature,
+  createActionLease
+} = require("../../../packages/shared/agent-actions");
+const { executionEpisodeFor, normalizeExecutionEpisode } = require("./execution-episode");
 
 const LEGACY_REPLAY_DB_PATH = path.resolve(__dirname, "../../../work/agent-transactions.sqlite");
 const DEFAULT_DB_PATH = process.env.ATW_TRANSACTION_DB
@@ -107,10 +110,10 @@ function governedActionSummary(action = {}) {
         capabilityId: String(capability.capabilityId || ""),
         operation: String(capability.operation || action.operation || ""),
         status: String(capability.status || ""),
-        actuatorId: String(capability.actuatorId || action.targetId || ""),
+        actuatorId: String(capability.actuatorId || action.actuatorId || ""),
         selectedStrategy: selectedStrategy && typeof selectedStrategy === "object" ? {
           operation: String(selectedStrategy.operation || action.operation || ""),
-          actuatorId: String(selectedStrategy.actuatorId || action.targetId || ""),
+          actuatorId: String(selectedStrategy.actuatorId || action.actuatorId || ""),
           method: String(selectedStrategy.method || action.interactionMethod || ""),
           actionType: String(selectedStrategy.actionType || action.type || ""),
           status: String(selectedStrategy.status || ""),
@@ -301,36 +304,37 @@ function compactRecoveryState(recovery = null) {
 
 function compactPendingAction(pending = null) {
   if (!pending || typeof pending !== "object") return pending || null;
+  const { originalAction, schemaVersion: _legacySchemaVersion, ...canonical } = pending;
   return eventSummary({
-    ...pending,
-    originalAction: pending.originalAction ? governedActionSummary(pending.originalAction) : undefined,
-    semanticGoal: pending.semanticGoal ? eventSummary(pending.semanticGoal) : undefined,
-    candidate: pending.candidate ? eventSummary(pending.candidate) : undefined
+    ...canonical,
+    contractVersion: "leased-action/v1",
+    actionLease: pending.actionLease || (originalAction ? createActionLease(originalAction) : null),
+    candidateIdentity: pending.candidateIdentity ? eventSummary(pending.candidateIdentity) : undefined
   });
 }
 
 function compactExecutionEpisode(state = {}) {
   const obligation = state.taskState?.currentObligation || null;
-  const recovery = compactRecoveryState(state.recoveryState);
-  const lifecycle = eventSummary(state.actionLifecycle || null);
-  const pending = compactPendingAction(state.pendingAction);
-  if (!obligation && !pending && !lifecycle && !recovery?.attempts && !state.pendingMechanicalEvidence) return null;
+  const current = executionEpisodeFor(state);
+  const recovery = compactRecoveryState(current);
+  const pending = compactPendingAction(current.leasedAction);
+  if (!obligation && !pending && current.status === "idle" && !recovery?.attempts && !current.mechanicalEvidence) return null;
   return {
-    contractVersion: "execution-episode/v1",
-    obligationId: String(obligation?.obligationId || pending?.semanticGoalId || ""),
+    ...eventSummary(current),
+    contractVersion: "execution-episode/v2",
+    obligationId: String(obligation?.obligationId || current.obligationId || pending?.obligationId || ""),
     leasedAction: pending,
-    status: String(lifecycle?.status || recovery?.phase || (pending ? "leased" : "idle")),
-    lifecycle,
-    attemptedStrategies: eventSummary(recovery?.failedStrategies || []),
-    attemptedStrategySignatures: eventSummary(recovery?.failedStrategySignatures || []),
+    status: String(current.status || recovery?.phase || (pending ? "leased" : "idle")),
+    failedStrategies: eventSummary(recovery?.failedStrategies || []),
+    failedStrategySignatures: eventSummary(recovery?.failedStrategySignatures || []),
     attemptedCandidateIds: eventSummary(recovery?.attemptedCandidateIds || []),
     staleRebind: eventSummary(recovery?.staleRebind || null),
     attempts: Math.max(0, Number(recovery?.attempts || 0)),
-    remainingAttempts: Math.max(0, Number(obligation?.recoveryBudget?.remainingAttempts || 0)),
+    remainingAttempts: Math.max(0, Number(current.remainingAttempts || 0)),
     stateHash: String(recovery?.stateHash || ""),
     lastCode: String(recovery?.lastCode || ""),
     lastRevealSample: eventSummary(recovery?.lastRevealSample || null),
-    mechanicalEvidence: eventSummary(state.pendingMechanicalEvidence || null),
+    mechanicalEvidence: eventSummary(current.mechanicalEvidence || null),
     updatedAt: String(recovery?.updatedAt || state.updatedAt || "")
   };
 }
@@ -351,13 +355,11 @@ function compactSessionState(state = {}) {
     site: eventSummary(state.site || {}),
     approvals: eventSummary(state.approvals || {}),
     lastAction: state.lastAction ? governedActionSummary(state.lastAction) : null,
-    failures: eventSummary((state.failures || []).slice(-80)),
     currentObservationId: String(state.currentObservationId || ""),
     currentObservationHash: String(state.currentObservationHash || ""),
     taskState: compactTaskState(state.taskState),
     observationReadiness: eventSummary(state.observationReadiness || null),
     executionEpisode: compactExecutionEpisode(state),
-    verifiedResults: eventSummary((state.verifiedResults || []).slice(-160)),
     transactionInvariants: compactTransactionInvariants(state.transactionInvariants),
     paymentState: eventSummary(state.paymentState || {}),
     stallCount: Math.max(0, Number(state.stallCount || 0)),
@@ -448,25 +450,29 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     }
     delete parsed.terminalGoalLatch;
     delete parsed.confirmationState;
-    const episode = parsed.executionEpisode || null;
-    if (episode) {
-      parsed.pendingAction = episode.leasedAction || null;
-      parsed.actionLifecycle = episode.lifecycle || null;
-      parsed.recoveryState = {
-        attempts: Math.max(0, Number(episode.attempts || 0)),
-        phase: episode.status || "idle",
-        stateHash: episode.stateHash || "",
-        attemptedCandidateIds: episode.attemptedCandidateIds || [],
-        failedStrategies: episode.attemptedStrategies || [],
-        failedStrategySignatures: episode.attemptedStrategySignatures || [],
-        staleRebind: episode.staleRebind || null,
-        lastCode: episode.lastCode || "",
-        lastRevealSample: episode.lastRevealSample || null,
-        updatedAt: episode.updatedAt || ""
-      };
-      parsed.pendingMechanicalEvidence = episode.mechanicalEvidence || null;
-    }
-    delete parsed.executionEpisode;
+    const episode = parsed.executionEpisode || (
+      parsed.pendingAction || parsed.actionLifecycle || parsed.recoveryState || parsed.pendingMechanicalEvidence
+        ? {
+            ...(parsed.actionLifecycle || {}),
+            ...(parsed.recoveryState || {}),
+            leasedAction: parsed.pendingAction || null,
+            mechanicalEvidence: parsed.pendingMechanicalEvidence || null
+          }
+        : null
+    );
+    parsed.executionEpisode = normalizeExecutionEpisode(episode
+      ? {
+          ...(episode.lifecycle || {}),
+          ...episode,
+          phase: episode.phase || episode.status || "idle",
+          failedStrategies: episode.failedStrategies || episode.attemptedStrategies || [],
+          failedStrategySignatures: episode.failedStrategySignatures || episode.attemptedStrategySignatures || []
+        }
+      : null);
+    delete parsed.pendingAction;
+    delete parsed.actionLifecycle;
+    delete parsed.recoveryState;
+    delete parsed.pendingMechanicalEvidence;
     delete parsed.currentStep;
     return parsed;
   }
@@ -656,96 +662,14 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     return { ...row, action: parse(row.action_json, null), result: parse(row.result_json, null) };
   }
 
-  function actionAttemptFromResult(result = {}) {
-    const reportedAction = result.action || {};
-    const target = result.targetSnapshot || {};
-    return normalizeAction({
-      id: result.actionId || reportedAction.id || "",
-      observationId: result.observationId || reportedAction.observationId || "",
-      observationHash: result.observationHash || reportedAction.observationHash || "",
-      type: reportedAction.action || reportedAction.type || "",
-      operation: result.operation || reportedAction.operation || "",
-      controlId: reportedAction.controlId || target.controlId || "",
-      targetId: reportedAction.targetId || target.id || "",
-      targetSnapshot: target,
-      value: reportedAction.value || "",
-      affordance: reportedAction.affordance || null,
-      semanticEffect: reportedAction.semanticEffect || "",
-      goalId: reportedAction.goalId || "",
-      decisionInstanceId: result.decisionInstanceId || reportedAction.decisionInstanceId || "",
-      requirementId: reportedAction.requirementId || ""
-    });
-  }
-
-  function failureFromResult(result = {}, state = {}) {
-    if (result.verified === true) return null;
-    const code = String(result.outcome?.code || result.code || "");
-    const provenNoEffectCodes = new Set([
-      "NO_OBSERVABLE_CHANGE",
-      "NO_OBSERVABLE_STAGE_CHANGE",
-      "TRANSITION_NO_EFFECT"
-    ]);
-    const staleCodes = new Set([
-      "OBSERVATION_HASH_MISMATCH",
-      "STALE_OBSERVATION",
-      "PAGE_CHANGED_BEFORE_ACTION",
-      "TARGET_OBSERVATION_DRIFT"
-    ]);
-    if (staleCodes.has(code)) return null;
-    const attempted = result.dispatched === true || result.executed === true;
-    if (!attempted) return null;
-    if (!provenNoEffectCodes.has(code)) return null;
-    const action = actionAttemptFromResult(result);
-    if (!action.decisionInstanceId) return null;
-    if (!["click", "type", "select", "click_xy", "keypress"].includes(action.type)) return null;
-    const signature = actuatorSignature(action);
-    const failedObservation = getObservation(state.id, result.observationId || action.observationId);
-    const pageStateHash = String(
-      result.pageStateHash
-      || result.observationHash
-      || action.observationHash
-      || failedObservation?.observationSnapshot?.snapshotHash
-      || failedObservation?.page?.snapshotHash
-      || ""
-    );
-    return {
-      at: String(result.at || nowIso()),
-      actionSignature: actionSignature(action),
-      actuatorSignature: signature,
-      goalKey: semanticGoalKey(action.affordance?.task
-        ? action
-        : (currentObligation(state.taskState || {}) || action)),
-      decisionInstanceId: action.decisionInstanceId,
-      actionId: String(result.actionId || action.id || ""),
-      observationId: String(result.observationId || ""),
-      pageStateHash,
-      controlId: String(action.controlId || ""),
-      targetId: String(action.targetId || ""),
-      operation: String(action.operation || ""),
-      code: code || "OUTCOME_NOT_VERIFIED",
-      message: String(result.outcome?.message || result.outcome?.reason || result.message || "The actuator did not produce its governed outcome.").slice(0, 500)
-    };
-  }
-
   function recordActionResult(transactionId, result = {}, patch = {}) {
     const state = getSession(transactionId);
     if (!state) return null;
-    const failure = failureFromResult(result, state);
-    const failures = [...(state.failures || [])];
-    if (failure && !failures.some((item) => (
-      item.actuatorSignature === failure.actuatorSignature
-      && item.goalKey === failure.goalKey
-      && item.decisionInstanceId === failure.decisionInstanceId
-      && item.pageStateHash === failure.pageStateHash
-    ))) {
-      failures.push(failure);
-    }
     db.exec("BEGIN IMMEDIATE");
     try {
       const updated = saveSession(withUpdate(state, {
         ...patch,
-        lastActionResult: result,
-        failures: failures.slice(-80)
+        lastActionResult: result
       }));
       const actionId = String(result.actionId || result.action?.id || "");
       if (actionId) {

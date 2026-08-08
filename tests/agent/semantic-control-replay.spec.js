@@ -3,22 +3,25 @@ const path = require("node:path");
 const { test, expect } = require("@playwright/test");
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const {
-  fieldDescriptors,
   selectNextProfileRequirement,
   profileGoalSatisfied,
-  profileStageReadiness,
   candidatesForProfileGoal,
   actionForProfileCandidate
-} = require("../../apps/web/agent/skill-expander");
+} = require("../../apps/web/agent/profile-mechanics");
+const {
+  fieldDescriptors,
+  profileStageReadiness
+} = require("../../apps/web/agent/profile-requirements");
 const { runLoopTurn: runRawLoopTurn, toClientDecision: toRawClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { executableDecisionFromActionLease } = require("./action-lease-replay-adapter");
 const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const {
   actionForObservationCandidate
-} = require("../../apps/web/agent/observation-candidates");
+} = require("./legacy-mechanics-binding-adapter");
 const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
-const { advanceActionLifecycle, pendingActionRecord } = require("../../apps/web/agent/action-lifecycle");
+const { advanceActionLifecycle, leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
+const { leasedAction, recovery: executionRecovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 const { sanitizedActionHistory } = require("./legacy-model-context-adapter");
 const { resolvePlannerSelection } = require("./legacy-planner-replay-adapter");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
@@ -480,7 +483,7 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
     observationHash: initial.observationSnapshot.snapshotHash
   };
   state.lastAction = { id: "act_first_scroll", type: "scroll" };
-  state.recoveryState = {
+  state = withExecutionFixture(state, { recovery: {
     attempts: 0,
     phase: "reveal",
     stateHash: "",
@@ -495,14 +498,14 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
         - Number(initial.page.viewport?.height || 0)
       ))
     }
-  };
-  state.pendingAction = pendingActionRecord({
+  } });
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
     action: { ...originalClick, targetSnapshot: null, expectedOutcome: null },
     goal: currentGoal,
     candidate: pendingCandidate,
     status: "needs_reveal",
     recoveryAttempts: 1
-  });
+  }) });
 
   const firstMovement = await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
@@ -552,8 +555,8 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
   expect(retry.clientDecision.action).toBe("scroll");
   expect(retry.clientDecision.expectedOutcome.attempt).toBe(2);
   expect(retry.clientDecision.expectedOutcome.scrollStrategy).toBe("target_center");
-  expect(retry.state.pendingAction.recoveryAttempts).toBe(2);
-  expect(retry.state.recoveryState.attempts).toBe(1);
+  expect(leasedAction(retry.state).recoveryAttempts).toBe(2);
+  expect(executionRecovery(retry.state).attempts).toBe(1);
   expect(retry.debug.modelUsage.calls).toHaveLength(0);
 
   await page.evaluate((decision) => {
@@ -596,9 +599,9 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
     JSON.stringify({ decision: resumed.clientDecision, state: resumed.state, debug: resumed.debug }, null, 2)
   ).toBe("click");
   expect(resumed.clientDecision.controlId).toBe(decline.controlId);
-  expect(resumed.state.pendingAction.schemaVersion).toBe(2);
-  expect(resumed.state.pendingAction.status).toBe("ready");
-  expect(resumed.state.pendingAction.originalAction.id).toBe(resumed.clientDecision.actionId);
+  expect(leasedAction(resumed.state).contractVersion).toBe("leased-action/v1");
+  expect(leasedAction(resumed.state).status).toBe("ready");
+  expect(leasedAction(resumed.state).originalAction.id).toBe(resumed.clientDecision.actionId);
 
   const clicked = await executeAtomicBrowserDecision(page, resumed.clientDecision, "obs_bundle_satisfied");
   expect(clicked.verification.ok).toBe(true);
@@ -735,9 +738,9 @@ test("resolved extras preserve one offscreen Continue through reveal, fresh obse
     revealTurn.clientDecision.action,
     JSON.stringify({ decision: revealTurn.clientDecision, state: revealTurn.state, debug: revealTurn.debug }, null, 2)
   ).toBe("scroll");
-  expect(revealTurn.state.pendingAction.schemaVersion).toBe(2);
-  expect(revealTurn.state.pendingAction.status).toBe("needs_reveal");
-  expect(revealTurn.state.pendingAction.originalAction.targetLabel).toMatch(/continue/i);
+  expect(leasedAction(revealTurn.state).contractVersion).toBe("leased-action/v1");
+  expect(leasedAction(revealTurn.state).status).toBe("needs_reveal");
+  expect(leasedAction(revealTurn.state).originalAction.targetLabel).toMatch(/continue/i);
 
   await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
@@ -766,8 +769,8 @@ test("resolved extras preserve one offscreen Continue through reveal, fresh obse
     JSON.stringify({ decision: resumed.clientDecision, state: resumed.state, debug: resumed.debug }, null, 2)
   ).toBe("click");
   expect(resumed.clientDecision.targetLabel).toMatch(/continue/i);
-  expect(resumed.state.pendingAction.status).toBe("ready");
-  expect(resumed.state.pendingAction.originalAction.id).toBe(resumed.clientDecision.actionId);
+  expect(leasedAction(resumed.state).status).toBe("ready");
+  expect(leasedAction(resumed.state).originalAction.id).toBe(resumed.clientDecision.actionId);
 
   const continued = await executeAtomicBrowserDecision(page, resumed.clientDecision, "obs_extras_advanced");
   expect(continued.result.dispatched).toBe(true);
@@ -922,7 +925,7 @@ test("three sibling extras resolve as an exact decision-group queue before Conti
   expect(new Set(completedGroupIds).size).toBe(3);
   const revealContinue = await nextTurn(observation, "turn_exact_groups_continue_reveal");
   expect(revealContinue.clientDecision.action).toBe("scroll");
-  expect(revealContinue.state.pendingAction.originalAction.targetLabel).toMatch(/continue/i);
+  expect(leasedAction(revealContinue.state).originalAction.targetLabel).toMatch(/continue/i);
 
   await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
@@ -3267,15 +3270,14 @@ test("one exact custom-control actuator advances through method-aware retry and 
   );
   expect(nativeResult.result.dispatched).toBe(true);
   expect(nativeResult.verification.ok).toBe(false);
-  const failedLifecycle = loopPrivate.applyTransitionStatus({
+  const failedLifecycle = loopPrivate.applyTransitionStatus(withExecutionFixture({
     ...governedNative.state,
     taskState: { ...initialTaskState, currentObligation: firstObligation },
     currentGoal: firstAuthoritativeGoal,
-    lastAction: governedNative.action,
-    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] }
-  }, nativeResult.observation, initial);
+    lastAction: governedNative.action
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), nativeResult.observation, initial);
   expect(failedLifecycle.transition.status).toBe("no_effect");
-  expect(failedLifecycle.state.recoveryState.failedStrategies).toHaveLength(1);
+  expect(executionRecovery(failedLifecycle.state).failedStrategies).toHaveLength(1);
   const unchangedRepeat = await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
     decision = hooks.decisionFromActionLease(decision);
@@ -3331,7 +3333,7 @@ test("one exact custom-control actuator advances through method-aware retry and 
     retryObservation
   );
   expect(failedSignatures, JSON.stringify({
-    stored: failedLifecycle.state.recoveryState.failedStrategies,
+    stored: executionRecovery(failedLifecycle.state).failedStrategies,
     retryGoal: goal
   })).toEqual([actuatorSignature(nativeAction)]);
   const pointerSet = groundedObservationCandidateSet(goal, retryObservation, failedSignatures, {
@@ -3960,12 +3962,11 @@ test("a settled exact age option creates one durable canonical verification when
   // a blank framework parent and only broader page progress; it must not
   // downgrade the exact browser-proven child settlement before TaskState can
   // persist it.
-  const lifecycle = loopPrivate.applyTransitionStatus({
+  const lifecycle = loopPrivate.applyTransitionStatus(withExecutionFixture({
     taskState: { ...surfaceTask, currentGoal: surfaceTask.currentGoal },
     currentGoal: surfaceTask.currentGoal,
-    lastAction: selectedAction,
-    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] }
-  }, selected.observation, openedObservation);
+    lastAction: selectedAction
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), selected.observation, openedObservation);
   expect(lifecycle.observation.lastActionResult).toMatchObject({
     verified: true,
     expectedOutcomeObserved: true,
@@ -8381,12 +8382,12 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   expect(staleGovernance.allow).toBe(false);
   expect(staleGovernance.decision).toBe("recoverable");
   expect(staleGovernance.code).toMatch(/CANONICAL_ALIAS_UNRESOLVED|CURRENT_GOAL_CANDIDATE_MISMATCH/);
-  const staleRecovery = loopPrivate.updateRecoveryState(state, {
+  const staleRecovery = loopPrivate.updateExecutionRecovery(state, {
     kind: "grounding_rejection",
     code: staleGovernance.code
   });
   expect(staleRecovery.classification).toBe("grounding_rejection");
-  expect(staleRecovery.recoveryState.attempts).toBe(0);
+  expect(staleRecovery.recovery.attempts).toBe(0);
   expect(staleRecovery.exhausted).toBe(false);
   state = staleRecovery.state;
 
@@ -10061,14 +10062,14 @@ test("final safe checkout replay advances completed traveler through both seat l
   expect(rejected.result.dispatched).toBe(false);
   expect(rejected.validation.code).toBe("TARGET_OUTSIDE_CURRENT_SURFACE");
   const recovery = advanceActionLifecycle({
-    state: { ...state, lastAction: wrongSurfaceAction, recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] } },
+    state: withExecutionFixture({ ...state, lastAction: wrongSurfaceAction }, { recovery: { attempts: 0, phase: "idle", failedStrategySignatures: [] } }),
     observation: rejected.observation,
     previousObservation: observation
   });
   expect(recovery.lifecycle.status).toBe("rejected_before_dispatch");
   expect(recovery.directive).toBe("rebuild_candidates");
-  expect(recovery.state.recoveryState.attempts).toBe(0);
-  expect(recovery.state.recoveryState.phase).toBe("grounding_rejection");
+  expect(executionRecovery(recovery.state).attempts).toBe(0);
+  expect(executionRecovery(recovery.state).phase).toBe("grounding_rejection");
   expect(recovery.directive).not.toContain("handoff");
   observation = rejected.observation;
   observation = await execute(observation, (candidate) => /no thanks/i.test(candidate.targetLabel), "obs_final_seat_1_declined");
@@ -11638,7 +11639,7 @@ test("multi-surface free choice confirms once, closes its completed parent, and 
     status: "proven",
     activeSurfaceId: observation.page.currentSurface.id,
     parentControlId: action.controlId,
-    parentActuatorId: action.targetId,
+    parentActuatorId: action.actuatorId,
     operation: action.operation
   });
   let governorState = createCheckoutSessionState({
@@ -12347,15 +12348,14 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
   const deadAction = loopPrivate.bindTargetSnapshot(actionForCurrentCandidate(goal, dead, before), before);
   const deadExecution = await executeAtomicBrowserDecision(page, toClientDecision(deadAction), "obs_memory_no_effect");
   expect(deadExecution.result.dispatched).toBe(true);
-  const failed = loopPrivate.applyTransitionStatus({
+  const failed = loopPrivate.applyTransitionStatus(withExecutionFixture({
     taskState: { ...taskState, currentGoal: goal },
     currentGoal: goal,
-    lastAction: deadAction,
-    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] }
-  }, deadExecution.observation, before);
+    lastAction: deadAction
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), deadExecution.observation, before);
   expect(failed.transition.status).toBe("no_effect");
-  expect(failed.state.recoveryState.attempts).toBe(1);
-  expect(failed.state.recoveryState.failedStrategies).toHaveLength(1);
+  expect(executionRecovery(failed.state).attempts).toBe(1);
+  expect(executionRecovery(failed.state).failedStrategies).toHaveLength(1);
 
   await page.evaluate(() => {
     const old = document.querySelector("button[name='dead-next']");
@@ -12391,7 +12391,7 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     lastAction: distinctMethodAction
   }, distinctMethodExecution.observation, rerendered);
   expect(twiceFailed.transition.status).toBe("no_effect");
-  expect(twiceFailed.state.recoveryState.failedStrategies).toHaveLength(2);
+  expect(executionRecovery(twiceFailed.state).failedStrategies).toHaveLength(2);
 
   const secondFailureSignatures = loopPrivate.failedStrategySignaturesForGoal(
     twiceFailed.state,
@@ -12420,8 +12420,8 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     lastAction: nextAction
   }, nextExecution.observation, distinctMethodExecution.observation);
   expect(progressed.transition.status).toBe("progressed");
-  expect(progressed.state.recoveryState.attempts).toBe(0);
-  expect(progressed.state.recoveryState.failedStrategies).toHaveLength(0);
+  expect(executionRecovery(progressed.state).attempts).toBe(0);
+  expect(executionRecovery(progressed.state).failedStrategies).toHaveLength(0);
 
   await page.locator("#decision-instance").evaluate((node) => { node.textContent = "Flight 2 of 2"; });
   const nextInstanceObservation = await browserObservation(page, "obs_memory_next_instance");

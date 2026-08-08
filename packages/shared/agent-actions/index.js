@@ -161,7 +161,7 @@ function isCandidateGrounded(candidate = {}, observation = {}) {
 function normalizeAction(raw = {}) {
   const region = raw.visualRegion && typeof raw.visualRegion === "object" ? raw.visualRegion : null;
   const mechanicalEffect = String(raw.mechanicalEffect || raw.physicalEffect || raw.affordance?.mechanicalEffect || raw.affordance?.physicalEffect || raw.affordance?.effect || "").slice(0, 80);
-  const semanticIntent = String(raw.semanticIntent || raw.intent || "").slice(0, 160);
+  const intent = String(raw.intent || raw.semanticIntent || "").slice(0, 160);
   const expectedPostconditions = Array.isArray(raw.expectedPostconditions)
     ? raw.expectedPostconditions.filter((item) => item && typeof item === "object").map((item) => ({ ...item })).slice(0, 8)
     : (raw.expectedOutcome && typeof raw.expectedOutcome === "object" ? [{ ...raw.expectedOutcome }] : []);
@@ -170,21 +170,19 @@ function normalizeAction(raw = {}) {
     type: ACTION_TYPES.has(raw.type) ? raw.type : "stop",
     observationId: raw.observationId ? String(raw.observationId).slice(0, 120) : "",
     observationHash: raw.observationHash ? String(raw.observationHash).slice(0, 120) : "",
-    intent: String(raw.intent || semanticIntent || "").slice(0, 120),
+    intent: intent.slice(0, 120),
     operation: raw.operation ? String(raw.operation).slice(0, 40) : "",
     interactionRole: raw.interactionRole ? String(raw.interactionRole).slice(0, 40) : "",
     semanticEffect: raw.semanticEffect ? String(raw.semanticEffect).slice(0, 40) : "",
     expectedEvidence: raw.expectedEvidence ? String(raw.expectedEvidence).slice(0, 40) : "",
     semanticOutcome: raw.semanticOutcome ? String(raw.semanticOutcome).slice(0, 80) : "",
     mechanicalEffect,
-    semanticIntent,
     expectedPostconditions,
     outcomeCompatibility: ["compatible", "context_only", "unknown"].includes(raw.outcomeCompatibility) ? raw.outcomeCompatibility : "unknown",
-    physicalEffect: mechanicalEffect,
     intendedOutcome: raw.intendedOutcome ? String(raw.intendedOutcome).slice(0, 120) : "",
     semanticOwnershipLinkId: raw.semanticOwnershipLinkId ? String(raw.semanticOwnershipLinkId).slice(0, 260) : "",
     policyCorrectionForDecisionGroupId: raw.policyCorrectionForDecisionGroupId ? String(raw.policyCorrectionForDecisionGroupId).slice(0, 140) : "",
-    goalId: raw.goalId ? String(raw.goalId).slice(0, 200) : "",
+    obligationId: (raw.obligationId || raw.goalId) ? String(raw.obligationId || raw.goalId).slice(0, 200) : "",
     semanticOwner: raw.semanticOwner && typeof raw.semanticOwner === "object"
       ? {
           stage: String(raw.semanticOwner.stage || "").slice(0, 120),
@@ -210,7 +208,6 @@ function normalizeAction(raw = {}) {
     actuatorId: normalizeTargetId(raw.actuatorId || raw.targetId),
     controlId: raw.controlId ? String(raw.controlId).slice(0, 140) : (raw.targetSnapshot?.controlId ? String(raw.targetSnapshot.controlId).slice(0, 140) : ""),
     decisionGroupId: raw.decisionGroupId ? String(raw.decisionGroupId).slice(0, 140) : (raw.targetSnapshot?.decisionGroupId ? String(raw.targetSnapshot.decisionGroupId).slice(0, 140) : ""),
-    targetId: normalizeTargetId(raw.targetId),
     targetLabel: raw.targetLabel ? String(raw.targetLabel).slice(0, 300) : "",
     targetSnapshot: raw.targetSnapshot && typeof raw.targetSnapshot === "object" ? raw.targetSnapshot : null,
     expectedOutcome: raw.expectedOutcome && typeof raw.expectedOutcome === "object" ? raw.expectedOutcome : null,
@@ -261,6 +258,9 @@ function normalizeAction(raw = {}) {
 }
 
 function createActionLease(action = {}) {
+  // This is the network/persistence boundary. Legacy input aliases are
+  // accepted once, then the published lease contains only canonical fields.
+  action = normalizeAction(action);
   const targetSnapshot = action.targetSnapshot || null;
   const successCondition = action.expectedOutcome || action.expectedPostconditions?.[0] || null;
   const semanticOwner = action.semanticOwner && typeof action.semanticOwner === "object"
@@ -280,16 +280,12 @@ function createActionLease(action = {}) {
       id: action.observationId || "",
       hash: action.observationHash || ""
     }),
-    obligationId: action.goalId || "",
+    obligationId: action.obligationId || "",
     semanticOwner: Object.freeze(semanticOwner),
-    // Migration-only scalar for existing browser receipts. New code uses the
-    // structured owner above; it is removed when the receipt boundary moves
-    // to ActionResult/v2.
-    semanticOwnerId: semanticOwner.repeatedInstance || "",
     candidateId: action.candidateId || "",
     target: Object.freeze({
       controlId: action.controlId || targetSnapshot?.controlId || "",
-      actuatorId: action.actuatorId || action.targetId || "",
+      actuatorId: action.actuatorId || "",
       surfaceId: targetSnapshot?.surfaceId || action.surfaceId || "",
       decisionGroupId: action.decisionGroupId || targetSnapshot?.decisionGroupId || "",
       snapshot: targetSnapshot
@@ -298,7 +294,7 @@ function createActionLease(action = {}) {
       actionType: action.type,
       operation: action.operation || "",
       method: action.interactionMethod || "",
-      effect: action.mechanicalEffect || action.physicalEffect || "",
+      effect: action.mechanicalEffect || "",
       value: action.value || action.targetLabel || "",
       keys: action.keys || "",
       x: action.x,
@@ -310,7 +306,7 @@ function createActionLease(action = {}) {
     }),
     expected: Object.freeze({
       intent: action.intent || "",
-      semanticEffect: action.semanticEffect || action.semanticIntent || "",
+      semanticEffect: action.semanticEffect || "",
       interactionRole: action.interactionRole || "",
       evidence: action.expectedEvidence || "",
       policyAuthorization: Object.freeze({
@@ -322,6 +318,55 @@ function createActionLease(action = {}) {
     }),
     capabilityProof: action.pipelineContract || null,
     risk: action.risk || "uncertain"
+  });
+}
+
+function actionFromLease(lease = null) {
+  if (!lease || lease.contractVersion !== "action-lease/v1") return null;
+  const target = lease.target || {};
+  const mechanic = lease.mechanic || {};
+  const expected = lease.expected || {};
+  const actionType = mechanic.actionType || "stop";
+  const carriesInputValue = ["type", "select", "keypress"].includes(actionType);
+  return normalizeAction({
+    id: lease.actionId || "",
+    type: actionType,
+    observationId: lease.observation?.id || "",
+    observationHash: lease.observation?.hash || "",
+    obligationId: lease.obligationId || "",
+    semanticOwner: lease.semanticOwner || null,
+    candidateId: lease.candidateId || "",
+    controlId: target.controlId || "",
+    actuatorId: target.actuatorId || "",
+    decisionGroupId: target.decisionGroupId || "",
+    targetSnapshot: target.snapshot || null,
+    operation: mechanic.operation || "",
+    interactionMethod: mechanic.method || "",
+    mechanicalEffect: mechanic.effect || "",
+    targetLabel: carriesInputValue ? "" : (mechanic.value || ""),
+    value: carriesInputValue ? (mechanic.value || "") : "",
+    keys: mechanic.keys || "",
+    x: mechanic.x,
+    y: mechanic.y,
+    scrollY: mechanic.scrollY,
+    visualRegion: mechanic.visualRegion || null,
+    exactOption: mechanic.exactOption || null,
+    boundedRecovery: mechanic.boundedRecovery === true,
+    intent: expected.intent || "",
+    semanticEffect: expected.semanticEffect || "",
+    interactionRole: expected.interactionRole || "",
+    expectedEvidence: expected.evidence || "",
+    expectedOutcome: expected.successCondition || null,
+    expectedPostconditions: expected.postconditions || [],
+    affordance: {
+      policy: {
+        allow: expected.policyAuthorization?.allow === true,
+        decision: expected.policyAuthorization?.decision || ""
+      }
+    },
+    pipelineContract: lease.capabilityProof || null,
+    risk: lease.risk || "uncertain",
+    requiresApproval: false
   });
 }
 
@@ -357,7 +402,7 @@ function actuatorSignature(action = {}) {
     method,
     operation,
     action.controlId || target.controlId || "",
-    action.targetId || target.id || `${action.x ?? ""},${action.y ?? ""}`
+    action.actuatorId || action.targetId || target.id || `${action.x ?? ""},${action.y ?? ""}`
   ].join(":");
 }
 
@@ -467,6 +512,7 @@ function actionSignature(action) {
 }
 
 module.exports = {
+  actionFromLease,
   createActionLease,
   normalizeAction,
   normalizeVisualRegion,

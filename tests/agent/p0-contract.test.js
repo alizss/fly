@@ -19,14 +19,13 @@ const {
 const { compactWholePageMarkdown } = require("../../apps/web/agent/observation-markdown");
 const { conciseActionFeedback, diffObservations, formatObservationDiffMarkdown } = require("../../apps/web/agent/observation-diff");
 const {
-  actionForObservationCandidate,
-  allRequiredDecisionGroupsResolved,
-  rawObservationCandidates
+  allRequiredDecisionGroupsResolved
 } = require("../../apps/web/agent/observation-candidates");
 const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { canonicalizePageSurface, currentSurface, surfaceBinding } = require("../../apps/web/agent/surface-contract");
-const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
+const { actionForCurrentCandidate, actionForObservationCandidate, buildCurrentCandidateSet, rawObservationCandidates } = require("./legacy-mechanics-binding-adapter");
 const { decisionInstanceKey } = require("../../packages/shared/agent-actions");
+const { withExecutionFixture } = require("./execution-episode-test-adapter");
 const {
   SEAT_POLICIES,
   canonicalizeUserPolicy,
@@ -406,7 +405,7 @@ test("fresh observation candidates expose only current canonical flexible-ticket
   );
   assert.equal(bound.candidateId, "obs_136:candidate_1");
   assert.equal(bound.controlId, "ctrl_flexible_current");
-  assert.equal(bound.targetId, "node_flexible_opener");
+  assert.equal(bound.actuatorId, "node_flexible_opener");
   assert.equal(bound.targetSnapshot.controlId, "ctrl_flexible_current");
   assert.equal(bound.targetSnapshot.id, "node_flexible_opener");
 });
@@ -444,22 +443,22 @@ test("stale canonical identity failures trigger bounded fresh replanning", () =>
   }
   assert.equal(__private.staleIdentityRejection({ outcome: { code: "VALIDATION_ERROR" } }), false);
 
-  const initial = { recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] }, lastAction: { type: "click" } };
-  const preDispatch = __private.updateRecoveryState(initial, {
+  const initial = withExecutionFixture({ lastAction: { type: "click" } }, { recovery: { attempts: 0, phase: "idle", failedStrategySignatures: [] } });
+  const preDispatch = __private.updateExecutionRecovery(initial, {
     kind: "grounding_rejection",
     code: "CURRENT_GOAL_CANDIDATE_MISMATCH"
   });
   assert.equal(preDispatch.classification, "grounding_rejection");
-  assert.equal(preDispatch.recoveryState.attempts, 0);
+  assert.equal(preDispatch.recovery.attempts, 0);
 
-  const dispatched = __private.updateRecoveryState(preDispatch.state, {
+  const dispatched = __private.updateExecutionRecovery(preDispatch.state, {
     kind: "execution_no_effect",
     code: "EXACT_FREE_OPTION_NOT_VERIFIED",
     stateHash: "same_state",
     strategySignature: "click:choose:ctrl_free"
   });
   assert.equal(dispatched.classification, "execution_no_effect");
-  assert.equal(dispatched.recoveryState.attempts, 1);
+  assert.equal(dispatched.recovery.attempts, 1);
 });
 
 test("planner executable contract contains only the authoritative candidateId", () => {
@@ -483,15 +482,14 @@ test("planner executable contract contains only the authoritative candidateId", 
     (error) => error instanceof PlannerContractError && error.code === "PLANNER_CANDIDATE_NOT_CURRENT"
   );
 
-  const recovered = __private.updateRecoveryState({
-    recoveryState: { attempts: 0, phase: "idle", failedStrategySignatures: [] },
+  const recovered = __private.updateExecutionRecovery(withExecutionFixture({
     lastAction: { type: "click" }
-  }, {
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategySignatures: [] } }), {
     kind: "planner_rejection",
     code: "PLANNER_CANDIDATE_NOT_CURRENT"
   });
   assert.equal(recovered.classification, "planner_rejection");
-  assert.equal(recovered.recoveryState.attempts, 0);
+  assert.equal(recovered.recovery.attempts, 0);
   assert.equal(recovered.exhausted, false);
 });
 
@@ -1392,7 +1390,7 @@ test("P0.7/P0.9 resolves every canonical alias to one logical control", () => {
   ];
 
   for (const aliasId of aliases) {
-    const resolution = __private.resolveActionControl({ type: "click", targetId: aliasId }, observation.page);
+    const resolution = __private.resolveActionControl({ type: "click", actuatorId: aliasId }, observation.page);
     assert.equal(resolution.ok, true, aliasId);
     assert.equal(resolution.control.controlId, "ctrl_bag_none", aliasId);
     const bound = __private.bindTargetSnapshot({ type: "click", targetId: aliasId }, observation);

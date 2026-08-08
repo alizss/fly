@@ -4,7 +4,7 @@ const { controlBelongsToCurrentSurface, currentSurface, surfaceBinding } = requi
 const { deriveActionSemantics } = require("./action-semantics");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
-const { obligationField } = require("./current-obligation");
+const { currentObligationValue: obligationField } = require("./current-obligation");
 
 function slug(value = "") {
   return String(value || "")
@@ -535,11 +535,11 @@ function actionForObservationCandidate(goal = {}, candidate = {}, observation = 
     type: candidate.type,
     intent: candidate.intent,
     operation: candidate.operation,
-    goalId: obligationField(goal, "goalId"),
+    obligationId: obligationField(goal, "goalId"),
     candidateId: candidate.candidateId,
     controlId: candidate.controlId,
     decisionGroupId: candidate.decisionGroupId,
-    targetId: candidate.targetId,
+    actuatorId: candidate.targetId,
     targetLabel: candidate.targetLabel,
     value: candidate.value || "",
     keys: candidate.keys || "",

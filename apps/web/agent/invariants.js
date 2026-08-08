@@ -474,7 +474,6 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
     || "";
   const targetControlId = action.controlId || action.targetSnapshot?.controlId || "";
   const effect = action.mechanicalEffect
-    || action.physicalEffect
     || action.affordance?.mechanicalEffect
     || action.affordance?.physicalEffect
     || action.affordance?.effect
@@ -505,7 +504,7 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
     )
   );
   const expected = action.expectedOutcome || {};
-  const safeMeaning = normalizedText(`${action.intent || ""} ${action.semanticIntent || ""} ${action.targetSnapshot?.semantic || ""} ${action.targetSnapshot?.risk || ""}`);
+  const safeMeaning = normalizedText(`${action.intent || ""} ${action.targetSnapshot?.semantic || ""} ${action.targetSnapshot?.risk || ""}`);
   const exactFreeReversal = effect === "select_free_option"
     && expected.type === "exact_free_option_selected"
     && expected.decisionGroupId === decisionGroupId
@@ -593,12 +592,11 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
   pass("CURRENCY_STABLE", baseline.currency && observed.currency ? observed.currency : "current evidence absent or baseline unknown");
 
   const actionEffect = action.mechanicalEffect
-    || action.physicalEffect
     || action.affordance?.mechanicalEffect
     || action.affordance?.physicalEffect
     || action.affordance?.effect
     || "";
-  const actionMeaning = normalizedText(`${action.intent || ""} ${action.semanticIntent || ""} ${action.risk || ""} ${action.targetSnapshot?.semantic || ""}`);
+  const actionMeaning = normalizedText(`${action.intent || ""} ${action.risk || ""} ${action.targetSnapshot?.semantic || ""}`);
   const exactCostReducingCorrection = exactPolicyCorrectionStep(action, state, observed);
   // A grounded observation-scoped correction may still have an unknown
   // browser semantic. Its safety comes from the exact conflict/control link

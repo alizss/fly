@@ -7,9 +7,10 @@ const { verifiedCommerceObligationFromActionResult } = require("../../apps/web/a
 const {
   advanceActionLifecycle,
   canonicalFailureCode,
-  pendingActionRecord
+  leasedActionRecord
 } = require("../../apps/web/agent/action-lifecycle");
-const { runLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { runLoopTurn: runRawLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { executableDecisionFromActionLease } = require("./action-lease-replay-adapter");
 const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { allRequiredSatisfied, missingRequired, normalizeRequirement } = require("../../packages/shared/requirements");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
@@ -23,11 +24,20 @@ const {
   currentObligationFromGoal
 } = require("../../apps/web/agent/authority-frames");
 const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
+const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 
 function taskMechanics(taskState = {}) {
   return currentObligation(taskState);
 }
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
+
+async function runLoopTurn(args = {}) {
+  const result = await runRawLoopTurn(args);
+  return {
+    ...result,
+    clientDecision: executableDecisionFromActionLease(result.clientDecision)
+  };
+}
 
 function actionableCapability(operation, actuatorId, { inViewport = true } = {}) {
   const actionability = {
@@ -699,9 +709,9 @@ test("an unrelated fresh paid selection is an intervening mutation, not progress
   assert.deepEqual(transition.causality.decisionGroupIds, ["dg_bundle"]);
   assert.equal(transition.nextDirective, "rebuild_task_state");
 
-  const state = createCheckoutSessionState({ goal: "Reach payment without paid extras", travelerId: "trav_external" });
+  let state = createCheckoutSessionState({ goal: "Reach payment without paid extras", travelerId: "trav_external" });
   state.lastAction = action;
-  state.pendingAction = pendingActionRecord({ action, goal: { goalId: "goal_continue" }, status: "ready" });
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({ action, goal: { goalId: "goal_continue" }, status: "ready" }) });
   const lifecycle = advanceActionLifecycle({ state, observation: after, previousObservation: before });
   assert.equal(lifecycle.lifecycle.status, "observed");
   assert.equal(lifecycle.directive, "rebuild_candidates");
@@ -768,9 +778,9 @@ test("a newly exposed destination decision cannot make verified navigation simul
   assert.equal(transition.causality, null);
   assert.equal(transition.status, "achieved");
 
-  const state = createCheckoutSessionState({ goal: "Reach payment without paid extras", travelerId: "trav_destination" });
+  let state = createCheckoutSessionState({ goal: "Reach payment without paid extras", travelerId: "trav_destination" });
   state.lastAction = action;
-  state.pendingAction = pendingActionRecord({ action, goal: { goalId: "goal_continue" }, status: "ready" });
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({ action, goal: { goalId: "goal_continue" }, status: "ready" }) });
   const lifecycle = advanceActionLifecycle({
     state,
     observation: after,
@@ -992,7 +1002,7 @@ test("a pre-dispatch price alarm rebuilds from current state instead of stopping
 });
 
 test("a fresh page mutation cancels a stale pending prediction but an unchanged snapshot keeps waiting", () => {
-  const pending = pendingActionRecord({
+  const pending = leasedActionRecord({
     action: {
       id: "act_pending_surface",
       observationId: "obs_source",
@@ -1003,17 +1013,17 @@ test("a fresh page mutation cancels a stale pending prediction but an unchanged 
     goal: { goalId: "goal_surface" },
     status: "ready"
   });
-  assert.equal(loopPrivate.pendingActionSupersededByFreshPage(pending, {
+  assert.equal(loopPrivate.leasedActionSupersededByFreshPage(pending, {
     observationId: "obs_same_facts",
     observationSnapshot: { snapshotHash: "hash_source" },
     page: {}
   }), false);
-  assert.equal(loopPrivate.pendingActionSupersededByFreshPage(pending, {
+  assert.equal(loopPrivate.leasedActionSupersededByFreshPage(pending, {
     observationId: "obs_user_changed_page",
     observationSnapshot: { snapshotHash: "hash_current" },
     page: {}
   }), true);
-  assert.equal(loopPrivate.pendingActionSupersededByFreshPage(pending, {
+  assert.equal(loopPrivate.leasedActionSupersededByFreshPage(pending, {
     observationId: "obs_result_received",
     observationSnapshot: { snapshotHash: "hash_current" },
     page: {},
@@ -1036,7 +1046,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
   });
   const browserResult = result("act_open");
   const after = observation("after", before.page, browserResult);
-  const state = {
+  const state = withExecutionFixture({
     currentGoal: { goalId: "goal_flex", semanticType: "flexible_ticket" },
     taskState: {
       currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_flex", semanticType: "flexible_ticket" } })
@@ -1048,18 +1058,17 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
       operation: "open",
       expectedOutcome: { type: "options_surface_appeared", controlId: "ctrl_flex" }
     },
-    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] },
     aiDecisionCache: { candidateSelection: { candidateId: "cached" } }
-  };
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
   const applied = loopPrivate.applyTransitionStatus(state, after, before);
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.observation.lastActionResult.verified, false);
   assert.equal(applied.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
-  assert.deepEqual(applied.state.recoveryState.failedStrategySignatures, ["click:open:ctrl_flex:,"]);
-  assert.equal(applied.state.recoveryState.failedStrategies[0].failureCount, 1);
+  assert.deepEqual(recovery(applied.state).failedStrategySignatures, ["click:open:ctrl_flex:,"]);
+  assert.equal(recovery(applied.state).failedStrategies[0].failureCount, 1);
   assert.equal(applied.directive, "try_distinct_capability");
-  assert.equal(applied.state.recoveryState.attempts, 1);
-  assert.equal(applied.state.recoveryState.phase, "execution_no_effect");
+  assert.equal(recovery(applied.state).attempts, 1);
+  assert.equal(recovery(applied.state).phase, "execution_no_effect");
   assert.equal(applied.state.aiDecisionCache, null);
 
   assert.deepEqual(
@@ -1107,23 +1116,22 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
     action
   };
   const after = observation("reuse_after", before.page, rejected);
-  const state = {
+  const state = withExecutionFixture({
     currentGoal: { goalId: "goal_title", semanticType: "title" },
     taskState: {
       currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_title", semanticType: "title" } })
     },
     lastAction: action,
-    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] },
     aiDecisionCache: { candidateSelection: { candidateId: "stale_reused_candidate" } }
-  };
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
 
   const applied = loopPrivate.applyTransitionStatus(state, after, before);
   const signature = "native_click:open:ctrl_title:,";
   assert.equal(applied.transition, null);
   assert.equal(applied.directive, "rebuild_candidates");
-  assert.deepEqual(applied.state.recoveryState.failedStrategySignatures, [signature]);
-  assert.equal(applied.state.recoveryState.failedStrategies[0].strategySignature, signature);
-  assert.equal(applied.state.recoveryState.failedStrategies[0].failureCount, 1);
+  assert.deepEqual(recovery(applied.state).failedStrategySignatures, [signature]);
+  assert.equal(recovery(applied.state).failedStrategies[0].strategySignature, signature);
+  assert.equal(recovery(applied.state).failedStrategies[0].failureCount, 1);
   assert.equal(applied.state.aiDecisionCache, null);
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), after),
@@ -1209,8 +1217,7 @@ test("every failed strategy is excluded on the same unchanged page state", () =>
     semanticGoal: "choose origin"
   };
   const goalKey = loopPrivate.semanticGoalRecoveryKey(goal, observationForSurface);
-  const state = {
-    recoveryState: { failedStrategies: [{
+  const state = withExecutionFixture({}, { recovery: { failedStrategies: [{
       goalKey,
       strategySignature: "keypress:open:origin::ArrowDown",
       pageStateHash: observationForSurface.observationSnapshot.snapshotHash,
@@ -1220,8 +1227,7 @@ test("every failed strategy is excluded on the same unchanged page state", () =>
       strategySignature: "click:open:origin_button::",
       pageStateHash: observationForSurface.observationSnapshot.snapshotHash,
       failureCount: 1
-    }], failedStrategySignatures: [] }
-  };
+    }], failedStrategySignatures: [] } });
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(state, goal, observationForSurface),
     ["keypress:open:origin::ArrowDown", "click:open:origin_button::"]
@@ -1276,7 +1282,7 @@ test("three distinct no-effect strategies exhaust only one unchanged state and m
     controls: ["one", "two", "three"].map((id) => ({ controlId: `ctrl_${id}`, label: id })),
     decisionGroups: []
   };
-  let state = { recoveryState: { attempts: 0, phase: "idle", stateHash: "", failedStrategySignatures: [] } };
+  let state = withExecutionFixture({}, { recovery: { attempts: 0, phase: "idle", stateHash: "", failedStrategySignatures: [] } });
   let before = observation("budget_before", samePage);
   before.observationSnapshot.snapshotHash = "unchanged_hash";
 
@@ -1293,7 +1299,7 @@ test("three distinct no-effect strategies exhaust only one unchanged state and m
     after.observationSnapshot.snapshotHash = "unchanged_hash";
     const advanced = advanceActionLifecycle({ state: { ...state, lastAction: action }, observation: after, previousObservation: before });
     state = advanced.state;
-    assert.equal(state.recoveryState.attempts, index + 1);
+    assert.equal(recovery(state).attempts, index + 1);
     assert.equal(advanced.directive, "try_distinct_capability");
     before = after;
   }
@@ -1313,8 +1319,8 @@ test("three distinct no-effect strategies exhaust only one unchanged state and m
   }, result(progressAction.id));
   const reset = advanceActionLifecycle({ state: { ...state, lastAction: progressAction }, observation: progressed, previousObservation: before });
   assert.equal(reset.transition.status, "progressed");
-  assert.equal(reset.state.recoveryState.attempts, 0);
-  assert.deepEqual(reset.state.recoveryState.failedStrategySignatures, []);
+  assert.equal(recovery(reset.state).attempts, 0);
+  assert.deepEqual(recovery(reset.state).failedStrategySignatures, []);
 });
 
 test("pre-dispatch surface rejection on an unchanged page rebuilds without consuming execution recovery", () => {
@@ -1331,16 +1337,15 @@ test("pre-dispatch surface rejection on an unchanged page rebuilds without consu
     outcome: { code: "TARGET_OUTSIDE_CURRENT_SURFACE" }
   });
   const advanced = advanceActionLifecycle({
-    state: {
+    state: withExecutionFixture({
       lastAction: {
         id: "act_no_thanks",
         observationId: "before",
         candidateId: "before:candidate_1",
         type: "click",
         controlId: "ctrl_no_thanks"
-      },
-      recoveryState: { attempts: 0, phase: "idle", stateHash: "", failedStrategySignatures: [] }
-    },
+      }
+    }, { recovery: { attempts: 0, phase: "idle", stateHash: "", failedStrategySignatures: [] } }),
     observation: after,
     previousObservation: before
   });
@@ -1349,8 +1354,8 @@ test("pre-dispatch surface rejection on an unchanged page rebuilds without consu
   assert.equal(advanced.lifecycle.dispatched, false);
   assert.equal(advanced.transition, null);
   assert.equal(advanced.directive, "rebuild_candidates");
-  assert.equal(advanced.state.recoveryState.attempts, 0);
-  assert.equal(advanced.state.recoveryState.phase, "grounding_rejection");
+  assert.equal(recovery(advanced.state).attempts, 0);
+  assert.equal(recovery(advanced.state).phase, "grounding_rejection");
   assert.notEqual(advanced.directive, "handoff_recovery_exhausted");
 });
 
@@ -1465,18 +1470,17 @@ test("typed seat choices keep safe navigation selectable even when compatibility
 
   const dispatchedSkip = { ...skip, id: "act_skip" };
   const unchanged = observation("typed_unchanged", before.page, result(dispatchedSkip.id));
-  const applied = loopPrivate.applyTransitionStatus({
+  const applied = loopPrivate.applyTransitionStatus(withExecutionFixture({
     currentGoal: goal,
-    lastAction: dispatchedSkip,
-    recoveryState: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] }
-  }, unchanged, before);
+    lastAction: dispatchedSkip
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), unchanged, before);
   assert.equal(applied.transition.status, "no_effect");
   assert.equal(applied.directive, "try_distinct_capability");
 
   const retrySet = groundedObservationCandidateSet(
     goal,
     unchanged,
-    applied.state.recoveryState.failedStrategySignatures,
+    recovery(applied.state).failedStrategySignatures,
     taskStateContext
   );
   assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_skip"), false);
@@ -1670,7 +1674,7 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
   const firstSet = groundedObservationCandidateSet(goal, current, [], { state, traveler, approvals: state.approvals });
   assert.deepEqual(firstSet.candidates.map((candidate) => candidate.targetLabel), ["Next"]);
   state.currentGoal = goal;
-  state.recoveryState = { ...state.recoveryState, failedStrategies: [], failedStrategySignatures: [] };
+  state = withExecutionFixture(state, { recovery: { ...recovery(state), failedStrategies: [], failedStrategySignatures: [] } });
 
   const store = {
     isCurrentObservation: (_transactionId, observationId, observationHash) => (
@@ -1694,7 +1698,7 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
 
   assert.equal(turn.clientDecision.action, "click");
   assert.equal(turn.clientDecision.targetLabel, "Next");
-  assert.equal(turn.clientDecision.affordance.effect, "advance_surface");
+  assert.equal(turn.clientDecision.mechanicalEffect, "advance_surface");
   assert.equal(turn.clientDecision.affordance.policy.allow, true);
   assert.equal(turn.debug.deterministic, true);
   assert.deepEqual(turn.debug.modelUsage.calls, []);

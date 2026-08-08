@@ -381,14 +381,14 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
   const target = action.targetSnapshot || {};
   const control = (page.controls || []).find((item) => item.controlId === (action.controlId || target.controlId)) || target;
   const semantics = normalizedActionSemantics(action, { control });
-  const physicalEffect = action.physicalEffect || action.affordance?.physicalEffect || action.affordance?.effect
+  const physicalEffect = action.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect
     || predictPhysicalEffect({ semantics, control, candidate: action, goal: action.goal || {} });
   const existing = action.expectedOutcome || {};
   const base = {
     interactionRole: semantics.interactionRole,
     semanticEffect: semantics.semanticEffect,
     expectedEvidence: semantics.expectedEvidence,
-    targetId: action.targetId || target.id || existing.targetId || "",
+    targetId: action.actuatorId || target.id || existing.targetId || "",
     controlId: action.controlId || target.controlId || existing.controlId || "",
     decisionGroupId: action.decisionGroupId || target.decisionGroupId || existing.decisionGroupId || "",
     requirementId: action.requirementId || existing.requirementId || "",

@@ -10,6 +10,7 @@ const {
 } = require("./legacy-mechanics-binding-adapter");
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const { toClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { executableDecisionFromActionLease } = require("./action-lease-replay-adapter");
 const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 
@@ -407,7 +408,7 @@ test("one requirement-component-capability contract remains identical through go
     turnId: "turn_contract_chain"
   });
   assert.equal(governed.allow, true, JSON.stringify(governed));
-  const decision = toClientDecision(governed.action);
+  const decision = executableDecisionFromActionLease(toClientDecision(governed.action));
   assert.deepEqual(action.pipelineContract, candidate.pipelineContract);
   assert.deepEqual(governed.action.pipelineContract, candidate.pipelineContract);
   assert.deepEqual(decision.pipelineContract, candidate.pipelineContract);
@@ -771,12 +772,12 @@ test("target binding preserves the exact bounded-recovery actuator instead of su
     pipelineContract
   }, observed);
 
-  assert.equal(bound.targetId, recoveryActuatorId);
+  assert.equal(bound.actuatorId, recoveryActuatorId);
   assert.equal(bound.targetSnapshot.id, recoveryActuatorId);
-  assert.notEqual(bound.targetId, preferredActivationId);
+  assert.notEqual(bound.actuatorId, preferredActivationId);
   assert.equal(
     bound.pipelineContract.capability.selectedStrategy.actuatorId,
-    bound.targetId
+    bound.actuatorId
   );
   assert.equal(agentContract.classifyExecutionLane({
     action: bound,
@@ -845,5 +846,5 @@ test("target binding preserves the exact bounded-recovery actuator instead of su
     turnId: "turn_bounded_recovery_binding"
   });
   assert.equal(governed.allow, true, JSON.stringify(governed));
-  assert.equal(governed.action.targetId, recoveryActuatorId);
+  assert.equal(governed.action.actuatorId, recoveryActuatorId);
 });

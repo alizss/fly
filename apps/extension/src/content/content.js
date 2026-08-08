@@ -15456,7 +15456,7 @@
       expectedPostconditions: lease.expected?.postconditions || [],
       goalId: lease.obligationId || "",
       semanticOwner: lease.semanticOwner || null,
-      decisionInstanceId: lease.semanticOwner?.repeatedInstance || lease.semanticOwnerId || "",
+      decisionInstanceId: lease.semanticOwner?.repeatedInstance || "",
       candidateId: lease.candidateId || "",
       logicalControlId: lease.target?.controlId || "",
       controlId: lease.target?.controlId || "",
