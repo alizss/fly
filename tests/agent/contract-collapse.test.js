@@ -348,3 +348,21 @@ test("extension logical controls and canonical graph compile outside the runtime
   assert.match(graph, /function applyControlsToObservationModels\s*\(/);
   assert.match(graph, /function buildCanonicalControlGraph\s*\(/);
 });
+
+test("extension perception facade owns section, readiness, and visual page projections", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const perception = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/perception.js"), "utf8");
+  const sections = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/sections.js"), "utf8");
+
+  assert.match(runtime, /createPerceptionFacade\s*\(/);
+  assert.match(runtime, /createSectionPerception\s*\(/);
+  assert.doesNotMatch(runtime, /function pageReadinessFacts\s*\(/);
+  assert.doesNotMatch(runtime, /function visualPageState\s*\(/);
+  assert.doesNotMatch(runtime, /function detectCheckoutSections\s*\(/);
+  assert.doesNotMatch(runtime, /function elementBelongsToSectionBand\s*\(/);
+  assert.match(perception, /function pageReadinessFacts\s*\(/);
+  assert.match(perception, /function visualPageState\s*\(/);
+  assert.match(sections, /function detectCheckoutSections\s*\(/);
+  assert.match(sections, /function elementBelongsToSectionBand\s*\(/);
+});
