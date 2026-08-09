@@ -317,3 +317,18 @@ test("observation transport sends one latest result and loop failures stay typed
   assert.match(content, /\["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"\]/);
   assert.match(content, /decision\.fatalBackendFailure === true/);
 });
+
+test("extension page-map and observation transport have one modular implementation", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const pageMap = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/page-map.js"), "utf8");
+  const transport = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/transport.js"), "utf8");
+
+  assert.match(runtime, /createPageMapCompiler\s*\(/);
+  assert.match(runtime, /createObservationTransport\s*\(/);
+  assert.doesNotMatch(runtime, /function buildPageMap\s*\(/);
+  assert.doesNotMatch(runtime, /function boundedObservationTransport\s*\(/);
+  assert.match(pageMap, /function buildPageMap\s*\(/);
+  assert.match(transport, /function boundedObservationTransport\s*\(/);
+  assert.match(transport, /function postObservationWithSizeRecovery\s*\(/);
+});

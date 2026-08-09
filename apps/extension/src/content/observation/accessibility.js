@@ -11,8 +11,7 @@ export function createAccessibilityProjection({
   elementId,
   elementById,
   queryAllDeep,
-  currentPageMap,
-  buildPageMap
+  currentPageMap
 }) {
   function accessibleName(element) {
     if (!element) return "";
@@ -68,7 +67,7 @@ export function createAccessibilityProjection({
     };
   }
 
-  function accessibilitySnapshot(map = currentPageMap() || buildPageMap()) {
+  function accessibilitySnapshot(map = currentPageMap() || {}) {
     const surface = map.currentSurface || {};
     const controls = [
       ...(map.fields || []).map((item) => item.element),
