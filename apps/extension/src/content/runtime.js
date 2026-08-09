@@ -5,7 +5,21 @@ import {
   validStoredSelectedBookingContract
 } from "./selected-booking.js";
 import { createActionTransport } from "./observation/action-transport.js";
+import { createAccessibilityProjection } from "./observation/accessibility.js";
+import { implicitRole, isVisible, queryAllDeep, textFromIds } from "./observation/dom.js";
 import { createPageStateStore } from "./observation/page-state-store.js";
+import {
+  boundedPhrase,
+  normalizedFieldAlias,
+  profileFieldTypesFromText
+} from "./observation/field-semantics.js";
+import {
+  currentCommercialOptionPrice,
+  localizedPriceAmount,
+  normalizedCurrencyToken,
+  structuredPriceFromText,
+  structuredPricesFromText
+} from "./observation/prices.js";
 
 (async function bootAirTravelWallet() {
   if (document.getElementById("atw-sidebar")) return;
@@ -201,6 +215,27 @@ import { createPageStateStore } from "./observation/page-state-store.js";
     compactActionResultForTransport,
     compactObservationActionContext
   } = createActionTransport({ compactText, compactChoiceCommitEvidence });
+  const {
+    accessibleName,
+    accessibilityState,
+    accessibilityNode,
+    accessibilitySnapshot
+  } = createAccessibilityProjection({
+    textFromIds,
+    implicitRole,
+    buttonText,
+    labelText,
+    isDisabledLike,
+    isVisible,
+    liveSectionForElement,
+    lookupControlForElement,
+    elementBox,
+    elementId,
+    elementById,
+    queryAllDeep,
+    currentPageMap: () => agent.pageMap || null,
+    buildPageMap
+  });
 
   function storageGet(keys) {
     return chrome.storage.local.get(keys);
@@ -507,24 +542,8 @@ import { createPageStateStore } from "./observation/page-state-store.js";
     ].filter(Boolean).join(" ").replace(/\s+/g, " ").toLowerCase();
   }
 
-  function normalizedFieldAlias(value = "") {
-    return String(value || "")
-      .trim()
-      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "");
-  }
-
   function canonicalProfileFieldType(value = "") {
     return AGENT_CONTRACT?.canonicalProfileFieldType?.(value) || "";
-  }
-
-  function boundedPhrase(text = "", phrase = "") {
-    const source = String(text || "").toLowerCase().replace(/[^a-z0-9+]+/g, " ").replace(/\s+/g, " ").trim();
-    const wanted = String(phrase || "").toLowerCase().replace(/[^a-z0-9+]+/g, " ").replace(/\s+/g, " ").trim();
-    if (!source || !wanted) return false;
-    return new RegExp(`(?:^|\\s)${wanted.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\ /g, "\\s+")}(?:$|\\s)`).test(source);
   }
 
   function stableProfileFieldOwnerKey(group) {
@@ -607,61 +626,6 @@ import { createPageStateStore } from "./observation/page-state-store.js";
       ownerKey: tight ? stableProfileFieldOwnerKey(group) : "",
       controlCount
     };
-  }
-
-  function profileFieldTypesFromText(value = "", { editable = true } = {}) {
-    const evidence = String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
-    if (!evidence) return [];
-    const matches = [];
-    const add = (fieldType) => {
-      if (fieldType && !matches.includes(fieldType)) matches.push(fieldType);
-    };
-    if (/emergency contact.*e[ -]?mail|e[ -]?mail.*emergency contact/.test(evidence)) add("emergency_contact_email");
-    else if (/confirm.*e[ -]?mail|repeat.*e[ -]?mail/.test(evidence)) add("confirm_email");
-    else if (editable && /(?:^|\s)e[ -]?mail(?:\s|$)/.test(evidence)) add("email");
-    if (/emergency contact.*name|name.*emergency contact/.test(evidence)) add("emergency_contact_name");
-    if (/emergency contact.*relationship|relationship.*emergency contact/.test(evidence)) add("emergency_contact_relationship");
-    if (/emergency contact.*(?:phone|mobile|telephone)|(?:phone|mobile|telephone).*emergency contact/.test(evidence)) add("emergency_contact_phone");
-    if (boundedPhrase(evidence, "surname") || /family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
-    const combinedGivenNames = /(?:first|given)\s*(?:\/|and|&)\s*middle\s+names?\b|\bgiven names\b|\bforenames\b/.test(evidence);
-    if (combinedGivenNames) add("given_names");
-    else {
-      if (/first[ _-]?name|given[ _-]?name|forename/.test(evidence)) add("first_name");
-      if (/middle[ _-]?name/.test(evidence)) add("middle_name");
-    }
-    if (/second (?:last name|surname)|additional surname|maternal surname/.test(evidence)) add("second_last_name");
-    if (editable && /(?:^|\s)(?:birth|date of birth|dob|bday)(?:\s|$)/.test(evidence)) add("date_of_birth");
-    if (editable && /(?:age at (?:the )?time of travel|age (?:at|on) departure|departure age|travel age|passenger age)/.test(evidence)) add("age_at_departure");
-    if (editable && /(?:^|\s)(?:place of birth|birth place|birth city)(?:\s|$)/.test(evidence)) add("place_of_birth");
-    if (editable && /(?:^|\s)(?:nationality|citizenship|country of citizenship)(?:\s|$)/.test(evidence)) add("nationality");
-    if (editable && /country of residence|residence country|resident country/.test(evidence)) add("country_of_residence");
-    if (editable && /(?:travel|identity)?\s*document type|passport or id|id type/.test(evidence)) add("document_type");
-    if (editable && /passport.*(?:number|no)|(?:number|no).*passport/.test(evidence)) add("passport_number");
-    if (editable && /(?:travel|identity)?.*document.*(?:number|no)|(?:number|no).*document/.test(evidence)) add("document_number");
-    if (editable && /(?:issuing|issue).*(?:country|nation)|(?:country|nation).*(?:issuing|issue)/.test(evidence)) add("issuing_country");
-    if (editable && /(?:passport|document).*(?:issue date|date of issue)|(?:issue date|date of issue).*(?:passport|document)/.test(evidence)) add("document_issue_date");
-    if (editable && /passport.*(?:expiry|expiration)|(?:expiry|expiration).*passport/.test(evidence)) add("passport_expiry");
-    if (editable && /document.*(?:expiry|expiration)|(?:expiry|expiration).*document/.test(evidence)) add("document_expiry");
-    if (editable && /frequent[ -]?flyer.*(?:program|programme|airline)|loyalty program/.test(evidence)) add("frequent_flyer_program");
-    if (editable && /frequent[ -]?flyer.*(?:number|no)|loyalty (?:number|no)|membership (?:number|no)/.test(evidence)) add("frequent_flyer_number");
-    if (editable && /known travell?er (?:number|no)|\bktn\b/.test(evidence)) add("known_traveler_number");
-    if (editable && /redress (?:control )?(?:number|no)/.test(evidence)) add("redress_number");
-    if (editable && /meal preference|special meal|meal request/.test(evidence)) add("meal_preference");
-    if (editable && /special assistance|assistance request|accessibility request/.test(evidence)) add("special_assistance");
-    if (/purpose of (?:the )?(?:trip|travel|journey)|(?:trip|travel|journey) purpose|reason for (?:the )?(?:trip|travel|journey)|business or leisure|travell?ing for (?:business|leisure)/.test(evidence)) add("travel_purpose");
-    const countryPhoneCode = /country.*(?:phone|dial|calling)?\s*code|(?:phone|dial|calling).*country.*code|dial.*code|calling.*code/.test(evidence);
-    // A custom country-code select may expose only a button opener. Exact
-    // phone-code wording remains field evidence even though that actuator is
-    // not itself editable.
-    if (countryPhoneCode) {
-      add("phone_country_code");
-    } else if (editable && (/(?:^|\s)(?:phone|telephone|mobile)(?:\s|$)/.test(evidence))
-      && !/(?:plan|bundle|package|insurance|addon|add on|emergency contact)/.test(evidence)) {
-      add("phone");
-    }
-    if (/(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(evidence)) add("title");
-    if (/(?:^|\s)(?:gender|sex)(?:\s|$)/.test(evidence)) add("gender");
-    return matches;
   }
 
   function explicitProfileLabelEvidence(input) {
@@ -3078,37 +3042,6 @@ import { createPageStateStore } from "./observation/page-state-store.js";
     renderSidebar("agent");
   }
 
-  function isVisible(element) {
-    if (!element) return false;
-    const rect = element.getBoundingClientRect();
-    const style = getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
-  }
-
-  function queryAllDeep(selector, root = document) {
-    const results = [];
-    const visit = (scope) => {
-      try {
-        results.push(...scope.querySelectorAll(selector));
-        const nested = scope.querySelectorAll("*");
-        for (const element of nested) {
-          if (element.shadowRoot) visit(element.shadowRoot);
-        }
-        for (const frame of scope.querySelectorAll("iframe")) {
-          try {
-            if (frame.contentDocument) visit(frame.contentDocument);
-          } catch (error) {
-            // Cross-origin frames are intentionally opaque to the content script.
-          }
-        }
-      } catch (error) {
-        // Some roots/frames can disappear while checkout pages re-render.
-      }
-    };
-    visit(root);
-    return [...new Set(results)];
-  }
-
   function elementSignature(element) {
     if (!element) return "";
     const box = isVisible(element) ? elementBox(element) : null;
@@ -4155,109 +4088,6 @@ import { createPageStateStore } from "./observation/page-state-store.js";
     return { semantic: fallbackSemantic || "unknown", physicalEffect: "unknown", conflict: false };
   }
 
-  function textFromIds(ids = "") {
-    return String(ids || "")
-      .split(/\s+/)
-      .map((id) => id && document.getElementById(id)?.innerText)
-      .filter(Boolean)
-      .join(" ");
-  }
-
-  function implicitRole(element) {
-    if (!element) return "";
-    const tag = (element.tagName || "").toLowerCase();
-    const type = (element.getAttribute?.("type") || "").toLowerCase();
-    if (element.getAttribute?.("role")) return element.getAttribute("role");
-    if (tag === "button" || ["button", "submit", "reset"].includes(type)) return "button";
-    if (tag === "a" && element.getAttribute("href")) return "link";
-    if (tag === "select") return "combobox";
-    if (tag === "textarea") return "textbox";
-    if (tag === "input") {
-      if (type === "checkbox") return "checkbox";
-      if (type === "radio") return "radio";
-      if (type === "range") return "slider";
-      return "textbox";
-    }
-    if (tag === "dialog") return "dialog";
-    return "";
-  }
-
-  function accessibleName(element) {
-    if (!element) return "";
-    return [
-      element.getAttribute?.("aria-label"),
-      textFromIds(element.getAttribute?.("aria-labelledby")),
-      element.getAttribute?.("alt"),
-      element.getAttribute?.("title"),
-      element.value && /button|submit|reset/.test(element.type || "") ? element.value : "",
-      buttonText(element),
-      labelText(element),
-      element.innerText || element.textContent
-    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 240);
-  }
-
-  function accessibilityState(element) {
-    if (!element) return {};
-    return {
-      disabled: isDisabledLike(element),
-      checked: element.checked === true || element.getAttribute?.("aria-checked") === "true",
-      selected: element.selected === true || element.getAttribute?.("aria-selected") === "true",
-      expanded: element.getAttribute?.("aria-expanded") || "",
-      pressed: element.getAttribute?.("aria-pressed") || "",
-      required: element.required === true || element.getAttribute?.("aria-required") === "true",
-      invalid: element.getAttribute?.("aria-invalid") === "true",
-      hasPopup: element.getAttribute?.("aria-haspopup") || "",
-      controls: element.getAttribute?.("aria-controls") || "",
-      describedBy: textFromIds(element.getAttribute?.("aria-describedby")).slice(0, 240)
-    };
-  }
-
-  function accessibilityNode(element, map = agent.pageMap || null) {
-    if (!element || !isVisible(element) || element.closest?.("#atw-sidebar")) return null;
-    const section = map ? liveSectionForElement(map, element) : null;
-    const surface = map?.currentSurface || {};
-    const control = map ? lookupControlForElement(map, element) : null;
-    const box = elementBox(element);
-    return {
-      id: elementId(element),
-      controlId: control?.controlId || element.dataset?.atwControlId || "",
-      role: implicitRole(element),
-      name: accessibleName(element),
-      state: accessibilityState(element),
-      box,
-      tag: (element.tagName || "").toLowerCase(),
-      kind: /radio|checkbox/i.test(element.type || "") ? "choice" : ((element.tagName || "").toLowerCase()),
-      sectionId: section?.id || "",
-      sectionType: section?.type || "",
-      sectionLabel: section?.label || "",
-      surfaceId: surface?.id || "",
-      surfaceType: surface?.type || "page",
-      inViewport: Boolean(box?.inViewport)
-    };
-  }
-
-  function accessibilitySnapshot(map = agent.pageMap || buildPageMap()) {
-    const surface = map.currentSurface || {};
-    const controls = [
-      ...(map.fields || []).map((item) => item.element),
-      ...(map.buttons || []).map((item) => item.element),
-      ...(surface.id ? [elementById(surface.id)] : []),
-      ...(surface.options || []).map((item) => elementById(item.id)),
-      ...(surface.buttons || []).map((item) => elementById(item.id))
-    ]
-      .filter(Boolean)
-      .map((element) => accessibilityNode(element, map))
-      .filter(Boolean)
-      .filter((node, index, list) => list.findIndex((item) => item.id === node.id) === index)
-      .slice(0, 120);
-    return {
-      foregroundSurfaceId: surface.id || "",
-      foregroundSurfaceType: surface.type || "page",
-      controls,
-      landmarkCount: queryAllDeep("main, [role='main'], form, nav, header, footer, aside").filter(isVisible).length
-    };
-  }
-
   function currentSurfaceEntryForElement(map, element) {
     if (!element) return null;
     const id = elementId(element);
@@ -5099,114 +4929,6 @@ import { createPageStateStore } from "./observation/page-state-store.js";
       .map((field) => field.label || "")
       .filter(Boolean)
       .map((text) => text.replace(/\s+/g, " ").trim());
-  }
-
-  const FALLBACK_CURRENCY_CODES = new Set([
-    "AED", "ARS", "AUD", "BGN", "BHD", "BRL", "CAD", "CHF", "CLP", "CNY",
-    "COP", "CZK", "DKK", "EGP", "EUR", "GBP", "HKD", "HRK", "HUF", "IDR",
-    "ILS", "INR", "ISK", "JPY", "KRW", "KWD", "MAD", "MXN", "MYR", "NOK",
-    "NZD", "OMR", "PEN", "PHP", "PLN", "QAR", "RON", "RSD", "RUB", "SAR",
-    "SEK", "SGD", "THB", "TRY", "TWD", "UAH", "USD", "VND", "ZAR"
-  ]);
-  const SUPPORTED_CURRENCY_CODES = (() => {
-    try {
-      const supported = typeof Intl.supportedValuesOf === "function"
-        ? Intl.supportedValuesOf("currency")
-        : [];
-      return new Set([...FALLBACK_CURRENCY_CODES, ...supported.map((code) => String(code).toUpperCase())]);
-    } catch (_) {
-      return FALLBACK_CURRENCY_CODES;
-    }
-  })();
-
-  function normalizedCurrencyToken(value = "") {
-    const token = String(value || "").trim().toUpperCase();
-    const symbols = { "€": "EUR", "$": "USD", "£": "GBP", "¥": "JPY", "₩": "KRW", "₹": "INR", "₺": "TRY" };
-    if (symbols[token]) return symbols[token];
-    if (token === "TL") return "TRY";
-    return SUPPORTED_CURRENCY_CODES.has(token) ? token : "";
-  }
-
-  function localizedPriceAmount(value = "") {
-    const raw = String(value || "").replace(/[\s'’]/g, "");
-    if (!/^-?\d[\d.,]*$/.test(raw)) return null;
-    const lastDot = raw.lastIndexOf(".");
-    const lastComma = raw.lastIndexOf(",");
-    const separator = Math.max(lastDot, lastComma);
-    let normalized = raw;
-    if (separator >= 0) {
-      const fractionalDigits = raw.length - separator - 1;
-      if (fractionalDigits >= 1 && fractionalDigits <= 2) {
-        normalized = `${raw.slice(0, separator).replace(/[.,]/g, "")}.${raw.slice(separator + 1)}`;
-      } else {
-        normalized = raw.replace(/[.,]/g, "");
-      }
-    }
-    const amount = Number(normalized);
-    return Number.isFinite(amount) ? amount : null;
-  }
-
-  function structuredPricesFromText(value = "") {
-    // Airline accessibility labels frequently wrap prefix-currency prices in
-    // bidi isolation/embedding marks (for example `\u202AEUR37.95\u202C`).
-    // Those are presentation controls, not semantic separators.
-    const text = String(value || "")
-      .replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-    // Accept plain decimals and localized thousands groups, but never merge
-    // duplicated accessibility amounts such as `EUR37.95 37.95 Euro` into
-    // one synthetic number.
-    const numberPattern = "-?(?:\\d{1,3}(?:[\\s'’.,]\\d{3})+(?:[.,]\\d{1,2})?|\\d+(?:[.,]\\d{1,2})?)";
-    // Alphabetic currency codes must be standalone tokens. Without both word
-    // boundaries, ordinary labels such as "Country 001" are parsed as
-    // "TRY 001", incorrectly turning a free form control into a money-risk
-    // action that policy will reject.
-    const currencyPattern = "(?:\\b(?:[A-Za-z]{3}|TL)\\b|€|\\$|£|¥|₩|₹|₺)";
-    // A compact amount such as "30EUR" has no word boundary between the
-    // digit and E. Direction-specific patterns preserve the protection
-    // against matching the TRY inside "Country" while accepting compact ISO
-    // prices emitted by accessibility text.
-    const currencyAfterAmountPattern = "(?:(?:[A-Za-z]{3}|TL)\\b|€|\\$|£|¥|₩|₹|₺)";
-    // Prefix ISO prices may also be compact (`EUR37.95`). Require a leading
-    // token boundary and a following numeric lookahead rather than a trailing
-    // word boundary; this accepts the compact price without matching the TRY
-    // substring inside labels such as `Country001`.
-    const currencyBeforeAmountPattern = "(?:\\b(?:[A-Za-z]{3}|TL)(?=\\s*-?\\d)|€|\\$|£|¥|₩|₹|₺)";
-    const matches = [
-      ...text.matchAll(new RegExp(`(${numberPattern})\\s*(${currencyAfterAmountPattern})`, "gi"))
-    ].map((match) => ({
-      amount: localizedPriceAmount(match[1]),
-      currency: normalizedCurrencyToken(match[2])
-    })).concat([
-      ...text.matchAll(new RegExp(`(${currencyBeforeAmountPattern})\\s*(${numberPattern})`, "gi"))
-    ].map((match) => ({
-      amount: localizedPriceAmount(match[2]),
-      currency: normalizedCurrencyToken(match[1])
-    }))).filter((price) => price.amount != null && price.currency);
-    return matches.filter((price, index, list) => (
-      list.findIndex((other) => other.amount === price.amount && other.currency === price.currency) === index
-    ));
-  }
-
-  function structuredPriceFromText(value = "") {
-    return structuredPricesFromText(value)[0] || null;
-  }
-
-  function currentCommercialOptionPrice(value = "") {
-    const text = String(value || "").replace(/\s+/g, " ").trim();
-    if (!text) return null;
-    const cues = [...text.matchAll(/\b(?:discounted|current|final|now|today(?:'s|’s)?)\s*(?:price)?\s*[:–—-]?\s*/gi)];
-    for (const cue of cues.reverse()) {
-      // Airline copy often renders a human price followed by an accessible
-      // canonical token: "Discounted Price: 30 Euro 30EUR". Parse the first
-      // structured token owned by the current-price cue instead of requiring
-      // the currency code to be adjacent to the cue itself.
-      const boundedTail = text.slice(cue.index + cue[0].length, cue.index + cue[0].length + 100);
-      const price = structuredPricesFromText(boundedTail)[0] || null;
-      if (price) return price;
-    }
-    return null;
   }
 
   function choiceGoalTerms(semantic = "", dateField = null) {
