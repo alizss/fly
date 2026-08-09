@@ -442,3 +442,18 @@ test("extension execution orchestrator owns one governed action lifecycle", () =
   assert.match(orchestrator, /function pushVerificationLedger\s*\(/);
   assert.match(orchestrator, /function verificationFromSurfaceFeedback\s*\(/);
 });
+
+test("extension controller owns single-flight turns and bounded destination waiting", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const lifecycle = fs.readFileSync(path.join(root, "apps/extension/src/content/controller/lifecycle.js"), "utf8");
+
+  assert.match(runtime, /createAgentLifecycle\s*\(/);
+  assert.doesNotMatch(runtime, /function beginDestinationWait\s*\(/);
+  assert.doesNotMatch(runtime, /function beginAgentLoop\s*\(/);
+  assert.doesNotMatch(runtime, /function abortActivePlannerRequest\s*\(/);
+  assert.match(lifecycle, /function beginDestinationWait\s*\(/);
+  assert.match(lifecycle, /function scheduleDestinationObservation\s*\(/);
+  assert.match(lifecycle, /function beginAgentLoop\s*\(/);
+  assert.match(lifecycle, /function abortActivePlannerRequest\s*\(/);
+});
