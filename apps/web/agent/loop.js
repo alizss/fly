@@ -1452,7 +1452,6 @@ function rawVerifiedCommerceReceipt(state = {}, observation = {}) {
  * @param {import("../../../packages/shared/agent-state").CheckoutSessionState} args.state
  * @param {Object} args.observation AgentObservation from the extension
  * @param {Object} args.traveler
- * @param {Array} args.actionHistory
  * @returns {Promise<{ state: Object, clientDecision: Object }>}
  */
 async function runLoopTurn({
@@ -1465,7 +1464,6 @@ async function runLoopTurn({
   traveler,
   userMessage = "",
   userResponse = null,
-  actionHistory = [],
   transactionStore = null,
   clientTurnId = ""
 }) {

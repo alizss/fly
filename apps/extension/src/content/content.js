@@ -165,6 +165,7 @@
     lastActionResult: null,
     lastBackendDebug: null,
     processDiagnostics: null,
+    sessionStartFailure: null,
     pageMap: null,
     lastPageMutationAt: Date.now(),
     pageUnderstanding: null,
@@ -197,7 +198,13 @@
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
   const DESTINATION_RETRY_INTERVAL_MS = 300;
   const DESTINATION_MUTATION_SETTLE_MS = 450;
+  const SELECTED_BOOKING_UNCHANGED_RETRY_MS = 30_000;
   let selectedBookingCaptureTimer = null;
+  let selectedBookingCaptureAttempt = {
+    url: "",
+    snapshotHash: "",
+    retryAfter: 0
+  };
 
   function authoritativeSelectedBookingFacts(facts = null) {
     if (!facts || facts.evidenceMode !== "typed") return null;
@@ -206,13 +213,16 @@
     const totalAmount = Number(facts.totalPrice?.amount);
     const totalCurrency = String(facts.totalPrice?.currency || facts.currency || "").trim().toUpperCase();
     const totalEvidence = facts.factEvidence?.totalPrice || null;
+    const travelerIds = (Array.isArray(facts.travelers) ? facts.travelers : [])
+      .map((entry) => String(entry?.travelerId || "").trim())
+      .filter(Boolean);
     const authoritativeTotal = Number.isFinite(totalAmount)
       && totalAmount >= 0
       && Boolean(totalCurrency)
       && totalEvidence?.authoritative === true
       && totalEvidence?.role === "booking_total"
       && Boolean(String(totalEvidence.ownerKey || "").trim());
-    if (facts.itinerary?.completeness !== "complete" || !segments.length || !authoritativeTotal) return null;
+    if (facts.itinerary?.completeness !== "complete" || !segments.length || !travelerIds.length || !authoritativeTotal) return null;
     const complete = segments.every((segment) => {
       const proof = segment.evidence || evidence.find((entry) => entry?.segmentId === segment.segmentId) || null;
       return Boolean(
@@ -275,11 +285,27 @@
 
   function scheduleSelectedBookingCapture(reason = "page_update") {
     if (agent.running || agent.sessionId || selectedBookingCaptureTimer) return false;
+    if (
+      selectedBookingCaptureAttempt.url === location.href
+      && Date.now() < selectedBookingCaptureAttempt.retryAfter
+    ) return false;
     selectedBookingCaptureTimer = setTimeout(() => {
       selectedBookingCaptureTimer = null;
       if (agent.running) return;
       const observed = pageStateStore.observe({ reason: `selected_booking_${reason}` });
-      captureSelectedBookingFromMap(observed.map);
+      const captured = captureSelectedBookingFromMap(observed.map);
+      const snapshotHash = String(observed.snapshotHash || observationHashForMap(observed.map));
+      const unchangedMiss = !captured
+        && selectedBookingCaptureAttempt.url === location.href
+        && selectedBookingCaptureAttempt.snapshotHash === snapshotHash
+        && observed.material === false;
+      selectedBookingCaptureAttempt = {
+        url: location.href,
+        snapshotHash,
+        retryAfter: captured
+          ? Number.POSITIVE_INFINITY
+          : Date.now() + (unchangedMiss ? SELECTED_BOOKING_UNCHANGED_RETRY_MS : 1_500)
+      };
     }, 350);
     return true;
   }
@@ -2828,6 +2854,7 @@
 
   async function startAgentSession(resumeSessionId = "") {
     try {
+      agent.sessionStartFailure = null;
       const settings = await storageGet(["apiBase", "selectedBookingContract"]);
       const currentBookingCapture = captureSelectedBookingFromMap(agent.pageMap);
       const selectedBooking = readSelectedBookingAcquisition() || currentBookingCapture;
@@ -2845,8 +2872,13 @@
           page: compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
         })
       });
-      if (!response.ok) throw new Error(`session returned ${response.status}`);
-      const session = await response.json();
+      const session = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        const error = new Error(session.error || `session returned ${response.status}`);
+        error.code = session.code || `HTTP_${response.status}`;
+        error.retryable = session.retryable === true;
+        throw error;
+      }
       const sessionId = String(session.id || "");
       if (!sessionId) throw new Error("session handshake returned an empty id");
       if (resumeSessionId && sessionId !== resumeSessionId) {
@@ -2856,6 +2888,10 @@
       logAgentEvent("agent_session_started", { sessionId: agent.sessionId });
       return session;
     } catch (error) {
+      agent.sessionStartFailure = {
+        code: String(error.code || "SESSION_START_FAILED"),
+        message: String(error.message || "Checkout session could not be started.")
+      };
       logAgentEvent("agent_session_failed", { error: error.message });
       agent.sessionId = "";
       return null;
@@ -15013,11 +15049,9 @@
   }
 
   function compactObservationActionContext(payload = {}) {
+    const { actionHistory: _retiredActionHistory, ...canonicalPayload } = payload;
     return {
-      ...payload,
-      actionHistory: Array.isArray(payload.actionHistory)
-        ? payload.actionHistory.slice(-3).map(compactActionResultForTransport).filter(Boolean)
-        : [],
+      ...canonicalPayload,
       lastActionResult: compactActionResultForTransport(payload.lastActionResult)
     };
   }
@@ -15449,6 +15483,8 @@
       }
       const error = new Error(body.error || `agent returned ${response.status}`);
       error.code = body.code || `HTTP_${response.status}`;
+      error.failureCode = body.failureCode || "";
+      error.sessionId = body.sessionId || "";
       error.retryable = body.retryable === true;
       throw error;
     }
@@ -15605,10 +15641,6 @@
     agent.activeTurnId = turnId;
     agent.activeObservationId = observationId;
     const observationSnapshot = mapObservationSnapshot(map);
-    const actionHistoryForTransport = agent.actionHistory
-      .slice(-12)
-      .map(compactActionResultForTransport)
-      .filter(Boolean);
     const lastActionForTransport = compactActionResultForTransport(
       agent.lastActionResult || agent.actionHistory[agent.actionHistory.length - 1] || null
     );
@@ -15710,7 +15742,6 @@
 	        skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
 	        paymentApproved: false
 	      },
-	      actionHistory: actionHistoryForTransport,
         // Best-effort context for the backend verifier — it independently judges
         // whether the last action actually worked from fresh browser evidence.
 	      lastActionResult: lastActionForTransport,
@@ -15871,11 +15902,13 @@
         setAgentActivity("Blocked", "The compact browser payload is still oversized. Automatic retries were stopped.");
       }
       const contextInvalidated = /extension context invalidated|context invalidated|receiving end does not exist/i.test(error.message || "");
-      const backendFailure = error?.code === "BACKEND_INTERNAL_ERROR" || /^HTTP_5\d\d$/.test(error?.code || "");
+      const backendFailure = ["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"].includes(error?.code)
+        || /^HTTP_5\d\d$/.test(error?.code || "");
       const oversizedObservation = error?.code === "OBSERVATION_TOO_LARGE";
       const decision = {
         source: "system",
         action: "stop",
+        fatalBackendFailure: backendFailure,
         targetId: "",
         value: "",
         message: contextInvalidated
@@ -15883,10 +15916,10 @@
           : oversizedObservation
             ? "The checkout observation remained too large after compact recovery. I stopped instead of retrying indefinitely."
           : backendFailure
-            ? `Agent backend error: ${error.message}. No browser action was dispatched.`
+            ? `Agent backend error${error.failureCode ? ` (${error.failureCode})` : ""}: ${error.message}. No browser action was dispatched.`
           : `AI agent unavailable: ${error.message}. I stopped because AI-only mode is enabled.`,
-        needsApproval: true,
-        risk: "uncertain",
+        needsApproval: !backendFailure,
+        risk: backendFailure ? "system" : "uncertain",
         reason: contextInvalidated
           ? "Extension lifecycle error: this page is still running the old content script after extension reload."
           : oversizedObservation
@@ -16154,6 +16187,16 @@
     }
     if (decision.reason) {
       setAgentActivity(message, decision.reason);
+    }
+
+    if (decision.fatalBackendFailure === true) {
+      // A backend exception is neither a user question nor a semantic stop.
+      // Preserve the durable transaction and surface the typed failure without
+      // writing an ask_user/stop outcome into its verified history.
+      agent.running = false;
+      agent.awaiting = "";
+      renderSidebar("agent");
+      return;
     }
 
     if (decision.risk !== "safe" && decision.needsApproval) {
@@ -17127,7 +17170,12 @@
       agent.running = false;
       agent.awaiting = "manual";
       await clearResumeMarker();
-      addAgentMessage("assistant", "I could not establish one durable checkout session, so I stopped before planning or changing the page.");
+      addAgentMessage(
+        "assistant",
+        agent.sessionStartFailure?.code === "SELECTED_BOOKING_REQUIRED"
+          ? "Start Fly from an approved flight selection that shows the itinerary and total price. I stopped before changing the page because no complete selected booking was available."
+          : `I could not establish one durable checkout session, so I stopped before planning or changing the page.${agent.sessionStartFailure?.message ? ` ${agent.sessionStartFailure.message}` : ""}`
+      );
       renderSidebar("agent");
       return;
     }

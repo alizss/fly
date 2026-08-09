@@ -36,6 +36,49 @@ const { compileDecisionFrame, currentObligationFromGoal } = require("../../apps/
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
+function testSelectedBooking(travelerId) {
+  const observationId = `selected_booking_${travelerId}`;
+  const evidence = {
+    segmentId: "segment_lju_lgw",
+    ownerKey: "itinerary:LJU:LGW:2026-10-15",
+    authoritative: true
+  };
+  return {
+    contractVersion: "selected-booking-acquisition/v1",
+    capturedAt: new Date().toISOString(),
+    sourceUrl: "https://example.test/flights/selected",
+    observationId,
+    facts: {
+      contractVersion: "transaction-facts/v2",
+      evidenceMode: "typed",
+      itinerary: {
+        completeness: "complete",
+        segments: [{
+          segmentId: evidence.segmentId,
+          origin: "LJU",
+          destination: "LGW",
+          departureDate: "2026-10-15",
+          evidence
+        }]
+      },
+      travelers: [{ travelerId }],
+      currency: "EUR",
+      totalPrice: { amount: 250, currency: "EUR" },
+      fareBrand: "Standard",
+      selectedExtras: [],
+      factEvidence: {
+        itinerary: [evidence],
+        totalPrice: {
+          ownerKey: "booking-total:LJU-LGW:250:EUR",
+          role: "booking_total",
+          authoritative: true
+        }
+      },
+      provenance: [{ source: "flight_selection", observationId, confidence: 1 }]
+    }
+  };
+}
+
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
   return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
 }
@@ -98,6 +141,23 @@ async function loadProducer(page, sourcePath = fixturePath) {
   });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
 }
+
+test("pre-session selected-booking capture backs off on an unchanged incomplete surface", async ({ page }) => {
+  await loadProducer(page);
+  await page.evaluate(() => {
+    document.body.innerHTML = "<main><h1>Passenger details</h1><p>Checkout has no selected-flight summary.</p></main>";
+    const profile = { id: "trav_provisional_start", first_name: "Ali", last_name: "Example" };
+    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
+  });
+
+  expect(await page.evaluate(() => (
+    window.__ATW_TEST__.scheduleSelectedBookingCapture("incomplete_surface")
+  ))).toBe(true);
+  await page.waitForTimeout(900);
+  expect(await page.evaluate(() => (
+    window.__ATW_TEST__.scheduleSelectedBookingCapture("unchanged_surface")
+  ))).toBe(false);
+});
 
 async function loadHtmlProducer(page, html) {
   await page.setContent(html);
@@ -7212,6 +7272,7 @@ test("real backend suppresses unchanged destination observations and wakes on tr
     data: {
       goal: "Continue checkout safely to payment review",
       traveler,
+      selectedBooking: testSelectedBooking(traveler.id),
       page: { site: "example.test", url: page.url(), step: "extras" }
     }
   });
@@ -9562,7 +9623,7 @@ test("action transport strips embedded page maps before the first backend reques
   expect(result.transportMode).toBe("canonical");
   expect(result.response).toEqual({ ok: true });
   expect(requestCount).toBe(1);
-  expect(received.actionHistory[0].outcome.evidence.choiceCommit.map).toBeUndefined();
+  expect(received.actionHistory).toBeUndefined();
   expect(received.lastActionResult.outcome.evidence.choiceCommit.map).toBeUndefined();
   expect(received.lastActionResult.outcome.evidence.choiceCommit).toMatchObject({
     ok: true,
@@ -9702,6 +9763,7 @@ test("large canonical observation uploads screenshot separately and reaches a gr
     data: {
       goal: "Continue checkout safely",
       traveler,
+      selectedBooking: testSelectedBooking(traveler.id),
       page: { site: "example.test", url: page.url(), step: "traveler_information" }
     }
   });
@@ -9732,7 +9794,6 @@ test("large canonical observation uploads screenshot separately and reaches a gr
       userIntent: "Continue checkout safely",
       traveler,
       approvalState: { skipPaidExtrasApproved: true, paymentApproved: false },
-      actionHistory: [],
       lastActionResult: null,
       page: {
         ...canonicalPage,

@@ -36,6 +36,7 @@ function normalizeSelectedBooking(raw = null) {
     || amount == null
     || amount < 0
     || !currency
+    || !travelerIds.length
   ) return null;
   return Object.freeze({
     contractVersion: CONTRACT_VERSION,

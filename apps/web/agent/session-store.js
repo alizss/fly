@@ -12,7 +12,7 @@ const { executionEpisodeFor, normalizeExecutionEpisode } = require("./execution-
 const LEGACY_REPLAY_DB_PATH = path.resolve(__dirname, "../../../work/agent-transactions.sqlite");
 const DEFAULT_DB_PATH = process.env.ATW_TRANSACTION_DB
   || path.resolve(__dirname, "../../../work/agent-transactions-v2.sqlite");
-const MAX_UNREFERENCED_OBSERVATIONS_PER_SESSION = 12;
+const ACTIVE_OBSERVATION_PAYLOADS_PER_SESSION = 2;
 
 function json(value, fallback = null) {
   try {
@@ -219,14 +219,79 @@ function compactTaskState(taskState = null) {
   };
 }
 
+function compactFactEvidence(evidence = null) {
+  if (!evidence || typeof evidence !== "object") return null;
+  return {
+    source: String(evidence.source || "").slice(0, 80),
+    ownerKey: String(evidence.ownerKey || "").slice(0, 180),
+    role: String(evidence.role || "").slice(0, 40),
+    ownerType: String(evidence.ownerType || "").slice(0, 60),
+    qualification: String(evidence.qualification || "").slice(0, 80),
+    observationId: String(evidence.observationId || "").slice(0, 120),
+    confidence: Math.max(0, Math.min(1, Number(evidence.confidence) || 0)),
+    authoritative: evidence.authoritative === true
+  };
+}
+
+function compactInvariantFacts(facts = null) {
+  if (!facts || typeof facts !== "object") return facts || null;
+  const segments = (facts.itinerary?.segments || []).slice(0, 12).map((segment) => ({
+    segmentId: String(segment.segmentId || "").slice(0, 120),
+    origin: String(segment.origin || "").slice(0, 80),
+    destination: String(segment.destination || "").slice(0, 80),
+    departureDate: String(segment.departureDate || "").slice(0, 40),
+    departureTime: String(segment.departureTime || "").slice(0, 20),
+    arrivalTime: String(segment.arrivalTime || "").slice(0, 20),
+    flightNumber: String(segment.flightNumber || "").slice(0, 30),
+    evidence: compactFactEvidence(segment.evidence)
+  }));
+  return {
+    contractVersion: String(facts.contractVersion || "").slice(0, 40),
+    evidenceMode: String(facts.evidenceMode || "").slice(0, 20),
+    itinerary: {
+      completeness: String(facts.itinerary?.completeness || "unknown").slice(0, 20),
+      segments
+    },
+    travelers: (facts.travelers || []).slice(0, 12).map((traveler) => ({
+      travelerId: String(traveler.travelerId || traveler.id || "").slice(0, 120),
+      name: String(traveler.name || "").slice(0, 160)
+    })),
+    currency: String(facts.currency || facts.totalPrice?.currency || "").slice(0, 20),
+    basePrice: facts.basePrice ? {
+      amount: Number.isFinite(Number(facts.basePrice.amount)) ? Number(facts.basePrice.amount) : null,
+      currency: String(facts.basePrice.currency || "").slice(0, 20)
+    } : null,
+    totalPrice: facts.totalPrice ? {
+      amount: Number.isFinite(Number(facts.totalPrice.amount)) ? Number(facts.totalPrice.amount) : null,
+      currency: String(facts.totalPrice.currency || facts.currency || "").slice(0, 20)
+    } : null,
+    fareBrand: String(facts.fareBrand || "").slice(0, 160),
+    selectedExtras: eventSummary(facts.selectedExtras || []),
+    factEvidence: {
+      itinerary: (facts.factEvidence?.itinerary || []).slice(0, 12).map((entry) => ({
+        segmentId: String(entry.segmentId || "").slice(0, 120),
+        ...compactFactEvidence(entry)
+      })),
+      fareBrand: compactFactEvidence(facts.factEvidence?.fareBrand),
+      totalPrice: compactFactEvidence(facts.factEvidence?.totalPrice),
+      travelers: compactFactEvidence(facts.factEvidence?.travelers)
+    },
+    provenance: (facts.provenance || []).slice(0, 20).map((entry) => ({
+      source: String(entry.source || "").slice(0, 80),
+      observationId: String(entry.observationId || "").slice(0, 120),
+      confidence: Math.max(0, Math.min(1, Number(entry.confidence) || 0))
+    }))
+  };
+}
+
 function compactTransactionInvariants(envelope = null) {
   if (!envelope || typeof envelope !== "object") return envelope || null;
   return {
     version: envelope.version,
-    baseline: eventSummary(envelope.baseline || null),
-    current: eventSummary(envelope.current || null),
+    baseline: compactInvariantFacts(envelope.baseline || null),
+    current: compactInvariantFacts(envelope.current || null),
     outcomeLedger: eventSummary(envelope.outcomeLedger || []),
-    reviewFacts: eventSummary(envelope.reviewFacts || null),
+    reviewFacts: compactInvariantFacts(envelope.reviewFacts || null),
     baselineStatus: String(envelope.baselineStatus || ""),
     baselineObservationId: String(envelope.baselineObservationId || ""),
     approvedAt: String(envelope.approvedAt || ""),
@@ -437,6 +502,55 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
   const updateTransaction = db.prepare(`
     UPDATE transactions SET state_json = ?, updated_at = ? WHERE id = ?
   `);
+  const compactHistoricalPayloads = db.prepare(`
+    UPDATE observations
+    SET payload_json = 'null'
+    WHERE transaction_id = ?
+      AND payload_json <> 'null'
+      AND observation_id NOT IN (
+        SELECT observation_id FROM observations
+        WHERE transaction_id = ?
+        ORDER BY created_at DESC, rowid DESC
+        LIMIT ?
+      )
+  `);
+
+  function compactObservationPayloads(transactionId) {
+    if (!transactionId) return 0;
+    return Number(compactHistoricalPayloads.run(
+      String(transactionId),
+      String(transactionId),
+      ACTIVE_OBSERVATION_PAYLOADS_PER_SESSION
+    ).changes || 0);
+  }
+
+  function compactAllObservationPayloads() {
+    const transactionIds = db.prepare("SELECT id FROM transactions").all().map((row) => row.id);
+    return transactionIds.reduce((total, transactionId) => total + compactObservationPayloads(transactionId), 0);
+  }
+
+  function observationStorageStats() {
+    const row = db.prepare(`
+      SELECT
+        COUNT(*) AS observation_count,
+        SUM(CASE WHEN payload_json <> 'null' THEN 1 ELSE 0 END) AS active_payload_count,
+        SUM(LENGTH(payload_json)) AS payload_bytes
+      FROM observations
+    `).get();
+    return {
+      observationCount: Number(row?.observation_count || 0),
+      activePayloadCount: Number(row?.active_payload_count || 0),
+      payloadBytes: Number(row?.payload_bytes || 0)
+    };
+  }
+
+  function reclaimObservationStorage({ vacuum = false } = {}) {
+    const before = observationStorageStats();
+    const compactedPayloads = compactAllObservationPayloads();
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    if (vacuum) db.exec("VACUUM");
+    return { before, after: observationStorageStats(), compactedPayloads, vacuumed: vacuum === true };
+  }
 
   function getSession(sessionId) {
     if (!sessionId) return null;
@@ -509,6 +623,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
       }
       db.prepare("UPDATE observations SET is_current = CASE WHEN observation_id = ? THEN 1 ELSE 0 END WHERE transaction_id = ?")
         .run(observationId, transactionId);
+      compactObservationPayloads(transactionId);
       return parse(existing.payload_json, null);
     }
     const payload = redactedObservation(observation);
@@ -529,28 +644,11 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
         json(payload, {}),
         nowIso()
       );
-      // Retain immutable observations that back governed actions plus a small
-      // recent diagnostic window. Historical full DOM graphs are not durable
-      // transaction state and previously caused unbounded SQLite growth.
-      db.prepare(`
-        DELETE FROM observations
-        WHERE transaction_id = ?
-          AND is_current = 0
-          AND observation_id NOT IN (
-            SELECT observation_id FROM governed_actions WHERE transaction_id = ?
-          )
-          AND observation_id NOT IN (
-            SELECT observation_id FROM observations
-            WHERE transaction_id = ?
-            ORDER BY created_at DESC
-            LIMIT ?
-          )
-      `).run(
-        transactionId,
-        transactionId,
-        transactionId,
-        MAX_UNREFERENCED_OBSERVATIONS_PER_SESSION
-      );
+      // Observation identity is durable; full perception is not. Keep only
+      // the current payload and its immediate predecessor for transition
+      // verification. Governed actions retain the observation id/hash and a
+      // compact target proof, so finalized actions never pin full DOM graphs.
+      compactObservationPayloads(transactionId);
       const currentState = updateSession ? getSession(transactionId) : null;
       if (currentState) {
         saveSession(withUpdate(currentState, {
@@ -775,6 +873,10 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     recordActionResult,
     recordActionEvent,
     recordActionEvents,
+    compactObservationPayloads,
+    compactAllObservationPayloads,
+    observationStorageStats,
+    reclaimObservationStorage,
     reconstructTransaction,
     close
   };
@@ -802,6 +904,10 @@ const DEFAULT_METHODS = [
   "recordActionResult",
   "recordActionEvent",
   "recordActionEvents",
+  "compactObservationPayloads",
+  "compactAllObservationPayloads",
+  "observationStorageStats",
+  "reclaimObservationStorage",
   "reconstructTransaction"
 ];
 

@@ -250,6 +250,13 @@ test("selected booking contract creates an immutable authoritative baseline befo
   assert.equal(facts.factEvidence.totalPrice.authoritative, true);
   assert.equal(facts.factEvidence.totalPrice.role, "booking_total");
   assert.equal(normalizeSelectedBooking({ contractVersion: "selected-booking/v1" }), null);
+  assert.equal(normalizeSelectedBooking({
+    contractVersion: "selected-booking/v1",
+    selectionId: "selection_without_travelers",
+    itinerary: { segments: [{ origin: "LJU", destination: "LGW", departureDate: "2026-10-15" }] },
+    approvedTotal: { amount: 355.49, currency: "EUR" },
+    travelerIds: []
+  }), null);
 });
 
 test("production import graph exposes one mechanics binder and one ambiguity boundary", () => {
@@ -289,4 +296,24 @@ test("non-boundary internal contract versions are absent", () => {
   assert.match(executionEpisode, /decisionInstanceId: legacyDecisionInstanceId/);
   assert.doesNotMatch(executionEpisode, /"decisionInstanceId"/);
   assert.doesNotMatch(lifecycle, /next\.decisionInstanceId|previous\.decisionInstanceId/);
+});
+
+test("observation transport sends one latest result and loop failures stay typed", () => {
+  const root = path.resolve(__dirname, "../..");
+  const server = fs.readFileSync(path.join(root, "apps/web/server.js"), "utf8");
+  const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "apps/extension/src/content/content.js"), "utf8");
+  const observationPayload = content.slice(
+    content.indexOf("const observationPayload = {"),
+    content.indexOf("const transport = await postObservationWithSizeRecovery")
+  );
+
+  assert.doesNotMatch(server, /actionHistory/);
+  assert.doesNotMatch(loop, /actionHistory/);
+  assert.doesNotMatch(observationPayload, /actionHistory/);
+  assert.match(observationPayload, /lastActionResult: lastActionForTransport/);
+  assert.match(server, /throw failure/);
+  assert.match(server, /error\.code === "AGENT_LOOP_FAILED"/);
+  assert.match(content, /\["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"\]/);
+  assert.match(content, /decision\.fatalBackendFailure === true/);
 });

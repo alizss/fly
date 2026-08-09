@@ -163,7 +163,7 @@ test("one durable execution episode replaces parallel lifecycle and recovery cop
   });
 });
 
-test("observation persistence retains only a bounded unreferenced window", () => {
+test("observation persistence retains metadata but only two active payloads", () => {
   const store = createStore({ dbPath: ":memory:" });
   const state = createCheckoutSessionState({ goal: "Reach payment review" });
   store.saveSession(state);
@@ -177,7 +177,43 @@ test("observation persistence retains only a bounded unreferenced window", () =>
   }
 
   const replay = store.reconstructTransaction(state.id);
-  assert.equal(replay.observations.length, 12);
+  assert.equal(replay.observations.length, 30);
   assert.equal(replay.currentObservation.observationId, "observation_29");
+  assert.equal(store.getObservation(state.id, "observation_0"), null);
+  assert.equal(store.getObservation(state.id, "observation_27"), null);
+  assert.equal(store.getObservation(state.id, "observation_28").observationId, "observation_28");
+  assert.equal(store.getObservation(state.id, "observation_29").observationId, "observation_29");
+  store.close();
+});
+
+test("a finalized governed action retains observation identity without pinning its full graph", () => {
+  const store = createStore({ dbPath: ":memory:" });
+  const state = createCheckoutSessionState({ goal: "Reach payment review" });
+  store.saveSession(state);
+  store.recordObservation(state.id, {
+    observationId: "observation_action_source",
+    observationSnapshot: { snapshotHash: "hash_action_source" },
+    page: { url: "https://example.test/checkout", step: "extras", controls: [{ controlId: "skip_bags" }] }
+  }, { updateSession: false });
+  assert.equal(store.reserveGovernedAction({
+    transactionId: state.id,
+    turnId: "turn_1",
+    observationId: "observation_action_source",
+    observationHash: "hash_action_source",
+    action: { id: "action_skip_bags", type: "click", controlId: "skip_bags", operation: "activate" }
+  }).ok, true);
+  store.updateGovernedAction("action_skip_bags", "verified", { verified: true });
+
+  for (let index = 0; index < 4; index += 1) {
+    store.recordObservation(state.id, {
+      observationId: `observation_after_${index}`,
+      observationSnapshot: { snapshotHash: `hash_after_${index}` },
+      page: { url: `https://example.test/checkout/${index}`, step: "extras", controls: [] }
+    }, { updateSession: false });
+  }
+
+  assert.equal(store.getObservation(state.id, "observation_action_source"), null);
+  assert.equal(store.getGovernedAction("action_skip_bags").observation_id, "observation_action_source");
+  assert.equal(store.reconstructTransaction(state.id).observations.length, 5);
   store.close();
 });

@@ -20,6 +20,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const agentLoop = require("./agent/loop");
 const agentSessionStore = require("./agent/session-store");
 const agentTraceStore = require("./agent/trace-store");
+const { agentLoopFailurePayload, createAgentLoopFailure } = require("./agent/http-errors");
 const { appendRotatingJsonLine, retentionConfig } = require("./agent/diagnostic-retention");
 const { prepareTransactionInvariants } = require("./agent/invariants");
 const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
@@ -79,18 +80,44 @@ function summarizeAgentSession(session) {
 function createAgentSession(body = {}) {
   const traveler = body.traveler || {};
   const requestedSessionId = clampText(body.sessionId || "", 120);
-  if (body.resumeOnly && (!requestedSessionId || !agentSessionStore.getSession(requestedSessionId))) {
+  const existing = requestedSessionId ? agentSessionStore.getSession(requestedSessionId) : null;
+  if (body.resumeOnly && (!requestedSessionId || !existing)) {
     return null;
   }
-  const state = agentSessionStore.getOrCreateSession(requestedSessionId, {
+  const explicitSelectedBooking = normalizeSelectedBooking(body.selectedBookingContract);
+  const selectedBooking = explicitSelectedBooking
+    ? {
+        observationId: explicitSelectedBooking.selectionId,
+        sourceUrl: explicitSelectedBooking.sourceUrl,
+        facts: transactionFactsFromSelectedBooking(explicitSelectedBooking)
+      }
+    : validatedSelectedBookingAcquisition(body.selectedBooking);
+  const durableBaseline = existing?.transactionInvariants?.baseline || null;
+  // A product-launched checkout supplies SelectedBooking and receives an
+  // approved immutable baseline immediately. Direct airline canaries still
+  // start provisionally while that cross-origin launch handoff is being wired;
+  // transaction verification must collect the same facts before payment review.
+  // Do not turn incomplete airline DOM evidence into a second admission gate.
+  const selectedTravelerIds = (selectedBooking?.facts?.travelers || durableBaseline?.travelers || [])
+    .map((entry) => clampText(entry?.travelerId, 120))
+    .filter(Boolean);
+  const primaryTravelerId = clampText(
+    traveler.id || body.travelerId || existing?.travelerId || selectedTravelerIds[0] || "",
+    120
+  );
+  const state = existing || agentSessionStore.getOrCreateSession(requestedSessionId, {
     goal: clampText(body.goal || body.userIntent || "Complete checkout safely.", 500),
-    travelerId: clampText(traveler.id || body.travelerId || "", 120),
+    travelerId: primaryTravelerId,
     site: { host: body.page?.site || "", url: body.page?.url || "" }
   });
   let updated = withUpdate(state, {
     status: "running",
     userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
-    travelerIds: [traveler.id || body.travelerId || state.travelerId].filter(Boolean),
+    travelerId: primaryTravelerId,
+    travelerIds: [...new Set([
+      ...selectedTravelerIds,
+      traveler.id || body.travelerId || state.travelerId
+    ].map((value) => clampText(value, 120)).filter(Boolean))],
     userPolicy: canonicalizeUserPolicy({
       bookingRules: clampText(traveler.booking_rules, 800),
       baggagePreference: clampText(traveler.baggage_preference, 120),
@@ -104,14 +131,6 @@ function createAgentSession(body = {}) {
       priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
     }
   });
-  const explicitSelectedBooking = normalizeSelectedBooking(body.selectedBookingContract);
-  const selectedBooking = explicitSelectedBooking
-    ? {
-        observationId: explicitSelectedBooking.selectionId,
-        sourceUrl: explicitSelectedBooking.sourceUrl,
-        facts: transactionFactsFromSelectedBooking(explicitSelectedBooking)
-      }
-    : validatedSelectedBookingAcquisition(body.selectedBooking);
   if (selectedBooking) {
     updated = prepareTransactionInvariants(updated, {
       observationId: selectedBooking.observationId,
@@ -995,6 +1014,7 @@ function validatedSelectedBookingAcquisition(raw = null) {
   const totalAmount = finiteNumberOrNull(facts?.totalPrice?.amount);
   const totalCurrency = clampText(facts?.totalPrice?.currency || facts?.currency, 20).toUpperCase();
   const totalEvidence = facts?.factEvidence?.totalPrice || null;
+  const travelerIds = (facts?.travelers || []).map((entry) => clampText(entry?.travelerId, 120)).filter(Boolean);
   const authoritativeTotal = totalAmount != null
     && totalAmount >= 0
     && Boolean(totalCurrency)
@@ -1004,6 +1024,7 @@ function validatedSelectedBookingAcquisition(raw = null) {
   const complete = facts?.evidenceMode === "typed"
     && facts?.itinerary?.completeness === "complete"
     && segments.length > 0
+    && travelerIds.length > 0
     && authoritativeTotal
     && segments.every((segment) => {
       const proof = segment.evidence || evidence.find((entry) => entry.segmentId === segment.segmentId) || null;
@@ -1136,18 +1157,6 @@ function compactAgentPayload(rawBody) {
         ? body.approvalState.priceAuthorization
         : null
     },
-    actionHistory: Array.isArray(body.actionHistory)
-      ? body.actionHistory.map((item) => ({
-        type: clampText(item.type, 80),
-        actionId: clampText(item.actionId, 120),
-        observationId: clampText(item.observationId, 120),
-        observationHash: clampText(item.observationHash, 120),
-        intent: clampText(item.intent, 120),
-        requirementId: clampText(item.requirementId, 120),
-        verified: typeof item.verified === "boolean" ? item.verified : undefined,
-        payload: item.payload || {}
-      })).slice(-12)
-      : [],
     lastActionResult: body.lastActionResult && typeof body.lastActionResult === "object" ? body.lastActionResult : null,
     traveler: {
       id: clampText(traveler.id, 120),
@@ -1410,7 +1419,6 @@ async function decideAgentNextActionViaLoop(body) {
       traveler: payload.traveler,
       userMessage: payload.userMessage,
       userResponse: payload.userResponse,
-      actionHistory: payload.actionHistory,
       transactionStore: agentSessionStore,
       clientTurnId: payload.clientTurnId
     });
@@ -1472,31 +1480,14 @@ async function decideAgentNextActionViaLoop(body) {
       debug: { ...(debug || {}), latency: serverLatency }
     };
   } catch (error) {
-    logAgent("loop turn ERROR", { message: error.message });
-    return aiUnavailableDecision(error.message);
+    const failure = createAgentLoopFailure(error, state.id);
+    logAgent("loop turn ERROR", {
+      sessionId: state.id,
+      failureCode: failure.failureCode,
+      message: failure.message
+    });
+    throw failure;
   }
-}
-
-function aiUnavailableDecision(reason) {
-  return {
-    source: "system",
-    action: "stop",
-    targetId: "",
-    value: "",
-    message: `AI agent unavailable: ${sanitizeAgentError(reason)}. I stopped because AI-only mode is enabled.`,
-    needsApproval: true,
-    risk: "uncertain",
-    reason: "AI-only mode: OpenAI must provide the next browser action."
-  };
-}
-
-function sanitizeAgentError(reason) {
-  const text = clampText(reason, 220)
-    .replace(/sk-[A-Za-z0-9_-]+/g, "[redacted-key]")
-    .replace(/sk-proj-[A-Za-z0-9_*.-]+/g, "[redacted-key]");
-  if (/incorrect api key/i.test(text)) return "OpenAI rejected the configured API key";
-  if (/OPENAI_API_KEY is not set/i.test(text)) return "OPENAI_API_KEY is not set";
-  return text;
 }
 
 function logAgent(label, data) {
@@ -1764,6 +1755,10 @@ async function handleApi(req, res, pathname) {
       requestOutcome = "decision";
       return sendJson(res, 200, decision);
     } catch (error) {
+      if (error.code === "AGENT_LOOP_FAILED") {
+        requestOutcome = "agent_loop_failed";
+        return sendJson(res, Number(error.status || 500), agentLoopFailurePayload(error));
+      }
       if (error.code === "OBSERVATION_RESYNC_REQUIRED") {
         requestOutcome = "observation_resync_required";
         return sendJson(res, 409, {

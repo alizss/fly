@@ -79,12 +79,32 @@ test("P0.2 next-action refuses to create a replacement transaction without a ses
   expect(await response.json()).toMatchObject({ code: "DURABLE_SESSION_REQUIRED" });
 });
 
+test("a direct-airline canary starts provisionally when selected booking handoff is unavailable", async ({ request }) => {
+  const travelerId = `trav_missing_booking_${Date.now()}`;
+  const response = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Complete checkout safely.",
+      traveler: { id: travelerId },
+      page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
+    }
+  });
+  expect(response.status()).toBe(201);
+  const started = await response.json();
+  expect(started.id).toMatch(/^chk_/);
+  const durable = await (await request.get(`${API}/agent/session/${started.id}`)).json();
+  expect(durable).toMatchObject({
+    travelerId,
+    transactionInvariants: null
+  });
+});
+
 test("P0.2 one session handshake resumes the exact transaction and rejects replacement", async ({ request }) => {
   const travelerId = `trav_${Date.now()}`;
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
       traveler: { id: travelerId, booking_rules: "No paid extras" },
+      selectedBooking: selectedBookingAcquisition(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
   });
@@ -177,6 +197,7 @@ test("a structured missing traveler answer crosses HTTP and resumes the exact fi
     data: {
       goal: "Complete traveler information",
       traveler,
+      selectedBooking: selectedBookingAcquisition(`obs_session_${Date.now()}`, traveler.id),
       page: {
         site: "example.test",
         url: "https://example.test/checkout/traveler",
@@ -313,10 +334,12 @@ test("a structured missing traveler answer crosses HTTP and resumes the exact fi
 });
 
 test("oversized observations receive a typed retryable transport error", async ({ request }) => {
+  const travelerId = `trav_large_${Date.now()}`;
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Test observation transport",
-      traveler: { id: `trav_large_${Date.now()}`, booking_rules: "No paid extras" },
+      traveler: { id: travelerId, booking_rules: "No paid extras" },
+      selectedBooking: selectedBookingAcquisition(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "seats" }
     }
   });
@@ -345,25 +368,53 @@ test("oversized observations receive a typed retryable transport error", async (
 
 test("transaction fact ownership evidence survives HTTP compaction into the durable baseline", async ({ request }) => {
   const travelerId = `trav_transaction_evidence_${Date.now()}`;
-  const started = await request.post(`${API}/agent/session`, {
-    data: {
-      goal: "Reach verified payment review",
-      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "No paid extras" },
-      page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
-    }
-  });
-  const session = await started.json();
-  expect(started.status(), JSON.stringify(session)).toBe(201);
-
   const observationId = `obs_transaction_evidence_${Date.now()}`;
   const routeEvidence = {
     source: "bounded_checkout_route",
     ownerKey: "route_owner_1",
+    role: "itinerary_segment",
+    ownerType: "selected_flight",
     qualification: "airport_code_pair",
     observationId,
     confidence: 0.88,
     authoritative: true
   };
+  const selectedBooking = selectedBookingAcquisition(observationId, travelerId);
+  selectedBooking.facts.itinerary.segments = [{
+    segmentId: "segment_1",
+    origin: "LHR",
+    destination: "LJU",
+    departureDate: "2026-08-10",
+    departureTime: "10:20",
+    arrivalTime: "13:30",
+    flightNumber: "",
+    evidence: routeEvidence
+  }];
+  selectedBooking.facts.factEvidence.itinerary = [{ segmentId: "segment_1", ...routeEvidence }];
+  selectedBooking.facts.totalPrice = { amount: 208, currency: "EUR" };
+  selectedBooking.facts.fareBrand = "Economy Light";
+  selectedBooking.facts.factEvidence.fareBrand = {
+    source: "owned_fare_summary_line",
+    ownerKey: "fare_owner_1",
+    observationId,
+    confidence: 0.9,
+    authoritative: true
+  };
+  const started = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Reach verified payment review",
+      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "No paid extras" },
+      selectedBooking,
+      page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
+    }
+  });
+  const session = await started.json();
+  expect(started.status(), JSON.stringify(session)).toBe(201);
+  const admittedState = await (await request.get(`${API}/agent/session/${session.id}`)).json();
+  expect(admittedState.transactionInvariants.baseline.itinerary.segments).toEqual([
+    expect.objectContaining({ origin: "LHR", destination: "LJU", departureDate: "2026-08-10" })
+  ]);
+
   const response = await request.post(`${API}/agent/next-action`, {
     data: {
       sessionId: session.id,
@@ -465,6 +516,7 @@ test("authoritative terminal evidence survives HTTP compaction without payment c
     data: {
       goal: "Reach verified payment review",
       traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "Stop before real payment" },
+      selectedBooking: selectedBookingAcquisition(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
   });
@@ -522,10 +574,12 @@ test("authoritative terminal evidence survives HTTP compaction without payment c
 });
 
 test("non-empty decision-group alternatives survive HTTP compaction with their control identity", async ({ request }) => {
+  const travelerId = `trav_decision_group_${Date.now()}`;
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Decline paid seats safely",
-      traveler: { id: `trav_decision_group_${Date.now()}`, booking_rules: "No paid seats" },
+      traveler: { id: travelerId, booking_rules: "No paid seats" },
+      selectedBooking: selectedBookingAcquisition(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "seats" }
     }
   });
@@ -602,10 +656,12 @@ test("non-empty decision-group alternatives survive HTTP compaction with their c
 });
 
 test("selected paid evidence and owned reversal survive the extension-to-backend boundary", async ({ request }) => {
+  const travelerId = `trav_paid_boundary_${Date.now()}`;
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Continue without paid extras",
-      traveler: { id: `trav_paid_boundary_${Date.now()}`, booking_rules: "No paid extras" },
+      traveler: { id: travelerId, booking_rules: "No paid extras" },
+      selectedBooking: selectedBookingAcquisition(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "seats" }
     }
   });
@@ -742,10 +798,12 @@ test("selected paid evidence and owned reversal survive the extension-to-backend
 });
 
 test("incremental observation transport reconstructs the canonical page and rejects a stale base", async ({ request }) => {
+  const travelerId = `trav_incremental_${Date.now()}`;
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Continue without paid extras",
-      traveler: { id: `trav_incremental_${Date.now()}`, booking_rules: "No paid extras" },
+      traveler: { id: travelerId, booking_rules: "No paid extras" },
+      selectedBooking: selectedBookingAcquisition(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "extras" }
     }
   });
