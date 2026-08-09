@@ -366,3 +366,18 @@ test("extension perception facade owns section, readiness, and visual page proje
   assert.match(sections, /function detectCheckoutSections\s*\(/);
   assert.match(sections, /function elementBelongsToSectionBand\s*\(/);
 });
+
+test("extension targeting owns exact resolution and actuator validation", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const targeting = fs.readFileSync(path.join(root, "apps/extension/src/content/execution/targeting.js"), "utf8");
+
+  assert.match(runtime, /createTargeting\s*\(/);
+  assert.doesNotMatch(runtime, /function resolveDecisionTarget\s*\(/);
+  assert.doesNotMatch(runtime, /function validateResolvedTarget\s*\(/);
+  assert.doesNotMatch(runtime, /function validateVisualCoordinateTarget\s*\(/);
+  assert.match(targeting, /function resolveDecisionTarget\s*\(/);
+  assert.match(targeting, /function validateResolvedTarget\s*\(/);
+  assert.match(targeting, /function validateVisualCoordinateTarget\s*\(/);
+  assert.match(targeting, /function liveTargetSnapshot\s*\(/);
+});
