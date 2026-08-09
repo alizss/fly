@@ -645,6 +645,7 @@ The next work in the current repository is therefore:
 - [x] Derive legacy decision/outcome read projections from `semanticOwnerId`, keep decision-group identity observation-local, and persist one ActionLease plus only the mechanical recovery identity required for bounded retry.
 - [x] Pass 325 unit assertions, the repository build/type/syntax checks, and the uninterrupted 154-case browser replay after the literal contract and identity collapse.
 - [ ] Run fresh live EasyJet, GoToGate, Kiwi, and Turkish canaries on the restarted extension/backend.
+- [x] Generate one normalized canary report from the existing trace plus compact client timing log, while requiring explicit no-intervention annotation before autonomous acceptance.
 - [ ] Measure client round-trip and each new server timing phase; do not declare latency fixed from offline tests.
 - [ ] Compile plus/minus quantity steppers from exact owned counter state; quantity zero must never become a selected paid item.
 - [ ] Remove `Remove button + nearby price` as an independent selection authority and add the exact Hold-luggage replay.
