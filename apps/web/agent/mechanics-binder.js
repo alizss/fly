@@ -1,9 +1,7 @@
 const {
-  actionForObservationCandidate,
   buildObservationCandidateSet
 } = require("./observation-candidates");
 const {
-  actionForProfileCandidate,
   candidatesForProfileGoal
 } = require("./profile-mechanics");
 const {
@@ -20,6 +18,7 @@ const {
 const {
   actuatorSignature,
   isCandidateGrounded,
+  normalizeAction,
   normalizeVisualRegion
 } = require("../../../packages/shared/agent-actions");
 const agentContract = require("../../extension/src/shared/agent-contract");
@@ -853,10 +852,62 @@ function bindMechanics({
   });
 }
 
+function draftForBoundMechanic(obligation = {}, candidate = {}, observation = {}) {
+  const profile = obligationField(obligation, "kind") === "profile_field";
+  return normalizeAction({
+    id: `${profile ? "act_goal" : "act_candidate"}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+    observationId: observation.observationId || "",
+    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+    type: candidate.type,
+    intent: profile ? "satisfy_semantic_goal" : candidate.intent,
+    operation: candidate.operation,
+    obligationId: obligationField(obligation, "goalId"),
+    semanticOwner: semanticOwner(obligation),
+    candidateId: candidate.candidateId,
+    candidateClass: candidate.candidateClass || "proven_action",
+    mechanicalHypothesis: candidate.mechanicalHypothesis === true,
+    discoveryEnvelope: candidate.discoveryEnvelope || null,
+    logicalControlId: candidate.logicalControlId || candidate.controlId || obligationField(obligation, "controlId") || "",
+    actuatorId: candidate.actuatorId || candidate.targetId || "",
+    controlId: candidate.controlId || obligationField(obligation, "controlId") || "",
+    decisionGroupId: candidate.decisionGroupId || "",
+    requirementId: candidate.requirementId || "",
+    interactionMethod: candidate.interactionMethod || "",
+    boundedRecovery: candidate.boundedRecovery === true,
+    exactOption: candidate.exactOption || candidate.pipelineContract?.component?.exactOption || null,
+    targetLabel: profile
+      ? obligationField(obligation, "label") || obligationField(obligation, "semanticType") || ""
+      : candidate.targetLabel,
+    value: candidate.value || "",
+    keys: candidate.keys || "",
+    x: candidate.visualRegion
+      ? Number(candidate.visualRegion.centerX ?? (Number(candidate.visualRegion.x || 0) + Number(candidate.visualRegion.width || 0) / 2))
+      : null,
+    y: candidate.visualRegion
+      ? Number(candidate.visualRegion.centerY ?? (Number(candidate.visualRegion.y || 0) + Number(candidate.visualRegion.height || 0) / 2))
+      : null,
+    visualRegion: candidate.visualRegion || null,
+    expectedOutcome: candidate.expectedOutcome || null,
+    pipelineContract: candidate.pipelineContract || null,
+    capabilityStatus: candidate.capabilityStatus || "",
+    executionChannel: candidate.executionChannel || "",
+    interactionRole: candidate.interactionRole,
+    semanticEffect: candidate.semanticEffect,
+    expectedEvidence: candidate.expectedEvidence,
+    intendedOutcome: candidate.intendedOutcome || "",
+    semanticOwnershipLinkId: candidate.semanticOwnershipLinkId || "",
+    policyCorrectionForDecisionGroupId: candidate.policyCorrectionForDecisionGroupId || "",
+    affordance: candidate.affordance || null,
+    risk: profile ? "safe" : candidate.risk,
+    requiresApproval: profile ? false : candidate.requiresApproval,
+    reason: candidate.summary || (profile
+      ? `Execute candidate ${candidate.candidateId} for ${obligationField(obligation, "semanticType")}=${obligationField(obligation, "desiredValue")}.`
+      : `Execute current candidate ${candidate.candidateId}.`)
+  });
+}
+
 function actionForCurrentCandidate(obligation = {}, candidate = {}, observation = {}) {
-  const action = obligationField(obligation, "kind") === "profile_field"
-    ? actionForProfileCandidate(obligation, candidate, observation)
-    : actionForObservationCandidate(obligation, candidate, observation);
+  const action = draftForBoundMechanic(obligation, candidate, observation);
   const semanticOwnershipLinkId = candidate.semanticOwnershipLinkId
     || candidate.expectedOutcome?.semanticOwnershipLinkId
     || action.semanticOwnershipLinkId

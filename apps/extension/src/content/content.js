@@ -81,7 +81,16 @@
   function rememberExactChoiceCommitment(target, decision = {}, evidence = {}) {
     const controlId = String(decision.controlId || target?.dataset?.atwControlId || "").trim();
     if (!controlId) return null;
-    const decisionGroupId = String(decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "").trim();
+    // ActionLease intentionally carries only fresh mechanical target identity.
+    // Use semantic ownership as the local exclusive-choice episode key when a
+    // legacy decision-group projection is not present on the lease.
+    const decisionGroupId = String(
+      decision.decisionGroupId
+      || decision.targetSnapshot?.decisionGroupId
+      || decision.semanticOwnerId
+      || decision.goalId
+      || ""
+    ).trim();
     clearCommittedChoicesForGroup(decisionGroupId, controlId);
     return updateChoiceInteractionState(controlId, {
       status: "committed",
@@ -6252,7 +6261,13 @@
 
   function rememberChoiceVisualStateBeforeDispatch(element, decision = {}) {
     const controlId = String(decision.controlId || element?.dataset?.atwControlId || "").trim();
-    const decisionGroupId = String(decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "").trim();
+    const decisionGroupId = String(
+      decision.decisionGroupId
+      || decision.targetSnapshot?.decisionGroupId
+      || decision.semanticOwnerId
+      || decision.goalId
+      || ""
+    ).trim();
     const exactChoiceSelection = ["choose", "select"].includes(String(decision.operation || ""))
       || ["exact_free_option_selected", "control_selected"].includes(String(decision.expectedOutcome?.type || ""));
     if (
@@ -15456,6 +15471,7 @@
       expectedPostconditions: lease.expected?.postconditions || [],
       goalId: lease.obligationId || "",
       semanticOwner: lease.semanticOwner || null,
+      semanticOwnerId: lease.semanticOwnerId || "",
       decisionInstanceId: lease.semanticOwner?.repeatedInstance || "",
       candidateId: lease.candidateId || "",
       logicalControlId: lease.target?.controlId || "",

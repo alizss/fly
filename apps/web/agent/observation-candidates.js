@@ -1,4 +1,3 @@
-const { normalizeAction } = require("../../../packages/shared/agent-actions");
 const { conflictedControlIds } = require("./control-alias-index");
 const { controlBelongsToCurrentSurface, currentSurface, surfaceBinding } = require("./surface-contract");
 const { deriveActionSemantics } = require("./action-semantics");
@@ -527,44 +526,8 @@ function buildObservationCandidateSet(goal = {}, observation = {}) {
   return { ...surfaceBinding(observation), candidates: rawObservationCandidates(observation, goal) };
 }
 
-function actionForObservationCandidate(goal = {}, candidate = {}, observation = {}) {
-  return normalizeAction({
-    id: `act_candidate_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
-    observationId: observation.observationId || "",
-    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-    type: candidate.type,
-    intent: candidate.intent,
-    operation: candidate.operation,
-    obligationId: obligationField(goal, "goalId"),
-    candidateId: candidate.candidateId,
-    controlId: candidate.controlId,
-    decisionGroupId: candidate.decisionGroupId,
-    actuatorId: candidate.targetId,
-    targetLabel: candidate.targetLabel,
-    value: candidate.value || "",
-    keys: candidate.keys || "",
-    interactionMethod: candidate.interactionMethod || "",
-    requirementId: candidate.requirementId || "",
-    expectedOutcome: candidate.expectedOutcome || null,
-    pipelineContract: candidate.pipelineContract || null,
-    capabilityStatus: candidate.capabilityStatus || "",
-    executionChannel: candidate.executionChannel || "",
-    interactionRole: candidate.interactionRole,
-    semanticEffect: candidate.semanticEffect,
-    expectedEvidence: candidate.expectedEvidence,
-    intendedOutcome: candidate.intendedOutcome || "",
-    semanticOwnershipLinkId: candidate.semanticOwnershipLinkId || "",
-    policyCorrectionForDecisionGroupId: candidate.policyCorrectionForDecisionGroupId || "",
-    affordance: candidate.affordance || null,
-    risk: candidate.risk,
-    requiresApproval: candidate.requiresApproval,
-    reason: candidate.summary || `Execute current candidate ${candidate.candidateId}.`
-  });
-}
-
 module.exports = {
   allRequiredDecisionGroupsResolved,
-  actionForObservationCandidate,
   buildObservationCandidateSet,
   requiredDecisionGroupsForCurrentSurface,
   unresolvedRequiredDecisionGroups,

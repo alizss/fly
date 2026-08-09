@@ -1,7 +1,7 @@
 /**
  * @typedef {"click"|"click_xy"|"type"|"select"|"scroll"|"keypress"|"wait"|"ask_user"|"final_review"|"stop"|"fill_known_fields"|"fill_visible_profile_fields"|"save_trip"} ActionType
  *
- * @typedef {Object} AgentAction
+ * @typedef {Object} ActionDraft
  * @property {string} id
  * @property {ActionType} type
  * @property {string} [observationId]
@@ -13,14 +13,14 @@
  * @property {"selected"|"dismissed"|"options_appeared"|"progress_changed"|"value_changed"|"target_visible"} [expectedEvidence]
  * @property {string} [semanticOutcome]
  * @property {string} [mechanicalEffect]
- * @property {string} [semanticIntent]
  * @property {Object[]} [expectedPostconditions]
  * @property {"compatible"|"context_only"|"unknown"} [outcomeCompatibility]
- * @property {string} [physicalEffect]
  * @property {string} [intendedOutcome]
  * @property {string} [semanticOwnershipLinkId]
  * @property {string} [policyCorrectionForDecisionGroupId]
- * @property {string} [goalId]
+ * @property {string} [obligationId]
+ * @property {Object} [semanticOwner]
+ * @property {string} [semanticOwnerId]
  * @property {string} [decisionInstanceId]
  * @property {string} [candidateId]
  * @property {"proven_action"|"mechanical_hypothesis"} [candidateClass]
@@ -30,7 +30,6 @@
  * @property {string} [actuatorId]
  * @property {string} [controlId]
  * @property {string} [decisionGroupId]
- * @property {string} [targetId]
  * @property {string} [targetLabel]
  * @property {Object} [targetSnapshot]
  * @property {Object} [expectedOutcome]
@@ -69,6 +68,11 @@ const ACTION_TYPES = new Set([
   "save_trip"
 ]);
 const RISK_LEVELS = new Set(["safe", "money", "payment", "legal", "uncertain"]);
+const {
+  normalizeSemanticOwner,
+  semanticOwnerFromLegacy,
+  semanticOwnerId
+} = require("../semantic-owner");
 
 /**
  * One lossless geometry contract shared by observation, planning, governance,
@@ -158,6 +162,9 @@ function isCandidateGrounded(candidate = {}, observation = {}) {
   );
 }
 
+// Single one-way compatibility boundary for historical producer inputs.
+// `semanticIntent`, `physicalEffect`, `goalId`, and `targetId` are accepted
+// here only; no canonical ActionDraft or ActionLease publishes those aliases.
 function normalizeAction(raw = {}) {
   const region = raw.visualRegion && typeof raw.visualRegion === "object" ? raw.visualRegion : null;
   const mechanicalEffect = String(raw.mechanicalEffect || raw.physicalEffect || raw.affordance?.mechanicalEffect || raw.affordance?.physicalEffect || raw.affordance?.effect || "").slice(0, 80);
@@ -165,6 +172,7 @@ function normalizeAction(raw = {}) {
   const expectedPostconditions = Array.isArray(raw.expectedPostconditions)
     ? raw.expectedPostconditions.filter((item) => item && typeof item === "object").map((item) => ({ ...item })).slice(0, 8)
     : (raw.expectedOutcome && typeof raw.expectedOutcome === "object" ? [{ ...raw.expectedOutcome }] : []);
+  const owner = semanticOwnerFromLegacy(raw);
   return {
     id: String(raw.id || `act_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
     type: ACTION_TYPES.has(raw.type) ? raw.type : "stop",
@@ -183,16 +191,8 @@ function normalizeAction(raw = {}) {
     semanticOwnershipLinkId: raw.semanticOwnershipLinkId ? String(raw.semanticOwnershipLinkId).slice(0, 260) : "",
     policyCorrectionForDecisionGroupId: raw.policyCorrectionForDecisionGroupId ? String(raw.policyCorrectionForDecisionGroupId).slice(0, 140) : "",
     obligationId: (raw.obligationId || raw.goalId) ? String(raw.obligationId || raw.goalId).slice(0, 200) : "",
-    semanticOwner: raw.semanticOwner && typeof raw.semanticOwner === "object"
-      ? {
-          stage: String(raw.semanticOwner.stage || "").slice(0, 120),
-          family: String(raw.semanticOwner.family || "").slice(0, 120),
-          subjectId: String(raw.semanticOwner.subjectId || "global").slice(0, 160),
-          passengerId: String(raw.semanticOwner.passengerId || "").slice(0, 160),
-          segmentId: String(raw.semanticOwner.segmentId || "").slice(0, 160),
-          repeatedInstance: String(raw.semanticOwner.repeatedInstance || "").slice(0, 900)
-        }
-      : null,
+    semanticOwner: owner,
+    semanticOwnerId: String(raw.semanticOwnerId || semanticOwnerId(owner)).slice(0, 300),
     decisionInstanceId: raw.decisionInstanceId ? String(raw.decisionInstanceId).slice(0, 900) : "",
     candidateId: raw.candidateId ? String(raw.candidateId).slice(0, 240) : "",
     candidateClass: ["proven_action", "mechanical_hypothesis"].includes(raw.candidateClass)
@@ -263,16 +263,9 @@ function createActionLease(action = {}) {
   action = normalizeAction(action);
   const targetSnapshot = action.targetSnapshot || null;
   const successCondition = action.expectedOutcome || action.expectedPostconditions?.[0] || null;
-  const semanticOwner = action.semanticOwner && typeof action.semanticOwner === "object"
-    ? { ...action.semanticOwner }
-    : {
-        stage: "",
-        family: "",
-        subjectId: "global",
-        passengerId: "",
-        segmentId: "",
-        repeatedInstance: action.decisionInstanceId || action.requirementId || action.decisionGroupId || ""
-      };
+  const semanticOwner = normalizeSemanticOwner(action.semanticOwner, {
+    repeatedInstance: action.decisionInstanceId || action.requirementId || action.decisionGroupId || ""
+  });
   return Object.freeze({
     contractVersion: "action-lease/v1",
     actionId: action.id || "",
@@ -282,12 +275,12 @@ function createActionLease(action = {}) {
     }),
     obligationId: action.obligationId || "",
     semanticOwner: Object.freeze(semanticOwner),
+    semanticOwnerId: action.semanticOwnerId || semanticOwnerId(semanticOwner),
     candidateId: action.candidateId || "",
     target: Object.freeze({
       controlId: action.controlId || targetSnapshot?.controlId || "",
       actuatorId: action.actuatorId || "",
       surfaceId: targetSnapshot?.surfaceId || action.surfaceId || "",
-      decisionGroupId: action.decisionGroupId || targetSnapshot?.decisionGroupId || "",
       snapshot: targetSnapshot
     }),
     mechanic: Object.freeze({
@@ -335,10 +328,11 @@ function actionFromLease(lease = null) {
     observationHash: lease.observation?.hash || "",
     obligationId: lease.obligationId || "",
     semanticOwner: lease.semanticOwner || null,
+    semanticOwnerId: lease.semanticOwnerId || "",
     candidateId: lease.candidateId || "",
     controlId: target.controlId || "",
     actuatorId: target.actuatorId || "",
-    decisionGroupId: target.decisionGroupId || "",
+    decisionGroupId: target.snapshot?.decisionGroupId || "",
     targetSnapshot: target.snapshot || null,
     operation: mechanic.operation || "",
     interactionMethod: mechanic.method || "",

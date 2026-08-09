@@ -1,4 +1,8 @@
 const CURRENT_OBLIGATION_VERSION = "current-obligation/v2";
+const {
+  normalizeSemanticOwner,
+  semanticOwnerId
+} = require("../../../packages/shared/semantic-owner");
 
 function isCurrentObligation(value = null) {
   return Boolean(value && value.contractVersion === CURRENT_OBLIGATION_VERSION);
@@ -100,6 +104,7 @@ function currentObligationValue(obligation = null, field = "") {
 
 function semanticOwner(obligation = null) {
   if (!isCurrentObligation(obligation)) return null;
+  if (obligation.semanticOwner) return normalizeSemanticOwner(obligation.semanticOwner);
   const subject = obligation.subject || {};
   const lineage = obligation.binding?.lineage || {};
   return Object.freeze({
@@ -112,10 +117,16 @@ function semanticOwner(obligation = null) {
   });
 }
 
+function currentSemanticOwnerId(obligation = null) {
+  if (!isCurrentObligation(obligation)) return "";
+  return String(obligation.semanticOwnerId || semanticOwnerId(semanticOwner(obligation)));
+}
+
 module.exports = {
   CURRENT_OBLIGATION_VERSION,
   currentObligationValue,
   isCurrentObligation,
   obligationField,
-  semanticOwner
+  semanticOwner,
+  semanticOwnerId: currentSemanticOwnerId
 };

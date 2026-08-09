@@ -24,7 +24,7 @@ const {
 const {
   actionForCurrentCandidate,
   bindMechanics
-} = require("./current-candidate-builder");
+} = require("./mechanics-binder");
 const { governAction, RECOVERABLE_GROUNDING_CODES } = require("./action-governor");
 const { buildControlAliasIndex, resolveActionControl } = require("./control-alias-index");
 const { enqueueTrace } = require("./trace-store");

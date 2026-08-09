@@ -2,11 +2,10 @@
 // inputs. Production binding accepts only CurrentObligation.
 const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
 const { rawObservationCandidates: bindRawObservationCandidates } = require("../../apps/web/agent/observation-candidates");
-const { actionForObservationCandidate: bindActionForObservationCandidate } = require("../../apps/web/agent/observation-candidates");
 const {
   actionForCurrentCandidate: bindActionForCurrentCandidate,
   bindMechanics
-} = require("../../apps/web/agent/current-candidate-builder");
+} = require("../../apps/web/agent/mechanics-binder");
 
 function obligationForLegacyGoal(goal = {}, observation = {}) {
   if (goal?.contractVersion === "current-obligation/v2") return goal;
@@ -33,7 +32,7 @@ function actionForCurrentCandidate(goal = {}, candidate = {}, observation = {}) 
 }
 
 function actionForObservationCandidate(goal = {}, candidate = {}, observation = {}) {
-  return bindActionForObservationCandidate(obligationForLegacyGoal(goal, observation), candidate, observation);
+  return bindActionForCurrentCandidate(obligationForLegacyGoal(goal, observation), candidate, observation);
 }
 
 function buildCurrentCandidateSet({

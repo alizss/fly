@@ -2,6 +2,10 @@ const agentContract = require("../../extension/src/shared/agent-contract");
 const { factsFromObservation } = require("./transaction-facts");
 const { fieldDescriptors } = require("./profile-requirements");
 const { buildCanonicalDecisions } = require("./canonical-decision");
+const {
+  normalizeSemanticOwner,
+  semanticOwnerId
+} = require("../../../packages/shared/semantic-owner");
 
 const OBSERVATION_FRAME_VERSION = "observation-frame/v2";
 const DECISION_FRAME_VERSION = "decision-frame/v2";
@@ -269,6 +273,20 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null } = {}) {
     }),
     adaptive: goal.adaptiveEnvelope ? Object.freeze({ ...goal.adaptiveEnvelope }) : null
   });
+  const owner = normalizeSemanticOwner({
+    stage: goal.stage || goal.owner?.stage || decisionFrame?.observation?.page?.step,
+    family: goal.canonicalSubject?.family || goal.subject?.family || goal.family || goal.sectionType || goal.semanticType,
+    subjectId: goal.subjectId || "global",
+    passengerId: goal.canonicalSubject?.passengerId || goal.passengerId || goal.travelerId,
+    segmentId: goal.canonicalSubject?.segmentId || goal.segmentId,
+    repeatedInstance: goal.canonicalSubject?.repeatedInstance
+      || goal.decisionInstanceId
+      || goal.canonicalOwnerId
+      || goal.requirementId
+      || goal.decisionGroupId
+      || goal.logicalFieldId
+      || goal.goalId
+  });
   const obligation = {
     contractVersion: CURRENT_OBLIGATION_VERSION,
     obligationId: clean(goal.goalId || goal.requirementId || goal.decisionGroupId),
@@ -277,6 +295,8 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null } = {}) {
     observationHash: clean(decisionFrame?.observationHash),
     surfaceId: clean(goal.owner?.surfaceId || goal.surfaceId || decisionFrame?.observationFrame?.surface?.id || "surface-page"),
     kind: clean(goal.kind || goal.semanticType || "unknown"),
+    semanticOwner: owner,
+    semanticOwnerId: semanticOwnerId(owner),
     subject: obligationSubject(goal),
     objective: clean(goal.objective || goal.semanticGoal || "resolve the current checkout obligation"),
     desiredEffect: obligationDesiredEffect(goal),

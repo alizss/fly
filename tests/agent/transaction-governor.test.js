@@ -11,8 +11,7 @@ const { governObservedAction: governAction } = require("./governance-test-helper
 const {
   selectNextProfileRequirement,
   profileGoalSatisfied,
-  candidatesForProfileGoal,
-  actionForProfileCandidate
+  candidatesForProfileGoal
 } = require("../../apps/web/agent/profile-mechanics");
 const {
   normalizeProfileFieldType,
@@ -24,7 +23,11 @@ const { runLoopTurn: runRawLoopTurn, __private: loopPrivate } = require("../../a
 const { executableDecisionFromActionLease } = require("./action-lease-replay-adapter");
 const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
-const { buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
+const {
+  actionForCurrentCandidate,
+  buildCurrentCandidateSet
+} = require("./legacy-mechanics-binding-adapter");
+const actionForProfileCandidate = actionForCurrentCandidate;
 const { reduceTaskState } = require("./task-state-replay-adapter");
 const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");

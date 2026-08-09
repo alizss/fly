@@ -1,6 +1,6 @@
 const { callStructured } = require("./openai-client");
 const { semanticBindingSchemaFor } = require("./schemas");
-const { compileInteractionView } = require("./select-candidate");
+const { compileInteractionView } = require("./interaction-view");
 const { controlBelongsToCurrentSurface } = require("./surface-contract");
 const {
   PROFILE_FIELDS,

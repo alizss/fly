@@ -19,6 +19,7 @@ function executableDecisionFromActionLease(rawDecision = {}) {
     goalId: lease.obligationId || "",
     obligationId: lease.obligationId || "",
     semanticOwner: lease.semanticOwner || null,
+    semanticOwnerId: lease.semanticOwnerId || "",
     decisionInstanceId: lease.semanticOwner?.repeatedInstance || "",
     candidateId: lease.candidateId || "",
     logicalControlId: lease.target?.controlId || "",

@@ -1,5 +1,4 @@
 const {
-  normalizeAction,
   isCandidateGrounded,
   semanticGoalKey,
   visualRegionsMatch
@@ -20,10 +19,6 @@ const {
   verifyLogicalField
 } = require("./logical-field");
 const { profileFieldLabel } = require("./profile-context");
-
-function uid(prefix) {
-  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-}
 
 const { obligationField } = require("./current-obligation");
 
@@ -930,52 +925,8 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
   });
 }
 
-function actionForProfileCandidate(goal = {}, candidate = {}, observation = {}) {
-  return normalizeAction({
-    id: uid("act_goal"),
-    observationId: observation.observationId || "",
-    observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-    type: candidate.type,
-    intent: "satisfy_semantic_goal",
-    operation: candidate.operation,
-    obligationId: obligationField(goal, "goalId"),
-    candidateId: candidate.candidateId,
-    candidateClass: candidate.candidateClass || "proven_action",
-    mechanicalHypothesis: candidate.mechanicalHypothesis === true,
-    discoveryEnvelope: candidate.discoveryEnvelope || null,
-    logicalControlId: candidate.logicalControlId || candidate.controlId || obligationField(goal, "controlId") || "",
-    actuatorId: candidate.actuatorId || candidate.targetId || "",
-    controlId: candidate.controlId || obligationField(goal, "controlId") || "",
-    interactionMethod: candidate.interactionMethod || "",
-    boundedRecovery: candidate.boundedRecovery === true,
-    exactOption: candidate.exactOption || candidate.pipelineContract?.component?.exactOption || null,
-    targetLabel: obligationField(goal, "label") || obligationField(goal, "semanticType") || "",
-    value: candidate.value || "",
-    keys: candidate.keys || "",
-    x: candidate.visualRegion
-      ? Number(candidate.visualRegion.centerX ?? (Number(candidate.visualRegion.x || 0) + Number(candidate.visualRegion.width || 0) / 2))
-      : null,
-    y: candidate.visualRegion
-      ? Number(candidate.visualRegion.centerY ?? (Number(candidate.visualRegion.y || 0) + Number(candidate.visualRegion.height || 0) / 2))
-      : null,
-    visualRegion: candidate.visualRegion || null,
-    expectedOutcome: candidate.expectedOutcome,
-    pipelineContract: candidate.pipelineContract || null,
-    capabilityStatus: candidate.capabilityStatus || "",
-    executionChannel: candidate.executionChannel || "",
-    interactionRole: candidate.interactionRole,
-    semanticEffect: candidate.semanticEffect,
-    expectedEvidence: candidate.expectedEvidence,
-    affordance: candidate.affordance || null,
-    risk: "safe",
-    requiresApproval: false,
-    reason: `Execute candidate ${candidate.candidateId} for ${obligationField(goal, "semanticType")}=${obligationField(goal, "desiredValue")}.`
-  });
-}
-
 module.exports = {
   selectNextProfileRequirement,
   profileGoalSatisfied,
-  candidatesForProfileGoal,
-  actionForProfileCandidate
+  candidatesForProfileGoal
 };

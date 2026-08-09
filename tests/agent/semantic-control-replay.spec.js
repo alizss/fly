@@ -5,8 +5,7 @@ const { governObservedAction: governAction } = require("./governance-test-helper
 const {
   selectNextProfileRequirement,
   profileGoalSatisfied,
-  candidatesForProfileGoal,
-  actionForProfileCandidate
+  candidatesForProfileGoal
 } = require("../../apps/web/agent/profile-mechanics");
 const {
   fieldDescriptors,
@@ -20,6 +19,7 @@ const {
 } = require("./legacy-mechanics-binding-adapter");
 const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
+const actionForProfileCandidate = actionForCurrentCandidate;
 const { advanceActionLifecycle, leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { leasedAction, recovery: executionRecovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 const { sanitizedActionHistory } = require("./legacy-model-context-adapter");

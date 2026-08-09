@@ -636,6 +636,8 @@ The next work in the current repository is therefore:
 - [x] Carry one structured semantic owner through CurrentObligation, governed actions, and ActionLease while retaining only a migration scalar for existing browser receipts.
 - [x] Remove version ceremony from turn-local decisions, grounding evidence, adaptive envelopes, and discovery hypotheses; retain versions only at persisted/network boundaries.
 - [x] Keep verified commerce receipts solely under TaskState and eliminate the remaining root-state transaction-fact read.
+- [x] Complete literal single-authority conformance: one structured semantic owner across obligation, lease, and journal; one mechanics binder as the sole action constructor; one shared InteractionView and bounded ambiguity resolver; canonical ActionLease output with legacy aliases accepted only at the migration boundary; and no turn-local version ceremony.
+- [x] Pass 321 unit assertions, the repository build/type/syntax checks, and the uninterrupted 154-case browser replay after the final contract collapse.
 - [ ] Run fresh live EasyJet, GoToGate, Kiwi, and Turkish canaries on the restarted extension/backend.
 - [ ] Measure client round-trip and each new server timing phase; do not declare latency fixed from offline tests.
 - [ ] Compile plus/minus quantity steppers from exact owned counter state; quantity zero must never become a selected paid item.

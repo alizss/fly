@@ -24,6 +24,10 @@ const {
 } = require("./authority-frames");
 const { obligationField } = require("./current-obligation");
 const agentContract = require("../../extension/src/shared/agent-contract");
+const {
+  semanticOwnerFromLegacy,
+  semanticOwnerId
+} = require("../../../packages/shared/semantic-owner");
 
 const COMPLETED = new Set(["satisfied", "waived", "waived_by_policy"]);
 const GOAL_CREATING = new Set(["active", "conflicted", "blocked"]);
@@ -43,9 +47,36 @@ function lower(value = "") {
   return clean(value).toLowerCase();
 }
 
+function semanticIdentity(source = {}, fallback = {}) {
+  if (!source || typeof source !== "object") return "";
+  if (source.semanticOwnerId) return clean(source.semanticOwnerId);
+  if (!source.semanticOwner) {
+    // One-way migration for receipts written before structured ownership.
+    // Preserve their established durable key so a direct receipt and its
+    // aggregated episode still reconcile as the same outcome.
+    return clean(
+      source.decisionInstanceId
+      || source.canonicalOwnerId
+      || source.decisionOwnerKey
+      || source.requirementId
+      || source.decisionGroupId
+    );
+  }
+  const owner = semanticOwnerFromLegacy(source, fallback);
+  return clean(semanticOwnerId(owner));
+}
+
 function verificationDecisionRecord(decision = {}) {
   const observed = decision.observed || decision.observation || {};
+  const owner = semanticOwnerFromLegacy(decision, {
+    stage: decision.stage,
+    family: decision.family,
+    subjectId: decision.subjectId,
+    repeatedInstance: decision.canonicalOwnerId || decision.decisionInstanceId || decision.decisionGroupId
+  });
   return Object.freeze({
+    semanticOwner: owner,
+    semanticOwnerId: semanticIdentity({ ...decision, semanticOwner: owner }),
     decisionGroupId: clean(decision.decisionGroupId),
     instanceId: clean(decision.instanceId || decision.decisionInstanceId),
     requirementId: clean(decision.requirementId),
@@ -917,7 +948,17 @@ function terminalEpisodeOutcome(episode = {}, parent = null) {
     || parent?.commitmentPhase === "declined_free"
     || /random|declin|without|skip/.test(lower(episode.intendedOutcome))
   );
+  const semanticOwner = semanticOwnerFromLegacy(episode, {
+    stage: episode.stage,
+    family,
+    subjectId: subjectKey,
+    passengerId: episode.passengerId,
+    segmentId: episode.segmentId,
+    repeatedInstance: decisionInstanceId
+  });
   return Object.freeze({
+    semanticOwner,
+    semanticOwnerId: clean(episode.semanticOwnerId || decisionInstanceId),
     decisionGroupId: clean(parent?.decisionGroupId || episode.parentDecisionGroupId),
     decisionInstanceId,
     decisionOwnerKey: decisionInstanceId,
@@ -1048,7 +1089,17 @@ function verifiedCommerceObligationFromActionResult(result = null, observationId
   );
   if (!actionId || !decisionGroupId || !decisionInstanceId) return null;
   const targetSnapshot = result.targetSnapshot || action.targetSnapshot || {};
+  const semanticOwner = semanticOwnerFromLegacy(action, {
+    stage: context.taskState?.stage,
+    family,
+    subjectId: task.semanticType || task.requirementId || family,
+    passengerId: task.passengerId,
+    segmentId: task.segmentId,
+    repeatedInstance: decisionInstanceId
+  });
   return Object.freeze({
+    semanticOwner,
+    semanticOwnerId: clean(action.semanticOwnerId || decisionInstanceId),
     actionId,
     observationId: clean(observationId || result.observationId),
     decisionGroupId,
@@ -1325,8 +1376,8 @@ function admittedVerifiedCommerceOutcomes({
     }));
   }
   return Object.freeze([...new Map(outcomes
-    .map((outcome) => [clean(outcome.decisionInstanceId), outcome])
-    .filter(([decisionInstanceId]) => Boolean(decisionInstanceId))).values()]);
+    .map((outcome) => [semanticIdentity(outcome), outcome])
+    .filter(([ownerId]) => Boolean(ownerId))).values()]);
 }
 
 function verifiedOutcomeJournal(previousJournal = [], admittedOutcomes = []) {
@@ -1339,28 +1390,31 @@ function verifiedOutcomeJournal(previousJournal = [], admittedOutcomes = []) {
       : 1;
   const add = (outcome = {}) => {
     const decisionInstanceId = clean(outcome?.decisionInstanceId);
-    if (!decisionInstanceId || outcome?.verified !== true) return;
+    const ownerId = semanticIdentity(outcome);
+    if (!ownerId || !decisionInstanceId || outcome?.verified !== true) return;
     const actionId = clean(outcome.actionId);
     const existingActionOwner = actionId ? actionOwners.get(actionId) : "";
-    const existingOwner = existingActionOwner || decisionInstanceId;
+    const existingOwner = existingActionOwner || ownerId;
     const existing = journal.get(existingOwner);
     if (!existing) {
-      journal.set(decisionInstanceId, outcome);
-      if (actionId) actionOwners.set(actionId, decisionInstanceId);
+      journal.set(ownerId, outcome);
+      if (actionId) actionOwners.set(actionId, ownerId);
       return;
     }
     // A receipt and the direct action committer can observe the same physical
     // action through different transient wrappers. Merge them once by action
     // ID, retaining the richer canonical receipt/episode identity.
     const identity = identityRank(outcome) > identityRank(existing) ? outcome : existing;
-    const targetOwner = clean(identity.decisionInstanceId || existingOwner);
+    const targetOwner = semanticIdentity(identity) || existingOwner;
     const merged = mergeVerifiedCommerceOutcome(existing, outcome);
     const canonical = Object.freeze({
       ...merged,
+      semanticOwner: identity.semanticOwner || merged.semanticOwner || null,
+      semanticOwnerId: targetOwner,
       decisionGroupId: clean(identity.decisionGroupId || merged.decisionGroupId),
-      decisionInstanceId: targetOwner,
-      decisionOwnerKey: clean(identity.decisionOwnerKey || targetOwner),
-      canonicalOwnerId: clean(identity.canonicalOwnerId || targetOwner),
+      decisionInstanceId: clean(identity.decisionInstanceId || merged.decisionInstanceId),
+      decisionOwnerKey: clean(identity.decisionOwnerKey || merged.decisionOwnerKey),
+      canonicalOwnerId: clean(identity.canonicalOwnerId || merged.canonicalOwnerId),
       admissionSource: clean(identity.admissionSource || merged.admissionSource),
       actionId: clean(identity.actionId || merged.actionId)
     });
