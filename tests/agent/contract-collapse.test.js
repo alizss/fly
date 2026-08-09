@@ -381,3 +381,33 @@ test("extension targeting owns exact resolution and actuator validation", () => 
   assert.match(targeting, /function validateVisualCoordinateTarget\s*\(/);
   assert.match(targeting, /function liveTargetSnapshot\s*\(/);
 });
+
+test("extension interaction module owns click, choice, keyboard, and scroll mechanics", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const interaction = fs.readFileSync(path.join(root, "apps/extension/src/content/execution/interaction.js"), "utf8");
+
+  assert.match(runtime, /createInteractionMechanics\s*\(/);
+  assert.doesNotMatch(runtime, /function dispatchGovernedClickMechanic\s*\(/);
+  assert.doesNotMatch(runtime, /function trustedBrowserChoice\s*\(/);
+  assert.doesNotMatch(runtime, /function scrollElementWithinNearestContainer\s*\(/);
+  assert.match(interaction, /function dispatchGovernedClickMechanic\s*\(/);
+  assert.match(interaction, /function trustedBrowserChoice\s*\(/);
+  assert.match(interaction, /function trustedBrowserKey\s*\(/);
+  assert.match(interaction, /function scrollElementWithinNearestContainer\s*\(/);
+});
+
+test("extension field interaction owns controlled typing, native select, and phone choice mechanics", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const fields = fs.readFileSync(path.join(root, "apps/extension/src/content/execution/field-interaction.js"), "utf8");
+
+  assert.match(runtime, /createFieldInteraction\s*\(/);
+  assert.doesNotMatch(runtime, /function setFieldValue\s*\(/);
+  assert.doesNotMatch(runtime, /function setSelectValue\s*\(/);
+  assert.doesNotMatch(runtime, /function selectCountryCodeControl\s*\(/);
+  assert.match(fields, /function setFieldValue\s*\(/);
+  assert.match(fields, /function setSelectValue\s*\(/);
+  assert.match(fields, /function selectCountryCodeControl\s*\(/);
+  assert.match(fields, /function selectComboboxOption\s*\(/);
+});

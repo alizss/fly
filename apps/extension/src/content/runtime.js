@@ -30,6 +30,8 @@ import { createFieldEvidence } from "./observation/field-evidence.js";
 import { createForegroundSurfaceCompiler } from "./observation/foreground-surface.js";
 import { createLogicalControlCompiler } from "./observation/logical-controls.js";
 import { createTargeting } from "./execution/targeting.js";
+import { createInteractionMechanics } from "./execution/interaction.js";
+import { createFieldInteraction } from "./execution/field-interaction.js";
 import {
   currentCommercialOptionPrice,
   localizedPriceAmount,
@@ -705,573 +707,6 @@ import {
   function phoneValueForField(phone) {
     const split = splitPhone(phone);
     return split.local || splitPhone(phone).local;
-  }
-
-  function dispatchKey(input, key) {
-    const code = key === " " ? "Space" : key;
-    input.dispatchEvent(new KeyboardEvent("keydown", { key, code, bubbles: true, cancelable: true }));
-    input.dispatchEvent(new KeyboardEvent("keyup", { key, code, bubbles: true, cancelable: true }));
-  }
-
-  function currentElementValue(element) {
-    if (!element) return "";
-    if (element.type === "checkbox" || element.type === "radio") return element.checked ? "checked" : "";
-    if (element.tagName === "SELECT") {
-      const option = element.selectedOptions?.[0];
-      return String(element.value || option?.textContent || "").trim();
-    }
-    if (element.getAttribute?.("role") === "combobox" || element.getAttribute?.("aria-haspopup") || element.matches?.("button, [role='button']")) {
-      return (element.value || element.innerText || element.textContent || element.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
-    }
-    if (element.isContentEditable) return element.innerText || element.textContent || "";
-    return element.value || "";
-  }
-
-  function normalizedValue(value, mode = "text") {
-    const text = String(value || "").replace(/\s+/g, " ").trim();
-    if (mode === "digits" || mode === "country_code") return text.replace(/\D/g, "");
-    return text.toLowerCase();
-  }
-
-  function valueMatches(element, expected, mode = "text") {
-    const actual = normalizedValue(currentElementValue(element), mode);
-    const wanted = normalizedValue(expected, mode);
-    if (!wanted) return true;
-    if (mode === "digits") return actual === wanted || actual.endsWith(wanted);
-    if (mode === "country_code") return actual === wanted || actual.includes(wanted);
-    return actual === wanted || actual.includes(wanted);
-  }
-
-  function setNativeElementValue(element, value) {
-    if (element.isContentEditable) {
-      element.textContent = value;
-      return;
-    }
-    const proto = element instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype
-      : element instanceof HTMLInputElement
-        ? HTMLInputElement.prototype
-        : Object.getPrototypeOf(element);
-    const descriptor = Object.getOwnPropertyDescriptor(proto, "value")
-      || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
-      || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
-    if (descriptor?.set) descriptor.set.call(element, value);
-    else element.value = value;
-  }
-
-  function dispatchFieldEvents(element) {
-    element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: element.value || "" }));
-    element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: element.value || "" }));
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-  }
-
-  async function setSelectValue(select, values, exactOption = null) {
-    const options = [...select.options];
-    const wanted = values.map((value) => String(value || "").trim()).filter(Boolean);
-    const exactSiteValue = String(exactOption?.siteValue || "").trim().toLowerCase();
-    const exactLabel = normalizeMatchText(exactOption?.label || "");
-    const uniqueMatch = (matches) => matches.length === 1 ? matches[0] : null;
-    let option = exactSiteValue
-      ? uniqueMatch(options.filter((item) => String(item.value || "").trim().toLowerCase() === exactSiteValue))
-      : null;
-    if (!option && exactLabel) {
-      option = uniqueMatch(options.filter((item) => normalizeMatchText(item.textContent || item.label || "") === exactLabel));
-    }
-    if (!option && !exactOption) {
-      for (const value of wanted) {
-        const normalizedValue = value.toLowerCase();
-        option = uniqueMatch(options.filter((item) => String(item.value || "").trim().toLowerCase() === normalizedValue));
-        if (option) break;
-      }
-      if (!option) {
-        for (const value of wanted) {
-          const normalizedLabel = normalizeMatchText(value);
-          option = uniqueMatch(options.filter((item) => normalizeMatchText(item.textContent || item.label || "") === normalizedLabel));
-          if (option) break;
-        }
-      }
-    }
-    if (!option) return { ok: false, method: "select-option", reason: "No matching option" };
-    showAgentCursor(select, `select ${option.textContent?.trim() || option.value}`);
-    select.value = option.value;
-    dispatchFieldEvents(select);
-    flashElement(select);
-    await sleep(120);
-    const selected = select.options?.[select.selectedIndex] || null;
-    return {
-      ok: Boolean(
-        selected
-        && String(selected.value || "") === String(option.value || "")
-        && normalizeMatchText(selected.textContent || selected.label || "") === normalizeMatchText(option.textContent || option.label || "")
-      ),
-      method: "select-option",
-      value: currentElementValue(select),
-      option: {
-        value: String(option.value || ""),
-        label: String(option.textContent || option.label || "").replace(/\s+/g, " ").trim()
-      }
-    };
-  }
-
-  function optionControlElement(option) {
-    if (option.matches?.("input[type='checkbox'], input[type='radio']")) return option;
-    return option.querySelector?.("input[type='checkbox'], input[type='radio']") || null;
-  }
-
-  function optionSelectedSignature(option, control) {
-    if (control) {
-      if (control.type === "checkbox" || control.type === "radio") return control.checked ? "checked" : "unchecked";
-      const aria = control.getAttribute?.("aria-checked") || control.getAttribute?.("aria-selected");
-      if (aria) return aria;
-    }
-    const optionAria = option.getAttribute?.("aria-checked") || option.getAttribute?.("aria-selected");
-    if (optionAria) return optionAria;
-    return option.className || "";
-  }
-
-  function optionControlCount(option) {
-    if (!option?.querySelectorAll) return option?.matches?.("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']") ? 1 : 0;
-    return option.querySelectorAll("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']").length;
-  }
-
-  function optionMatchText(option) {
-    return (overlayChoiceText(option) || option?.innerText || option?.textContent || option?.value || "")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function optionMatchScore(option, wanted) {
-    if (!option || !isVisible(option) || option.closest?.("#atw-sidebar")) return null;
-    const text = optionMatchText(option);
-    const normalized = normalizeMatchText(text);
-    if (!normalized || !wanted.some((term) => normalized.includes(normalizeMatchText(term)))) return null;
-    const rect = option.getBoundingClientRect();
-    const controls = optionControlCount(option);
-    const noExtra = /none of the passengers|none of the travellers|none of the travelers|no thanks|no thanks|without|decline|0 eur|0 €|0eur/i.test(text);
-    let score = 100;
-    if (option.matches?.("input[type='checkbox'], input[type='radio']")) score += 35;
-    if (option.matches?.("label, [role='option'], li, [role='checkbox'], [role='radio']")) score += 25;
-    if (/none of the passengers|none of the travellers|none of the travelers/i.test(text)) score += 160;
-    if (/0\s*(eur|€|usd|\$)|free/i.test(text)) score += 80;
-    if (/all passengers|all travellers|all travelers|passenger\s+\d|adult/i.test(text) && !/none/i.test(text)) score -= 200;
-    if (/all passengers|passenger\s+\d|adult/i.test(text) && /none of the passengers|none of the travellers|none of the travelers/i.test(text)) score -= 240;
-    if (controls > 1) score -= controls * 75;
-    if (text.length > 180) score -= Math.min(260, Math.round((text.length - 180) / 2));
-    if (rect.width > 420 || rect.height > 140) score -= 80;
-    if (noExtra) score += 20;
-    return { option, score, text };
-  }
-
-  function bestVisibleOptionForTerms(terms) {
-    const wanted = terms.map((term) => String(term || "").toLowerCase()).filter((term) => term.length >= 2);
-    return queryAllDeep("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio'], [role='option'], li, label, button, [data-headlessui-state]")
-      .map((element) => optionMatchScore(element, wanted))
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score)[0] || null;
-  }
-
-  async function selectComboboxOption(input, terms) {
-    showAgentCursor(input, "open dropdown");
-    userLikeClick(input);
-    await sleep(220);
-    dispatchKey(input, "ArrowDown");
-    await sleep(180);
-    const wanted = terms.map((term) => String(term || "").toLowerCase()).filter((term) => term.length >= 2);
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      const pick = bestVisibleOptionForTerms(wanted);
-      if (pick?.option) {
-        const option = pick.option;
-        const control = optionControlElement(option);
-        const before = optionSelectedSignature(option, control);
-        const beforeInputValue = normalizedValue(currentElementValue(input), "country_code");
-        showAgentCursor(option, pick.text || option.innerText || "option");
-        userLikeClick(option);
-        flashElement(option);
-        await sleep(220);
-        await settleAndHandleInterrupts("combobox option selected");
-
-        let verified = control
-          ? optionSelectedSignature(option, control) !== before
-          : normalizedValue(currentElementValue(input), "country_code") !== beforeInputValue || valueMatches(input, terms[0], "country_code");
-
-        if (!verified && control) {
-          showAgentCursor(control, "retry: click checkbox directly");
-          userLikeClick(control);
-          await sleep(220);
-          verified = optionSelectedSignature(option, control) !== before;
-        }
-
-        return {
-          ok: verified,
-          method: "combobox-option",
-          value: currentElementValue(input),
-          option: pick.text.slice(0, 160),
-          reason: verified ? "" : "Clicked the option but its selected state did not change."
-        };
-      }
-      await sleep(160);
-    }
-    dispatchKey(input, "Enter");
-    await sleep(180);
-    return { ok: valueMatches(input, terms[0], "country_code"), method: "combobox-enter", value: currentElementValue(input) };
-  }
-
-  function countrySearchTerms(split, t) {
-    const numericCode = split.countryCode.replace(/\D/g, "");
-    const countryNames = {
-      "386": ["slovenia", "slovenija", "si"],
-      "1": ["united states", "usa", "us", "canada"],
-      "44": ["united kingdom", "uk", "gb", "great britain"]
-    };
-    return [
-      split.countryCode,
-      numericCode,
-      ...(countryNames[numericCode] || []),
-      t.nationality,
-      t.country,
-      t.country_code,
-      t.address_country
-    ].filter(Boolean);
-  }
-
-  function controlText(element) {
-    if (!element) return "";
-    return [currentElementValue(element), element.innerText, element.textContent, element.getAttribute("aria-label")]
-      .filter(Boolean)
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
-
-  function isCountryCodeCandidate(input, localInput) {
-    if (!input || input === localInput || isPaymentField(input)) return false;
-    const text = `${labelText(input)} ${controlText(input)}`;
-    const value = String(input.value || "");
-    const role = input.getAttribute("role") || "";
-    const localRect = localInput?.getBoundingClientRect?.();
-    const rect = input.getBoundingClientRect();
-    const nearPhone = localRect
-      ? Math.abs(rect.top - localRect.top) < 130 && rect.left <= localRect.left + 40
-      : false;
-    const codeLikeValue = /^\s*\+\d{1,4}/.test(value);
-    const comboLike = role === "combobox" || input.getAttribute("aria-autocomplete") || /combobox|country|dial|calling/i.test(text);
-    return codeLikeValue || comboLike || nearPhone && /country|code|\+\d|headlessui/i.test(text || input.id || input.name || "");
-  }
-
-  function countryCodeCandidates(localInput) {
-    const controls = queryAllDeep("input, select, button, [role='button'], [role='combobox'], [aria-haspopup='listbox']")
-      .filter((element) => !element.closest("#atw-sidebar") && !element.disabled && isVisible(element));
-    const localRect = localInput?.getBoundingClientRect?.();
-    return controls
-      .filter((element) => {
-        if (element === localInput || isPaymentField(element)) return false;
-        if (element.tagName === "INPUT" || element.tagName === "SELECT") return isCountryCodeCandidate(element, localInput);
-        const rect = element.getBoundingClientRect();
-        const text = controlText(element).toLowerCase();
-        const nearPhone = localRect
-          ? Math.abs(rect.top - localRect.top) < 95 && rect.left < localRect.left && rect.right <= localRect.left + 36
-          : false;
-        return nearPhone && (/^\s*\+\d/.test(text) || /country|code|calling|dial/.test(text));
-      });
-  }
-
-  function findPhoneCountryInput(map, localInput) {
-    const explicit = map.fields.find((field) => field.field === "phone_country_code" && field.element);
-    if (explicit) return explicit.element;
-    const candidates = countryCodeCandidates(localInput);
-    if (!candidates.length) return null;
-    const localRect = localInput?.getBoundingClientRect?.();
-    return candidates
-      .map((input) => {
-        const rect = input.getBoundingClientRect();
-        const text = `${labelText(input)} ${controlText(input)}`;
-        let score = 0;
-        if (/country|dial|calling|phone country/i.test(text)) score += 20;
-        if (/^\s*\+\d{1,4}/.test(controlText(input))) score += 18;
-        if (input.tagName === "BUTTON" || input.getAttribute("role") === "button") score += 8;
-        if (input.getAttribute("role") === "combobox" || input.getAttribute("aria-autocomplete")) score += 12;
-        if (/headlessui-combobox/i.test(input.id || input.name || "")) score += 10;
-        if (localRect) {
-          if (Math.abs(rect.top - localRect.top) < 90) score += 16;
-          if (rect.left < localRect.left) score += 8;
-          score -= Math.abs(rect.top - localRect.top) / 40;
-        }
-        return { input, score };
-      })
-      .sort((a, b) => b.score - a.score)[0]?.input || null;
-  }
-
-  function countryOptionScore(element, terms) {
-    const text = controlText(element).toLowerCase();
-    if (!text || text.length > 220) return 0;
-    const normalizedTerms = terms.map((term) => String(term || "").toLowerCase()).filter(Boolean);
-    let score = 0;
-    for (const term of normalizedTerms) {
-      if (!term) continue;
-      if (text === term) score += 40;
-      else if (text.includes(term)) score += term.startsWith("+") ? 32 : 18;
-    }
-    if (/slovenia|slovenija/.test(text)) score += 30;
-    if (/\+386|386/.test(text)) score += 26;
-    if (/guernsey|jersey|\+44-?1481|\+44-?1534/.test(text)) score -= 50;
-    return score;
-  }
-
-  async function selectCountryCodeControl(control, terms, split) {
-    if (!control) return { ok: false, method: "country-control", value: "" };
-    if (control.tagName === "SELECT") return setSelectValue(control, terms);
-    setAgentActivity(`Selecting ${split.countryCode}`, "Opening country code selector");
-    showAgentCursor(control, `Select ${split.countryCode}`, "Open country code menu");
-    flashElement(control);
-    userLikeClick(control);
-    await sleep(260);
-    if (control.tagName === "INPUT") {
-      try {
-        setNativeElementValue(control, terms.find((term) => /[a-z]/i.test(term)) || split.countryCode);
-        dispatchFieldEvents(control);
-        await sleep(220);
-      } catch (error) {
-        logAgentEvent("country_code_type_failed", { error: error.message });
-      }
-    }
-    const option = queryAllDeep("[role='option'], li, button, [data-headlessui-state], [aria-selected], div")
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
-      .map((element) => ({ element, score: countryOptionScore(element, terms) }))
-      .filter((item) => item.score > 0)
-      .sort((a, b) => b.score - a.score)[0]?.element || null;
-    if (option) {
-      showAgentCursor(option, `Choose ${split.countryCode}`, controlText(option).slice(0, 90));
-      flashElement(option);
-      userLikeClick(option);
-      await sleep(420);
-      await settleAndHandleInterrupts("country code selected");
-    } else if (control.tagName === "INPUT") {
-      dispatchKey(control, "Enter");
-      await sleep(260);
-      await settleAndHandleInterrupts("country code entered");
-    }
-    const value = controlText(control);
-    const ok = normalizedValue(value, "country_code").includes(split.countryCode.replace(/\D/g, "")) || Boolean(option);
-    return { ok, method: option ? "country-option-click" : "country-input-enter", value, option: controlText(option).slice(0, 120) };
-  }
-
-  async function fillPhoneFieldsFromMap(map) {
-    const t = traveler();
-    const split = travelerPhoneParts(t);
-    if (!split.local && !split.countryCode) return 0;
-
-    const phoneFields = map.fields.filter((field) => field.field === "phone" && field.element);
-    const localField = phoneFields.find((field) => !/country|dial|calling/i.test(field.label)) || phoneFields[0];
-    const localInput = localField?.element || null;
-    let count = 0;
-
-    const countryInput = findPhoneCountryInput(map, localInput);
-    if (countryInput && split.countryCode) {
-      const terms = countrySearchTerms(split, t);
-      const result = countryInput.tagName === "SELECT"
-        ? await setSelectValue(countryInput, terms)
-        : (countryInput.tagName === "INPUT" || countryInput.tagName === "TEXTAREA")
-          ? await (async () => {
-            const fillResult = await setFieldValue(countryInput, split.countryCode, { fieldType: "phone_country_code", compareMode: "country_code" });
-            const optionResult = await selectComboboxOption(countryInput, terms);
-            return optionResult.ok ? optionResult : fillResult;
-          })()
-          : await selectCountryCodeControl(countryInput, terms, split);
-      if (result.ok) {
-        filledFields.push({
-          fieldType: "phone_country_code",
-          selector: countryInput.name || countryInput.id || countryInput.tagName.toLowerCase(),
-          confidence: 0.88
-        });
-        count += 1;
-      }
-      setAgentActivity(result.ok ? `Country code ${split.countryCode} accepted` : `Country code ${split.countryCode} not accepted`, result.ok ? "Now checking the local phone number" : "Will rescan the phone selector");
-      await reportActionResult({
-        type: "phone_country_code",
-        action: "select_country_code",
-        fieldType: "phone_country_code",
-        target: countryInput.name || countryInput.id || countryInput.tagName.toLowerCase(),
-        ok: result.ok,
-        message: result.ok ? `Country code ${split.countryCode} accepted.` : `Country code ${split.countryCode} did not stick.`,
-        payload: {
-          method: result.method,
-          value: result.value,
-          option: result.option
-        }
-      });
-      const interrupt = await settleAndHandleInterrupts("phone country code");
-      if (interrupt.blocked && !interrupt.handled) return count;
-    }
-
-    if (localInput && split.local) {
-      const current = String(localInput.value || "").replace(/\D/g, "");
-      if (current !== split.local) {
-        const result = await setFieldValue(localInput, split.local, { fieldType: "phone", compareMode: "digits" });
-        if (result.ok) {
-          filledFields.push({
-            fieldType: "phone",
-            selector: localInput.name || localInput.id || localInput.tagName.toLowerCase(),
-            confidence: localField?.confidence || 0.9
-          });
-          count += 1;
-        }
-      }
-    }
-
-    const interrupt = await settleAndHandleInterrupts("phone fields");
-    if (interrupt.blocked && !interrupt.handled) return count;
-
-    if (count) {
-      logAgentEvent("phone_fill", {
-        countryCode: split.countryCode,
-        localDigits: split.local.length,
-        countryControl: countryInput ? countryInput.name || countryInput.id || countryInput.tagName.toLowerCase() : "",
-        localControl: localInput ? localInput.name || localInput.id || localInput.tagName.toLowerCase() : ""
-      });
-    }
-    return count;
-  }
-
-  async function typeWithFallback(element, value) {
-    showAgentCursor(element, `type ${String(value).slice(0, 12)}`);
-    userLikeClick(element);
-    await sleep(80);
-    element.focus({ preventScroll: true });
-    if (typeof element.select === "function") element.select();
-    setNativeElementValue(element, "");
-    dispatchFieldEvents(element);
-    await sleep(180);
-    for (const char of String(value)) {
-      setNativeElementValue(element, `${element.value || ""}${char}`);
-      element.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: char }));
-      element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: char }));
-      await sleep(45);
-    }
-    element.dispatchEvent(new Event("change", { bubbles: true }));
-    element.blur?.();
-    await sleep(360);
-  }
-
-  async function setFieldValue(element, value, options = {}) {
-    const mode = options.compareMode || "text";
-    const fieldType = options.fieldType || "unknown";
-    const fieldLabel = fieldType.replace(/_/g, " ");
-    const expected = String(value || "");
-    const resolveLiveElement = typeof options.resolveLiveElement === "function"
-      ? options.resolveLiveElement
-      : () => element;
-    const reportLocalResult = options.reportResult !== false;
-    const reportFieldResult = async (payload) => {
-      if (reportLocalResult) await reportActionResult(payload);
-    };
-    const result = {
-      ok: false,
-      fieldType,
-      selector: element?.name || element?.id || element?.tagName?.toLowerCase() || "",
-      expected: mode === "digits" ? expected.replace(/\D/g, "").length : expected.slice(0, 80),
-      method: "",
-      actual: ""
-    };
-    if (!element || !expected) {
-      result.method = "skipped";
-      result.reason = "Missing element or value";
-      recordAction("field_fill", result);
-      setAgentActivity(result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok ? "Moving to the next required item" : "Will rescan and recover");
-      await verifyAgentStep(element, "Field", result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok, 700);
-      await reportFieldResult({
-        type: "field_fill",
-        action: "fill_text",
-        fieldType,
-        target: result.selector,
-        ok: false,
-        message: result.reason
-      });
-      return result;
-    }
-
-    await showAgentThought(element, "Field", `Filling ${fieldLabel}`, "Using saved traveler profile, then verifying the value sticks.", 900);
-    flashElement(element);
-
-    if (element.tagName === "SELECT") {
-      const selectResult = await setSelectValue(element, [expected], options.exactOption || null);
-      result.ok = selectResult.ok;
-      result.method = selectResult.method;
-      result.actual = selectResult.value || currentElementValue(element);
-      recordAction("field_fill", result);
-      await reportFieldResult({
-        type: "field_fill",
-        action: "select_dropdown",
-        fieldType,
-        target: result.selector,
-        ok: result.ok,
-        message: result.ok ? `${fieldLabel} accepted.` : `${fieldLabel} did not accept the selected option.`
-      });
-      return result;
-    }
-
-    try {
-      element.focus({ preventScroll: true });
-      setNativeElementValue(element, expected);
-      dispatchFieldEvents(element);
-      element.blur?.();
-      await sleep(520);
-      const liveElement = resolveLiveElement() || element;
-      if (valueMatches(liveElement, expected, mode)) {
-        element = liveElement;
-        result.ok = true;
-        result.method = "native-setter";
-        result.actual = currentElementValue(element);
-        recordAction("field_fill", result);
-        setAgentActivity(`${fieldLabel} accepted`, "Moving to the next required item");
-        await verifyAgentStep(element, "Field", `${fieldLabel} accepted`, true, 700);
-        await reportFieldResult({
-          type: "field_fill",
-          action: "fill_text",
-          fieldType,
-          target: result.selector,
-          ok: true,
-          message: `${fieldLabel} accepted.`
-        });
-        return result;
-      }
-    } catch (error) {
-      result.reason = error.message;
-    }
-
-    try {
-      element = resolveLiveElement() || element;
-      await typeWithFallback(element, expected);
-      element = resolveLiveElement() || element;
-      result.ok = valueMatches(element, expected, mode);
-      result.method = "clear-and-type";
-      result.actual = currentElementValue(element);
-      recordAction("field_fill", result);
-      setAgentActivity(result.ok ? `${fieldLabel} accepted` : `${fieldLabel} not accepted`, result.ok ? "Moving to the next required item" : "Will rescan and recover");
-      await reportFieldResult({
-        type: "field_fill",
-        action: "fill_text",
-        fieldType,
-        target: result.selector,
-        ok: result.ok,
-        message: result.ok ? `${fieldLabel} accepted.` : `${fieldLabel} did not keep the typed value.`
-      });
-      return result;
-    } catch (error) {
-      result.ok = false;
-      result.method = "clear-and-type";
-      result.reason = error.message;
-      result.actual = currentElementValue(element);
-      recordAction("field_fill", result);
-      await reportFieldResult({
-        type: "field_fill",
-        action: "fill_text",
-        fieldType,
-        target: result.selector,
-        ok: false,
-        message: error.message
-      });
-      return result;
-    }
   }
 
   function sleep(ms) {
@@ -2798,7 +2233,7 @@ import {
     buttonText,
     candidateInputs,
     choiceLabel,
-    controlText,
+    controlText: (...args) => controlText(...args),
     elementBox,
     elementById,
     elementId,
@@ -2916,9 +2351,9 @@ import {
     clickableAncestor,
     compactText,
     controlOwnedEvidence,
-    controlText,
+    controlText: (...args) => controlText(...args),
     currentCommercialOptionPrice,
-    currentElementValue,
+    currentElementValue: (...args) => currentElementValue(...args),
     decisionChoiceOwnerLabel,
     directControlName,
     elementBelongsToSectionBand,
@@ -2977,7 +2412,7 @@ import {
     choiceRisk,
     compactText,
     controlOwnedEvidence,
-    controlText,
+    controlText: (...args) => controlText(...args),
     decisionChoiceOwnerLabel,
     directControlName,
     elementById,
@@ -3035,10 +2470,10 @@ import {
     compactText,
     controlExclusiveNodeIds,
     controlMemberNodeIds,
-    controlText,
+    controlText: (...args) => controlText(...args),
     controlsAreCompatibleAliases,
     createObservationControlRegistry,
-    currentElementValue,
+    currentElementValue: (...args) => currentElementValue(...args),
     elementBox,
     elementById,
     elementId,
@@ -4569,480 +4004,6 @@ import {
     setTimeout(() => cursor.classList.remove("is-clicking"), 350);
   }
 
-  function userLikeClick(element, meta = {}) {
-    const rect = element.getBoundingClientRect();
-    const hitTarget = document.elementFromPoint(
-      Math.min(window.innerWidth - 2, Math.max(2, rect.left + rect.width / 2)),
-      Math.min(window.innerHeight - 2, Math.max(2, rect.top + rect.height / 2))
-    );
-    const eventInit = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      button: 0,
-      buttons: 1,
-      detail: 1,
-      pointerId: 1,
-      pointerType: "mouse",
-      isPrimary: true,
-      clientX: Math.round(rect.left + rect.width / 2),
-      clientY: Math.round(rect.top + rect.height / 2)
-    };
-    logFlow("dom.click.dispatch", {
-      meta,
-      point: { x: eventInit.clientX, y: eventInit.clientY },
-      target: elementDescriptor(element),
-      hitTarget: elementDescriptor(hitTarget),
-      pageBefore: pageSnapshot("before-click")
-    });
-    watchClickToFirstMutation("click", meta);
-    element.dispatchEvent(new PointerEvent("pointerdown", eventInit));
-    element.dispatchEvent(new MouseEvent("mousedown", eventInit));
-    element.dispatchEvent(new PointerEvent("pointerup", { ...eventInit, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("mouseup", { ...eventInit, buttons: 0 }));
-    element.dispatchEvent(new MouseEvent("click", { ...eventInit, buttons: 0 }));
-  }
-
-  function nativeElementClick(element, meta = {}) {
-    if (!element || typeof element.click !== "function") return false;
-    logFlow("dom.native_click.dispatch", {
-      meta,
-      target: elementDescriptor(element),
-      pageBefore: pageSnapshot("before-native-click")
-    });
-    watchClickToFirstMutation("native_click", meta);
-    element.click();
-    return true;
-  }
-
-  async function trustedBrowserClick(element, decision = {}) {
-    if (!element) return { ok: false, code: "CANONICAL_ACTUATOR_UNAVAILABLE" };
-    const rect = element.getBoundingClientRect();
-    const x = Math.round(rect.left + rect.width / 2);
-    const y = Math.round(rect.top + rect.height / 2);
-    return withAgentUiPointerPassthrough(async () => {
-      if (typeof globalThis.__ATW_TEST_TRUSTED_INPUT__ === "function") {
-        return globalThis.__ATW_TEST_TRUSTED_INPUT__({ element, x, y, decision });
-      }
-      if (!globalThis.chrome?.runtime?.sendMessage) {
-        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE" };
-      }
-      try {
-        return await chrome.runtime.sendMessage({
-          type: "ATW_TRUSTED_POINTER_CLICK",
-          governed: true,
-          actionId: decision.actionId || decision.id || "",
-          observationId: decision.observationId || "",
-          controlId: decision.controlId || "",
-          x,
-          y
-        });
-      } catch (error) {
-        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE", error: error.message };
-      }
-    });
-  }
-
-  function boundedLocalClickMechanicAllowed(decision = {}) {
-    const operation = String(decision.operation || "").toLowerCase();
-    const risk = String(decision.risk || decision.targetSnapshot?.risk || "").toLowerCase();
-    const effect = String([
-      decision.intent,
-      decision.semanticEffect,
-      decision.physicalEffect,
-      decision.mechanicalEffect,
-      decision.targetSnapshot?.semantic
-    ].filter(Boolean).join(" ")).toLowerCase();
-    return ["open", "choose", "select", "activate"].includes(operation)
-      && !isStageExitDecision(decision)
-      && !/money|paid|payment|purchase|legal|consent|account|login|itinerary/.test(`${risk} ${effect}`);
-  }
-
-  function localMechanicReactionSnapshot(element) {
-    return JSON.stringify({
-      connected: Boolean(element?.isConnected),
-      expanded: element?.getAttribute?.("aria-expanded") || "",
-      checked: element?.getAttribute?.("aria-checked") || element?.checked || false,
-      selected: element?.getAttribute?.("aria-selected") || element?.selected || false,
-      value: element?.value || "",
-      text: String(element?.innerText || element?.textContent || "").replace(/\s+/g, " ").trim()
-    });
-  }
-
-  async function waitForLocalMechanicReaction(element, before, timeoutMs = 320) {
-    const startedAt = performance.now();
-    while (performance.now() - startedAt < timeoutMs) {
-      if (localMechanicReactionSnapshot(element) !== before) return true;
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-    }
-    return localMechanicReactionSnapshot(element) !== before;
-  }
-
-  async function dispatchGovernedClickMechanic(element, decision = {}, meta = {}) {
-    const reactionBefore = localMechanicReactionSnapshot(element);
-    let choiceCommitResult = null;
-    let primary = { ok: true, method: decision.interactionMethod || "pointer_sequence" };
-    if (decision.interactionMethod === "native_click") {
-      primary = nativeElementClick(element, meta)
-        ? { ok: true, method: "native_click" }
-        : { ok: false, code: "NATIVE_CLICK_UNAVAILABLE", method: "native_click" };
-    } else if (decision.interactionMethod === "browser_trusted_input") {
-      primary = await trustedBrowserClick(element, { ...decision, ...meta });
-    } else if (decision.interactionMethod === "browser_trusted_choice") {
-      primary = await trustedBrowserChoice(element, { ...decision, ...meta });
-      if (primary?.ok === true) {
-        choiceCommitResult = await settleTrustedChoiceInteraction(element, { ...decision, ...meta });
-      }
-    } else {
-      userLikeClick(element, { ...meta, method: decision.interactionMethod || "pointer_sequence" });
-    }
-    if (primary?.ok !== true) return { ...primary, choiceCommitResult };
-
-    const mayFallback = boundedLocalClickMechanicAllowed(decision)
-      && !["browser_trusted_input", "browser_trusted_choice"].includes(decision.interactionMethod);
-    const reactionObserved = mayFallback
-      ? await waitForLocalMechanicReaction(element, reactionBefore)
-      : false;
-    if (!mayFallback || reactionObserved) {
-      return {
-        ok: true,
-        method: primary.method || decision.interactionMethod || "pointer_sequence",
-        choiceCommitResult,
-        reactionObserved
-      };
-    }
-
-    // Reuse the same fresh action lease and exact actuator. This is one local
-    // mechanic, not a new semantic decision or a silently rebound target.
-    const freshMap = pageStateStore.observe({ reason: "bounded_local_click_revalidate" }).map;
-    const freshTarget = resolveDecisionTarget(decision, freshMap);
-    const validation = freshTarget && freshTarget === element
-      ? validateResolvedTarget(decision, freshTarget, freshMap)
-      : { ok: false, code: "TARGET_DISAPPEARED" };
-    if (!validation.ok) {
-      return { ok: true, method: primary.method || decision.interactionMethod || "pointer_sequence", choiceCommitResult };
-    }
-    const fallback = await trustedBrowserClick(freshTarget, { ...decision, ...meta });
-    pushActionLedger({
-      actionId: meta.actionId || decision.actionId || decision.id || "",
-      observationId: meta.observationId || decision.observationId || "",
-      stage: "local_mechanic_fallback",
-      action: decision,
-      primaryMethod: primary.method || decision.interactionMethod || "pointer_sequence",
-      fallbackMethod: "browser_trusted_input",
-      fallbackCode: fallback?.code || ""
-    });
-    return {
-      // The primary mechanic was dispatched. An unavailable optional fallback
-      // must not rewrite that fact as a pre-dispatch failure; canonical
-      // verification below decides whether the action worked.
-      ok: true,
-      code: fallback?.ok === true ? "LOCAL_FALLBACK_DISPATCHED" : (fallback?.code || "LOCAL_FALLBACK_UNAVAILABLE"),
-      method: fallback?.ok === true ? "browser_trusted_input" : (primary.method || decision.interactionMethod || "pointer_sequence"),
-      fallbackUsed: fallback?.ok === true,
-      choiceCommitResult
-    };
-  }
-
-  async function trustedBrowserChoice(element, decision = {}) {
-    if (!element) return { ok: false, code: "CANONICAL_ACTUATOR_UNAVAILABLE" };
-    const choiceLabel = String(decision.value || "").trim();
-    if (!choiceLabel) return { ok: false, code: "TRUSTED_CHOICE_VALUE_MISSING" };
-    rememberChoiceActuatorBinding(decision.controlId, element, decision);
-    const previousInteraction = choiceInteractionStates.get(String(decision.controlId || "").trim()) || {};
-    updateChoiceInteractionState(decision.controlId, {
-      status: "dispatched",
-      actuatorId: elementId(element),
-      desiredLabel: choiceLabel,
-      attempts: Number(previousInteraction.attempts || 0) + 1,
-      popupClosed: false,
-      focusSettled: false
-    });
-    const rect = element.getBoundingClientRect();
-    const x = Math.round(rect.left + rect.width / 2);
-    const y = Math.round(rect.top + rect.height / 2);
-    return withAgentUiPointerPassthrough(async () => {
-      if (typeof globalThis.__ATW_TEST_TRUSTED_CHOICE__ === "function") {
-        const result = await globalThis.__ATW_TEST_TRUSTED_CHOICE__({ element, x, y, choiceLabel, decision });
-        if (result?.ok !== true) {
-          updateChoiceInteractionState(decision.controlId, {
-            status: "unsettled",
-            code: result?.code || "TRUSTED_INPUT_UNAVAILABLE"
-          });
-        }
-        return result;
-      }
-      if (!globalThis.chrome?.runtime?.sendMessage) {
-        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE" };
-      }
-      try {
-        const result = await chrome.runtime.sendMessage({
-          type: "ATW_TRUSTED_CHOICE",
-          governed: true,
-          actionId: decision.actionId || decision.id || "",
-          observationId: decision.observationId || "",
-          controlId: decision.controlId || "",
-          choiceLabel,
-          x,
-          y
-        });
-        if (result?.ok !== true) {
-          updateChoiceInteractionState(decision.controlId, {
-            status: "unsettled",
-            code: result?.code || "TRUSTED_INPUT_UNAVAILABLE"
-          });
-        }
-        return result;
-      } catch (error) {
-        updateChoiceInteractionState(decision.controlId, {
-          status: "unsettled",
-          code: "TRUSTED_INPUT_UNAVAILABLE"
-        });
-        return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE", error: error.message };
-      }
-    });
-  }
-
-  async function trustedBrowserKey(key = "", decision = {}) {
-    const normalizedKey = String(key || "");
-    if (!["Escape", "Tab"].includes(normalizedKey)) {
-      return { ok: false, code: "TRUSTED_KEY_UNSUPPORTED" };
-    }
-    if (typeof globalThis.__ATW_TEST_TRUSTED_KEY__ === "function") {
-      return globalThis.__ATW_TEST_TRUSTED_KEY__({ key: normalizedKey, decision });
-    }
-    if (!globalThis.chrome?.runtime?.sendMessage) {
-      return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE" };
-    }
-    try {
-      return await chrome.runtime.sendMessage({
-        type: "ATW_TRUSTED_KEY",
-        governed: true,
-        actionId: decision.actionId || decision.id || "",
-        observationId: decision.observationId || "",
-        controlId: decision.controlId || "",
-        key: normalizedKey
-      });
-    } catch (error) {
-      return { ok: false, code: "TRUSTED_INPUT_UNAVAILABLE", error: error.message };
-    }
-  }
-
-  function visibleChoiceSurfacesForValue(choiceLabel = "") {
-    const wanted = normalizeMatchText(choiceLabel);
-    return queryAllDeep("[role='listbox'], [role='menu'], [role='tree'], [data-headlessui-state~='open']")
-      .filter((surface) => (
-        isVisible(surface)
-        && !surface.closest?.("#atw-sidebar")
-        && (
-          !wanted
-          || normalizeMatchText(surface.innerText || surface.textContent || "").includes(wanted)
-        )
-      ));
-  }
-
-  function choiceEpisodeEvidence(target, decision = {}, map = null) {
-    const control = (map?.controls || []).find((item) => item.controlId === decision.controlId) || null;
-    const activeSurface = map?.currentSurface || {};
-    const liveChoiceSurfaces = queryAllDeep("[role='listbox'], [role='menu'], [data-headlessui-state='open'], [aria-expanded='true'], .popover")
-      .filter((surface) => !surface.closest?.("#atw-sidebar") && isVisible(surface))
-      .filter((surface) => (
-        isTransientChoiceOverlay(surface)
-        || /dropdown|listbox|menu|popover|choice|option|tree/.test(String(surface.getAttribute?.("role") || "").toLowerCase())
-      ));
-    const activeChoiceSurface = Boolean(
-      liveChoiceSurfaces.length
-      || (
-        activeSurface.type
-        && activeSurface.type !== "page"
-        && /dropdown|listbox|menu|popover|choice|option|tree/.test(String(activeSurface.type || "").toLowerCase())
-      )
-    );
-    const expanded = Boolean(
-      control?.state?.expanded === true
-      || target?.getAttribute?.("aria-expanded") === "true"
-      || target?.closest?.("[aria-expanded='true']")
-    );
-    const visibleChoiceSurfaces = visibleChoiceSurfacesForValue(decision.value || decision.targetLabel || "");
-    const relatedElements = [
-      target,
-      elementById(control?.stateElementId || ""),
-      elementById(control?.preferredActivationElementId || ""),
-      ...Object.values(control?.operations || {}).flatMap((capability) => (
-        capability?.actuatorIds || []
-      )).map(elementById)
-    ].filter(Boolean);
-    const focusInsideTarget = Boolean(
-      document.activeElement
-      && relatedElements.some((element) => (
-        document.activeElement === element
-        || element.contains?.(document.activeElement)
-      ))
-    );
-    return {
-      activeChoiceSurface,
-      expanded,
-      visibleChoiceSurfaceCount: visibleChoiceSurfaces.length,
-      popupOpen: Boolean(activeChoiceSurface || expanded || visibleChoiceSurfaces.length),
-      focusInsideTarget,
-      activeElementId: document.activeElement ? elementId(document.activeElement) : "",
-      surfaceId: activeSurface.id || (liveChoiceSurfaces[0] ? elementId(liveChoiceSurfaces[0]) : ""),
-      surfaceType: activeSurface.type || (liveChoiceSurfaces.length ? "choice_overlay" : "page"),
-      continueDisabled: map?.stageExit?.continueDisabled === true
-    };
-  }
-
-  async function settleTrustedChoiceInteraction(target, decision = {}) {
-    await waitForUiSettle(180);
-    const beforeCleanup = choiceEpisodeEvidence(target, decision);
-    let escapeAttempted = false;
-    let tabAttempted = false;
-    let escapeResult = null;
-    let tabResult = null;
-
-    if (beforeCleanup.popupOpen) {
-      escapeAttempted = true;
-      escapeResult = await trustedBrowserKey("Escape", decision);
-      if (escapeResult?.ok !== true) pressEscape(document.activeElement || target);
-      await waitForUiSettle(180);
-    }
-
-    const afterEscape = choiceEpisodeEvidence(target, decision);
-    if (afterEscape.popupOpen || afterEscape.focusInsideTarget) {
-      tabAttempted = true;
-      tabResult = await trustedBrowserKey("Tab", decision);
-      if (tabResult?.ok !== true) target?.blur?.();
-      await waitForUiSettle(220);
-    }
-
-    const afterCleanup = choiceEpisodeEvidence(target, decision);
-    const popupClosed = !afterCleanup.popupOpen;
-    const focusSettled = !afterCleanup.focusInsideTarget;
-    const settled = popupClosed && focusSettled;
-    const state = updateChoiceInteractionState(decision.controlId, {
-      status: settled ? "settled" : "unsettled",
-      actuatorId: elementId(target),
-      desiredLabel: String(decision.value || "").trim(),
-      popupClosed,
-      focusSettled,
-      escapeAttempted,
-      tabAttempted,
-      code: settled ? "CHOICE_COMMIT_SETTLED" : "CHOICE_COMMIT_NOT_SETTLED"
-    });
-    pageStateStore?.invalidate?.("choice_commit_state");
-    return {
-      ok: settled,
-      code: state?.code || "CHOICE_COMMIT_NOT_SETTLED",
-      controlId: String(decision.controlId || ""),
-      actuatorId: state?.actuatorId || elementId(target),
-      desiredLabel: state?.desiredLabel || String(decision.value || "").trim(),
-      popupClosed,
-      focusSettled,
-      escapeAttempted,
-      tabAttempted,
-      escapeResult,
-      tabResult,
-      beforeCleanup,
-      afterEscape,
-      afterCleanup
-    };
-  }
-
-  function watchClickToFirstMutation(method = "click", meta = {}) {
-    const startedAt = performance.now();
-    let done = false;
-    const finish = (changed) => {
-      if (done) return;
-      done = true;
-      observer.disconnect();
-      logFlow("latency.span", {
-        click_to_first_mutation_ms: changed ? Math.round(performance.now() - startedAt) : null,
-        mutation_observed: Boolean(changed),
-        method,
-        meta
-      });
-    };
-    const observer = new MutationObserver(() => finish(true));
-    try {
-      observer.observe(document.documentElement, {
-        subtree: true,
-        childList: true,
-        attributes: true,
-        characterData: true
-      });
-      setTimeout(() => finish(false), 1600);
-    } catch (error) {
-      logFlow("latency.span", {
-        click_to_first_mutation_ms: null,
-        mutation_observed: false,
-        method,
-        error: error.message
-      });
-    }
-  }
-
-  async function waitForPaint(ms = 300) {
-    await sleep(ms);
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-  }
-
-  function pressEscape(target = document.activeElement || document.body) {
-    const eventInit = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true };
-    target?.dispatchEvent?.(new KeyboardEvent("keydown", eventInit));
-    document.dispatchEvent(new KeyboardEvent("keydown", eventInit));
-    target?.dispatchEvent?.(new KeyboardEvent("keyup", eventInit));
-    document.dispatchEvent(new KeyboardEvent("keyup", eventInit));
-    target?.blur?.();
-  }
-
-  function clickResolvedViewportTarget(target, x = 18, y = 18, meta = {}) {
-    if (!target) return false;
-    const eventInit = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: x,
-      clientY: y
-    };
-    logFlow("dom.click_xy.dispatch", {
-      meta,
-      point: { x, y },
-      topElement: elementDescriptor(target),
-      pageBefore: pageSnapshot("before-click-xy")
-    });
-    watchClickToFirstMutation("click_xy", meta);
-    target.dispatchEvent(new PointerEvent("pointerdown", eventInit));
-    target.dispatchEvent(new MouseEvent("mousedown", eventInit));
-    target.dispatchEvent(new PointerEvent("pointerup", eventInit));
-    target.dispatchEvent(new MouseEvent("mouseup", eventInit));
-    target.dispatchEvent(new MouseEvent("click", eventInit));
-    return true;
-  }
-
-  function clickViewportPoint(x = 18, y = 18, meta = {}) {
-    const target = document.elementFromPoint(x, y) || document.body;
-    return clickResolvedViewportTarget(target, x, y, meta);
-  }
-
-  function transientOverlayOpen() {
-    return activeOverlayElements().some((overlay) => isTransientChoiceOverlay(overlay));
-  }
-
-  async function waitForUiSettle(ms = 650) {
-    const startedAt = performance.now();
-    setAgentActivity("Wait -> Watching page update", "Waiting for a material popup, selection, validation, price, progress, or route change.");
-    const settled = await pageStateStore.waitForQuiet({
-      maxWaitMs: ms,
-      minQuietMs: 80,
-      awaitMutationMs: Math.min(180, Math.max(60, Math.round(ms * 0.25)))
-    });
-    logFlow("latency.span", {
-      page_settle_ms: Math.round(performance.now() - startedAt),
-      requested_settle_ms: ms,
-      mutation_settled: settled.settled
-    });
-  }
-
   function exactChoiceCommitReadiness(target, decision = {}, pageMap = agent.pageMap || {}) {
     if (isChoiceSelected(target)) {
       return { ready: true, source: "observed_selected_state" };
@@ -5415,7 +4376,7 @@ import {
     clickableAncestor,
     compactText,
     controlOwnedEvidence,
-    controlText,
+    controlText: (...args) => controlText(...args),
     decisionGroupIdForContext,
     elementBelongsToSectionBand,
     elementBox,
@@ -5438,7 +4399,7 @@ import {
     queryAllDeep,
     resolveOwnedControlMeaning,
     stableHash,
-    waitForPaint
+    waitForPaint: (...args) => waitForPaint(...args)
   });
 
   const {
@@ -5473,7 +4434,7 @@ import {
     clickPointIsClear,
     compactText,
     controlMemberNodeIds,
-    currentElementValue,
+    currentElementValue: (...args) => currentElementValue(...args),
     currentSurfaceEntries,
     decisionTargetAliasIds,
     elementBox,
@@ -5631,110 +4592,6 @@ import {
       centerX: Math.round(centerX),
       centerY: Math.round(centerY),
       inViewport
-    };
-  }
-
-  function composedParent(element) {
-    if (!element) return null;
-    return element.parentElement || element.getRootNode?.()?.host || null;
-  }
-
-  function isEffectiveScrollContainer(element) {
-    if (!element || element === document.body || element === document.documentElement) return false;
-    const style = getComputedStyle(element);
-    return /(auto|scroll|overlay)/.test(`${style.overflowY || ""} ${style.overflow || ""}`)
-      && element.scrollHeight > element.clientHeight + 2;
-  }
-
-  function nearestEffectiveScrollContainer(element) {
-    let current = composedParent(element);
-    for (let depth = 0; current && depth < 24; depth += 1, current = composedParent(current)) {
-      if (isEffectiveScrollContainer(current)) return current;
-    }
-    return document.scrollingElement || document.documentElement;
-  }
-
-  function scrollElementWithinNearestContainer(element, options = {}) {
-    if (options.authority !== "governed_executor") {
-      return { ok: false, code: "UNGOVERNED_SCROLL_BLOCKED", container: null, moved: false };
-    }
-    if (!element) return { ok: false, code: "TARGET_DISAPPEARED", container: null, moved: false };
-    const container = nearestEffectiveScrollContainer(element);
-    const behavior = options.behavior || "smooth";
-    const amount = Number(options.amount || 0);
-    const strategy = options.strategy === "nearest_container" ? "nearest_container" : "target_center";
-    const documentScroller = container === document.scrollingElement
-      || container === document.documentElement
-      || container === document.body;
-    const before = documentScroller ? Number(window.scrollY || 0) : Number(container.scrollTop || 0);
-    if (strategy === "target_center") {
-      element.scrollIntoView({ block: "center", inline: "nearest", behavior });
-    } else {
-      const targetBox = element.getBoundingClientRect();
-      const viewportCenter = documentScroller
-        ? window.innerHeight / 2
-        : (() => {
-            const containerBox = container.getBoundingClientRect();
-            return containerBox.top + containerBox.height / 2;
-          })();
-      const centeredDelta = targetBox.top + targetBox.height / 2 - viewportCenter;
-      if (documentScroller) window.scrollBy({ top: centeredDelta || amount, left: 0, behavior });
-      else container.scrollBy({ top: centeredDelta || amount, left: 0, behavior });
-    }
-    const after = documentScroller ? Number(window.scrollY || 0) : Number(container.scrollTop || 0);
-    return {
-      ok: true,
-      code: "SCROLL_DISPATCHED",
-      container,
-      containerId: documentScroller ? "document" : elementId(container),
-      containerType: documentScroller ? "document" : "element",
-      strategy,
-      before,
-      after,
-      moved: after !== before
-    };
-  }
-
-  async function waitForScrollSettle(element, options = {}) {
-    const container = options.container || nearestEffectiveScrollContainer(element);
-    const timeoutMs = Math.max(250, Number(options.timeoutMs || 3000));
-    const quietMs = Math.max(80, Number(options.quietMs || 140));
-    const documentScroller = container === document.scrollingElement
-      || container === document.documentElement
-      || container === document.body;
-    const sample = () => {
-      const rect = element?.getBoundingClientRect?.() || null;
-      return {
-        windowX: Number(window.scrollX || 0),
-        windowY: Number(window.scrollY || 0),
-        containerTop: documentScroller ? Number(window.scrollY || 0) : Number(container?.scrollTop || 0),
-        targetX: Number(rect?.left || 0),
-        targetY: Number(rect?.top || 0)
-      };
-    };
-    const changed = (before, after) => Object.keys(before).some((key) => Math.abs(before[key] - after[key]) > 0.5);
-    const startedAt = performance.now();
-    let lastChangeAt = startedAt;
-    let previous = sample();
-    while (performance.now() - startedAt < timeoutMs) {
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      const current = sample();
-      if (changed(previous, current)) lastChangeAt = performance.now();
-      previous = current;
-      if (performance.now() - startedAt >= quietMs && performance.now() - lastChangeAt >= quietMs) {
-        return {
-          settled: true,
-          timedOut: false,
-          durationMs: Math.round(performance.now() - startedAt),
-          targetInViewport: element ? elementBox(element).inViewport === true : false
-        };
-      }
-    }
-    return {
-      settled: false,
-      timedOut: true,
-      durationMs: Math.round(performance.now() - startedAt),
-      targetInViewport: element ? elementBox(element).inViewport === true : false
     };
   }
 
@@ -6165,6 +5022,105 @@ import {
     onMaterialMutation: (timestamp) => {
       agent.lastPageMutationAt = timestamp;
     }
+  });
+
+  const {
+    boundedLocalClickMechanicAllowed,
+    choiceEpisodeEvidence,
+    clickResolvedViewportTarget,
+    clickViewportPoint,
+    composedParent,
+    dispatchGovernedClickMechanic,
+    isEffectiveScrollContainer,
+    localMechanicReactionSnapshot,
+    nativeElementClick,
+    nearestEffectiveScrollContainer,
+    pressEscape,
+    scrollElementWithinNearestContainer,
+    settleTrustedChoiceInteraction,
+    transientOverlayOpen,
+    trustedBrowserChoice,
+    trustedBrowserClick,
+    trustedBrowserKey,
+    userLikeClick,
+    visibleChoiceSurfacesForValue,
+    waitForLocalMechanicReaction,
+    waitForPaint,
+    waitForScrollSettle,
+    waitForUiSettle,
+    watchClickToFirstMutation
+  } = createInteractionMechanics({
+    activeOverlayElements,
+    agent,
+    choiceInteractionStates,
+    elementBox,
+    elementById,
+    elementDescriptor,
+    elementId,
+    isStageExitDecision,
+    isTransientChoiceOverlay,
+    isVisible,
+    logFlow,
+    normalizeMatchText,
+    pageSnapshot,
+    pageStateStore,
+    pushActionLedger,
+    queryAllDeep,
+    rememberChoiceActuatorBinding,
+    resolveDecisionTarget,
+    setAgentActivity,
+    sleep,
+    updateChoiceInteractionState,
+    validateResolvedTarget,
+    withAgentUiPointerPassthrough
+  });
+
+  const {
+    bestVisibleOptionForTerms,
+    controlText,
+    countryCodeCandidates,
+    countryOptionScore,
+    countrySearchTerms,
+    currentElementValue,
+    dispatchFieldEvents,
+    dispatchKey,
+    fillPhoneFieldsFromMap,
+    findPhoneCountryInput,
+    isCountryCodeCandidate,
+    normalizedValue,
+    optionControlCount,
+    optionControlElement,
+    optionMatchScore,
+    optionMatchText,
+    optionSelectedSignature,
+    selectComboboxOption,
+    selectCountryCodeControl,
+    setFieldValue,
+    setNativeElementValue,
+    setSelectValue,
+    typeWithFallback,
+    valueMatches
+  } = createFieldInteraction({
+    filledFields,
+    flashElement,
+    isPaymentField,
+    isVisible,
+    labelText,
+    logAgentEvent,
+    normalizeMatchText,
+    overlayChoiceText,
+    queryAllDeep,
+    recordAction,
+    reportActionResult,
+    setAgentActivity,
+    settleAndHandleInterrupts,
+    showAgentCursor,
+    showAgentThought,
+    sleep,
+    traveler,
+    travelerPhoneParts,
+    userLikeClick,
+    verifyAgentStep
   });
 
   async function observePageStateAfterMutation(reason = "post_action_verification", maxWaitMs = 800) {
