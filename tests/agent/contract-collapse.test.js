@@ -304,9 +304,10 @@ test("observation transport sends one latest result and loop failures stay typed
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
   const content = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
   const execution = fs.readFileSync(path.join(root, "apps/extension/src/content/execution/orchestrator.js"), "utf8");
-  const observationPayload = content.slice(
-    content.indexOf("const observationPayload = {"),
-    content.indexOf("const transport = await postObservationWithSizeRecovery")
+  const decisions = fs.readFileSync(path.join(root, "apps/extension/src/content/controller/decision-client.js"), "utf8");
+  const observationPayload = decisions.slice(
+    decisions.indexOf("const observationPayload = {"),
+    decisions.indexOf("const transport = await postObservationWithSizeRecovery")
   );
 
   assert.doesNotMatch(server, /actionHistory/);
@@ -315,7 +316,7 @@ test("observation transport sends one latest result and loop failures stay typed
   assert.match(observationPayload, /lastActionResult: lastActionForTransport/);
   assert.match(server, /throw failure/);
   assert.match(server, /error\.code === "AGENT_LOOP_FAILED"/);
-  assert.match(content, /\["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"\]/);
+  assert.match(decisions, /\["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"\]/);
   assert.match(execution, /decision\.fatalBackendFailure === true/);
 });
 
@@ -456,4 +457,57 @@ test("extension controller owns single-flight turns and bounded destination wait
   assert.match(lifecycle, /function scheduleDestinationObservation\s*\(/);
   assert.match(lifecycle, /function beginAgentLoop\s*\(/);
   assert.match(lifecycle, /function abortActivePlannerRequest\s*\(/);
+});
+
+test("extension controller modules own session, backend decisions, and checkout turns", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const session = fs.readFileSync(path.join(root, "apps/extension/src/content/controller/session-client.js"), "utf8");
+  const decisions = fs.readFileSync(path.join(root, "apps/extension/src/content/controller/decision-client.js"), "utf8");
+  const checkout = fs.readFileSync(path.join(root, "apps/extension/src/content/controller/checkout-controller.js"), "utf8");
+
+  assert.match(runtime, /createSessionClient\s*\(/);
+  assert.match(runtime, /createDecisionClient\s*\(/);
+  assert.match(runtime, /createCheckoutController\s*\(/);
+  assert.doesNotMatch(runtime, /function startAgentSession\s*\(/);
+  assert.doesNotMatch(runtime, /function requestAgentDecision\s*\(/);
+  assert.doesNotMatch(runtime, /function processCheckoutAgent\s*\(/);
+  assert.match(session, /function startAgentSession\s*\(/);
+  assert.match(decisions, /function requestAgentDecision\s*\(/);
+  assert.match(checkout, /function processCheckoutAgent\s*\(/);
+});
+
+test("extension sidebar module owns rendering and diagnostic presentation", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const sidebar = fs.readFileSync(path.join(root, "apps/extension/src/content/ui/sidebar.js"), "utf8");
+
+  assert.match(runtime, /createSidebarUi\s*\(/);
+  assert.doesNotMatch(runtime, /function renderSidebar\s*\(/);
+  assert.doesNotMatch(runtime, /function observerPanelHtml\s*\(/);
+  assert.match(sidebar, /function renderSidebar\s*\(/);
+  assert.match(sidebar, /function observerPanelHtml\s*\(/);
+  assert.match(sidebar, /function agentProcessDiagnosticsHtml\s*\(/);
+});
+
+test("extension diagnostics and screenshot projection are modular boundaries", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const flow = fs.readFileSync(path.join(root, "apps/extension/src/content/diagnostics/flow.js"), "utf8");
+  const debug = fs.readFileSync(path.join(root, "apps/extension/src/content/diagnostics/debug.js"), "utf8");
+  const screenshot = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/screenshot.js"), "utf8");
+  const understanding = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/page-understanding.js"), "utf8");
+
+  assert.match(runtime, /createFlowDiagnostics\s*\(/);
+  assert.match(runtime, /createDebugDiagnostics\s*\(/);
+  assert.match(runtime, /createScreenshotObservation\s*\(/);
+  assert.match(runtime, /createPageUnderstanding\s*\(/);
+  assert.doesNotMatch(runtime, /function compactFlowLogPayload\s*\(/);
+  assert.doesNotMatch(runtime, /function debugSnapshot\s*\(/);
+  assert.doesNotMatch(runtime, /function prepareScreenshotAnnotations\s*\(/);
+  assert.doesNotMatch(runtime, /function buildPageUnderstanding\s*\(/);
+  assert.match(flow, /function compactFlowLogPayload\s*\(/);
+  assert.match(debug, /function debugSnapshot\s*\(/);
+  assert.match(screenshot, /function prepareScreenshotAnnotations\s*\(/);
+  assert.match(understanding, /function buildPageUnderstanding\s*\(/);
 });

@@ -16,11 +16,13 @@ import { createDecisionGroupCompiler } from "./observation/decision-groups.js";
 import { implicitRole, isVisible, queryAllDeep, textFromIds } from "./observation/dom.js";
 import { createPageStateStore } from "./observation/page-state-store.js";
 import { createPageMapCompiler } from "./observation/page-map.js";
+import { createPageUnderstanding } from "./observation/page-understanding.js";
 import { createPerceptionFacade } from "./observation/perception.js";
 import { createSectionPerception } from "./observation/sections.js";
 import { createStageExitCompiler } from "./observation/stage-exit.js";
 import { createTransactionEvidenceCompiler } from "./observation/transaction-evidence.js";
 import { createObservationTransport } from "./observation/transport.js";
+import { createScreenshotObservation } from "./observation/screenshot.js";
 import {
   boundedPhrase,
   normalizedFieldAlias,
@@ -35,6 +37,12 @@ import { createFieldInteraction } from "./execution/field-interaction.js";
 import { createExecutionOrchestrator } from "./execution/orchestrator.js";
 import { createOutcomeVerification } from "./verification/outcomes.js";
 import { createAgentLifecycle } from "./controller/lifecycle.js";
+import { createDecisionClient } from "./controller/decision-client.js";
+import { createSessionClient } from "./controller/session-client.js";
+import { createCheckoutController } from "./controller/checkout-controller.js";
+import { createSidebarUi } from "./ui/sidebar.js";
+import { createFlowDiagnostics } from "./diagnostics/flow.js";
+import { createDebugDiagnostics } from "./diagnostics/debug.js";
 import {
   currentCommercialOptionPrice,
   localizedPriceAmount,
@@ -742,261 +750,25 @@ import {
     return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
   }
 
-  function pageSnapshot(label = "") {
-    const map = agent.pageMap || buildPageMap();
-    return {
-      label,
-      url: location.href,
-      site: map.site,
-      // The extension reports observed facts and capabilities only. Checkout
-      // stage is reduced authoritatively by the backend from this payload.
-      step: "unknown",
-      signature: pageSignature(map).slice(0, 900),
-      snapshotHash: observationHashForMap(map),
-      graphIntegrity: map.graphIntegrity || null,
-      foreground: map.foreground || foregroundSurfaceState(map.currentSurface || {}),
-      visualState: map.visualState || visualPageState(map),
-      accessibility: map.accessibility ? {
-        foregroundSurfaceId: map.accessibility.foregroundSurfaceId,
-        foregroundSurfaceType: map.accessibility.foregroundSurfaceType,
-        controls: (map.accessibility.controls || []).slice(0, 40)
-      } : null,
-      currentSurface: map.currentSurface ? {
-        id: map.currentSurface.id || "",
-        type: map.currentSurface.type || "page",
-        label: compactText(map.currentSurface.label, 220),
-        taskHint: map.currentSurface.taskHint || "",
-        blocksBackground: Boolean(map.currentSurface.blocksBackground),
-        expectedResolution: map.currentSurface.expectedResolution || "",
-        foreground: map.currentSurface.foreground || foregroundSurfaceState(map.currentSurface),
-        visualState: map.currentSurface.visualState || null,
-        options: (map.currentSurface.options || []).slice(0, 20).map((option) => ({
-          id: option.id,
-          label: option.label,
-          risk: option.risk,
-          semantic: option.semantic,
-          selected: Boolean(option.selected),
-          accessibility: option.accessibility || null,
-          box: option.box
-        })),
-        buttons: (map.currentSurface.buttons || []).slice(0, 20).map((button) => ({
-          id: button.id,
-          label: button.label,
-          risk: button.risk,
-          semantic: button.semantic,
-          selected: Boolean(button.selected),
-          accessibility: button.accessibility || null,
-          box: button.box
-        })),
-        taskQueue: (map.currentSurface.taskQueue || []).map((task) => ({
-          id: task.id,
-          sectionType: task.sectionType,
-          sectionLabel: task.sectionLabel,
-          status: task.status
-        })).slice(0, 8)
-      } : null,
-      surfaceStack: (map.surfaceStack || []).map((surface) => ({
-        id: surface.id || "",
-        type: surface.type || "page",
-        label: compactText(surface.label, 160),
-        isCurrent: Boolean(surface.isCurrent),
-        blocksBackground: Boolean(surface.blocksBackground),
-        taskTypes: (surface.taskQueue || []).map((task) => task.sectionType).slice(0, 8),
-        expectedResolution: surface.expectedResolution || ""
-      })),
-      summary: map.summary,
-      errors: actionableCheckoutErrors(map.errors),
-      visibleControls: [...(map.buttons || []), ...(map.fields || [])]
-        .filter((item) => item.box?.inViewport)
-        .slice(0, 24)
-        .map((item) => ({
-          id: item.id,
-          label: compactText(item.label || item.field || "", 100),
-          risk: item.risk || "",
-          field: item.field || "",
-          box: item.box
-        }))
-    };
-  }
-
-  function sendFlowLog(entry) {
-    const apiBase = agent.apiBase || DEFAULT_API;
-    fetch(`${apiBase}/agent/client-log`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        sessionId: agent.sessionId || "",
-        clientTurnId: entry.turnId || agent.activeTurnId || "",
-        entry
-      })
-    }).catch(() => {
-      // Logging must never slow or break the checkout agent.
-    });
-  }
-
-  function compactFlowLogTarget(target = {}) {
-    if (!target || typeof target !== "object") return target || null;
-    return {
-      id: String(target.id || target.targetId || ""),
-      controlId: String(target.controlId || ""),
-      actuatorId: String(target.actuatorId || target.targetId || ""),
-      stableKey: compactText(target.stableKey || "", 240),
-      label: compactText(target.label || target.targetLabel || target.accessibleName || "", 240),
-      role: String(target.role || target.kind || ""),
-      semantic: String(target.semantic || target.fieldType || ""),
-      risk: String(target.risk || ""),
-      surfaceId: String(target.surfaceId || ""),
-      decisionGroupId: String(target.decisionGroupId || ""),
-      state: target.state ? {
-        selected: target.state.selected === true || target.state.checked === true,
-        valuePresent: target.state.valuePresent === true,
-        normalizedValue: compactText(target.state.normalizedValue || target.state.selectedValue || "", 160),
-        disabled: target.state.disabled === true,
-        expanded: target.state.expanded === true
-      } : null,
-      box: target.box || target.visualRegion || null
-    };
-  }
-
-  function compactFlowLogPage(page = {}) {
-    if (!page || typeof page !== "object") return page || null;
-    return {
-      site: String(page.site || ""),
-      url: compactText(page.url || "", 500),
-      step: String(page.step || ""),
-      snapshotHash: String(page.snapshotHash || page.observationSnapshot?.snapshotHash || ""),
-      currentSurface: page.currentSurface ? {
-        id: String(page.currentSurface.id || ""),
-        type: String(page.currentSurface.type || "page"),
-        label: compactText(page.currentSurface.label || "", 240),
-        blocksBackground: page.currentSurface.blocksBackground === true
-      } : null,
-      summary: page.summary ? {
-        fields: Number(page.summary.fields || 0),
-        controls: Number(page.summary.controls || 0),
-        decisionGroups: Number(page.summary.decisionGroups || 0),
-        errors: Number(page.summary.errors || 0),
-        paidChoices: Number(page.summary.paidChoices || 0),
-        pendingTasks: Number(page.summary.pendingTasks || 0),
-        continueAllowed: page.summary.continueAllowed === true,
-        priceText: compactText(page.summary.priceText || "", 100)
-      } : null,
-      errors: (page.errors || []).slice(0, 8).map((error) => compactText(
-        typeof error === "string" ? error : error.message || error.label || "",
-        240
-      ))
-    };
-  }
-
-  function compactFlowLogValue(value, key = "", depth = 0) {
-    if (value == null || typeof value === "number" || typeof value === "boolean") return value;
-    if (typeof value === "string") return compactText(value, 900);
-    if (depth >= 4) return "[bounded]";
-    if (key === "page" || key === "pageBefore" || key === "pageAfterAction") {
-      return compactFlowLogPage(value);
-    }
-    if (key === "targetSnapshot" || key === "target" || key === "resolved") {
-      return compactFlowLogTarget(value);
-    }
-    if (Array.isArray(value)) {
-      return value.slice(0, 24).map((item) => compactFlowLogValue(item, "", depth + 1));
-    }
-    if (typeof value !== "object") return compactText(String(value), 900);
-    const dropped = new Set([
-      "observation",
-      "previousObservation",
-      "beforeObservation",
-      "afterObservation",
-      "pageMap",
-      "controls",
-      "controlAliases",
-      "candidateSet",
-      "contextCapabilities",
-      "normalCandidates",
-      "recoveryCandidates",
-      "excludedCandidates",
-      "operations",
-      "actuators",
-      "strategies",
-      "exactActuators",
-      "actionabilityByActuator",
-      "targetabilityByActuator",
-      "visualRegions",
-      "backendDebug",
-      "debug",
-      "processAwareness",
-      "transactionReview",
-      "canonicalDecisions",
-      "observedDecisions",
-      "semanticCompilation",
-      "interactionView",
-      "screenshotDataUrl"
-    ]);
-    const compact = {};
-    for (const [childKey, childValue] of Object.entries(value).slice(0, 100)) {
-      if (dropped.has(childKey)) continue;
-      compact[childKey] = compactFlowLogValue(childValue, childKey, depth + 1);
-    }
-    return compact;
-  }
-
-  function compactFlowLogPayload(phase = "", payload = {}) {
-    const compact = compactFlowLogValue(payload, "", 0) || {};
-    if (JSON.stringify(compact).length <= 32_000) return compact;
-    const decision = payload.decision || {};
-    return {
-      truncated: true,
-      phase: String(phase || ""),
-      turnId: String(payload.turnId || ""),
-      observationId: String(payload.observationId || decision.observationId || ""),
-      actionId: String(payload.actionId || decision.actionId || decision.id || ""),
-      action: String(typeof payload.action === "string" ? payload.action : decision.action || ""),
-      intent: String(payload.intent || decision.intent || ""),
-      targetLabel: compactText(payload.targetLabel || decision.targetLabel || "", 240),
-      code: String(payload.code || payload.failureCode || payload.result?.code || ""),
-      reason: compactText(payload.reason || decision.reason || "", 500),
-      observationBytes: Number(payload.observationBytes || 0),
-      request_upload_ms: Number(payload.request_upload_ms || 0),
-      turn_total_ms: Number(payload.turn_total_ms || 0),
-      page: compactFlowLogPage(payload.page || payload.pageAfterAction || payload.pageBefore || {}),
-      targetSnapshot: compactFlowLogTarget(payload.targetSnapshot || decision.targetSnapshot || {})
-    };
-  }
-
-  function sendActionLedger(row) {
-    const apiBase = agent.apiBase || DEFAULT_API;
-    fetch(`${apiBase}/agent/action-ledger`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(row)
-    }).catch(() => {
-      // Best-effort durable audit trail; execution must not depend on logging.
-    });
-  }
-
-  function shouldSendFlowLog(phase = "") {
-    if (agent.sessionId || agent.activeTurnId || agent.running || agent.awaiting) return true;
-    return /^(backend|execute|ledger|action|invariant|policy|target|outcome|latency)\./.test(String(phase || ""));
-  }
-
-  function logFlow(phase, payload = {}) {
-    const diagnosticPayload = compactFlowLogPayload(phase, payload);
-    const entry = {
-      seq: agent.flowSeq + 1,
-      at: new Date().toISOString(),
-      turnId: payload.turnId || agent.activeTurnId || "",
-      phase,
-      payload: diagnosticPayload
-    };
-    agent.flowSeq += 1;
-    agent.flowLog.push(entry);
-    agent.flowLog = agent.flowLog.slice(-160);
-    logAgentEvent(`flow:${phase}`, diagnosticPayload);
-    // eslint-disable-next-line no-console
-    console.debug("[atw-flow]", phase, diagnosticPayload);
-    if (shouldSendFlowLog(phase)) sendFlowLog(entry);
-    return entry;
-  }
+  const {
+    compactFlowLogPage,
+    compactFlowLogPayload,
+    compactFlowLogTarget,
+    logFlow,
+    pageSnapshot,
+    sendActionLedger
+  } = createFlowDiagnostics({
+    DEFAULT_API,
+    actionableCheckoutErrors,
+    agent,
+    buildPageMap: (...args) => buildPageMap(...args),
+    compactText,
+    foregroundSurfaceState: (...args) => foregroundSurfaceState(...args),
+    logAgentEvent,
+    observationHashForMap,
+    pageSignature,
+    visualPageState: (...args) => visualPageState(...args)
+  });
 
   const {
     abortActivePlannerRequest,
@@ -1015,8 +787,8 @@ import {
     addAgentMessage,
     agent,
     logFlow,
-    processCheckoutAgent,
-    renderSidebar,
+    processCheckoutAgent: (...args) => processCheckoutAgent(...args),
+    renderSidebar: (...args) => renderSidebar(...args),
     setAgentActivity
   });
 
@@ -1347,248 +1119,6 @@ import {
         }
       });
     }
-  }
-
-  async function startAgentSession(resumeSessionId = "") {
-    try {
-      agent.sessionStartFailure = null;
-      const settings = await storageGet(["apiBase", "selectedBookingContract"]);
-      const selectedTraveler = traveler();
-      if (!selectedTraveler?.id) {
-        const error = new Error("Select at least one wallet traveler before starting checkout.");
-        error.code = "SELECTED_TRAVELER_REQUIRED";
-        throw error;
-      }
-      const immediateAcquisition = resumeSessionId
-        ? null
-        : readSelectedBookingAcquisition()
-          || captureSelectedBookingFromMap(agent.pageMap || pageStateStore.current());
-      const selectedBookingContract = resumeSessionId
-        ? null
-        : validStoredSelectedBookingContract(settings.selectedBookingContract, selectedTraveler)
-          || composeSelectedBookingContract(immediateAcquisition, selectedTraveler);
-      const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/session`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          sessionId: resumeSessionId || "",
-          resumeOnly: Boolean(resumeSessionId),
-          goal: agent.userGoal || "Complete this flight checkout safely with one-click assistance.",
-          userIntent: userIntentText(),
-          traveler: traveler(),
-          selectedBookingContract,
-          page: compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
-        })
-      });
-      const session = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const error = new Error(session.error || `session returned ${response.status}`);
-        error.code = session.code || `HTTP_${response.status}`;
-        error.retryable = session.retryable === true;
-        throw error;
-      }
-      const sessionId = String(session.id || "");
-      if (!sessionId) throw new Error("session handshake returned an empty id");
-      if (resumeSessionId && sessionId !== resumeSessionId) {
-        throw new Error("session handshake returned a replacement transaction id");
-      }
-      agent.sessionId = sessionId;
-      logAgentEvent("agent_session_started", { sessionId: agent.sessionId });
-      return session;
-    } catch (error) {
-      agent.sessionStartFailure = {
-        code: String(error.code || "SESSION_START_FAILED"),
-        message: String(error.message || "Checkout session could not be started.")
-      };
-      logAgentEvent("agent_session_failed", { error: error.message });
-      agent.sessionId = "";
-      return null;
-    }
-  }
-
-  async function reportActionResult(result = {}) {
-    if (!agent.sessionId) {
-      if (!agent.running) return false;
-      throw new Error("Cannot report an action result without the durable checkout session.");
-    }
-    if (agent.activeExecutionActionId && !result.actionId && typeof result.verified !== "boolean") {
-      logFlow("action.report.helper_suppressed", {
-        actionId: agent.activeExecutionActionId,
-        resultType: result.type || "",
-        reason: "Only the final governed verification result may update the transaction."
-      });
-      return false;
-    }
-    logFlow("action.report", {
-      result,
-      page: pageSnapshot("report-action-result")
-    });
-    try {
-      const settings = await storageGet(["apiBase"]);
-      const map = pageStateStore.observe({ reason: "action_report" }).map;
-      const authoritativeResult = compactActionResultForTransport({
-        ...(agent.lastActionResult || {}),
-        ...result,
-        actionId: result.actionId || agent.lastActionResult?.actionId || agent.activeExecutionActionId || "",
-        observationId: result.observationId || agent.lastActionResult?.observationId || agent.activeExecutionObservationId || ""
-      });
-      const pageReference = {
-        site: map.site || location.host,
-        url: location.href,
-        step: map.step || "unknown",
-        snapshotHash: observationHashForMap(map),
-        surfaceId: map.currentSurface?.id || "surface-page",
-        surfaceType: map.currentSurface?.type || "page",
-        errors: actionableCheckoutErrors(map.errors || []).slice(0, 4)
-      };
-      const reportBody = JSON.stringify({
-        sessionId: agent.sessionId,
-        result: {
-          ...authoritativeResult,
-          stage: authoritativeResult.stage || pageReference.step,
-          errors: authoritativeResult.errors || pageReference.errors
-        },
-        // The next observation carries the complete canonical page. Result
-        // persistence only needs enough fresh identity to advance the durable
-        // action lifecycle, not hundreds of destination controls.
-        page: pageReference
-      });
-      let session = null;
-      let lastError = null;
-      for (let attempt = 1; attempt <= ACTION_REPORT_MAX_ATTEMPTS; attempt += 1) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), ACTION_REPORT_TIMEOUT_MS);
-        const startedAt = performance.now();
-        try {
-          const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/report`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: reportBody,
-            signal: controller.signal
-          });
-          if (!response.ok) {
-            const error = new Error(`agent report returned ${response.status}`);
-            error.retryable = response.status >= 500;
-            throw error;
-          }
-          session = await response.json();
-          logFlow("action.report.acknowledged", {
-            actionId: authoritativeResult.actionId || "",
-            attempt,
-            duration_ms: Math.round(performance.now() - startedAt),
-            resultAt: authoritativeResult.at || "",
-            page: pageReference
-          });
-          break;
-        } catch (error) {
-          lastError = error;
-          const retryable = error.name === "AbortError" || error.retryable === true || error instanceof TypeError;
-          logFlow("action.report.attempt_failed", {
-            actionId: authoritativeResult.actionId || "",
-            attempt,
-            retryable,
-            duration_ms: Math.round(performance.now() - startedAt),
-            error: error.message || error.name || "Action report failed"
-          });
-          if (!retryable || attempt >= ACTION_REPORT_MAX_ATTEMPTS) throw error;
-          setAgentActivity("Saving action result", `Retrying durable result acknowledgement (${attempt + 1}/${ACTION_REPORT_MAX_ATTEMPTS}).`);
-        } finally {
-          clearTimeout(timeout);
-        }
-      }
-      if (!session) throw lastError || new Error("agent report did not return a session");
-      if (!session?.id || session.id !== agent.sessionId) {
-        throw new Error("agent report did not acknowledge the active durable session");
-      }
-      return true;
-    } catch (error) {
-      logAgentEvent("agent_report_failed", { error: error.message });
-      resetAgentLoopLifecycle("action_result_persistence_failed");
-      agent.running = false;
-      agent.awaiting = "manual";
-      addAgentMessage("assistant", "I could not persist the verified action result in the active checkout session, so I stopped before taking another action.");
-      renderSidebar("agent");
-      throw error;
-    }
-  }
-
-  function debugSnapshot() {
-    const map = agent.pageMap || buildPageMap();
-    return {
-      captured_at: new Date().toISOString(),
-      url: location.href,
-      host: location.host,
-      traveler: traveler() ? [traveler().first_name, traveler().last_name].filter(Boolean).join(" ") : "",
-      agent_state: {
-        sessionId: agent.sessionId,
-        running: agent.running,
-        awaiting: agent.awaiting,
-        activeTurnId: agent.activeTurnId,
-        activeObservationId: agent.activeObservationId,
-        skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
-        skipRoutineRunning: agent.skipRoutineRunning,
-        repeatClickCount: agent.repeatClickCount
-      },
-      page: {
-        site: map.site,
-        step: map.step,
-        coverage: map.coverage,
-        summary: map.summary,
-        errors: map.errors,
-        paidChoices: map.paidChoices,
-        fields: map.fields.map((field) => ({
-          id: field.id,
-          label: field.label,
-          box: field.box,
-          kind: field.kind,
-          field: field.field,
-          required: field.required,
-          hasValue: Boolean(field.value),
-          confidence: field.confidence
-        })),
-        buttons: map.buttons.map((button) => ({
-          id: button.id,
-          label: button.label,
-          box: button.box,
-          risk: button.risk
-        })),
-        overlays: (map.overlays || []).map((overlay) => ({
-          id: overlay.id,
-          label: overlay.label,
-          box: overlay.box,
-          role: overlay.role
-        })),
-        text_sample: map.text.slice(0, 1500)
-      },
-      messages: agent.messages,
-      actionHistory: agent.actionHistory,
-      lastActionResult: agent.lastActionResult,
-      actionLedger: agent.actionLedger,
-      flowLog: agent.flowLog,
-      lastBackendDebug: agent.lastBackendDebug,
-      filledFields,
-      warnings,
-      events: agent.debugLog
-    };
-  }
-
-  async function copyDebugLog() {
-    const text = JSON.stringify(debugSnapshot(), null, 2);
-    try {
-      await navigator.clipboard.writeText(text);
-      addAgentMessage("assistant", "Debug log copied. Paste it here and I can see what the agent saw and decided.");
-    } catch (error) {
-      const textarea = document.createElement("textarea");
-      textarea.value = text;
-      textarea.style.position = "fixed";
-      textarea.style.left = "-9999px";
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand("copy");
-      textarea.remove();
-      addAgentMessage("assistant", "Debug log copied with alternate clipboard method. Paste it here.");
-    }
-    renderSidebar("agent");
   }
 
   function elementSignature(element) {
@@ -3096,7 +2626,7 @@ import {
     observedLocale,
     pageCoverage,
     pageReadinessFacts,
-    priceFromText,
+    priceFromText: (...args) => priceFromText(...args),
     primaryPageText,
     profileFieldGroupEvidence,
     queryAllDeep,
@@ -3275,6 +2805,48 @@ import {
     onMaterialMutation: (timestamp) => {
       agent.lastPageMutationAt = timestamp;
     }
+  });
+
+  const {
+    copyDebugLog,
+    debugSnapshot
+  } = createDebugDiagnostics({
+    addAgentMessage,
+    agent,
+    buildPageMap,
+    getFilledFields: () => filledFields,
+    getWarnings: () => warnings,
+    renderSidebar: (...args) => renderSidebar(...args),
+    traveler
+  });
+
+  const {
+    reportActionResult,
+    startAgentSession
+  } = createSessionClient({
+    ACTION_REPORT_MAX_ATTEMPTS,
+    ACTION_REPORT_TIMEOUT_MS,
+    DEFAULT_API,
+    actionableCheckoutErrors,
+    addAgentMessage,
+    agent,
+    captureSelectedBookingFromMap,
+    compactActionResultForTransport,
+    compactPageMap: (...args) => compactPageMap(...args),
+    composeSelectedBookingContract,
+    logAgentEvent,
+    logFlow,
+    observationHashForMap,
+    pageSnapshot,
+    pageStateStore,
+    readSelectedBookingAcquisition,
+    renderSidebar: (...args) => renderSidebar(...args),
+    resetAgentLoopLifecycle,
+    setAgentActivity,
+    storageGet,
+    traveler,
+    userIntentText,
+    validStoredSelectedBookingContract
   });
 
   const {
@@ -4073,262 +3645,26 @@ import {
     };
   }
 
-  function annotationBox(item = {}) {
-    const box = item.visualRegion || item.box || null;
-    if (box?.width > 0 && box?.height > 0) return box;
-    const id = item.preferredActivationElementId || item.stateElementId || item.id || "";
-    const element = id ? elementById(id) : null;
-    return element && isVisible(element) ? elementBox(element) : null;
-  }
-
-  function annotationPrefix(item = {}) {
-    const kind = normalizeMatchText(`${item.kind || ""} ${item.role || ""} ${item.field || ""} ${item.semantic || ""} ${item.risk || ""}`);
-    if (/\b(field|input|textbox|textarea|select|combobox|email|phone|name|date)\b/.test(kind)) return "F";
-    if (/\b(button|continue|next|close|back|submit)\b/.test(kind)) return "B";
-    if (/\b(choice|radio|checkbox|option|listbox|decline|extra|seat|baggage|bundle|insurance)\b/.test(kind)) return "O";
-    return "C";
-  }
-
-  function annotationLabel(item = {}) {
-    return compactText(item.label || item.accessibleName || item.field || item.semantic || item.id || item.controlId || "", 90);
-  }
-
-  function addScreenshotAnnotationCandidate(groups, item, source) {
-    if (!item) return;
-    const box = annotationBox(item);
-    if (!box?.inViewport || !meaningfulActionBox(box)) return;
-    if (box.x > window.innerWidth || box.y > window.innerHeight || box.x + box.width < 0 || box.y + box.height < 0) return;
-    const key = item.annotationKey || item.controlId || item.id || item.stateElementId || item.preferredActivationElementId || "";
-    if (!key) return;
-    const existing = groups.get(key) || {
-      key,
-      items: [],
-      box: null,
-      label: "",
-      prefix: item.prefix || annotationPrefix(item),
-      targetId: item.id || item.preferredActivationElementId || item.stateElementId || "",
-      controlId: item.controlId || "",
-      decisionGroupId: item.decisionGroupId || "",
-      kind: item.kind || item.field || item.role || "",
-      role: item.role || "",
-      semantic: item.semantic || "",
-      risk: item.risk || "",
-      selected: Boolean(item.selected),
-      required: Boolean(item.required),
-      source
-    };
-    existing.items.push(item);
-    existing.box = unionBoxes([existing.box, box].filter(Boolean)) || box;
-    existing.label = existing.label || annotationLabel(item);
-    existing.targetId = existing.targetId || item.id || item.preferredActivationElementId || item.stateElementId || "";
-    existing.controlId = existing.controlId || item.controlId || "";
-    existing.decisionGroupId = existing.decisionGroupId || item.decisionGroupId || "";
-    existing.kind = existing.kind || item.kind || item.field || item.role || "";
-    existing.role = existing.role || item.role || "";
-    existing.semantic = existing.semantic || item.semantic || "";
-    existing.risk = existing.risk || item.risk || "";
-    existing.selected = existing.selected || Boolean(item.selected);
-    existing.required = existing.required || Boolean(item.required);
-    groups.set(key, existing);
-  }
-
-  function assignVisualRefToAliases(map, group) {
-    const matches = (item) => item && (
-      (group.controlId && item.controlId === group.controlId)
-      || (group.targetId && item.id === group.targetId)
-      || (group.targetId && item.stateElementId === group.targetId)
-      || (group.targetId && item.preferredActivationElementId === group.targetId)
-    );
-    const touch = (item) => {
-      if (matches(item)) item.visualRef = group.visualRef;
-    };
-    (map.controls || []).forEach(touch);
-    (map.fields || []).forEach(touch);
-    (map.buttons || []).forEach(touch);
-    (map.sections || []).forEach((section) => {
-      (section.choices || []).forEach(touch);
-      (section.fields || []).forEach(touch);
-      (section.buttons || []).forEach(touch);
-    });
-    [map.currentSurface].filter(Boolean).forEach((surface) => {
-      (surface.options || []).forEach(touch);
-      (surface.buttons || []).forEach(touch);
-    });
-    (map.accessibility?.controls || []).forEach(touch);
-    (map.decisionGroups || []).forEach((decisionGroup) => {
-      (decisionGroup.alternatives || []).forEach(touch);
-    });
-  }
-
-  function prepareScreenshotAnnotations(map, observationId = agent.activeObservationId || "") {
-    const groups = new Map();
-    const addList = (items, source) => (items || []).forEach((item) => addScreenshotAnnotationCandidate(groups, item, source));
-    const finalControls = (map.controls || []).filter((control) => control?.controlId);
-    const controlsById = new Map(finalControls.map((control) => [control.controlId, control]));
-    (map.controls || []).forEach((control) => {
-      (control.recovery?.open?.regions || []).forEach((region, index) => {
-        const canonicalRegion = normalizeVisualRegionContract(region, {
-          observationId,
-          controlId: control.controlId,
-          operation: "open",
-          source: "control.recovery.open",
-          surfaceId: control.surfaceId || ""
-        });
-        Object.assign(region, canonicalRegion);
-        addScreenshotAnnotationCandidate(groups, {
-          annotationKey: `recovery:${control.controlId}:open:${index}`,
-          controlId: control.controlId,
-          decisionGroupId: control.decisionGroupId || "",
-          label: `${control.label || control.semantic || "Control"} open region`,
-          kind: "visual_recovery",
-          role: "visual_region",
-          semantic: control.semantic || "",
-          risk: "safe",
-          prefix: "R",
-          visualRegion: canonicalRegion
-        }, "control.recovery.open");
-      });
-    });
-    // Screenshot grounding is a projection of the finalized canonical
-    // registry. Copied field/section/surface models can retain identities for
-    // controls that lost ownership during registry reconciliation, so they are
-    // intentionally not annotation sources.
-    addList(finalControls, "control");
-
-    const counters = { B: 0, F: 0, O: 0, C: 0 };
-    const annotations = [...groups.values()]
-      .filter((group) => {
-        const control = controlsById.get(group.controlId);
-        if (!control) return false;
-        if (!group.targetId) return group.source === "control.recovery.open";
-        return controlMemberNodeIds(control).includes(group.targetId)
-          || group.targetId === control.controlId;
-      })
-      .filter((group) => group.box?.width > 0 && group.box?.height > 0)
-      .sort((a, b) => (a.box.y - b.box.y) || (a.box.x - b.box.x))
-      .slice(0, 80)
-      .map((group) => {
-        const prefix = group.prefix || "C";
-        counters[prefix] = (counters[prefix] || 0) + 1;
-        const visualRef = `${prefix}${counters[prefix]}`;
-        const annotation = {
-          visualRef,
-          targetId: group.targetId,
-          controlId: group.controlId,
-          decisionGroupId: group.decisionGroupId,
-          label: group.label,
-          kind: group.kind,
-          role: group.role,
-          semantic: group.semantic,
-          risk: group.risk,
-          selected: group.selected,
-          required: group.required,
-          source: group.source,
-          box: group.box
-        };
-        group.visualRef = visualRef;
-        group.items.forEach((item) => { item.visualRef = visualRef; });
-        assignVisualRefToAliases(map, group);
-        return annotation;
-      });
-    map.screenshotAnnotations = annotations;
-    return annotations;
-  }
-
-  function clearScreenshotAnnotationOverlay() {
-    document.getElementById("atw-screenshot-annotations")?.remove();
-  }
-
-  function renderScreenshotAnnotationOverlay(annotations = []) {
-    clearScreenshotAnnotationOverlay();
-    const visibleAnnotations = (annotations || []).filter((item) => item.box?.inViewport).slice(0, 80);
-    if (!visibleAnnotations.length) return null;
-    const root = document.createElement("div");
-    root.id = "atw-screenshot-annotations";
-    root.setAttribute("aria-hidden", "true");
-    Object.assign(root.style, {
-      position: "fixed",
-      inset: "0",
-      pointerEvents: "none",
-      zIndex: "2147483646",
-      fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif"
-    });
-    for (const item of visibleAnnotations) {
-      const box = item.box;
-      const outline = document.createElement("div");
-      Object.assign(outline.style, {
-        position: "absolute",
-        left: `${Math.max(0, Math.min(window.innerWidth - 4, box.x))}px`,
-        top: `${Math.max(0, Math.min(window.innerHeight - 4, box.y))}px`,
-        width: `${Math.max(8, Math.min(window.innerWidth, box.width))}px`,
-        height: `${Math.max(8, Math.min(window.innerHeight, box.height))}px`,
-        border: "2px solid rgba(14, 132, 255, 0.95)",
-        boxShadow: "0 0 0 2px rgba(255,255,255,0.9), 0 0 14px rgba(14,132,255,0.65)",
-        borderRadius: "4px",
-        boxSizing: "border-box"
-      });
-      const tag = document.createElement("div");
-      tag.textContent = `[${item.visualRef}]`;
-      Object.assign(tag.style, {
-        position: "absolute",
-        left: `${Math.max(4, Math.min(window.innerWidth - 56, box.x))}px`,
-        top: `${Math.max(4, Math.min(window.innerHeight - 24, box.y - 24))}px`,
-        padding: "2px 6px",
-        borderRadius: "5px",
-        background: "rgba(6, 20, 38, 0.94)",
-        color: "#fff",
-        border: "1px solid rgba(255,255,255,0.8)",
-        fontSize: "12px",
-        fontWeight: "800",
-        lineHeight: "16px",
-        letterSpacing: "0"
-      });
-      root.append(outline, tag);
-    }
-    document.documentElement.appendChild(root);
-    return root;
-  }
-
-  async function captureVisibleScreenshot(annotations = []) {
-    const overlay = renderScreenshotAnnotationOverlay(annotations);
-    try {
-      if (overlay) await waitForPaint(60);
-      const response = await chrome.runtime.sendMessage({ type: "ATW_CAPTURE_VISIBLE_TAB" });
-      if (!response?.ok) {
-        logAgentEvent("screenshot", { ok: false, error: response?.error || "unavailable" });
-        return "";
-      }
-      logAgentEvent("screenshot", { ok: true, bytes: response.dataUrl.length, annotations: annotations.length });
-      return response.dataUrl;
-    } catch (error) {
-      logAgentEvent("screenshot", { ok: false, error: error.message });
-      return "";
-    } finally {
-      clearScreenshotAnnotationOverlay();
-    }
-  }
-
-  function observationNeedsScreenshot(map = {}) {
-    const graph = map.graphIntegrity || {};
-    if (graph.ok === false && Number(graph.actionableConflictCount || graph.aliasConflictCount || 0) > 0) return true;
-    const surfaceId = map.currentSurface?.id || map.currentSurface?.surfaceId || "surface-page";
-    return (map.controls || []).some((control) => {
-      if (control.surfaceId && control.surfaceId !== surfaceId) return false;
-      const executable = Object.values(control.operations || {}).some((operation) => (
-        operation?.actionability?.executable === true || operation?.actionability?.revealable === true
-      ));
-      if (!executable || !control.visualRegion) return false;
-      const localIdentity = compactText([
-        control.ownText,
-        control.ariaLabel,
-        control.title,
-        control.testId,
-        control.label,
-        control.accessibleName
-      ].filter(Boolean).join(" "), 240);
-      return !localIdentity;
-    });
-  }
+  const {
+    captureVisibleScreenshot,
+    clearScreenshotAnnotationOverlay,
+    observationNeedsScreenshot,
+    prepareScreenshotAnnotations,
+    renderScreenshotAnnotationOverlay
+  } = createScreenshotObservation({
+    agent,
+    compactText,
+    controlMemberNodeIds,
+    elementBox,
+    elementById,
+    isVisible,
+    logAgentEvent,
+    meaningfulActionBox,
+    normalizeMatchText,
+    normalizeVisualRegionContract,
+    unionBoxes,
+    waitForPaint
+  });
 
   const {
     boundedObservationTransport,
@@ -4348,473 +3684,38 @@ import {
     stableHash,
     uniqueControlIds
   });
-  function decisionFromActionLease(rawDecision = {}) {
-    const lease = rawDecision.actionLease || null;
-    if (lease?.contractVersion !== "action-lease/v1") return rawDecision;
-    const operation = String(lease.mechanic?.operation || "");
-    const semanticEffect = String(lease.expected?.semanticEffect || "");
-    const actionType = String(lease.mechanic?.actionType || rawDecision.action || "stop");
-    const interactionRole = ["choose", "select"].includes(operation)
-      ? "choice"
-      : operation === "open"
-        ? "opener"
-        : ["type", "select"].includes(actionType)
-          ? "field"
-          : /advance|navigate/.test(semanticEffect)
-            ? "navigation"
-            : "command";
-    const successCondition = lease.expected?.successCondition || null;
-    return {
-      ...rawDecision,
-      actionId: lease.actionId || rawDecision.actionId || "",
-      observationId: lease.observation?.id || "",
-      observationHash: lease.observation?.hash || "",
-      action: actionType,
-      intent: String(lease.expected?.objective || semanticEffect || actionType),
-      operation,
-      mechanicalEffect: String(lease.mechanic?.effect || operation),
-      physicalEffect: String(lease.mechanic?.effect || operation),
-      interactionRole,
-      semanticEffect,
-      expectedEvidence: String(successCondition?.type || ""),
-      semanticIntent: semanticEffect,
-      expectedPostconditions: successCondition ? [successCondition] : [],
-      goalId: lease.obligationId || "",
-      semanticOwner: lease.semanticOwner || null,
-      semanticOwnerId: lease.semanticOwnerId || "",
-      decisionInstanceId: lease.semanticOwner?.repeatedInstance || "",
-      candidateId: lease.candidateId || "",
-      logicalControlId: lease.target?.controlId || "",
-      controlId: lease.target?.controlId || "",
-      actuatorId: lease.target?.actuatorId || "",
-      targetId: lease.target?.actuatorId || "",
-      targetSnapshot: null,
-      decisionGroupId: String(
-        successCondition?.decisionGroupId
-        || successCondition?.parentDecisionGroupId
-        || ""
-      ),
-      expectedOutcome: successCondition,
-      affordance: lease.expected?.policyAuthorization ? {
-        policy: lease.expected.policyAuthorization
-      } : null,
-      pipelineContract: lease.capabilityProof || null,
-      interactionMethod: lease.mechanic?.method || "",
-      boundedRecovery: lease.mechanic?.boundedRecovery === true,
-      exactOption: lease.mechanic?.exactOption || null,
-      value: lease.mechanic?.value || "",
-      keys: lease.mechanic?.keys || "",
-      x: lease.mechanic?.x,
-      y: lease.mechanic?.y,
-      scrollY: lease.mechanic?.scrollY,
-      visualRegion: lease.mechanic?.visualRegion || null,
-      risk: lease.risk || rawDecision.risk || "uncertain"
-    };
-  }
-
-  async function requestAgentDecision(map, userMessage = "", clientLatency = {}, loopToken = {}, userResponse = null) {
-    const turnId = nextFlowId("turn");
-    const observationId = nextFlowId("obs");
-    const materialHash = observationHashForMap(map);
-    const feedbackKey = stableHash(JSON.stringify({
-      actionId: agent.lastActionResult?.actionId || "",
-      code: agent.lastActionResult?.code || agent.lastActionResult?.failureCode || "",
-      verified: agent.lastActionResult?.verified,
-      postconditionSatisfied: agent.lastActionResult?.postconditionSatisfied
-    }));
-    const destinationReadinessRetry = Boolean(
-      agent.destinationWait?.status === "WAITING_FOR_DESTINATION"
-    );
-    const reobserveRetryToken = String(agent.destinationWait?.retryToken || "");
-    const retryTokenAvailable = Boolean(
-      destinationReadinessRetry
-      && reobserveRetryToken
-      && !agent.honoredReobserveRetryTokens.has(reobserveRetryToken)
-    );
-    const unchangedObservation = Boolean(
-      agent.lastSentMaterialHash === materialHash
-      && agent.lastSentFeedbackKey === feedbackKey
-    );
-    const referenceRetryAuthorized = Boolean(retryTokenAvailable && unchangedObservation);
-    if (
-      !userMessage
-      && !destinationReadinessRetry
-      && agent.lastSentMaterialHash === materialHash
-      && agent.lastSentFeedbackKey === feedbackKey
-    ) {
-      logFlow("backend.request.unchanged_material_suppressed", {
-        materialHash,
-        feedbackKey,
-        mutationDiff: clientLatency.observation_diff || emptyPageStateDiff()
-      });
-      setAgentActivity(
-        "Waiting for page changes",
-        "The checkout state is unchanged. I will resume when the page exposes new actionable state."
-      );
-      renderSidebar("agent");
-      return null;
-    }
-    if (
-      destinationReadinessRetry
-      && !userMessage
-      && unchangedObservation
-      && agent.destinationWait.deadlineObservationSent !== true
-      && !referenceRetryAuthorized
-    ) {
-      logFlow("backend.request.unchanged_readiness_retry_suppressed", {
-        materialHash,
-        feedbackKey,
-        attempts: agent.destinationWait.attempts,
-        elapsedMs: Date.now() - agent.destinationWait.startedAt
-      });
-      setAgentActivity(
-        "Waiting for page changes",
-        "The checkout state is unchanged. I will resume on a material page mutation or at the readiness deadline."
-      );
-      renderSidebar("agent");
-      return null;
-    }
-    if (agent.activePlannerRequest) {
-      logFlow("backend.request.duplicate_suppressed", {
-        turnId,
-        observationId,
-        activeTurnId: agent.activePlannerRequest.turnId,
-        activeObservationId: agent.activePlannerRequest.observationId
-      });
-      agent.loopRerunQueued = true;
-      return null;
-    }
-    const request = {
-      turnId,
-      observationId,
-      loopRunId: loopToken.loopRunId || agent.activeLoopRunId,
-      lifecycleId: loopToken.lifecycleId ?? agent.lifecycleId,
-      controller: new AbortController()
-    };
-    agent.activePlannerRequest = request;
-    agent.activeTurnId = turnId;
-    agent.activeObservationId = observationId;
-    const observationSnapshot = mapObservationSnapshot(map);
-    const lastActionForTransport = compactActionResultForTransport(
-      agent.lastActionResult || agent.actionHistory[agent.actionHistory.length - 1] || null
-    );
-    logAgentEvent("agent_request", {
-      turnId,
-      observationId,
-      userMessage: userMessage ? "[provided]" : "",
-      step: map.step,
-      summary: map.summary,
-      errors: map.errors,
-      paidChoices: map.paidChoices
-    });
-	    logFlow("backend.request.prepare", {
-	      turnId,
-	      observationId,
-	      userMessage: Boolean(userMessage),
-	      observation: observationSnapshot,
-	      page: pageSnapshot("before-backend"),
-	      lastAction: lastActionForTransport
-    });
-    try {
-      const settings = await storageGet(["apiBase"]);
-      const screenshotRequired = observationNeedsScreenshot(map);
-      const screenshotAnnotations = screenshotRequired ? prepareScreenshotAnnotations(map, observationId) : [];
-      const screenshotStartedAt = performance.now();
-      const screenshotCacheKey = `${map.currentSurface?.id || "surface-page"}:${materialHash}`;
-      let screenshotDataUrl = screenshotRequired ? agent.screenshotCache.get(screenshotCacheKey) || "" : "";
-      const screenshotCacheHit = Boolean(screenshotDataUrl);
-      if (screenshotRequired && !screenshotDataUrl) {
-        screenshotDataUrl = await captureVisibleScreenshot(screenshotAnnotations);
-        if (screenshotDataUrl) {
-          agent.screenshotCache.set(screenshotCacheKey, screenshotDataUrl);
-          while (agent.screenshotCache.size > 3) agent.screenshotCache.delete(agent.screenshotCache.keys().next().value);
-        }
-      }
-      const screenshotCaptureMs = Math.round(performance.now() - screenshotStartedAt);
-      const apiBase = settings.apiBase || DEFAULT_API;
-      const screenshotId = await uploadObservationScreenshot(apiBase, {
-        sessionId: agent.sessionId,
-        observationId,
-        screenshotDataUrl,
-        signal: request.controller.signal
-      });
-      logFlow("backend.request.send", {
-        turnId,
-        api: `${settings.apiBase || DEFAULT_API}/agent/next-action`,
-        screenshotBytes: screenshotDataUrl.length,
-        screenshotRequired,
-        screenshotCacheHit,
-        screenshotAnnotations: screenshotAnnotations.length,
-        observation_build_ms: clientLatency.observation_build_ms ?? null,
-        observationMode: clientLatency.observation_mode || "full_snapshot",
-        screenshot_capture_ms: screenshotCaptureMs,
-        currentSurface: map.currentSurface ? {
-          type: map.currentSurface.type,
-          taskHint: map.currentSurface.taskHint,
-          options: (map.currentSurface.options || []).map((option) => ({
-            id: option.id,
-            label: compactText(option.label, 100),
-            risk: option.risk,
-            semantic: option.semantic,
-            selected: Boolean(option.selected),
-            box: option.box
-          })).slice(0, 12)
-        } : null
-      });
-      const requestStartedAt = performance.now();
-      const canonicalPage = compactPageMap(map, observationId);
-      const observationMode = referenceRetryAuthorized
-        ? "reference"
-        : clientLatency.observation_mode || "full_snapshot";
-      const observationPayload = {
-        sessionId: agent.sessionId,
-        clientTurnId: turnId,
-        observationId,
-        observationSnapshot,
-        observationUpdate: {
-          mode: observationMode,
-          baseSnapshotHash: referenceRetryAuthorized
-            ? materialHash
-            : clientLatency.base_snapshot_hash || "",
-          snapshotHash: materialHash,
-          diff: clientLatency.observation_diff || emptyPageStateDiff()
-        },
-        userIntent: userIntentText(),
-        userMessage,
-        userResponse,
-        traveler: traveler(),
-        destinationReadiness: agent.destinationWait ? {
-          status: agent.destinationWait.status,
-          startedAt: agent.destinationWait.startedAt,
-          deadlineAt: agent.destinationWait.deadlineAt,
-          attempts: agent.destinationWait.attempts,
-          backendWaits: agent.destinationWait.backendWaits,
-          deadlineObservationSent: agent.destinationWait.deadlineObservationSent,
-          retryToken: agent.destinationWait.retryToken || ""
-        } : null,
-	      approvalState: {
-	        skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
-	        paymentApproved: false
-	      },
-        // Best-effort context for the backend verifier — it independently judges
-        // whether the last action actually worked from fresh browser evidence.
-	      lastActionResult: lastActionForTransport,
-        page: {
-          ...canonicalPage,
-          screenshotId,
-          screenshotAnnotations: screenshotAnnotations.map((annotation) => ({
-            visualRef: annotation.visualRef || "",
-            controlId: annotation.controlId || "",
-            decisionGroupId: annotation.decisionGroupId || "",
-            box: annotation.box || null
-          }))
-        }
-      };
-      const transport = await postObservationWithSizeRecovery(apiBase, observationPayload, request.controller.signal);
-      const response = transport.response;
-      const decision = decisionFromActionLease(await response.json());
-      if (!agent.sessionId || !decision.sessionId || decision.sessionId !== agent.sessionId) {
-        throw new Error("backend did not preserve the active durable checkout session");
-      }
-      if (!plannerRequestIsCurrent(request)) {
-        logFlow("backend.response.stale_ignored", {
-          turnId,
-          observationId,
-          decisionObservationId: decision.observationId || "",
-          decisionActionId: decision.actionId || decision.id || "",
-          activeTurnId: agent.activePlannerRequest?.turnId || "",
-          activeObservationId: agent.activePlannerRequest?.observationId || "",
-          lifecycleId: agent.lifecycleId,
-          requestLifecycleId: request.lifecycleId
-        });
-        return null;
-      }
-      agent.lastSentMaterialHash = materialHash;
-      agent.lastSentFeedbackKey = feedbackKey;
-      if (referenceRetryAuthorized) {
-        agent.honoredReobserveRetryTokens.add(reobserveRetryToken);
-      }
-      const requestUploadMs = Math.round(performance.now() - requestStartedAt);
-      logFlow("backend.request.transport", {
-        turnId,
-        observationId,
-        screenshotId,
-        observationBytes: transport.bytes,
-        transportMode: transport.transportMode
-      });
-      agent.lastBackendDebug = decision.debug || null;
-      const diagnosticTaskState = decision.debug?.taskState || null;
-      const processAwareness = decision.debug?.processAwareness
-        || diagnosticTaskState?.processAwareness
-        || null;
-      const transactionReview = decision.debug?.transactionReview
-        || diagnosticTaskState?.transactionReview
-        || null;
-      agent.processDiagnostics = processAwareness || transactionReview ? {
-        processAwareness,
-        transactionReview,
-        updatedAt: Date.now()
-      } : agent.processDiagnostics;
-      const backendLatency = decision.debug?.latency || {};
-      const modelUsage = decision.debug?.modelUsage || {};
-      logAgentEvent("agent_decision", {
-        turnId,
-        actionId: decision.actionId || decision.id || "",
-        observationId: decision.observationId || "",
-        source: decision.source,
-        action: decision.action,
-        intent: decision.intent || "",
-        requirementId: decision.requirementId || "",
-        decisionGroupId: decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "",
-        targetId: decision.targetId,
-        targetLabel: decision.targetLabel,
-        targetSnapshot: decision.targetSnapshot || null,
-        expectedOutcome: decision.expectedOutcome || null,
-        risk: decision.risk,
-        needsApproval: decision.needsApproval,
-        message: decision.message,
-        reason: decision.reason,
-        debug: decision.debug || null
-      });
-      logFlow("latency.spans", {
-        turnId,
-        observationId,
-        observation_build_ms: clientLatency.observation_build_ms ?? null,
-        screenshot_capture_ms: screenshotCaptureMs,
-        request_upload_ms: requestUploadMs,
-        classification_model_ms: backendLatency.classification_model_ms ?? null,
-        verify_plan_model_ms: backendLatency.verify_plan_model_ms ?? null,
-        policy_ms: backendLatency.policy_ms ?? null,
-        semantic_compile_ms: backendLatency.semantic_compile_ms ?? null,
-        task_state_ms: backendLatency.task_state_ms ?? null,
-        trace_write_ms: backendLatency.trace_write_ms ?? null,
-        final_state_persist_ms: backendLatency.final_state_persist_ms ?? null,
-        turn_total_ms: backendLatency.turn_total_ms ?? null,
-        input_tokens: modelUsage.input_tokens ?? null,
-        output_tokens: modelUsage.output_tokens ?? null,
-        model: modelUsage.model || "",
-        action: decision.action || "",
-        actionId: decision.actionId || decision.id || ""
-      });
-      logFlow("backend.response", {
-        turnId,
-        observation_build_ms: clientLatency.observation_build_ms ?? null,
-        screenshot_capture_ms: screenshotCaptureMs,
-        request_upload_ms: requestUploadMs,
-        classification_model_ms: backendLatency.classification_model_ms ?? null,
-        verify_plan_model_ms: backendLatency.verify_plan_model_ms ?? null,
-        policy_ms: backendLatency.policy_ms ?? null,
-        semantic_compile_ms: backendLatency.semantic_compile_ms ?? null,
-        task_state_ms: backendLatency.task_state_ms ?? null,
-        trace_write_ms: backendLatency.trace_write_ms ?? null,
-        final_state_persist_ms: backendLatency.final_state_persist_ms ?? null,
-        turn_total_ms: backendLatency.turn_total_ms ?? null,
-        input_tokens: modelUsage.input_tokens ?? null,
-        output_tokens: modelUsage.output_tokens ?? null,
-        model: modelUsage.model || "",
-        decision: {
-          source: decision.source,
-          actionId: decision.actionId || decision.id || "",
-          observationId: decision.observationId || "",
-          action: decision.action,
-          intent: decision.intent || "",
-          requirementId: decision.requirementId || "",
-          decisionGroupId: decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "",
-          targetId: decision.targetId,
-          targetLabel: decision.targetLabel,
-          targetSnapshot: decision.targetSnapshot || null,
-          expectedOutcome: decision.expectedOutcome || null,
-          value: decision.value,
-          x: decision.x,
-          y: decision.y,
-          risk: decision.risk,
-          needsApproval: decision.needsApproval,
-          reason: decision.reason
-        },
-        backendDebug: decision.debug || null
-      });
-      if (agent.destinationWait && !isDestinationReadinessDecision(decision)) {
-        clearDestinationWait("semantic_destination_ready");
-      }
-      return decision;
-    } catch (error) {
-      if (error?.name === "AbortError" || request.controller.signal.aborted) {
-        logFlow("backend.request.aborted", {
-          turnId,
-          observationId,
-          reason: String(request.controller.signal.reason || error.message || "aborted")
-        });
-        return null;
-      }
-      if (error?.code === "OBSERVATION_TOO_LARGE" && error.retryable === true) {
-        logFlow("backend.observation_too_large_blocked", {
-          turnId,
-          observationId,
-          code: error.code,
-          reason: error.message
-        });
-        setAgentActivity("Blocked", "The compact browser payload is still oversized. Automatic retries were stopped.");
-      }
-      const contextInvalidated = /extension context invalidated|context invalidated|receiving end does not exist/i.test(error.message || "");
-      const backendFailure = ["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"].includes(error?.code)
-        || /^HTTP_5\d\d$/.test(error?.code || "");
-      const oversizedObservation = error?.code === "OBSERVATION_TOO_LARGE";
-      const decision = {
-        source: "system",
-        action: "stop",
-        fatalBackendFailure: backendFailure,
-        targetId: "",
-        value: "",
-        message: contextInvalidated
-          ? "Chrome invalidated the extension context after reload. Refresh this checkout tab, then start the agent again."
-          : oversizedObservation
-            ? "The checkout observation remained too large after compact recovery. I stopped instead of retrying indefinitely."
-          : backendFailure
-            ? `Agent backend error${error.failureCode ? ` (${error.failureCode})` : ""}: ${error.message}. No browser action was dispatched.`
-          : `AI agent unavailable: ${error.message}. I stopped because AI-only mode is enabled.`,
-        needsApproval: !backendFailure,
-        risk: backendFailure ? "system" : "uncertain",
-        reason: contextInvalidated
-          ? "Extension lifecycle error: this page is still running the old content script after extension reload."
-          : oversizedObservation
-            ? "Observation transport circuit breaker: compact recovery was exhausted."
-          : backendFailure
-            ? "The backend failed while processing the current observation; this is separate from AI service availability."
-          : "AI-only mode: backend/OpenAI must provide the next action."
-      };
-      logAgentEvent("agent_decision", {
-        turnId,
-        actionId: decision.actionId || decision.id || "",
-        observationId: decision.observationId || observationId,
-        source: decision.source,
-        action: decision.action,
-        intent: decision.intent || "",
-        requirementId: decision.requirementId || "",
-        decisionGroupId: decision.decisionGroupId || decision.targetSnapshot?.decisionGroupId || "",
-        targetId: decision.targetId,
-        targetSnapshot: decision.targetSnapshot || null,
-        expectedOutcome: decision.expectedOutcome || null,
-        risk: decision.risk,
-        needsApproval: decision.needsApproval,
-        message: decision.message,
-        reason: decision.reason
-      });
-      logFlow(
-        contextInvalidated
-          ? "extension.context_invalidated"
-          : oversizedObservation
-            ? "backend.observation_too_large_stopped"
-            : backendFailure
-              ? "backend.processing_error"
-              : "backend.error",
-        { turnId, error: error.message, code: error.code || "", decision }
-      );
-      return decision;
-    } finally {
-      if (agent.activePlannerRequest === request) agent.activePlannerRequest = null;
-    }
-  }
-
+  const {
+    decisionFromActionLease,
+    requestAgentDecision
+  } = createDecisionClient({
+    DEFAULT_API,
+    agent,
+    captureVisibleScreenshot,
+    clearDestinationWait,
+    compactActionResultForTransport,
+    compactPageMap,
+    compactText,
+    emptyPageStateDiff,
+    isDestinationReadinessDecision,
+    logAgentEvent,
+    logFlow,
+    mapObservationSnapshot,
+    nextFlowId,
+    observationHashForMap,
+    observationNeedsScreenshot,
+    pageSnapshot,
+    plannerRequestIsCurrent,
+    postObservationWithSizeRecovery,
+    prepareScreenshotAnnotations,
+    renderSidebar: (...args) => renderSidebar(...args),
+    setAgentActivity,
+    shouldAutoDeclinePaidExtras,
+    stableHash,
+    storageGet,
+    traveler,
+    uploadObservationScreenshot,
+    userIntentText
+  });
   const {
     clickAndVerifyAdvance,
     continueAfterAction,
@@ -4865,7 +3766,7 @@ import {
     pageSnapshot,
     pageStateStore,
     persistControlFlowDecision,
-    processCheckoutAgent,
+    processCheckoutAgent: (...args) => processCheckoutAgent(...args),
     pushActionLedger,
     queryAllDeep,
     recordAction,
@@ -4875,7 +3776,7 @@ import {
     rememberChoiceVisualStateBeforeDispatch,
     rememberExactChoiceCommitment,
     rememberUnexecutedActionResult,
-    renderSidebar,
+    renderSidebar: (...args) => renderSidebar(...args),
     reportActionResult,
     resolveDecisionTarget,
     scrollElementWithinNearestContainer,
@@ -4900,650 +3801,71 @@ import {
     withOverlayProgressEvidence
   });
 
-  function maskFieldPreview(fieldType, value) {
-    const text = String(value || "");
-    if (!text) return "";
-    if (["passport_number", "phone", "phone_country_code"].includes(fieldType)) {
-      return text.length > 4 ? `${text.slice(0, Math.max(2, text.length - 4))}${"*".repeat(4)}` : "****";
-    }
-    if (fieldType === "email" || fieldType === "confirm_email") {
-      const [user, domain] = text.split("@");
-      if (!domain) return "***";
-      return `${user.slice(0, 2)}${"*".repeat(Math.max(2, user.length - 2))}@${domain}`;
-    }
-    return text.length > 60 ? `${text.slice(0, 60)}…` : text;
-  }
+  const {
+    buildPageUnderstanding,
+    buildProposedNextActions,
+    buildReasoningSummary,
+    extractPageOptions,
+    fieldEvidence,
+    maskFieldPreview,
+    priceFromText,
+    sectionEvidence
+  } = createPageUnderstanding({
+    classifyStepDetailed,
+    runRiskChecks,
+    structuredPriceFromText
+  });
 
-  function sectionEvidence(section) {
-    const evidence = [];
-    const filledFields = (section.fields || []).filter((field) => field.hasValue);
-    const emptyRequired = (section.fields || []).filter((field) => field.required && !field.hasValue);
-    if (filledFields.length) {
-      evidence.push(`${filledFields.length} field(s) filled: ${filledFields.map((field) => (field.field !== "unknown" ? field.field : field.label.slice(0, 24))).join(", ")}`);
-    }
-    if (emptyRequired.length) {
-      evidence.push(`${emptyRequired.length} required field(s) empty: ${emptyRequired.map((field) => (field.field !== "unknown" ? field.field : field.label.slice(0, 24))).join(", ")}`);
-    }
-    if (section.selected && section.selected.length) evidence.push(`Selected: ${section.selected.join(", ")}`);
-    if (!evidence.length) evidence.push(`Status inferred as ${section.status}.`);
-    return evidence;
-  }
-
-  function fieldEvidence(field) {
-    const evidence = [`Label/placeholder: "${(field.label || "").slice(0, 60)}"`];
-    evidence.push(field.hasValue ? "Field currently has a value" : "Field appears empty");
-    if (field.required) evidence.push("Marked required");
-    return evidence;
-  }
-
-  function priceFromText(text = "") {
-    const normalized = String(text || "").replace(/\s+/g, " ");
-    const totalLabel = normalized.match(/\b(?:amount to pay|total(?: amount| price)?|grand total|subtotal)\b/i);
-    const ownedTotal = totalLabel
-      ? structuredPriceFromText(normalized.slice(totalLabel.index, totalLabel.index + 160))
-      : null;
-    if (ownedTotal) return ownedTotal;
-    const totalMatch = normalized.match(/(?:amount to pay|total amount|total price|grand total|subtotal)[^0-9€$£]{0,80}(?:(EUR|USD|GBP|[€$£])\s?(\d+(?:[.,]\d{1,2})?)|(\d+(?:[.,]\d{1,2})?)\s?(EUR|USD|GBP|[€$£]))/i);
-    const match = totalMatch
-      || normalized.match(/(EUR|USD|GBP|[€$£])\s?(\d+(?:[.,]\d{1,2})?)/i)
-      || text.match(/(\d+(?:[.,]\d{1,2})?)\s?(EUR|USD|GBP|[€$£])/i);
-    if (!match) return null;
-    const currencyMap = { "€": "EUR", "$": "USD", "£": "GBP" };
-    const currencyToken = /[a-z€$£]/i.test(match[1] || "") ? match[1] : (match[4] || match[2]);
-    const amountToken = currencyToken === match[1] ? match[2] : (match[3] || match[1]);
-    const currency = currencyMap[currencyToken] || currencyToken.toUpperCase();
-    const amount = Number(amountToken.replace(",", "."));
-    return Number.isFinite(amount) ? { amount, currency } : null;
-  }
-
-  function includedBaggageOptions(section) {
-    if (section.type !== "baggage") return [];
-    const text = section.text || "";
-    const items = [];
-    if (/personal item[^.]{0,80}?included/i.test(text)) {
-      items.push({
-        id: `${section.id}-personal-item`,
-        category: "baggage",
-        label: "Personal item",
-        status: "included",
-        description: "Small bag included for all passengers.",
-        confidence: 0.85,
-        evidence: ["Section text mentions personal item as included"]
-      });
-    }
-    if (/hand baggage[^.]{0,80}?included/i.test(text)) {
-      items.push({
-        id: `${section.id}-hand-baggage`,
-        category: "baggage",
-        label: "Hand baggage",
-        status: "included",
-        description: "Cabin bag included for all passengers.",
-        confidence: 0.85,
-        evidence: ["Section text mentions hand baggage as included"]
-      });
-    }
-    return items;
-  }
-
-  function categoryForSectionType(type) {
-    if (type === "baggage") return "baggage";
-    if (type === "seat") return "seat";
-    if (type === "cancellation_insurance") return "insurance";
-    if (type === "payment") return "payment";
-    return "unknown";
-  }
-
-  function extractPageOptions(sections = []) {
-    const options = [];
-    for (const section of sections) {
-      options.push(...includedBaggageOptions(section));
-      const category = categoryForSectionType(section.type);
-      for (const choice of section.choices || []) {
-        let status = "unknown";
-        if (choice.selected) status = "selected";
-        else if (choice.semantic === "add_paid_extra") status = "paid_extra";
-        else if (choice.semantic === "decline_paid_extra" || choice.semantic === "decline_baggage") status = "not_selected";
-        const price = priceFromText(choice.label);
-        options.push({
-          id: choice.id,
-          category,
-          label: (choice.label || "").slice(0, 80),
-          status,
-          price: price || undefined,
-          confidence: status === "unknown" ? 0.5 : 0.8,
-          evidence: [`Detected as a ${section.label} choice`, `Selected: ${choice.selected}`]
-        });
-      }
-    }
-    return options;
-  }
-
-  function actionTypeForSectionType(type) {
-    if (type === "contact" || type === "passenger") return "fill_field";
-    if (["baggage", "bundle", "flexible_ticket", "cancellation_insurance", "seat"].includes(type)) return "select_option";
-    if (type === "continue") return "click_continue";
-    return "ask_user";
-  }
-
-  function riskLevelForTask(task) {
-    return task.rule && /no paid extras/i.test(task.rule) ? "safe" : "medium";
-  }
-
-  function buildProposedNextActions(taskQueue = []) {
-    return taskQueue.slice(0, 8).map((task, index) => ({
-      id: `action-${task.sectionId || index}`,
-      actionType: actionTypeForSectionType(task.sectionType),
-      label: task.objective || `Resolve ${task.sectionLabel}`,
-      targetElementId: task.sectionId,
-      riskLevel: riskLevelForTask(task),
-      executableInObserverMode: false,
-      reason: task.rule || "Pending section needs attention before continuing.",
-      confidence: 0.75
-    }));
-  }
-
-  function buildReasoningSummary(map, stepInfo, sections) {
-    const incomplete = sections.filter((section) => section.status === "incomplete");
-    const complete = sections.filter((section) => section.status === "complete");
-    const blockerText = incomplete.length
-      ? `${incomplete.length} incomplete: ${incomplete.map((section) => section.label).join(", ")}`
-      : "no incomplete sections";
-    const shortSummary = `This is a ${map.site} ${stepInfo.step.replace(/_/g, " ")} page. ${complete.length} section${complete.length === 1 ? "" : "s"} complete, ${blockerText}.`;
-    const keyEvidence = sections.slice(0, 6).flatMap((section) => (section.evidence || []).slice(0, 1).map((item) => `${section.label}: ${item}`));
-    const uncertainty = [
-      ...map.fields.filter((field) => field.field !== "unknown" && field.confidence < 0.7).map((field) => `Low confidence field match: "${(field.label || "").slice(0, 40)}" (${Math.round(field.confidence * 100)}%)`),
-      ...sections.filter((section) => section.status === "unknown").map((section) => `Section "${section.label}" status could not be determined.`)
-    ].slice(0, 6);
-    return { shortSummary, keyEvidence, uncertainty };
-  }
-
-  function buildPageUnderstanding(map) {
-    const stepInfo = classifyStepDetailed({
-      visibleText: `${map.text} ${map.fullText.slice(0, 2500)}`,
-      url: location.href,
-      structuralEvidence: {
-        seatInventoryCount: (map.collections || [])
-          .filter((collection) => collection.type === "seat_inventory")
-          .reduce((total, collection) => total + Number(collection.totalCount || collection.members?.length || 0), 0)
-      }
-    });
-    const sections = (map.sections || []).map((section) => ({
-      id: section.id,
-      label: section.label,
-      type: section.type,
-      status: section.status,
-      confidence: section.type === "unknown" ? 0.5 : 0.85,
-      evidence: sectionEvidence(section),
-      box: section.box
-    }));
-    const fields = map.fields.map((field) => ({
-      id: field.id,
-      label: field.label,
-      semanticType: field.field,
-      required: field.required,
-      visible: true,
-      filled: Boolean(field.value),
-      valuePreview: field.value ? maskFieldPreview(field.field, field.value) : undefined,
-      confidence: field.confidence,
-      evidence: fieldEvidence(field),
-      box: field.box
-    }));
-    const options = extractPageOptions(map.sections || []);
-    const warnings = runRiskChecks();
-    const proposedNextActions = buildProposedNextActions(map.taskQueue || []);
-    const reasoningSummary = buildReasoningSummary(map, stepInfo, sections);
-    const blockers = sections
-      .filter((section) => section.status === "incomplete")
-      .map((section) => ({
-        type: "incomplete_section",
-        message: `${section.label} is incomplete.`,
-        severity: section.type === "passenger" || section.type === "contact" ? "high" : "medium"
-      }));
-
-    return {
-      pageIdentity: {
-        host: location.host,
-        url: location.href,
-        siteName: map.site,
-        pageType: stepInfo.step,
-        confidence: stepInfo.confidence
-      },
-      checkoutState: {
-        overallStatus: stepInfo.step === "unknown" ? "not_checkout" : (map.summary.continueAllowed ? "ready_to_continue" : (blockers.length ? "blocked" : "in_progress")),
-        currentStep: stepInfo.step,
-        completedSteps: sections.filter((section) => section.status === "complete").map((section) => section.label),
-        incompleteSteps: sections.filter((section) => section.status === "incomplete").map((section) => section.label),
-        blockers
-      },
-      sections,
-      fields,
-      options,
-      warnings,
-      proposedNextActions,
-      reasoningSummary,
-      debug: {
-        scanId: `scan_${Date.now().toString(36)}`,
-        scannedAt: new Date().toISOString(),
-        engineVersion: "observer-v1",
-        latencyMs: 0
-      }
-    };
-  }
+  const {
+    handleAgentChoice,
+    handleChatSubmit,
+    observePageOnly,
+    processCheckoutAgent,
+    resumeCheckoutAfterNavigation,
+    setObserverTab,
+    takeOverCheckout
+  } = createCheckoutController({
+    DESTINATION_MUTATION_SETTLE_MS,
+    VALIDATION_TERMS,
+    addAgentMessage,
+    agent,
+    announceSectionQueue,
+    beginAgentLoop,
+    buildPageUnderstanding,
+    clearResumeMarker,
+    describePageMap,
+    executeAgentDecision,
+    finishAgentLoop,
+    isVisible,
+    labelText,
+    logAgentEvent,
+    logFlow,
+    outlineCoreSections,
+    pageStateStore,
+    persistControlFlowDecision,
+    rememberPagePlan,
+    renderSidebar: (...args) => renderSidebar(...args),
+    requestAgentDecision,
+    resetAgentLoopLifecycle,
+    resetFieldProgress,
+    runRiskChecks,
+    saveResumeMarker,
+    scheduleDestinationObservation,
+    setAgentActivity,
+    setWarnings: (nextWarnings) => {
+      warnings = nextWarnings;
+    },
+    shouldAutoDeclinePaidExtras,
+    showAgentThought,
+    sleep,
+    startAgentSession,
+    travelerRules,
+    travelerValue
+  });
 
   // TEMP: perception-only debugging mode. Builds the page map and shows the section/field
   // breakdown in the sidebar + on-page outlines, but never calls the backend and never
   // fills/clicks anything. Safe to run repeatedly on any site while we tune section detection.
-  async function observePageOnly() {
-    agent.running = false;
-    agent.awaiting = "";
-    agent.messages = [];
-    agent.reasoningLog = [];
-    agent.actionHistory = [];
-    agent.processDiagnostics = null;
-    agent.observerTab = agent.observerTab || "summary";
-    setAgentActivity("Observing page (no actions will be taken)", travelerRules() || "Using saved traveler profile");
-    agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "observe_only" }).map;
-    const map = agent.pageMap;
-    const started = Date.now();
-    agent.pageUnderstanding = buildPageUnderstanding(map);
-    agent.pageUnderstanding.debug.latencyMs = Date.now() - started;
-    outlineCoreSections(map.sections || []);
-    renderSidebar("observer");
-    logAgentEvent("observe_only", {
-      pageType: agent.pageUnderstanding.pageIdentity.pageType,
-      pageConfidence: agent.pageUnderstanding.pageIdentity.confidence,
-      sections: agent.pageUnderstanding.sections.map((s) => ({ label: s.label, type: s.type, status: s.status })),
-      options: agent.pageUnderstanding.options.length,
-      warnings: agent.pageUnderstanding.warnings.length
-    });
-  }
-
-  function setObserverTab(tab) {
-    agent.observerTab = tab;
-    renderSidebar("observer");
-  }
-
-  async function takeOverCheckout() {
-    if (agent.running || agent.loopBusy) {
-      logFlow("loop.start_duplicate_suppressed", {
-        activeLoopRunId: agent.activeLoopRunId,
-        lifecycleId: agent.lifecycleId
-      });
-      return;
-    }
-    resetAgentLoopLifecycle("start_agent");
-    agent.running = true;
-    agent.sessionId = "";
-    agent.awaiting = "";
-    agent.messages = [];
-    agent.reasoningLog = [];
-    agent.lastClickSignature = "";
-    agent.repeatClickCount = 0;
-    agent.lastClickAt = 0;
-    agent.skipPaidExtrasApproved = false;
-    agent.autopilotMode = true;
-    agent.pendingUserMessage = "";
-    agent.pendingUserResponse = null;
-    agent.pendingInputRequest = null;
-    agent.sessionProfileOverrides = {};
-    agent.skipPaidExtrasApproved = shouldAutoDeclinePaidExtras();
-    agent.actionHistory = [];
-    agent.processDiagnostics = null;
-    resetFieldProgress();
-    setAgentActivity("Starting checkout agent", travelerRules() || "Using saved traveler profile");
-    agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "agent_start" }).map;
-    const session = await startAgentSession();
-    if (!session || !agent.sessionId) {
-      agent.running = false;
-      agent.awaiting = "manual";
-      await clearResumeMarker();
-      addAgentMessage(
-        "assistant",
-        ["SELECTED_BOOKING_REQUIRED", "SELECTED_TRAVELER_REQUIRED"].includes(agent.sessionStartFailure?.code)
-          ? agent.sessionStartFailure.message
-          : `I could not establish one durable checkout session, so I stopped before planning or changing the page.${agent.sessionStartFailure?.message ? ` ${agent.sessionStartFailure.message}` : ""}`
-      );
-      renderSidebar("agent");
-      return;
-    }
-    await saveResumeMarker();
-    addAgentMessage("assistant", `${describePageMap(agent.pageMap)} I will work step by step and ask when money, payment, or uncertainty appears.`);
-    renderSidebar("agent");
-    await announceSectionQueue();
-    await sleep(650);
-    processCheckoutAgent();
-  }
-
-  async function resumeCheckoutAfterNavigation(marker) {
-    resetAgentLoopLifecycle("resume_after_navigation");
-    agent.running = true;
-    agent.sessionId = "";
-    agent.awaiting = "";
-    agent.messages = [];
-    agent.reasoningLog = [];
-    agent.lastClickSignature = "";
-    agent.repeatClickCount = 0;
-    agent.lastClickAt = 0;
-    agent.skipPaidExtrasApproved = Boolean(marker.skipPaidExtrasApproved);
-    agent.autopilotMode = true;
-    agent.pendingUserMessage = "";
-    agent.pendingUserResponse = null;
-    agent.pendingInputRequest = null;
-    agent.sessionProfileOverrides = {};
-    agent.actionHistory = [];
-    agent.processDiagnostics = null;
-    resetFieldProgress();
-    setAgentActivity("Continuing checkout agent after page change", travelerRules() || "Using saved traveler profile");
-    // A newly loaded checkout document is still hydrating when the content
-    // script starts. Building the entire page map immediately and then again
-    // after the old 650 ms delay caused two multi-second DOM scans on large
-    // airline pages. Let initial framework work land first, then create one
-    // atomic fresh observation which the first planning turn can reuse.
-    await sleep(650);
-    const resumedObservation = await pageStateStore.observeFresh({
-      reason: "navigation_resume",
-      maxWaitMs: 650,
-      maxAttempts: 2,
-      postBuildGraceMs: 100
-    });
-    agent.pageMap = rememberPagePlan(resumedObservation.map);
-    const resumeSessionId = String(marker.sessionId || "");
-    const session = resumeSessionId ? await startAgentSession(resumeSessionId) : null;
-    if (!session || agent.sessionId !== resumeSessionId) {
-      agent.running = false;
-      agent.awaiting = "manual";
-      await clearResumeMarker();
-      addAgentMessage("assistant", "The prior checkout session could not be resumed, so I stopped instead of starting a replacement transaction.");
-      renderSidebar("agent");
-      return;
-    }
-    await saveResumeMarker();
-    addAgentMessage("assistant", "Picking back up where I left off after the page changed.");
-    renderSidebar("agent");
-    await announceSectionQueue();
-    processCheckoutAgent();
-  }
-
-  async function processCheckoutAgent() {
-    if (!agent.running) return;
-    if (!agent.sessionId) {
-      agent.running = false;
-      agent.awaiting = "manual";
-      addAgentMessage("assistant", "The durable checkout session is missing, so I stopped before observing or acting.");
-      renderSidebar("agent");
-      return;
-    }
-    const loopToken = beginAgentLoop();
-    if (!loopToken) return;
-    let shouldRerun = false;
-    try {
-      warnings = runRiskChecks();
-      await showAgentThought(
-        null,
-        "Observe",
-        "Backend planner",
-        "Reading the current page and sending it to the backend before taking any checkout action.",
-        120
-      );
-      if (loopToken.lifecycleId !== agent.lifecycleId || !agent.running) return;
-      const observationStartedAt = performance.now();
-      const observed = await pageStateStore.observeFresh({
-        reason: "planning_turn",
-        maxWaitMs: 650,
-        maxAttempts: 2,
-        postBuildGraceMs: 100
-      });
-      if (!observed.fresh) {
-        logFlow("planning.stale_observation_deferred", {
-          attempts: observed.freshnessAttempts,
-          mutationVersion: observed.mutationVersion,
-          observation_build_ms: observed.timings?.observationBuildMs || 0
-        });
-        setAgentActivity(
-          "Waiting for one fresh page state",
-          "The checkout changed while I was reading it. I will observe again instead of planning from mixed state."
-        );
-        agent.loopRerunQueued = true;
-        return;
-      }
-      const stableMap = rememberPagePlan(observed.map);
-      agent.pageMap = stableMap;
-      const observationBuildMs = observed.timings.observationBuildMs;
-      const observationElapsedMs = Math.round(performance.now() - observationStartedAt);
-      logFlow("latency.span", {
-        observation_build_ms: observationBuildMs,
-        observation_mode: observed.mode,
-        observation_total_ms: observationElapsedMs,
-        observation_freshness_attempts: observed.freshnessAttempts,
-        mutation_version: observed.mutationVersion,
-        material: observed.material,
-        step: stableMap.step,
-        controls: stableMap.controls?.length || 0,
-        fields: stableMap.fields?.length || 0,
-        buttons: stableMap.buttons?.length || 0
-      });
-      if (stableMap.graphIntegrity && !stableMap.graphIntegrity.ok) {
-        logFlow("control.graph_conflicts_diagnostic", {
-          actionableConflictCount: Number(stableMap.graphIntegrity.actionableConflictCount || 0),
-          diagnosticConflictCount: Number(stableMap.graphIntegrity.diagnosticConflictCount || 0),
-          conflicts: (stableMap.graphIntegrity.conflicts || []).slice(0, 8)
-        });
-      }
-
-      const userMessage = agent.pendingUserMessage;
-      const userResponse = agent.pendingUserResponse;
-      agent.pendingUserMessage = "";
-      agent.pendingUserResponse = null;
-      const decision = await requestAgentDecision(
-        stableMap,
-        userMessage,
-        {
-          observation_build_ms: observationBuildMs,
-          observation_mode: observed.mode,
-          observation_diff: observed.diff,
-          base_snapshot_hash: observed.baseSnapshotHash
-        },
-        loopToken,
-        userResponse
-      );
-      if (!decision || loopToken.lifecycleId !== agent.lifecycleId || !agent.running) return;
-      await executeAgentDecision(decision, stableMap);
-    } finally {
-      shouldRerun = finishAgentLoop(loopToken);
-      if (agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
-        const remaining = Math.max(0, agent.destinationWait.deadlineAt - Date.now());
-        const materialWakePending = agent.destinationWait.wakeRequested === true
-          && agent.destinationWait.lastWakeReason === "dom_mutation";
-        // A material MutationObserver event may wake earlier. Otherwise send
-        // exactly one deadline observation instead of polling every interval.
-        scheduleDestinationObservation(
-          materialWakePending ? "dom_mutation" : "readiness_deadline",
-          materialWakePending ? DESTINATION_MUTATION_SETTLE_MS : remaining
-        );
-      } else if (shouldRerun) {
-        setTimeout(() => processCheckoutAgent(), 0);
-      }
-    }
-  }
-
-  function collectBlockingIssues() {
-    const issues = [];
-    const visibleText = [...document.querySelectorAll("body *")]
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
-      .map((element) => (element.innerText || element.textContent || "").trim())
-      .filter(Boolean);
-
-    for (const text of visibleText) {
-      const normalized = text.toLowerCase();
-      if (normalized.length > 180) continue;
-      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /required|must enter|too long|invalid|not valid|error/.test(normalized)) {
-        issues.push(text.replace(/\s+/g, " "));
-      }
-      if (issues.length >= 4) break;
-    }
-
-    const titleAreaVisible = document.body.innerText.toLowerCase().includes("title *") || document.body.innerText.toLowerCase().includes("you must enter a gender");
-    const anyTitleChecked = [...document.querySelectorAll("input[type='radio']")]
-      .filter((radio) => /mr|mrs|ms|title|gender/.test(labelText(radio)))
-      .some((radio) => radio.checked);
-    if (titleAreaVisible && !anyTitleChecked && !travelerValue("title")) {
-      issues.unshift("title/gender is required but no traveler title preference is saved");
-    }
-
-    return [...new Set(issues)];
-  }
-
-  async function handleAgentChoice(choice) {
-    logAgentEvent("user_choice", { choice });
-    if (choice === "skip_extras") {
-      addAgentMessage("user", "Skip extras.");
-      agent.skipPaidExtrasApproved = true;
-      document.querySelector("[data-demo-skip-extras]")?.click();
-      agent.awaiting = "";
-      agent.running = true;
-      agent.pendingUserMessage = "Use my saved no-extras preference and continue safely.";
-      await processCheckoutAgent();
-    }
-
-    if (choice === "add_bag") {
-      addAgentMessage("user", "Add cabin bag.");
-      document.querySelector("[data-demo-add-bag]")?.click();
-      agent.awaiting = "";
-      renderSidebar("agent");
-      await sleep(600);
-      processCheckoutAgent();
-    }
-
-    if (choice === "confirm_pay") {
-      addAgentMessage("user", "Confirm demo payment.");
-      const demoPay = document.querySelector("[data-demo-pay]");
-      if (demoPay) {
-        demoPay.click();
-        await sleep(500);
-        processCheckoutAgent();
-      } else {
-        addAgentMessage("assistant", "I will not click payment on real sites in this prototype. Please confirm payment manually.");
-        renderSidebar("review");
-      }
-    }
-
-    if (choice === "stop") {
-      resetAgentLoopLifecycle("user_stop");
-      agent.running = false;
-      agent.awaiting = "";
-      if (agent.sessionId) {
-        await persistControlFlowDecision({
-          action: "stop",
-          message: "Checkout stopped by the user.",
-          reason: "The user explicitly stopped the active checkout session.",
-          risk: "safe"
-        });
-      }
-      addAgentMessage("user", "Stop checkout.");
-      addAgentMessage("assistant", "Stopped. Nothing was paid or submitted by me.");
-      renderSidebar("agent");
-    }
-
-    if (choice === "retry") {
-      addAgentMessage("user", "I fixed it. Continue.");
-      agent.running = true;
-      agent.awaiting = "";
-      agent.repeatClickCount = 0;
-      agent.lastClickAt = 0;
-      renderSidebar("agent");
-      await sleep(300);
-      processCheckoutAgent();
-    }
-
-    if (choice === "skip_paid") {
-      addAgentMessage("user", "Skip paid extras.");
-      agent.skipPaidExtrasApproved = true;
-      agent.running = true;
-      agent.awaiting = "";
-      agent.pendingUserMessage = "Use my saved no-extras preference and continue safely.";
-      await processCheckoutAgent();
-    }
-  }
-
-  async function handleChatSubmit(event) {
-    event.preventDefault();
-    const input = document.getElementById("atw-chat-input");
-    const text = (input?.value || "").trim();
-    if (!text) return;
-    if (input) input.value = "";
-    addAgentMessage("user", text);
-    const normalized = text.toLowerCase();
-    logAgentEvent("chat", { text });
-
-    if (/stop|cancel|pause/.test(normalized)) {
-      await handleAgentChoice("stop");
-      return;
-    }
-
-    if (agent.pendingInputRequest?.field) {
-      const request = agent.pendingInputRequest;
-      const sensitive = request.sensitive === true;
-      agent.sessionProfileOverrides[request.field] = text;
-      agent.pendingUserMessage = text;
-      agent.pendingUserResponse = {
-        requestId: request.requestId || "",
-        field: request.field,
-        ...(sensitive
-          ? {
-              value: "",
-              valueRef: "profile://session/document_number",
-              hasValue: true
-            }
-          : {
-              value: text,
-              valueRef: "",
-              hasValue: true
-            })
-      };
-      addAgentMessage("assistant", `Got it. I will use that ${request.label || request.field.replace(/_/g, " ")} for this checkout and continue.`);
-      agent.running = true;
-      agent.awaiting = "";
-      renderSidebar("agent");
-      await sleep(300);
-      processCheckoutAgent();
-      return;
-    }
-
-    if (/add.*bag|checked bag|baggage/.test(normalized) && !/no|skip|dont|don't/.test(normalized)) {
-      await handleAgentChoice("add_bag");
-      return;
-    }
-
-    if (agent.awaiting === "extras" && /continue|try again|fixed|done|yes|ok|go ahead|proceed/.test(normalized)) {
-      agent.pendingUserMessage = text;
-      agent.running = true;
-      agent.awaiting = "";
-      renderSidebar("agent");
-      await sleep(300);
-      processCheckoutAgent();
-      return;
-    }
-
-    if (/continue|try again|fixed|done|yes|ok|go ahead|proceed/.test(normalized)) {
-      await handleAgentChoice("retry");
-      return;
-    }
-
-    if (/pay|book|confirm/.test(normalized)) {
-      addAgentMessage("assistant", "For safety, I will not click real payment from chat. Review the site payment screen and confirm there manually.");
-      renderSidebar("review");
-      return;
-    }
-
-    agent.pendingUserMessage = text;
-    addAgentMessage("assistant", "Got it. I will send that to the agent, rescan the page, and continue only if the next action is safe.");
-    agent.running = true;
-    agent.awaiting = "";
-    renderSidebar("agent");
-    await sleep(300);
-    processCheckoutAgent();
-  }
-
   function actionableCheckoutErrors(errors = []) {
     return (errors || [])
       .map((error) => String(typeof error === "string" ? error : error?.message || "").replace(/\s+/g, " ").trim())
@@ -5641,464 +3963,42 @@ import {
     renderSidebar("saved");
   }
 
-  function warningHtml() {
-    const list = warnings.length ? warnings : runRiskChecks();
-    if (!list.length) return "<p class='atw-muted'>No booking risks detected.</p>";
-    return list.map((warning) => `
-      <div class="atw-warning ${warning.severity}">
-        <strong>${warning.title}</strong>
-        <span>${warning.message}</span>
-      </div>
-    `).join("");
-  }
-
-  function paymentInstruction() {
-    const preference = traveler()?.payment_preference || "browser saved card";
-    const copy = {
-      "browser saved card": "Use the browser's saved card autofill on the payment step. Air Travel Wallet will not fill card number or CVC.",
-      "Apple Pay / Google Pay": "Use Apple Pay or Google Pay if the checkout offers it. Confirm the payment yourself.",
-      "company virtual card": "Use your company virtual card provider for the card step. Keep final purchase confirmation manual.",
-      "manual payment": "Payment is set to manual. Review the fare and complete payment yourself."
-    };
-    return copy[preference] || copy["browser saved card"];
-  }
-
-  function agentStatusHtml(map) {
-    const label = agent.running
-      ? agent.skipRoutineRunning
-        ? "Acting"
-        : "Thinking"
-      : agent.awaiting
-        ? "Waiting"
-        : "Ready";
-    const detail = agent.currentAction
-      ? agent.currentAction
-      : agent.awaiting === "extras"
-      ? "Needs your choice on paid extras"
-      : agent.awaiting === "final"
-        ? "Paused before payment"
-        : agent.awaiting === "manual"
-          ? "Needs guidance"
-          : `${map.step.replace(/_/g, " ")} · ${map.summary.buttons} actions`;
-    return `
-      <div class="atw-agent-live">
-        <div class="atw-live-dot ${agent.running ? "is-running" : ""}"></div>
-        <div>
-          <strong>${label}</strong>
-          <span>${detail}</span>
-          ${agent.currentReason ? `<em>${agent.currentReason}</em>` : ""}
-        </div>
-      </div>
-    `;
-  }
-
-  function agentSectionsHtml(map) {
-    const sections = (map.sections || []).filter((section) => section.type !== "continue");
-    if (!sections.length) return "";
-    let currentAssigned = false;
-    return `
-      <ol class="atw-section-progress">
-        ${sections.map((section) => {
-          const state = section.status === "complete" ? "done" : section.status === "blocked" ? "blocked" : "pending";
-          const isCurrent = state === "pending" && !currentAssigned;
-          if (isCurrent) currentAssigned = true;
-          return `<li class="${state}${isCurrent ? " is-current" : ""}"><span class="atw-dot"></span>${escapeHtml(section.label)}</li>`;
-        }).join("")}
-      </ol>
-    `;
-  }
-
-  function agentReasoningHtml() {
-    if (!agent.reasoningLog.length) return "";
-    return `
-      <div class="atw-reasoning-log">
-        ${agent.reasoningLog.slice(-5).reverse().map((entry) => `
-          <div class="atw-reasoning-item ${entry.ok === false ? "is-warn" : ""}">
-            <span class="atw-reasoning-step">${escapeHtml(entry.loopStep)}</span>
-            <span class="atw-reasoning-text">${escapeHtml(entry.action)}</span>
-            ${entry.reason ? `<span class="atw-reasoning-reason">${escapeHtml(entry.reason)}</span>` : ""}
-          </div>
-        `).join("")}
-      </div>
-    `;
-  }
-
-  function diagnosticRoute(facts = {}) {
-    return (facts.itinerary?.segments || [])
-      .map((segment) => `${segment.origin || "?"} → ${segment.destination || "?"}`)
-      .filter(Boolean)
-      .join(" · ");
-  }
-
-  function diagnosticPrice(facts = {}) {
-    const amount = facts.totalPrice?.amount;
-    const currency = facts.totalPrice?.currency || facts.currency || "";
-    return amount == null ? "unknown" : `${amount} ${currency}`.trim();
-  }
-
-  function agentProcessDiagnosticsHtml() {
-    const diagnostics = agent.processDiagnostics;
-    if (!diagnostics) return "";
-    const awareness = diagnostics.processAwareness || {};
-    const review = diagnostics.transactionReview || {};
-    const baseline = review.baseline || {};
-    const current = review.reviewFacts || review.current || {};
-    const achievements = (awareness.achievements || []).slice(-4).reverse();
-    const unresolved = (awareness.unresolved || []).slice(0, 4);
-    const contradictions = review.contradictions || [];
-    const missing = review.missingFacts || [];
-    const route = diagnosticRoute(baseline) || diagnosticRoute(current) || "not established";
-    return `
-      <details class="atw-process-diagnostics" open>
-        <summary>Agent state · testing</summary>
-        <div class="atw-process-grid">
-          <div><span>Where</span><strong>${escapeHtml(awareness.currentPosition?.stage || agent.pageMap?.step || "observing")}</strong></div>
-          <div><span>Status</span><strong>${escapeHtml(awareness.status || (agent.running ? "in progress" : "waiting"))}</strong></div>
-          <div class="is-wide"><span>Doing</span><strong>${escapeHtml(awareness.currentObjective || agent.currentAction || "observe and plan the next safe action")}</strong></div>
-          <div class="is-wide"><span>Selected booking</span><strong>${escapeHtml(route)} · ${escapeHtml(diagnosticPrice(baseline))} · ${escapeHtml(review.baselineStatus || "collecting")}</strong></div>
-          <div class="is-wide"><span>Current/review evidence</span><strong>${escapeHtml(diagnosticPrice(current))}${review.ready === true ? " · verified" : ""}</strong></div>
-        </div>
-        ${achievements.length ? `<div class="atw-process-list"><span>Done</span>${achievements.map((item) => `<em>✓ ${escapeHtml(item.label || item.kind || item.achievementId)}</em>`).join("")}</div>` : ""}
-        ${unresolved.length || missing.length || contradictions.length ? `<div class="atw-process-list is-warn"><span>Still unresolved</span>${[...unresolved, ...missing.map((item) => `transaction: ${item}`), ...contradictions.map((item) => `conflict: ${item}`)].slice(0, 6).map((item) => `<em>${escapeHtml(item)}</em>`).join("")}</div>` : ""}
-      </details>
-    `;
-  }
-
-  function selectedBookingAcquisitionHtml() {
-    const acquisition = readSelectedBookingAcquisition();
-    const durable = agent.processDiagnostics?.transactionReview?.baseline || null;
-    const facts = acquisition?.facts || durable || null;
-    const segments = facts?.itinerary?.segments || [];
-    const captured = segments.length > 0 && segments.every((segment) => (
-      segment.origin && segment.destination && segment.departureDate
-    ));
-    const route = captured ? diagnosticRoute(facts) : "missing";
-    const dates = captured
-      ? segments.map((segment) => segment.departureDate).filter(Boolean).join(" · ")
-      : "departure date unavailable";
-    const source = acquisition
-      ? "captured before session"
-      : captured
-        ? "durable baseline"
-        : "not acquired";
-    return `<div class="atw-map-line">Selected booking: <strong>${captured ? "captured" : "missing"}</strong> · ${escapeHtml(route)} · ${escapeHtml(dates)} · ${escapeHtml(source)}</div>`;
-  }
-
-  // Sidebar is logs-only by design: it starts the agent and shows what it's doing
-  // (section checklist, reasoning log). Anything that needs the user's input is
-  // asked on the page itself, next to the AI cursor — see cursorPromptHtml().
-  function agentChatHtml() {
-    const map = agent.pageMap || pageStateStore.observe({ reason: "sidebar_render" }).map;
-    return `
-      ${agentStatusHtml(map)}
-      <div class="atw-map-line">Reading ${map.site}: ${map.step.replace(/_/g, " ")} · ${map.summary.knownFields}/${map.summary.fields} fields · ${map.summary.paidChoices} paid areas</div>
-      ${selectedBookingAcquisitionHtml()}
-      ${agentProcessDiagnosticsHtml()}
-      ${agentSectionsHtml(map)}
-      ${agent.running ? agentReasoningHtml() : ""}
-      ${agent.awaiting ? `<div class="atw-mini-note">Waiting for you — answer next to the AI cursor on the page.</div>` : ""}
-    `;
-  }
-
-  function latestQuestionText() {
-    const last = [...agent.messages].reverse().find((message) => message.role === "assistant");
-    return last?.text || `I found ${routeSummary()}. Want me to complete checkout for ${traveler()?.first_name || "this traveler"}?`;
-  }
-
-  function cursorPromptHtml() {
-    return `
-      <div class="atw-cursor-prompt-message">${escapeHtml(latestQuestionText())}</div>
-      ${agentDecisionHtml()}
-      <form id="atw-chat-form" class="atw-chat-form">
-        <input id="atw-chat-input" placeholder="Type: continue, skip extras, stop..." />
-        <button class="atw-primary" type="submit">Send</button>
-      </form>
-    `;
-  }
-
-  function renderCursorPrompt() {
-    const existing = document.getElementById("atw-cursor-prompt");
-    if (!agent.awaiting) {
-      existing?.remove();
-      return;
-    }
-    const prompt = existing || document.createElement("div");
-    prompt.id = "atw-cursor-prompt";
-    prompt.innerHTML = cursorPromptHtml();
-    if (!prompt.parentElement) document.body.appendChild(prompt);
-    const cursor = document.getElementById("atw-agent-cursor");
-    const anchorRect = cursor?.getBoundingClientRect();
-    if (anchorRect && anchorRect.width) {
-      const left = Math.min(Math.max(8, anchorRect.left), window.innerWidth - 340);
-      const top = Math.min(anchorRect.bottom + 14, window.innerHeight - 40);
-      prompt.style.left = `${Math.max(8, left)}px`;
-      prompt.style.top = `${Math.max(8, top)}px`;
-    } else {
-      prompt.style.left = "50%";
-      prompt.style.top = "auto";
-      prompt.style.bottom = "24px";
-      prompt.style.transform = "translateX(-50%)";
-    }
-  }
-
-  function agentDecisionHtml() {
-    if (agent.awaiting === "extras") {
-      const demoAddBag = inferCheckoutSite() === "demo" ? '<button id="atw-add-bag">Add cabin bag</button>' : "";
-      return `
-        <div class="atw-choice-grid">
-          <button id="atw-stop">Review manually</button>
-          <button class="atw-primary" id="atw-skip-extras">Skip paid extras</button>
-          ${demoAddBag}
-        </div>
-      `;
-    }
-    if (agent.awaiting === "final") {
-      if (inferCheckoutSite() === "demo") {
-        return `
-          <div class="atw-choice-grid">
-            <button id="atw-stop">No, stop</button>
-            <button class="atw-primary" id="atw-confirm-pay">Confirm demo payment</button>
-          </div>
-        `;
-      }
-      return `
-        <div class="atw-choice-grid">
-          <button id="atw-stop">Stop</button>
-          <button class="atw-primary" id="atw-save-after-payment">Payment done, save</button>
-        </div>
-      `;
-    }
-    if (agent.awaiting === "manual") {
-      return `
-        <div class="atw-choice-grid">
-          <button id="atw-stop">Stop</button>
-          <button class="atw-primary" id="atw-retry">I fixed it, continue</button>
-        </div>
-        <button id="atw-skip-paid" class="atw-wide-action">Skip paid extras</button>
-      `;
-    }
-    return "";
-  }
-
-  function escapeHtml(text) {
-    return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  }
-
-  function pct(value) {
-    return `${Math.round((value || 0) * 100)}%`;
-  }
-
-  const OBSERVER_TABS = [
-    ["summary", "Summary"],
-    ["pagemap", "Page Map"],
-    ["fields", "Fields"],
-    ["options", "Options"],
-    ["debug", "Debug JSON"]
-  ];
-
-  function observerTabsHtml() {
-    return `
-      <div class="atw-buttons" style="flex-wrap:wrap;">
-        ${OBSERVER_TABS.map(([key, label]) => `
-          <button class="atw-tab ${agent.observerTab === key ? "atw-primary" : ""}" data-observer-tab="${key}">${label}</button>
-        `).join("")}
-      </div>
-    `;
-  }
-
-  function observerSummaryHtml(pu) {
-    const blocker = pu.checkoutState.blockers[0]?.message || "None detected.";
-    const nextAction = pu.proposedNextActions[0]?.label || "None — nothing pending.";
-    return `
-      <div class="atw-box">
-        <strong>Page understood [Observer Mode — no actions taken]</strong>
-        <div class="atw-muted">Current step: ${escapeHtml(pu.pageIdentity.pageType.replace(/_/g, " "))} (confidence ${pct(pu.pageIdentity.confidence)})</div>
-        <div class="atw-muted">Overall status: ${escapeHtml(pu.checkoutState.overallStatus.replace(/_/g, " "))}</div>
-        <div class="atw-muted">Detected sections: ${pu.sections.length}</div>
-      </div>
-      <div class="atw-box">
-        <strong>Main blocker</strong>
-        <div class="atw-muted">${escapeHtml(blocker)}</div>
-      </div>
-      <div class="atw-box">
-        <strong>Recommended next step (not executed)</strong>
-        <div class="atw-muted">${escapeHtml(nextAction)}</div>
-      </div>
-      <div class="atw-box">
-        <strong>Reasoning</strong>
-        <div class="atw-muted">${escapeHtml(pu.reasoningSummary.shortSummary)}</div>
-        ${pu.reasoningSummary.keyEvidence.length ? `<ul class="atw-list">${pu.reasoningSummary.keyEvidence.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul>` : ""}
-        ${pu.reasoningSummary.uncertainty.length ? `<div class="atw-muted" style="margin-top:6px;"><em>Uncertain about:</em><ul class="atw-list">${pu.reasoningSummary.uncertainty.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul></div>` : ""}
-      </div>
-      ${pu.warnings.length ? `
-        <div class="atw-box">
-          <strong>Warnings</strong>
-          <ul class="atw-list">${pu.warnings.map((w) => `<li>[${w.severity}] ${escapeHtml(w.title || w.type)}: ${escapeHtml(w.message)}</li>`).join("")}</ul>
-        </div>
-      ` : ""}
-    `;
-  }
-
-  function observerPageMapHtml(pu) {
-    return `
-      <div class="atw-box">
-        <strong>Sections (${pu.sections.length})</strong>
-        ${pu.sections.map((section, index) => `
-          <div style="margin:10px 0;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);">
-            <div><strong>${index + 1}. [${escapeHtml(section.type)}]</strong> ${escapeHtml(section.label)} — ${escapeHtml(section.status)} (${pct(section.confidence)})</div>
-            <ul class="atw-list">${section.evidence.map((e) => `<li>${escapeHtml(e)}</li>`).join("")}</ul>
-          </div>
-        `).join("") || "<div class='atw-muted'>No sections detected.</div>"}
-      </div>
-    `;
-  }
-
-  function observerFieldsHtml(pu) {
-    const known = pu.fields.filter((f) => f.semanticType !== "unknown");
-    const unknownCount = pu.fields.length - known.length;
-    return `
-      <div class="atw-box">
-        <strong>Recognized fields (${known.length}/${pu.fields.length})</strong>
-        ${known.map((field) => `
-          <div style="margin:8px 0;">
-            <div>${field.filled ? "✓" : "✗"} <strong>${escapeHtml(field.semanticType)}</strong>${field.required ? " (required)" : ""} — ${field.filled ? escapeHtml(field.valuePreview || "filled") : "empty"} (${pct(field.confidence)})</div>
-            <div class="atw-muted" style="font-size:11px;">${escapeHtml(field.label.slice(0, 60))}</div>
-          </div>
-        `).join("") || "<div class='atw-muted'>None recognized.</div>"}
-        ${unknownCount ? `<div class="atw-muted">+${unknownCount} unrecognized field(s) on page (tracked within their section's choices, not shown here).</div>` : ""}
-      </div>
-    `;
-  }
-
-  function observerOptionsHtml(pu) {
-    if (!pu.options.length) return `<div class="atw-box atw-muted">No paid/choice options detected on this page.</div>`;
-    return `
-      <div class="atw-box">
-        <strong>Options (${pu.options.length})</strong>
-        ${pu.options.map((option) => `
-          <div style="margin:8px 0;padding-top:8px;border-top:1px solid rgba(255,255,255,0.08);">
-            <div><strong>${escapeHtml(option.label)}</strong> — ${escapeHtml(option.category)} · ${escapeHtml(option.status)}${option.price ? ` · ${option.price.amount} ${option.price.currency}` : ""} (${pct(option.confidence)})</div>
-          </div>
-        `).join("")}
-      </div>
-    `;
-  }
-
-  function observerDebugHtml(pu) {
-    return `
-      <div class="atw-box">
-        <button id="atw-copy-observer-json">Copy debug JSON</button>
-        <pre style="white-space:pre-wrap;font-size:10px;line-height:1.4;max-height:400px;overflow-y:auto;margin-top:8px;">${escapeHtml(JSON.stringify(pu, null, 2))}</pre>
-      </div>
-    `;
-  }
-
-  function observerPanelHtml() {
-    const pu = agent.pageUnderstanding;
-    if (!pu) return `<div class="atw-box atw-muted">Click "Observe page" to scan.</div>`;
-    const renderers = {
-      summary: observerSummaryHtml,
-      pagemap: observerPageMapHtml,
-      fields: observerFieldsHtml,
-      options: observerOptionsHtml,
-      debug: observerDebugHtml
-    };
-    return (renderers[agent.observerTab] || observerSummaryHtml)(pu);
-  }
-
-  function renderSidebar(mode = "ready") {
-    const t = traveler();
-    const detected = bookingDetected();
-    const root = document.getElementById("atw-sidebar") || document.createElement("aside");
-    root.id = "atw-sidebar";
-    root.innerHTML = `
-      <div class="atw-panel">
-        <div class="atw-head">
-          <div>
-            <h2>Air Travel Agent</h2>
-            <p>${location.host}</p>
-          </div>
-          <span class="atw-pill">${mode === "saved" ? "Saved" : detected ? "Live" : "Idle"}</span>
-        </div>
-        <label class="atw-label">Traveler
-          <select id="atw-traveler">
-            ${appData.travelers.map((item) => {
-              const name = [item.first_name, item.middle_name, item.last_name].filter(Boolean).join(" ");
-              return `<option value="${item.id}" ${item.id === t.id ? "selected" : ""}>${name}</option>`;
-            }).join("")}
-          </select>
-        </label>
-        <label class="atw-label">Anything specific for this booking? (optional)
-          <textarea id="atw-user-goal" placeholder="e.g. book free, nothing extra, no seat" ${agent.running ? "disabled" : ""}>${escapeHtml(agent.userGoal)}</textarea>
-        </label>
-        <div class="atw-buttons">
-          <button class="atw-primary" id="atw-takeover" ${detected && !agent.running ? "" : "disabled"}>Start agent</button>
-          <button id="atw-observe-only" ${detected ? "" : "disabled"}>Observe page (no actions) [TEMP]</button>
-        </div>
-        ${mode === "observer" ? `
-          <div class="atw-observer">
-            ${observerTabsHtml()}
-            ${observerPanelHtml()}
-          </div>
-        ` : `
-          <div class="atw-agent-card">
-            ${agentChatHtml()}
-          </div>
-        `}
-        <details class="atw-details">
-          <summary>Profile and logs</summary>
-          <div class="atw-box">
-            <strong>${t.first_name} ${t.last_name}</strong>
-            <div class="atw-muted">${t.nationality} · ${t.document?.masked_document_number || "No document"} · expires ${t.document?.expiry_date || "not set"}</div>
-          </div>
-          <div class="atw-box">
-            <strong>Payment helper</strong>
-            <div class="atw-muted">${paymentInstruction()}</div>
-          </div>
-          <div class="atw-box">
-            <strong>Booking rules</strong>
-            <div class="atw-muted">${travelerRules() || "Ask before paid extras. Stop before real payment."}</div>
-          </div>
-          <button id="atw-copy-debug">Copy debug log</button>
-          <button id="atw-save">Save confirmed trip</button>
-          <div class="atw-box">
-            <strong>Filled fields</strong>
-            ${filledFields.length ? `<ul class="atw-list">${filledFields.map((field) => `<li>${field.fieldType} (${Math.round(field.confidence * 100)}%)</li>`).join("")}</ul>` : "<p class='atw-muted'>Nothing filled yet.</p>"}
-          </div>
-          <div>${warningHtml()}</div>
-        </details>
-      </div>
-    `;
-    if (!root.parentElement) document.body.appendChild(root);
-    renderCursorPrompt();
-    document.getElementById("atw-user-goal")?.addEventListener("input", (event) => { agent.userGoal = event.target.value; });
-    document.getElementById("atw-takeover").addEventListener("click", () => takeOverCheckout().catch((error) => alert(error.message)));
-    document.getElementById("atw-observe-only")?.addEventListener("click", () => observePageOnly().catch((error) => alert(error.message)));
-    document.querySelectorAll("[data-observer-tab]").forEach((button) => {
-      button.addEventListener("click", () => setObserverTab(button.dataset.observerTab));
-    });
-    document.getElementById("atw-copy-observer-json")?.addEventListener("click", () => {
-      navigator.clipboard.writeText(JSON.stringify(agent.pageUnderstanding, null, 2))
-        .then(() => alert("Debug JSON copied."))
-        .catch((error) => alert(error.message));
-    });
-    document.getElementById("atw-copy-debug")?.addEventListener("click", () => copyDebugLog().catch((error) => alert(error.message)));
-    document.getElementById("atw-save")?.addEventListener("click", () => saveTrip().catch((error) => alert(error.message)));
-    document.getElementById("atw-skip-extras")?.addEventListener("click", () => handleAgentChoice("skip_extras"));
-    document.getElementById("atw-add-bag")?.addEventListener("click", () => handleAgentChoice("add_bag"));
-    document.getElementById("atw-confirm-pay")?.addEventListener("click", () => handleAgentChoice("confirm_pay"));
-    document.getElementById("atw-save-after-payment")?.addEventListener("click", () => saveTrip().catch((error) => alert(error.message)));
-    document.getElementById("atw-stop")?.addEventListener("click", () => handleAgentChoice("stop"));
-    document.getElementById("atw-retry")?.addEventListener("click", () => handleAgentChoice("retry"));
-    document.getElementById("atw-skip-paid")?.addEventListener("click", () => handleAgentChoice("skip_paid"));
-    document.getElementById("atw-chat-form")?.addEventListener("submit", handleChatSubmit);
-    document.getElementById("atw-traveler").addEventListener("change", async (event) => {
-      selectedTravelerId = event.target.value;
-      await chrome.storage.local.set({ selectedTravelerId });
-      warnings = runRiskChecks();
-      renderSidebar(mode);
-    });
-  }
+  const {
+    agentDecisionHtml,
+    agentProcessDiagnosticsHtml,
+    agentStatusHtml,
+    escapeHtml,
+    renderCursorPrompt,
+    renderSidebar,
+    selectedBookingAcquisitionHtml,
+    warningHtml
+  } = createSidebarUi({
+    agent,
+    bookingDetected,
+    copyDebugLog,
+    getAppData: () => appData,
+    getFilledFields: () => filledFields,
+    getWarnings: () => warnings,
+    handleAgentChoice,
+    handleChatSubmit,
+    inferCheckoutSite,
+    observePageOnly,
+    pageStateStore,
+    readSelectedBookingAcquisition,
+    routeSummary,
+    runRiskChecks,
+    saveTrip,
+    setObserverTab,
+    setSelectedTravelerId: (travelerId) => {
+      selectedTravelerId = travelerId;
+    },
+    setWarnings: (nextWarnings) => {
+      warnings = nextWarnings;
+    },
+    takeOverCheckout,
+    traveler,
+    travelerRules
+  });
 
   function watchForCheckoutChanges() {
     const observer = new MutationObserver((mutations) => {
