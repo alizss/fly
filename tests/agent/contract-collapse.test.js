@@ -411,3 +411,18 @@ test("extension field interaction owns controlled typing, native select, and pho
   assert.match(fields, /function selectCountryCodeControl\s*\(/);
   assert.match(fields, /function selectComboboxOption\s*\(/);
 });
+
+test("extension outcome verification owns expected results and canonical postcondition proof", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const outcomes = fs.readFileSync(path.join(root, "apps/extension/src/content/verification/outcomes.js"), "utf8");
+
+  assert.match(runtime, /createOutcomeVerification\s*\(/);
+  assert.doesNotMatch(runtime, /function expectedOutcomeForDecision\s*\(/);
+  assert.doesNotMatch(runtime, /function verifyExpectedOutcomeInternal\s*\(/);
+  assert.doesNotMatch(runtime, /function transitionFeedbackForMaps\s*\(/);
+  assert.match(outcomes, /function expectedOutcomeForDecision\s*\(/);
+  assert.match(outcomes, /function verifyExpectedOutcomeInternal\s*\(/);
+  assert.match(outcomes, /function transitionFeedbackForMaps\s*\(/);
+  assert.match(outcomes, /function exactChildChoiceSettlementEvidence\s*\(/);
+});
