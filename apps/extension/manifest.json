@@ -144,7 +144,7 @@
         "https://*.airindia.com/*",
         "https://*.goindigo.in/*"
       ],
-      "js": ["src/shared/agent-contract.js", "src/content/content.js"],
+      "js": ["dist/content.js"],
       "css": ["src/content/sidebar.css"],
       "run_at": "document_idle"
     }

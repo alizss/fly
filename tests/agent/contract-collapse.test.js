@@ -302,7 +302,7 @@ test("observation transport sends one latest result and loop failures stay typed
   const root = path.resolve(__dirname, "../..");
   const server = fs.readFileSync(path.join(root, "apps/web/server.js"), "utf8");
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
-  const content = fs.readFileSync(path.join(root, "apps/extension/src/content/content.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
   const observationPayload = content.slice(
     content.indexOf("const observationPayload = {"),
     content.indexOf("const transport = await postObservationWithSizeRecovery")

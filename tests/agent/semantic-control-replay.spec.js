@@ -75,8 +75,7 @@ async function runLoopTurn(args = {}) {
 
 const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "seat-baggage.html");
 const profileFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "profile-form.html");
-const contractScriptPath = path.join(__dirname, "..", "..", "apps", "extension", "src", "shared", "agent-contract.js");
-const contentScriptPath = path.join(__dirname, "..", "..", "apps", "extension", "src", "content", "content.js");
+const contentScriptPath = path.join(__dirname, "..", "..", "apps", "extension", "dist", "content.js");
 const TEST_API = `http://127.0.0.1:${Number(process.env.ATW_TEST_PORT || 4273)}/api`;
 
 function verifiedTransactionReview(totalPrice = 208) {
@@ -104,7 +103,6 @@ function verifiedTransactionReview(totalPrice = 208) {
 async function loadProducer(page, sourcePath = fixturePath) {
   await page.setContent(fs.readFileSync(sourcePath, "utf8"));
   await page.evaluate(() => { window.__ATW_ENABLE_TEST_HOOKS__ = true; });
-  await page.addScriptTag({ path: contractScriptPath });
   await page.addScriptTag({ path: contentScriptPath });
   await page.evaluate(() => {
     window.__ATW_TEST_TRUSTED_INPUT__ = ({ element, x, y }) => {
@@ -346,7 +344,6 @@ test("resume sends no stored booking contract and uses only the durable baseline
 async function loadHtmlProducer(page, html) {
   await page.setContent(html);
   await page.evaluate(() => { window.__ATW_ENABLE_TEST_HOOKS__ = true; });
-  await page.addScriptTag({ path: contractScriptPath });
   await page.addScriptTag({ path: contentScriptPath });
   // Browser replays do not run the extension service worker. Model its
   // governed pointer bridge here; production dispatch remains Chrome
@@ -7792,7 +7789,6 @@ test("P0.7 scroll recovery uses the nearest effective container and fails closed
     </div>
   `);
   await page.evaluate(() => { window.__ATW_ENABLE_TEST_HOOKS__ = true; });
-  await page.addScriptTag({ path: contractScriptPath });
   await page.addScriptTag({ path: contentScriptPath });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
 

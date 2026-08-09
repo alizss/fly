@@ -180,7 +180,7 @@ test("shared semantic effects canonicalize legacy free-choice vocabulary", () =>
 
 test("production runtime contains one semantic compiler and one TaskState reduction site", () => {
   const root = path.resolve(__dirname, "../..");
-  const browser = fs.readFileSync(path.join(root, "apps/extension/src/content/content.js"), "utf8");
+  const browser = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
   const candidateBinder = fs.readFileSync(path.join(root, "apps/web/agent/select-candidate.js"), "utf8");
   const ambiguityResolver = fs.readFileSync(path.join(root, "apps/web/agent/ambiguity-resolver.js"), "utf8");
