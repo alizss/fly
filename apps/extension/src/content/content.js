@@ -213,16 +213,13 @@
     const totalAmount = Number(facts.totalPrice?.amount);
     const totalCurrency = String(facts.totalPrice?.currency || facts.currency || "").trim().toUpperCase();
     const totalEvidence = facts.factEvidence?.totalPrice || null;
-    const travelerIds = (Array.isArray(facts.travelers) ? facts.travelers : [])
-      .map((entry) => String(entry?.travelerId || "").trim())
-      .filter(Boolean);
     const authoritativeTotal = Number.isFinite(totalAmount)
       && totalAmount >= 0
       && Boolean(totalCurrency)
       && totalEvidence?.authoritative === true
       && totalEvidence?.role === "booking_total"
       && Boolean(String(totalEvidence.ownerKey || "").trim());
-    if (facts.itinerary?.completeness !== "complete" || !segments.length || !travelerIds.length || !authoritativeTotal) return null;
+    if (facts.itinerary?.completeness !== "complete" || !segments.length || !authoritativeTotal) return null;
     const complete = segments.every((segment) => {
       const proof = segment.evidence || evidence.find((entry) => entry?.segmentId === segment.segmentId) || null;
       return Boolean(
@@ -234,6 +231,68 @@
       );
     });
     return complete ? facts : null;
+  }
+
+  function composeSelectedBookingContract(acquisition = null, selectedTraveler = null) {
+    const facts = authoritativeSelectedBookingFacts(acquisition?.facts);
+    const travelerId = String(selectedTraveler?.id || "").trim();
+    if (!facts || !travelerId) return null;
+    return {
+      contractVersion: "selected-booking/v1",
+      selectionId: String(acquisition.observationId || `selected_booking_${Date.now().toString(36)}`),
+      selectedAt: String(acquisition.capturedAt || new Date().toISOString()),
+      sourceUrl: String(acquisition.sourceUrl || location.href),
+      itinerary: {
+        segments: facts.itinerary.segments.map((segment) => ({
+          segmentId: segment.segmentId || "",
+          origin: segment.origin || "",
+          destination: segment.destination || "",
+          departureDate: segment.departureDate || "",
+          departureTime: segment.departureTime || "",
+          arrivalDate: segment.arrivalDate || "",
+          arrivalTime: segment.arrivalTime || "",
+          carrier: segment.carrier || "",
+          flightNumber: segment.flightNumber || ""
+        }))
+      },
+      approvedTotal: {
+        amount: Number(facts.totalPrice.amount),
+        currency: String(facts.totalPrice.currency || facts.currency || "").trim().toUpperCase()
+      },
+      fareBrand: String(facts.fareBrand || ""),
+      travelerIds: [travelerId]
+    };
+  }
+
+  function validStoredSelectedBookingContract(raw = null, selectedTraveler = null, now = Date.now()) {
+    if (!raw || raw.contractVersion !== "selected-booking/v1") return null;
+    const selectedAt = Date.parse(String(raw.selectedAt || ""));
+    const travelerId = String(selectedTraveler?.id || "").trim();
+    const travelerIds = Array.isArray(raw.travelerIds)
+      ? raw.travelerIds.map((value) => String(value || "").trim()).filter(Boolean)
+      : [];
+    const segments = Array.isArray(raw.itinerary?.segments) ? raw.itinerary.segments : [];
+    const amount = Number(raw.approvedTotal?.amount);
+    const currency = String(raw.approvedTotal?.currency || "").trim().toUpperCase();
+    const fresh = Number.isFinite(selectedAt)
+      && selectedAt <= now + 60_000
+      && now - selectedAt <= SELECTED_BOOKING_MAX_AGE_MS;
+    const completeItinerary = segments.length > 0 && segments.every((segment) => (
+      String(segment?.origin || "").trim()
+      && String(segment?.destination || "").trim()
+      && String(segment?.departureDate || "").trim()
+    ));
+    if (
+      !String(raw.selectionId || "").trim()
+      || !fresh
+      || !completeItinerary
+      || !Number.isFinite(amount)
+      || amount < 0
+      || !currency
+      || !travelerId
+      || !travelerIds.includes(travelerId)
+    ) return null;
+    return raw;
   }
 
   function captureSelectedBookingFromMap(map = null) {
@@ -2856,8 +2915,20 @@
     try {
       agent.sessionStartFailure = null;
       const settings = await storageGet(["apiBase", "selectedBookingContract"]);
-      const currentBookingCapture = captureSelectedBookingFromMap(agent.pageMap);
-      const selectedBooking = readSelectedBookingAcquisition() || currentBookingCapture;
+      const selectedTraveler = traveler();
+      if (!selectedTraveler?.id) {
+        const error = new Error("Select at least one wallet traveler before starting checkout.");
+        error.code = "SELECTED_TRAVELER_REQUIRED";
+        throw error;
+      }
+      const immediateAcquisition = resumeSessionId
+        ? null
+        : readSelectedBookingAcquisition()
+          || captureSelectedBookingFromMap(agent.pageMap || pageStateStore.current());
+      const selectedBookingContract = resumeSessionId
+        ? null
+        : validStoredSelectedBookingContract(settings.selectedBookingContract, selectedTraveler)
+          || composeSelectedBookingContract(immediateAcquisition, selectedTraveler);
       const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/session`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2867,8 +2938,7 @@
           goal: agent.userGoal || "Complete this flight checkout safely with one-click assistance.",
           userIntent: userIntentText(),
           traveler: traveler(),
-          selectedBookingContract: settings.selectedBookingContract || null,
-          selectedBooking,
+          selectedBookingContract,
           page: compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
         })
       });
@@ -17172,8 +17242,8 @@
       await clearResumeMarker();
       addAgentMessage(
         "assistant",
-        agent.sessionStartFailure?.code === "SELECTED_BOOKING_REQUIRED"
-          ? "Start Fly from an approved flight selection that shows the itinerary and total price. I stopped before changing the page because no complete selected booking was available."
+        ["SELECTED_BOOKING_REQUIRED", "SELECTED_TRAVELER_REQUIRED"].includes(agent.sessionStartFailure?.code)
+          ? agent.sessionStartFailure.message
           : `I could not establish one durable checkout session, so I stopped before planning or changing the page.${agent.sessionStartFailure?.message ? ` ${agent.sessionStartFailure.message}` : ""}`
       );
       renderSidebar("agent");
@@ -18082,7 +18152,9 @@
           : mutation.target?.parentElement;
         return !target?.closest?.("#atw-sidebar, #atw-agent-cursor, .atw-agent-cursor");
       });
-      if (pageChanged && externalPageMutation) scheduleSelectedBookingCapture("dom_mutation");
+      if (pageChanged && externalPageMutation) {
+        scheduleSelectedBookingCapture("dom_mutation");
+      }
       if (pageChanged && agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
         scheduleDestinationObservation("dom_mutation", DESTINATION_MUTATION_SETTLE_MS);
       }
@@ -18175,9 +18247,12 @@
       narrowerExactControlOwner,
       compactPageMap,
       authoritativeSelectedBookingFacts,
+      composeSelectedBookingContract,
+      validStoredSelectedBookingContract,
       captureSelectedBookingFromMap,
       readSelectedBookingAcquisition,
       scheduleSelectedBookingCapture,
+      startAgentSession,
       compactSurfaceReference,
       observationTransportBytes,
       observationNeedsScreenshot,

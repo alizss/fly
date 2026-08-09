@@ -3868,7 +3868,7 @@ test("a genuine paid seat conflict never substitutes unrelated Next or Back for 
   assert.equal(candidates.some((candidate) => candidate.controlId === back.controlId), false);
 });
 
-test("TaskState grants one bounded re-observation token and then terminates an unchanged no-obligation surface", () => {
+test("TaskState waits through unchanged observations and stops only after the real re-observation deadline", () => {
   const page = {
     step: "unknown",
     currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", blocksBackground: false },
@@ -3897,9 +3897,30 @@ test("TaskState grants one bounded re-observation token and then terminates an u
       page
     }
   });
-  assert.equal(second.disposition.kind, "stop", JSON.stringify(second.disposition, null, 2));
+  assert.equal(second.disposition.kind, "wait_reobserve", JSON.stringify(second.disposition, null, 2));
   assert.equal(second.disposition.reobserveCount, 2);
   assert.equal(second.disposition.surfaceFingerprint, first.disposition.surfaceFingerprint);
+  assert.equal(second.disposition.retryToken, first.disposition.retryToken);
+  assert.equal(second.disposition.reobserveDeadlineAt, first.disposition.reobserveDeadlineAt);
+
+  const afterDeadline = reduceTaskState({
+    previousTaskState: {
+      ...second,
+      disposition: {
+        ...second.disposition,
+        reobserveStartedAt: Date.now() - 9_000,
+        reobserveDeadlineAt: Date.now() - 1
+      }
+    },
+    observation: {
+      observationId: "obs_reobserve_after_deadline",
+      observationSnapshot: { snapshotHash: "hash_reobserve_after_deadline" },
+      page
+    }
+  });
+  assert.equal(afterDeadline.disposition.kind, "stop", JSON.stringify(afterDeadline.disposition, null, 2));
+  assert.equal(afterDeadline.disposition.reobserveCount, 3);
+  assert.match(afterDeadline.disposition.reason, /after the bounded re-observation deadline/);
 });
 
 test("payment review remains active until every verified decision is present in the transaction ledger", () => {

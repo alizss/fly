@@ -3214,12 +3214,13 @@ function reduceDecisionFrame({
     && previousDisposition.code === dispositionCode
     && previousDisposition.surfaceFingerprint === fingerprint
   );
+  const reobserveNow = Date.now();
   const reobserveCount = sameReobserveDisposition
     ? Number(previousDisposition.reobserveCount || 0) + 1
     : 1;
   const reobserveStartedAt = sameReobserveDisposition
-    ? Number(previousDisposition.reobserveStartedAt || Date.now())
-    : Date.now();
+    ? Number(previousDisposition.reobserveStartedAt || reobserveNow)
+    : reobserveNow;
   const reobserveDeadlineAt = sameReobserveDisposition
     ? Number(previousDisposition.reobserveDeadlineAt || (reobserveStartedAt + TASK_STATE_REOBSERVE_DEADLINE_MS))
     : reobserveStartedAt + TASK_STATE_REOBSERVE_DEADLINE_MS;
@@ -3321,11 +3322,11 @@ function reduceDecisionFrame({
       reason: "The active checkout requirement cannot be resolved deterministically from the fresh evidence.",
       userActionRequired: true
     };
-  } else if (reobserveCount === 1) {
+  } else if (reobserveDeadlineAt > reobserveNow) {
     disposition = {
       kind: "wait_reobserve",
       code: dispositionCode,
-      reason: "No executable obligation is proven yet; request a fresh settled observation before stopping.",
+      reason: "No executable obligation is proven yet; wait for a material mutation or the bounded deadline before stopping.",
       reobserveCount,
       retryToken: reobserveRetryToken,
       reobserveStartedAt,

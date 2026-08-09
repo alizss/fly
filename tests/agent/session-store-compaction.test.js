@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const { compactSessionState, createStore } = require("../../apps/web/agent/session-store");
 const { createCheckoutSessionState, withUpdate } = require("../../packages/shared/agent-state");
 const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
+const { leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
 
 test("session persistence keeps semantic facts and removes ephemeral candidate graphs", () => {
   const store = createStore({ dbPath: ":memory:" });
@@ -114,6 +115,78 @@ test("compact persistence preserves the target-local identity required to suppre
     failureCount: 2,
     code: "TRANSITION_NO_EFFECT"
   });
+});
+
+test("compact persistence retains a leased action's source observation id and hash", () => {
+  const store = createStore({ dbPath: ":memory:" });
+  const state = withExecutionFixture(createCheckoutSessionState({ goal: "Reach payment review" }), {
+    leasedAction: leasedActionRecord({
+      action: {
+        id: "action_continue",
+        type: "click",
+        observationId: "observation_passenger_details",
+        observationHash: "hash_passenger_details",
+        intent: "navigate_stage",
+        mechanicalEffect: "advance_checkout_stage",
+        controlId: "continue"
+      }
+    })
+  });
+
+  store.saveSession(state);
+  const persistedLease = store.getSession(state.id).executionEpisode.leasedAction.actionLease;
+
+  assert.deepEqual(persistedLease.observation, {
+    id: "observation_passenger_details",
+    hash: "hash_passenger_details"
+  });
+  store.close();
+});
+
+test("the ledger returns only the durable result for the currently leased action", () => {
+  const store = createStore({ dbPath: ":memory:" });
+  const state = withExecutionFixture(createCheckoutSessionState({ goal: "Reach payment review" }), {
+    leasedAction: leasedActionRecord({
+      action: {
+        id: "action_continue",
+        type: "click",
+        observationId: "observation_passenger_details",
+        observationHash: "hash_passenger_details",
+        intent: "navigate_stage",
+        mechanicalEffect: "advance_checkout_stage",
+        controlId: "continue"
+      }
+    })
+  });
+  store.saveSession(state);
+  store.recordObservation(state.id, {
+    observationId: "observation_passenger_details",
+    observationSnapshot: { snapshotHash: "hash_passenger_details" },
+    page: { url: "https://example.test/passenger-details", step: "traveler_information" }
+  }, { updateSession: false });
+  store.reserveGovernedAction({
+    transactionId: state.id,
+    observationId: "observation_passenger_details",
+    observationHash: "hash_passenger_details",
+    action: { id: "action_continue", type: "click", controlId: "continue" }
+  });
+  store.recordActionResult(state.id, {
+    actionId: "action_continue",
+    observationId: "observation_passenger_details",
+    dispatched: true,
+    verified: false,
+    failureCode: "CHECKOUT_STAGE_NOT_ADVANCED"
+  });
+
+  assert.deepEqual(store.getPendingActionResult(store.getSession(state.id)), {
+    actionId: "action_continue",
+    observationId: "observation_passenger_details",
+    dispatched: true,
+    verified: false,
+    failureCode: "CHECKOUT_STAGE_NOT_ADVANCED"
+  });
+  assert.equal(store.getPendingActionResult(createCheckoutSessionState({ goal: "No lease" })), null);
+  store.close();
 });
 
 test("one durable execution episode replaces parallel lifecycle and recovery copies", () => {

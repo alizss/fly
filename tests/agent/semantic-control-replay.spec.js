@@ -38,44 +38,22 @@ const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 function testSelectedBooking(travelerId) {
   const observationId = `selected_booking_${travelerId}`;
-  const evidence = {
-    segmentId: "segment_lju_lgw",
-    ownerKey: "itinerary:LJU:LGW:2026-10-15",
-    authoritative: true
-  };
   return {
-    contractVersion: "selected-booking-acquisition/v1",
-    capturedAt: new Date().toISOString(),
+    contractVersion: "selected-booking/v1",
+    selectionId: observationId,
+    selectedAt: new Date().toISOString(),
     sourceUrl: "https://example.test/flights/selected",
-    observationId,
-    facts: {
-      contractVersion: "transaction-facts/v2",
-      evidenceMode: "typed",
-      itinerary: {
-        completeness: "complete",
-        segments: [{
-          segmentId: evidence.segmentId,
-          origin: "LJU",
-          destination: "LGW",
-          departureDate: "2026-10-15",
-          evidence
-        }]
-      },
-      travelers: [{ travelerId }],
-      currency: "EUR",
-      totalPrice: { amount: 250, currency: "EUR" },
-      fareBrand: "Standard",
-      selectedExtras: [],
-      factEvidence: {
-        itinerary: [evidence],
-        totalPrice: {
-          ownerKey: "booking-total:LJU-LGW:250:EUR",
-          role: "booking_total",
-          authoritative: true
-        }
-      },
-      provenance: [{ source: "flight_selection", observationId, confidence: 1 }]
-    }
+    itinerary: {
+      segments: [{
+        segmentId: "segment_lju_lgw",
+        origin: "LJU",
+        destination: "LGW",
+        departureDate: "2026-10-15"
+      }]
+    },
+    approvedTotal: { amount: 250, currency: "EUR" },
+    fareBrand: "Standard",
+    travelerIds: [travelerId]
   };
 }
 
@@ -157,6 +135,212 @@ test("pre-session selected-booking capture backs off on an unchanged incomplete 
   expect(await page.evaluate(() => (
     window.__ATW_TEST__.scheduleSelectedBookingCapture("unchanged_surface")
   ))).toBe(false);
+});
+
+for (const checkoutCase of [
+  { name: "EasyJet", origin: "LJU", destination: "EDI", total: 362 },
+  { name: "GoToGate", origin: "LHR", destination: "LJU", total: 208 }
+]) {
+  test(`delayed ${checkoutCase.name} booking hydration does not block provisional startup`, async ({ page }) => {
+    await loadHtmlProducer(page, "<main><h1>Loading checkout…</h1></main>");
+    const travelerId = `trav_${checkoutCase.name.toLowerCase()}`;
+    let requestBody = null;
+    await page.route("https://agent.test/api/agent/session", async (route) => {
+      requestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({ id: `chk_provisional_${checkoutCase.name.toLowerCase()}` })
+      });
+    });
+    const started = await page.evaluate(async (id) => {
+      window.chrome = {
+        storage: { local: { get: async () => ({ apiBase: "https://agent.test/api" }) } },
+        runtime: { sendMessage: async () => ({ ok: false }) }
+      };
+      const profile = { id, first_name: "Ali", last_name: "Example" };
+      window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
+      window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_loading_shell" });
+      const startedAt = performance.now();
+      const session = await window.__ATW_TEST__.startAgentSession();
+      return { session, elapsedMs: performance.now() - startedAt };
+    }, travelerId);
+    expect(started.session.id).toBe(`chk_provisional_${checkoutCase.name.toLowerCase()}`);
+    expect(started.elapsedMs).toBeLessThan(1_000);
+    expect(requestBody.selectedBookingContract).toBeNull();
+
+    const laterContract = await page.evaluate(({ origin, destination, total, travelerId: selectedTravelerId }) => {
+      document.body.innerHTML = `
+        <main>
+          <h1>Passenger details</h1>
+          <section data-origin="${origin}" data-destination="${destination}" data-departure-date="2026-10-15">
+            <p>${origin} → ${destination}</p>
+          </section>
+          <aside><p class="booking-total">Booking total ${total} EUR</p></aside>
+          <button type="button">Continue</button>
+        </main>`;
+      window.__ATW_TEST__.notePageMutations([{
+        type: "childList",
+        target: document.body,
+        addedNodes: [document.body.firstElementChild],
+        removedNodes: []
+      }]);
+      const observed = window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_hydrated_later" });
+      const acquisition = window.__ATW_TEST__.captureSelectedBookingFromMap(observed.map);
+      return window.__ATW_TEST__.composeSelectedBookingContract(acquisition, { id: selectedTravelerId });
+    }, { ...checkoutCase, travelerId });
+    expect(laterContract).toMatchObject({
+      contractVersion: "selected-booking/v1",
+      itinerary: { segments: [expect.objectContaining({ origin: checkoutCase.origin, destination: checkoutCase.destination })] },
+      approvedTotal: { amount: checkoutCase.total, currency: "EUR" },
+      travelerIds: [travelerId]
+    });
+  });
+}
+
+test("a persisted booking acquisition composes immediately on a later checkout surface", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <section data-origin="LJU" data-destination="LGW" data-departure-date="2026-10-15">LJU → LGW</section>
+      <p>Booking total 250 EUR</p>
+    </main>
+  `);
+  let requestBody = null;
+  await page.route("https://agent.test/api/agent/session", async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ id: "chk_persisted_booking" }) });
+  });
+  const session = await page.evaluate(async () => {
+    window.chrome = {
+      storage: { local: { get: async () => ({ apiBase: "https://agent.test/api" }) } },
+      runtime: { sendMessage: async () => ({ ok: false }) }
+    };
+    const profile = { id: "trav_persisted_booking", first_name: "Ali", last_name: "Example" };
+    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
+    const observed = window.__ATW_TEST__.observePageState({ forceFull: true, reason: "persist_booking" });
+    window.__ATW_TEST__.captureSelectedBookingFromMap(observed.map);
+    document.body.innerHTML = "<main><h1>Passenger details</h1></main>";
+    window.__ATW_TEST__.notePageMutations([{ type: "childList", target: document.body }]);
+    return window.__ATW_TEST__.startAgentSession();
+  });
+  expect(session.id).toBe("chk_persisted_booking");
+  expect(requestBody.selectedBookingContract).toMatchObject({
+    approvedTotal: { amount: 250, currency: "EUR" },
+    travelerIds: ["trav_persisted_booking"]
+  });
+});
+
+test("startup without booking evidence creates a provisional session without a background scan loop", async ({ page }) => {
+  await loadHtmlProducer(page, "<main><h1>Passenger details</h1><p>No booking summary</p></main>");
+  let requestBody = null;
+  await page.route("https://agent.test/api/agent/session", async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ id: "chk_provisional_no_booking" }) });
+  });
+  const started = await page.evaluate(async () => {
+    window.chrome = {
+      storage: { local: { get: async () => ({ apiBase: "https://agent.test/api" }) } },
+      runtime: { sendMessage: async () => ({ ok: false }) }
+    };
+    const profile = { id: "trav_timeout", first_name: "Ali", last_name: "Example" };
+    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
+    window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_timeout_shell" });
+    const startedAt = performance.now();
+    const session = await window.__ATW_TEST__.startAgentSession();
+    return { session, elapsedMs: performance.now() - startedAt };
+  });
+  expect(started.session.id).toBe("chk_provisional_no_booking");
+  expect(started.elapsedMs).toBeLessThan(1_000);
+  expect(requestBody.selectedBookingContract).toBeNull();
+  expect(await page.evaluate(() => window.__ATW_TEST__.scheduleSelectedBookingCapture("post_start"))).toBe(false);
+});
+
+test("an invalid stored booking falls back to fresh acquisition for the selected wallet traveler", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <section data-origin="LJU" data-destination="LGW" data-departure-date="2026-10-15">LJU → LGW</section>
+      <p class="booking-total">Booking total 250 EUR</p>
+      <button type="button">Continue</button>
+    </main>
+  `);
+  let requestBody = null;
+  await page.route("https://agent.test/api/agent/session", async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "chk_fresh_acquisition" })
+    });
+  });
+  const staleContract = {
+    contractVersion: "selected-booking/v1",
+    selectionId: "stale_selection",
+    selectedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+    sourceUrl: "https://example.test/old",
+    itinerary: { segments: [{ origin: "OLD", destination: "OLD", departureDate: "2025-01-01" }] },
+    approvedTotal: { amount: 1, currency: "EUR" },
+    travelerIds: ["trav_other"]
+  };
+  const session = await page.evaluate(async ({ stored }) => {
+    window.chrome = {
+      storage: { local: { get: async () => ({ apiBase: "https://agent.test/api", selectedBookingContract: stored }) } },
+      runtime: { sendMessage: async () => ({ ok: false }) }
+    };
+    const profile = { id: "trav_current", first_name: "Ali", last_name: "Example" };
+    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
+    window.__ATW_TEST__.observePageState({ forceFull: true, reason: "stored_contract_fallback" });
+    return window.__ATW_TEST__.startAgentSession();
+  }, { stored: staleContract });
+  expect(session.id).toBe("chk_fresh_acquisition");
+  expect(requestBody.selectedBookingContract).toMatchObject({
+    contractVersion: "selected-booking/v1",
+    approvedTotal: { amount: 250, currency: "EUR" },
+    travelerIds: ["trav_current"]
+  });
+  expect(requestBody.selectedBookingContract.selectionId).not.toBe("stale_selection");
+});
+
+test("resume sends no stored booking contract and uses only the durable baseline", async ({ page }) => {
+  await loadHtmlProducer(page, "<main><h1>Passenger details</h1></main>");
+  let requestBody = null;
+  await page.route("https://agent.test/api/agent/session", async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "chk_resume_existing" })
+    });
+  });
+  const session = await page.evaluate(async () => {
+    window.chrome = {
+      storage: {
+        local: {
+          get: async () => ({
+            apiBase: "https://agent.test/api",
+            selectedBookingContract: {
+              contractVersion: "selected-booking/v1",
+              selectionId: "must_not_be_resent",
+              selectedAt: new Date().toISOString(),
+              itinerary: { segments: [{ origin: "LJU", destination: "LGW", departureDate: "2026-10-15" }] },
+              approvedTotal: { amount: 250, currency: "EUR" },
+              travelerIds: ["trav_resume"]
+            }
+          })
+        }
+      },
+      runtime: { sendMessage: async () => ({ ok: false }) }
+    };
+    const profile = { id: "trav_resume", first_name: "Ali", last_name: "Example" };
+    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
+    window.__ATW_TEST__.observePageState({ forceFull: true, reason: "resume_without_contract" });
+    return window.__ATW_TEST__.startAgentSession("chk_resume_existing");
+  });
+  expect(session.id).toBe("chk_resume_existing");
+  expect(requestBody).toMatchObject({
+    sessionId: "chk_resume_existing",
+    resumeOnly: true,
+    selectedBookingContract: null
+  });
 });
 
 async function loadHtmlProducer(page, html) {
@@ -7272,7 +7456,7 @@ test("real backend suppresses unchanged destination observations and wakes on tr
     data: {
       goal: "Continue checkout safely to payment review",
       traveler,
-      selectedBooking: testSelectedBooking(traveler.id),
+      selectedBookingContract: testSelectedBooking(traveler.id),
       page: { site: "example.test", url: page.url(), step: "extras" }
     }
   });
@@ -9763,7 +9947,7 @@ test("large canonical observation uploads screenshot separately and reaches a gr
     data: {
       goal: "Continue checkout safely",
       traveler,
-      selectedBooking: testSelectedBooking(traveler.id),
+      selectedBookingContract: testSelectedBooking(traveler.id),
       page: { site: "example.test", url: page.url(), step: "traveler_information" }
     }
   });

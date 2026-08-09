@@ -84,27 +84,45 @@ function createAgentSession(body = {}) {
   if (body.resumeOnly && (!requestedSessionId || !existing)) {
     return null;
   }
-  const explicitSelectedBooking = normalizeSelectedBooking(body.selectedBookingContract);
-  const selectedBooking = explicitSelectedBooking
-    ? {
-        observationId: explicitSelectedBooking.selectionId,
-        sourceUrl: explicitSelectedBooking.sourceUrl,
-        facts: transactionFactsFromSelectedBooking(explicitSelectedBooking)
-      }
-    : validatedSelectedBookingAcquisition(body.selectedBooking);
   const durableBaseline = existing?.transactionInvariants?.baseline || null;
-  // A product-launched checkout supplies SelectedBooking and receives an
-  // approved immutable baseline immediately. Direct airline canaries still
-  // start provisionally while that cross-origin launch handoff is being wired;
-  // transaction verification must collect the same facts before payment review.
-  // Do not turn incomplete airline DOM evidence into a second admission gate.
+  // A finalized product contract seeds approved transaction truth immediately.
+  // Direct-site sessions may begin without it and progressively promote one
+  // coherent owned booking envelope; raw acquisition is never admitted here.
+  const admittedSelectedBooking = existing ? null : normalizeSelectedBooking(body.selectedBookingContract);
+  const selectedBooking = admittedSelectedBooking
+    ? {
+        observationId: admittedSelectedBooking.selectionId,
+        sourceUrl: admittedSelectedBooking.sourceUrl,
+        facts: transactionFactsFromSelectedBooking(admittedSelectedBooking)
+      }
+    : null;
   const selectedTravelerIds = (selectedBooking?.facts?.travelers || durableBaseline?.travelers || [])
     .map((entry) => clampText(entry?.travelerId, 120))
     .filter(Boolean);
-  const primaryTravelerId = clampText(
-    traveler.id || body.travelerId || existing?.travelerId || selectedTravelerIds[0] || "",
-    120
-  );
+  const requestedTravelerId = clampText(traveler.id || body.travelerId || "", 120);
+  const durableTravelerId = clampText(existing?.travelerId || selectedTravelerIds[0] || "", 120);
+  if (existing && requestedTravelerId && requestedTravelerId !== durableTravelerId) {
+    throw requestBodyError(
+      "TRAVELER_IDENTITY_MISMATCH",
+      "The selected wallet traveler does not match the traveler bound to this durable checkout.",
+      409
+    );
+  }
+  if (!existing && !requestedTravelerId) {
+    throw requestBodyError(
+      "SELECTED_TRAVELER_REQUIRED",
+      "Select at least one wallet traveler before starting checkout.",
+      422
+    );
+  }
+  if (!existing && selectedBooking && !selectedTravelerIds.includes(requestedTravelerId)) {
+    throw requestBodyError(
+      "TRAVELER_IDENTITY_MISMATCH",
+      "The selected wallet traveler is not authorized by the selected booking contract.",
+      409
+    );
+  }
+  const primaryTravelerId = existing ? durableTravelerId : requestedTravelerId;
   const state = existing || agentSessionStore.getOrCreateSession(requestedSessionId, {
     goal: clampText(body.goal || body.userIntent || "Complete checkout safely.", 500),
     travelerId: primaryTravelerId,
@@ -116,8 +134,8 @@ function createAgentSession(body = {}) {
     travelerId: primaryTravelerId,
     travelerIds: [...new Set([
       ...selectedTravelerIds,
-      traveler.id || body.travelerId || state.travelerId
-    ].map((value) => clampText(value, 120)).filter(Boolean))],
+      primaryTravelerId
+    ].filter(Boolean))],
     userPolicy: canonicalizeUserPolicy({
       bookingRules: clampText(traveler.booking_rules, 800),
       baggagePreference: clampText(traveler.baggage_preference, 120),
@@ -1006,44 +1024,6 @@ function compactTransactionFacts(facts = null) {
   };
 }
 
-function validatedSelectedBookingAcquisition(raw = null) {
-  if (!raw || typeof raw !== "object") return null;
-  const facts = compactTransactionFacts(raw.facts || raw);
-  const segments = facts?.itinerary?.segments || [];
-  const evidence = facts?.factEvidence?.itinerary || [];
-  const totalAmount = finiteNumberOrNull(facts?.totalPrice?.amount);
-  const totalCurrency = clampText(facts?.totalPrice?.currency || facts?.currency, 20).toUpperCase();
-  const totalEvidence = facts?.factEvidence?.totalPrice || null;
-  const travelerIds = (facts?.travelers || []).map((entry) => clampText(entry?.travelerId, 120)).filter(Boolean);
-  const authoritativeTotal = totalAmount != null
-    && totalAmount >= 0
-    && Boolean(totalCurrency)
-    && totalEvidence?.authoritative === true
-    && totalEvidence?.role === "booking_total"
-    && Boolean(totalEvidence?.ownerKey);
-  const complete = facts?.evidenceMode === "typed"
-    && facts?.itinerary?.completeness === "complete"
-    && segments.length > 0
-    && travelerIds.length > 0
-    && authoritativeTotal
-    && segments.every((segment) => {
-      const proof = segment.evidence || evidence.find((entry) => entry.segmentId === segment.segmentId) || null;
-      return Boolean(
-        segment.origin
-        && segment.destination
-        && segment.departureDate
-        && proof?.authoritative === true
-        && proof.ownerKey
-      );
-    });
-  if (!complete) return null;
-  return {
-    observationId: clampText(raw.observationId || `selected_booking_${Date.now()}`, 120),
-    sourceUrl: clampText(raw.sourceUrl, 1000),
-    facts
-  };
-}
-
 function compactTerminalEvidence(evidence = null) {
   if (!evidence || typeof evidence !== "object") return null;
   const compiled = agentContract.compileTerminalEvidence({ terminalEvidence: evidence });
@@ -1354,6 +1334,13 @@ async function decideAgentNextActionViaLoop(body) {
     ? agentSessionStore.getObservation(state.id, state.currentObservationId)
     : null;
   const previousObservationReadMs = Date.now() - previousObservationReadStartedAt;
+  // A full-page navigation creates a new content-script document, so the
+  // request may not carry the result reported by the previous document. The
+  // governed-action ledger is the durable execution authority: reattach only
+  // the result matching the currently leased action, never arbitrary history.
+  const durablePendingActionResult = payload.lastActionResult
+    ? null
+    : agentSessionStore.getPendingActionResult(state);
 
   const observation = {
     observationId: payload.observationId,
@@ -1362,7 +1349,7 @@ async function decideAgentNextActionViaLoop(body) {
     destinationReadiness: payload.destinationReadiness,
     userIntent: payload.userIntent,
     page: payload.page,
-    lastActionResult: payload.lastActionResult || null
+    lastActionResult: payload.lastActionResult || durablePendingActionResult || null
   };
 
   // The loop owns the single authoritative state commit for this turn. The

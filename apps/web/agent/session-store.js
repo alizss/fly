@@ -370,12 +370,30 @@ function compactRecoveryState(recovery = null) {
 function compactPendingAction(pending = null) {
   if (!pending || typeof pending !== "object") return pending || null;
   const { originalAction, schemaVersion: _legacySchemaVersion, ...canonical } = pending;
-  return eventSummary({
+  const actionLease = pending.actionLease || (originalAction ? createActionLease(originalAction) : null);
+  const compactLease = actionLease ? {
+    ...eventSummary(actionLease),
+    // `eventSummary` intentionally removes properties named `observation`
+    // because they normally contain a complete browser graph. An ActionLease
+    // is different: its observation is only the immutable source id/hash and
+    // is required to invalidate the lease after a cross-document navigation.
+    observation: {
+      id: String(actionLease.observation?.id || ""),
+      hash: String(actionLease.observation?.hash || "")
+    }
+  } : null;
+  const compact = eventSummary({
     ...canonical,
     contractVersion: "leased-action/v1",
-    actionLease: pending.actionLease || (originalAction ? createActionLease(originalAction) : null),
+    actionLease: compactLease,
     candidateIdentity: pending.candidateIdentity ? eventSummary(pending.candidateIdentity) : undefined
   });
+  // The outer bounded traversal also encounters the nested key name, so put
+  // the two scalar identity fields back after generic compaction.
+  if (compact?.actionLease && compactLease?.observation) {
+    compact.actionLease.observation = compactLease.observation;
+  }
+  return compact;
 }
 
 function compactExecutionEpisode(state = {}) {
@@ -760,6 +778,17 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     return { ...row, action: parse(row.action_json, null), result: parse(row.result_json, null) };
   }
 
+  function getPendingActionResult(state = {}) {
+    const actionId = String(
+      executionEpisodeFor(state).leasedAction?.actionLease?.actionId || ""
+    );
+    if (!actionId) return null;
+    const governed = getGovernedAction(actionId);
+    const result = governed?.result;
+    if (!result || String(result.actionId || result.action?.id || "") !== actionId) return null;
+    return result;
+  }
+
   function recordActionResult(transactionId, result = {}, patch = {}) {
     const state = getSession(transactionId);
     if (!state) return null;
@@ -870,6 +899,7 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     advanceGovernedAction,
     updateGovernedAction,
     getGovernedAction,
+    getPendingActionResult,
     recordActionResult,
     recordActionEvent,
     recordActionEvents,
@@ -901,6 +931,7 @@ const DEFAULT_METHODS = [
   "advanceGovernedAction",
   "updateGovernedAction",
   "getGovernedAction",
+  "getPendingActionResult",
   "recordActionResult",
   "recordActionEvent",
   "recordActionEvents",
