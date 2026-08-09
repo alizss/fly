@@ -303,6 +303,7 @@ test("observation transport sends one latest result and loop failures stay typed
   const server = fs.readFileSync(path.join(root, "apps/web/server.js"), "utf8");
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
   const content = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const execution = fs.readFileSync(path.join(root, "apps/extension/src/content/execution/orchestrator.js"), "utf8");
   const observationPayload = content.slice(
     content.indexOf("const observationPayload = {"),
     content.indexOf("const transport = await postObservationWithSizeRecovery")
@@ -315,7 +316,7 @@ test("observation transport sends one latest result and loop failures stay typed
   assert.match(server, /throw failure/);
   assert.match(server, /error\.code === "AGENT_LOOP_FAILED"/);
   assert.match(content, /\["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"\]/);
-  assert.match(content, /decision\.fatalBackendFailure === true/);
+  assert.match(execution, /decision\.fatalBackendFailure === true/);
 });
 
 test("extension page-map and observation transport have one modular implementation", () => {
@@ -425,4 +426,19 @@ test("extension outcome verification owns expected results and canonical postcon
   assert.match(outcomes, /function verifyExpectedOutcomeInternal\s*\(/);
   assert.match(outcomes, /function transitionFeedbackForMaps\s*\(/);
   assert.match(outcomes, /function exactChildChoiceSettlementEvidence\s*\(/);
+});
+
+test("extension execution orchestrator owns one governed action lifecycle", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const orchestrator = fs.readFileSync(path.join(root, "apps/extension/src/content/execution/orchestrator.js"), "utf8");
+
+  assert.match(runtime, /createExecutionOrchestrator\s*\(/);
+  assert.doesNotMatch(runtime, /function executeAgentDecision\s*\(/);
+  assert.doesNotMatch(runtime, /function clickAndVerifyAdvance\s*\(/);
+  assert.doesNotMatch(runtime, /function pushVerificationLedger\s*\(/);
+  assert.match(orchestrator, /function executeAgentDecision\s*\(/);
+  assert.match(orchestrator, /function clickAndVerifyAdvance\s*\(/);
+  assert.match(orchestrator, /function pushVerificationLedger\s*\(/);
+  assert.match(orchestrator, /function verificationFromSurfaceFeedback\s*\(/);
 });
