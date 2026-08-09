@@ -332,3 +332,19 @@ test("extension page-map and observation transport have one modular implementati
   assert.match(transport, /function boundedObservationTransport\s*\(/);
   assert.match(transport, /function postObservationWithSizeRecovery\s*\(/);
 });
+
+test("extension logical controls and canonical graph compile outside the runtime orchestrator", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const controls = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/logical-controls.js"), "utf8");
+  const graph = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/control-graph.js"), "utf8");
+
+  assert.match(runtime, /createLogicalControlCompiler\s*\(/);
+  assert.match(runtime, /createControlGraphCompiler\s*\(/);
+  assert.doesNotMatch(runtime, /function controlOperationsForElement\s*\(/);
+  assert.doesNotMatch(runtime, /function applyControlsToObservationModels\s*\(/);
+  assert.match(controls, /function controlOperationsForElement\s*\(/);
+  assert.match(controls, /function canonicalControlForElement\s*\(/);
+  assert.match(graph, /function applyControlsToObservationModels\s*\(/);
+  assert.match(graph, /function buildCanonicalControlGraph\s*\(/);
+});
