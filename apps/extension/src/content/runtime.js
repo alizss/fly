@@ -9501,6 +9501,7 @@ import {
     normalizeMatchText,
     overlayTopHitCount,
     overlayVisualScore,
+    pointBelongsToElement,
     primaryPageText,
     queryAllDeep,
     resolveOwnedControlMeaning,

@@ -1846,6 +1846,41 @@ test("nonblocking popover-shaped checkout chrome cannot veto the page Skip bags 
   expect(candidateSet.candidates.some((candidate) => candidate.controlId === skip.controlId)).toBe(true);
 });
 
+test("foreground surface geometry receives its point ownership helper after module extraction", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { margin: 0; min-height: 100vh; }
+      #background-action { position: absolute; left: 24px; top: 24px; width: 160px; height: 44px; }
+      .popover {
+        position: absolute;
+        left: 12px;
+        bottom: 12px;
+        width: 220px;
+        height: 120px;
+        background: white;
+        border: 1px solid #ccc;
+        z-index: 10;
+      }
+      .popover button { width: 120px; height: 40px; }
+    </style>
+    <button id="background-action" type="button">Continue checkout</button>
+    <section class="popover" aria-label="Contextual help">
+      <p>Need help with this page?</p>
+      <button type="button">Close help</button>
+    </section>
+  `);
+
+  const map = await page.evaluate(() => window.__ATW_TEST__.buildPageMap());
+  expect(map.currentSurface).toMatchObject({
+    id: "surface-page",
+    type: "page",
+    blocksBackground: false
+  });
+  expect(map.surfaceStack).toEqual(expect.arrayContaining([
+    expect.objectContaining({ type: "popover", blocksBackground: false })
+  ]));
+});
+
 test("zero-quantity hold-bag counters remain offers and progress through Skip bags", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>body { font-family: sans-serif; padding: 24px; } button { min-height: 40px; }</style>

@@ -29,6 +29,7 @@ export function createForegroundSurfaceCompiler(dependencies) {
     normalizeMatchText,
     overlayTopHitCount,
     overlayVisualScore,
+    pointBelongsToElement,
     primaryPageText,
     queryAllDeep,
     resolveOwnedControlMeaning,
