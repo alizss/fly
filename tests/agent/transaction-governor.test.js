@@ -2276,12 +2276,18 @@ test("Unified semantic goal state survives a SQLite restart", () => {
     stage: "traveler_information",
     currentObligation: currentObligationFromGoal({ goal: currentGoal })
   };
-  state = withExecutionFixture(state, { leasedAction: {
-    status: "governed",
-    actionId: "act_email",
-    goalId: currentGoal.goalId,
-    candidateId: currentGoal.candidates[0].candidateId
-  } });
+  state = withExecutionFixture(state, { leasedAction: leasedActionRecord({
+    action: {
+      id: "act_email",
+      type: "type",
+      obligationId: currentGoal.goalId,
+      candidateId: currentGoal.candidates[0].candidateId,
+      risk: "safe"
+    },
+    candidate: currentGoal.candidates[0],
+    goal: currentGoal,
+    status: "governed"
+  }) });
   state = withExecutionFixture(state, { recovery: { ...recovery(state), attemptedCandidateIds: ["candidate_previous"] } });
   let store = createStore({ dbPath });
   store.saveSession(state);

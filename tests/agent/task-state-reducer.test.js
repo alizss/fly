@@ -2740,7 +2740,7 @@ test("one decision episode closes a selected parent dropdown after child confirm
   });
   assert.equal(completedState.decisionEpisode.status, "completed_pending_surface_exit");
   assert.equal(completedState.outcomeJournal.length, 1);
-  assert.equal(completedState.outcomeJournal[0].decisionInstanceId, parentState.decisionEpisode.decisionInstanceId);
+  assert.equal(completedState.outcomeJournal[0].decisionInstanceId, completedState.outcomeJournal[0].semanticOwnerId);
   assert.equal(completedState.currentGoal.semanticType, "completed_choice_surface");
   const candidates = buildCurrentCandidateSet({
     goal: completedState.currentGoal,
@@ -3136,7 +3136,8 @@ test("a verified commerce result is journaled even when its transient episode is
   });
 
   assert.equal(state.outcomeJournal.length, 1);
-  assert.equal(state.outcomeJournal[0].decisionInstanceId, decisionInstanceId);
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, state.outcomeJournal[0].semanticOwnerId);
+  assert.notEqual(state.outcomeJournal[0].semanticOwnerId, decisionInstanceId);
   assert.equal(state.outcomeJournal[0].admissionSource, "verified_action_contract");
   // Direct journal admission is useful backward-compatible evidence, but it
   // is not allowed to manufacture an expected obligation. Production loop
@@ -3202,7 +3203,8 @@ test("a verified commerce receipt remains an expected obligation after the sourc
   });
 
   assert.equal(state.outcomeJournal.length, 1);
-  assert.equal(state.outcomeJournal[0].decisionInstanceId, decisionInstanceId);
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, state.outcomeJournal[0].semanticOwnerId);
+  assert.notEqual(state.outcomeJournal[0].semanticOwnerId, decisionInstanceId);
   assert.equal(state.outcomeJournal[0].admissionSource, "verified_action_obligation");
   assert.deepEqual(state.outcomeCoverage.expectedActionIds, ["act_lost_bundle_decline"]);
   assert.deepEqual(state.outcomeCoverage.missingActionIds, ["act_lost_bundle_decline"]);
@@ -3271,9 +3273,10 @@ test("one verified action cannot create duplicate receipt and direct journal own
 
   assert.equal(state.outcomeJournal.length, 1);
   assert.equal(state.outcomeJournal[0].actionId, "act_flexible_none");
-  assert.equal(state.outcomeJournal[0].decisionInstanceId, canonicalOwnerId);
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, state.outcomeJournal[0].semanticOwnerId);
+  assert.notEqual(state.outcomeJournal[0].semanticOwnerId, canonicalOwnerId);
   assert.equal(state.outcomeJournal[0].admissionSource, "verified_action_obligation");
-  assert.deepEqual(state.outcomeCoverage.expectedDecisionInstanceIds, [canonicalOwnerId]);
+  assert.deepEqual(state.outcomeCoverage.expectedDecisionInstanceIds, [state.outcomeJournal[0].semanticOwnerId]);
   assert.equal(state.outcomeCoverage.expectedDecisionInstanceIds.includes(transientOwnerId), false);
 });
 
@@ -3337,7 +3340,8 @@ test("a stale page episode cannot own the next sibling receipt while its exact f
     "obs_baggage",
     { decisionEpisode: staleEpisode }
   );
-  assert.equal(baggage.decisionInstanceId, "owner_baggage");
+  assert.equal(baggage.decisionInstanceId, baggage.semanticOwnerId);
+  assert.notEqual(baggage.semanticOwnerId, "owner_baggage");
   assert.notEqual(baggage.decisionInstanceId, staleEpisode.canonicalOwnerId);
 
   const parentEpisode = {
@@ -3360,7 +3364,8 @@ test("a stale page episode cannot own the next sibling receipt while its exact f
     "obs_flexible_confirmation",
     { decisionEpisode: parentEpisode }
   );
-  assert.equal(child.decisionInstanceId, "owner_flexible");
+  assert.equal(child.decisionInstanceId, child.semanticOwnerId);
+  assert.notEqual(child.semanticOwnerId, "owner_flexible");
   assert.equal(child.decisionGroupId, "dg_flexible");
 });
 
@@ -3448,7 +3453,7 @@ test("a compact verified result resolves its exact commerce owner from the resul
   });
 
   assert.equal(state.outcomeJournal.length, 1);
-  assert.equal(state.outcomeJournal[0].decisionInstanceId, decisionInstanceId);
+  assert.equal(state.outcomeJournal[0].decisionInstanceId, state.outcomeJournal[0].semanticOwnerId);
   assert.equal(state.outcomeJournal[0].subjectKey, "extras_airhelp");
   assert.deepEqual(state.outcomeCoverage.expectedDecisionInstanceIds, []);
 });

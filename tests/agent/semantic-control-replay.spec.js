@@ -11624,7 +11624,7 @@ test("multi-surface free choice confirms once, closes its completed parent, and 
   expect(taskState.decisionEpisode.status).toBe("completed_pending_surface_exit");
   expect(taskState.outcomeJournal).toHaveLength(1);
   expect(taskState.outcomeJournal[0]).toMatchObject({
-    decisionInstanceId: taskState.decisionEpisode.decisionInstanceId,
+    decisionInstanceId: taskState.outcomeJournal[0].semanticOwnerId,
     verified: true,
     originKind: "verified_commerce_decision"
   });

@@ -296,7 +296,6 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
     }
   }
   return Object.freeze({
-    contractVersion: "transaction-review/v1",
     ready: envelope.baselineStatus === "approved" && !missing.length && !contradictions.length,
     baselineStatus: envelope.baselineStatus || "collecting",
     missingFacts: Object.freeze(missing),

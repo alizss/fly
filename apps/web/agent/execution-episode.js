@@ -11,7 +11,7 @@ const RECOVERY_FIELDS = Object.freeze([
   "lastCode",
   "lastRevealSample",
   "outcomeId",
-  "decisionInstanceId",
+  "semanticOwnerId",
   "transitionTrail",
   "staleRebind",
   "remainingAttempts",
@@ -55,7 +55,7 @@ function emptyExecutionEpisode() {
     lastCode: "",
     lastRevealSample: null,
     outcomeId: "",
-    decisionInstanceId: "",
+    semanticOwnerId: "",
     transitionTrail: [],
     staleRebind: null,
     remainingAttempts: 0,
@@ -68,6 +68,7 @@ function emptyExecutionEpisode() {
 
 function normalizeExecutionEpisode(raw = null) {
   const source = raw && typeof raw === "object" ? raw : {};
+  const { decisionInstanceId: legacyDecisionInstanceId = "", ...canonicalSource } = source;
   const leasedAction = source.leasedAction && typeof source.leasedAction === "object"
     ? { ...source.leasedAction }
     : null;
@@ -82,14 +83,15 @@ function normalizeExecutionEpisode(raw = null) {
   }
   return {
     ...emptyExecutionEpisode(),
-    ...source,
+    ...canonicalSource,
     contractVersion: EXECUTION_EPISODE_VERSION,
-    obligationId: String(source.obligationId || ""),
+    obligationId: String(source.obligationId || leasedAction?.actionLease?.obligationId || ""),
     leasedAction,
     status: String(source.status || source.phase || "idle"),
     actionId: String(source.actionId || leasedAction?.actionLease?.actionId || leasedAction?.originalAction?.id || ""),
     observationId: String(source.observationId || ""),
-    candidateId: String(source.candidateId || source.leasedAction?.candidateId || ""),
+    candidateId: String(source.candidateId || source.leasedAction?.actionLease?.candidateId || source.leasedAction?.candidateId || ""),
+    semanticOwnerId: String(source.semanticOwnerId || legacyDecisionInstanceId || ""),
     approved: source.approved === true,
     dispatched: source.dispatched === true,
     observed: source.observed === true,

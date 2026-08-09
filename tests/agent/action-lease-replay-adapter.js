@@ -1,21 +1,34 @@
 function executableDecisionFromActionLease(rawDecision = {}) {
   const lease = rawDecision.actionLease || null;
   if (lease?.contractVersion !== "action-lease/v1") return rawDecision;
+  const operation = String(lease.mechanic?.operation || "");
+  const semanticEffect = String(lease.expected?.semanticEffect || "");
+  const actionType = String(lease.mechanic?.actionType || rawDecision.action || "stop");
+  const interactionRole = ["choose", "select"].includes(operation)
+    ? "choice"
+    : operation === "open"
+      ? "opener"
+      : ["type", "select"].includes(actionType)
+        ? "field"
+        : /advance|navigate/.test(semanticEffect)
+          ? "navigation"
+          : "command";
+  const successCondition = lease.expected?.successCondition || null;
   return {
     ...rawDecision,
     actionId: lease.actionId || rawDecision.actionId || "",
     observationId: lease.observation?.id || "",
     observationHash: lease.observation?.hash || "",
-    action: lease.mechanic?.actionType || rawDecision.action || "stop",
-    intent: lease.expected?.intent || lease.expected?.semanticEffect || rawDecision.action || "",
-    operation: lease.mechanic?.operation || "",
-    mechanicalEffect: lease.mechanic?.effect || "",
-    physicalEffect: lease.mechanic?.effect || "",
-    interactionRole: lease.expected?.interactionRole || "",
-    semanticEffect: lease.expected?.semanticEffect || "",
-    expectedEvidence: lease.expected?.evidence || "",
-    semanticIntent: lease.expected?.semanticEffect || "",
-    expectedPostconditions: lease.expected?.postconditions || [],
+    action: actionType,
+    intent: String(lease.expected?.objective || semanticEffect || actionType),
+    operation,
+    mechanicalEffect: String(lease.mechanic?.effect || operation),
+    physicalEffect: String(lease.mechanic?.effect || operation),
+    interactionRole,
+    semanticEffect,
+    expectedEvidence: String(successCondition?.type || ""),
+    semanticIntent: semanticEffect,
+    expectedPostconditions: successCondition ? [successCondition] : [],
     goalId: lease.obligationId || "",
     obligationId: lease.obligationId || "",
     semanticOwner: lease.semanticOwner || null,
@@ -26,9 +39,13 @@ function executableDecisionFromActionLease(rawDecision = {}) {
     controlId: lease.target?.controlId || "",
     actuatorId: lease.target?.actuatorId || "",
     targetId: lease.target?.actuatorId || "",
-    targetSnapshot: lease.target?.snapshot || null,
-    decisionGroupId: lease.target?.decisionGroupId || lease.target?.snapshot?.decisionGroupId || "",
-    expectedOutcome: lease.expected?.successCondition || null,
+    targetSnapshot: null,
+    decisionGroupId: String(
+      successCondition?.decisionGroupId
+      || successCondition?.parentDecisionGroupId
+      || ""
+    ),
+    expectedOutcome: successCondition,
     affordance: lease.expected?.policyAuthorization ? {
       policy: lease.expected.policyAuthorization
     } : null,

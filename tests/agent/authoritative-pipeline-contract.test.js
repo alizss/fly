@@ -117,7 +117,9 @@ test("raw exact commerce receipt is persisted before lifecycle can reinterpret p
   );
 
   assert.equal(receipt.actionId, actionId);
-  assert.equal(receipt.decisionInstanceId, canonicalOwnerId);
+  assert.equal(receipt.decisionInstanceId, receipt.semanticOwnerId);
+  assert.notEqual(receipt.semanticOwnerId, canonicalOwnerId);
+  assert.match(receipt.semanticOwnerId, /^owner:/);
 
   // Parent checkout status is free to progress later; the receipt is already
   // immutable and no longer depends on those rewritten booleans.

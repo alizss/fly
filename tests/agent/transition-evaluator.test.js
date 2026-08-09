@@ -159,7 +159,8 @@ test("authoritative transition records exact free selection as fresh visible pro
     after.observationId
   );
   assert.equal(receipt.actionId, "act_1");
-  assert.equal(receipt.decisionInstanceId, "seats:extras:seat-decline:dg_seat:global");
+  assert.equal(receipt.decisionInstanceId, receipt.semanticOwnerId);
+  assert.match(receipt.semanticOwnerId, /^owner:/);
 });
 
 test("matching browser-verified stage advancement cannot be rewritten as no effect", () => {

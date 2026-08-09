@@ -19,7 +19,14 @@ function withExecutionFixture(state = {}, {
 }
 
 function leasedAction(state = {}) {
-  return executionEpisodeFor(state).leasedAction || null;
+  const leased = executionEpisodeFor(state).leasedAction || null;
+  if (!leased) return null;
+  return {
+    ...leased,
+    obligationId: leased.actionLease?.obligationId || "",
+    candidateId: leased.actionLease?.candidateId || "",
+    originalAction: leased.originalAction || null
+  };
 }
 
 function lifecycle(state = {}) {

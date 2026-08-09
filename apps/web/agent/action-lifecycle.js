@@ -45,21 +45,12 @@ function leasedActionRecord({ action = {}, candidate = null, goal = {}, status =
   const record = {
     contractVersion: LEASED_ACTION_VERSION,
     actionLease: createActionLease(action),
-    obligationId: action.obligationId || goal.obligationId || goal.goalId || "",
-    candidateId: action.candidateId || candidate?.candidateId || "",
-    candidateStableKey: candidate?.affordance?.stableKey || candidate?.stableKey || action.affordance?.stableKey || "",
-    capability: candidate?.operation || action.operation || action.type || "",
-    expectedOutcome: action.expectedOutcome || candidate?.expectedOutcome || null,
     status,
-    sourceObservationId: action.observationId || "",
-    sourceObservationHash: action.observationHash || "",
     recoveryAttempts: Number(recoveryAttempts || 0),
     candidateIdentity: candidate ? {
       candidateId: candidate.candidateId || action.candidateId || "",
       stableKey: candidate.affordance?.stableKey || candidate.stableKey || action.affordance?.stableKey || "",
       operation: candidate.operation || action.operation || action.type || "",
-      semanticGoal: candidate.semanticGoal || "",
-      decisionGroupId: candidate.decisionGroupId || action.decisionGroupId || "",
       controlId: candidate.controlId || action.controlId || "",
       actuatorId: candidate.actuatorId || candidate.targetId || action.actuatorId || "",
       interactionMethod: candidate.interactionMethod || action.interactionMethod || ""
@@ -96,7 +87,7 @@ function normalizeLeasedAction(pending = null) {
   return leasedActionRecord({
     action: { ...action, id: pending.actionId || action.id || "" },
     candidate: pending.candidateIdentity || pending.candidate || null,
-    goal: { obligationId: pending.obligationId || pending.goalId || "" },
+    goal: { obligationId: pending.actionLease?.obligationId || pending.obligationId || pending.goalId || "" },
     status: pending.type === "viewport_rebind" || pending.status === "viewport_recovery" || pending.status === "rebind"
       ? "needs_reveal"
       : (pending.status === "approved" ? "ready" : (pending.status || "ready")),
@@ -200,7 +191,7 @@ function executionRecoveryFor(state = {}) {
     lastCode: String(existing.lastCode || ""),
     lastRevealSample: existing.lastRevealSample || null,
     outcomeId: String(existing.outcomeId || ""),
-    decisionInstanceId: String(existing.decisionInstanceId || ""),
+    semanticOwnerId: String(existing.semanticOwnerId || ""),
     transitionTrail: [...(existing.transitionTrail || [])].slice(-12),
     remainingAttempts: Math.max(0, Number(existing.remainingAttempts || 0)),
     deadlineAt: Math.max(0, Number(existing.deadlineAt || 0)),
@@ -276,7 +267,7 @@ function updateExecutionRecovery(state = {}, event = {}) {
     next.failedStrategies = [];
     next.lastCode = code;
     next.lastRevealSample = null;
-    next.decisionInstanceId = "";
+    next.semanticOwnerId = "";
     classification = kind;
   } else if (["grounding_rejection", "planner_rejection"].includes(kind)) {
     next.phase = kind;
@@ -295,19 +286,19 @@ function updateExecutionRecovery(state = {}, event = {}) {
     classification = event.measurableProgress === true ? "reveal_progress" : "reveal_no_effect";
   } else if (kind === "execution_no_effect") {
     const stateHash = String(event.stateHash || "");
-    const decisionInstanceId = String(event.decisionInstanceId || "");
-    const sameDecisionInstance = Boolean(
-      decisionInstanceId
-      && previous.decisionInstanceId
-      && decisionInstanceId === previous.decisionInstanceId
+    const semanticOwnerId = String(event.semanticOwnerId || "");
+    const sameSemanticOwner = Boolean(
+      semanticOwnerId
+      && previous.semanticOwnerId
+      && semanticOwnerId === previous.semanticOwnerId
     );
-    const signatures = !sameDecisionInstance || (stateHash && stateHash !== previous.stateHash)
+    const signatures = !sameSemanticOwner || (stateHash && stateHash !== previous.stateHash)
       ? []
       : [...previous.failedStrategySignatures];
     if (event.strategySignature && !signatures.includes(event.strategySignature)) signatures.push(event.strategySignature);
     next.phase = "execution_no_effect";
     next.stateHash = stateHash || previous.stateHash;
-    next.decisionInstanceId = decisionInstanceId;
+    next.semanticOwnerId = semanticOwnerId;
     next.failedStrategySignatures = signatures;
     next.attempts = signatures.length || previous.attempts + 1;
     next.lastCode = code || "TRANSITION_NO_EFFECT";
@@ -665,14 +656,14 @@ function advanceActionLifecycle({
         || ""
       );
       const signature = actuatorSignature(action);
-      const decisionInstanceId = action.decisionInstanceId
+      const semanticOwnerId = action.semanticOwnerId
         || decisionInstanceKey(action, previousObservation || observation);
       recovery = updateExecutionRecovery(state, {
         kind: "execution_no_effect",
         code: "TRANSITION_NO_EFFECT",
         stateHash,
         strategySignature: signature,
-        decisionInstanceId
+        semanticOwnerId
       });
       lifecycle = { ...lifecycle, status: "failed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
       // A finite no-effect budget suppresses repeated strategies, but it does

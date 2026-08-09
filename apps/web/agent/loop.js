@@ -1994,7 +1994,7 @@ async function runLoopTurn({
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
         type: "wait",
         intent: "reobserve_after_grounding_rejection",
-        obligationId: pending.obligationId || "",
+        obligationId: pending.actionLease?.obligationId || pending.obligationId || "",
         reason: "The pending target disappeared. Discard its binding, rebuild candidates from the fresh surface, and reselect without consuming an execution attempt.",
         risk: "safe",
         requiresApproval: false
@@ -2114,7 +2114,7 @@ async function runLoopTurn({
           observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
           type: "wait",
           intent: "reobserve_after_grounding_rejection",
-          obligationId: pending.obligationId || "",
+          obligationId: pending.actionLease?.obligationId || pending.obligationId || "",
           reason: "The governed reveal binding was rejected before dispatch. Rebuild it from a fresh observation without consuming an execution attempt.",
           risk: "safe",
           requiresApproval: false
@@ -2139,7 +2139,7 @@ async function runLoopTurn({
       const exhaustedGoal = authoritativeGoal || {};
       const mechanicalEvidence = {
         kind: "goal_strategies_exhausted",
-        goalId: obligationField(exhaustedGoal, "goalId") || pending.obligationId || "",
+        goalId: obligationField(exhaustedGoal, "goalId") || pending.actionLease?.obligationId || pending.obligationId || "",
         semanticGoalKey: semanticGoalKey(exhaustedGoal),
         decisionGroupId: exhaustedGoal.decisionGroupId || exhaustedGoal.subject?.decisionGroupId || "",
         subjectKey: exhaustedGoal.canonicalSubject?.key || exhaustedGoal.subject?.key || exhaustedGoal.semanticType || "",
@@ -2178,7 +2178,7 @@ async function runLoopTurn({
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
         type: "wait",
         intent: "reobserve_after_grounding_rejection",
-        obligationId: pending.obligationId || "",
+        obligationId: pending.actionLease?.obligationId || pending.obligationId || "",
         reason: "The rebound pending action was rejected before dispatch. Rebuild current candidates from fresh browser evidence without consuming an execution attempt.",
         risk: "safe",
         requiresApproval: false

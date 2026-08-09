@@ -172,7 +172,16 @@ function normalizeAction(raw = {}) {
   const expectedPostconditions = Array.isArray(raw.expectedPostconditions)
     ? raw.expectedPostconditions.filter((item) => item && typeof item === "object").map((item) => ({ ...item })).slice(0, 8)
     : (raw.expectedOutcome && typeof raw.expectedOutcome === "object" ? [{ ...raw.expectedOutcome }] : []);
-  const owner = semanticOwnerFromLegacy(raw);
+  const hasSemanticOwner = Boolean(
+    raw.semanticOwner
+    || raw.semanticOwnerId
+    || raw.decisionInstanceId
+    || raw.canonicalOwnerId
+    || raw.decisionOwnerKey
+    || raw.requirementId
+    || raw.decisionGroupId
+  );
+  const owner = hasSemanticOwner ? semanticOwnerFromLegacy(raw) : null;
   return {
     id: String(raw.id || `act_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
     type: ACTION_TYPES.has(raw.type) ? raw.type : "stop",
@@ -192,7 +201,7 @@ function normalizeAction(raw = {}) {
     policyCorrectionForDecisionGroupId: raw.policyCorrectionForDecisionGroupId ? String(raw.policyCorrectionForDecisionGroupId).slice(0, 140) : "",
     obligationId: (raw.obligationId || raw.goalId) ? String(raw.obligationId || raw.goalId).slice(0, 200) : "",
     semanticOwner: owner,
-    semanticOwnerId: String(raw.semanticOwnerId || semanticOwnerId(owner)).slice(0, 300),
+    semanticOwnerId: String(raw.semanticOwnerId || (owner ? semanticOwnerId(owner) : "")).slice(0, 300),
     decisionInstanceId: raw.decisionInstanceId ? String(raw.decisionInstanceId).slice(0, 900) : "",
     candidateId: raw.candidateId ? String(raw.candidateId).slice(0, 240) : "",
     candidateClass: ["proven_action", "mechanical_hypothesis"].includes(raw.candidateClass)
@@ -263,9 +272,11 @@ function createActionLease(action = {}) {
   action = normalizeAction(action);
   const targetSnapshot = action.targetSnapshot || null;
   const successCondition = action.expectedOutcome || action.expectedPostconditions?.[0] || null;
-  const semanticOwner = normalizeSemanticOwner(action.semanticOwner, {
-    repeatedInstance: action.decisionInstanceId || action.requirementId || action.decisionGroupId || ""
-  });
+  const semanticOwner = action.semanticOwner
+    ? normalizeSemanticOwner(action.semanticOwner, {
+        repeatedInstance: action.decisionInstanceId || action.requirementId || action.decisionGroupId || ""
+      })
+    : null;
   return Object.freeze({
     contractVersion: "action-lease/v1",
     actionId: action.id || "",
@@ -274,19 +285,21 @@ function createActionLease(action = {}) {
       hash: action.observationHash || ""
     }),
     obligationId: action.obligationId || "",
-    semanticOwner: Object.freeze(semanticOwner),
-    semanticOwnerId: action.semanticOwnerId || semanticOwnerId(semanticOwner),
+    semanticOwner: semanticOwner ? Object.freeze(semanticOwner) : null,
+    semanticOwnerId: action.semanticOwnerId || (semanticOwner ? semanticOwnerId(semanticOwner) : ""),
     candidateId: action.candidateId || "",
     target: Object.freeze({
       controlId: action.controlId || targetSnapshot?.controlId || "",
       actuatorId: action.actuatorId || "",
-      surfaceId: targetSnapshot?.surfaceId || action.surfaceId || "",
-      snapshot: targetSnapshot
+      surfaceId: targetSnapshot?.surfaceId || action.surfaceId || ""
     }),
     mechanic: Object.freeze({
       actionType: action.type,
       operation: action.operation || "",
       method: action.interactionMethod || "",
+      // Operation is the browser primitive (activate/type/choose); effect is
+      // the mechanically expected state transition (for example
+      // advance_surface). They are deliberately distinct canonical facts.
       effect: action.mechanicalEffect || "",
       value: action.value || action.targetLabel || "",
       keys: action.keys || "",
@@ -298,16 +311,13 @@ function createActionLease(action = {}) {
       boundedRecovery: action.boundedRecovery === true
     }),
     expected: Object.freeze({
-      intent: action.intent || "",
+      objective: action.intent || "",
       semanticEffect: action.semanticEffect || "",
-      interactionRole: action.interactionRole || "",
-      evidence: action.expectedEvidence || "",
       policyAuthorization: Object.freeze({
         allow: action.affordance?.policy?.allow === true,
         decision: String(action.affordance?.policy?.decision || "")
       }),
-      successCondition,
-      postconditions: action.expectedPostconditions || (successCondition ? [successCondition] : [])
+      successCondition
     }),
     capabilityProof: action.pipelineContract || null,
     risk: action.risk || "uncertain"
@@ -332,11 +342,10 @@ function actionFromLease(lease = null) {
     candidateId: lease.candidateId || "",
     controlId: target.controlId || "",
     actuatorId: target.actuatorId || "",
-    decisionGroupId: target.snapshot?.decisionGroupId || "",
-    targetSnapshot: target.snapshot || null,
+    targetSnapshot: null,
     operation: mechanic.operation || "",
     interactionMethod: mechanic.method || "",
-    mechanicalEffect: mechanic.effect || "",
+    mechanicalEffect: mechanic.effect || mechanic.operation || "",
     targetLabel: carriesInputValue ? "" : (mechanic.value || ""),
     value: carriesInputValue ? (mechanic.value || "") : "",
     keys: mechanic.keys || "",
@@ -346,12 +355,10 @@ function actionFromLease(lease = null) {
     visualRegion: mechanic.visualRegion || null,
     exactOption: mechanic.exactOption || null,
     boundedRecovery: mechanic.boundedRecovery === true,
-    intent: expected.intent || "",
+    intent: expected.objective || expected.semanticEffect || "",
     semanticEffect: expected.semanticEffect || "",
-    interactionRole: expected.interactionRole || "",
-    expectedEvidence: expected.evidence || "",
     expectedOutcome: expected.successCondition || null,
-    expectedPostconditions: expected.postconditions || [],
+    expectedPostconditions: expected.successCondition ? [expected.successCondition] : [],
     affordance: {
       policy: {
         allow: expected.policyAuthorization?.allow === true,

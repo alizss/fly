@@ -4,8 +4,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { toClientDecision } = require("../../apps/web/agent/loop");
-const { normalizeAction } = require("../../packages/shared/agent-actions");
+const { actionFromLease, normalizeAction } = require("../../packages/shared/agent-actions");
 const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
+const { normalizeExecutionEpisode } = require("../../apps/web/agent/execution-episode");
 const {
   normalizeSemanticOwner,
   semanticOwnerId
@@ -43,9 +45,99 @@ test("ActionLease is the sole enumerable execution contract at the HTTP boundary
   assert.deepEqual(transported.actionLease.target, {
     controlId: "control_1",
     actuatorId: "actuator_1",
-    surfaceId: "",
-    snapshot: null
+    surfaceId: ""
   });
+  assert.equal(transported.actionLease.expected.intent, undefined);
+  assert.equal(transported.actionLease.expected.objective, "");
+  assert.equal(transported.actionLease.expected.interactionRole, undefined);
+  assert.equal(transported.actionLease.expected.evidence, undefined);
+  assert.equal(transported.actionLease.expected.postconditions, undefined);
+  assert.deepEqual(Object.keys(transported.actionLease.target).sort(), ["actuatorId", "controlId", "surfaceId"]);
+  assert.deepEqual(Object.keys(transported.actionLease.expected).sort(), [
+    "objective",
+    "policyAuthorization",
+    "semanticEffect",
+    "successCondition"
+  ]);
+});
+
+test("ActionLease hydration does not recreate a transported target snapshot or semantic aliases", () => {
+  const decision = toClientDecision({
+    id: "act_compact",
+    type: "click",
+    observationId: "obs_compact",
+    observationHash: "hash_compact",
+    obligationId: "obligation_compact",
+    controlId: "control_compact",
+    actuatorId: "actuator_compact",
+    targetSnapshot: {
+      controlId: "control_compact",
+      decisionGroupId: "legacy_group",
+      label: "large duplicated snapshot"
+    },
+    intent: "advance_surface",
+    operation: "activate",
+    mechanicalEffect: "advance_surface",
+    semanticEffect: "advance_checkout_stage",
+    expectedOutcome: { type: "checkout_stage_advanced" },
+    risk: "safe"
+  });
+  const hydrated = actionFromLease(decision.actionLease);
+
+  assert.equal(decision.actionLease.target.snapshot, undefined);
+  assert.equal(hydrated.targetSnapshot, null);
+  assert.equal(hydrated.decisionGroupId, "");
+  assert.equal(hydrated.intent, "advance_surface");
+  assert.equal(hydrated.mechanicalEffect, "advance_surface");
+  assert.equal(hydrated.semanticEffect, "advance_checkout_stage");
+});
+
+test("durable leased action stores one ActionLease plus mechanical recovery identity", () => {
+  const record = leasedActionRecord({
+    action: {
+      id: "act_lease",
+      type: "click",
+      observationId: "obs_lease",
+      observationHash: "hash_lease",
+      obligationId: "obligation_lease",
+      candidateId: "candidate_lease",
+      controlId: "control_lease",
+      actuatorId: "actuator_lease",
+      operation: "activate",
+      risk: "safe"
+    },
+    candidate: {
+      candidateId: "candidate_lease",
+      controlId: "control_lease",
+      targetId: "actuator_lease",
+      operation: "activate"
+    }
+  });
+
+  for (const duplicate of [
+    "obligationId",
+    "candidateId",
+    "candidateStableKey",
+    "capability",
+    "expectedOutcome",
+    "sourceObservationId",
+    "sourceObservationHash"
+  ]) {
+    assert.equal(Object.prototype.hasOwnProperty.call(record, duplicate), false);
+  }
+  assert.equal(record.actionLease.obligationId, "obligation_lease");
+  assert.equal(record.actionLease.candidateId, "candidate_lease");
+  assert.equal(record.candidateIdentity.decisionGroupId, undefined);
+  assert.equal(record.candidateIdentity.semanticGoal, undefined);
+});
+
+test("execution episode migrates legacy decision identity into semanticOwnerId once", () => {
+  const episode = normalizeExecutionEpisode({
+    decisionInstanceId: "legacy_decision_instance",
+    status: "failed"
+  });
+  assert.equal(episode.semanticOwnerId, "legacy_decision_instance");
+  assert.equal(Object.prototype.hasOwnProperty.call(episode, "decisionInstanceId"), false);
 });
 
 test("legacy action aliases migrate once and never enter the canonical ActionDraft", () => {
@@ -185,4 +277,16 @@ test("production import graph exposes one mechanics binder and one ambiguity bou
   for (const token of retired) {
     assert.equal(fs.existsSync(path.join(root, `${token}.js`)), false);
   }
+});
+
+test("non-boundary internal contract versions are absent", () => {
+  const root = path.resolve(__dirname, "../../apps/web/agent");
+  const invariants = fs.readFileSync(path.join(root, "invariants.js"), "utf8");
+  const executionEpisode = fs.readFileSync(path.join(root, "execution-episode.js"), "utf8");
+  const lifecycle = fs.readFileSync(path.join(root, "action-lifecycle.js"), "utf8");
+
+  assert.doesNotMatch(invariants, /transaction-review\/v1/);
+  assert.match(executionEpisode, /decisionInstanceId: legacyDecisionInstanceId/);
+  assert.doesNotMatch(executionEpisode, /"decisionInstanceId"/);
+  assert.doesNotMatch(lifecycle, /next\.decisionInstanceId|previous\.decisionInstanceId/);
 });

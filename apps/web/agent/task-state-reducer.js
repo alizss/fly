@@ -25,6 +25,7 @@ const {
 const { obligationField } = require("./current-obligation");
 const agentContract = require("../../extension/src/shared/agent-contract");
 const {
+  normalizeSemanticOwner,
   semanticOwnerFromLegacy,
   semanticOwnerId
 } = require("../../../packages/shared/semantic-owner");
@@ -49,6 +50,9 @@ function lower(value = "") {
 
 function semanticIdentity(source = {}, fallback = {}) {
   if (!source || typeof source !== "object") return "";
+  if (source.semanticOwner) {
+    return clean(semanticOwnerId(semanticOwnerFromLegacy(source, fallback)));
+  }
   if (source.semanticOwnerId) return clean(source.semanticOwnerId);
   if (!source.semanticOwner) {
     // One-way migration for receipts written before structured ownership.
@@ -62,8 +66,7 @@ function semanticIdentity(source = {}, fallback = {}) {
       || source.decisionGroupId
     );
   }
-  const owner = semanticOwnerFromLegacy(source, fallback);
-  return clean(semanticOwnerId(owner));
+  return "";
 }
 
 function verificationDecisionRecord(decision = {}) {
@@ -956,13 +959,16 @@ function terminalEpisodeOutcome(episode = {}, parent = null) {
     segmentId: episode.segmentId,
     repeatedInstance: decisionInstanceId
   });
+  const ownerId = semanticOwnerId(semanticOwner);
   return Object.freeze({
     semanticOwner,
-    semanticOwnerId: clean(episode.semanticOwnerId || decisionInstanceId),
+    semanticOwnerId: ownerId,
     decisionGroupId: clean(parent?.decisionGroupId || episode.parentDecisionGroupId),
-    decisionInstanceId,
-    decisionOwnerKey: decisionInstanceId,
-    canonicalOwnerId: decisionInstanceId,
+    // Legacy read-model projections are deterministically derived from the
+    // sole durable semantic owner; they no longer invent parallel identity.
+    decisionInstanceId: ownerId,
+    decisionOwnerKey: ownerId,
+    canonicalOwnerId: ownerId,
     originKind: "verified_commerce_decision",
     family,
     subjectKey,
@@ -1088,24 +1094,40 @@ function verifiedCommerceObligationFromActionResult(result = null, observationId
     || decisionGroupId
   );
   if (!actionId || !decisionGroupId || !decisionInstanceId) return null;
+  const episodeIdentityOwnsReceipt = Boolean(
+    episodeOwnsReceipt
+    || (
+      decisionEpisode?.episodeId
+      && clean(lineage.decisionEpisodeId) === clean(decisionEpisode.episodeId)
+      && clean(lineage.parentDecisionGroupId || lineage.decisionGroupId) === decisionGroupId
+    )
+  );
   const targetSnapshot = result.targetSnapshot || action.targetSnapshot || {};
-  const semanticOwner = semanticOwnerFromLegacy(action, {
-    stage: context.taskState?.stage,
-    family,
-    subjectId: task.semanticType || task.requirementId || family,
-    passengerId: task.passengerId,
-    segmentId: task.segmentId,
-    repeatedInstance: decisionInstanceId
-  });
+  const semanticOwner = action.semanticOwner
+    ? semanticOwnerFromLegacy(action)
+    : normalizeSemanticOwner({
+        stage: context.taskState?.stage || decisionEpisode?.stage,
+        family: episodeIdentityOwnsReceipt ? decisionEpisode?.family : family,
+        subjectId: (episodeIdentityOwnsReceipt ? decisionEpisode?.subjectKey : "")
+          || task.semanticType
+          || task.requirementId
+          || family,
+        passengerId: task.passengerId || decisionEpisode?.passengerId,
+        segmentId: task.segmentId || decisionEpisode?.segmentId,
+        repeatedInstance: (episodeIdentityOwnsReceipt
+          ? decisionEpisode?.canonicalOwnerId || decisionEpisode?.decisionInstanceId
+          : "") || decisionInstanceId
+      });
+  const ownerId = semanticOwnerId(semanticOwner);
   return Object.freeze({
     semanticOwner,
-    semanticOwnerId: clean(action.semanticOwnerId || decisionInstanceId),
+    semanticOwnerId: ownerId,
     actionId,
     observationId: clean(observationId || result.observationId),
     decisionGroupId,
-    decisionInstanceId,
-    decisionOwnerKey: decisionInstanceId,
-    canonicalOwnerId: decisionInstanceId,
+    decisionInstanceId: ownerId,
+    decisionOwnerKey: ownerId,
+    canonicalOwnerId: ownerId,
     decisionEpisodeId: clean(episodeOwnsReceipt ? decisionEpisode.episodeId : lineage.decisionEpisodeId),
     family,
     subjectKey: clean(
@@ -1128,7 +1150,7 @@ function verifiedCommerceObligationFromActionResult(result = null, observationId
       mechanicalEffect,
       expectedOutcomeType: clean(postcondition.type),
       expectedDisposition: clean(postcondition.expectedDisposition),
-      semanticIntent: clean(action.intent || result.semanticIntent)
+      objective: clean(action.intent || result.semanticIntent)
     })
   });
 }
@@ -1147,11 +1169,14 @@ function verifiedCommerceObligations(previous = [], supplied = []) {
 function commerceOutcomeFromVerifiedObligation(obligation = {}) {
   if (!obligation?.actionId || obligation.verified !== true || obligation.originKind !== "verified_commerce_obligation") return null;
   if (!DECISION_EPISODE_FAMILIES.has(clean(obligation.family))) return null;
+  const ownerId = semanticIdentity(obligation);
   return Object.freeze({
+    semanticOwner: obligation.semanticOwner || null,
+    semanticOwnerId: ownerId,
     decisionGroupId: clean(obligation.decisionGroupId),
-    decisionInstanceId: clean(obligation.decisionInstanceId),
-    decisionOwnerKey: clean(obligation.decisionOwnerKey || obligation.decisionInstanceId),
-    canonicalOwnerId: clean(obligation.canonicalOwnerId || obligation.decisionInstanceId),
+    decisionInstanceId: ownerId,
+    decisionOwnerKey: ownerId,
+    canonicalOwnerId: ownerId,
     originKind: "verified_commerce_decision",
     admissionSource: "verified_action_obligation",
     actionId: clean(obligation.actionId),
@@ -1278,22 +1303,36 @@ function commerceOutcomeFromVerifiedAction({
   const price = targetSnapshot.structuredPrice
     || decision?.priceRisk
     || {};
+  const subjectKey = clean(
+    decision?.subject?.key
+    || decision?.requirementId
+    || explicit.requirementId
+    || (!lineage.explicit ? lineage.fallbackLineage?.requirementId : "")
+    || family
+  );
+  const semanticOwner = action.semanticOwner
+    ? semanticOwnerFromLegacy(action)
+    : normalizeSemanticOwner({
+        stage: previousTaskState.stage,
+        family,
+        subjectId: subjectKey,
+        passengerId: decision?.subject?.passengerId || explicit.passengerId,
+        segmentId: decision?.subject?.segmentId || explicit.segmentId,
+        repeatedInstance: decisionInstanceId
+      });
+  const ownerId = semanticOwnerId(semanticOwner);
   return Object.freeze({
+    semanticOwner,
+    semanticOwnerId: ownerId,
     decisionGroupId,
-    decisionInstanceId,
-    decisionOwnerKey: decisionInstanceId,
-    canonicalOwnerId: decisionInstanceId,
+    decisionInstanceId: ownerId,
+    decisionOwnerKey: ownerId,
+    canonicalOwnerId: ownerId,
     originKind: "verified_commerce_decision",
     admissionSource: "verified_action_contract",
     actionId: clean(actionResult.actionId || action.id),
     family,
-    subjectKey: clean(
-      decision?.subject?.key
-      || decision?.requirementId
-      || explicit.requirementId
-      || (!lineage.explicit ? lineage.fallbackLineage?.requirementId : "")
-      || family
-    ),
+    subjectKey,
     label: clean(
       postcondition?.expectedSelectedLabel
       || decision?.selectedLabel
