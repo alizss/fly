@@ -6,6 +6,11 @@ import {
 } from "./selected-booking.js";
 import { createActionTransport } from "./observation/action-transport.js";
 import { createAccessibilityProjection } from "./observation/accessibility.js";
+import {
+  buildCanonicalAliasIndex,
+  decisionTargetAliasIds
+} from "./observation/control-aliases.js";
+import { createControlRegistryTools } from "./observation/control-registry.js";
 import { implicitRole, isVisible, queryAllDeep, textFromIds } from "./observation/dom.js";
 import { createPageStateStore } from "./observation/page-state-store.js";
 import {
@@ -13,6 +18,7 @@ import {
   normalizedFieldAlias,
   profileFieldTypesFromText
 } from "./observation/field-semantics.js";
+import { createFieldEvidence } from "./observation/field-evidence.js";
 import {
   currentCommercialOptionPrice,
   localizedPriceAmount,
@@ -216,6 +222,23 @@ import {
     compactObservationActionContext
   } = createActionTransport({ compactText, compactChoiceCommitEvidence });
   const {
+    labelText,
+    localLabelText,
+    stableProfileFieldOwnerKey,
+    profileFieldGroupEvidence,
+    explicitProfileLabelEvidence,
+    classifyProfileField
+  } = createFieldEvidence({
+    queryAllDeep,
+    implicitRole,
+    choiceLabel,
+    elementId,
+    normalizedFieldAlias,
+    canonicalProfileFieldType,
+    profileFieldTypesFromText,
+    normalizedProfileChoiceValue
+  });
+  const {
     accessibleName,
     accessibilityState,
     accessibilityNode,
@@ -235,6 +258,23 @@ import {
     queryAllDeep,
     currentPageMap: () => agent.pageMap || null,
     buildPageMap
+  });
+  const {
+    controlsAreCompatibleAliases,
+    controlMemberNodeIds,
+    controlExclusiveNodeIds,
+    exactAtomicControlNodeId,
+    narrowerExactControlOwner,
+    controlContextPriority,
+    createObservationControlRegistry
+  } = createControlRegistryTools({
+    normalizeMatchText,
+    elementById,
+    isActionableClickTarget,
+    elementId,
+    stateElementForControl,
+    canonicalControlForElement,
+    unionBoxes
   });
 
   function storageGet(keys) {
@@ -506,284 +546,8 @@ import {
     await sleep(Math.min(Math.max(0, pause), 150));
   }
 
-  function labelText(input) {
-    const direct = input.closest("label")?.innerText || "";
-    const idLabel = input.id ? queryAllDeep(`label[for="${CSS.escape(input.id)}"]`)[0]?.innerText || "" : "";
-    const labelledBy = (input.getAttribute("aria-labelledby") || "")
-      .split(/\s+/)
-      .map((id) => id && document.getElementById(id)?.innerText)
-      .filter(Boolean)
-      .join(" ");
-    const primary = [input.name, input.id, input.placeholder, input.getAttribute("aria-label"), input.getAttribute("aria-describedby"), direct, idLabel, labelledBy].filter(Boolean).join(" ");
-    const usefulPrimary = primary.replace(/headlessui|combobox|input|select|field|control|react|aria|describedby|labelledby|[-_\d]/gi, " ").replace(/\s+/g, " ").trim();
-    const nearby = [input.parentElement, input.parentElement?.parentElement]
-      .map((element) => (element?.innerText || "").replace(/\s+/g, " ").trim())
-      .filter((text) => text && text.length < 260)
-      .join(" ");
-    return [primary, usefulPrimary.length < 4 ? nearby : ""].filter(Boolean).join(" ").toLowerCase();
-  }
-
-  function localLabelText(input) {
-    const direct = input.closest("label")?.innerText || "";
-    const idLabel = input.id ? queryAllDeep(`label[for="${CSS.escape(input.id)}"]`)[0]?.innerText || "" : "";
-    const labelledBy = (input.getAttribute("aria-labelledby") || "")
-      .split(/\s+/)
-      .map((id) => id && document.getElementById(id)?.innerText)
-      .filter(Boolean)
-      .join(" ");
-    return [
-      input.name,
-      input.id,
-      input.placeholder,
-      input.getAttribute("aria-label"),
-      direct,
-      idLabel,
-      labelledBy
-    ].filter(Boolean).join(" ").replace(/\s+/g, " ").toLowerCase();
-  }
-
   function canonicalProfileFieldType(value = "") {
     return AGENT_CONTRACT?.canonicalProfileFieldType?.(value) || "";
-  }
-
-  function stableProfileFieldOwnerKey(group) {
-    if (!group) return "";
-    const explicit = [
-      group.getAttribute?.("name") ? `name:${group.getAttribute("name")}` : "",
-      group.getAttribute?.("data-testid") ? `testid:${group.getAttribute("data-testid")}` : "",
-      group.getAttribute?.("aria-labelledby") ? `labelledby:${group.getAttribute("aria-labelledby")}` : "",
-      group.getAttribute?.("aria-label") ? `arialabel:${normalizedFieldAlias(group.getAttribute("aria-label"))}` : "",
-      group.id && !/^atw[-_]/i.test(group.id) ? `id:${group.id}` : ""
-    ].filter(Boolean);
-    if (explicit.length) return explicit.join("|");
-    const path = [];
-    for (let current = group, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
-      const tag = String(current.tagName || "node").toLowerCase();
-      const role = String(current.getAttribute?.("role") || "").toLowerCase();
-      const siblings = current.parentElement
-        ? [...current.parentElement.children].filter((item) => (
-            String(item.tagName || "").toLowerCase() === tag
-            && String(item.getAttribute?.("role") || "").toLowerCase() === role
-          ))
-        : [current];
-      path.push(`${tag}:${role || "none"}:${Math.max(0, siblings.indexOf(current))}`);
-    }
-    return `path:${path.join("/")}`;
-  }
-
-  function profileFieldGroupEvidence(input) {
-    let group = input?.closest?.("fieldset, [role='radiogroup'], [role='group']") || null;
-    if (!group && (input?.type === "radio" || implicitRole(input) === "radio")) {
-      const name = input.getAttribute?.("name") || "";
-      const peers = name
-        ? queryAllDeep(`input[type='radio'][name="${CSS.escape(name)}"], [role='radio'][name="${CSS.escape(name)}"]`)
-        : [];
-      for (let current = input.parentElement, depth = 0; current && depth < 5; current = current.parentElement, depth += 1) {
-        if (peers.length > 1 && peers.every((peer) => current.contains(peer))) {
-          group = current;
-          break;
-        }
-      }
-    }
-    const labelledBy = String(group?.getAttribute?.("aria-labelledby") || "")
-      .split(/\s+/)
-      .filter(Boolean)
-      .map((id) => document.getElementById(id)?.textContent || "")
-      .join(" ");
-    const label = [
-      group?.querySelector?.("legend")?.textContent,
-      group?.querySelector?.(":scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > label")?.textContent,
-      group?.getAttribute?.("aria-label"),
-      labelledBy
-    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
-    const optionLabels = group
-      ? queryAllDeep("input[type='radio'], [role='radio'], option, [role='option']", group)
-        .map((option) => choiceLabel(option))
-        .filter(Boolean)
-        .slice(0, 12)
-      : [];
-    const controlCount = group
-      ? queryAllDeep("input, select, textarea, [role='radio'], [role='combobox'], [role='spinbutton']", group)
-        .filter((control, index, list) => list.indexOf(control) === index)
-        .length
-      : 0;
-    const role = String(group?.getAttribute?.("role") || "").toLowerCase();
-    const tight = Boolean(
-      group
-      && label
-      && (
-        group.tagName === "FIELDSET"
-        || role === "radiogroup"
-        || (role === "group" && controlCount > 0 && controlCount <= 4)
-      )
-    );
-    return {
-      group,
-      label,
-      optionLabels,
-      tight,
-      ownerId: tight ? elementId(group) : "",
-      ownerKey: tight ? stableProfileFieldOwnerKey(group) : "",
-      controlCount
-    };
-  }
-
-  function explicitProfileLabelEvidence(input) {
-    const nestedLabel = input.closest?.("label");
-    const idLabel = input.id ? queryAllDeep(`label[for="${CSS.escape(input.id)}"]`)[0] : null;
-    const labelledBy = String(input.getAttribute?.("aria-labelledby") || "")
-      .split(/\s+/)
-      .filter(Boolean)
-      .map((id) => document.getElementById(id)?.textContent || "")
-      .join(" ");
-    return [
-      input.getAttribute?.("aria-label"),
-      nestedLabel?.textContent,
-      idLabel?.textContent,
-      labelledBy,
-      input.getAttribute?.("placeholder")
-    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
-  }
-
-  function classifyProfileField(input, hintedField = "") {
-    const hinted = canonicalProfileFieldType(hintedField);
-    if (!input) return { fieldType: "", source: "none", confidence: 0, evidence: [] };
-    const type = String(input.getAttribute?.("type") || input.type || "").toLowerCase();
-    const role = String(implicitRole(input) || "").toLowerCase();
-    const autocomplete = String(input.getAttribute?.("autocomplete") || "").toLowerCase();
-    const group = profileFieldGroupEvidence(input);
-    const editable = !["radio", "checkbox", "button", "submit", "reset"].includes(type)
-      && !["radio", "checkbox", "button", "option"].includes(role);
-    const explicitLabel = explicitProfileLabelEvidence(input);
-    const result = (fieldType, source, confidence, used = "", extra = {}) => ({
-      fieldType,
-      source,
-      confidence,
-      evidence: [used].filter(Boolean).slice(0, 4),
-      evidenceByChannel: {
-        rawAttributes: [input.name, input.id, input.getAttribute?.("data-testid"), autocomplete].filter(Boolean),
-        explicitLabel: explicitLabel ? [explicitLabel] : [],
-        tightLocalOwner: group.tight && group.label ? [group.label] : [],
-        sectionContext: []
-      },
-      tightOwnerId: group.ownerId || "",
-      tightOwnerKey: group.ownerKey || "",
-      ...extra
-    });
-    const resolveTier = (candidates = [], source = "", confidence = 0, used = "") => {
-      const unique = [...new Set(candidates.filter(Boolean))];
-      if (unique.length === 1) return result(unique[0], source, confidence, used);
-      if (unique.length > 1) {
-        return result("", "semantic_conflict", 0, used, {
-          ambiguity: {
-            code: "AMBIGUOUS_FIELD_SEMANTICS",
-            source,
-            candidates: unique
-          }
-        });
-      }
-      return null;
-    };
-    if (hinted) return result(hinted, "canonical_hint", 1, hintedField);
-
-    const autocompleteAliases = {
-      "given-name": "first_name", "additional-name": "middle_name", "family-name": "last_name", name: "full_name",
-      email: "email", tel: "phone", "tel-national": "phone", "tel-country-code": "phone_country_code",
-      bday: "date_of_birth", "bday-day": "date_of_birth", "bday-month": "date_of_birth", "bday-year": "date_of_birth",
-      country: "nationality", "country-name": "nationality"
-    };
-    const directMachineText = [
-      input.name,
-      input.id,
-      input.getAttribute?.("data-testid"),
-      autocomplete,
-      input.getAttribute?.("aria-label"),
-      input.getAttribute?.("placeholder")
-    ].filter(Boolean).join(" ");
-    const rawCandidates = [
-      autocompleteAliases[autocomplete],
-      ...[input.name, input.id, input.getAttribute?.("data-testid")]
-        .map(canonicalProfileFieldType)
-        .filter(Boolean)
-    ];
-    const explicitLabelTypes = profileFieldTypesFromText(explicitLabel, { editable });
-    if (
-      explicitLabelTypes.length === 1
-      && explicitLabelTypes[0] === "given_names"
-      && rawCandidates.every((candidate) => ["first_name", "given_names"].includes(candidate))
-    ) {
-      return result("given_names", "explicit_composite_label", 0.99, explicitLabel);
-    }
-    const optionCodecCandidates = (() => {
-      if (!(type === "radio" || role === "radio") || !group.tight) return [];
-      const titleValues = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "title"));
-      const genderValues = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "gender"));
-      if (genderValues.includes("male") && genderValues.includes("female")) return ["gender"];
-      if (titleValues.includes("mr") && titleValues.includes("mrs/ms")) return ["title"];
-      return [];
-    })();
-    const ownershipFamily = (fieldType = "") => {
-      if (["passport_number", "document_number"].includes(fieldType)) return "document_number";
-      if (["passport_expiry", "document_expiry"].includes(fieldType)) return "document_expiry";
-      return fieldType;
-    };
-    const crossChannelCandidates = [...new Set([
-      ...rawCandidates,
-      ...profileFieldTypesFromText(directMachineText, { editable }),
-      ...explicitLabelTypes,
-      ...optionCodecCandidates
-    ].filter(Boolean).map(ownershipFamily))];
-    if (crossChannelCandidates.length > 1) {
-      return result("", "semantic_conflict", 0, `${directMachineText} ${explicitLabel}`, {
-        ambiguity: {
-          code: "AMBIGUOUS_FIELD_SEMANTICS",
-          source: "conflicting_direct_evidence",
-          candidates: crossChannelCandidates
-        }
-      });
-    }
-    const rawResolution = resolveTier(
-      rawCandidates,
-      autocompleteAliases[autocomplete] ? "autocomplete_or_control_attribute" : "control_attribute",
-      0.99,
-      [input.name, input.id, input.getAttribute?.("data-testid"), autocomplete].filter(Boolean).join(" ")
-    );
-    if (rawResolution) return rawResolution;
-
-    const directMachineResolution = resolveTier(
-      profileFieldTypesFromText(directMachineText, { editable }),
-      "direct_machine_evidence",
-      0.98,
-      directMachineText
-    );
-    if (directMachineResolution) return directMachineResolution;
-    const directMachineAlias = normalizedFieldAlias(directMachineText);
-    if (!explicitLabelTypes.length && /(?:passenger|travell?er|adult)_(?:category|type|class)|(?:category|type|class)_(?:passenger|travell?er|adult)/.test(directMachineAlias)) {
-      return result("", "direct_non_profile_control", 0.99, directMachineText);
-    }
-
-    const explicitResolution = resolveTier(
-      profileFieldTypesFromText(explicitLabel, { editable }),
-      "explicit_label_or_aria",
-      0.96,
-      explicitLabel
-    );
-    if (explicitResolution) return explicitResolution;
-    if (type === "tel") return result("phone", "input_type", 0.9, type);
-
-    const titleGroup = /(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(group.label.toLowerCase());
-    const normalizedTitleOptions = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "title"));
-    const titleOptions = normalizedTitleOptions.includes("mr") && normalizedTitleOptions.includes("mrs/ms");
-    if (group.tight && (type === "radio" || role === "radio") && (titleGroup || titleOptions)) {
-      return result("title", titleGroup ? "radio_group_label" : "radio_group_options", titleGroup ? 0.98 : 0.9, `${group.label} ${group.optionLabels.join(" ")}`);
-    }
-    const genderGroup = /(?:^|\s)(?:gender|sex)(?:\s|$)/.test(group.label.toLowerCase());
-    const normalizedGenderOptions = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "gender"));
-    const genderOptions = normalizedGenderOptions.includes("male") && normalizedGenderOptions.includes("female");
-    if (group.tight && (type === "radio" || role === "radio") && (genderGroup || genderOptions)) {
-      return result("gender", genderGroup ? "radio_group_label" : "radio_group_options", genderGroup ? 0.98 : 0.9, `${group.label} ${group.optionLabels.join(" ")}`);
-    }
-    return result("", "none", 0);
   }
 
   function inferCheckoutSite() {
@@ -4096,135 +3860,6 @@ import {
 
   function isActionableClickTarget(element) {
     return Boolean(element?.matches?.("button, a, input[type='button'], input[type='submit'], [role='button'], [role='option'], [role='checkbox'], [role='radio'], label, input[type='checkbox'], input[type='radio'], [tabindex]"));
-  }
-
-  function canonicalAliasRecords(control = {}) {
-    const operationAliases = Object.entries(control.operations || {}).flatMap(([operation, capability]) =>
-      (capability?.actuatorIds || []).map((aliasId) => ({ aliasId, kind: `operation:${operation}` }))
-    );
-    const recoveryAliases = Object.entries(control.recovery || {}).flatMap(([operation, recovery]) =>
-      [
-        ...(recovery?.actuatorIds || []),
-        ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-      ].map((aliasId) => ({ aliasId, kind: `recovery:${operation}` }))
-    );
-    return [
-      { aliasId: control.controlId, kind: "control" },
-      { aliasId: control.stableKey, kind: "stable_key" },
-      { aliasId: control.stateElementId, kind: "state" },
-      { aliasId: control.preferredActivationElementId, kind: "activation" },
-      { aliasId: control.visualRef, kind: "visual" },
-      ...(control.actuators || []).map((actuator) => ({
-        aliasId: actuator?.nodeId,
-        kind: actuator?.relation || "actuator"
-      })),
-      ...operationAliases,
-      ...recoveryAliases
-    ]
-      .map((entry) => ({ ...entry, aliasId: String(entry.aliasId || "").trim() }))
-      .filter((entry, index, list) => entry.aliasId
-        && list.findIndex((item) => item.aliasId === entry.aliasId) === index);
-  }
-
-  function buildCanonicalAliasIndex(map = {}) {
-    const byControlId = new Map();
-    const byAlias = new Map();
-    const aliasKinds = new Map();
-    const ambiguousAliases = new Set();
-    const conflicts = [];
-
-    for (const control of map.controls || []) {
-      const controlId = String(control?.controlId || "").trim();
-      if (!controlId) continue;
-      if (byControlId.has(controlId) && byControlId.get(controlId) !== control) {
-        conflicts.push({ code: "DUPLICATE_CONTROL_ID", aliasId: controlId, controlIds: [controlId] });
-        ambiguousAliases.add(controlId);
-        byAlias.delete(controlId);
-        continue;
-      }
-      byControlId.set(controlId, control);
-    }
-
-    const register = (aliasValue, controlValue, kind = "alias", source = "control") => {
-      const aliasId = String(aliasValue || "").trim();
-      const controlId = String(controlValue || "").trim();
-      if (!aliasId || !controlId) return;
-      if (!byControlId.has(controlId)) {
-        conflicts.push({ code: "UNKNOWN_CONTROL_ID", aliasId, controlIds: [controlId], source });
-        ambiguousAliases.add(aliasId);
-        byAlias.delete(aliasId);
-        return;
-      }
-      if (ambiguousAliases.has(aliasId)) return;
-      const owner = byAlias.get(aliasId);
-      if (owner && owner !== controlId) {
-        conflicts.push({ code: "ALIAS_OWNERSHIP_CONFLICT", aliasId, controlIds: [owner, controlId].sort(), source });
-        ambiguousAliases.add(aliasId);
-        byAlias.delete(aliasId);
-        aliasKinds.delete(aliasId);
-        return;
-      }
-      byAlias.set(aliasId, controlId);
-      aliasKinds.set(aliasId, kind || "alias");
-    };
-
-    for (const control of byControlId.values()) {
-      canonicalAliasRecords(control).forEach((entry) => register(entry.aliasId, control.controlId, entry.kind));
-    }
-    for (const annotation of map.screenshotAnnotations || []) {
-      if (!annotation?.controlId) continue;
-      register(annotation.visualRef, annotation.controlId, "visual", "screenshot_annotation");
-      register(annotation.targetId, annotation.controlId, "annotation_target", "screenshot_annotation");
-    }
-    for (const group of map.decisionGroups || []) {
-      for (const alternative of group?.alternatives || []) {
-        if (!alternative?.controlId) continue;
-        register(alternative.targetId, alternative.controlId, "decision_target", "decision_group");
-        register(alternative.visualRef, alternative.controlId, "visual", "decision_group");
-      }
-    }
-
-    const entries = [...byAlias.entries()]
-      .map(([aliasId, controlId]) => ({ aliasId, controlId, kind: aliasKinds.get(aliasId) || "alias" }))
-      .sort((a, b) => a.aliasId.localeCompare(b.aliasId));
-    return {
-      byAlias,
-      byControlId,
-      aliasKinds,
-      ambiguousAliases,
-      conflicts,
-      entries,
-      resolve(aliasValue) {
-        const aliasId = String(aliasValue || "").trim();
-        if (!aliasId || ambiguousAliases.has(aliasId)) return null;
-        const controlId = byAlias.get(aliasId);
-        return controlId ? byControlId.get(controlId) || null : null;
-      }
-    };
-  }
-
-  function decisionTargetAliasIds(decision = {}) {
-    const target = decision.targetSnapshot || {};
-    return [
-      decision.controlId,
-      decision.stableKey,
-      decision.targetId,
-      decision.visualRef,
-      target.controlId,
-      target.stableKey,
-      target.id,
-      target.visualRef,
-      target.stateElementId,
-      target.preferredActivationElementId,
-      ...(target.actuators || []).map((actuator) => actuator?.nodeId),
-      ...Object.values(target.operations || {}).flatMap((capability) => capability?.actuatorIds || []),
-      ...Object.values(target.recovery || {}).flatMap((recovery) => [
-        ...(recovery?.actuatorIds || []),
-        ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-      ])
-    ]
-      .map((aliasId) => String(aliasId || "").trim())
-      .filter((aliasId, index, list) => aliasId && list.indexOf(aliasId) === index);
   }
 
   function resolveDecisionTarget(decision, map) {
@@ -8555,229 +8190,6 @@ import {
           : [`No selected option for ${group.sectionLabel || group.requirementId || "decision"}`]
       }];
     });
-  }
-
-  function controlsAreCompatibleAliases(a = {}, b = {}) {
-    const sameControl = a.controlId && b.controlId && a.controlId === b.controlId;
-    if (sameControl) return true;
-    const sameMeaning = normalizeMatchText(a.label || "") === normalizeMatchText(b.label || "")
-      && (a.semantic || "") === (b.semantic || "")
-      && (a.risk || "") === (b.risk || "")
-      && (a.decisionGroupId || "") === (b.decisionGroupId || "");
-    return Boolean(sameMeaning);
-  }
-
-  function controlMemberNodeIds(control = {}) {
-    const operationActuatorIds = Object.values(control.operations || {})
-      .flatMap((capability) => capability?.actuatorIds || []);
-    const recoveryActuatorIds = Object.values(control.recovery || {})
-      .flatMap((recovery) => [
-        ...(recovery?.actuatorIds || []),
-        ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-      ]);
-    return [
-      control.stateElementId,
-      control.preferredActivationElementId,
-      ...(control.actuators || []).map((actuator) => actuator.nodeId),
-      ...operationActuatorIds,
-      ...recoveryActuatorIds
-    ].filter((nodeId, index, list) => nodeId && list.indexOf(nodeId) === index);
-  }
-
-  function controlExclusiveNodeIds(control = {}) {
-    const operationActuatorIds = Object.values(control.operations || {})
-      .flatMap((capability) => capability?.actuatorIds || []);
-    const ids = new Set([
-      control.stateElementId,
-      control.preferredActivationElementId,
-      ...operationActuatorIds
-    ].filter(Boolean));
-    for (const actuator of control.actuators || []) {
-      if (!actuator?.nodeId) continue;
-      if (["state", "activation", "label"].includes(actuator.relation)) {
-        ids.add(actuator.nodeId);
-        continue;
-      }
-      if (actuator.relation === "source") {
-        const node = elementById(actuator.nodeId);
-        if (node && isActionableClickTarget(node)) ids.add(actuator.nodeId);
-      }
-    }
-    return [...ids];
-  }
-
-  // A broad temporary representation of a composite widget may include a
-  // nested atomic control in addition to its own actuator. The atomic control
-  // is the more precise owner of that physical node; retaining the broad
-  // claim as an unresolved conflict would suppress a valid child mechanic
-  // such as a dropdown's owned search/filter input. This resolver is narrow:
-  // both controls must overlap, one must own exactly one canonical actuator,
-  // and every operation on that control must use only that actuator. Two
-  // controls making competing claims over the same atomic actuator remain an
-  // unresolved conflict.
-  function exactAtomicControlNodeId(control = {}) {
-    const exclusiveIds = controlExclusiveNodeIds(control);
-    if (exclusiveIds.length !== 1) return "";
-    const [nodeId] = exclusiveIds;
-    if (control.stateElementId && control.stateElementId !== nodeId) return "";
-    if (control.preferredActivationElementId && control.preferredActivationElementId !== nodeId) return "";
-    const operationIds = [...new Set(Object.values(control.operations || {})
-      .flatMap((capability) => capability?.actuatorIds || [])
-      .filter(Boolean))];
-    if (!operationIds.length || operationIds.some((id) => id !== nodeId)) return "";
-    return nodeId;
-  }
-
-  function narrowerExactControlOwner(existing = {}, incoming = {}) {
-    const existingIds = new Set(controlExclusiveNodeIds(existing));
-    const incomingIds = new Set(controlExclusiveNodeIds(incoming));
-    const existingAtomicId = exactAtomicControlNodeId(existing);
-    const incomingAtomicId = exactAtomicControlNodeId(incoming);
-    if (existingAtomicId && incomingIds.has(existingAtomicId) && incomingIds.size > existingIds.size) {
-      return existing;
-    }
-    if (incomingAtomicId && existingIds.has(incomingAtomicId) && existingIds.size > incomingIds.size) {
-      return incoming;
-    }
-    return null;
-  }
-
-  function controlContextPriority(context = {}) {
-    const surface = context.surface || {};
-    if (surface?.type && surface.type !== "page") return 100;
-    if (context.section?.id || context.sectionId) return 50;
-    return 10;
-  }
-
-  function createObservationControlRegistry() {
-    const controls = new Map();
-    const byDomNode = new Map();
-    const priorityByControlId = new Map();
-    const conflicts = [];
-
-    const removeOwnedControl = (control) => {
-      if (!control?.controlId) return;
-      controls.delete(control.controlId);
-      priorityByControlId.delete(control.controlId);
-      for (const [nodeId, owner] of byDomNode.entries()) {
-        if (owner?.controlId !== control.controlId) continue;
-        byDomNode.delete(nodeId);
-        const node = elementById(nodeId);
-        if (node?.dataset?.atwControlId === control.controlId) {
-          try {
-            delete node.dataset.atwControlId;
-          } catch (_) {
-            // SVG/foreign elements may not expose a mutable dataset.
-          }
-        }
-      }
-    };
-
-    const registerOwnedControl = (control, priority) => {
-      if (!control?.controlId) return null;
-      const existing = controls.get(control.controlId) || {};
-      const actuators = [...(existing.actuators || []), ...(control.actuators || [])]
-        .filter((entry, index, list) => entry?.nodeId && list.findIndex((other) => other.nodeId === entry.nodeId && other.relation === entry.relation) === index);
-      const merged = {
-        ...existing,
-        ...control,
-        actuators,
-        visualRegion: unionBoxes([existing.visualRegion, control.visualRegion].filter(Boolean)) || control.visualRegion || existing.visualRegion
-      };
-      controls.set(merged.controlId, merged);
-      priorityByControlId.set(merged.controlId, Math.max(priority, priorityByControlId.get(merged.controlId) || 0));
-      for (const nodeId of controlExclusiveNodeIds(merged)) {
-        byDomNode.set(nodeId, merged);
-        const node = elementById(nodeId);
-        if (node) {
-          try {
-            node.dataset.atwControlId = merged.controlId;
-          } catch (_) {
-            // SVG/foreign elements may not expose dataset.
-          }
-        }
-      }
-      return merged;
-    };
-
-    const lookupElement = (element) => {
-      if (!element) return null;
-      const nodeIds = [
-        elementId(element),
-        element.dataset?.atwControlId,
-        stateElementForControl(element) ? elementId(stateElementForControl(element)) : ""
-      ].filter(Boolean);
-      for (const id of nodeIds) {
-        if (controls.has(id)) return controls.get(id);
-        if (byDomNode.has(id)) return byDomNode.get(id);
-      }
-      return null;
-    };
-
-    const register = (element, context = {}, explicitPriority = null) => {
-      if (!element || element.closest?.("#atw-sidebar")) return null;
-      const priority = Number.isFinite(explicitPriority) ? explicitPriority : controlContextPriority(context);
-      const existing = lookupElement(element);
-      if (existing && priority <= (priorityByControlId.get(existing.controlId) || 0)) {
-        return existing;
-      }
-
-      const control = canonicalControlForElement(element, context);
-      if (!control?.controlId) return existing || null;
-      const memberIds = controlExclusiveNodeIds(control);
-      const existingOwners = memberIds
-        .map((nodeId) => byDomNode.get(nodeId))
-        .filter(Boolean)
-        .filter((owner, index, list) => list.findIndex((other) => other.controlId === owner.controlId) === index);
-      const incompatibleOwner = existingOwners.find((owner) => !controlsAreCompatibleAliases(owner, control));
-      if (incompatibleOwner) {
-        const ownerPriority = priorityByControlId.get(incompatibleOwner.controlId) || 0;
-        const exactOwner = priority === ownerPriority
-          ? narrowerExactControlOwner(incompatibleOwner, control)
-          : null;
-        const resolvedBy = exactOwner
-          ? "narrower_exact_actuator_owner"
-          : priority > ownerPriority
-            ? "foreground_or_higher_priority"
-            : (priority < ownerPriority ? "existing_higher_priority" : "unresolved_equal_priority");
-        conflicts.push({
-          nodeIds: memberIds,
-          existing: {
-            controlId: incompatibleOwner.controlId,
-            label: incompatibleOwner.label,
-            semantic: incompatibleOwner.semantic,
-            risk: incompatibleOwner.risk,
-            decisionGroupId: incompatibleOwner.decisionGroupId,
-            surfaceId: incompatibleOwner.surfaceId
-          },
-          incoming: {
-            controlId: control.controlId,
-            label: control.label,
-            semantic: control.semantic,
-            risk: control.risk,
-            decisionGroupId: control.decisionGroupId,
-            surfaceId: control.surfaceId
-          },
-          resolved: resolvedBy !== "unresolved_equal_priority",
-          resolvedBy
-        });
-        if (exactOwner === incompatibleOwner) return incompatibleOwner;
-        if (exactOwner === control) {
-          removeOwnedControl(incompatibleOwner);
-          return registerOwnedControl(control, priority);
-        }
-        if (priority <= ownerPriority) return incompatibleOwner;
-        removeOwnedControl(incompatibleOwner);
-      }
-      return registerOwnedControl(control, priority);
-    };
-
-    return {
-      register,
-      lookupElement,
-      controls: () => [...controls.values()],
-      conflicts
-    };
   }
 
   function lookupControlForElement(map = agent.pageMap || null, element = null) {
