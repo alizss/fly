@@ -23,7 +23,6 @@ const {
 } = require("./logical-field");
 const { profileFieldLabel } = require("./profile-context");
 
-const PLACEHOLDER_FIELD_VALUE = /^(?:choose|select|please select|select one(?: option)?|please choose|month|day|year|title|gender|nationality|country)$/i;
 const NON_BLOCKING_PROFILE_FIELDS = new Set([
   "middle_name",
   "second_last_name",
@@ -98,7 +97,10 @@ function meaningfulObservedFieldValue(field = {}, control = {}) {
   const selectLike = /select|combobox|listbox/.test(
     `${control.kind || field.kind || ""} ${control.role || field.role || ""} ${control.domRole || ""}`.toLowerCase()
   );
-  if (selectLike && PLACEHOLDER_FIELD_VALUE.test(raw)) return "";
+  if (selectLike && agentContract.isPlaceholderChoiceValue(raw, {
+    label: control.label || field.label || "",
+    optionValue: state.selectedValue || state.normalizedValue || raw
+  })) return "";
   if (raw) return raw;
   if (state.checked || state.selected) return "[selected]";
   return "";

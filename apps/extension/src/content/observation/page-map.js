@@ -133,6 +133,18 @@ export function createPageMapCompiler(dependencies) {
         } : null,
         semantic,
         dateField: semantic === "date_of_birth" ? dateFieldEvidenceForElement(input) : null,
+        phoneField: ["phone", "phone_country_code"].includes(semantic)
+          ? agentContract?.inferPhoneFieldCodec?.({
+              semanticType: semantic,
+              label: labelText(input),
+              name: input.getAttribute("name") || "",
+              placeholder: input.getAttribute("placeholder") || "",
+              pattern: input.getAttribute("pattern") || "",
+              autocomplete: input.getAttribute("autocomplete") || "",
+              inputMode: input.getAttribute("inputmode") || "",
+              accessibleDescription: describedText(input)
+            }) || null
+          : null,
         required: Boolean(
           input.required
           || input.getAttribute?.("aria-required") === "true"

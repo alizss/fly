@@ -481,10 +481,18 @@ export function createLogicalControlCompiler(dependencies) {
   
   function isPlaceholderChoiceValue(value = "", element = null) {
     const normalized = String(value || "").replace(/\s+/g, " ").trim();
-    if (!normalized) return false;
-    if (/^(choose|select|please select|select one|select one option|please choose|month|day|year|title|gender|nationality|country)$/i.test(normalized)) {
+    const selectedOption = element?.tagName === "SELECT" && element.selectedIndex >= 0
+      ? element.options?.[element.selectedIndex]
+      : null;
+    if (AGENT_CONTRACT?.isPlaceholderChoiceValue?.(normalized, {
+      optionValue: selectedOption?.value ?? normalized,
+      optionLabel: selectedOption?.textContent || selectedOption?.label || "",
+      optionDisabled: selectedOption?.disabled === true,
+      optionIndex: Number(element?.selectedIndex ?? -1)
+    })) {
       return true;
     }
+    if (!normalized) return false;
     if (!element || !isDropdownLikeElement(element)) return false;
     const explicitPlaceholders = [
       element.getAttribute?.("placeholder"),
@@ -2081,6 +2089,25 @@ export function createLogicalControlCompiler(dependencies) {
     const boxes = members.map((item) => isVisible(item.element) ? elementBox(item.element) : null).filter(Boolean);
     const state = controlStateForElement(stateElement, semantic, presentationBinding);
     const dateField = semantic === "date_of_birth" ? dateFieldEvidenceForElement(stateElement) : null;
+    const phoneField = ["phone", "phone_country_code"].includes(fieldType)
+      ? AGENT_CONTRACT?.inferPhoneFieldCodec?.({
+          semanticType: fieldType,
+          label,
+          name: stateElement.getAttribute?.("name") || "",
+          placeholder: stateElement.getAttribute?.("placeholder") || "",
+          pattern: stateElement.getAttribute?.("pattern") || "",
+          autocomplete: stateElement.getAttribute?.("autocomplete") || "",
+          inputMode: stateElement.getAttribute?.("inputmode") || "",
+          accessibleDescription: describedText(stateElement)
+        }) || null
+      : null;
+    if (fieldType === "phone" && phoneField?.representation === "combined_international") {
+      const rawPhoneValue = String(stateElement.value || stateElement.getAttribute?.("value") || "").trim();
+      const phoneDigits = rawPhoneValue.replace(/\D/g, "");
+      state.normalizedValue = phoneDigits
+        ? `${rawPhoneValue.startsWith("+") ? "+" : ""}${phoneDigits}`
+        : "";
+    }
     const domRole = implicitRole(stateElement) || implicitRole(element);
     const stateTag = String(stateElement.tagName || "").toLowerCase();
     const baseStableKey = stableControlKeyForElement(element, stateElement, kind);
@@ -2551,6 +2578,7 @@ export function createLogicalControlCompiler(dependencies) {
             : choiceRisk(label),
       structuredPrice: economicStructuredPrice,
       dateField,
+      phoneField,
       state,
       representationLifecycle,
       choiceContract: presentationBinding ? {

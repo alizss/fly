@@ -25,9 +25,9 @@ export function profileFieldTypesFromText(value = "", { editable = true } = {}) 
   if (/emergency contact.*e[ -]?mail|e[ -]?mail.*emergency contact/.test(evidence)) add("emergency_contact_email");
   else if (/confirm.*e[ -]?mail|repeat.*e[ -]?mail/.test(evidence)) add("confirm_email");
   else if (editable && /(?:^|\s)e[ -]?mail(?:\s|$)/.test(evidence)) add("email");
-  if (/emergency contact.*name|name.*emergency contact/.test(evidence)) add("emergency_contact_name");
+  if (/(?:emergency|sos)(?: contact)?.*name|name.*(?:emergency|sos)(?: contact)?/.test(evidence)) add("emergency_contact_name");
   if (/emergency contact.*relationship|relationship.*emergency contact/.test(evidence)) add("emergency_contact_relationship");
-  if (/emergency contact.*(?:phone|mobile|telephone)|(?:phone|mobile|telephone).*emergency contact/.test(evidence)) add("emergency_contact_phone");
+  if (/(?:emergency|sos)(?: contact)?.*(?:phone|mobile|telephone)|(?:phone|mobile|telephone).*(?:emergency|sos)(?: contact)?/.test(evidence)) add("emergency_contact_phone");
   if (boundedPhrase(evidence, "surname") || /family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
   const combinedGivenNames = /(?:first|given)\s*(?:\/|and|&)\s*middle\s+names?\b|\bgiven names\b|\bforenames\b/.test(evidence);
   if (combinedGivenNames) add("given_names");
@@ -58,7 +58,7 @@ export function profileFieldTypesFromText(value = "", { editable = true } = {}) 
   const countryPhoneCode = /country.*(?:phone|dial|calling)?\s*code|(?:phone|dial|calling).*country.*code|dial.*code|calling.*code/.test(evidence);
   if (countryPhoneCode) add("phone_country_code");
   else if (editable && /(?:^|\s)(?:phone|telephone|mobile)(?:\s|$)/.test(evidence)
-    && !/(?:plan|bundle|package|insurance|addon|add on|emergency contact)/.test(evidence)) add("phone");
+    && !/(?:plan|bundle|package|insurance|addon|add on|emergency|sos)/.test(evidence)) add("phone");
   if (/(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(evidence)) add("title");
   if (/(?:^|\s)(?:gender|sex)(?:\s|$)/.test(evidence)) add("gender");
   return matches;

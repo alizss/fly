@@ -75,6 +75,7 @@ async function runLoopTurn(args = {}) {
 
 const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "seat-baggage.html");
 const profileFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "profile-form.html");
+const croatiaFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "croatia-passenger.html");
 const contentScriptPath = path.join(__dirname, "..", "..", "apps", "extension", "dist", "content.js");
 const TEST_API = `http://127.0.0.1:${Number(process.env.ATW_TEST_PORT || 4273)}/api`;
 
@@ -2330,6 +2331,85 @@ test("profile scheduling follows visual order and composite dependencies", async
   expect(descriptors.findIndex((descriptor) => descriptor.semanticType === "phone_country_code"))
     .toBeLessThan(descriptors.findIndex((descriptor) => descriptor.semanticType === "phone"));
   expect(deriveProfileGoal(observation, traveler)).toMatchObject({ semanticType: "title", desiredValue: "mr" });
+});
+
+test("Croatia-style title, combined phone, and validation compile through the universal profile pipeline", async ({ page }) => {
+  await loadProducer(page, croatiaFixturePath);
+  const traveler = {
+    id: "trav_croatia_profile",
+    first_name: "Ali",
+    last_name: "SIFRAR",
+    gender: "male",
+    email: "ali@example.com",
+    phone_country_code: "+386",
+    phone: "70328922",
+    nationality: "Slovenia"
+  };
+  await page.evaluate((profile) => window.__ATW_TEST__.setAppDataForTest({
+    travelers: [profile],
+    preferences: {}
+  }, profile.id), traveler);
+
+  const initial = await browserObservation(page, "obs_croatia_initial");
+  initial.page.step = "traveler_information";
+  const titleControl = initial.page.controls.find((control) => control.fieldType === "title");
+  expect(titleControl?.state?.normalizedValue || titleControl?.state?.valueText || "").toBe("");
+  expect(titleControl?.state?.valuePresent).toBe(false);
+  expect(titleControl?.required).toBe(true);
+  expect(new Set(titleControl?.options?.map((option) => option.label))).toEqual(new Set(["---", "Mr", "Mrs", "Ms"]));
+
+  const titleGoal = deriveProfileGoal(initial, traveler);
+  expect(titleGoal).toMatchObject({ semanticType: "title", desiredValue: "mr" });
+  const titleCandidates = candidatesForProfileGoal(titleGoal, initial, traveler);
+  expect(titleCandidates).toHaveLength(1);
+  expect(titleCandidates[0]).toMatchObject({ operation: "select" });
+  const titleSelected = await executeAtomicBrowserDecision(
+    page,
+    toClientDecision(actionForProfileCandidate(titleGoal, titleCandidates[0], initial)),
+    "obs_croatia_title_selected"
+  );
+  expect(titleSelected.verification.ok, JSON.stringify(titleSelected.verification)).toBe(true);
+  expect(await page.locator("#Title").inputValue()).toBe("MR");
+
+  await page.locator("#FirstName").fill(traveler.first_name);
+  await page.locator("#LastName").fill(traveler.last_name);
+  await page.locator("#Email").fill(traveler.email);
+  await page.locator("#ConfirmEmail").fill(traveler.email);
+  await page.locator("#PhoneHome").fill(traveler.phone);
+
+  const invalid = await browserObservation(page, "obs_croatia_invalid_phone");
+  invalid.page.step = "traveler_information";
+  const primaryPhone = invalid.page.controls.find((control) => control.name === "PhoneHome");
+  const emergencyPhone = invalid.page.controls.find((control) => control.name === "SosPhone");
+  const phoneIssue = invalid.page.validationIssues.find((issue) => /valid phone/i.test(issue.message));
+  expect(primaryPhone?.fieldType).toBe("phone");
+  expect(primaryPhone?.phoneField?.representation).toBe("combined_international");
+  expect(emergencyPhone?.fieldType).toBe("emergency_contact_phone");
+  expect(phoneIssue).toMatchObject({ controlId: primaryPhone.controlId, semanticType: "phone" });
+  expect(await page.locator("#Continue").isDisabled()).toBe(true);
+
+  const phoneGoal = deriveProfileGoal(invalid, traveler);
+  expect(phoneGoal).toMatchObject({ semanticType: "phone", componentRole: "international_number" });
+  const phoneCandidates = candidatesForProfileGoal(phoneGoal, invalid, traveler);
+  expect(phoneCandidates).toHaveLength(1);
+  expect(phoneCandidates[0].inputValue || phoneCandidates[0].value).toBe("+38670328922");
+  const phoneCorrected = await executeAtomicBrowserDecision(
+    page,
+    toClientDecision(actionForProfileCandidate(phoneGoal, phoneCandidates[0], invalid)),
+    "obs_croatia_phone_corrected"
+  );
+  expect(phoneCorrected.verification.ok, JSON.stringify(phoneCorrected.verification)).toBe(true);
+  expect(await page.locator("#PhoneHome").inputValue()).toBe("+38670328922");
+  expect(await page.locator("#SosName").inputValue()).toBe("");
+  expect(await page.locator("#SosPhone").inputValue()).toBe("");
+  expect(await page.locator("#Continue").isEnabled()).toBe(true);
+
+  const settled = await browserObservation(page, "obs_croatia_settled");
+  settled.page.step = "traveler_information";
+  expect(fieldDescriptors(settled, traveler).filter((descriptor) => (
+    ["emergency_contact_name", "emergency_contact_phone"].includes(descriptor.semanticType)
+    && descriptor.requiresResolution
+  ))).toEqual([]);
 });
 
 test("stage advancement prefers governed browser-level pointer input", async ({ page }) => {

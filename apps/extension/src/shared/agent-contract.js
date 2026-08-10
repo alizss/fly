@@ -226,9 +226,9 @@
     frequent_flyer_number: ["frequent_flyer_number", "loyalty_number", "membership_number"],
     known_traveler_number: ["known_traveler_number", "known_traveller_number", "ktn"],
     redress_number: ["redress_number", "redress_control_number"],
-    emergency_contact_name: ["emergency_contact_name", "emergency_name"],
+    emergency_contact_name: ["emergency_contact_name", "emergency_name", "sos_name", "sosname"],
     emergency_contact_relationship: ["emergency_contact_relationship", "emergency_relationship"],
-    emergency_contact_phone: ["emergency_contact_phone", "emergency_phone"],
+    emergency_contact_phone: ["emergency_contact_phone", "emergency_phone", "sos_phone", "sosphone"],
     emergency_contact_email: ["emergency_contact_email", "emergency_email"],
     meal_preference: ["meal_preference", "meal_request", "special_meal"],
     special_assistance: ["special_assistance", "assistance_request", "accessibility_request"],
@@ -1994,6 +1994,101 @@
     return age >= actualBounds.minimum && age <= actualBounds.maximum;
   }
 
+  function isPlaceholderChoiceValue(value = "", evidence = {}) {
+    const raw = String(value ?? "").replace(/\s+/g, " ").trim();
+    const label = String(evidence.optionLabel ?? evidence.label ?? raw).replace(/\s+/g, " ").trim();
+    const optionValue = String(evidence.optionValue ?? raw).replace(/\s+/g, " ").trim();
+    const normalized = raw.toLowerCase();
+    const normalizedLabel = label.toLowerCase();
+    const normalizedOptionValue = optionValue.toLowerCase();
+    const prompt = /^(?:choose|select|please select|select one(?: option)?|please choose|month|day|year|title|gender|nationality|country|none selected|not selected)$/i;
+    const sentinel = /^(?:-1|null|undefined|placeholder|prompt|unselected|none_selected|not_selected)$/i;
+    const punctuationOnly = /^(?:[-–—_.*]+)$/;
+    if (!raw && (
+      !label
+      || prompt.test(normalizedLabel)
+      || punctuationOnly.test(label)
+      || evidence.optionDisabled === true
+      || evidence.optionIndex === 0
+    )) return true;
+    if (prompt.test(normalized) || prompt.test(normalizedLabel)) return true;
+    if (sentinel.test(normalized) || sentinel.test(normalizedOptionValue)) return true;
+    if (punctuationOnly.test(label) || punctuationOnly.test(raw)) return true;
+    if (evidence.optionDisabled === true && evidence.optionIndex === 0) return true;
+    return false;
+  }
+
+  function phoneDigits(value = "") {
+    return String(value || "").replace(/\D/g, "");
+  }
+
+  function canonicalPhoneParts({ phone = "", countryCode = "", localNumber = "" } = {}) {
+    const rawPhone = String(phone || "").trim();
+    const explicitCodeDigits = phoneDigits(countryCode);
+    const phoneValueDigits = phoneDigits(rawPhone);
+    const localValueDigits = phoneDigits(localNumber);
+    const country = explicitCodeDigits ? `+${explicitCodeDigits}` : "";
+    let local = localValueDigits || phoneValueDigits;
+    if (explicitCodeDigits && local.startsWith(explicitCodeDigits)) local = local.slice(explicitCodeDigits.length);
+    local = local.replace(/^0+/, "");
+    return Object.freeze({
+      countryCode: country,
+      localNumber: local,
+      international: country && local
+        ? `${country}${local}`
+        : rawPhone.startsWith("+") && phoneValueDigits
+          ? `+${phoneValueDigits}`
+          : local
+    });
+  }
+
+  function inferPhoneFieldCodec(evidence = {}) {
+    const autocomplete = String(evidence.autocomplete || "").trim().toLowerCase();
+    const semanticType = canonicalProfileFieldType(evidence.semanticType || evidence.fieldType || "");
+    const text = [
+      evidence.label,
+      evidence.placeholder,
+      evidence.description,
+      evidence.accessibleDescription,
+      evidence.helperText,
+      evidence.pattern,
+      evidence.name,
+      evidence.inputMode
+    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+    let representation = "local_only";
+    let source = "default_local";
+    if (semanticType === "phone_country_code" || autocomplete === "tel-country-code") {
+      representation = "country_code";
+      source = semanticType === "phone_country_code" ? "semantic_type" : "autocomplete";
+    } else if (autocomplete === "tel-national") {
+      representation = "local_only";
+      source = "autocomplete";
+    } else if (
+      autocomplete === "tel"
+      || /include (?:your )?country code|with (?:the )?country code|international (?:phone|telephone|mobile|number)|country code.*(?:phone|number)|(?:phone|number).*country code|e\.164|example\s*\+\d|e\.g\.\s*\+\d/.test(text)
+    ) {
+      representation = "combined_international";
+      source = autocomplete === "tel" ? "autocomplete_and_local_evidence" : "local_format_evidence";
+    }
+    return Object.freeze({
+      contractVersion: "phone-field-codec/v1",
+      representation,
+      source,
+      evidence: text.slice(0, 320)
+    });
+  }
+
+  function encodePhoneForField(profile = {}, codec = {}) {
+    const parts = canonicalPhoneParts({
+      phone: profile.phone || profile.mobile || "",
+      countryCode: profile.phone_country_code || profile.country_code || profile.dial_code || "",
+      localNumber: profile.phone_local_number || profile.local_phone_number || ""
+    });
+    if (codec.representation === "country_code") return parts.countryCode;
+    if (codec.representation === "combined_international") return parts.international;
+    return parts.localNumber;
+  }
+
   return Object.freeze({
     CONTRACT_VERSION,
     TERMINAL_EVIDENCE_VERSION,
@@ -2034,6 +2129,10 @@
     isPaymentCommitText,
     compileSemanticCheckout,
     profileChoiceValueCompatible,
+    isPlaceholderChoiceValue,
+    canonicalPhoneParts,
+    inferPhoneFieldCodec,
+    encodePhoneForField,
     isNormalExecutableContract,
     isBoundedRecoveryContract,
     classifyExecutionLane,

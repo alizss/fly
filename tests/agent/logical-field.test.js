@@ -17,6 +17,7 @@ const {
 const { fieldDescriptors } = require("../../apps/web/agent/profile-requirements");
 const { evaluatePostcondition } = require("../../apps/web/agent/transition-evaluator");
 const { semanticGoalKey, decisionInstanceKey } = require("../../packages/shared/agent-actions");
+const agentContract = require("../../apps/extension/src/shared/agent-contract");
 
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
   return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
@@ -857,6 +858,91 @@ test("phone and passport expiry reuse the same scalar/composite adapter contract
   assert.equal(expiry.structure, "composite");
   assert.equal(expiry.currentCanonicalValue, "2031-09-14");
   assert.equal(logicalFieldSatisfied(expiry), true);
+});
+
+test("shared placeholder and combined-phone contracts preserve site semantics", () => {
+  assert.equal(agentContract.isPlaceholderChoiceValue("-1", {
+    optionValue: "-1",
+    optionLabel: "---",
+    optionIndex: 0
+  }), true);
+  assert.equal(agentContract.isPlaceholderChoiceValue("MR", {
+    optionValue: "MR",
+    optionLabel: "Mr",
+    optionIndex: 1
+  }), false);
+
+  const phoneControl = {
+    controlId: "ctrl_phone_full",
+    stableKey: "contact-phone-full",
+    semantic: "phone",
+    fieldType: "phone",
+    sectionId: "contact",
+    role: "textbox",
+    kind: "tel",
+    label: "Phone number",
+    name: "PhoneHome",
+    autocomplete: "tel",
+    accessibleDescription: "Please include your country code (e.g. +441112222 for UK)",
+    phoneField: agentContract.inferPhoneFieldCodec({
+      semanticType: "phone",
+      autocomplete: "tel",
+      accessibleDescription: "Please include your country code (e.g. +441112222 for UK)"
+    }),
+    state: { normalizedValue: "", valuePresent: false, invalid: false },
+    operations: { type: { operation: "type", actuatorId: "target_phone_full", actuatorIds: ["target_phone_full"] } }
+  };
+  const profile = {
+    id: "trav_combined_phone",
+    phone_country_code: "+386",
+    phone: "70328922"
+  };
+  const [phone] = resolveLogicalFields({
+    controls: [phoneControl],
+    fields: [{ ...fieldFor(phoneControl), phoneField: phoneControl.phoneField, description: phoneControl.accessibleDescription }],
+    validationIssues: []
+  }, profile);
+
+  assert.equal(phone.structure, "scalar");
+  assert.equal(phone.components[0].role, "international_number");
+  assert.equal(phone.components[0].inputValue, "+38670328922");
+  assert.equal(phone.desiredCanonicalValue, "+38670328922");
+  assert.equal(logicalFieldSatisfied(phone), false);
+});
+
+test("native invalid phone state reopens the exact primary phone component", () => {
+  const phoneControl = {
+    controlId: "ctrl_phone_invalid",
+    stableKey: "contact-phone-invalid",
+    semantic: "phone",
+    fieldType: "phone",
+    sectionId: "contact",
+    role: "textbox",
+    kind: "tel",
+    label: "Phone number",
+    name: "PhoneHome",
+    autocomplete: "tel",
+    phoneField: { representation: "combined_international" },
+    state: {
+      normalizedValue: "70328922",
+      valuePresent: true,
+      invalid: true,
+      validationMessage: "Please enter a valid phone number"
+    },
+    operations: { type: { operation: "type", actuatorId: "target_phone_invalid", actuatorIds: ["target_phone_invalid"] } }
+  };
+  const profile = { id: "trav_invalid_phone", phone_country_code: "+386", phone: "70328922" };
+  const page = {
+    controls: [phoneControl],
+    fields: [{ ...fieldFor(phoneControl), phoneField: phoneControl.phoneField }],
+    validationIssues: []
+  };
+  const [phone] = resolveLogicalFields(page, profile);
+
+  assert.equal(phone.components[0].validationIssues[0].controlId, "ctrl_phone_invalid");
+  assert.match(phone.components[0].validationIssues[0].message, /valid phone/i);
+  assert.equal(logicalFieldSatisfied(phone), false);
+  assert.equal(deriveProfileGoal({ observationId: "obs_invalid_phone", page }, profile)?.semanticType, "phone");
 });
 
 test("logical field graph exposes one complete authoritative contract", () => {

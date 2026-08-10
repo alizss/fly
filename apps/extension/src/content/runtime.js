@@ -79,6 +79,7 @@ import {
     "too short",
     "invalid",
     "not valid",
+    "please enter a valid",
     "confirm",
     "missing",
     "select one option",
@@ -2531,6 +2532,7 @@ import {
       });
 
     const issueOwnership = (element) => {
+      const issueText = compactText(element.innerText || element.textContent || "", 240).toLowerCase();
       const errorId = element.id || "";
       const directlyOwnedFields = fields.filter((field) => {
         const input = field.element;
@@ -2569,6 +2571,24 @@ import {
       const surfaceElement = activeSurface.id ? elementById(activeSurface.id) : null;
       const inSurface = Boolean(surfaceElement?.contains?.(element));
       let nearestField = logicalGroupOwned ? null : (directlyOwnedField || null);
+      if (!nearestField && !logicalGroupOwned) {
+        const ownershipRoot = semanticSectionElement || containingSection?.element || surfaceElement || document.body;
+        const invalidFields = fields.filter((field) => {
+          const input = field.element;
+          if (!input || !ownershipRoot?.contains?.(input) || !isVisible(input)) return false;
+          const invalid = input.getAttribute?.("aria-invalid") === "true"
+            || (typeof input.matches === "function" && input.matches(":invalid"));
+          if (!invalid) return false;
+          if (/phone|mobile|telephone/.test(issueText)) {
+            return ["phone", "phone_country_code", "emergency_contact_phone"].includes(field.field || field.fieldType || "");
+          }
+          if (/e-?mail/.test(issueText)) {
+            return ["email", "confirm_email"].includes(field.field || field.fieldType || "");
+          }
+          return true;
+        });
+        if (invalidFields.length === 1) nearestField = invalidFields[0];
+      }
       if (!nearestField && containingSection) {
         const errorBox = elementBox(element);
         nearestField = fields
@@ -2633,7 +2653,7 @@ import {
       if (/^\*?\s*field required\.?$/.test(normalized)) continue;
       if (/^passenger\s+\d+,\s*(adult|child|infant)\s+\*?field required\.?$/.test(normalized)) continue;
       if (/please enter your name and surname exactly/.test(normalized)) continue;
-      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /must enter|too long|too short|invalid|not valid|error|you must|required.+field|field.+required/.test(normalized)) {
+      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /must enter|too long|too short|invalid|not valid|please enter a valid|error|you must|required.+field|field.+required/.test(normalized)) {
         addIssue(text, element);
       }
       if (issues.length >= 12) break;

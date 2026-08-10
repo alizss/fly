@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Croatia passenger details fixture</title>
+  <style>
+    body { font: 16px sans-serif; margin: 24px; }
+    label { display: block; margin: 12px 0; }
+    input, select, button { min-height: 36px; min-width: 240px; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Passenger information</h1>
+    <form id="passenger-form">
+      <section aria-labelledby="passenger-heading">
+        <h2 id="passenger-heading">Adult passenger</h2>
+        <label for="Title">Title *</label>
+        <select id="Title" name="Title" required>
+          <option value="-1" selected>---</option>
+          <option value="MR">Mr</option>
+          <option value="MRS">Mrs</option>
+          <option value="MS">Ms</option>
+        </select>
+
+        <label for="FirstName">First name *</label>
+        <input id="FirstName" name="FirstName" autocomplete="given-name" required>
+
+        <label for="LastName">Last name *</label>
+        <input id="LastName" name="LastName" autocomplete="family-name" required>
+      </section>
+
+      <section aria-labelledby="contact-heading">
+        <h2 id="contact-heading">Contact details</h2>
+        <label for="Email">Email *</label>
+        <input id="Email" name="Email" type="email" autocomplete="email" required>
+
+        <label for="ConfirmEmail">Confirm email *</label>
+        <input id="ConfirmEmail" name="ConfirmEmail" type="email" required>
+
+        <label for="PhoneHome">Phone number *</label>
+        <input id="PhoneHome" name="PhoneHome" type="tel" autocomplete="tel"
+          inputmode="tel" aria-describedby="phone-help" pattern="\+[0-9]{8,15}" required>
+        <p id="phone-help">Please include your country code (e.g. +441112222 for UK)</p>
+        <p id="phone-error" role="alert" hidden>Please enter a valid phone number</p>
+      </section>
+
+      <section aria-labelledby="emergency-heading">
+        <h2 id="emergency-heading">Emergency contact (optional)</h2>
+        <label for="SosName">Emergency contact name</label>
+        <input id="SosName" name="SosName">
+        <label for="SosPhone">Emergency contact phone</label>
+        <input id="SosPhone" name="SosPhone" type="tel" inputmode="tel"
+          aria-describedby="sos-phone-help">
+        <p id="sos-phone-help">Include the emergency contact country code.</p>
+      </section>
+
+      <button id="Continue" type="submit" disabled>Continue</button>
+    </form>
+    <p id="next-stage" hidden>Choose seats</p>
+  </main>
+  <script>
+    (() => {
+      const form = document.getElementById("passenger-form");
+      const title = document.getElementById("Title");
+      const phone = document.getElementById("PhoneHome");
+      const error = document.getElementById("phone-error");
+      const submit = document.getElementById("Continue");
+      const requiredText = ["FirstName", "LastName", "Email", "ConfirmEmail"]
+        .map((id) => document.getElementById(id));
+
+      const update = () => {
+        const phoneValid = /^\+[0-9]{8,15}$/.test(phone.value);
+        phone.setCustomValidity(phone.value && !phoneValid ? "Please enter a valid phone number" : "");
+        phone.setAttribute("aria-invalid", phone.value && !phoneValid ? "true" : "false");
+        error.hidden = !phone.value || phoneValid;
+        const emailsMatch = document.getElementById("Email").value === document.getElementById("ConfirmEmail").value;
+        submit.disabled = title.value === "-1"
+          || requiredText.some((input) => !input.value)
+          || !emailsMatch
+          || !phoneValid;
+      };
+
+      form.addEventListener("input", update);
+      form.addEventListener("change", update);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        update();
+        if (submit.disabled) return;
+        form.hidden = true;
+        document.getElementById("next-stage").hidden = false;
+      });
+      update();
+    })();
+  </script>
+</body>
+</html>

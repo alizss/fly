@@ -128,9 +128,7 @@ function executable(control = {}) {
 }
 
 function isPlaceholderValue(value = "") {
-  return /^(?:choose|select|please select|select one(?: option)?|please choose|month|day|year|title|gender|nationality|country)$/i.test(
-    clean(value)
-  );
+  return agentContract.isPlaceholderChoiceValue(clean(value));
 }
 
 function meaningfulControlValue(control = {}) {
@@ -352,9 +350,20 @@ function transitionFor(control = {}, alternative = {}) {
 
 function selectedControl(group = {}, controls = []) {
   const selectedId = clean(group.selectedControlId);
-  return controls.find((control) => control.controlId === selectedId)
+  const selected = controls.find((control) => control.controlId === selectedId)
     || controls.find((control) => control.selected || control.state?.checked || control.state?.selected)
     || null;
+  if (!selected) return null;
+  const observed = clean(
+    selected.state?.selectedValue
+    || selected.state?.normalizedValue
+    || selected.currentValue
+    || group.selectedLabel
+  );
+  return agentContract.isPlaceholderChoiceValue(observed, {
+    label: group.selectedLabel || selected.label || "",
+    optionValue: observed
+  }) ? null : selected;
 }
 
 function selectedOutcome(selected = null, transitions = [], controlType = "") {

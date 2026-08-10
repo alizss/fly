@@ -11,6 +11,7 @@ const PROFILE_FIELDS = new Set(agentContract.PROFILE_FIELD_TYPES);
 const DATE_FIELDS = new Set(["date_of_birth", "document_issue_date", "passport_expiry", "document_expiry"]);
 const COMPONENT_ORDER = new Map([
   ["value", 0],
+  ["international_number", 0],
   ["country_code", 0],
   ["local_number", 1],
   ["day", 0],
@@ -83,9 +84,9 @@ function semanticTypesFromLabel(value = "") {
   if (/frequent[ -]?flyer.*(?:number|no)|loyalty (?:number|no)|membership (?:number|no)/.test(evidence)) add("frequent_flyer_number");
   if (/known travell?er (?:number|no)|\bktn\b/.test(evidence)) add("known_traveler_number");
   if (/redress (?:control )?(?:number|no)/.test(evidence)) add("redress_number");
-  if (/emergency contact.*name|name.*emergency contact/.test(evidence)) add("emergency_contact_name");
+  if (/(?:emergency|sos)(?: contact)?.*name|name.*(?:emergency|sos)(?: contact)?/.test(evidence)) add("emergency_contact_name");
   if (/emergency contact.*relationship|relationship.*emergency contact/.test(evidence)) add("emergency_contact_relationship");
-  if (/emergency contact.*(?:phone|mobile|telephone)|(?:phone|mobile|telephone).*emergency contact/.test(evidence)) add("emergency_contact_phone");
+  if (/(?:emergency|sos)(?: contact)?.*(?:phone|mobile|telephone)|(?:phone|mobile|telephone).*(?:emergency|sos)(?: contact)?/.test(evidence)) add("emergency_contact_phone");
   if (/emergency contact.*e[ -]?mail|e[ -]?mail.*emergency contact/.test(evidence)) add("emergency_contact_email");
   if (/meal preference|special meal|meal request/.test(evidence)) add("meal_preference");
   if (/special assistance|assistance request|accessibility request/.test(evidence)) add("special_assistance");
@@ -94,7 +95,7 @@ function semanticTypesFromLabel(value = "") {
   if (/(?:^|\s)(?:gender|sex)(?:\s|$)/.test(evidence)) add("gender");
   if (/(?:^|\s)(?:country|dial|calling)[ _-]?code(?:\s|$)/.test(evidence)) add("phone_country_code");
   if (/(?:^|\s)(?:phone|telephone|mobile)(?:\s|$)/.test(evidence)
-    && !/(?:plan|bundle|package|insurance|addon|add on)/.test(evidence)) {
+    && !/(?:plan|bundle|package|insurance|addon|add on|emergency|sos)/.test(evidence)) {
     add(/country.*code|dial.*code|calling.*code/.test(evidence) ? "phone_country_code" : "phone");
   }
   return matches;
@@ -446,7 +447,19 @@ function dateComponentRole(control = {}, field = {}) {
 function componentRole(control = {}, field = {}, semanticType = "") {
   if (DATE_FIELDS.has(semanticType)) return dateComponentRole(control, field);
   if (semanticType === "phone_country_code") return "country_code";
-  if (semanticType === "phone") return "local_number";
+  if (semanticType === "phone") {
+    const codec = control.phoneField || field.phoneField || agentContract.inferPhoneFieldCodec({
+      semanticType,
+      label: control.label || field.label || "",
+      name: control.name || field.name || "",
+      placeholder: control.placeholder || field.placeholder || "",
+      pattern: control.pattern || field.pattern || "",
+      autocomplete: control.autocomplete || field.autocomplete || "",
+      inputMode: control.inputMode || field.inputMode || "",
+      accessibleDescription: control.accessibleDescription || field.accessibleDescription || field.description || ""
+    });
+    return codec.representation === "combined_international" ? "international_number" : "local_number";
+  }
   if (/radio|checkbox|option|choice/.test(String(control.role || control.kind || field.kind || "").toLowerCase())) {
     return "option";
   }
@@ -493,6 +506,10 @@ function currentComponentValue(semanticType = "", role = "", control = {}, field
     return "";
   }
   const raw = rawControlValue(control);
+  if (semanticType === "phone" && role === "international_number") {
+    const digits = String(raw || "").replace(/\D/g, "");
+    return digits ? `+${digits}` : "";
+  }
   if (semanticType === "age_at_departure" && desiredValue) {
     const options = [...(control.options || []), ...(field.options || [])];
     const selectedOption = options.find((option) => (
@@ -536,7 +553,7 @@ function validationIssueContradictedByFreshOwner(issue = {}, control = {}) {
 }
 
 function relevantComponentIssues(page = {}, control = {}, logicalFieldId = "", role = "") {
-  return (page.validationIssues || []).filter((issue) => {
+  const observed = (page.validationIssues || []).filter((issue) => {
     const owned = Boolean(control.controlId && issue.controlId === control.controlId)
       || Boolean(
         logicalFieldId
@@ -546,6 +563,19 @@ function relevantComponentIssues(page = {}, control = {}, logicalFieldId = "", r
       );
     return owned && !validationIssueContradictedByFreshOwner(issue, control);
   });
+  const state = control.state || control.controlState || {};
+  if (state.invalid === true && !observed.some((issue) => issue.controlId === control.controlId)) {
+    observed.push({
+      issueId: `native-invalid:${control.controlId || logicalFieldId}`,
+      message: String(state.validationMessage || "The current field value is invalid."),
+      controlId: control.controlId || "",
+      logicalFieldId,
+      componentRole: role,
+      semanticType: control.fieldType || control.semantic || "",
+      source: "native_invalid_state"
+    });
+  }
+  return observed;
 }
 
 function relevantLogicalIssues(page = {}, logicalFieldId = "", controlIds = new Set(), ownerKey = "") {
@@ -685,6 +715,8 @@ function decodeLogicalValue(semanticType = "", components = []) {
     return "";
   }
   if (semanticType === "phone") {
+    const international = components.find((component) => component.role === "international_number")?.currentValue || "";
+    if (international) return international;
     const country = components.find((component) => component.role === "country_code")?.currentValue || "";
     const local = components.find((component) => component.role === "local_number")?.currentValue || "";
     if (country && local) return `${country}${local}`;
@@ -1187,8 +1219,12 @@ function resolveLogicalFields(page = {}, profile = {}) {
     const logicalFieldId = `lf_${normalizedAlias(`${group.subject.id}_${group.semanticType}_${group.owner}`)}`;
     const traveler = travelerForSubject(profile, group.subject);
     const phoneTypes = new Set(group.members.map((member) => member.directSemanticType));
+    const combinedInternationalPhone = group.members.some((member) => member.role === "international_number");
+    const fullPhoneValue = agentContract.encodePhoneForField(traveler, { representation: "combined_international" });
     const desiredCanonicalValue = group.semanticType === "phone"
-      ? phoneTypes.has("phone_country_code") && phoneTypes.has("phone")
+      ? combinedInternationalPhone
+        ? fullPhoneValue
+        : phoneTypes.has("phone_country_code") && phoneTypes.has("phone")
         ? `${desiredProfileValue("phone_country_code", traveler)}${desiredProfileValue("phone", traveler)}`
         : phoneTypes.has("phone_country_code")
           ? desiredProfileValue("phone_country_code", traveler)
@@ -1208,13 +1244,17 @@ function resolveLogicalFields(page = {}, profile = {}) {
           ? "phone"
           : group.semanticType;
       const desiredValue = group.semanticType === "phone"
-        ? desiredProfileValue(componentSemanticType, traveler)
+        ? role === "international_number"
+          ? fullPhoneValue
+          : desiredProfileValue(componentSemanticType, traveler)
         : desiredComponentValue(group.semanticType, role, desiredCanonicalValue);
       const currentValue = currentComponentValue(componentSemanticType, role, control, field, desiredValue);
       const desiredInputValue = DATE_FIELDS.has(group.semanticType)
         ? desiredValue
         : group.semanticType === "phone"
-          ? desiredProfileInputValue(componentSemanticType, traveler)
+          ? role === "international_number"
+            ? agentContract.encodePhoneForField(traveler, control.phoneField || field.phoneField || { representation: "combined_international" })
+            : desiredProfileInputValue(componentSemanticType, traveler)
           : desiredProfileInputValue(group.semanticType, traveler, { page });
       const validationIssues = relevantComponentIssues(page, control, logicalFieldId, role);
       const observedContract = agentContract.observedComponentContract(control, {
@@ -1435,7 +1475,12 @@ function verifyLogicalField(page = {}, expectation = {}, profile = {}) {
   const componentSemanticType = semanticType === "phone" && role === "country_code"
     ? "phone_country_code"
     : semanticType;
-  const expectedComponentValue = DATE_FIELDS.has(semanticType) && role !== "value"
+  const expectedComponentValue = semanticType === "phone" && role === "international_number"
+    ? (() => {
+        const digits = String(rawExpectedComponentValue || "").replace(/\D/g, "");
+        return digits ? `+${digits}` : "";
+      })()
+    : DATE_FIELDS.has(semanticType) && role !== "value"
     ? dateComponentValue(role, rawExpectedComponentValue)
     : canonicalValue(componentSemanticType, rawExpectedComponentValue);
   const component = logicalField?.components.find((item) => (
