@@ -191,7 +191,8 @@ test("production runtime contains one semantic compiler and one TaskState reduct
   assert.equal((loop.match(/reduceDecisionFrame\s*\(/g) || []).length, 1);
   assert.equal(/\bselectCandidate\b|\bresolveActiveComponentSemantics\b/.test(loop), false);
   assert.equal((ambiguityResolver.match(/require\("\.\/select-candidate"\)/g) || []).length, 1);
-  assert.equal((ambiguityResolver.match(/require\("\.\/active-component-grounding"\)/g) || []).length, 1);
+  assert.equal((ambiguityResolver.match(/require\("\.\/active-component-grounding"\)/g) || []).length, 0);
+  assert.equal((ambiguityResolver.match(/require\("\.\/semantic-scene-reconciliation"\)/g) || []).length, 1);
   assert.equal(/resolveSemanticOwnership|reusableSemanticOwnershipDecision/.test(`${loop}\n${candidateBinder}`), false);
   assert.equal(/activeDecisions|profileReadiness/.test(candidateBinder), false);
   assert.equal(/prepareTransactionInvariants|profileStageReadiness/.test(governor), false);

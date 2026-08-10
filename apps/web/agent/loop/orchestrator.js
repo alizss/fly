@@ -19,7 +19,7 @@ const agentContract = require("../../../extension/src/shared/agent-contract");
 
 const {
   resolveAmbiguity,
-  unknownComponentsForObligation
+  semanticSceneUncertainty
 } = require("../ambiguity-resolver");
 const {
   actionForCurrentCandidate,
@@ -470,12 +470,53 @@ async function runLoopTurn({
     ambiguityModelKind = request.kind || "unknown";
     return resolveAmbiguity(request);
   };
-  // V2 has no pre-TaskState semantic-ownership model. Selected commerce truth
-  // comes from the DecisionFrame transaction facts and verified receipts;
-  // ambiguous mechanics may be explored only after one obligation is
-  // admitted. This removes a model call and, more importantly, a second task
-  // authority ahead of deterministic compilation.
+  // Deterministic semantics remain the fast path. When the current scene has
+  // a required unknown component, an explicit classifier contradiction, or
+  // an unowned local validation, one closed model call may add grounded
+  // hypotheses to fresh observed IDs. It cannot publish work or actions;
+  // DecisionFrame is compiled once from the reconciled evidence and TaskState
+  // remains the sole obligation authority.
   const semanticCompileStartedAt = Date.now();
+  const deterministicSemanticCompilation = agentContract.compileSemanticCheckout(observation.page || {});
+  const sceneUncertainty = semanticSceneUncertainty({
+    observation,
+    semanticCompilation: deterministicSemanticCompilation,
+    traveler
+  });
+  if (sceneUncertainty.needed) {
+    try {
+      const reconciled = await resolveTurnAmbiguity({
+        kind: "semantic_scene",
+        input: {
+          apiKey,
+          model: recoveryModel || model,
+          observation,
+          semanticCompilation: deterministicSemanticCompilation,
+          traveler,
+          screenshotDataUrl,
+          uncertainty: sceneUncertainty
+        }
+      });
+      observation = reconciled.observation;
+      activeComponentGrounding = reconciled.reconciliation;
+      activeComponentGroundingMeta = reconciled.meta;
+      latency.classification_model_ms += Number(reconciled.meta?.durationMs || 0);
+    } catch (error) {
+      activeComponentGrounding = {
+        status: "unknown",
+        authority: "hypothesis_only",
+        reasonCode: "SEMANTIC_SCENE_UNRESOLVED",
+        evidence: `Grounded scene reconciliation was unavailable: ${error?.code || error?.message || "unknown error"}`
+      };
+      observation = {
+        ...observation,
+        page: {
+          ...(observation.page || {}),
+          semanticSceneReconciliation: activeComponentGrounding
+        }
+      };
+    }
+  }
   observationFrame = createObservationFrame(observation);
   decisionFrame = compileDecisionFrame({ observation, observationFrame, state, traveler });
   observation = decisionFrame.observation;
@@ -507,47 +548,6 @@ async function runLoopTurn({
   const authoritativeGoal = taskMechanics(taskState);
   latency.task_state_ms = Date.now() - taskStateStartedAt;
 
-  // TaskState admits the Current Obligation before a model may hypothesize a
-  // profile binding. This prevents unrelated required-looking page controls
-  // (for example paid bundle cards) from competing with a known safe decline.
-  // Grounding is scoped to the exact admitted controls and may refine only the
-  // turn-local mechanics view. It does not rebuild DecisionFrame, rerun
-  // TaskState, change transaction facts, or publish another obligation.
-  const admittedUnknownComponents = unknownComponentsForObligation(
-    observation,
-    taskState.currentObligation
-  );
-  if (admittedUnknownComponents.length) {
-    const admittedControlIds = admittedUnknownComponents
-      .map((control) => control.controlId)
-      .filter(Boolean);
-    try {
-      const grounded = await resolveTurnAmbiguity({
-        kind: "semantic_binding",
-        input: {
-          apiKey,
-          model: recoveryModel || model,
-          observation,
-          traveler,
-          transactionReview: transactionContext.review,
-          screenshotDataUrl,
-          attemptedStrategies: recoveryFacts(state).failedStrategies || [],
-          admittedControlIds
-        }
-      });
-      observation = grounded.observation;
-      activeComponentGrounding = grounded.optionalBinding;
-      activeComponentGroundingMeta = grounded.meta;
-      latency.classification_model_ms += Number(grounded.meta?.durationMs || 0);
-    } catch (error) {
-      activeComponentGrounding = {
-        status: "unknown",
-        reasonCode: "ACTIVE_REQUIREMENT_UNRESOLVED",
-        candidateComponentIds: admittedControlIds,
-        evidence: `Bounded semantic grounding was unavailable: ${error?.code || error?.message || "unknown error"}`
-      };
-    }
-  }
   const ambiguityModelAlreadyUsed = () => ambiguityModelCalls > 0;
   if (taskState.clearObsoleteRecovery) {
     state = withUpdate(state, {
@@ -1356,7 +1356,7 @@ async function runLoopTurn({
         const rebuiltObvious = deterministicTaskCandidate(candidateSet, observationGoal);
         if (rebuiltObvious) {
           selected = { candidateId: rebuiltObvious.candidateId, candidate: rebuiltObvious, meta: null };
-        } else if (ambiguityModelAlreadyUsed() && ambiguityModelKind === "semantic_binding" && observationCandidates[0]) {
+        } else if (ambiguityModelAlreadyUsed() && ambiguityModelKind === "semantic_scene" && observationCandidates[0]) {
           const bounded = observationCandidates[0];
           selected = { candidateId: bounded.candidateId, candidate: bounded, confidence: "bounded_deterministic", meta: null };
         } else if (ambiguityModelAlreadyUsed()) {

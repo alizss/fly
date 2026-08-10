@@ -25,8 +25,8 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Layer | Result | Evidence |
 |---|---:|---|
 | Build, type, and syntax | ✅ | `npm run check` |
-| Agent unit suite | ✅ 359/359 | Semantic authority, policy, transaction, recovery, persistence, and architecture invariants |
-| Browser replay suite | ✅ 169/169 | One uninterrupted run after SelectedBooking and action-lease repeat-guard corrections |
+| Agent unit suite | ✅ 365/365 | Semantic authority, scene reconciliation, profile codecs, policy, transaction, recovery, persistence, and architecture invariants |
+| Browser replay suite | ✅ 172/172 | One uninterrupted run including Croatia title/phone/validation and all established canaries |
 | Durable session boundary | ✅ | Complete `SelectedBooking/v1`, strict traveler membership, resume identity, typed failures |
 | Irreversible-action boundary | ✅ | No payment, billing, legal, card, Pay, or purchase action in current review-only replays/canaries |
 
@@ -37,10 +37,10 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Scalar/combined text and email fields | ✅ | Expand live structural portfolio |
 | Split names, DOB, phone, and documents | ✅ | Adult-plus-child and additional document families |
 | Native/custom selects and autocomplete | ✅ | Transfer to more localized widgets |
-| Placeholder/sentinel commitment (`-1`, prompt options, punctuation placeholders) | ❌ Croatia discovery | Shared deterministic contract and cross-site replay required |
-| Phone representation codec (combined international vs split prefix/local) | ❌ Croatia discovery | Croatia combined-field repair; retain Turkish and GoToGate split/custom-prefix behavior |
-| Validation ownership and exact-field repair | ❌ Croatia discovery | Attribute section-level invalid-phone evidence to the rendered native-invalid owner and reopen it |
-| Grounded Semantic Scene Reconciliation | ⏳ | Add only after deterministic Croatia contracts; zero calls for known scenes, one closed-ID call for true ambiguity |
+| Placeholder/sentinel commitment (`-1`, prompt options, punctuation placeholders) | 🧪 | Croatia structural replay is green; fresh live Croatia proof pending |
+| Phone representation codec (combined international vs split prefix/local) | 🧪 | Croatia combined-field replay and Turkish/GoToGate split-phone regressions are green; fresh live proof pending |
+| Validation ownership and exact-field repair | 🧪 | Native-invalid and section-level phone validation reopen the exact primary owner in replay; fresh live proof pending |
+| Grounded Semantic Scene Reconciliation | 🧪 | Known scenes use zero calls; a deliberately ambiguous fixture proves one closed-ID hypothesis call; fresh unfamiliar live proof pending |
 | Logical identity across framework rerender | ✅ | Continue live confirmation across new frameworks |
 | Active-surface and dormant-branch ownership | ✅ | New modal/drawer implementations |
 | Repeated passenger/leg decision ownership | ✅ | Multi-traveler live matrix |
@@ -85,7 +85,7 @@ Test structures deliberately. A primary site discovers a universal defect; a con
 | 1 | European low-cost direct | EasyJet | Ryanair or Wizz Air | 🟡 | Run confirmation-site controlled baseline |
 | 1 | United States network direct | American or United | The other | ⏳ | Test address/contact conventions |
 | 1 | Long-haul international direct | Emirates or Qatar | The other | ⏳ | Test nationality/document structure |
-| 1 | Regional direct | Croatia Airlines | Select after primary | ❌ | Repair title sentinel, combined phone format, validation ownership, and optional emergency-contact separation; rerun controlled baseline |
+| 1 | Regional direct | Croatia Airlines | Select after primary | 🧪 | Structural repair replay is green; rerun a fresh controlled live baseline and record intervention status |
 | 1 | Third structurally different OTA | Trip.com or eDreams/Opodo | Select after primary | ⏳ | Choose by observed structure, not brand count |
 | 2 | Asian/localized direct | Singapore or Korean Air | The other | ⏳ | Begin after Wave 1 stability |
 

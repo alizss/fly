@@ -1,5 +1,5 @@
-// The V2 runtime has only two model boundaries: bounded semantic binding for
-// an already-admitted component and selection from an immutable candidate ID
+// The V2 runtime has two mutually exclusive ambiguity modes per turn: grounded
+// semantic-scene reconciliation and selection from an immutable candidate ID
 // set. Historical extractor/verifier/planner schemas were removed with V1.
 
 const candidateSelectionSchema = {
@@ -54,8 +54,41 @@ function semanticBindingSchemaFor(componentIds = [], semanticTypes = [], factSou
   };
 }
 
+function semanticSceneSchemaFor(controlIds = [], semanticTypes = [], factSources = [], validationIssueIds = []) {
+  const controls = [...new Set(controlIds.map(String).filter(Boolean))];
+  const semantics = [...new Set(semanticTypes.map(String).filter(Boolean))];
+  const sources = [...new Set(factSources.map(String).filter(Boolean))];
+  const issues = [...new Set(validationIssueIds.map(String).filter(Boolean))];
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["status", "hypotheses"],
+    properties: {
+      status: { type: "string", enum: ["grounded", "unknown"] },
+      hypotheses: {
+        type: "array",
+        maxItems: 4,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["controlId", "semanticType", "factSource", "validationIssueId", "confidence", "evidence"],
+          properties: {
+            controlId: { type: "string", enum: ["", ...controls] },
+            semanticType: { type: "string", enum: ["unknown", ...semantics] },
+            factSource: { type: "string", enum: ["", ...sources] },
+            validationIssueId: { type: "string", enum: ["", ...issues] },
+            confidence: { type: "string", enum: ["high", "medium", "low"] },
+            evidence: { type: "string" }
+          }
+        }
+      }
+    }
+  };
+}
+
 module.exports = {
   candidateSelectionSchema,
   candidateSelectionSchemaFor,
-  semanticBindingSchemaFor
+  semanticBindingSchemaFor,
+  semanticSceneSchemaFor
 };
