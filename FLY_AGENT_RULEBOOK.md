@@ -1,127 +1,128 @@
-# Fly Agent Operating Guide
+# Fly — Agent and Engineering Rulebook
 
-## Core mission (always)
-From a flight chosen in cart, this agent must complete checkout on unfamiliar airline/OTA sites in a universal way:
-- Understand current checkout decision state.
-- Compile each decision into a canonical semantic effect contract.
-- Apply traveler profile policy to select one exact action.
-- Execute only grounded actuators on the observed page.
-- Verify observed effects.
-- Use canonical semantics as the fast path; when semantics are incomplete, allow one exact low-consequence reversible mechanic through the shared governor and verifier.
-- Continue only when the resulting state change is freshly verified.
-- Stop at verified payment review, never trigger payment/card actions.
+Last updated: 2026-08-10
 
-## Why this exists
-Our success depends less on per-site button labels and more on a robust, reusable decision pipeline.
+## Core mission
 
-## Current non-negotiable components
-1. Current Obligation = the one exact active requirement, decision, or stage exit Fly is solving now.
-2. Decision Evidence = what is actually on the page now.
-3. Decision-Effect Compiler = what the decision changes if accepted/rejected/selected.
-4. Profile Resolver = which decision is allowed/preferred from user policy.
-5. Grounded Actuator = exact button/link/input owned by the Current Obligation.
-6. Verifier = checks whether the action changed the page as expected.
-7. Outcome Journal / Transaction Ledger = durable proof that the right decisions were applied.
-8. Consequence-Gated Adaptive Operator = the fallback that can try one exact current reversible control when canonical planning has no goal.
-9. Transition Readiness = rules for moving to the next step (seat, insurance, bundles, contacts, review).
+Given an approved selected booking, traveler, and policy, Fly must complete an unfamiliar airline/OTA checkout to verified payment review, ask only when user facts or authority are genuinely required, and never perform payment, legal, or purchase actions under the current milestone.
 
-Transition Readiness owns only loading, hydration, and transport stability. It must not reinterpret semantic completeness, inherit a deadline from a different stage/surface/URL, or ask the traveler about internal mechanics. Once a destination is stable and exposes a checkout-relevant capability, the one runtime controller owns what to do next.
+Fly learns reusable checkout mechanics—not airline workflows.
 
-The full semantic chain is mandatory for consequential choices and completion. It is supporting evidence—not a veto—for a harmless, exact, reversible mechanic whose outcome can be observed immediately.
-
-## How to triage failures (first principles)
-When stuck, do not start with site-specific patches.
-
-1. Confirm where it stops.
-- stage id / step name
-- what was waiting for
-- what action was last performed
-
-2. Decide if the issue is:
-- missing decision interpretation (wrong meaning of page state),
-- missing effect contract (action executed but result not represented),
-- missing state continuity (no destination/action readiness binding),
-- or page noise (irrelevant modal/ads/feedback overlay).
-
-3. Fix the smallest universal layer first.
-- Add/adjust parser or state transition logic.
-- Do not add new per-site selectors unless the universal layer cannot represent behavior.
-
-4. Re-run only after the fix is single-purpose.
-- same flow should move forward, not reopen already completed choices.
-
-## What to remove / simplify first
-- Remove duplicate inferencing that re-derives meaning already provided by the compiler.
-- Remove schedulers that skip the current field because its present actuator failed; keep the obligation and try bounded mechanics against it.
-- Keep unknown-surface observations as context only. Generic ambiguity itself is never executable, but it may trigger one bounded task over exact current low-consequence controls.
-- Remove heuristic guesses like "continue always means safe", "no thanks always free", "any matching label satisfies decision".
-- Remove navigation readiness that depends on stale or non-durable markers.
-- Remove broad route parsing where it overfits unrelated text as route data.
-- Remove any rule that asks the user to diagnose internal mechanics. User questions are for missing profile facts, authentication/challenges, consequential choices, or authority boundaries.
-- Remove any rule that promotes a positioned summary/sidebar to exclusive foreground from action words alone; blocking ownership requires structural evidence.
-
-## What must always stay
-- Outcome verification before final success.
-- Bounded reobserve/retry loops with timeout.
-- Stale-action and duplicate-action refusal.
-- Route evidence dedup + richer-route merge rules.
-- Explicit policy-boundary checks for paid extras and unsupported actions.
-- Deterministic authority over identity, itinerary, price, legal acceptance, payment, purchase, and final completion.
-
-## The one runtime loop
+## One runtime loop
 
 ```text
-Observe a compact fresh surface
-→ prefer one canonical requirement/decision
-→ otherwise admit one exact safe reversible control
+fresh immutable observation
+→ compile meaning once
+→ TaskState publishes one obligation/disposition
+→ bind exact mechanics for that obligation
 → consequence governor
-→ execute one atomic action
-→ fresh state-change verification
-→ persist verified progress or try one distinct bounded mechanic
+→ execute one leased action
+→ fresh mechanical and semantic verification
+→ persist compact verified facts
+→ continue, recover, ask, stop, or finish review
 ```
 
-Do not add a second planner, a generic blocked-navigation journey, or another completion receipt. Semantic classifiers inform this loop; they do not independently stop it.
+Do not add a second semantic compiler, requirement lifecycle, planner, readiness authority, verifier, recovery store, or completion receipt.
 
-## Valid reasons to stop
+## Responsibility rules
 
-- A required traveler fact is genuinely missing.
-- CAPTCHA, OTP, login, bank approval, or another human challenge is active.
-- A consequential choice lacks profile policy or explicit authority.
-- Itinerary, price, currency, identity, legal, payment, or purchase evidence conflicts with the approved contract.
-- The website is unavailable or rejects valid completed input.
-- The bounded controller exhausted distinct grounded mechanics and reports an internal diagnostic.
+1. **Observation** reports mechanics, current state, ownership evidence, and transaction evidence.
+2. **DecisionFrame** compiles semantic entities once.
+3. **TaskState** alone decides what work exists and how the turn ends.
+4. **Mechanics binder** finds actuators only for the admitted obligation.
+5. **Governor** checks consequences immediately before execution.
+6. **Browser verifier** proves the mechanic occurred.
+7. **Transition verifier** proves the same semantic obligation was satisfied.
+8. **Transaction review** independently reconciles the selected booking and outcomes.
 
-Do not ask the traveler because Fly could not classify an ordinary enabled button or because an internal semantic goal is absent.
+Actionability does not create work. A model may choose only supplied fresh reversible candidate IDs. It may not invent targets, facts, obligations, effects, or permission.
 
-## Minimal test of a fix
-Before moving to next bug:
-- The same path no longer loops.
-- The right profile choice is preserved across pages.
-- `outcomeJournal` includes the executed verified decision outcomes.
-- `transactionReview.outcomeLedger` is complete or explicitly blocked with reason.
+## Behavior on unfamiliar sites
 
-## Progress discipline
-Every run should update:
-- `FLY_PROGRESS.md`
-- `FLY_FINAL_ROADMAP.md`
-- `FLY_COVERAGE_MATRIX.md`
+Fly should autonomously handle:
 
-Use short, skimmable entries:
-- what blocked us,
-- what fixed,
-- what next,
-- any regressions to watch for.
+- New ordinary textboxes and textareas.
+- Different DOM nesting, wrappers, and visual order.
+- Combined or split names, DOB, phone, address, and document fields.
+- Native/custom selects, autocomplete, portal listboxes, radios, cards, switches, and steppers.
+- Rerendered controls with new physical identities.
+- Shadow/portal/overlay surfaces when usable evidence exists.
+- Offscreen controls, delayed hydration, localized labels, and reused Continue buttons.
+- Optional blank fields and dormant login/signup/future-step representations.
 
-## Session handoff template
-- User goal for this session:
-- Current stage reached:
-- Exact root bottleneck:
-- Root fix applied:
-- Evidence check:
-- Risk of regression:
-- Remove/simplify candidates:
-- Next 1-2 moves:
+The absence of an airline-specific skill is never a stop reason.
 
-## Core goal reminder
-The long-term goal is not to optimize one airline.
-The long-term goal is universal profile-safe checkout completion with evidence-backed state transitions across new airline and OTA sites.
+## Valid stop or pause reasons
+
+- Required traveler data is genuinely missing.
+- Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge is active.
+- Legal, payment, purchase, identity, itinerary, price, currency, or paid-choice authority is missing or contradictory.
+- Inventory is sold out, the session expired, the airline is unavailable, or valid completed input is rejected.
+- Distinct safe grounded mechanics are exhausted after bounded recovery.
+- Verified payment review is reached under the current milestone.
+
+Exhausted mechanics on an otherwise eligible journey is an engineering coverage defect, not a desired product handoff.
+
+Do not ask the user to diagnose DOMs, buttons, selectors, readiness, or internal agent mechanics.
+
+## Non-negotiable safety
+
+Always preserve:
+
+- Exact selected traveler and booking identity.
+- Exact target freshness and ActionLease identity.
+- Stale-action and exact-duplicate refusal.
+- Consequence governance for paid extras, route, dates, identity, price, currency, legal, payment, and purchase.
+- Fresh semantic postcondition verification.
+- Bounded recovery and failed-strategy memory.
+- Transaction and outcome reconciliation.
+- Zero payment/legal/card/Pay/purchase capability under the current milestone.
+
+Never weaken safety to make a site pass.
+
+## Failure triage
+
+For every material live failure:
+
+1. Identify the last verified obligation, action, and fresh surface.
+2. Classify it as expected handoff, external website failure, or universal contract/mechanics defect.
+3. Locate the owning layer: observation, semantic compilation, TaskState admission, mechanics binding, governance, execution, verification, recovery, or transaction review.
+4. Add the smallest exact trace-derived replay.
+5. Repair the universal component; never start with an airline conditional.
+6. Run focused test, full unit suite, full browser suite, and repository checks.
+7. Rerun the discovering site and one retained canary.
+8. Confirm important repairs on a related second site.
+
+## Simplification test
+
+Remove or demote anything that independently:
+
+- Re-discovers work after DecisionFrame/TaskState.
+- Reinterprets policy during mechanics binding.
+- Treats a declared effect as observed success.
+- Persists turn-local candidate/observation graphs as semantic memory.
+- Polls unchanged full observations instead of waiting for mutation/deadline.
+- Converts diagnostics or compatibility state into runtime authority.
+
+Do not remove distinct safety roles merely because they inspect related evidence. TaskState/governor, browser/backend verification, deterministic/adaptive mechanics, and transaction/payment boundaries serve different purposes.
+
+## Acceptance after a fix
+
+- The exact failure replay passes.
+- No completed work reopens or loops.
+- Correct profile/policy state survives navigation and rerender.
+- 359/359 unit tests pass.
+- 169/169 browser replays pass uninterrupted.
+- `npm run check` and `git diff --check` pass.
+- The discovering site and one retained canary pass.
+- No unauthorized irreversible action executes.
+- Manual intervention is explicitly annotated in the canary report.
+
+## Documentation discipline
+
+- PRD changes only for product scope, safety, or promotion gates.
+- Roadmap changes for architecture status or engineering sequence.
+- Coverage matrix changes for material live/site/scenario acceptance evidence.
+- Progress changes for material implementation or root-cause decisions.
+- Handoff stays current with code structure, commands, risks, and next work.
+- Keep historical detail in Git history and sanitized traces, not duplicated across current documents.
