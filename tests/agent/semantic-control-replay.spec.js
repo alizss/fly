@@ -9793,26 +9793,33 @@ test("price-summary utilities cannot become free checkout alternatives", async (
   expect(result.publishedLockGroups).toEqual([]);
 });
 
-test("identical navigation dispatch is held while the first action is settling", async ({ page }) => {
+test("only the identical navigation action lease is held while a reused Continue mechanic remains available", async ({ page }) => {
   await loadHtmlProducer(page, `<main><button id="continue" type="button">Continue</button></main>`);
   const result = await page.evaluate(() => {
     const hooks = window.__ATW_TEST__;
     const target = document.getElementById("continue");
     const decision = {
+      actionId: "act_continue_stage_one",
       action: "click",
       interactionRole: "navigation",
       semanticEffect: "advance",
       intent: "navigate_stage"
     };
+    const freshLease = {
+      ...decision,
+      actionId: "act_continue_stage_two"
+    };
     return {
       first: hooks.repeatGuardFor(target, "first", decision),
       immediateRepeat: hooks.repeatGuardFor(target, "repeat", decision),
+      freshLeaseOnSameMechanic: hooks.repeatGuardFor(target, "fresh stage", freshLease),
       state: hooks.repeatGuardState()
     };
   });
 
   expect(result.first).toBe(true);
   expect(result.immediateRepeat).toBe(false);
+  expect(result.freshLeaseOnSameMechanic).toBe(true);
   expect(result.state.lastClickAt).toBeGreaterThan(0);
 });
 

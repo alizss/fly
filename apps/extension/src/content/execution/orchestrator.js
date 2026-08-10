@@ -302,22 +302,31 @@ export function createExecutionOrchestrator({
       return false;
     }
     const signature = elementSignature(element);
+    const actionLeaseId = String(decision?.actionId || decision?.id || "").trim();
+    // A DOM signature identifies a mechanic, not an execution lease. Checkout
+    // stages routinely reuse the same Continue element/markup. Only the exact
+    // same governed action may be held as an in-flight duplicate; a fresh lease
+    // must be allowed through and remains governed by the backend episode.
+    const dispatchSignature = actionLeaseId
+      ? `${signature}::action:${actionLeaseId}`
+      : signature;
     const now = Date.now();
     const navigationLike = Boolean(decision && (
       decision.interactionRole === "navigation"
       || decision.semanticEffect === "advance"
       || /navigate|advance|continue|next_stage/.test(String(decision.intent || decision.physicalEffect || "").toLowerCase())
     ));
-    const sameSignature = signature === agent.lastClickSignature;
+    const sameSignature = dispatchSignature === agent.lastClickSignature;
     if (sameSignature) {
       agent.repeatClickCount += 1;
     } else {
-      agent.lastClickSignature = signature;
+      agent.lastClickSignature = dispatchSignature;
       agent.repeatClickCount = 0;
     }
     if (navigationLike && sameSignature && agent.lastClickAt && now - agent.lastClickAt < 4_000) {
       logFlow("repeat_guard.navigation_settling", {
         signature,
+        actionLeaseId,
         elapsedMs: now - agent.lastClickAt,
         message: String(message || "")
       });
@@ -327,6 +336,7 @@ export function createExecutionOrchestrator({
     if (agent.repeatClickCount >= 2) {
       logFlow("repeat_guard.diagnostic", {
         signature,
+        actionLeaseId,
         repeatClickCount: agent.repeatClickCount,
         message: String(message || ""),
         page: pageSnapshot("repeat-guard-diagnostic")
