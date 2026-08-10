@@ -12,7 +12,6 @@ const DIAGNOSTIC_DIR = process.env.ATW_DIAGNOSTIC_DIR || DATA_DIR;
 const DB_FILE = process.env.ATW_PROFILE_DB || path.join(DATA_DIR, "air-travel-wallet-db.json");
 const MAX_OBSERVATION_BYTES = 5_500_000;
 const MAX_SCREENSHOT_UPLOAD_BYTES = 12_000_000;
-const screenshotUploads = new Map();
 const KEY = crypto.createHash("sha256").update(process.env.ATW_ENCRYPTION_KEY || "local-dev-key-change-me").digest();
 const AGENT_MODEL = process.env.ATW_AGENT_MODEL || "gpt-4.1-mini";
 const AGENT_RECOVERY_MODEL = process.env.ATW_AGENT_RECOVERY_MODEL || AGENT_MODEL;
@@ -22,16 +21,13 @@ const agentSessionStore = require("./agent/session-store");
 const agentTraceStore = require("./agent/trace-store");
 const { agentLoopFailurePayload, createAgentLoopFailure } = require("./agent/http-errors");
 const { appendRotatingJsonLine, retentionConfig } = require("./agent/diagnostic-retention");
-const { prepareTransactionInvariants } = require("./agent/invariants");
 const { withUpdate, normalizeStep } = require("../../packages/shared/agent-state");
 const { PAGE_SURFACE_ID, normalizeSurface } = require("./agent/surface-contract");
 const { normalizeCanonicalDate } = require("./agent/date-field-codec");
 const { canonicalizeUserPolicy, seatPolicyFrom } = require("./agent/policy-profile");
 const agentContract = require("../extension/src/shared/agent-contract");
-const {
-  normalizeSelectedBooking,
-  transactionFactsFromSelectedBooking
-} = require("../../packages/shared/selected-booking");
+const { createSessionService } = require("./agent/session-service");
+const { createScreenshotStore } = require("./agent/screenshot-store");
 const { readBody, requestBodyError } = require("./http/body");
 const { sendJson } = require("./http/response");
 const { createStaticHandler } = require("./http/static");
@@ -55,132 +51,6 @@ function finiteNumberOrNull(value) {
 function normalizeTravelPurpose(value, fallback = "leisure") {
   const normalized = String(value || "").trim().toLowerCase();
   return ["leisure", "business"].includes(normalized) ? normalized : fallback;
-}
-
-function summarizeAgentSession(session) {
-  if (!session) return null;
-  return {
-    id: session.id,
-    status: session.status,
-    goal: session.goal,
-    currentStage: session.taskState?.stage || "unknown",
-    travelerName: "",
-    approvals: session.approvals,
-    completedFields: [],
-    lockedFields: {},
-    retryCounts: {},
-    lastAction: session.lastAction,
-    lastResult: session.lastActionResult || null,
-    lastPageSummary: {
-      site: session.site?.host || "",
-      url: session.site?.url || "",
-      requirements: 0,
-      missing: (session.taskState?.activeDecisions || []).filter((decision) => decision.required === true).length
-        + (session.taskState?.validationBlockers || []).length
-    },
-    events: []
-  };
-}
-
-function createAgentSession(body = {}) {
-  const traveler = body.traveler || {};
-  const requestedSessionId = clampText(body.sessionId || "", 120);
-  const existing = requestedSessionId ? agentSessionStore.getSession(requestedSessionId) : null;
-  if (body.resumeOnly && (!requestedSessionId || !existing)) {
-    return null;
-  }
-  const durableBaseline = existing?.transactionInvariants?.baseline || null;
-  // A finalized product contract seeds approved transaction truth immediately.
-  // Direct-site sessions may begin without it and progressively promote one
-  // coherent owned booking envelope; raw acquisition is never admitted here.
-  const admittedSelectedBooking = existing ? null : normalizeSelectedBooking(body.selectedBookingContract);
-  const selectedBooking = admittedSelectedBooking
-    ? {
-        observationId: admittedSelectedBooking.selectionId,
-        sourceUrl: admittedSelectedBooking.sourceUrl,
-        facts: transactionFactsFromSelectedBooking(admittedSelectedBooking)
-      }
-    : null;
-  const selectedTravelerIds = (selectedBooking?.facts?.travelers || durableBaseline?.travelers || [])
-    .map((entry) => clampText(entry?.travelerId, 120))
-    .filter(Boolean);
-  const requestedTravelerId = clampText(traveler.id || body.travelerId || "", 120);
-  const durableTravelerId = clampText(existing?.travelerId || selectedTravelerIds[0] || "", 120);
-  if (existing && requestedTravelerId && requestedTravelerId !== durableTravelerId) {
-    throw requestBodyError(
-      "TRAVELER_IDENTITY_MISMATCH",
-      "The selected wallet traveler does not match the traveler bound to this durable checkout.",
-      409
-    );
-  }
-  if (!existing && !requestedTravelerId) {
-    throw requestBodyError(
-      "SELECTED_TRAVELER_REQUIRED",
-      "Select at least one wallet traveler before starting checkout.",
-      422
-    );
-  }
-  if (!existing && selectedBooking && !selectedTravelerIds.includes(requestedTravelerId)) {
-    throw requestBodyError(
-      "TRAVELER_IDENTITY_MISMATCH",
-      "The selected wallet traveler is not authorized by the selected booking contract.",
-      409
-    );
-  }
-  const primaryTravelerId = existing ? durableTravelerId : requestedTravelerId;
-  const state = existing || agentSessionStore.getOrCreateSession(requestedSessionId, {
-    goal: clampText(body.goal || body.userIntent || "Complete checkout safely.", 500),
-    travelerId: primaryTravelerId,
-    site: { host: body.page?.site || "", url: body.page?.url || "" }
-  });
-  let updated = withUpdate(state, {
-    status: "running",
-    userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
-    travelerId: primaryTravelerId,
-    travelerIds: [...new Set([
-      ...selectedTravelerIds,
-      primaryTravelerId
-    ].filter(Boolean))],
-    userPolicy: canonicalizeUserPolicy({
-      bookingRules: clampText(traveler.booking_rules, 800),
-      baggagePreference: clampText(traveler.baggage_preference, 120),
-      paymentPreference: clampText(traveler.payment_preference, 120)
-    }, traveler),
-    approvals: {
-      ...state.approvals,
-      skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
-      paymentApproved: false,
-      paymentAuthorization: body.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
-      priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
-    }
-  });
-  if (selectedBooking) {
-    updated = prepareTransactionInvariants(updated, {
-      observationId: selectedBooking.observationId,
-      page: {
-        site: body.page?.site || "",
-        url: selectedBooking.sourceUrl || body.page?.url || "",
-        step: "flight_selection",
-        transactionFacts: selectedBooking.facts
-      }
-    }, traveler).state;
-  }
-  agentSessionStore.saveSession(updated);
-  return updated;
-}
-
-function reportAgentResult(body = {}) {
-  const checkoutState = agentSessionStore.getSession(body.sessionId);
-  if (!checkoutState) return null;
-  const result = body.result || {};
-  const status = result.type === "final_review"
-    ? "ready_for_payment"
-    : result.type === "save_trip"
-      ? "complete"
-      : ["ask_user", "stop"].includes(result.type)
-        ? "awaiting_user"
-        : checkoutState.status;
-  return agentSessionStore.recordActionResult(checkoutState.id, result, { status });
 }
 
 function encryptSensitive(value) {
@@ -418,41 +288,12 @@ function extensionTraveler(db, traveler) {
   };
 }
 
-function storeScreenshotUpload({ sessionId = "", observationId = "", screenshotDataUrl = "" } = {}) {
-  if (!screenshotDataUrl.startsWith("data:image/")) {
-    throw requestBodyError("SCREENSHOT_INVALID", "Screenshot upload must be a data:image URL.", 400);
-  }
-  const screenshotId = uid("shot");
-  screenshotUploads.set(screenshotId, {
-    screenshotId,
-    sessionId: clampText(sessionId, 120),
-    observationId: clampText(observationId, 120),
-    screenshotDataUrl,
-    createdAt: Date.now()
-  });
-  while (screenshotUploads.size > 40) {
-    screenshotUploads.delete(screenshotUploads.keys().next().value);
-  }
-  return screenshotId;
-}
-
-function screenshotForObservation(page = {}, body = {}) {
-  const screenshotId = clampText(page.screenshotId, 120);
-  if (!screenshotId) return { screenshotId: "", screenshotDataUrl: String(page.screenshotDataUrl || "") };
-  const upload = screenshotUploads.get(screenshotId);
-  if (!upload) throw requestBodyError("SCREENSHOT_REFERENCE_EXPIRED", "Screenshot reference is unknown or expired.", 409);
-  if (upload.sessionId && upload.sessionId !== clampText(body.sessionId, 120)) {
-    throw requestBodyError("SCREENSHOT_SESSION_MISMATCH", "Screenshot reference belongs to another checkout session.", 409);
-  }
-  if (upload.observationId && upload.observationId !== clampText(body.observationId, 120)) {
-    throw requestBodyError("SCREENSHOT_OBSERVATION_MISMATCH", "Screenshot reference belongs to another observation.", 409);
-  }
-  return { screenshotId, screenshotDataUrl: upload.screenshotDataUrl };
-}
-
 function clampText(value, max = 4000) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
+
+const { createAgentSession, reportAgentResult, summarizeAgentSession } = createSessionService(agentSessionStore);
+const { screenshotForObservation, storeScreenshotUpload } = createScreenshotStore();
 
 function lowerText(value) {
   return clampText(value, 4000).toLowerCase();

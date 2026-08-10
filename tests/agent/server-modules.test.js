@@ -9,6 +9,7 @@ const { readBody } = require("../../apps/web/http/body");
 const { sendJson } = require("../../apps/web/http/response");
 const { createStaticHandler } = require("../../apps/web/http/static");
 const { createAgentRoutes } = require("../../apps/web/routes/agent");
+const { createScreenshotStore } = require("../../apps/web/agent/screenshot-store");
 
 function request(body, headers = {}) {
   const req = new EventEmitter();
@@ -100,4 +101,21 @@ test("agent route rejects planning without replacing the durable session", async
   assert.equal(res.status, 409);
   assert.equal(JSON.parse(res.body).code, "DURABLE_SESSION_REQUIRED");
   assert.equal(timings.at(-1).outcome, "durable_session_required");
+});
+
+test("screenshot references remain bounded to their durable session and observation", () => {
+  const screenshots = createScreenshotStore({ maxEntries: 2 });
+  const screenshotId = screenshots.storeScreenshotUpload({
+    sessionId: "chk_1",
+    observationId: "obs_1",
+    screenshotDataUrl: "data:image/jpeg;base64,YQ=="
+  });
+  assert.equal(
+    screenshots.screenshotForObservation({ screenshotId }, { sessionId: "chk_1", observationId: "obs_1" }).screenshotDataUrl,
+    "data:image/jpeg;base64,YQ=="
+  );
+  assert.throws(
+    () => screenshots.screenshotForObservation({ screenshotId }, { sessionId: "chk_2", observationId: "obs_1" }),
+    (error) => error.code === "SCREENSHOT_SESSION_MISMATCH"
+  );
 });
