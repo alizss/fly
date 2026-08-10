@@ -1,9 +1,10 @@
 import {
-  SELECTED_BOOKING_MAX_AGE_MS,
   authoritativeSelectedBookingFacts,
   composeSelectedBookingContract,
   validStoredSelectedBookingContract
 } from "./selected-booking.js";
+import { createAgentRuntimeContext } from "./runtime-context.js";
+import { createSelectedBookingAcquisition } from "./selected-booking-acquisition.js";
 import { createActionTransport } from "./observation/action-transport.js";
 import { createAccessibilityProjection } from "./observation/accessibility.js";
 import {
@@ -11,10 +12,12 @@ import {
   decisionTargetAliasIds
 } from "./observation/control-aliases.js";
 import { createControlRegistryTools } from "./observation/control-registry.js";
+import { createElementRegistry } from "./observation/element-registry.js";
 import { createControlGraphCompiler } from "./observation/control-graph.js";
 import { createDecisionGroupCompiler } from "./observation/decision-groups.js";
 import { implicitRole, isVisible, queryAllDeep, textFromIds } from "./observation/dom.js";
 import { createPageStateStore } from "./observation/page-state-store.js";
+import { createPageStateSupport } from "./observation/page-state-support.js";
 import { createPageMapCompiler } from "./observation/page-map.js";
 import { createPageUnderstanding } from "./observation/page-understanding.js";
 import { createPerceptionFacade } from "./observation/perception.js";
@@ -23,6 +26,8 @@ import { createStageExitCompiler } from "./observation/stage-exit.js";
 import { createTransactionEvidenceCompiler } from "./observation/transaction-evidence.js";
 import { createObservationTransport } from "./observation/transport.js";
 import { createScreenshotObservation } from "./observation/screenshot.js";
+import { createObservationSignatures } from "./observation/signatures.js";
+import { actionableCheckoutErrors } from "./observation/validation.js";
 import {
   boundedPhrase,
   normalizedFieldAlias,
@@ -40,6 +45,8 @@ import { createAgentLifecycle } from "./controller/lifecycle.js";
 import { createDecisionClient } from "./controller/decision-client.js";
 import { createSessionClient } from "./controller/session-client.js";
 import { createCheckoutController } from "./controller/checkout-controller.js";
+import { createCheckoutWatcher } from "./controller/checkout-watch.js";
+import { createTripService } from "./controller/trip-service.js";
 import { createSidebarUi } from "./ui/sidebar.js";
 import { createFlowDiagnostics } from "./diagnostics/flow.js";
 import { createDebugDiagnostics } from "./diagnostics/debug.js";
@@ -60,8 +67,6 @@ import {
   const ACTION_REPORT_MAX_ATTEMPTS = 2;
   const AGENT_SINGLE_BRAIN = true;
   const AGENT_CONTRACT = globalThis.AtwAgentContract || null;
-  const BAGGAGE_TERMS = ["no cabin bag", "baggage not included", "personal item only", "without baggage", "checked baggage not included"];
-  const MULTI_AIRPORT_CODES = new Set(["LHR", "LGW", "LTN", "STN", "LCY", "CDG", "ORY", "BVA", "IST", "SAW"]);
   const PAYMENT_TERMS = ["card", "cvc", "cvv", "security code", "payment", "cc-number", "cc-csc"];
   const SLOW_STEP_MS = 160;
   const VERIFY_STEP_MS = 120;
@@ -85,8 +90,6 @@ import {
   let selectedTravelerId = null;
   let filledFields = [];
   let warnings = [];
-  let renderTimer = null;
-  let elementIdCounter = 0;
   const canonicalSelectionCommitments = new Map();
   const choiceActuatorBindings = new Map();
   const choiceInteractionStates = new Map();
@@ -180,66 +183,34 @@ import {
     const control = clicked && agent.pageMap ? lookupControlForElement(agent.pageMap, clicked) : null;
     if (control?.decisionGroupId) clearCommittedChoicesForGroup(control.decisionGroupId);
   }, true);
-  let agent = {
-    running: false,
-    sessionId: "",
-    apiBase: DEFAULT_API,
-    awaiting: "",
-    messages: [],
-    lastClickSignature: "",
-    repeatClickCount: 0,
-    lastClickAt: 0,
-    failedLocalStrategies: [],
-    skipPaidExtrasApproved: false,
-    skipRoutineRunning: false,
-    autopilotMode: true,
-    pendingUserMessage: "",
-    pendingUserResponse: null,
-    pendingInputRequest: null,
-    sessionProfileOverrides: {},
-    currentAction: "",
-    currentReason: "",
-    currentStage: "",
-    userGoal: "",
-    reasoningLog: [],
-    actionHistory: [],
-    completedFields: {},
-    sectionPlan: [],
-    taskQueue: [],
-    debugLog: [],
-    flowLog: [],
-    flowSeq: 0,
-    activeTurnId: "",
-    activeObservationId: "",
-    activeExecutionActionId: "",
-    activeExecutionObservationId: "",
-    activeExecutionDecisionAction: "",
-    actionLedger: [],
-    lastActionResult: null,
-    lastBackendDebug: null,
-    processDiagnostics: null,
-    sessionStartFailure: null,
-    pageMap: null,
-    lastPageMutationAt: Date.now(),
-    pageUnderstanding: null,
-    observerTab: "summary",
-    lifecycleId: 0,
-    loopRunSerial: 0,
-    activeLoopRunId: 0,
-    loopBusy: false,
-    loopRerunQueued: false,
-    activePlannerRequest: null,
-    destinationWait: null,
-    destinationWaitTimer: null,
-    honoredReobserveRetryTokens: new Set(),
-    lastSentMaterialHash: "",
-    lastSentFeedbackKey: "",
-    screenshotCache: new Map()
-  };
+  const { owner: agent, scopes: runtimeScopes } = createAgentRuntimeContext(DEFAULT_API);
   let pageStateStore = null;
   let buildPageMap = null;
-  let activeObservationElementRegistry = null;
   let activeObservationControlRegistry = null;
+  const {
+    normalizeMatchText,
+    stableHash,
+    elementSignature,
+    pageSignature,
+    itineraryActionEvidence,
+    structuralPageSignature,
+    materialObservationSignature,
+    observationHashForMap
+  } = createObservationSignatures({
+    activeOverlayElements: (...args) => activeOverlayElements(...args),
+    buildPageMap: (...args) => buildPageMap(...args),
+    buttonText: (...args) => buttonText(...args),
+    directControlName: (...args) => directControlName(...args),
+    elementBox: (...args) => elementBox(...args),
+    isVisible,
+    overlayText: (...args) => overlayText(...args)
+  });
+  const elementRegistry = createElementRegistry({
+    compactText,
+    directControlName: (...args) => directControlName(...args),
+    queryAllDeep
+  });
+  const { elementId, elementById } = elementRegistry;
   const {
     observationTransportBytes,
     compactActionTransportValue,
@@ -319,93 +290,10 @@ import {
   }
 
   const RESUME_KEY = "atwAgentResume";
-  const SELECTED_BOOKING_KEY = "atwSelectedBookingAcquisitionV1";
   const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
   const DESTINATION_RETRY_INTERVAL_MS = 300;
   const DESTINATION_MUTATION_SETTLE_MS = 450;
-  const SELECTED_BOOKING_UNCHANGED_RETRY_MS = 30_000;
-  let selectedBookingCaptureTimer = null;
-  let selectedBookingCaptureAttempt = {
-    url: "",
-    snapshotHash: "",
-    retryAfter: 0
-  };
-
-  function captureSelectedBookingFromMap(map = null) {
-    const facts = authoritativeSelectedBookingFacts(map?.transactionFacts);
-    if (!facts) return null;
-    const existing = readSelectedBookingAcquisition();
-    // Once checkout has started rendering traveler/extras/payment pages, the
-    // selected flight is immutable. Only the actual flight-selection stage
-    // may replace a prior capture when the user chooses a different flight.
-    if (existing && map?.step !== "flight_selection") return existing;
-    const acquisition = {
-      contractVersion: "selected-booking-acquisition/v1",
-      capturedAt: new Date().toISOString(),
-      sourceOrigin: location.origin,
-      sourceUrl: location.href,
-      observationId: `booking_capture_${Date.now().toString(36)}`,
-      facts
-    };
-    try {
-      sessionStorage.setItem(SELECTED_BOOKING_KEY, JSON.stringify(acquisition));
-      return acquisition;
-    } catch (error) {
-      // Sandboxed/opaque documents may deny sessionStorage. The acquisition
-      // is still valid for the current page/session handshake even though it
-      // cannot survive navigation in that environment.
-      return acquisition;
-    }
-  }
-
-  function readSelectedBookingAcquisition() {
-    try {
-      const acquisition = JSON.parse(sessionStorage.getItem(SELECTED_BOOKING_KEY) || "null");
-      const capturedAt = Date.parse(acquisition?.capturedAt || "");
-      if (
-        acquisition?.contractVersion !== "selected-booking-acquisition/v1"
-        || acquisition.sourceOrigin !== location.origin
-        || !Number.isFinite(capturedAt)
-        || Date.now() - capturedAt > SELECTED_BOOKING_MAX_AGE_MS
-        || !authoritativeSelectedBookingFacts(acquisition.facts)
-      ) {
-        sessionStorage.removeItem(SELECTED_BOOKING_KEY);
-        return null;
-      }
-      return acquisition;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  function scheduleSelectedBookingCapture(reason = "page_update") {
-    if (agent.running || agent.sessionId || selectedBookingCaptureTimer) return false;
-    if (
-      selectedBookingCaptureAttempt.url === location.href
-      && Date.now() < selectedBookingCaptureAttempt.retryAfter
-    ) return false;
-    selectedBookingCaptureTimer = setTimeout(() => {
-      selectedBookingCaptureTimer = null;
-      if (agent.running) return;
-      const observed = pageStateStore.observe({ reason: `selected_booking_${reason}` });
-      const captured = captureSelectedBookingFromMap(observed.map);
-      const snapshotHash = String(observed.snapshotHash || observationHashForMap(observed.map));
-      const unchangedMiss = !captured
-        && selectedBookingCaptureAttempt.url === location.href
-        && selectedBookingCaptureAttempt.snapshotHash === snapshotHash
-        && observed.material === false;
-      selectedBookingCaptureAttempt = {
-        url: location.href,
-        snapshotHash,
-        retryAfter: captured
-          ? Number.POSITIVE_INFINITY
-          : Date.now() + (unchangedMiss ? SELECTED_BOOKING_UNCHANGED_RETRY_MS : 1_500)
-      };
-    }, 350);
-    return true;
-  }
-
   async function saveResumeMarker() {
     try {
       if (!agent.running || !agent.sessionId) {
@@ -760,7 +648,7 @@ import {
   } = createFlowDiagnostics({
     DEFAULT_API,
     actionableCheckoutErrors,
-    agent,
+    agent: runtimeScopes.flow,
     buildPageMap: (...args) => buildPageMap(...args),
     compactText,
     foregroundSurfaceState: (...args) => foregroundSurfaceState(...args),
@@ -785,7 +673,7 @@ import {
     DESTINATION_RETRY_INTERVAL_MS,
     DESTINATION_WAIT_TIMEOUT_MS,
     addAgentMessage,
-    agent,
+    agent: runtimeScopes.lifecycle,
     logFlow,
     processCheckoutAgent: (...args) => processCheckoutAgent(...args),
     renderSidebar: (...args) => renderSidebar(...args),
@@ -1121,89 +1009,9 @@ import {
     }
   }
 
-  function elementSignature(element) {
-    if (!element) return "";
-    const box = isVisible(element) ? elementBox(element) : null;
-    const surface = element.closest?.("[role='dialog'], [aria-modal='true'], .modal, .popover, [role='listbox'], [role='menu']")
-      || activeOverlayElements()[0]
-      || null;
-    const surfaceText = surface ? overlayText(surface).slice(0, 260) : "";
-    return [
-      location.href,
-      element.tagName,
-      element.id,
-      element.name,
-      box ? `${Math.round(box.centerX)}:${Math.round(box.centerY)}:${Math.round(box.width)}x${Math.round(box.height)}` : "",
-      surfaceText,
-      element.innerText || element.value || element.getAttribute("aria-label") || ""
-    ].join("|").slice(0, 500);
-  }
-
-  function pageSignature(map = buildPageMap()) {
-    return [
-      location.href,
-      map.step,
-      map.errors.join("|"),
-      map.text.slice(0, 800)
-    ].join("||");
-  }
-
-  function stableHash(value = "") {
-    const text = String(value || "");
-    let hash = 2166136261;
-    for (let i = 0; i < text.length; i += 1) {
-      hash ^= text.charCodeAt(i);
-      hash = Math.imul(hash, 16777619);
-    }
-    return `h${(hash >>> 0).toString(36)}`;
-  }
-
-  function canonicalItineraryActionDate(value = "") {
-    const text = String(value || "").replace(/(\d{1,2})(?:st|nd|rd|th)\b/gi, "$1").trim();
-    const iso = text.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
-    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-    const months = new Map([
-      ["january", 1], ["february", 2], ["march", 3], ["april", 4], ["may", 5], ["june", 6],
-      ["july", 7], ["august", 8], ["september", 9], ["october", 10], ["november", 11], ["december", 12],
-      ["jan", 1], ["feb", 2], ["mar", 3], ["apr", 4], ["jun", 6], ["jul", 7], ["aug", 8],
-      ["sep", 9], ["sept", 9], ["oct", 10], ["nov", 11], ["dec", 12]
-    ]);
-    const dayFirst = text.match(/\b(\d{1,2})\s+([\p{L}.]+)\s+(20\d{2})\b/iu);
-    const monthFirst = text.match(/\b([\p{L}.]+)\s+(\d{1,2})(?:,)?\s+(20\d{2})\b/iu);
-    const match = dayFirst || monthFirst;
-    if (!match) return "";
-    const day = Number(dayFirst ? match[1] : match[2]);
-    const monthName = String(dayFirst ? match[2] : match[1]).toLowerCase().replace(/\.$/, "");
-    const year = Number(match[3]);
-    const month = months.get(monthName) || 0;
-    const date = new Date(Date.UTC(year, month - 1, day));
-    if (!month || date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day) return "";
-    return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  }
-
-  function itineraryActionEvidence(element) {
-    if (!element?.matches?.("button, a, [role='button'], [role='link']")) return null;
-    const labels = [
-      element.getAttribute?.("aria-label"),
-      directControlName(element),
-      buttonText(element),
-      element.getAttribute?.("title")
-    ].map((value) => String(value || "").replace(/\s+/g, " ").trim()).filter(Boolean);
-    for (const label of [...new Set(labels)]) {
-      const match = label.match(/^(?:edit|change|modify|view)\s+([\p{L}][\p{L} .'’-]{1,78}?)\s+(?:to|→|–|—)\s+([\p{L}][\p{L} .'’-]{1,78}?)\s+flight\s+(?:on|departing(?:\s+on)?)\s+(.{5,60}?)(?:[.!]|$)/iu);
-      if (!match) continue;
-      const departureDate = canonicalItineraryActionDate(match[3]);
-      const origin = match[1].trim();
-      const destination = match[2].trim();
-      if (!departureDate || origin.toLowerCase() === destination.toLowerCase()) continue;
-      return { label, origin, destination, departureDate };
-    }
-    return null;
-  }
-
   const { transactionFactsEvidence } = createTransactionEvidenceCompiler({
     AGENT_CONTRACT,
-    agent,
+    agent: runtimeScopes.transactionEvidence,
     implicitRole,
     isVisible,
     itineraryActionEvidence,
@@ -1214,230 +1022,6 @@ import {
     traveler,
     visiblePageText
   });
-
-  function structuralPageSignature(map = buildPageMap()) {
-    const activeSurface = map.currentSurface || {};
-    const stableSection = (section) => [
-      section.type || "",
-      normalizeMatchText(section.label || ""),
-      section.status || "",
-      (section.selected || []).map(normalizeMatchText).join(",")
-    ].join(":");
-    const stableControl = (control) => [
-      control.kind || control.role || control.type || "",
-      control.field || "",
-      normalizeMatchText(control.label || control.field || ""),
-      control.hasValue ? "1" : "0",
-      control.selected ? "1" : "0"
-    ].join(":");
-    const sections = (map.sections || [])
-      .map(stableSection)
-      .join("|");
-    const controls = [...(map.buttons || []), ...(map.fields || [])]
-      .map(stableControl)
-      .join("|");
-    return [
-      pageSignature(map),
-      `surface:${activeSurface.type || "page"}:${normalizeMatchText(activeSurface.label || "")}`,
-      `sections:${sections}`,
-      `controls:${controls}`
-    ].join("||").slice(0, 4000);
-  }
-
-  function materialObservationSignature(map = buildPageMap()) {
-    const materialUrl = (() => {
-      try {
-        const url = new URL(map.url || location.href, location.href);
-        return `${url.origin}${url.pathname}${url.search}`;
-      } catch (error) {
-        return String(map.url || location.href || "").split("#")[0];
-      }
-    })();
-    const foreground = map.currentSurface?.type && map.currentSurface.type !== "page"
-      ? map.currentSurface
-      : {};
-    const stableState = (state = {}) => ({
-      checked: Boolean(state.checked),
-      selected: Boolean(state.selected),
-      disabled: Boolean(state.disabled),
-      expanded: Boolean(state.expanded),
-      valuePresent: Boolean(state.valuePresent),
-      normalizedValue: String(state.normalizedValue || ""),
-      required: Boolean(state.required)
-    });
-    const controls = (map.controls || [])
-      .map((control) => ({
-        controlId: control.controlId || "",
-        decisionGroupId: control.decisionGroupId || "",
-        semantic: control.semantic || control.field || "",
-        kind: control.kind || control.role || control.type || "",
-        risk: control.risk || "",
-        surfaceId: control.surfaceId || "",
-        sectionId: control.sectionId || "",
-        commitState: control.commitState ? {
-          status: control.commitState.status || "",
-          popupClosed: control.commitState.popupClosed === true,
-          focusSettled: control.commitState.focusSettled === true,
-          actuatorId: control.commitState.actuatorId || ""
-        } : null,
-        state: stableState(control.state || {
-          checked: control.checked,
-          selected: control.selected,
-          disabled: control.disabled,
-          valuePresent: control.hasValue,
-          required: control.required
-        })
-      }))
-      .sort((a, b) => a.controlId.localeCompare(b.controlId));
-    const decisionGroups = (map.decisionGroups || [])
-      .map((group) => ({
-        decisionGroupId: group.decisionGroupId || "",
-        requirementId: group.requirementId || "",
-        semanticType: group.semanticType || group.sectionType || "",
-        stage: group.stage || map.step || "",
-        surfaceId: group.surfaceId || "",
-        instanceId: group.instanceId || "",
-        status: group.status || "",
-        selectedControlId: group.selectedControlId || group.selected?.controlId || "",
-        selectedValue: group.selectedValue || group.selected?.value || "",
-        selectedDisposition: group.selectedEvidence?.disposition || "",
-        selectedPrice: group.selectedEvidence?.structuredPrice || null,
-        removalControlId: group.removalControlId || ""
-      }))
-      .sort((a, b) => a.decisionGroupId.localeCompare(b.decisionGroupId));
-    const fields = (map.fields || [])
-      .map((field) => ({
-        controlId: field.controlId || "",
-        semantic: field.field || "",
-        decisionGroupId: field.decisionGroupId || "",
-        hasValue: Boolean(field.hasValue),
-        required: Boolean(field.required),
-        disabled: Boolean(field.disabled || field.element?.disabled)
-      }))
-      .sort((a, b) => `${a.controlId}:${a.semantic}`.localeCompare(`${b.controlId}:${b.semantic}`));
-    return JSON.stringify({
-      url: materialUrl,
-      step: map.step || "unknown",
-      foreground: {
-        id: foreground.id || "",
-        type: foreground.type || "page",
-        decisionGroupId: foreground.decisionGroupId || ""
-      },
-      transactionFacts: map.transactionFacts ? {
-        evidenceMode: map.transactionFacts.evidenceMode,
-        itinerary: map.transactionFacts.itinerary,
-        travelers: map.transactionFacts.travelers,
-        currency: map.transactionFacts.currency,
-        basePrice: map.transactionFacts.basePrice,
-        totalPrice: map.transactionFacts.totalPrice,
-        fareBrand: map.transactionFacts.fareBrand,
-        selectedExtras: map.transactionFacts.selectedExtras,
-        factEvidence: map.transactionFacts.factEvidence
-      } : null,
-      price: map.price || null,
-      controls,
-      decisionGroups,
-      fields
-    });
-  }
-
-  function observationHashForMap(map = buildPageMap()) {
-    return stableHash(materialObservationSignature(map));
-  }
-
-  function nextElementId(reservedIds = new Set()) {
-    let id = "";
-    do {
-      elementIdCounter += 1;
-      id = `atw-el-${elementIdCounter}`;
-    } while (reservedIds.has(id));
-    reservedIds.add(id);
-    return id;
-  }
-
-  function createObservationElementRegistry() {
-    const byElement = new WeakMap();
-    const byId = new Map();
-    const duplicateRekeys = [];
-    const initialOwners = new Map();
-    for (const element of queryAllDeep("[data-atw-element-id]")) {
-      const id = element.dataset?.atwElementId || "";
-      if (!id) continue;
-      if (!initialOwners.has(id)) initialOwners.set(id, []);
-      initialOwners.get(id).push(element);
-    }
-    const reservedIds = new Set(initialOwners.keys());
-
-    const assign = (element) => {
-      if (!element) return "";
-      const assigned = byElement.get(element);
-      if (assigned) return assigned;
-
-      const inheritedId = element.dataset?.atwElementId || "";
-      const inheritedOwners = inheritedId ? (initialOwners.get(inheritedId) || []) : [];
-      const inheritedIsUnique = Boolean(inheritedId)
-        && inheritedOwners.length <= 1
-        && (!byId.has(inheritedId) || byId.get(inheritedId) === element);
-      const id = inheritedIsUnique ? inheritedId : nextElementId(reservedIds);
-
-      if (inheritedId && inheritedId !== id) {
-        duplicateRekeys.push({
-          inheritedId,
-          assignedId: id,
-          duplicateCount: Math.max(inheritedOwners.length, byId.has(inheritedId) ? 2 : 1),
-          tag: (element.tagName || "").toLowerCase(),
-          label: compactText(directControlName(element) || element.getAttribute?.("aria-label") || element.textContent || "", 140)
-        });
-      }
-      try {
-        element.dataset.atwElementId = id;
-      } catch (_) {
-        // SVG/foreign elements may not expose a mutable dataset.
-      }
-      byElement.set(element, id);
-      byId.set(id, element);
-      return id;
-    };
-
-    for (const owners of initialOwners.values()) {
-      if (owners.length < 2) continue;
-      owners.forEach(assign);
-    }
-
-    return {
-      assign,
-      idFor: (element) => byElement.get(element) || "",
-      elementFor: (id) => byId.get(id) || null,
-      duplicateRekeys
-    };
-  }
-
-  function elementId(element) {
-    if (!element) return "";
-    if (!activeObservationElementRegistry) {
-      activeObservationElementRegistry = createObservationElementRegistry();
-    }
-    return activeObservationElementRegistry.assign(element);
-  }
-
-  function elementById(id) {
-    if (!id) return null;
-    const owned = activeObservationElementRegistry?.elementFor?.(id);
-    if (owned) return owned;
-    const matches = queryAllDeep(`[data-atw-element-id="${CSS.escape(id)}"]`);
-    if (matches.length !== 1) return null;
-    const assignedId = elementId(matches[0]);
-    return assignedId === id ? matches[0] : null;
-  }
-
-  function normalizeMatchText(value) {
-    return String(value || "")
-      .toLowerCase()
-      .replace(/€|eur/g, " eur ")
-      .replace(/[^\p{L}\p{N}]+/gu, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-  }
 
   function liveElementText(element) {
     if (!element) return "";
@@ -2171,7 +1755,7 @@ import {
     visibleOverlays
   } = createPerceptionFacade({
     activeOverlayElements: (...args) => activeOverlayElements(...args),
-    agent,
+    agent: runtimeScopes.perception,
     compactText,
     elementBox,
     elementId,
@@ -2220,7 +1804,7 @@ import {
   } = createForegroundSurfaceCompiler({
     accessibilityNode,
     actionElementLabel,
-    agent,
+    agent: runtimeScopes.foregroundSurface,
     boundHighCardinalityActionElements,
     boundedSurfaceEvidenceOptions,
     buttonText,
@@ -2279,7 +1863,7 @@ import {
     accessibleName,
     accessibilityState,
     actuatorActionability,
-    agent,
+    agent: runtimeScopes.targeting,
     buildCanonicalAliasIndex,
     buildPageMap,
     buttonText,
@@ -2568,13 +2152,13 @@ import {
   }
 
   function beginObservationCompilation() {
-    activeObservationElementRegistry = createObservationElementRegistry();
+    elementRegistry.begin();
     activeObservationControlRegistry = null;
   }
 
   function currentObservationCompilation() {
     return {
-      elementRegistry: activeObservationElementRegistry,
+      elementRegistry: elementRegistry.current(),
       controlRegistry: activeObservationControlRegistry
     };
   }
@@ -2637,153 +2221,14 @@ import {
     visiblePageText,
     visualPageState
   }));
-  function emptyPageStateDiff() {
-    return {
-      addedControls: [],
-      removedControls: [],
-      stateChanges: [],
-      textChanges: [],
-      validationChanges: [],
-      priceChanges: [],
-      surfaceChanges: []
-    };
-  }
-
-  function canonicalPageStateDiff(before = null, after = null) {
-    if (!before || !after) return emptyPageStateDiff();
-    const diff = emptyPageStateDiff();
-    const beforeControls = new Map((before.controls || []).map((control) => [control.controlId, control]));
-    const afterControls = new Map((after.controls || []).map((control) => [control.controlId, control]));
-    const stateFor = (control = {}) => ({
-      checked: Boolean(control.state?.checked),
-      selected: Boolean(control.state?.selected || control.selected),
-      disabled: Boolean(control.state?.disabled),
-      expanded: Boolean(control.state?.expanded),
-      valuePresent: Boolean(control.state?.valuePresent),
-      normalizedValue: String(control.state?.normalizedValue || control.currentValue || ""),
-      selectedValue: String(control.state?.selectedValue || ""),
-      fieldType: String(control.fieldType || ""),
-      executable: Object.values(control.operations || {}).some((operation) => operation?.actionability?.executable === true)
-    });
-    for (const [controlId, control] of afterControls) {
-      const prior = beforeControls.get(controlId);
-      if (!prior) {
-        diff.addedControls.push({ controlId, stableKey: control.stableKey || "", surfaceId: control.surfaceId || "" });
-        continue;
-      }
-      const beforeState = stateFor(prior);
-      const afterState = stateFor(control);
-      if (JSON.stringify(beforeState) !== JSON.stringify(afterState)) {
-        diff.stateChanges.push({ controlId, before: beforeState, after: afterState });
-      }
-      const beforeText = compactText([prior.ownText, prior.ariaLabel, prior.title, prior.label].filter(Boolean).join(" "), 240);
-      const afterText = compactText([control.ownText, control.ariaLabel, control.title, control.label].filter(Boolean).join(" "), 240);
-      if (beforeText !== afterText) diff.textChanges.push({ controlId, before: beforeText, after: afterText });
-    }
-    for (const [controlId, control] of beforeControls) {
-      if (!afterControls.has(controlId)) {
-        diff.removedControls.push({ controlId, stableKey: control.stableKey || "", surfaceId: control.surfaceId || "" });
-      }
-    }
-    const validationKey = (issue = {}) => `${issue.issueId || issue.controlId || ""}:${issue.message || issue}`;
-    const beforeValidation = new Set([...(before.validationIssues || []).map(validationKey), ...(before.errors || []).map(String)]);
-    const afterValidation = new Set([...(after.validationIssues || []).map(validationKey), ...(after.errors || []).map(String)]);
-    const appeared = [...afterValidation].filter((value) => !beforeValidation.has(value));
-    const cleared = [...beforeValidation].filter((value) => !afterValidation.has(value));
-    if (appeared.length || cleared.length) diff.validationChanges.push({ appeared, cleared });
-    if (JSON.stringify(before.price || null) !== JSON.stringify(after.price || null)
-      || JSON.stringify(before.transactionFacts?.selectedExtras || []) !== JSON.stringify(after.transactionFacts?.selectedExtras || [])) {
-      diff.priceChanges.push({
-        before: before.price || null,
-        after: after.price || null,
-        selectedExtrasBefore: before.transactionFacts?.selectedExtras || [],
-        selectedExtrasAfter: after.transactionFacts?.selectedExtras || []
-      });
-    }
-    const surfaceFor = (map = {}) => ({
-      id: map.currentSurface?.id || "surface-page",
-      type: map.currentSurface?.type || "page",
-      label: map.currentSurface?.label || "",
-      progressMarkers: map.foreground?.progressMarkers || map.currentSurface?.foreground?.progressMarkers || null
-    });
-    const beforeSurface = surfaceFor(before);
-    const afterSurface = surfaceFor(after);
-    if (JSON.stringify(beforeSurface) !== JSON.stringify(afterSurface)) {
-      diff.surfaceChanges.push({ before: beforeSurface, after: afterSurface });
-    }
-    return Object.fromEntries(Object.entries(diff).map(([key, value]) => [key, value.slice(0, 40)]));
-  }
-
-  function pageStateDiffIsMaterial(diff = emptyPageStateDiff()) {
-    return Object.values(diff).some((entries) => Array.isArray(entries) && entries.length > 0);
-  }
-
-  function mutationOwnedControlId(target) {
-    if (!target || target.nodeType !== Node.ELEMENT_NODE) target = target?.parentElement || null;
-    return target?.closest?.("[data-atw-control-id]")?.dataset?.atwControlId
-      || target?.dataset?.atwControlId
-      || "";
-  }
-
-  function mutationMayBeMaterial(mutation) {
-    const target = mutation?.target?.nodeType === Node.ELEMENT_NODE
-      ? mutation.target
-      : mutation?.target?.parentElement;
-    if (!target || target.closest?.("#atw-sidebar, #atw-screenshot-annotation-overlay")) return false;
-    if (mutation.type === "viewport") return true;
-    if (mutation.type === "attributes") {
-      if (/^data-atw-/.test(mutation.attributeName || "")) return false;
-      const materialAttributes = new Set([
-        "checked", "selected", "value", "disabled", "required", "hidden", "open",
-        "aria-checked", "aria-selected", "aria-expanded", "aria-disabled", "aria-invalid",
-        "aria-hidden", "aria-valuenow", "data-price", "data-selected", "data-value"
-      ]);
-      if (materialAttributes.has(mutation.attributeName)) return true;
-      if (["class", "style"].includes(mutation.attributeName)) {
-        return Boolean(mutationOwnedControlId(target)
-          || target.matches?.("[role='dialog'], [aria-modal='true'], .modal, .popover, [role='listbox'], [role='menu'], [role='alert'], progress"));
-      }
-      return false;
-    }
-    if (mutation.type === "characterData") {
-      return Boolean(mutationOwnedControlId(target)
-        || target.closest?.("[role='dialog'], [aria-modal='true'], [role='alert'], [aria-live], h1, h2, [data-checkout-step], [class*='step'], [class*='progress'], [data-price], [class*='price'], [class*='total'], progress"));
-    }
-    if (mutation.type === "childList") {
-      const nodes = [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])];
-      const selector = "button, input, select, textarea, [role='button'], [role='option'], [role='radio'], [role='checkbox'], [role='dialog'], [aria-modal='true'], .modal, .popover, [role='listbox'], [role='menu'], [role='alert'], [aria-live], [data-price], [class*='price'], [class*='total'], progress";
-      return nodes.some((node) => {
-        if (node.nodeType === Node.TEXT_NODE) return Boolean(mutationOwnedControlId(target)
-          || target.matches?.("h1, h2, [data-checkout-step], [class*='step'], [class*='progress'], [role='alert'], [aria-live], [data-price], [class*='price'], [class*='total'], progress")
-          || target.closest?.("[role='dialog'], [aria-modal='true']"));
-        return Boolean(node.matches?.(selector) || node.querySelector?.(selector));
-      });
-    }
-    return mutation.type === "input" || mutation.type === "change";
-  }
-
-  function syncIncrementalControlModels(map, controlsById) {
-    const sync = (items = []) => items.map((item) => {
-      const control = controlsById.get(item.controlId || item.id);
-      return control ? applyControlToModel({ ...item }, control) : item;
-    });
-    map.fields = sync(map.fields || []);
-    map.buttons = sync(map.buttons || []);
-    map.sections = (map.sections || []).map((section) => ({
-      ...section,
-      fields: sync(section.fields || []),
-      choices: sync(section.choices || []),
-      buttons: sync(section.buttons || [])
-    }));
-    if (map.currentSurface?.type && map.currentSurface.type !== "page") {
-      map.currentSurface = {
-        ...map.currentSurface,
-        options: sync(map.currentSurface.options || []),
-        buttons: sync(map.currentSurface.buttons || [])
-      };
-    }
-    return map;
-  }
+  const {
+    emptyPageStateDiff,
+    canonicalPageStateDiff,
+    pageStateDiffIsMaterial,
+    mutationOwnedControlId,
+    mutationMayBeMaterial,
+    syncIncrementalControlModels
+  } = createPageStateSupport({ applyControlToModel, compactText });
 
   pageStateStore = createPageStateStore({
     buildPageMap,
@@ -2808,11 +2253,22 @@ import {
   });
 
   const {
+    capture: captureSelectedBookingFromMap,
+    read: readSelectedBookingAcquisition,
+    schedule: scheduleSelectedBookingCapture,
+    cancel: cancelSelectedBookingCapture
+  } = createSelectedBookingAcquisition({
+    isSessionActive: () => Boolean(agent.running || agent.sessionId),
+    observationHashForMap,
+    pageStateStore
+  });
+
+  const {
     copyDebugLog,
     debugSnapshot
   } = createDebugDiagnostics({
     addAgentMessage,
-    agent,
+    agent: runtimeScopes.debug,
     buildPageMap,
     getFilledFields: () => filledFields,
     getWarnings: () => warnings,
@@ -2829,7 +2285,7 @@ import {
     DEFAULT_API,
     actionableCheckoutErrors,
     addAgentMessage,
-    agent,
+    agent: runtimeScopes.session,
     captureSelectedBookingFromMap,
     compactActionResultForTransport,
     compactPageMap: (...args) => compactPageMap(...args),
@@ -2876,7 +2332,6 @@ import {
     watchClickToFirstMutation
   } = createInteractionMechanics({
     activeOverlayElements,
-    agent,
     choiceInteractionStates,
     elementBox,
     elementById,
@@ -3652,7 +3107,7 @@ import {
     prepareScreenshotAnnotations,
     renderScreenshotAnnotationOverlay
   } = createScreenshotObservation({
-    agent,
+    agent: runtimeScopes.screenshot,
     compactText,
     controlMemberNodeIds,
     elementBox,
@@ -3689,7 +3144,7 @@ import {
     requestAgentDecision
   } = createDecisionClient({
     DEFAULT_API,
-    agent,
+    agent: runtimeScopes.decision,
     captureVisibleScreenshot,
     clearDestinationWait,
     compactActionResultForTransport,
@@ -3731,7 +3186,7 @@ import {
     AGENT_CONTRACT,
     activeOverlayElements,
     addAgentMessage,
-    agent,
+    agent: runtimeScopes.execution,
     beginDestinationWait,
     buildPageMap,
     buttonText,
@@ -3802,6 +3257,18 @@ import {
   });
 
   const {
+    runRiskChecks,
+    saveTrip
+  } = createTripService({
+    defaultApi: DEFAULT_API,
+    getAppData: () => appData,
+    renderSaved: () => renderSidebar("saved"),
+    setAppData: (value) => { appData = value; },
+    storageGet,
+    traveler
+  });
+
+  const {
     buildPageUnderstanding,
     buildProposedNextActions,
     buildReasoningSummary,
@@ -3828,7 +3295,7 @@ import {
     DESTINATION_MUTATION_SETTLE_MS,
     VALIDATION_TERMS,
     addAgentMessage,
-    agent,
+    agent: runtimeScopes.checkout,
     announceSectionQueue,
     beginAgentLoop,
     buildPageUnderstanding,
@@ -3863,106 +3330,6 @@ import {
     travelerValue
   });
 
-  // TEMP: perception-only debugging mode. Builds the page map and shows the section/field
-  // breakdown in the sidebar + on-page outlines, but never calls the backend and never
-  // fills/clicks anything. Safe to run repeatedly on any site while we tune section detection.
-  function actionableCheckoutErrors(errors = []) {
-    return (errors || [])
-      .map((error) => String(typeof error === "string" ? error : error?.message || "").replace(/\s+/g, " ").trim())
-      .filter(Boolean)
-      .filter((error) => !/no seat map available|not possible to reserve seats|requested random seating/i.test(error));
-  }
-
-  function monthsAfter(dateString, months) {
-    const date = new Date(dateString);
-    date.setMonth(date.getMonth() + months);
-    return date;
-  }
-
-  function extractPrice() {
-    const priceEl = document.querySelector("[data-price]");
-    if (!priceEl) return null;
-    const amount = Number(priceEl.textContent.replace(/[^0-9.]/g, ""));
-    return Number.isFinite(amount) ? { amount, currency: priceEl.dataset.currency || "USD" } : null;
-  }
-
-  function extractTrip() {
-    const t = traveler();
-    const price = extractPrice();
-    const departure = document.querySelector("[data-departure]")?.textContent?.trim() || "";
-    return {
-      workspace_id: appData.workspaces[0]?.id,
-      traveler_profile_id: t.id,
-      airline: document.querySelector("[data-airline]")?.textContent?.trim() || "Demo Air",
-      seller: document.querySelector("[data-seller]")?.textContent?.trim() || location.host,
-      origin_airport: document.querySelector("[data-origin]")?.textContent?.trim() || "",
-      destination_airport: document.querySelector("[data-destination]")?.textContent?.trim() || "",
-      departure_at: departure ? new Date(departure).toISOString() : "",
-      return_at: "",
-      booking_reference: document.querySelector("[data-booking-reference]")?.textContent?.trim() || "",
-      price_amount: price?.amount || 0,
-      price_currency: price?.currency || "USD",
-      baggage_summary: document.querySelector("[data-baggage-summary]")?.textContent?.trim() || "",
-      booking_url: location.href,
-      invoice_status: "missing",
-      warnings: runRiskChecks().map((warning) => warning.message)
-    };
-  }
-
-  function runRiskChecks() {
-    const t = traveler();
-    const pageText = document.body.innerText.toLowerCase();
-    const trip = extractTripShallow();
-    const results = [];
-
-    if (BAGGAGE_TERMS.some((term) => pageText.includes(term))) {
-      results.push({ type: "missing_baggage", severity: "medium", title: "Baggage may not be included", message: "This fare appears to exclude cabin or checked baggage." });
-    }
-
-    if (t?.document?.expiry_date && trip.departureDate) {
-      const minValid = monthsAfter(trip.departureDate, 6);
-      if (new Date(t.document.expiry_date) < minValid) {
-        results.push({ type: "passport_expiry", severity: "high", title: "Passport expiry risk", message: "Passport may expire too soon for this trip." });
-      }
-    }
-
-    const first = document.querySelector("[name='first_name']")?.value;
-    const last = document.querySelector("[name='last_name']")?.value;
-    if ((first && first.trim().toLowerCase() !== t.first_name.toLowerCase()) || (last && last.trim().toLowerCase() !== t.last_name.toLowerCase())) {
-      results.push({ type: "name_mismatch", severity: "high", title: "Name mismatch", message: "Passenger name may not match saved travel document." });
-    }
-
-    if (MULTI_AIRPORT_CODES.has(trip.destinationAirport)) {
-      results.push({ type: "multiple_airport", severity: "low", title: "Confirm airport", message: "This city has multiple airports. Confirm the correct airport." });
-    }
-
-    if (pageText.includes("invoice") && !pageText.includes("tax id")) {
-      results.push({ type: "invoice_missing", severity: "medium", title: "Invoice details missing", message: "Company workspace is active and invoice fields may not be complete." });
-    }
-
-    return results;
-  }
-
-  function extractTripShallow() {
-    const departureText = document.querySelector("[data-departure]")?.textContent?.trim();
-    return {
-      departureDate: departureText ? new Date(departureText) : null,
-      destinationAirport: document.querySelector("[data-destination]")?.textContent?.trim()
-    };
-  }
-
-  async function saveTrip() {
-    const settings = await storageGet(["apiBase"]);
-    const response = await fetch(`${settings.apiBase || DEFAULT_API}/trips`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(extractTrip())
-    });
-    if (!response.ok) throw new Error("Could not save trip");
-    appData = await response.json();
-    renderSidebar("saved");
-  }
-
   const {
     agentDecisionHtml,
     agentProcessDiagnosticsHtml,
@@ -3973,7 +3340,7 @@ import {
     selectedBookingAcquisitionHtml,
     warningHtml
   } = createSidebarUi({
-    agent,
+    agent: runtimeScopes.sidebar,
     bookingDetected,
     copyDebugLog,
     getAppData: () => appData,
@@ -3992,6 +3359,9 @@ import {
     setSelectedTravelerId: (travelerId) => {
       selectedTravelerId = travelerId;
     },
+    setUserGoal: (value) => {
+      agent.userGoal = String(value || "");
+    },
     setWarnings: (nextWarnings) => {
       warnings = nextWarnings;
     },
@@ -4000,53 +3370,22 @@ import {
     travelerRules
   });
 
-  function watchForCheckoutChanges() {
-    const observer = new MutationObserver((mutations) => {
-      const pageChanged = pageStateStore.noteMutations(mutations);
-      const externalPageMutation = mutations.some((mutation) => {
-        const target = mutation.target?.nodeType === Node.ELEMENT_NODE
-          ? mutation.target
-          : mutation.target?.parentElement;
-        return !target?.closest?.("#atw-sidebar, #atw-agent-cursor, .atw-agent-cursor");
-      });
-      if (pageChanged && externalPageMutation) {
-        scheduleSelectedBookingCapture("dom_mutation");
-      }
-      if (pageChanged && agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
-        scheduleDestinationObservation("dom_mutation", DESTINATION_MUTATION_SETTLE_MS);
-      }
-      if (!pageChanged || renderTimer) return;
-      renderTimer = setTimeout(() => {
-        renderTimer = null;
-        if (!filledFields.length) {
-          warnings = runRiskChecks();
-          renderSidebar();
-        }
-      }, 180);
-    });
-    observer.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true,
-      attributes: true,
-      attributeOldValue: true,
-      attributeFilter: [
-        "checked", "selected", "value", "disabled", "required", "hidden", "open", "class", "style",
-        "aria-checked", "aria-selected", "aria-expanded", "aria-disabled", "aria-invalid", "aria-hidden", "aria-valuenow",
-        "data-price", "data-selected", "data-value"
-      ]
-    });
-    pageStateStore.attachMutationObserver(observer);
-    document.addEventListener("input", pageStateStore.noteEvent, true);
-    document.addEventListener("change", pageStateStore.noteEvent, true);
-    document.addEventListener("scroll", (event) => pageStateStore.noteEvent({
-      type: "viewport",
-      target: event.target === document ? document.documentElement : event.target
-    }), true);
-    window.addEventListener("resize", () => pageStateStore.noteEvent({ type: "viewport", target: document.documentElement }), { passive: true });
-  }
+  const { watch: watchForCheckoutChanges, stop: stopWatchingCheckoutChanges } = createCheckoutWatcher({
+    destinationMutationSettleMs: DESTINATION_MUTATION_SETTLE_MS,
+    getDestinationWait: () => agent.destinationWait,
+    hasFilledFields: () => Boolean(filledFields.length),
+    pageStateStore,
+    refreshSidebarWarnings: () => {
+      warnings = runRiskChecks();
+      renderSidebar();
+    },
+    scheduleDestinationObservation,
+    scheduleSelectedBookingCapture
+  });
 
   window.addEventListener("pagehide", () => {
+    stopWatchingCheckoutChanges();
+    cancelSelectedBookingCapture();
     if (!agent.running) captureSelectedBookingFromMap(pageStateStore.current());
     saveResumeMarker();
   });

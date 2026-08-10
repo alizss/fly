@@ -16,6 +16,7 @@ export function createSidebarUi({
   saveTrip,
   setObserverTab,
   setSelectedTravelerId,
+  setUserGoal,
   setWarnings,
   takeOverCheckout,
   traveler,
@@ -452,7 +453,7 @@ export function createSidebarUi({
     `;
     if (!root.parentElement) document.body.appendChild(root);
     renderCursorPrompt();
-    document.getElementById("atw-user-goal")?.addEventListener("input", (event) => { agent.userGoal = event.target.value; });
+    document.getElementById("atw-user-goal")?.addEventListener("input", (event) => setUserGoal(event.target.value));
     document.getElementById("atw-takeover").addEventListener("click", () => takeOverCheckout().catch((error) => alert(error.message)));
     document.getElementById("atw-observe-only")?.addEventListener("click", () => observePageOnly().catch((error) => alert(error.message)));
     document.querySelectorAll("[data-observer-tab]").forEach((button) => {

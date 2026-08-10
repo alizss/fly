@@ -1,7 +1,6 @@
 export function createInteractionMechanics(dependencies) {
   const {
     activeOverlayElements,
-    agent,
     choiceInteractionStates,
     elementBox,
     elementById,
