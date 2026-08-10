@@ -543,3 +543,24 @@ test("web server remains a composition root instead of a second agent authority"
     assert.doesNotMatch(server, new RegExp(`function ${escapedResponsibility}\\s*\\(`));
   }
 });
+
+test("TaskState modules preserve one reducer authority behind the compatibility facade", () => {
+  const root = path.resolve(__dirname, "../..");
+  const facade = fs.readFileSync(path.join(root, "apps/web/agent/task-state-reducer.js"), "utf8");
+  const reducer = fs.readFileSync(path.join(root, "apps/web/agent/task-state/reducer.js"), "utf8");
+  const modules = [
+    "stage.js",
+    "terminal.js",
+    "profile-verification.js",
+    "commerce-ledger.js",
+    "decision-episode.js",
+    "surface-state.js"
+  ].map((file) => fs.readFileSync(path.join(root, "apps/web/agent/task-state", file), "utf8"));
+
+  assert.match(facade, /module\.exports = require\("\.\/task-state\/reducer"\)/);
+  assert.doesNotMatch(facade, /function reduceDecisionFrame\s*\(/);
+  assert.match(reducer, /function reduceDecisionFrame\s*\(/);
+  for (const moduleSource of modules) {
+    assert.doesNotMatch(moduleSource, /function reduceDecisionFrame\s*\(/);
+  }
+});
