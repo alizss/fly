@@ -119,6 +119,52 @@ export function createExecutionOrchestrator({
     return executionResult;
   }
 
+  async function holdDispatchedStageExit(actionId, observationId, decision, expectedOutcome, afterMap = {}) {
+    const pendingResult = rememberUnexecutedActionResult(
+      actionId,
+      observationId,
+      decision,
+      {
+        ok: false,
+        code: "NAVIGATION_TRANSITION_PENDING",
+        message: "The governed stage exit was dispatched once; verification is waiting for a material page change or the bounded deadline.",
+        dispatched: true,
+        executed: true,
+        targetResolved: true,
+        clickReachedPage: true,
+        pageChanged: false,
+        resultObservationHash: observationHashForMap(afterMap)
+      }
+    );
+    pushActionLedger({
+      actionId,
+      observationId,
+      stage: "dispatched_wait",
+      action: decision,
+      expectedOutcome,
+      executionResult: pendingResult
+    });
+    beginDestinationWait({
+      action: "wait",
+      intent: "wait_for_dispatched_stage_exit",
+      semanticIntent: "wait_for_dispatched_stage_exit",
+      observationId,
+      actionId,
+      expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
+      reobserveRetryToken: `stage_exit:${actionId}`
+    });
+    await reportActionResult(pendingResult);
+    logFlow("action.lifecycle.stage_exit_pending", {
+      actionId,
+      observationId,
+      resultObservationHash: pendingResult.resultObservationHash || "",
+      next: "mutation_or_deadline"
+    });
+    clearExecutionContext();
+    renderSidebar("agent");
+    return pendingResult;
+  }
+
 
   function exactChoiceCommitReadiness(target, decision = {}, pageMap = agent.pageMap || {}) {
     if (isChoiceSelected(target)) {
@@ -355,7 +401,12 @@ export function createExecutionOrchestrator({
     const verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, element);
     let advanced = verification.ok;
     agent.pageMap = afterMap;
-    setAgentActivity(advanced ? `Advanced to ${afterMap.step.replace(/_/g, " ")}` : `${label} did not advance`, advanced ? "Reading the next page state" : "Looking for the remaining blocker");
+    const visibleBlockers = Array.isArray(afterMap.errors) ? afterMap.errors.filter(Boolean) : [];
+    const transitionPending = !advanced && !visibleBlockers.length && agent.running;
+    setAgentActivity(
+      advanced ? `Advanced to ${afterMap.step.replace(/_/g, " ")}` : transitionPending ? "Waiting for the page to advance" : `${label} did not advance`,
+      advanced ? "Reading the next page state" : transitionPending ? "The stage exit was dispatched once; waiting for a material page change." : "Looking for the remaining blocker"
+    );
     logAgentEvent("verify_advance", {
       label,
       advanced,
@@ -366,6 +417,10 @@ export function createExecutionOrchestrator({
     });
     const actionId = options.actionId || agent.activeExecutionActionId || nextFlowId("act");
     const observationId = options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "";
+    if (transitionPending && inferCheckoutSite() !== "demo") {
+      await holdDispatchedStageExit(actionId, observationId, governedDecision, expectedOutcome, afterMap);
+      return false;
+    }
     if (!advanced && inferCheckoutSite() !== "demo") {
       if (agent.running) {
         addAgentMessage("assistant", `${label} did not advance, so I am rescanning and sending the updated page back to the AI.`);
@@ -1166,6 +1221,7 @@ export function createExecutionOrchestrator({
     exactChoiceCommitReadiness,
     executeAgentDecision,
     finalizeGovernedAction,
+    holdDispatchedStageExit,
     pushVerificationLedger,
     repeatGuardFor,
     settleExactChoiceOutcome,

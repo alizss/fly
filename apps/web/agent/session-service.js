@@ -44,6 +44,13 @@ function createSessionService(agentSessionStore) {
     if (body.resumeOnly && (!requestedSessionId || !existing)) return null;
     const durableBaseline = existing?.transactionInvariants?.baseline || null;
     const admittedSelectedBooking = existing ? null : normalizeSelectedBooking(body.selectedBookingContract);
+    if (!existing && !admittedSelectedBooking) {
+      throw requestBodyError(
+        "SELECTED_BOOKING_REQUIRED",
+        "A complete approved flight selection is required before starting checkout.",
+        422
+      );
+    }
     const selectedBooking = admittedSelectedBooking
       ? {
           observationId: admittedSelectedBooking.selectionId,

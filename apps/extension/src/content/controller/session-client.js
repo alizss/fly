@@ -3,9 +3,9 @@ export function createSessionClient({
   ACTION_REPORT_TIMEOUT_MS,
   DEFAULT_API,
   actionableCheckoutErrors,
+  acquireSelectedBookingForStart,
   addAgentMessage,
   agent,
-  captureSelectedBookingFromMap,
   compactActionResultForTransport,
   compactPageMap,
   composeSelectedBookingContract,
@@ -14,7 +14,6 @@ export function createSessionClient({
   observationHashForMap,
   pageSnapshot,
   pageStateStore,
-  readSelectedBookingAcquisition,
   renderSidebar,
   resetAgentLoopLifecycle,
   setAgentActivity,
@@ -23,7 +22,7 @@ export function createSessionClient({
   userIntentText,
   validStoredSelectedBookingContract
 }) {
-  async function startAgentSession(resumeSessionId = "") {
+  async function startAgentSession(resumeSessionId = "", options = {}) {
     try {
       agent.sessionStartFailure = null;
       const settings = await storageGet(["apiBase", "selectedBookingContract"]);
@@ -33,14 +32,29 @@ export function createSessionClient({
         error.code = "SELECTED_TRAVELER_REQUIRED";
         throw error;
       }
-      const immediateAcquisition = resumeSessionId
-        ? null
-        : readSelectedBookingAcquisition()
-          || captureSelectedBookingFromMap(agent.pageMap || pageStateStore.current());
-      const selectedBookingContract = resumeSessionId
-        ? null
-        : validStoredSelectedBookingContract(settings.selectedBookingContract, selectedTraveler)
-          || composeSelectedBookingContract(immediateAcquisition, selectedTraveler);
+      let selectedBookingContract = null;
+      if (!resumeSessionId) {
+        selectedBookingContract = validStoredSelectedBookingContract(settings.selectedBookingContract, selectedTraveler);
+        if (!selectedBookingContract) {
+          setAgentActivity(
+            "Confirming the selected booking",
+            "Waiting briefly for the selected itinerary and displayed starting total."
+          );
+          renderSidebar("agent");
+          const acquisition = await acquireSelectedBookingForStart({
+            initialMap: agent.pageMap || pageStateStore.current(),
+            timeoutMs: options.bookingAcquisitionTimeoutMs
+          });
+          selectedBookingContract = composeSelectedBookingContract(acquisition, selectedTraveler);
+        }
+        if (!selectedBookingContract) {
+          const error = new Error(
+            "The selected itinerary and starting total are not available yet. Return to the approved flight selection or make its booking summary visible, then start again."
+          );
+          error.code = "SELECTED_BOOKING_REQUIRED";
+          throw error;
+        }
+      }
       const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/session`, {
         method: "POST",
         headers: { "content-type": "application/json" },

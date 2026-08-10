@@ -137,7 +137,7 @@ test("a final booking contract without a selected request traveler creates no tr
   });
 });
 
-test("the session boundary ignores raw airline acquisition while allowing a provisional durable session", async ({ request }) => {
+test("the session boundary rejects raw airline acquisition instead of creating a provisional transaction", async ({ request }) => {
   const travelerId = `trav_raw_acquisition_${Date.now()}`;
   const response = await request.post(`${API}/agent/session`, {
     data: {
@@ -147,17 +147,14 @@ test("the session boundary ignores raw airline acquisition while allowing a prov
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
   });
-  expect(response.status()).toBe(201);
-  const started = await response.json();
-  const durable = await (await request.get(`${API}/agent/session/${started.id}`)).json();
-  expect(durable).toMatchObject({
-    travelerId,
-    travelerIds: [travelerId],
-    transactionInvariants: null
+  expect(response.status()).toBe(422);
+  expect(await response.json()).toMatchObject({
+    code: "SELECTED_BOOKING_REQUIRED",
+    error: "A complete approved flight selection is required before starting checkout."
   });
 });
 
-test("missing itinerary and total start provisionally without inventing transaction truth", async ({ request }) => {
+test("missing itinerary and total cannot create a durable transaction", async ({ request }) => {
   const travelerId = `trav_no_booking_${Date.now()}`;
   const response = await request.post(`${API}/agent/session`, {
     data: {
@@ -166,14 +163,10 @@ test("missing itinerary and total start provisionally without inventing transact
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
   });
-  expect(response.status()).toBe(201);
-  const started = await response.json();
-  const durable = await (await request.get(`${API}/agent/session/${started.id}`)).json();
-  expect(durable).toMatchObject({
-    status: "running",
-    travelerId,
-    travelerIds: [travelerId],
-    transactionInvariants: null
+  expect(response.status()).toBe(422);
+  expect(await response.json()).toMatchObject({
+    code: "SELECTED_BOOKING_REQUIRED",
+    error: "A complete approved flight selection is required before starting checkout."
   });
 });
 

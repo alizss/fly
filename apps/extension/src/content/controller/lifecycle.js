@@ -25,7 +25,7 @@ export function createAgentLifecycle({
   function isDestinationReadinessDecision(decision = {}) {
     if (decision.action !== "wait") return false;
     const intent = `${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase();
-    return /wait_for_ready_observation|reobserve_after_transient_observation|reobserve_degraded_loading_destination|reobserve_after_grounding_rejection|task_state_reobserve/.test(intent)
+    return /wait_for_ready_observation|wait_for_dispatched_stage_exit|reobserve_after_transient_observation|reobserve_degraded_loading_destination|reobserve_after_grounding_rejection|task_state_reobserve/.test(intent)
       || (decision.expectedPostconditions || []).some((postcondition) => (
         postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
       ));
@@ -70,26 +70,29 @@ export function createAgentLifecycle({
     const backendStartedAt = Number(decision.readinessStartedAt || 0);
     const backendDeadlineAt = Number(decision.readinessDeadlineAt || 0);
     const taskStateWait = /task_state_reobserve/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
+    const dispatchedStageExitWait = /wait_for_dispatched_stage_exit/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
     const retryToken = String(decision.reobserveRetryToken || "");
     agent.destinationWait = {
       status: "WAITING_FOR_DESTINATION",
-      kind: taskStateWait ? "current_surface" : "destination",
+      kind: taskStateWait ? "current_surface" : dispatchedStageExitWait ? "dispatched_stage_exit" : "destination",
       startedAt: backendStartedAt > 0 ? backendStartedAt : (existing?.startedAt || now),
       deadlineAt: backendDeadlineAt > 0 ? backendDeadlineAt : (existing?.deadlineAt || (now + DESTINATION_WAIT_TIMEOUT_MS)),
       attempts: Number(existing?.attempts || 0),
       backendWaits: Number(existing?.backendWaits || 0) + 1,
-      wakeRequested: false,
-      lastWakeReason: "backend_wait",
-      lastMutationAt: Number(existing?.lastMutationAt || 0),
+      wakeRequested: decision.wakeRequested === true,
+      lastWakeReason: decision.lastWakeReason || "backend_wait",
+      lastMutationAt: Number(decision.lastMutationAt || existing?.lastMutationAt || 0),
       deadlineObservationSent: Boolean(existing?.deadlineObservationSent),
       observationId: decision.observationId || existing?.observationId || "",
       actionId: decision.actionId || decision.id || existing?.actionId || "",
       retryToken: retryToken || existing?.retryToken || ""
     };
     setAgentActivity(
-      taskStateWait ? "Watching the current checkout surface" : "Waiting for destination",
+      taskStateWait ? "Watching the current checkout surface" : dispatchedStageExitWait ? "Waiting for the checkout stage to change" : "Waiting for destination",
       taskStateWait
         ? "No safe current actuator is available yet. I will resume on a material page change or stop at the bounded deadline."
+        : dispatchedStageExitWait
+          ? "The stage exit was dispatched once. I will resume on a material page change or verify it at the bounded deadline."
         : "Navigation completed, but the destination controls are still hydrating. I will continue automatically."
     );
     renderSidebar("agent");

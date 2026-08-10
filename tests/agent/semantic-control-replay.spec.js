@@ -139,7 +139,7 @@ for (const checkoutCase of [
   { name: "EasyJet", origin: "LJU", destination: "EDI", total: 362 },
   { name: "GoToGate", origin: "LHR", destination: "LJU", total: 208 }
 ]) {
-  test(`delayed ${checkoutCase.name} booking hydration does not block provisional startup`, async ({ page }) => {
+  test(`delayed ${checkoutCase.name} booking hydration composes one approved transaction before startup`, async ({ page }) => {
     await loadHtmlProducer(page, "<main><h1>Loading checkout…</h1></main>");
     const travelerId = `trav_${checkoutCase.name.toLowerCase()}`;
     let requestBody = null;
@@ -151,7 +151,7 @@ for (const checkoutCase of [
         body: JSON.stringify({ id: `chk_provisional_${checkoutCase.name.toLowerCase()}` })
       });
     });
-    const started = await page.evaluate(async (id) => {
+    const started = await page.evaluate(async ({ id, origin, destination, total }) => {
       window.chrome = {
         storage: { local: { get: async () => ({ apiBase: "https://agent.test/api" }) } },
         runtime: { sendMessage: async () => ({ ok: false }) }
@@ -159,35 +159,27 @@ for (const checkoutCase of [
       const profile = { id, first_name: "Ali", last_name: "Example" };
       window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
       window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_loading_shell" });
+      setTimeout(() => {
+        document.body.innerHTML = `
+          <main>
+            <h1>Passenger details</h1>
+            <section data-origin="${origin}" data-destination="${destination}" data-departure-date="2026-10-15">
+              <p>${origin} → ${destination}</p>
+            </section>
+            <aside><p>Selected flight ${total} EUR</p></aside>
+            <button type="button">Continue</button>
+          </main>`;
+      }, 120);
       const startedAt = performance.now();
-      const session = await window.__ATW_TEST__.startAgentSession();
+      const session = await window.__ATW_TEST__.startAgentSession("", { bookingAcquisitionTimeoutMs: 2_000 });
       return { session, elapsedMs: performance.now() - startedAt };
-    }, travelerId);
-    expect(started.session.id).toBe(`chk_provisional_${checkoutCase.name.toLowerCase()}`);
-    expect(started.elapsedMs).toBeLessThan(1_000);
-    expect(requestBody.selectedBookingContract).toBeNull();
-
-    const laterContract = await page.evaluate(({ origin, destination, total, travelerId: selectedTravelerId }) => {
-      document.body.innerHTML = `
-        <main>
-          <h1>Passenger details</h1>
-          <section data-origin="${origin}" data-destination="${destination}" data-departure-date="2026-10-15">
-            <p>${origin} → ${destination}</p>
-          </section>
-          <aside><p class="booking-total">Booking total ${total} EUR</p></aside>
-          <button type="button">Continue</button>
-        </main>`;
-      window.__ATW_TEST__.notePageMutations([{
-        type: "childList",
-        target: document.body,
-        addedNodes: [document.body.firstElementChild],
-        removedNodes: []
-      }]);
-      const observed = window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_hydrated_later" });
-      const acquisition = window.__ATW_TEST__.captureSelectedBookingFromMap(observed.map);
-      return window.__ATW_TEST__.composeSelectedBookingContract(acquisition, { id: selectedTravelerId });
-    }, { ...checkoutCase, travelerId });
-    expect(laterContract).toMatchObject({
+    }, { id: travelerId, ...checkoutCase });
+    expect(started).toMatchObject({
+      session: { id: `chk_provisional_${checkoutCase.name.toLowerCase()}` }
+    });
+    expect(started.elapsedMs).toBeGreaterThanOrEqual(100);
+    expect(started.elapsedMs).toBeLessThan(2_000);
+    expect(requestBody.selectedBookingContract).toMatchObject({
       contractVersion: "selected-booking/v1",
       itinerary: { segments: [expect.objectContaining({ origin: checkoutCase.origin, destination: checkoutCase.destination })] },
       approvedTotal: { amount: checkoutCase.total, currency: "EUR" },
@@ -228,7 +220,7 @@ test("a persisted booking acquisition composes immediately on a later checkout s
   });
 });
 
-test("startup without booking evidence creates a provisional session without a background scan loop", async ({ page }) => {
+test("startup without booking evidence fails once without creating a provisional transaction", async ({ page }) => {
   await loadHtmlProducer(page, "<main><h1>Passenger details</h1><p>No booking summary</p></main>");
   let requestBody = null;
   await page.route("https://agent.test/api/agent/session", async (route) => {
@@ -244,13 +236,12 @@ test("startup without booking evidence creates a provisional session without a b
     window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
     window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_timeout_shell" });
     const startedAt = performance.now();
-    const session = await window.__ATW_TEST__.startAgentSession();
+    const session = await window.__ATW_TEST__.startAgentSession("", { bookingAcquisitionTimeoutMs: 120 });
     return { session, elapsedMs: performance.now() - startedAt };
   });
-  expect(started.session.id).toBe("chk_provisional_no_booking");
+  expect(started.session).toBeNull();
   expect(started.elapsedMs).toBeLessThan(1_000);
-  expect(requestBody.selectedBookingContract).toBeNull();
-  expect(await page.evaluate(() => window.__ATW_TEST__.scheduleSelectedBookingCapture("post_start"))).toBe(false);
+  expect(requestBody).toBeNull();
 });
 
 test("an invalid stored booking falls back to fresh acquisition for the selected wallet traveler", async ({ page }) => {
@@ -5868,6 +5859,78 @@ test("a persistent untagged checkout route anchors transaction identity before f
   expect(observed.transactionFacts.factEvidence.itinerary[0]).toMatchObject({
     source: "bounded_checkout_route",
     authoritative: true
+  });
+});
+
+test("one dispatched stage exit stays in flight until a mutation or bounded deadline", async ({ page }) => {
+  await loadProducer(page);
+  let reported = null;
+  await page.route("https://agent.test/api/agent/report", async (route) => {
+    reported = route.request().postDataJSON();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "session_stage_exit_pending" })
+    });
+  });
+  const result = await page.evaluate(async () => {
+    window.chrome = {
+      storage: { local: { get: async () => ({ apiBase: "https://agent.test/api" }) } },
+      runtime: { sendMessage: async () => ({ ok: false }) }
+    };
+    const hooks = window.__ATW_TEST__;
+    const profile = { id: "trav_stage_exit_pending", first_name: "Ali", last_name: "Sifrar" };
+    hooks.setAppDataForTest({ travelers: [profile], preferences: {} }, profile.id);
+    hooks.setAgentRunningForTest(true);
+    hooks.setAgentSessionForTest("session_stage_exit_pending");
+    const map = hooks.buildPageMap();
+    const decision = {
+      action: "click",
+      actionId: "act_stage_exit_pending",
+      observationId: "obs_stage_exit_pending",
+      intent: "advance checkout stage",
+      semanticIntent: "advance_checkout_stage",
+      mechanicalEffect: "advance_checkout_stage",
+      physicalEffect: "advance_checkout_stage",
+      interactionRole: "navigation",
+      controlId: map.stageExit?.candidates?.[0]?.controlId || "continue",
+      targetId: map.stageExit?.candidates?.[0]?.controlId || "continue"
+    };
+    const pending = await hooks.holdDispatchedStageExit(
+      decision.actionId,
+      decision.observationId,
+      decision,
+      { type: "stage_changed" },
+      map
+    );
+    const state = hooks.agentLoopState();
+    const recognized = hooks.isDestinationReadinessDecision({
+      action: "wait",
+      intent: "wait_for_dispatched_stage_exit"
+    });
+    hooks.clearDestinationWait("test_complete");
+    hooks.setAgentRunningForTest(false);
+    return { pending, state, recognized };
+  });
+
+  expect(result.pending).toMatchObject({
+    actionId: "act_stage_exit_pending",
+    dispatched: true,
+    executed: true,
+    verified: false,
+    failureCode: "NAVIGATION_TRANSITION_PENDING"
+  });
+  expect(result.state.destinationWait).toMatchObject({
+    status: "WAITING_FOR_DESTINATION",
+    kind: "dispatched_stage_exit",
+    actionId: "act_stage_exit_pending",
+    retryToken: "stage_exit:act_stage_exit_pending"
+  });
+  expect(result.recognized).toBe(true);
+  expect(reported.result).toMatchObject({
+    actionId: "act_stage_exit_pending",
+    dispatched: true,
+    failureCode: "NAVIGATION_TRANSITION_PENDING"
   });
 });
 

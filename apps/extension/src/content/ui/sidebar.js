@@ -417,6 +417,7 @@ export function createSidebarUi({
           <button class="atw-primary" id="atw-takeover" ${detected && !agent.running ? "" : "disabled"}>Start agent</button>
           <button id="atw-observe-only" ${detected ? "" : "disabled"}>Observe page (no actions) [TEMP]</button>
         </div>
+        ${!agent.running ? `<div class="atw-mini-note">Start confirms the selected itinerary and currently displayed total as Fly's checkout baseline. Fly will stop before purchase.</div>` : ""}
         ${mode === "observer" ? `
           <div class="atw-observer">
             ${observerTabsHtml()}

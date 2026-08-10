@@ -1,4 +1,5 @@
 import {
+  approvedSelectedBookingAcquisitionFromMap,
   authoritativeSelectedBookingFacts,
   composeSelectedBookingContract,
   validStoredSelectedBookingContract
@@ -2253,6 +2254,8 @@ import {
   });
 
   const {
+    acquireForStart: acquireSelectedBookingForStart,
+    approveVisibleSummary: approveVisibleSelectedBookingSummary,
     capture: captureSelectedBookingFromMap,
     read: readSelectedBookingAcquisition,
     schedule: scheduleSelectedBookingCapture,
@@ -2284,9 +2287,9 @@ import {
     ACTION_REPORT_TIMEOUT_MS,
     DEFAULT_API,
     actionableCheckoutErrors,
+    acquireSelectedBookingForStart,
     addAgentMessage,
     agent: runtimeScopes.session,
-    captureSelectedBookingFromMap,
     compactActionResultForTransport,
     compactPageMap: (...args) => compactPageMap(...args),
     composeSelectedBookingContract,
@@ -2295,7 +2298,6 @@ import {
     observationHashForMap,
     pageSnapshot,
     pageStateStore,
-    readSelectedBookingAcquisition,
     renderSidebar: (...args) => renderSidebar(...args),
     resetAgentLoopLifecycle,
     setAgentActivity,
@@ -3177,6 +3179,7 @@ import {
     exactChoiceCommitReadiness,
     executeAgentDecision,
     finalizeGovernedAction,
+    holdDispatchedStageExit,
     pushVerificationLedger,
     repeatGuardFor,
     settleExactChoiceOutcome,
@@ -3443,9 +3446,12 @@ import {
       narrowerExactControlOwner,
       compactPageMap,
       authoritativeSelectedBookingFacts,
+      approvedSelectedBookingAcquisitionFromMap,
       composeSelectedBookingContract,
       validStoredSelectedBookingContract,
       captureSelectedBookingFromMap,
+      approveVisibleSelectedBookingSummary,
+      acquireSelectedBookingForStart,
       readSelectedBookingAcquisition,
       scheduleSelectedBookingCapture,
       startAgentSession,
@@ -3503,6 +3509,7 @@ import {
       trustedBrowserKey,
       settleTrustedChoiceInteraction,
       settleExactChoiceOutcome,
+      holdDispatchedStageExit,
       choiceEpisodeEvidence,
       compactChoiceCommitEvidence,
       structuredPriceFromText,
