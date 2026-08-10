@@ -262,7 +262,8 @@ test("selected booking contract creates an immutable authoritative baseline befo
 test("production import graph exposes one mechanics binder and one ambiguity boundary", () => {
   const root = path.resolve(__dirname, "../../apps/web/agent");
   const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
-  const loop = read("loop.js");
+  const loopFacade = read("loop.js");
+  const loop = read("loop/orchestrator.js");
   const grounding = read("active-component-grounding.js");
   const binder = read("mechanics-binder.js");
   const retired = [
@@ -275,9 +276,10 @@ test("production import graph exposes one mechanics binder and one ambiguity bou
     "mechanicContract"
   ];
 
-  assert.match(loop, /require\("\.\/mechanics-binder"\)/);
-  assert.match(loop, /require\("\.\/ambiguity-resolver"\)/);
-  assert.doesNotMatch(loop, /require\("\.\/(?:select-candidate|active-component-grounding)"\)/);
+  assert.match(loopFacade, /module\.exports = require\("\.\/loop\/orchestrator"\)/);
+  assert.match(loop, /require\("\.\.\/mechanics-binder"\)/);
+  assert.match(loop, /require\("\.\.\/ambiguity-resolver"\)/);
+  assert.doesNotMatch(loop, /require\("\.\.\/(?:select-candidate|active-component-grounding)"\)/);
   assert.match(grounding, /require\("\.\/interaction-view"\)/);
   assert.doesNotMatch(grounding, /require\("\.\/select-candidate"\)/);
   assert.match(binder, /function bindMechanics/);
@@ -562,5 +564,26 @@ test("TaskState modules preserve one reducer authority behind the compatibility 
   assert.match(reducer, /function reduceDecisionFrame\s*\(/);
   for (const moduleSource of modules) {
     assert.doesNotMatch(moduleSource, /function reduceDecisionFrame\s*\(/);
+  }
+});
+
+test("agent loop modules preserve one turn orchestrator behind the compatibility facade", () => {
+  const root = path.resolve(__dirname, "../..");
+  const facade = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
+  const orchestrator = fs.readFileSync(path.join(root, "apps/web/agent/loop/orchestrator.js"), "utf8");
+  const modules = [
+    "action-contract.js",
+    "mechanics.js",
+    "transition.js",
+    "observation-settlement.js",
+    "recovery.js",
+    "turn-result.js"
+  ].map((file) => fs.readFileSync(path.join(root, "apps/web/agent/loop", file), "utf8"));
+
+  assert.match(facade, /module\.exports = require\("\.\/loop\/orchestrator"\)/);
+  assert.doesNotMatch(facade, /async function runLoopTurn\s*\(/);
+  assert.match(orchestrator, /async function runLoopTurn\s*\(/);
+  for (const moduleSource of modules) {
+    assert.doesNotMatch(moduleSource, /async function runLoopTurn\s*\(/);
   }
 });
