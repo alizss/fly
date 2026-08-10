@@ -301,6 +301,7 @@ test("non-boundary internal contract versions are absent", () => {
 test("observation transport sends one latest result and loop failures stay typed", () => {
   const root = path.resolve(__dirname, "../..");
   const server = fs.readFileSync(path.join(root, "apps/web/server.js"), "utf8");
+  const nextAction = fs.readFileSync(path.join(root, "apps/web/agent/next-action-service.js"), "utf8");
   const agentRoutes = fs.readFileSync(path.join(root, "apps/web/routes/agent.js"), "utf8");
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
   const content = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
@@ -316,7 +317,7 @@ test("observation transport sends one latest result and loop failures stay typed
   assert.doesNotMatch(loop, /actionHistory/);
   assert.doesNotMatch(observationPayload, /actionHistory/);
   assert.match(observationPayload, /lastActionResult: lastActionForTransport/);
-  assert.match(server, /throw failure/);
+  assert.match(nextAction, /throw failure/);
   assert.match(agentRoutes, /error\.code === "AGENT_LOOP_FAILED"/);
   assert.match(decisions, /\["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"\]/);
   assert.match(execution, /decision\.fatalBackendFailure === true/);
@@ -512,4 +513,33 @@ test("extension diagnostics and screenshot projection are modular boundaries", (
   assert.match(debug, /function debugSnapshot\s*\(/);
   assert.match(screenshot, /function prepareScreenshotAnnotations\s*\(/);
   assert.match(understanding, /function buildPageUnderstanding\s*\(/);
+});
+
+test("web server remains a composition root instead of a second agent authority", () => {
+  const root = path.resolve(__dirname, "../..");
+  const server = fs.readFileSync(path.join(root, "apps/web/server.js"), "utf8");
+
+  for (const boundary of [
+    "createSessionService",
+    "createScreenshotStore",
+    "createRequestDiagnostics",
+    "createWalletStore",
+    "createRequestPayloadAdapter",
+    "createNextActionService",
+    "createAgentRoutes",
+    "createWalletRoutes"
+  ]) {
+    assert.match(server, new RegExp(`${boundary}\\s*\\(`));
+  }
+  for (const escapedResponsibility of [
+    "compactAgentPayload",
+    "hydrateIncrementalAgentBody",
+    "decideAgentNextActionViaLoop",
+    "writeClientFlowLog",
+    "writeActionLedgerRow",
+    "readDb",
+    "seedDb"
+  ]) {
+    assert.doesNotMatch(server, new RegExp(`function ${escapedResponsibility}\\s*\\(`));
+  }
 });
