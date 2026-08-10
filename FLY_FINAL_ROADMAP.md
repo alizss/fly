@@ -646,6 +646,7 @@ The next work in the current repository is therefore:
 - [x] Pass 325 unit assertions, the repository build/type/syntax checks, and the uninterrupted 154-case browser replay after the literal contract and identity collapse.
 - [ ] Run fresh live EasyJet, GoToGate, Kiwi, and Turkish canaries on the restarted extension/backend.
 - [x] Generate one normalized canary report from the existing trace plus compact client timing log, while requiring explicit no-intervention annotation before autonomous acceptance.
+- [x] Begin backend modularization at the HTTP boundary: centralize body/response/static handling and move agent plus wallet route dispatch out of `server.js` without changing agent authority.
 - [ ] Measure client round-trip and each new server timing phase; do not declare latency fixed from offline tests.
 - [ ] Compile plus/minus quantity steppers from exact owned counter state; quantity zero must never become a selected paid item.
 - [ ] Remove `Remove button + nearby price` as an independent selection authority and add the exact Hold-luggage replay.

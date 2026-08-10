@@ -32,6 +32,11 @@ const {
   normalizeSelectedBooking,
   transactionFactsFromSelectedBooking
 } = require("../../packages/shared/selected-booking");
+const { readBody, requestBodyError } = require("./http/body");
+const { sendJson } = require("./http/response");
+const { createStaticHandler } = require("./http/static");
+const { createAgentRoutes } = require("./routes/agent");
+const { createWalletRoutes } = require("./routes/wallet");
 
 function uid(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
@@ -411,58 +416,6 @@ function extensionTraveler(db, traveler) {
         }
       : null
   };
-}
-
-function sendJson(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    "content-type": "application/json",
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,OPTIONS",
-    "access-control-allow-headers": "content-type"
-  });
-  res.end(body);
-}
-
-function requestBodyError(code, message, status = 413) {
-  const error = new Error(message);
-  error.code = code;
-  error.status = status;
-  error.retryable = code === "OBSERVATION_TOO_LARGE";
-  return error;
-}
-
-function readBody(req, { maxBytes = 6_000_000, tooLargeCode = "REQUEST_TOO_LARGE" } = {}) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    let bytes = 0;
-    let oversized = false;
-    const contentLength = Number(req.headers["content-length"] || 0);
-    if (contentLength > maxBytes) {
-      oversized = true;
-    }
-    req.on("data", (chunk) => {
-      if (oversized) return;
-      bytes += Buffer.byteLength(chunk);
-      if (bytes > maxBytes) {
-        oversized = true;
-        body = "";
-        return;
-      }
-      body += chunk;
-    });
-    req.on("end", () => {
-      if (oversized) {
-        return reject(requestBodyError(tooLargeCode, `Request body exceeds ${maxBytes} bytes.`));
-      }
-      if (!body) return resolve({});
-      try {
-        resolve(JSON.parse(body));
-      } catch (error) {
-        reject(error);
-      }
-    });
-  });
 }
 
 function storeScreenshotUpload({ sessionId = "", observationId = "", screenshotDataUrl = "" } = {}) {
@@ -1679,283 +1632,48 @@ function upsertTravelerDocument(db, travelerId, body) {
   document.updated_at = now();
 }
 
+const handleAgentRoutes = createAgentRoutes({
+  MAX_OBSERVATION_BYTES,
+  MAX_SCREENSHOT_UPLOAD_BYTES,
+  agentLoopFailurePayload,
+  agentSessionStore,
+  agentTraceStore,
+  clampText,
+  createAgentSession,
+  dataDir: DATA_DIR,
+  decideAgentNextActionViaLoop,
+  logAgent,
+  readBody,
+  reportAgentResult,
+  sendJson,
+  storeScreenshotUpload,
+  summarizeAgentSession,
+  writeActionLedgerRow,
+  writeClientFlowLog
+});
+
+const handleWalletRoutes = createWalletRoutes({
+  bootstrapPayload,
+  extensionBootstrapPayload,
+  now,
+  readBody,
+  sendJson,
+  travelerFromBody,
+  uid,
+  upsertTravelerDocument,
+  writeDb
+});
+
 async function handleApi(req, res, pathname) {
   if (req.method === "OPTIONS") return sendJson(res, 204, {});
+  if (await handleAgentRoutes(req, res, pathname)) return;
   const db = readDb();
-
-  if (req.method === "GET" && pathname === "/api/bootstrap") {
-    return sendJson(res, 200, bootstrapPayload(db));
-  }
-
-  if (req.method === "GET" && pathname === "/api/extension/bootstrap") {
-    return sendJson(res, 200, extensionBootstrapPayload(db));
-  }
-
-  if (req.method === "POST" && pathname === "/api/agent/client-log") {
-    const body = await readBody(req);
-    const summary = await writeClientFlowLog(body);
-    logAgent("client flow", summary);
-    return sendJson(res, 200, { ok: true });
-  }
-
-  if (req.method === "POST" && pathname === "/api/agent/action-ledger") {
-    const body = await readBody(req);
-    const summary = await writeActionLedgerRow(body);
-    logAgent("action ledger", summary);
-    return sendJson(res, 200, { ok: true });
-  }
-
-  if (req.method === "POST" && pathname === "/api/agent/screenshot") {
-    const body = await readBody(req, { maxBytes: MAX_SCREENSHOT_UPLOAD_BYTES, tooLargeCode: "SCREENSHOT_TOO_LARGE" });
-    const sessionId = clampText(body.sessionId || "", 120);
-    const observationId = clampText(body.observationId || "", 120);
-    if (!sessionId || !agentSessionStore.getSession(sessionId)) {
-      return sendJson(res, 409, { error: "A current checkout session is required for screenshot upload.", code: "DURABLE_SESSION_NOT_FOUND", retryable: false });
-    }
-    if (!observationId) return sendJson(res, 400, { error: "observationId is required.", code: "OBSERVATION_ID_REQUIRED", retryable: false });
-    const screenshotId = storeScreenshotUpload({ sessionId, observationId, screenshotDataUrl: String(body.screenshotDataUrl || "") });
-    return sendJson(res, 201, { screenshotId });
-  }
-
-  if (req.method === "POST" && pathname === "/api/agent/next-action") {
-    const requestStartedAt = Date.now();
-    let requestParseMs = 0;
-    let sessionLookupMs = 0;
-    let requestOutcome = "error";
-    try {
-      const parseStartedAt = Date.now();
-      const body = await readBody(req, { maxBytes: MAX_OBSERVATION_BYTES, tooLargeCode: "OBSERVATION_TOO_LARGE" });
-      requestParseMs = Date.now() - parseStartedAt;
-      const sessionId = clampText(body.sessionId || "", 120);
-      if (!sessionId) {
-        requestOutcome = "durable_session_required";
-        return sendJson(res, 409, { error: "A durable checkout session is required before planning.", code: "DURABLE_SESSION_REQUIRED" });
-      }
-      const lookupStartedAt = Date.now();
-      const sessionExists = Boolean(agentSessionStore.getSession(sessionId));
-      sessionLookupMs = Date.now() - lookupStartedAt;
-      if (!sessionExists) {
-        requestOutcome = "durable_session_not_found";
-        return sendJson(res, 409, { error: "The checkout session no longer exists; refusing to create a replacement transaction.", code: "DURABLE_SESSION_NOT_FOUND" });
-      }
-      const decision = await decideAgentNextActionViaLoop(body);
-      requestOutcome = "decision";
-      return sendJson(res, 200, decision);
-    } catch (error) {
-      if (error.code === "AGENT_LOOP_FAILED") {
-        requestOutcome = "agent_loop_failed";
-        return sendJson(res, Number(error.status || 500), agentLoopFailurePayload(error));
-      }
-      if (error.code === "OBSERVATION_RESYNC_REQUIRED") {
-        requestOutcome = "observation_resync_required";
-        return sendJson(res, 409, {
-          error: error.message,
-          code: error.code,
-          retryable: true
-        });
-      }
-      if (/^DURABLE_SESSION_/.test(error.message || "")) {
-        requestOutcome = "durable_session_error";
-        return sendJson(res, 409, { error: error.message, code: error.message });
-      }
-      throw error;
-    } finally {
-      // Always record the complete HTTP boundary, including readiness waits
-      // and early 409s; otherwise the slowest non-planning paths misleadingly
-      // report zero latency.
-      logAgent("next-action request timing", {
-        outcome: requestOutcome,
-        request_parse_ms: requestParseMs,
-        session_lookup_ms: sessionLookupMs,
-        request_total_ms: Date.now() - requestStartedAt
-      });
-    }
-  }
-
-  if (req.method === "POST" && pathname === "/api/agent/session") {
-    const body = await readBody(req);
-    const session = createAgentSession(body);
-    if (!session) {
-      return sendJson(res, 409, {
-        error: "The saved checkout session could not be resumed; refusing to create a replacement transaction.",
-        code: "DURABLE_SESSION_NOT_FOUND"
-      });
-    }
-    return sendJson(res, 201, summarizeAgentSession(session));
-  }
-
-  if (req.method === "POST" && pathname === "/api/agent/report") {
-    const body = await readBody(req);
-    const session = reportAgentResult(body);
-    if (!session) return sendJson(res, 404, { error: "Agent session not found" });
-    return sendJson(res, 200, summarizeAgentSession(session));
-  }
-
-  if (req.method === "GET" && pathname.startsWith("/api/agent/session/")) {
-    const sessionId = pathname.slice("/api/agent/session/".length);
-    const state = agentSessionStore.getSession(sessionId);
-    if (!state) return sendJson(res, 404, { error: "Checkout session not found" });
-    return sendJson(res, 200, state);
-  }
-
-  if (req.method === "GET" && pathname.startsWith("/api/agent/transaction/")) {
-    const sessionId = pathname.slice("/api/agent/transaction/".length);
-    const transaction = agentSessionStore.reconstructTransaction(sessionId);
-    if (!transaction) return sendJson(res, 404, { error: "Checkout transaction not found" });
-    return sendJson(res, 200, transaction);
-  }
-
-  if (req.method === "GET" && pathname.startsWith("/api/agent/traces/")) {
-    const sessionId = pathname.slice("/api/agent/traces/".length);
-    return sendJson(res, 200, { sessionId, traces: agentTraceStore.listTraces(DATA_DIR, sessionId) });
-  }
-
-  if (req.method === "POST" && pathname === "/api/workspaces") {
-    const body = await readBody(req);
-    const workspace = {
-      id: uid("wrk"),
-      name: String(body.name || "Personal Workspace").slice(0, 80),
-      owner_user_id: "local_user",
-      created_at: now()
-    };
-    db.workspaces.push(workspace);
-    db.workspace_members.push({
-      id: uid("mem"),
-      workspace_id: workspace.id,
-      user_id: "local_user",
-      email: "ops@example.com",
-      role: "owner",
-      created_at: now()
-    });
-    writeDb(db);
-    return sendJson(res, 201, bootstrapPayload(db));
-  }
-
-  if (req.method === "POST" && pathname === "/api/travelers") {
-    const body = await readBody(req);
-    const workspaceId = body.workspace_id || db.workspaces[0]?.id;
-    const traveler = travelerFromBody({ ...body, workspace_id: workspaceId }, {
-      id: uid("trav"),
-      created_at: now(),
-      updated_at: now()
-    });
-    db.traveler_profiles.push(traveler);
-    upsertTravelerDocument(db, traveler.id, body);
-    db.preferences = db.preferences || {};
-    if (!db.preferences.selected_traveler_id) db.preferences.selected_traveler_id = traveler.id;
-    writeDb(db);
-    return sendJson(res, 201, bootstrapPayload(db));
-  }
-
-  const travelerMatch = pathname.match(/^\/api\/travelers\/([^/]+)$/);
-  if (travelerMatch && req.method === "POST") {
-    const body = await readBody(req);
-    const travelerId = travelerMatch[1];
-    const index = db.traveler_profiles.findIndex((traveler) => traveler.id === travelerId);
-    if (index === -1) return sendJson(res, 404, { error: "Traveler not found" });
-    db.traveler_profiles[index] = travelerFromBody(body, db.traveler_profiles[index]);
-    upsertTravelerDocument(db, travelerId, body);
-    writeDb(db);
-    return sendJson(res, 200, bootstrapPayload(db));
-  }
-
-  if (travelerMatch && req.method === "DELETE") {
-    const travelerId = travelerMatch[1];
-    const before = db.traveler_profiles.length;
-    db.traveler_profiles = db.traveler_profiles.filter((traveler) => traveler.id !== travelerId);
-    if (db.traveler_profiles.length === before) return sendJson(res, 404, { error: "Traveler not found" });
-    db.traveler_documents = db.traveler_documents.filter((doc) => doc.traveler_profile_id !== travelerId);
-    db.trips = db.trips.filter((trip) => trip.traveler_profile_id !== travelerId);
-    db.preferences = db.preferences || {};
-    if (db.preferences.selected_traveler_id === travelerId) {
-      db.preferences.selected_traveler_id = db.traveler_profiles[0]?.id || "";
-    }
-    writeDb(db);
-    return sendJson(res, 200, bootstrapPayload(db));
-  }
-
-  if (req.method === "POST" && pathname === "/api/preferences") {
-    const body = await readBody(req);
-    db.preferences = {
-      ...(db.preferences || {}),
-      selected_traveler_id: body.selected_traveler_id || db.preferences?.selected_traveler_id || ""
-    };
-    writeDb(db);
-    return sendJson(res, 200, bootstrapPayload(db));
-  }
-
-  if (req.method === "POST" && pathname === "/api/trips") {
-    const body = await readBody(req);
-    const trip = {
-      id: uid("trip"),
-      workspace_id: body.workspace_id || db.workspaces[0]?.id,
-      traveler_profile_id: body.traveler_profile_id || db.traveler_profiles[0]?.id,
-      created_by_user_id: "local_user",
-      airline: body.airline || "",
-      seller: body.seller || "",
-      origin_airport: body.origin_airport || "",
-      destination_airport: body.destination_airport || "",
-      departure_at: body.departure_at || "",
-      return_at: body.return_at || "",
-      booking_reference: body.booking_reference || "",
-      ticket_number: body.ticket_number || "",
-      price_amount: Number(body.price_amount || 0),
-      price_currency: body.price_currency || "USD",
-      baggage_summary: body.baggage_summary || "",
-      booking_url: body.booking_url || "",
-      status: body.status || "booked",
-      invoice_status: body.invoice_status || "missing",
-      warnings: Array.isArray(body.warnings) ? body.warnings.slice(0, 8) : [],
-      notes: body.notes || "",
-      created_at: now(),
-      updated_at: now()
-    };
-    db.trips.unshift(trip);
-    writeDb(db);
-    return sendJson(res, 201, bootstrapPayload(db));
-  }
-
-  if (req.method === "POST" && pathname === "/api/invites") {
-    const body = await readBody(req);
-    db.invites.push({
-      id: uid("inv"),
-      workspace_id: body.workspace_id || db.workspaces[0]?.id,
-      email: body.email || "",
-      role: body.role || "member",
-      created_at: now()
-    });
-    writeDb(db);
-    return sendJson(res, 201, bootstrapPayload(db));
-  }
+  if (await handleWalletRoutes(req, res, pathname, db)) return;
 
   sendJson(res, 404, { error: "Not found" });
 }
 
-function serveStatic(req, res, pathname) {
-  const routeFile = pathname === "/" || pathname === "/login" || pathname === "/onboarding" || pathname === "/dashboard" || pathname.startsWith("/travelers") || pathname.startsWith("/trips") || pathname.startsWith("/settings")
-    ? "index.html"
-    : pathname === "/demo/checkout"
-      ? "checkout.html"
-      : pathname.slice(1);
-  const filePath = path.normalize(path.join(PUBLIC_DIR, routeFile));
-  if (!filePath.startsWith(PUBLIC_DIR)) {
-    res.writeHead(403);
-    return res.end("Forbidden");
-  }
-  if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-    res.writeHead(404);
-    return res.end("Not found");
-  }
-  const ext = path.extname(filePath);
-  const types = {
-    ".html": "text/html; charset=utf-8",
-    ".css": "text/css; charset=utf-8",
-    ".js": "application/javascript; charset=utf-8",
-    ".json": "application/json; charset=utf-8"
-  };
-  res.writeHead(200, { "content-type": types[ext] || "application/octet-stream" });
-  fs.createReadStream(filePath).pipe(res);
-}
+const serveStatic = createStaticHandler(PUBLIC_DIR);
 
 const server = http.createServer(async (req, res) => {
   try {

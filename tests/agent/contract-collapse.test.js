@@ -301,6 +301,7 @@ test("non-boundary internal contract versions are absent", () => {
 test("observation transport sends one latest result and loop failures stay typed", () => {
   const root = path.resolve(__dirname, "../..");
   const server = fs.readFileSync(path.join(root, "apps/web/server.js"), "utf8");
+  const agentRoutes = fs.readFileSync(path.join(root, "apps/web/routes/agent.js"), "utf8");
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop.js"), "utf8");
   const content = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
   const execution = fs.readFileSync(path.join(root, "apps/extension/src/content/execution/orchestrator.js"), "utf8");
@@ -311,11 +312,12 @@ test("observation transport sends one latest result and loop failures stay typed
   );
 
   assert.doesNotMatch(server, /actionHistory/);
+  assert.doesNotMatch(agentRoutes, /actionHistory/);
   assert.doesNotMatch(loop, /actionHistory/);
   assert.doesNotMatch(observationPayload, /actionHistory/);
   assert.match(observationPayload, /lastActionResult: lastActionForTransport/);
   assert.match(server, /throw failure/);
-  assert.match(server, /error\.code === "AGENT_LOOP_FAILED"/);
+  assert.match(agentRoutes, /error\.code === "AGENT_LOOP_FAILED"/);
   assert.match(decisions, /\["AGENT_LOOP_FAILED", "BACKEND_INTERNAL_ERROR"\]/);
   assert.match(execution, /decision\.fatalBackendFailure === true/);
 });
