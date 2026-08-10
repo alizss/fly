@@ -1,3 +1,5 @@
+import { currentNavigationUrl, sanitizedNavigationUrl } from "../navigation-identity.js";
+
 export function createExecutionOrchestrator({
   AGENT_CONTRACT,
   activeOverlayElements,
@@ -247,7 +249,10 @@ export function createExecutionOrchestrator({
       && afterOverlaySignature
       && beforeOverlaySignature !== afterOverlaySignature
     );
-    const urlChanged = Boolean(expected.beforeUrl && location.href !== expected.beforeUrl);
+    const urlChanged = Boolean(
+      expected.beforeUrl
+      && currentNavigationUrl() !== sanitizedNavigationUrl(expected.beforeUrl)
+    );
 
     let ok = false;
     if (expected.type === "options_surface_appeared") ok = overlayAppeared;
@@ -422,7 +427,7 @@ export function createExecutionOrchestrator({
       advanced,
       step: afterMap.step,
       errors: afterMap.errors,
-      url: location.href,
+      url: currentNavigationUrl(),
       verification
     });
     const actionId = options.actionId || agent.activeExecutionActionId || nextFlowId("act");

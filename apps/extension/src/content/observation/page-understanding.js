@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createPageUnderstanding({
   classifyStepDetailed,
   runRiskChecks,
@@ -163,7 +165,7 @@ export function createPageUnderstanding({
   function buildPageUnderstanding(map) {
     const stepInfo = classifyStepDetailed({
       visibleText: `${map.text} ${map.fullText.slice(0, 2500)}`,
-      url: location.href,
+      url: currentNavigationUrl(),
       structuralEvidence: {
         seatInventoryCount: (map.collections || [])
           .filter((collection) => collection.type === "seat_inventory")
@@ -206,7 +208,7 @@ export function createPageUnderstanding({
     return {
       pageIdentity: {
         host: location.host,
-        url: location.href,
+        url: currentNavigationUrl(),
         siteName: map.site,
         pageType: stepInfo.step,
         confidence: stepInfo.confidence

@@ -30,7 +30,9 @@ export function createCheckoutController({
   shouldAutoDeclinePaidExtras,
   showAgentThought,
   sleep,
+  startWatchingCheckoutChanges,
   startAgentSession,
+  stopWatchingCheckoutChanges,
   travelerRules,
   travelerValue
 }) {
@@ -95,6 +97,7 @@ export function createCheckoutController({
     agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "agent_start" }).map;
     const session = await startAgentSession();
     if (!session || !agent.sessionId) {
+      stopWatchingCheckoutChanges();
       agent.running = false;
       agent.awaiting = "manual";
       await clearResumeMarker();
@@ -107,6 +110,7 @@ export function createCheckoutController({
       renderSidebar("agent");
       return;
     }
+    startWatchingCheckoutChanges();
     await saveResumeMarker();
     addAgentMessage("assistant", `${describePageMap(agent.pageMap)} I will work step by step and ask when money, payment, or uncertainty appears.`);
     renderSidebar("agent");
@@ -151,6 +155,7 @@ export function createCheckoutController({
     const resumeSessionId = String(marker.sessionId || "");
     const session = resumeSessionId ? await startAgentSession(resumeSessionId) : null;
     if (!session || agent.sessionId !== resumeSessionId) {
+      stopWatchingCheckoutChanges();
       agent.running = false;
       agent.awaiting = "manual";
       await clearResumeMarker();
@@ -158,6 +163,7 @@ export function createCheckoutController({
       renderSidebar("agent");
       return;
     }
+    startWatchingCheckoutChanges();
     await saveResumeMarker();
     addAgentMessage("assistant", "Picking back up where I left off after the page changed.");
     renderSidebar("agent");
@@ -168,6 +174,7 @@ export function createCheckoutController({
   async function processCheckoutAgent() {
     if (!agent.running) return;
     if (!agent.sessionId) {
+      stopWatchingCheckoutChanges();
       agent.running = false;
       agent.awaiting = "manual";
       addAgentMessage("assistant", "The durable checkout session is missing, so I stopped before observing or acting.");
@@ -332,6 +339,7 @@ export function createCheckoutController({
       resetAgentLoopLifecycle("user_stop");
       agent.running = false;
       agent.awaiting = "";
+      stopWatchingCheckoutChanges();
       if (agent.sessionId) {
         await persistControlFlowDecision({
           action: "stop",
@@ -349,6 +357,7 @@ export function createCheckoutController({
       addAgentMessage("user", "I fixed it. Continue.");
       agent.running = true;
       agent.awaiting = "";
+      startWatchingCheckoutChanges();
       agent.repeatClickCount = 0;
       agent.lastClickAt = 0;
       renderSidebar("agent");

@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createPageMapCompiler(dependencies) {
   const {
     accessibilityNode,
@@ -70,13 +72,13 @@ export function createPageMapCompiler(dependencies) {
       .reduce((total, collection) => total + collection.members.length, 0);
     const terminalStructure = observeTerminalStructure(fullText);
     const terminalEvidence = agentContract?.compileTerminalEvidence?.({
-      url: location.href,
+      url: currentNavigationUrl(),
       visibleText: `${text} ${fullText}`,
       structuralEvidence: terminalStructure
     }) || null;
     const step = classifyStep({
       visibleText: `${text} ${fullText.slice(0, 2500)}`,
-      url: location.href,
+      url: currentNavigationUrl(),
       structuralEvidence: { seatInventoryCount, ...terminalStructure },
       terminalEvidence
     });

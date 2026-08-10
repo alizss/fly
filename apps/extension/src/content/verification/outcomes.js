@@ -1,3 +1,5 @@
+import { currentNavigationUrl, sanitizedNavigationUrl } from "../navigation-identity.js";
+
 export function createOutcomeVerification({
   AGENT_CONTRACT,
   actionableCheckoutErrors,
@@ -86,7 +88,7 @@ export function createOutcomeVerification({
       stateElementId: decision.targetSnapshot?.stateElementId || targetControl?.stateElementId || "",
       targetLabel: String(label || "").replace(/\s+/g, " ").trim().slice(0, 180),
       beforeSignature: structuralPageSignature(map),
-      beforeUrl: map.url || location.href,
+      beforeUrl: map.url || currentNavigationUrl(),
       beforeVisualState: visualPageState(map),
       policyAuthorized: Boolean(
         decision.policy?.allow === true
@@ -237,7 +239,8 @@ export function createOutcomeVerification({
     const beforeVisual = visualPageState(beforeMap);
     const afterVisual = visualPageState(afterMap);
     const visualChanged = beforeVisual?.fingerprint !== afterVisual?.fingerprint;
-    const navigationOccurred = beforeMap.step !== afterMap.step || (beforeMap.url || location.href) !== (afterMap.url || location.href);
+    const currentUrl = currentNavigationUrl();
+    const navigationOccurred = beforeMap.step !== afterMap.step || (beforeMap.url || currentUrl) !== (afterMap.url || currentUrl);
     const beforeOverlay = Boolean(beforeSurface.type && beforeSurface.type !== "page");
     const afterOverlay = Boolean(afterSurface.type && afterSurface.type !== "page");
     const overlayAppeared = Boolean(afterOverlay && (!beforeOverlay || surfaceChanged));
@@ -478,13 +481,25 @@ export function createOutcomeVerification({
       ...(afterMap.validationIssues || []).map((issue) => issue.message).filter(Boolean)
     ];
     const validationAppeared = afterErrors.some((error) => !beforeErrors.includes(error));
+    const expectedBeforeNavigationUrl = sanitizedNavigationUrl(
+      expected.beforeUrl || beforeMap.url || currentNavigationUrl()
+    );
+    const observedAfterNavigationUrl = sanitizedNavigationUrl(afterMap.url || currentNavigationUrl());
+    const liveAfterNavigationUrl = currentNavigationUrl();
+    // The immutable after-map normally owns URL evidence. A same-document hash
+    // transition can land between DOM compilation and verification, so a live
+    // browser URL that differs from the governed pre-action URL is also fresh
+    // mechanical evidence. It cannot manufacture progress when unchanged.
+    const verifiedAfterNavigationUrl = liveAfterNavigationUrl !== expectedBeforeNavigationUrl
+      ? liveAfterNavigationUrl
+      : observedAfterNavigationUrl;
     const evidence = {
       beforeObservationHash: observationHashForMap(beforeMap),
       afterObservationHash: observationHashForMap(afterMap),
       beforeStep: beforeMap.step,
       afterStep: afterMap.step,
-      beforeUrl: expected.beforeUrl || beforeMap.url || location.href,
-      afterUrl: afterMap.url || location.href,
+      beforeUrl: expectedBeforeNavigationUrl,
+      afterUrl: verifiedAfterNavigationUrl,
       beforeSurface: beforeMap.currentSurface?.label || "",
       afterSurface: afterMap.currentSurface?.label || "",
       visual: {
@@ -1116,7 +1131,7 @@ export function createOutcomeVerification({
       const afterPriceAmount = afterMap.price?.amount == null ? null : Number(afterMap.price.amount);
       const checkoutStageAdvanced = Boolean(
         String(beforeMap.step || "") !== String(afterMap.step || "")
-        || String(expected.beforeUrl || beforeMap.url || "") !== String(afterMap.url || location.href)
+        || expectedBeforeNavigationUrl !== verifiedAfterNavigationUrl
         || progressMarkerChanged
         || (
           surfaceChanged
@@ -1329,7 +1344,8 @@ export function createOutcomeVerification({
       const sameSurfaceId = expected.surfaceId && afterSurface.id === expected.surfaceId;
       const sameSurfaceLabel = normalizeMatchText(afterSurface.label || "") && normalizeMatchText(afterSurface.label || "") === normalizeMatchText(expected.surfaceLabel || "");
       const foregroundGone = !afterSurface.type || afterSurface.type === "page";
-      const stepAdvanced = beforeMap.step !== afterMap.step || location.href !== (beforeMap.url || location.href);
+      const currentUrl = currentNavigationUrl();
+      const stepAdvanced = beforeMap.step !== afterMap.step || currentUrl !== (beforeMap.url || currentUrl);
       const advancedInPlace = Boolean(progressMarkerChanged);
       const ok = Boolean(stepAdvanced || advancedInPlace || foregroundGone || (!sameSurfaceId && !sameSurfaceLabel && (foregroundChanged || visualChanged || changed)));
       return {
@@ -1361,8 +1377,8 @@ export function createOutcomeVerification({
     }
     if (expected.type === "current_surface_advanced") {
       const stepChanged = beforeMap.step !== afterMap.step;
-      const beforeUrl = String(expected.beforeUrl || beforeMap.url || location.href);
-      const afterUrl = String(afterMap.url || location.href);
+      const beforeUrl = expectedBeforeNavigationUrl;
+      const afterUrl = verifiedAfterNavigationUrl;
       const urlChanged = beforeUrl !== afterUrl;
       const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged || (surfaceChanged && !overlayAppeared));
       return {
@@ -1378,8 +1394,8 @@ export function createOutcomeVerification({
       // browser URL on every internal snapshot. Compare against the governed
       // pre-action URL when it is supplied; treating a missing beforeMap.url
       // as an empty string made every same-page click look like navigation.
-      const beforeUrl = String(expected.beforeUrl || beforeMap.url || location.href);
-      const afterUrl = String(afterMap.url || location.href);
+      const beforeUrl = expectedBeforeNavigationUrl;
+      const afterUrl = verifiedAfterNavigationUrl;
       const urlChanged = beforeUrl !== afterUrl;
       const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged);
       return {

@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createForegroundSurfaceCompiler(dependencies) {
   const {
     accessibilityNode,
@@ -449,7 +451,7 @@ export function createForegroundSurfaceCompiler(dependencies) {
           sectionLabel,
           surfaceId: overlayId,
           surfaceType: "modal",
-          stage: classifyStep({ visibleText: primaryPageText(), url: location.href }),
+          stage: classifyStep({ visibleText: primaryPageText(), url: currentNavigationUrl() }),
           instance: overlayText(overlay).slice(0, 120)
         });
     return {

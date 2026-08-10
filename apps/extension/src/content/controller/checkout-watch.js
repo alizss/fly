@@ -10,8 +10,7 @@ export function createCheckoutWatcher({
   hasFilledFields,
   pageStateStore,
   refreshSidebarWarnings,
-  scheduleDestinationObservation,
-  scheduleSelectedBookingCapture
+  scheduleDestinationObservation
 }) {
   let observer = null;
   let renderTimer = null;
@@ -33,8 +32,7 @@ export function createCheckoutWatcher({
           : mutation.target?.parentElement;
         return !target?.closest?.("#atw-sidebar, #atw-agent-cursor, .atw-agent-cursor");
       });
-      if (pageChanged && externalPageMutation) scheduleSelectedBookingCapture("dom_mutation");
-      if (pageChanged && getDestinationWait()?.status === "WAITING_FOR_DESTINATION") {
+      if (pageChanged && externalPageMutation && getDestinationWait()?.status === "WAITING_FOR_DESTINATION") {
         scheduleDestinationObservation("dom_mutation", destinationMutationSettleMs);
       }
       if (!pageChanged || renderTimer) return;

@@ -178,6 +178,10 @@ export function createPerceptionFacade(dependencies) {
       + (optionCount ? 0.15 : 0)
       + (navCount ? 0.1 : 0)
       + (/seat|baggage|bundle|insurance|extra|are you sure|not selected/i.test(text) ? 0.05 : 0));
+    const progressMarkers = {
+      ...surfaceProgressMarkers(text),
+      pageStage: String(document.body?.dataset?.stage || "").trim().slice(0, 120)
+    };
     return {
       active,
       id: activeSurface.id || "",
@@ -186,7 +190,7 @@ export function createPerceptionFacade(dependencies) {
       blocksBackground: activeSurface.blocksBackground === true,
       confidence,
       reason: active ? "Visible foreground surface owns the next action until it closes or changes." : "No foreground surface detected.",
-      progressMarkers: surfaceProgressMarkers(text),
+      progressMarkers,
       fingerprint: surfaceVisualFingerprint(activeSurface),
       optionCount,
       navigationControlCount: navCount,

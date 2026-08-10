@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createSessionClient({
   ACTION_REPORT_MAX_ATTEMPTS,
   ACTION_REPORT_TIMEOUT_MS,
@@ -122,7 +124,7 @@ export function createSessionClient({
       });
       const pageReference = {
         site: map.site || location.host,
-        url: location.href,
+        url: currentNavigationUrl(),
         step: map.step || "unknown",
         snapshotHash: observationHashForMap(map),
         surfaceId: map.currentSurface?.id || "surface-page",

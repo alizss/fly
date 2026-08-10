@@ -6,6 +6,15 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "ATW_TAB_CONTEXT") {
+    sendResponse({
+      ok: Number.isInteger(sender.tab?.id),
+      tabId: Number.isInteger(sender.tab?.id) ? sender.tab.id : null,
+      windowId: Number.isInteger(sender.tab?.windowId) ? sender.tab.windowId : null
+    });
+    return false;
+  }
+
   if (["ATW_TRUSTED_POINTER_CLICK", "ATW_TRUSTED_CHOICE", "ATW_TRUSTED_KEY"].includes(message?.type)) {
     const tabId = sender.tab?.id;
     const x = Number(message.x);

@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createFlowDiagnostics({
   DEFAULT_API,
   actionableCheckoutErrors,
@@ -14,7 +16,7 @@ export function createFlowDiagnostics({
     const map = agent.pageMap || buildPageMap();
     return {
       label,
-      url: location.href,
+      url: currentNavigationUrl(),
       site: map.site,
       // The extension reports observed facts and capabilities only. Checkout
       // stage is reduced authoritatively by the backend from this payload.

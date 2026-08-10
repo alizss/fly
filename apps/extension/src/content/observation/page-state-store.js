@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createPageStateStore({
   buildPageMap,
   rememberPagePlan,
@@ -152,7 +154,8 @@ export function createPageStateStore({
   const observe = ({ forceFull = false, reason = "observe" } = {}) => {
     const startedAt = performance.now();
     drainMutationRecords();
-    const urlChanged = Boolean(canonicalUrl && canonicalUrl !== location.href);
+    const currentUrl = currentNavigationUrl();
+    const urlChanged = Boolean(canonicalUrl && canonicalUrl !== currentUrl);
     if (canonical && !dirty && !forceFull && !urlChanged) {
       update = {
         ...update,
@@ -189,7 +192,7 @@ export function createPageStateStore({
     const fresh = captureStartVersion === captureEndVersion;
     const diff = canonicalPageStateDiff(before, next);
     canonical = next;
-    canonicalUrl = location.href;
+    canonicalUrl = currentUrl;
     dirty = !fresh;
     if (fresh) pendingMutations = [];
     update = {

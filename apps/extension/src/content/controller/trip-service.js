@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 const BAGGAGE_TERMS = [
   "no cabin bag", "baggage not included", "personal item only", "without baggage", "checked baggage not included"
 ];
@@ -80,7 +82,7 @@ export function createTripService({
       price_amount: price?.amount || 0,
       price_currency: price?.currency || "USD",
       baggage_summary: document.querySelector("[data-baggage-summary]")?.textContent?.trim() || "",
-      booking_url: location.href,
+      booking_url: currentNavigationUrl(),
       invoice_status: "missing",
       warnings: runRiskChecks().map((warning) => warning.message)
     };

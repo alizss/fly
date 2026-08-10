@@ -22,7 +22,8 @@ export function createSidebarUi({
   traveler,
   travelerRules
 }) {
-  function warningHtml() {
+  function warningHtml(dormant = false) {
+    if (dormant) return "<p class='atw-muted'>Risk checks begin after Start.</p>";
     const currentWarnings = getWarnings();
     const list = currentWarnings.length ? currentWarnings : runRiskChecks();
     if (!list.length) return "<p class='atw-muted'>No booking risks detected.</p>";
@@ -169,7 +170,16 @@ export function createSidebarUi({
   // Sidebar is logs-only by design: it starts the agent and shows what it's doing
   // (section checklist, reasoning log). Anything that needs the user's input is
   // asked on the page itself, next to the AI cursor — see cursorPromptHtml().
-  function agentChatHtml() {
+  function agentChatHtml(dormant = false) {
+    if (dormant) {
+      return `
+        <div class="atw-agent-live">
+          <div class="atw-live-dot"></div>
+          <div><strong>Ready</strong><span>Fly is idle until you press Start.</span></div>
+        </div>
+        ${selectedBookingAcquisitionHtml()}
+      `;
+    }
     const map = agent.pageMap || pageStateStore.observe({ reason: "sidebar_render" }).map;
     return `
       ${agentStatusHtml(map)}
@@ -390,7 +400,8 @@ export function createSidebarUi({
 
   function renderSidebar(mode = "ready") {
     const t = traveler();
-    const detected = bookingDetected();
+    const dormant = mode === "ready" && !agent.running && !agent.pageMap;
+    const detected = dormant || bookingDetected();
     const root = document.getElementById("atw-sidebar") || document.createElement("aside");
     root.id = "atw-sidebar";
     root.innerHTML = `
@@ -425,7 +436,7 @@ export function createSidebarUi({
           </div>
         ` : `
           <div class="atw-agent-card">
-            ${agentChatHtml()}
+            ${agentChatHtml(dormant)}
           </div>
         `}
         <details class="atw-details">
@@ -448,7 +459,7 @@ export function createSidebarUi({
             <strong>Filled fields</strong>
             ${getFilledFields().length ? `<ul class="atw-list">${getFilledFields().map((field) => `<li>${field.fieldType} (${Math.round(field.confidence * 100)}%)</li>`).join("")}</ul>` : "<p class='atw-muted'>Nothing filled yet.</p>"}
           </div>
-          <div>${warningHtml()}</div>
+          <div>${warningHtml(dormant)}</div>
         </details>
       </div>
     `;

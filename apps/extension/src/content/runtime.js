@@ -6,6 +6,7 @@ import {
 } from "./selected-booking.js";
 import { createAgentRuntimeContext } from "./runtime-context.js";
 import { createSelectedBookingAcquisition } from "./selected-booking-acquisition.js";
+import { currentNavigationUrl } from "./navigation-identity.js";
 import { createActionTransport } from "./observation/action-transport.js";
 import { createAccessibilityProjection } from "./observation/accessibility.js";
 import {
@@ -91,6 +92,8 @@ import {
   let selectedTravelerId = null;
   let filledFields = [];
   let warnings = [];
+  let watchForCheckoutChanges = () => null;
+  let stopWatchingCheckoutChanges = () => undefined;
   const canonicalSelectionCommitments = new Map();
   const choiceActuatorBindings = new Map();
   const choiceInteractionStates = new Map();
@@ -290,6 +293,44 @@ import {
     return chrome.storage.local.get(keys);
   }
 
+  const SELECTED_BOOKING_DURABLE_PREFIX = "atwSelectedBookingAcquisitionV1";
+  let tabContextPromise = null;
+
+  async function tabContextId() {
+    if (!tabContextPromise) {
+      tabContextPromise = Promise.resolve(chrome.runtime.sendMessage({ type: "ATW_TAB_CONTEXT" }))
+        .then((response) => Number.isInteger(response?.tabId) ? String(response.tabId) : "")
+        .catch(() => "");
+    }
+    return tabContextPromise;
+  }
+
+  async function selectedBookingDurableKey() {
+    const contextId = await tabContextId();
+    return contextId ? `${SELECTED_BOOKING_DURABLE_PREFIX}:${contextId}` : "";
+  }
+
+  async function readDurableSelectedBookingAcquisition() {
+    const key = await selectedBookingDurableKey();
+    if (!key) return null;
+    const stored = await storageGet(key);
+    return stored?.[key] || null;
+  }
+
+  async function writeDurableSelectedBookingAcquisition(acquisition = null) {
+    const key = await selectedBookingDurableKey();
+    if (!key || !acquisition) return false;
+    await chrome.storage.local.set({ [key]: acquisition });
+    return true;
+  }
+
+  async function clearDurableSelectedBookingAcquisition() {
+    const key = await selectedBookingDurableKey();
+    if (!key) return false;
+    await chrome.storage.local.remove(key);
+    return true;
+  }
+
   const RESUME_KEY = "atwAgentResume";
   const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
@@ -303,9 +344,11 @@ import {
       }
       await chrome.storage.local.set({
         [RESUME_KEY]: {
+          tabContextId: await tabContextId(),
           travelerId: selectedTravelerId,
           sessionId: agent.sessionId,
           skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
+          navigationUrl: currentNavigationUrl(),
           savedAt: Date.now()
         }
       });
@@ -512,7 +555,7 @@ import {
     const matches = candidateInputs().map(detectField).filter(Boolean);
     const step = classifyStep({
       visibleText: `${primaryPageText()} ${visiblePageText().slice(0, 1200)}`,
-      url: location.href
+      url: currentNavigationUrl()
     });
     const checkoutCopy = /checkout|traveller information|traveler information|configure your trip|select baggage|seat selection|payment|booking confirmed/i.test(visiblePageText());
     return matches.length >= 3 || step !== "unknown" || checkoutCopy;
@@ -716,7 +759,7 @@ import {
       snapshotHash: stableHash(materialSignature),
       diagnosticHash: stableHash(structuralSignature),
       pageHash: stableHash(signature),
-      url: location.href,
+      url: currentNavigationUrl(),
       site: map.site,
       step: map.step,
       foreground: map.foreground || foregroundSurfaceState(map.currentSurface || {}),
@@ -1558,7 +1601,7 @@ import {
     let routePath = String(evidence.routePath || "").toLowerCase();
     if (!routePath) {
       try {
-        routePath = new URL(String(evidence.url || location.href), location.href).pathname.toLowerCase();
+        routePath = new URL(String(evidence.url || currentNavigationUrl()), currentNavigationUrl()).pathname.toLowerCase();
       } catch (error) {
         routePath = String(location.pathname || "").toLowerCase();
       }
@@ -1568,7 +1611,7 @@ import {
       routePath,
       structuralEvidence: evidence.structuralEvidence || structuralEvidence || {},
       terminalEvidence: evidence.terminalEvidence || null,
-      url: String(evidence.url || location.href || "")
+      url: String(evidence.url || currentNavigationUrl() || "")
     };
   }
 
@@ -2256,11 +2299,17 @@ import {
   const {
     acquireForStart: acquireSelectedBookingForStart,
     approveVisibleSummary: approveVisibleSelectedBookingSummary,
+    armSelectionCapture: armSelectedBookingCapture,
+    cancel: cancelSelectedBookingCapture,
     capture: captureSelectedBookingFromMap,
+    disarmSelectionCapture: disarmSelectedBookingCapture,
+    hydrate: hydrateSelectedBookingAcquisition,
     read: readSelectedBookingAcquisition,
-    schedule: scheduleSelectedBookingCapture,
-    cancel: cancelSelectedBookingCapture
+    schedule: scheduleSelectedBookingCapture
   } = createSelectedBookingAcquisition({
+    durableClear: clearDurableSelectedBookingAcquisition,
+    durableRead: readDurableSelectedBookingAcquisition,
+    durableWrite: writeDurableSelectedBookingAcquisition,
     isSessionActive: () => Boolean(agent.running || agent.sessionId),
     observationHashForMap,
     pageStateStore
@@ -2963,7 +3012,7 @@ import {
     };
     return {
       site: map.site,
-      url: location.href,
+      url: currentNavigationUrl(),
       step: map.step || "unknown",
       stepEvidence: {
         source: "extension_fresh_observation",
@@ -3328,7 +3377,9 @@ import {
     shouldAutoDeclinePaidExtras,
     showAgentThought,
     sleep,
+    startWatchingCheckoutChanges: () => watchForCheckoutChanges(),
     startAgentSession,
+    stopWatchingCheckoutChanges: () => stopWatchingCheckoutChanges(),
     travelerRules,
     travelerValue
   });
@@ -3373,7 +3424,7 @@ import {
     travelerRules
   });
 
-  const { watch: watchForCheckoutChanges, stop: stopWatchingCheckoutChanges } = createCheckoutWatcher({
+  ({ watch: watchForCheckoutChanges, stop: stopWatchingCheckoutChanges } = createCheckoutWatcher({
     destinationMutationSettleMs: DESTINATION_MUTATION_SETTLE_MS,
     getDestinationWait: () => agent.destinationWait,
     hasFilledFields: () => Boolean(filledFields.length),
@@ -3382,14 +3433,13 @@ import {
       warnings = runRiskChecks();
       renderSidebar();
     },
-    scheduleDestinationObservation,
-    scheduleSelectedBookingCapture
-  });
+    scheduleDestinationObservation
+  }));
 
   window.addEventListener("pagehide", () => {
     stopWatchingCheckoutChanges();
     cancelSelectedBookingCapture();
-    if (!agent.running) captureSelectedBookingFromMap(pageStateStore.current());
+    disarmSelectedBookingCapture();
     saveResumeMarker();
   });
   document.addEventListener("visibilitychange", () => {
@@ -3451,7 +3501,10 @@ import {
       validStoredSelectedBookingContract,
       captureSelectedBookingFromMap,
       approveVisibleSelectedBookingSummary,
+      armSelectedBookingCapture,
       acquireSelectedBookingForStart,
+      disarmSelectedBookingCapture,
+      hydrateSelectedBookingAcquisition,
       readSelectedBookingAcquisition,
       scheduleSelectedBookingCapture,
       startAgentSession,
@@ -3526,24 +3579,27 @@ import {
       withOverlayProgressEvidence,
       withChoiceCommitEvidence
     });
-    return;
+    if (window.__ATW_TEST_BOOT__ !== true) return;
   }
 
   try {
     await fetchData();
-    captureSelectedBookingFromMap(pageStateStore.observe({ forceFull: true, reason: "selected_booking_initial" }).map);
-    warnings = runRiskChecks();
+    await hydrateSelectedBookingAcquisition();
+    armSelectedBookingCapture();
+    warnings = [];
     const resumeMarker = await readResumeMarker();
-    const resumeIsFresh = Boolean(resumeMarker) && (Date.now() - (resumeMarker.savedAt || 0) < RESUME_MAX_AGE_MS);
+    const currentTabContextId = await tabContextId();
+    const resumeIsFresh = Boolean(resumeMarker)
+      && Boolean(currentTabContextId)
+      && resumeMarker.tabContextId === currentTabContextId
+      && (Date.now() - (resumeMarker.savedAt || 0) < RESUME_MAX_AGE_MS);
     if (resumeIsFresh && resumeMarker.travelerId) {
       selectedTravelerId = resumeMarker.travelerId;
-      renderSidebar("agent");
       resumeCheckoutAfterNavigation(resumeMarker);
     } else {
       if (resumeMarker) await clearResumeMarker();
       renderSidebar();
     }
-    watchForCheckoutChanges();
   } catch (error) {
     const root = document.createElement("aside");
     root.id = "atw-sidebar";

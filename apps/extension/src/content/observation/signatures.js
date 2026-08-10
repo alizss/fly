@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createObservationSignatures({
   activeOverlayElements,
   buildPageMap,
@@ -34,7 +36,7 @@ export function createObservationSignatures({
       || null;
     const surfaceText = surface ? overlayText(surface).slice(0, 260) : "";
     return [
-      location.href,
+      currentNavigationUrl(),
       element.tagName,
       element.id,
       element.name,
@@ -45,7 +47,7 @@ export function createObservationSignatures({
   }
 
   function pageSignature(map = buildPageMap()) {
-    return [location.href, map.step, map.errors.join("|"), map.text.slice(0, 800)].join("||");
+    return [currentNavigationUrl(), map.step, map.errors.join("|"), map.text.slice(0, 800)].join("||");
   }
 
   function canonicalItineraryActionDate(value = "") {
@@ -111,10 +113,11 @@ export function createObservationSignatures({
   function materialObservationSignature(map = buildPageMap()) {
     const materialUrl = (() => {
       try {
-        const url = new URL(map.url || location.href, location.href);
+        const currentUrl = currentNavigationUrl();
+        const url = new URL(map.url || currentUrl, currentUrl);
         return `${url.origin}${url.pathname}${url.search}`;
       } catch (error) {
-        return String(map.url || location.href || "").split("#")[0];
+        return String(map.url || currentNavigationUrl() || "").split("#")[0];
       }
     })();
     const foreground = map.currentSurface?.type && map.currentSurface.type !== "page" ? map.currentSurface : {};

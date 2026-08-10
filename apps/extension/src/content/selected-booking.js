@@ -1,4 +1,11 @@
+import { currentNavigationUrl } from "./navigation-identity.js";
+
 export const SELECTED_BOOKING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+const BOOKING_APPROVAL_SOURCES = new Set([
+  "explicit_agent_start",
+  "explicit_flight_selection"
+]);
 
 function authoritativeSelectedBookingItinerary(facts = null) {
   if (!facts || facts.evidenceMode !== "typed") return null;
@@ -43,7 +50,7 @@ export function approvedSelectedBookingAcquisitionFromMap(map = null, {
   // framework-specific price owner is a booking-total owner. The user's Start
   // action is the one explicit authority allowed to promote that currently
   // displayed page total into the immutable checkout baseline.
-  if (approvalSource !== "explicit_agent_start") return null;
+  if (!BOOKING_APPROVAL_SOURCES.has(approvalSource)) return null;
   const facts = authoritativeSelectedBookingItinerary(map?.transactionFacts);
   const amount = Number(map?.price?.amount);
   const currency = String(map?.price?.currency || "").trim().toUpperCase();
@@ -56,11 +63,13 @@ export function approvedSelectedBookingAcquisitionFromMap(map = null, {
     factEvidence: {
       ...(facts.factEvidence || {}),
       totalPrice: {
-        source: "user_approved_visible_checkout_total",
+        source: approvalSource === "explicit_flight_selection"
+          ? "user_selected_visible_flight_total"
+          : "user_approved_visible_checkout_total",
         ownerKey,
         role: "booking_total",
         ownerType: "selected_booking_summary",
-        qualification: "explicit_agent_start",
+        qualification: approvalSource,
         observationId: String(observationHash || ""),
         confidence: 1,
         authoritative: true
@@ -69,7 +78,7 @@ export function approvedSelectedBookingAcquisitionFromMap(map = null, {
     provenance: [
       ...(Array.isArray(facts.provenance) ? facts.provenance : []),
       {
-        source: "explicit_agent_start",
+        source: approvalSource,
         observationId: String(observationHash || ""),
         confidence: 1
       }
@@ -91,7 +100,7 @@ export function composeSelectedBookingContract(acquisition = null, selectedTrave
   const travelerId = String(selectedTraveler?.id || "").trim();
   if (!facts || !travelerId) return null;
   const now = typeof environment.now === "function" ? environment.now() : Date.now();
-  const sourceUrl = environment.sourceUrl ?? globalThis.location?.href ?? "";
+  const sourceUrl = environment.sourceUrl ?? currentNavigationUrl();
   return {
     contractVersion: "selected-booking/v1",
     selectionId: String(acquisition.observationId || `selected_booking_${now.toString(36)}`),

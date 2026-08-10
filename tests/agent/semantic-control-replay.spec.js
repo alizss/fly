@@ -118,6 +118,201 @@ async function loadProducer(page, sourcePath = fixturePath) {
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
 }
 
+async function installBootChrome(page, initialStorage = {}, tabId = 42) {
+  await page.evaluate(({ stored, contextTabId }) => {
+    window.__ATW_BOOT_STORAGE__ = { ...stored };
+    window.chrome = {
+      storage: {
+        local: {
+          get: async (keys) => {
+            const requested = Array.isArray(keys) ? keys : [keys];
+            return Object.fromEntries(requested
+              .filter((key) => Object.prototype.hasOwnProperty.call(window.__ATW_BOOT_STORAGE__, key))
+              .map((key) => [key, window.__ATW_BOOT_STORAGE__[key]]));
+          },
+          set: async (values) => {
+            Object.assign(window.__ATW_BOOT_STORAGE__, values || {});
+          },
+          remove: async (keys) => {
+            for (const key of (Array.isArray(keys) ? keys : [keys])) delete window.__ATW_BOOT_STORAGE__[key];
+          }
+        }
+      },
+      runtime: {
+        sendMessage: async (message) => message?.type === "ATW_TAB_CONTEXT"
+          ? { ok: true, tabId: contextTabId, windowId: 1 }
+          : { ok: false }
+      }
+    };
+  }, { stored: initialStorage, contextTabId: tabId });
+}
+
+function bootAppData(travelerId = "trav_boot") {
+  return {
+    workspaces: [{ id: "workspace_boot", name: "Fly test" }],
+    travelers: [{
+      id: travelerId,
+      first_name: "Ali",
+      last_name: "Example",
+      nationality: "Slovenian",
+      booking_rules: "No paid extras"
+    }],
+    preferences: { selected_traveler_id: travelerId }
+  };
+}
+
+test("idle checkout stays dormant and a user-selected booking survives an airline origin change", async ({ page }) => {
+  const bootstrap = bootAppData("trav_cross_origin_booking");
+  await page.route("https://book.lufthansa.test/**", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `
+        <main>
+          <h1>Select your flight</h1>
+          <section data-origin="LJU" data-destination="FRA" data-departure-date="2026-10-15">LJU → FRA</section>
+          <aside>Booking total 280 EUR</aside>
+          <button id="continue" type="button">Continue</button>
+        </main>`
+    });
+  });
+  await page.route("https://book.lufthansa.test/api/extension/bootstrap", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "access-control-allow-origin": "*" },
+      body: JSON.stringify(bootstrap)
+    });
+  });
+  await page.goto("https://book.lufthansa.test/select?secret=must-not-leave-page#/flight?token=hidden");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://book.lufthansa.test/api",
+    selectedTravelerId: "trav_cross_origin_booking"
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+  await page.waitForFunction(() => document.getElementById("atw-sidebar")?.innerText.includes("Fly is idle until you press Start"));
+
+  const idle = await page.evaluate(() => ({
+    update: window.__ATW_TEST__.pageStateStoreState().lastUpdate,
+    sidebar: document.getElementById("atw-sidebar")?.innerText || ""
+  }));
+  expect(idle.update.mode).toBe("uninitialized");
+  expect(idle.sidebar).toContain("Fly is idle until you press Start");
+
+  await page.evaluate(() => {
+    for (let index = 0; index < 80; index += 1) {
+      document.querySelector("main").setAttribute("data-tick", String(index));
+    }
+  });
+  await page.waitForTimeout(250);
+  expect(await page.evaluate(() => window.__ATW_TEST__.pageStateStoreState().lastUpdate.mode)).toBe("uninitialized");
+
+  await page.locator("#continue").click();
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__.readSelectedBookingAcquisition()));
+  const firstPage = await page.evaluate(() => ({
+    acquisition: window.__ATW_TEST__.readSelectedBookingAcquisition(),
+    storage: { ...window.__ATW_BOOT_STORAGE__ }
+  }));
+  expect(firstPage.acquisition.facts).toMatchObject({
+    itinerary: { segments: [expect.objectContaining({ origin: "LJU", destination: "FRA" })] },
+    totalPrice: { amount: 280, currency: "EUR" }
+  });
+  expect(firstPage.acquisition.sourceUrl).not.toContain("secret=");
+  expect(firstPage.acquisition.sourceUrl).not.toContain("token=");
+  expect(firstPage.storage["atwSelectedBookingAcquisitionV1:42"]).toBeTruthy();
+
+  const laterPage = await page.context().newPage();
+  let laterSessionBody = null;
+  await laterPage.route("https://checkout.lufthansa.test/**", async (route) => {
+    await route.fulfill({ status: 200, contentType: "text/html", body: "<main><h1>Passenger details</h1></main>" });
+  });
+  await laterPage.route("https://checkout.lufthansa.test/api/extension/bootstrap", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "access-control-allow-origin": "*" },
+      body: JSON.stringify(bootstrap)
+    });
+  });
+  await laterPage.route("https://checkout.lufthansa.test/api/agent/session", async (route) => {
+    laterSessionBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "chk_lufthansa_cross_origin" })
+    });
+  });
+  await laterPage.goto("https://checkout.lufthansa.test/passengers?session=sensitive");
+  await laterPage.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(laterPage, {
+    ...firstPage.storage,
+    apiBase: "https://checkout.lufthansa.test/api"
+  }, 42);
+  await laterPage.addScriptTag({ path: contentScriptPath });
+  await laterPage.waitForFunction(() => Boolean(window.__ATW_TEST__));
+  await laterPage.waitForFunction(() => Boolean(window.__ATW_TEST__.readSelectedBookingAcquisition()));
+  const carried = await laterPage.evaluate(() => ({
+    acquisition: window.__ATW_TEST__.readSelectedBookingAcquisition(),
+    update: window.__ATW_TEST__.pageStateStoreState().lastUpdate
+  }));
+  expect(carried.acquisition.facts.totalPrice).toEqual({ amount: 280, currency: "EUR" });
+  expect(carried.update.mode).toBe("uninitialized");
+  const started = await laterPage.evaluate(() => window.__ATW_TEST__.startAgentSession());
+  expect(started).toMatchObject({ id: "chk_lufthansa_cross_origin" });
+  expect(laterSessionBody.selectedBookingContract).toMatchObject({
+    itinerary: { segments: [expect.objectContaining({ origin: "LJU", destination: "FRA" })] },
+    approvedTotal: { amount: 280, currency: "EUR" },
+    travelerIds: ["trav_cross_origin_booking"]
+  });
+  await laterPage.close();
+});
+
+test("a resume marker from another tab cannot activate observation", async ({ page }) => {
+  await page.route("https://resume-scope.test/**", async (route) => {
+    await route.fulfill({ status: 200, contentType: "text/html", body: "<main><h1>Passenger details</h1></main>" });
+  });
+  await page.route("https://resume-scope.test/api/extension/bootstrap", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      headers: { "access-control-allow-origin": "*" },
+      body: JSON.stringify(bootAppData("trav_scoped_resume"))
+    });
+  });
+  await page.goto("https://resume-scope.test/passengers");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://resume-scope.test/api",
+    selectedTravelerId: "trav_scoped_resume",
+    atwAgentResume: {
+      tabContextId: "99",
+      travelerId: "trav_scoped_resume",
+      sessionId: "chk_wrong_tab",
+      savedAt: Date.now()
+    }
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+  await page.waitForFunction(() => !window.__ATW_BOOT_STORAGE__.atwAgentResume);
+  const state = await page.evaluate(() => ({
+    update: window.__ATW_TEST__.pageStateStoreState().lastUpdate,
+    marker: window.__ATW_BOOT_STORAGE__.atwAgentResume || null
+  }));
+  expect(state.update.mode).toBe("uninitialized");
+  expect(state.marker).toBeNull();
+});
+
 test("pre-session selected-booking capture backs off on an unchanged incomplete surface", async ({ page }) => {
   await loadProducer(page);
   await page.evaluate(() => {

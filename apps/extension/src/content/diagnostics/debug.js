@@ -1,3 +1,5 @@
+import { currentNavigationUrl } from "../navigation-identity.js";
+
 export function createDebugDiagnostics({
   addAgentMessage,
   agent,
@@ -11,7 +13,7 @@ export function createDebugDiagnostics({
     const map = agent.pageMap || buildPageMap();
     return {
       captured_at: new Date().toISOString(),
-      url: location.href,
+      url: currentNavigationUrl(),
       host: location.host,
       traveler: traveler() ? [traveler().first_name, traveler().last_name].filter(Boolean).join(" ") : "",
       agent_state: {

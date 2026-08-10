@@ -3,6 +3,7 @@ import {
   approvedSelectedBookingAcquisitionFromMap,
   authoritativeSelectedBookingFacts
 } from "./selected-booking.js";
+import { currentNavigationUrl } from "./navigation-identity.js";
 
 const SELECTED_BOOKING_KEY = "atwSelectedBookingAcquisitionV1";
 const UNCHANGED_RETRY_MS = 30_000;
@@ -10,6 +11,9 @@ const START_ACQUISITION_TIMEOUT_MS = 10_000;
 const START_MUTATION_SETTLE_MS = 180;
 
 export function createSelectedBookingAcquisition({
+  durableClear = async () => undefined,
+  durableRead = async () => null,
+  durableWrite = async () => undefined,
   isSessionActive,
   observationHashForMap,
   pageStateStore,
@@ -18,23 +22,31 @@ export function createSelectedBookingAcquisition({
 }) {
   let captureTimer = null;
   let pendingStartAcquisition = null;
+  let durableAcquisition = null;
+  let durableHydrated = false;
+  let selectionCaptureArmed = false;
   let captureAttempt = {
     url: "",
     snapshotHash: "",
     retryAfter: 0
   };
 
+  function validAcquisition(acquisition = null, { requireCurrentOrigin = false } = {}) {
+    const capturedAt = Date.parse(acquisition?.capturedAt || "");
+    return Boolean(
+      acquisition?.contractVersion === "selected-booking-acquisition/v1"
+      && (!requireCurrentOrigin || acquisition.sourceOrigin === location.origin)
+      && Number.isFinite(capturedAt)
+      && Date.now() - capturedAt <= SELECTED_BOOKING_MAX_AGE_MS
+      && authoritativeSelectedBookingFacts(acquisition.facts)
+    );
+  }
+
   function read() {
+    if (validAcquisition(durableAcquisition)) return durableAcquisition;
     try {
       const acquisition = JSON.parse(sessionStorage.getItem(SELECTED_BOOKING_KEY) || "null");
-      const capturedAt = Date.parse(acquisition?.capturedAt || "");
-      if (
-        acquisition?.contractVersion !== "selected-booking-acquisition/v1"
-        || acquisition.sourceOrigin !== location.origin
-        || !Number.isFinite(capturedAt)
-        || Date.now() - capturedAt > SELECTED_BOOKING_MAX_AGE_MS
-        || !authoritativeSelectedBookingFacts(acquisition.facts)
-      ) {
+      if (!validAcquisition(acquisition, { requireCurrentOrigin: true })) {
         sessionStorage.removeItem(SELECTED_BOOKING_KEY);
         return null;
       }
@@ -44,13 +56,36 @@ export function createSelectedBookingAcquisition({
     }
   }
 
+  async function hydrate() {
+    if (durableHydrated) return read();
+    durableHydrated = true;
+    try {
+      const acquisition = await durableRead();
+      if (validAcquisition(acquisition)) {
+        durableAcquisition = acquisition;
+        try {
+          sessionStorage.setItem(SELECTED_BOOKING_KEY, JSON.stringify(acquisition));
+        } catch (error) {
+          // Cross-origin durable storage is authoritative when sessionStorage is unavailable.
+        }
+      } else if (acquisition) {
+        await durableClear();
+      }
+    } catch (error) {
+      // A storage outage must not prevent bounded visible-page acquisition.
+    }
+    return read();
+  }
+
   function persist(acquisition = null) {
     if (!acquisition) return null;
+    durableAcquisition = acquisition;
     try {
       sessionStorage.setItem(SELECTED_BOOKING_KEY, JSON.stringify(acquisition));
     } catch (error) {
       // Opaque documents may deny sessionStorage; the in-memory result remains valid.
     }
+    Promise.resolve(durableWrite(acquisition)).catch(() => undefined);
     return acquisition;
   }
 
@@ -64,19 +99,19 @@ export function createSelectedBookingAcquisition({
       contractVersion: "selected-booking-acquisition/v1",
       capturedAt: new Date().toISOString(),
       sourceOrigin: location.origin,
-      sourceUrl: location.href,
+      sourceUrl: currentNavigationUrl(),
       observationId: `booking_capture_${Date.now().toString(36)}`,
       facts
     };
     return persist(acquisition);
   }
 
-  function approveVisibleSummary(map = null) {
+  function approveVisibleSummary(map = null, approvalSource = "explicit_agent_start") {
     const observationHash = String(observationHashForMap(map) || "");
     return persist(approvedSelectedBookingAcquisitionFromMap(map, {
-      approvalSource: "explicit_agent_start",
+      approvalSource,
       observationHash,
-      sourceUrl: location.href
+      sourceUrl: currentNavigationUrl()
     }));
   }
 
@@ -89,6 +124,7 @@ export function createSelectedBookingAcquisition({
     timeoutMs = START_ACQUISITION_TIMEOUT_MS,
     mutationSettleMs = START_MUTATION_SETTLE_MS
   } = {}) {
+    await hydrate();
     const immediate = acquisitionFromMap(initialMap || pageStateStore.current());
     if (immediate) return immediate;
     if (pendingStartAcquisition) return pendingStartAcquisition.promise;
@@ -173,9 +209,53 @@ export function createSelectedBookingAcquisition({
     return promise;
   }
 
+  function potentialBookingCommitTarget(target = null) {
+    const owner = target?.closest?.("a, button, [role='button'], [role='radio'], [role='option']");
+    if (!owner || owner.closest?.("#atw-sidebar")) return null;
+    const copy = [
+      owner.innerText,
+      owner.textContent,
+      owner.getAttribute?.("aria-label"),
+      owner.getAttribute?.("title"),
+      owner.id,
+      owner.getAttribute?.("name"),
+      owner.getAttribute?.("data-testid")
+    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 600);
+    return /\b(?:select|choose|continue|proceed|confirm|book|fare|flight|next)\b/i.test(copy)
+      ? owner
+      : null;
+  }
+
+  function onPotentialBookingCommit(event) {
+    if (isSessionActive() || !potentialBookingCommitTarget(event.target)) return;
+    queueMicrotask(() => {
+      if (isSessionActive()) return;
+      const observed = pageStateStore.observe({
+        forceFull: true,
+        reason: "selected_booking_user_commit"
+      });
+      capture(observed.map) || approveVisibleSummary(observed.map, "explicit_flight_selection");
+    });
+  }
+
+  function armSelectionCapture() {
+    if (selectionCaptureArmed) return false;
+    selectionCaptureArmed = true;
+    document.addEventListener("click", onPotentialBookingCommit, false);
+    return true;
+  }
+
+  function disarmSelectionCapture() {
+    if (!selectionCaptureArmed) return false;
+    selectionCaptureArmed = false;
+    document.removeEventListener("click", onPotentialBookingCommit, false);
+    return true;
+  }
+
   function schedule(reason = "page_update") {
     if (isSessionActive() || captureTimer) return false;
-    if (captureAttempt.url === location.href && Date.now() < captureAttempt.retryAfter) return false;
+    const currentUrl = currentNavigationUrl();
+    if (captureAttempt.url === currentUrl && Date.now() < captureAttempt.retryAfter) return false;
     captureTimer = setTimeout(() => {
       captureTimer = null;
       if (isSessionActive()) return;
@@ -183,11 +263,11 @@ export function createSelectedBookingAcquisition({
       const captured = capture(observed.map);
       const snapshotHash = String(observed.snapshotHash || observationHashForMap(observed.map));
       const unchangedMiss = !captured
-        && captureAttempt.url === location.href
+        && captureAttempt.url === currentNavigationUrl()
         && captureAttempt.snapshotHash === snapshotHash
         && observed.material === false;
       captureAttempt = {
-        url: location.href,
+        url: currentNavigationUrl(),
         snapshotHash,
         retryAfter: captured
           ? Number.POSITIVE_INFINITY
@@ -211,5 +291,15 @@ export function createSelectedBookingAcquisition({
     return cancelled;
   }
 
-  return Object.freeze({ acquireForStart, approveVisibleSummary, capture, read, schedule, cancel });
+  return Object.freeze({
+    acquireForStart,
+    approveVisibleSummary,
+    armSelectionCapture,
+    cancel,
+    capture,
+    disarmSelectionCapture,
+    hydrate,
+    read,
+    schedule
+  });
 }
