@@ -37,6 +37,10 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Scalar/combined text and email fields | ✅ | Expand live structural portfolio |
 | Split names, DOB, phone, and documents | ✅ | Adult-plus-child and additional document families |
 | Native/custom selects and autocomplete | ✅ | Transfer to more localized widgets |
+| Placeholder/sentinel commitment (`-1`, prompt options, punctuation placeholders) | ❌ Croatia discovery | Shared deterministic contract and cross-site replay required |
+| Phone representation codec (combined international vs split prefix/local) | ❌ Croatia discovery | Croatia combined-field repair; retain Turkish and GoToGate split/custom-prefix behavior |
+| Validation ownership and exact-field repair | ❌ Croatia discovery | Attribute section-level invalid-phone evidence to the rendered native-invalid owner and reopen it |
+| Grounded Semantic Scene Reconciliation | ⏳ | Add only after deterministic Croatia contracts; zero calls for known scenes, one closed-ID call for true ambiguity |
 | Logical identity across framework rerender | ✅ | Continue live confirmation across new frameworks |
 | Active-surface and dormant-branch ownership | ✅ | New modal/drawer implementations |
 | Repeated passenger/leg decision ownership | ✅ | Multi-traveler live matrix |
@@ -81,7 +85,7 @@ Test structures deliberately. A primary site discovers a universal defect; a con
 | 1 | European low-cost direct | EasyJet | Ryanair or Wizz Air | 🟡 | Run confirmation-site controlled baseline |
 | 1 | United States network direct | American or United | The other | ⏳ | Test address/contact conventions |
 | 1 | Long-haul international direct | Emirates or Qatar | The other | ⏳ | Test nationality/document structure |
-| 1 | Regional direct | Croatia Airlines | Select after primary | ⏳ | Restart from controlled selected-booking baseline |
+| 1 | Regional direct | Croatia Airlines | Select after primary | ❌ | Repair title sentinel, combined phone format, validation ownership, and optional emergency-contact separation; rerun controlled baseline |
 | 1 | Third structurally different OTA | Trip.com or eDreams/Opodo | Select after primary | ⏳ | Choose by observed structure, not brand count |
 | 2 | Asian/localized direct | Singapore or Korean Air | The other | ⏳ | Begin after Wave 1 stability |
 
@@ -121,6 +125,9 @@ A site/scenario is accepted only when all applicable checks pass:
 
 - [ ] Complete approved starting itinerary, traveler, currency, and total.
 - [ ] Required known profile facts are filled and verified.
+- [ ] Prompt/sentinel select values are unresolved until an exact non-placeholder option commits.
+- [ ] Phone values follow the observed field representation contract; combined international fields include the saved country code while split fields preserve separate components.
+- [ ] Fresh validation reopens its exact active owner before optional or unrelated fields can become work.
 - [ ] Optional/dormant controls do not block progress.
 - [ ] Reversible decisions match explicit policy.
 - [ ] Unauthorized paid selections are absent or exactly corrected.
@@ -174,6 +181,8 @@ controlled live run
 ```
 
 Never add an airline end-to-end workflow because a normal textbox, dropdown, layout, or DOM owner is unfamiliar.
+
+For semantic uncertainty, the replay must additionally prove whether the deterministic fast path or Semantic Scene Reconciliation ran. A known fixture must use zero model calls. An ambiguous fixture may use at most one call and must accept only supplied fresh evidence/control IDs; the resulting hypothesis remains non-authoritative until deterministic reconciliation publishes the final `DecisionFrame`.
 
 ## 12. Update rule
 
