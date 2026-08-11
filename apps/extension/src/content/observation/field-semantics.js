@@ -59,7 +59,7 @@ export function profileFieldTypesFromText(value = "", { editable = true } = {}) 
   if (countryPhoneCode) add("phone_country_code");
   else if (editable && /(?:^|\s)(?:phone|telephone|mobile)(?:\s|$)/.test(evidence)
     && !/(?:plan|bundle|package|insurance|addon|add on|emergency|sos)/.test(evidence)) add("phone");
-  if (/(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(evidence)) add("title");
-  if (/(?:^|\s)(?:gender|sex)(?:\s|$)/.test(evidence)) add("gender");
+  if (/\b(?:title|salutation|honorific)\b/.test(evidence)) add("title");
+  if (/\b(?:gender|sex)\b/.test(evidence)) add("gender");
   return matches;
 }

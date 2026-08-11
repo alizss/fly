@@ -54,7 +54,7 @@ test("known deterministic profile scenes do not request semantic reconciliation"
 });
 
 test("uncertain required controls and unowned validation produce a closed hypothesis surface", () => {
-  const unknown = control();
+  const unknown = control({ semantic: "choice" });
   const scene = semanticSceneUncertainty({
     observation: observation([unknown], [{
       issueId: "validation_1",

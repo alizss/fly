@@ -16,8 +16,8 @@
     <form id="passenger-form">
       <section aria-labelledby="passenger-heading">
         <h2 id="passenger-heading">Adult passenger</h2>
-        <label for="Title">Title *</label>
-        <select id="Title" name="Title" required>
+        <label for="IDEN_TitleCode">Title: *</label>
+        <select id="IDEN_TitleCode" name="IDEN_TitleCode" required>
           <option value="-1" selected>---</option>
           <option value="MR">Mr</option>
           <option value="MRS">Mrs</option>
@@ -63,7 +63,7 @@
   <script>
     (() => {
       const form = document.getElementById("passenger-form");
-      const title = document.getElementById("Title");
+      const title = document.getElementById("IDEN_TitleCode");
       const phone = document.getElementById("PhoneHome");
       const error = document.getElementById("phone-error");
       const submit = document.getElementById("Continue");

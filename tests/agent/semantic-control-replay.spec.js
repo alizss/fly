@@ -2258,7 +2258,7 @@ test("split state and actuator nodes compile into one owned traveler-title decis
   expect(ms, JSON.stringify(titleControls, null, 2)).toBeTruthy();
   expect(mr?.fieldClassification).toMatchObject({
     fieldType: "title",
-    source: "owned_exclusive_option_set"
+    source: "control_attribute"
   });
   expect(mr?.choiceContract).toMatchObject({ ownershipComplete: true, optionCount: 2 });
   expect(ms?.choiceContract).toMatchObject({ ownershipComplete: true, optionCount: 2 });
@@ -2369,7 +2369,7 @@ test("Croatia-style title, combined phone, and validation compile through the un
     "obs_croatia_title_selected"
   );
   expect(titleSelected.verification.ok, JSON.stringify(titleSelected.verification)).toBe(true);
-  expect(await page.locator("#Title").inputValue()).toBe("MR");
+  expect(await page.locator("#IDEN_TitleCode").inputValue()).toBe("MR");
 
   await page.locator("#FirstName").fill(traveler.first_name);
   await page.locator("#LastName").fill(traveler.last_name);
@@ -2404,12 +2404,27 @@ test("Croatia-style title, combined phone, and validation compile through the un
   expect(await page.locator("#SosPhone").inputValue()).toBe("");
   expect(await page.locator("#Continue").isEnabled()).toBe(true);
 
+  await page.locator("#Continue").scrollIntoViewIfNeeded();
   const settled = await browserObservation(page, "obs_croatia_settled");
   settled.page.step = "traveler_information";
   expect(fieldDescriptors(settled, traveler).filter((descriptor) => (
     ["emergency_contact_name", "emergency_contact_phone"].includes(descriptor.semanticType)
     && descriptor.requiresResolution
   ))).toEqual([]);
+  const settledGoal = deriveObservationGoal(settled, []);
+  const settledCandidates = buildCurrentCandidateSet({
+    goal: settledGoal,
+    observation: settled,
+    state: { taskState: { currentGoal: settledGoal }, approvals: {} }
+  });
+  expect(settledCandidates.candidates).toHaveLength(1);
+  expect(settledCandidates.candidates[0]).toMatchObject({
+    intent: "navigate_stage",
+    operation: "activate"
+  });
+  expect(settled.page.controls.find((control) => (
+    control.controlId === settledCandidates.candidates[0].controlId
+  ))?.label).toBe("Continue");
 });
 
 test("stage advancement prefers governed browser-level pointer input", async ({ page }) => {

@@ -773,6 +773,7 @@ test("raw machine semantics outrank a broad passenger group and DOB owns only it
 
   assert.equal(normalizeProfileFieldType("passengers.0.nationality"), "nationality");
   assert.equal(normalizeProfileFieldType("passengers.0.title"), "title");
+  assert.equal(normalizeProfileFieldType("IDEN_TitleCode"), "title");
   assert.equal(normalizeProfileFieldType("passengers.0.idNumber"), "document_number");
   assert.equal(normalizeProfileFieldType("passengers.0.birthDay"), "date_of_birth");
   assert.equal(semanticTypeForControl(rawControls[0], page.fields[0]), "nationality");

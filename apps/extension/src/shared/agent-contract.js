@@ -192,7 +192,7 @@
     INACTIVE: "inactive"
   });
   const PROFILE_FIELD_ALIAS_GROUPS = Object.freeze({
-    title: ["title", "traveler_title", "traveller_title", "salutation", "gender_title", "honorific"],
+    title: ["title", "title_code", "titlecode", "traveler_title", "traveller_title", "salutation", "gender_title", "honorific"],
     gender: ["gender", "sex"],
     first_name: ["first_name", "firstname", "given_name", "forename"],
     given_names: ["given_names", "first_middle_name", "first_and_middle_name", "forenames"],
@@ -302,6 +302,7 @@
     if (/(?:passport|document|id)_(?:issue|issued)_(?:day|month|year)/.test(normalized)) return "document_issue_date";
     if (/^(?:passport_)?nationality$|^country_of_citizenship$/.test(withoutSubject)) return "nationality";
     if (/^(?:travell?er_)?title$|^salutation$|^gender_title$/.test(withoutSubject)) return "title";
+    if (/(?:^|_)(?:title|salutation|honorific)(?:_?code)?(?:_|$)/.test(normalized)) return "title";
     if (/^(?:passport_)?id_number$|^travel_document_(?:number|no)$/.test(withoutSubject)) {
       return withoutSubject.startsWith("passport") ? "passport_number" : "document_number";
     }

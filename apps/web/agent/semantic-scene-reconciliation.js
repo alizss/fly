@@ -51,7 +51,14 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
     ].join(" ")).toLowerCase();
     if (control.globalChrome || FORBIDDEN.test(text)) return false;
     const semantic = clean(control.fieldType || control.semantic).toLowerCase();
-    const unknown = !semantic || semantic === "unknown";
+    const unknown = !semantic || [
+      "unknown",
+      "choice",
+      "field",
+      "value_field",
+      "input",
+      "control"
+    ].includes(semantic);
     const ambiguous = Boolean(control.fieldClassification?.ambiguity);
     const ownsValidation = validationIssues.some((issue) => issue.controlId === control.controlId);
     const required = control.required === true || control.state?.required === true;
