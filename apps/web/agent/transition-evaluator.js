@@ -44,8 +44,10 @@ function controlValue(control = {}) {
 }
 
 function selected(control = {}) {
-  const state = control.state || control.controlState || {};
-  return Boolean(control.selected || state.selected || state.checked);
+  return agentContract.controlSelectionCommitted({
+    ...control,
+    state: control.state || control.controlState || {}
+  });
 }
 
 function surfaceOf(page = {}) {
@@ -108,10 +110,7 @@ function groupHasPaidSelection(group = {}, page = {}) {
     decisionGroupId: group.decisionGroupId || group.requirementId,
     selectedControlId,
     selectionOwnerId: evidence.ownerElementId || group.semanticOwnership?.ownerElementId,
-    selected: evidence.selected === true
-      || selectedControl.selected === true
-      || selectedControl.state?.selected === true
-      || selectedControl.state?.checked === true,
+    selected: evidence.selected === true || agentContract.controlSelectionCommitted(selectedControl),
     effectRole: evidence.effectRole || selectedControl.effectRole,
     disposition: evidence.disposition,
     priceAmount: evidence.structuredPrice?.amount ?? selectedControl.structuredPrice?.amount,
@@ -872,6 +871,17 @@ function evaluatePostcondition(
       }
     };
   }
+  if (type === "payment_entry_reached") {
+    const boundary = String(afterPage.terminalEvidence?.boundary || "");
+    const satisfied = ["PAYMENT_ENTRY", "PURCHASE_COMMIT"].includes(boundary);
+    return { type, satisfied, evidence: { boundary, terminalEvidence: afterPage.terminalEvidence || null } };
+  }
+  if (type === "legal_attestation_accepted") {
+    const control = controlById(afterPage, expected.controlId || action.controlId || "");
+    const state = control?.state || {};
+    const satisfied = Boolean(control && (control.selected === true || state.checked === true || state.selected === true));
+    return { type, satisfied, evidence: { controlId: control?.controlId || "", selected: satisfied, authorizationId: expected.authorizationId || "" } };
+  }
   if (type === "checkout_stage_advanced") {
     const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
     const advanced = !currentSurfaceIsSiteFailure(afterPage) && Boolean(
@@ -916,6 +926,12 @@ function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}) {
   }
   if (postcondition.satisfied && postcondition.type === "control_selected") {
     return { effect: predictedEffect === "select_paid_option" ? "select_paid_option" : predictedEffect, verified: true, evidence: postcondition.evidence };
+  }
+  if (postcondition.satisfied && postcondition.type === "legal_attestation_accepted") {
+    return { effect: "accept_legal_terms", verified: true, evidence: postcondition.evidence };
+  }
+  if (postcondition.satisfied && postcondition.type === "payment_entry_reached") {
+    return { effect: "advance_to_payment", verified: true, evidence: postcondition.evidence };
   }
   if (postcondition.satisfied && ["normalized_value_changed", "logical_component_committed", "field_value_changed", "date_value_committed"].includes(postcondition.type)) {
     return { effect: predictedEffect === "enter_payment_credentials" ? "enter_payment_credentials" : "set_field_value", verified: true, evidence: postcondition.evidence };
@@ -969,12 +985,15 @@ function blockerFrom(afterObservation = {}, diff = {}) {
 }
 
 function parentProgressFor(action = {}, afterObservation = {}, localEffect = {}, diff = {}) {
+  const afterPage = pageOf(afterObservation);
   const task = action.affordance?.task || {};
   const contract = task.parentOutcomeContract || task.outcomeContract || {};
   const outcomeId = task.stageOutcomeId || contract.outcomeId || task.transactionOutcomeId || "";
   const taskOutcome = contract.taskOutcome || "";
   const observedStage = decideStage(afterObservation).stage;
-  const completed = taskOutcome === "payment_review_reached"
+  const completed = taskOutcome === "payment_entry_reached"
+    ? ["PAYMENT_ENTRY", "PURCHASE_COMMIT"].includes(afterPage.terminalEvidence?.boundary)
+    : taskOutcome === "payment_review_reached"
     ? observedStage === "payment"
     : taskOutcome === "booking_confirmed"
       ? observedStage === "confirmation"

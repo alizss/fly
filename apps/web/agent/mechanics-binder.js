@@ -342,6 +342,8 @@ function bindCandidateEnvelope(candidate = {}, index, observation = {}, binding 
 // new checkout objective or consequence policy from labels/DOM shape.
 function localMechanicalEffect(goal = {}, candidate = {}, control = {}) {
   const operation = candidateOperation(candidate);
+  if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE) return "accept_legal_terms";
+  if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT) return "advance_to_payment";
   if (obligationField(goal, "kind") === "profile_field" && control.role === "editable_combobox"
     && ["type", "keyboard"].includes(operation)) return "filter_options";
   const observedSemanticEffect = agentContract.canonicalSemanticEffect(control.semantic || "");
@@ -353,6 +355,8 @@ function localMechanicalEffect(goal = {}, candidate = {}, control = {}) {
       "dismiss_surface",
       "open_surface",
       "advance_checkout_stage",
+      "advance_to_payment",
+      "accept_legal_terms",
       agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION,
       "set_field_value"
     ].includes(observedSemanticEffect)
@@ -451,6 +455,19 @@ function buildCurrentCandidateSet({
       surfaceId: binding.surfaceId || "",
       mustNotIncreasePrice: true
     } : null;
+    const obligationEffect = obligationField(goal, "semanticEffect");
+    // These two consequential boundaries are deliberately compiled by
+    // TaskState as exact, transaction-bound contracts.  Mechanics may bind
+    // the admitted actuator, but must not replace the contract with a generic
+    // checkbox-selected or checkout-advanced outcome.  The governor needs the
+    // authorization identity for legal acceptance, and verification needs the
+    // actual payment-entry postcondition for the following navigation.
+    const authoritativeBoundaryOutcome = [
+      agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE,
+      agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT
+    ].includes(obligationEffect)
+      ? goalComponentOutcome
+      : null;
     const exactComponentExpectedOutcome = editableProfileQuery ? {
       ...(bound.expectedOutcome || {}),
       type: "semantic_progress",
@@ -485,7 +502,7 @@ function buildCurrentCandidateSet({
       surfaceId: binding.surfaceId || "",
       requireSurfaceDismissed: true,
       mustNotIncreasePrice: true
-    } : (bound.expectedOutcome || boundedInteractionOutcome);
+    } : (authoritativeBoundaryOutcome || bound.expectedOutcome || boundedInteractionOutcome);
     const compiledExpectedOutcome = compileTypedExpectedOutcome({
       ...bound,
       expectedOutcome: exactComponentExpectedOutcome,
@@ -538,7 +555,11 @@ function buildCurrentCandidateSet({
       obligation
       )
         && (obligationField(goal, "kind") !== "adaptive_surface" || adaptiveScore >= 70),
-      requiresApproval: exactProfileOption ? false : Boolean(bound.requiresApproval),
+      requiresApproval: exactProfileOption
+        || obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE
+        || obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT
+        ? false
+        : Boolean(bound.requiresApproval),
       expectedOutcome,
       localMechanicalPostcondition: expectedOutcome,
       obligationSuccessCondition: outcomeContract,
@@ -558,7 +579,11 @@ function buildCurrentCandidateSet({
       // Exact profile agreement is deterministic even when its actuator still
       // needs viewport recovery. Visibility is a mechanical condition, not a
       // reason to ask AI to reinterpret an already-known value.
-      risk: adaptiveExactMatch || adaptiveDeterministicFilter || exactProfileOption || obligationField(goal, "kind") === "adaptive_interaction"
+      risk: obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE
+        ? "legal"
+        : obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT
+          ? "safe"
+          : adaptiveExactMatch || adaptiveDeterministicFilter || exactProfileOption || obligationField(goal, "kind") === "adaptive_interaction"
         ? "safe"
         : (bound.risk || (obligationField(goal, "kind") === "profile_field" ? "safe" : "uncertain")),
       requiresJudgment: adaptiveExactMatch || adaptiveDeterministicFilter || exactProfileOption

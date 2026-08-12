@@ -1,5 +1,6 @@
 const { controlBelongsToCurrentSurface } = require("../surface-contract");
 const { controlHasExecutableCapability } = require("./control-evidence");
+const agentContract = require("../../../extension/src/shared/agent-contract");
 
 function clean(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -10,7 +11,6 @@ function lower(value = "") {
 }
 
 function terminalForStage(stage = "unknown") {
-  if (stage === "payment") return "payment_review_reached";
   if (stage === "confirmation") return "confirmation_reached";
   return "active";
 }
@@ -85,9 +85,14 @@ function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence =
   // A lone hidden CVV/card field is not a payment-review boundary. Require
   // either mutually reinforcing payment-stage evidence or an owned final
   // envelope together with the actual commit and payment-method controls.
-  const observed = Boolean(
-    stageDecisionEvidence.terminalEvidence?.boundaryObserved === true
-    || verifiedPaymentStage
+  const terminalEvidence = stageDecisionEvidence.terminalEvidence || page.terminalEvidence || {};
+  const declaredBoundary = Object.values(agentContract.CHECKOUT_BOUNDARY).includes(terminalEvidence.boundary)
+    ? terminalEvidence.boundary
+    : terminalEvidence.boundaryObserved === true
+      ? agentContract.CHECKOUT_BOUNDARY.PAYMENT_ENTRY
+      : agentContract.CHECKOUT_BOUNDARY.UNKNOWN;
+  const fallbackPaymentEntry = Boolean(
+    verifiedPaymentStage
     || strongStageEvidence
     || (
       hasReviewEnvelope
@@ -95,14 +100,46 @@ function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence =
       && (paymentMethodControlIds.length || paymentCredentialControlIds.length)
     )
   );
+  const boundary = declaredBoundary !== agentContract.CHECKOUT_BOUNDARY.UNKNOWN
+    ? declaredBoundary
+    : fallbackPaymentEntry
+      ? agentContract.CHECKOUT_BOUNDARY.PAYMENT_ENTRY
+      : agentContract.CHECKOUT_BOUNDARY.UNKNOWN;
+  const paymentEntry = [
+    agentContract.CHECKOUT_BOUNDARY.PAYMENT_ENTRY,
+    agentContract.CHECKOUT_BOUNDARY.PURCHASE_COMMIT
+  ].includes(boundary);
+  const legalGate = boundary === agentContract.CHECKOUT_BOUNDARY.LEGAL_GATE;
+  const prePaymentReview = boundary === agentContract.CHECKOUT_BOUNDARY.PRE_PAYMENT_REVIEW;
+  const observed = boundary !== agentContract.CHECKOUT_BOUNDARY.UNKNOWN;
+  const canonicalIdsForObservedElements = (ids = []) => {
+    const wanted = new Set(ids.map(clean).filter(Boolean));
+    if (!wanted.size) return [];
+    return controls.filter((control) => (
+      wanted.has(clean(control.controlId))
+      || wanted.has(clean(control.stateElementId))
+      || wanted.has(clean(control.preferredActivationElementId))
+      || (control.actuators || []).some((actuator) => wanted.has(clean(actuator.nodeId)))
+    )).map((control) => control.controlId);
+  };
+  const legalAcceptanceControlIds = canonicalIdsForObservedElements(terminalEvidence.legalAcceptanceControlIds || []);
+  const advanceToPaymentControlIds = canonicalIdsForObservedElements(terminalEvidence.advanceToPaymentControlIds || []);
   return Object.freeze({
     observed,
-    terminalEvidence: stageDecisionEvidence.terminalEvidence || null,
+    boundary,
+    paymentEntry,
+    purchaseCommit: boundary === agentContract.CHECKOUT_BOUNDARY.PURCHASE_COMMIT,
+    legalGate,
+    prePaymentReview,
+    terminalEvidence,
     reviewContext,
     hasReviewEnvelope,
     payControlIds: Object.freeze(payControlIds),
     paymentMethodControlIds: Object.freeze(paymentMethodControlIds),
     paymentCredentialControlIds: Object.freeze(paymentCredentialControlIds),
+    legalAcceptanceControlIds: Object.freeze(legalAcceptanceControlIds),
+    legalAcceptanceText: clean(terminalEvidence.legalAcceptanceText || ""),
+    advanceToPaymentControlIds: Object.freeze(advanceToPaymentControlIds),
     pendingContactControlIds: Object.freeze(pendingContactControlIds)
   });
 }

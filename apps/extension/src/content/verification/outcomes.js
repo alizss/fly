@@ -198,11 +198,11 @@ export function createOutcomeVerification({
     const beforeControlState = beforeControl?.state || beforeControl?.controlState || {};
     const afterControlState = afterControl?.state || afterControl?.controlState || {};
     const controlChanged = JSON.stringify({
-      selected: Boolean(beforeControl?.selected || beforeControlState.selected || beforeControlState.checked),
+      selected: Boolean(beforeControl?.selected || beforeControlState.selected || beforeControlState.checked || beforeControlState.pressed),
       value: beforeControlState.normalizedValue || beforeControlState.value || "",
       expanded: beforeControlState.expanded
     }) !== JSON.stringify({
-      selected: Boolean(afterControl?.selected || afterControlState.selected || afterControlState.checked),
+      selected: Boolean(afterControl?.selected || afterControlState.selected || afterControlState.checked || afterControlState.pressed),
       value: afterControlState.normalizedValue || afterControlState.value || "",
       expanded: afterControlState.expanded
     });
@@ -846,7 +846,7 @@ export function createOutcomeVerification({
         evidence: { ...evidence, value, control: afterControl || null }
       };
     }
-    if (expected.type === "control_selected") {
+    if (["control_selected", "legal_attestation_accepted"].includes(expected.type)) {
       const expectedSelectedControlId = expected.expectedSelectedControlId || expectedControlId;
       const selectedControlId = afterDecisionGroup?.selectedControlId
         || (afterControl && (afterControl.selected || afterControlState?.checked || afterControlState?.selected) ? afterControl.controlId : "");
@@ -1403,6 +1403,16 @@ export function createOutcomeVerification({
         code: ok ? "CHECKOUT_STAGE_ADVANCED" : "CHECKOUT_STAGE_NOT_ADVANCED",
         message: ok ? "Fresh stage, URL, or progress-marker evidence proves checkout advanced." : "No fresh checkout-stage evidence was observed.",
         evidence: { ...evidence, stepChanged, urlChanged, progressMarkerChanged, overlayAppeared, surfaceChanged }
+      };
+    }
+    if (expected.type === "payment_entry_reached") {
+      const boundary = String(afterMap.terminalEvidence?.boundary || "");
+      const ok = ["PAYMENT_ENTRY", "PURCHASE_COMMIT"].includes(boundary);
+      return {
+        ok,
+        code: ok ? "PAYMENT_ENTRY_REACHED" : "PAYMENT_ENTRY_NOT_REACHED",
+        message: ok ? "Actual payment entry is now visible." : "The checkout has not yet exposed an owned payment-entry component.",
+        evidence: { ...evidence, boundary, terminalEvidence: afterMap.terminalEvidence || null }
       };
     }
     if (expected.type === "stage_exit_or_feedback") {

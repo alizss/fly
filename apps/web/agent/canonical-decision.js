@@ -2,6 +2,7 @@
 
 const { resolveProfileDecision } = require("./policy-profile");
 const agentContract = require("../../extension/src/shared/agent-contract");
+const PROFILE_FIELDS = new Set(agentContract.PROFILE_FIELD_TYPES || []);
 
 const CONTROL_TYPES = Object.freeze({
   VALUE_FIELD: "value_field",
@@ -338,7 +339,7 @@ function transitionFor(control = {}, alternative = {}) {
     operation,
     label: clean(alternative.label || control.label),
     canonicalValue: alternative.canonicalValue ?? control.canonicalValue ?? alternative.value ?? control.currentValue ?? clean(alternative.label || control.label),
-    selected: Boolean(control.selected || control.state?.checked || control.state?.selected || alternative.selected),
+    selected: agentContract.controlSelectionCommitted(control, alternative),
     executable: executable(control),
     paid: !nonEconomic && paid(merged),
     price,
@@ -351,7 +352,7 @@ function transitionFor(control = {}, alternative = {}) {
 function selectedControl(group = {}, controls = []) {
   const selectedId = clean(group.selectedControlId);
   const selected = controls.find((control) => control.controlId === selectedId)
-    || controls.find((control) => control.selected || control.state?.checked || control.state?.selected)
+    || controls.find((control) => agentContract.controlSelectionCommitted(control))
     || null;
   if (!selected) return null;
   const observed = clean(
@@ -824,13 +825,20 @@ function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
     });
   }
   if (/field|textbox|input|combobox|select/.test(shape) || control.fieldType || control.field) {
+    const profileSemantic = agentContract.canonicalProfileFieldType(
+      control.fieldType || control.field || control.semantic || ""
+    );
+    // An unknown input is observation evidence, not automatically a traveler
+    // requirement. Semantic Scene Reconciliation or deterministic field
+    // recognition must ground it into the profile ontology first.
+    if (!PROFILE_FIELDS.has(profileSemantic)) return null;
     const value = meaningfulControlValue(control);
     const required = control.required === true || control.state?.required === true;
     return Object.freeze({
       decisionId: `control:${control.controlId}`,
       subject: Object.freeze({
-        key: slug(control.fieldType || control.field || control.semantic || control.controlId),
-        label: clean(control.label || control.fieldType || control.field || "Value field"),
+        key: slug(profileSemantic),
+        label: clean(control.label || profileSemantic || "Value field"),
         family: "profile"
       }),
       controlType: CONTROL_TYPES.VALUE_FIELD,

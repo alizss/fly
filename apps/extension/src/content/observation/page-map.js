@@ -60,17 +60,53 @@ export function createPageMapCompiler(dependencies) {
     visualPageState
   } = dependencies;
 
+  function isCheckboxContextLink(element) {
+    if (!element?.matches?.("a")) return false;
+    const legalCopy = /terms|conditions|privacy|purchase|carriage|restrictions/i;
+    const directLabel = element.closest("label");
+    if (
+      directLabel
+      && directLabel.querySelector("input[type='checkbox'], [role='checkbox']")
+      && legalCopy.test(String(directLabel.innerText || directLabel.textContent || ""))
+    ) return true;
+    let owner = element.parentElement;
+    for (let depth = 0; owner && depth < 3; depth += 1, owner = owner.parentElement) {
+      const ownerText = String(owner.innerText || owner.textContent || "").replace(/\s+/g, " ").trim();
+      if (ownerText.length > 1_000) break;
+      if (
+        legalCopy.test(ownerText)
+        && owner.querySelector("input[type='checkbox'], [role='checkbox']")
+      ) return true;
+    }
+    return false;
+  }
+
   function buildPageMap() {
     beginObservationCompilation();
     const text = primaryPageText();
     const fullText = visiblePageText();
     const sourceActionElements = queryAllDeep("button, a, input[type='button'], input[type='submit'], [role='button'], [role='option'], [role='menuitem'], [role='checkbox'], [role='radio']")
-      .filter((button) => isVisible(button) && !button.closest("#atw-sidebar") && !isPaymentField(button) && !isAuxiliaryNavigationAction(button));
+      .filter((button) => (
+        isVisible(button)
+        && !button.closest("#atw-sidebar")
+        && !isPaymentField(button)
+        && !isAuxiliaryNavigationAction(button)
+        // Legal-document links inside a checkbox label are explanatory
+        // context owned by the checkbox, not competing checkout actuators.
+        && !isCheckboxContextLink(button)
+      ));
     const structuralCollections = discoverStructuralActionCollections(sourceActionElements, `${text} ${fullText.slice(0, 2500)}`);
     const seatInventoryCount = structuralCollections
       .filter((collection) => collection.type === "seat_inventory")
       .reduce((total, collection) => total + collection.members.length, 0);
     const terminalStructure = observeTerminalStructure(fullText);
+    const headingText = queryAllDeep("h1, h2, h3, legend, [role='heading'], [aria-current='step'], [data-current='true'], [data-active='true']")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .map((element) => String(element.innerText || element.textContent || element.getAttribute?.("aria-label") || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 24)
+      .join(" | ")
+      .slice(0, 2_000);
     const terminalEvidence = agentContract?.compileTerminalEvidence?.({
       url: currentNavigationUrl(),
       visibleText: `${text} ${fullText}`,
@@ -258,6 +294,11 @@ export function createPageMapCompiler(dependencies) {
       coverage: pageCoverage(),
       readiness: pageReadinessFacts(),
       terminalEvidence,
+      sceneContext: {
+        primaryText: String(text || "").replace(/\s+/g, " ").trim().slice(0, 3_500),
+        headingText,
+        activeProgressText: String(terminalStructure.activeProgressText || "").replace(/\s+/g, " ").trim().slice(0, 500)
+      },
       fields,
       buttons,
       overlays,

@@ -17,7 +17,8 @@ function controlState(control = {}) {
   const state = control.state || control.controlState || {};
   return {
     label: clean(control.label || control.accessibleName, 180),
-    selected: Boolean(control.selected || state.selected || state.checked),
+    selected: Boolean(control.selected || state.selected || state.checked || state.pressed),
+    pressed: state.pressed === true,
     value: clean(state.normalizedValue || state.value || "", 120),
     expanded: state.expanded === true,
     disabled: Boolean(state.disabled || control.disabled),

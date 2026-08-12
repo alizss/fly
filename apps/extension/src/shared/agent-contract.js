@@ -7,6 +7,13 @@
 
   const CONTRACT_VERSION = "agent-contract/v1";
   const TERMINAL_EVIDENCE_VERSION = "terminal-evidence/v1";
+  const CHECKOUT_BOUNDARY = Object.freeze({
+    UNKNOWN: "UNKNOWN",
+    PRE_PAYMENT_REVIEW: "PRE_PAYMENT_REVIEW",
+    LEGAL_GATE: "LEGAL_GATE",
+    PAYMENT_ENTRY: "PAYMENT_ENTRY",
+    PURCHASE_COMMIT: "PURCHASE_COMMIT"
+  });
   const CAPABILITY_STATUS = Object.freeze({
     PROVEN_EXECUTABLE: "proven_executable",
     RECOVERABLE: "recoverable",
@@ -51,6 +58,10 @@
     REMOVE_PAID_SELECTION: "remove_paid_selection",
     RANDOM_ASSIGNMENT: "random_assignment",
     ADVANCE_CHECKOUT_STAGE: "advance_checkout_stage",
+    ADVANCE_TO_PAYMENT: "advance_to_payment",
+    LEGAL_ACCEPTANCE: "legal_acceptance",
+    LEGAL_ACCEPTANCE_AND_ADVANCE: "legal_acceptance_and_advance",
+    TRANSACTION_COMMIT: "transaction_commit",
     DISMISS_SURFACE: "dismiss_surface",
     SAFE_CHECKOUT_PROGRESS: "safe_checkout_progress",
     UNKNOWN: "unknown"
@@ -68,7 +79,10 @@
     choose_paid_option: SEMANTIC_EFFECT.SELECT_PAID_OPTION,
     selected_paid_extra: SEMANTIC_EFFECT.SELECT_PAID_OPTION,
     advance: SEMANTIC_EFFECT.ADVANCE_CHECKOUT_STAGE,
-    next_stage: SEMANTIC_EFFECT.ADVANCE_CHECKOUT_STAGE
+    next_stage: SEMANTIC_EFFECT.ADVANCE_CHECKOUT_STAGE,
+    continue_to_payment: SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT,
+    accept_legal_terms: SEMANTIC_EFFECT.LEGAL_ACCEPTANCE,
+    submit_purchase: SEMANTIC_EFFECT.TRANSACTION_COMMIT
   });
 
   function canonicalSemanticEffect(value = "") {
@@ -84,6 +98,75 @@
       [SEMANTIC_EFFECT.RANDOM_ASSIGNMENT]: [SEMANTIC_EFFECT.SELECT_FREE_OPTION]
     };
     return (compatible[desired] || []).includes(observed);
+  }
+
+  function normalizedValidationMessage(value = "") {
+    return String(typeof value === "string" ? value : value?.message || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function isNonBlockingValidationSummary(value = "") {
+    const message = normalizedValidationMessage(value).toLowerCase();
+    if (!message) return true;
+    return /(?:^|\b)(?:0|zero)\s+errors?\b/.test(message)
+      || /(?:^|\b)no\s+errors?\b/.test(message)
+      || /(?:^|\b)there (?:is|are) no\s+errors?\b/.test(message);
+  }
+
+  function validationIssueAdmission(issue = {}, context = {}) {
+    const message = normalizedValidationMessage(issue);
+    if (!message || isNonBlockingValidationSummary(message)) {
+      return Object.freeze({ blocking: false, classification: "diagnostic", code: "NON_BLOCKING_SUMMARY" });
+    }
+    const controls = Array.isArray(context.controls) ? context.controls : [];
+    const currentSurface = context.currentSurface || {};
+    const wantedControlId = String(issue.controlId || "").trim();
+    const control = wantedControlId
+      ? controls.find((candidate) => String(candidate?.controlId || "") === wantedControlId) || null
+      : null;
+    const lifecycle = control?.representationLifecycle || {};
+    const rendered = control && lifecycle.status !== "dormant_hidden" && lifecycle.active !== false;
+    const surfaceId = String(control?.surfaceId || "surface-page");
+    const currentSurfaceId = String(currentSurface.id || "surface-page");
+    const currentSurfaceType = String(currentSurface.type || "page");
+    const current = Boolean(control && rendered && (
+      currentSurfaceType === "page"
+        ? surfaceId === "surface-page" || surfaceId === currentSurfaceId
+        : surfaceId === currentSurfaceId
+    ));
+    if (current) {
+      return Object.freeze({ blocking: true, classification: "owned_active_validation", code: "ACTIVE_CONTROL_VALIDATION" });
+    }
+    const exit = context.stageExit || {};
+    const mechanicallyBlocked = exit.continueDisabled === true || exit.navigationState === "disabled";
+    if (issue.stageWide === true && (issue.blockingEvidence === true || mechanicallyBlocked)) {
+      return Object.freeze({ blocking: true, classification: "stage_wide_validation", code: "ACTIVE_STAGE_VALIDATION" });
+    }
+    return Object.freeze({ blocking: false, classification: "diagnostic", code: "UNOWNED_VALIDATION_DIAGNOSTIC" });
+  }
+
+  // One explicit commitment truth for every layer that consumes an observed
+  // choice. `aria-pressed=true` is the native selected state for toggle-style
+  // buttons and must not be lost merely because the control is not a checkbox
+  // or radio. Framework-specific commitment evidence remains admissible only
+  // when the observer has already attributed it to this exact control.
+  function controlSelectionCommitted(control = {}, option = {}) {
+    const state = control.state || control.currentState || {};
+    const selectionEvidence = state.selectionEvidence || control.selectionEvidence || {};
+    return Boolean(
+      option.selected === true
+      || control.selected === true
+      || control.checked === true
+      || control.pressed === true
+      || state.selected === true
+      || state.checked === true
+      || state.pressed === true
+      || selectionEvidence.selected === true
+      || selectionEvidence.checked === true
+      || selectionEvidence.pressed === true
+      || selectionEvidence.committed === true
+    );
   }
 
   const NON_COMMERCE_EFFECT_ROLES = Object.freeze(new Set([
@@ -141,10 +224,11 @@
       || value.selectedEvidence?.ownerElementId
       || ""
     ).trim();
-    const selected = value.selected === true
-      || value.checked === true
-      || value.currentState?.selected === true
-      || value.selectedEvidence?.selected === true;
+    const selected = controlSelectionCommitted({
+      ...value,
+      state: value.currentState || value.state || {},
+      selectionEvidence: value.selectedEvidence || value.selectionEvidence || null
+    });
     const effectRole = commerceToken(
       value.effectRole
       || value.currentState?.effectRole
@@ -351,11 +435,17 @@
     if (supplied?.contractVersion === TERMINAL_EVIDENCE_VERSION) {
       const signals = supplied.signals || {};
       const signalCount = Object.values(signals).filter(Boolean).length;
-      const boundaryObserved = supplied.boundaryObserved === true || supplied.verified === true;
+      const boundary = Object.values(CHECKOUT_BOUNDARY).includes(supplied.boundary)
+        ? supplied.boundary
+        : (supplied.boundaryObserved === true || supplied.verified === true)
+          ? CHECKOUT_BOUNDARY.PAYMENT_ENTRY
+          : CHECKOUT_BOUNDARY.UNKNOWN;
+      const boundaryObserved = [CHECKOUT_BOUNDARY.PAYMENT_ENTRY, CHECKOUT_BOUNDARY.PURCHASE_COMMIT].includes(boundary);
       return Object.freeze({
         ...cloneSerializable(supplied),
         contractVersion: TERMINAL_EVIDENCE_VERSION,
-        stage: boundaryObserved ? "payment_review" : "unknown",
+        stage: boundaryObserved ? "payment_entry" : boundary === CHECKOUT_BOUNDARY.LEGAL_GATE ? "legal_gate" : boundary === CHECKOUT_BOUNDARY.PRE_PAYMENT_REVIEW ? "pre_payment_review" : "unknown",
+        boundary,
         signals: Object.freeze({ ...signals }),
         signalCount,
         boundaryObserved,
@@ -406,11 +496,15 @@
       || credentialKinds.size >= 2;
     const method = structural.paymentMethodPresent === true
       || /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/.test(visible);
-    const commit = structural.payControlPresent === true || isPaymentCommitText(visible);
+    const commit = structural.payControlPresent === true
+      || structural.transactionCommitControlPresent === true
+      || isPaymentCommitText(visible);
     const legal = structural.legalAcceptancePresent === true;
+    const advanceToPayment = Array.isArray(structural.advanceToPaymentControlIds)
+      && structural.advanceToPaymentControlIds.length > 0;
     const review = structural.reviewSummaryPresent === true
-      || (/\b(?:amount\s+to\s+pay|total)\b/.test(visible)
-        && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/.test(visible));
+      || (/\b(?:amount\s+to\s+pay|total(?:\s+to\s+be\s+paid)?)\b/.test(visible)
+        && /\b(?:departure|return|itinerary|travel\s+details|your\s+order|your\s+booking|booking\s+details)\b/.test(visible));
     const heading = structural.paymentHeadingPresent === true
       || /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/.test(visible);
     // Some payment pages hydrate methods/credentials only after the traveler
@@ -432,7 +526,7 @@
     });
     const signalCount = Object.values(signals).filter(Boolean).length;
     const stageAnchor = route || progress || heading;
-    const boundaryObserved = Boolean(
+    const paymentEntryObserved = Boolean(
       (form && (stageAnchor || method || commit))
       || (stageAnchor && method && commit)
       || (route && progress && (method || commit || review))
@@ -442,16 +536,34 @@
       // credential kind is a typed terminal boundary; generic payment copy or
       // a lone card field without review ownership still cannot qualify.
       || (heading && review && credentialKinds.size >= 1)
-      // A final review can intentionally keep payment credentials hidden
-      // until the user accepts terms. Review ownership + legal acceptance +
-      // an exact payment commit control is already the boundary at which Fly
-      // must stop; requiring hydrated card fields here caused the agent to
-      // reinterpret final checkout as an earlier traveler/seat page.
-      || (review && legal && commit)
     );
+    const purchaseCommitObserved = Boolean(paymentEntryObserved && commit);
+    // A booking summary is allowed to remain visible throughout seats and
+    // extras. It is transaction evidence, not proof that the current surface
+    // is the final review. Admit PRE_PAYMENT_REVIEW only when that summary is
+    // tied to a current payment-stage anchor or an exact advance-to-payment
+    // actuator. LEGAL_GATE is independently exact because the attestation is
+    // a current owned blocker.
+    const prePaymentReviewObserved = Boolean(
+      (review && (stageAnchor || advanceToPayment))
+      || (heading && commit)
+    );
+    const boundary = purchaseCommitObserved
+      ? CHECKOUT_BOUNDARY.PURCHASE_COMMIT
+      : paymentEntryObserved
+        ? CHECKOUT_BOUNDARY.PAYMENT_ENTRY
+        : review && legal
+          ? CHECKOUT_BOUNDARY.LEGAL_GATE
+          : prePaymentReviewObserved
+            ? CHECKOUT_BOUNDARY.PRE_PAYMENT_REVIEW
+            : CHECKOUT_BOUNDARY.UNKNOWN;
+    // Compatibility name: boundaryObserved now means the promised product
+    // milestone (actual payment entry), never merely a review/legal page.
+    const boundaryObserved = paymentEntryObserved;
     return Object.freeze({
       contractVersion: TERMINAL_EVIDENCE_VERSION,
-      stage: boundaryObserved ? "payment_review" : "unknown",
+      stage: paymentEntryObserved ? "payment_entry" : boundary === CHECKOUT_BOUNDARY.LEGAL_GATE ? "legal_gate" : boundary === CHECKOUT_BOUNDARY.PRE_PAYMENT_REVIEW ? "pre_payment_review" : "unknown",
+      boundary,
       signals,
       signalCount,
       boundaryObserved,
@@ -460,6 +572,9 @@
       paymentCredentialKinds: Object.freeze([...credentialKinds]),
       signalStates,
       evidenceSources: Object.freeze([...(structural.terminalEvidenceSources || [])]),
+      legalAcceptanceControlIds: Object.freeze([...(structural.legalAcceptanceControlIds || [])]),
+      legalAcceptanceText: normalizedText(structural.legalAcceptanceText || "").slice(0, 1600),
+      advanceToPaymentControlIds: Object.freeze([...(structural.advanceToPaymentControlIds || [])]),
       capabilities: Object.freeze({ paymentActionsAllowed: false })
     });
   }
@@ -680,12 +795,12 @@
       currency: structuredPrice?.currency || "",
       structuredPrice,
       included: option.included === true || structuredPrice?.amount === 0,
-      selected: option.selected === true || control.selected === true || control.state?.checked === true || control.state?.selected === true,
+      selected: controlSelectionCommitted(control, option),
       exactActuator,
       stateProbe: cloneSerializable(option.stateProbe || {
         controlId: text(control.controlId, 160),
         stateElementId: text(control.stateElementId, 160),
-        selected: option.selected === true || control.selected === true || control.state?.checked === true || control.state?.selected === true
+        selected: controlSelectionCommitted(control, option)
       })
     };
   }
@@ -794,7 +909,7 @@
           },
           structuredPrice,
           included: explicitlyIncluded || structuredPrice?.amount === 0,
-          selected: item.control.selected === true || item.control.state?.selected === true || item.control.state?.checked === true,
+          selected: controlSelectionCommitted(item.control),
           exactActuator: exactActuatorFor(item.control),
           stateProbe: {
             controlId: item.control.controlId,
@@ -934,7 +1049,7 @@
           canonicalAttributes: canonicalAttributesFromEvidence(`${surface.label || ""} ${control.label || ""}`),
           structuredPrice: control.structuredPrice || (included ? { amount: 0, currency: "" } : null),
           included,
-          selected: control.selected === true || control.state?.selected === true || control.state?.checked === true,
+          selected: controlSelectionCommitted(control),
           exactActuator: exactActuatorFor(control),
           stateProbe: {
             controlId: control.controlId,
@@ -996,16 +1111,233 @@
     const shape = normalizedText(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`).toLowerCase();
     const requiredEmpty = (control.required === true || control.state?.required === true)
       && control.state?.valuePresent !== true
-      && control.state?.selected !== true
-      && control.state?.checked !== true;
+      && !controlSelectionCommitted(control);
     return requiredEmpty
       || /selection[_ -]?cta/.test(meaning)
       || /radio|option/.test(shape);
   }
 
+  function reconstructSemanticSceneGroups(controls = []) {
+    const classified = controls.filter((control) => {
+      const item = control.semanticSceneItem || {};
+      return item.grounded === true
+        && ["optional_paid_accept", "optional_paid_decline"].includes(item.role)
+        && operationExecutable(control);
+    });
+    const groups = new Map();
+    for (const control of classified) {
+      const related = [...new Set([
+        control.controlId,
+        ...(control.semanticSceneItem?.relatedControlIds || [])
+      ].filter(Boolean))].sort();
+      if (related.length < 2) continue;
+      const key = related.join("|");
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(control);
+    }
+    return [...groups.entries()].flatMap(([key, items]) => {
+      const unique = [...new Map(items.map((control) => [control.controlId, control])).values()];
+      const roles = new Set(unique.map((control) => control.semanticSceneItem?.role));
+      if (!roles.has("optional_paid_accept") || !roles.has("optional_paid_decline")) return [];
+      const requiresResolution = unique.some((control) => (
+        ["html_required", "visually_required", "progression_required"].includes(
+          control.semanticSceneItem?.requiredness
+        )
+      ));
+      const decisionGroupId = `dg_scene_${normalizedKey(key)}`.slice(0, 220);
+      const options = unique.map((control) => {
+        const decline = control.semanticSceneItem?.role === "optional_paid_decline";
+        return normalizeDecisionOption({
+          optionId: normalizedKey(control.label || control.controlId),
+          controlId: control.controlId,
+          label: control.label || control.controlId,
+          structuredPrice: control.structuredPrice || (decline ? { amount: 0, currency: "" } : null),
+          included: decline,
+          selected: controlSelectionCommitted(control),
+          exactActuator: exactActuatorFor(control)
+        }, control);
+      });
+      const label = normalizedText(
+        unique.map((control) => control.label || "").join(" / ")
+      ).slice(0, 240) || "Optional paid product";
+      const decisionContract = normalizeDecisionContract({
+        decisionId: decisionGroupId,
+        decisionGroupId,
+        kind: DECISION_KIND.EXCLUSIVE_CHOICE,
+        subject: "optional_product",
+        subjectLabel: label,
+        required: requiresResolution,
+        requiresResolution,
+        exclusive: true,
+        options,
+        evidence: unique.map((control) => control.semanticSceneItem?.evidence).filter(Boolean),
+        confidence: Math.min(...unique.map((control) => (
+          control.semanticSceneItem?.confidence === "high" ? 0.95 : 0.82
+        )))
+      }, new Map(controls.map((control) => [control.controlId, control])));
+      return [{
+        decisionGroupId,
+        requirementId: `extras:optional_product:${normalizedKey(key)}`,
+        surfaceId: unique[0].surfaceId || "surface-page",
+        surfaceType: unique[0].surfaceType || "page",
+        sectionId: unique[0].sectionId || "",
+        sectionType: "extras",
+        sectionLabel: label,
+        subject: "optional_product",
+        kind: DECISION_KIND.EXCLUSIVE_CHOICE,
+        required: requiresResolution,
+        requiresResolution,
+        material: true,
+        status: decisionContract.currentSelection ? "satisfied" : (requiresResolution ? "missing" : "optional"),
+        selectedControlId: options.find((option) => option.selected)?.controlId || "",
+        selectedLabel: options.find((option) => option.selected)?.label || "",
+        alternatives: options.map((option) => {
+          const control = unique.find((candidate) => candidate.controlId === option.controlId) || {};
+          const decline = control.semanticSceneItem?.role === "optional_paid_decline";
+          return {
+            ...option,
+            targetId: option.exactActuator?.targetId || "",
+            semantic: decline ? "decline_paid_extra" : "add_paid_extra",
+            risk: decline ? "safe_decline" : "money"
+          };
+        }),
+        evidence: decisionContract.evidence,
+        confidence: decisionContract.confidence,
+        decisionContract
+      }];
+    });
+  }
+
+  function normalizeDeterministicSceneControl(control = {}, page = {}) {
+    const primaryLabel = normalizedText(
+      control.label || control.accessibleName || control.name || ""
+    ).toLowerCase();
+    const shape = normalizedText(
+      `${control.kind || ""} ${control.role || ""} ${control.domRole || ""} ${control.inputType || ""}`
+    ).toLowerCase();
+    const description = normalizedText([
+      control.label,
+      control.accessibleName,
+      control.name,
+      control.placeholder,
+      control.accessibleDescription,
+      control.description,
+      control.helperText,
+      control.sectionLabel
+    ].filter(Boolean).join(" ")).toLowerCase();
+    const isTextEntry = /textbox|input|textarea|text|search/.test(shape)
+      && !/checkbox|radio|button|submit|select|combobox/.test(shape);
+    const isCheckbox = /checkbox/.test(shape);
+    const isButton = /button|submit/.test(shape);
+    const legalAttestation = isCheckbox
+      && /\b(?:terms|conditions|privacy|purchase|carriage|restrictions)\b/.test(description)
+      && (
+        /\b(?:agree|accept|confirm|affirm|acknowledge|examined|accuracy)\b/.test(description)
+        || page.terminalEvidence?.boundaryObserved === true
+      );
+    if (legalAttestation) {
+      return {
+        ...control,
+        semantic: "legal_terms",
+        semanticIntent: "legal_attestation",
+        risk: "legal",
+        fieldClassification: {
+          fieldType: "",
+          source: "deterministic_legal_attestation",
+          confidence: 0.99,
+          evidence: [description.slice(0, 300)]
+        },
+        semanticSceneItem: {
+          role: "legal_attestation",
+          semanticType: "legal_terms",
+          factSource: "",
+          requiredness: control.required === true || control.state?.required === true
+            ? "progression_required"
+            : "optional_meaningful",
+          consequence: "legal_attestation",
+          confidence: "high",
+          evidence: description.slice(0, 300),
+          relatedControlIds: [control.controlId].filter(Boolean),
+          grounded: true,
+          deterministic: true
+        }
+      };
+    }
+    const transactionCommit = isButton
+      && page.terminalEvidence?.boundaryObserved === true
+      && /^(?:confirm|confirm booking|confirm transaction|confirm reservation|review and confirm)$/.test(primaryLabel);
+    if (transactionCommit) {
+      return {
+        ...control,
+        semantic: "transaction_confirmation",
+        semanticIntent: "transaction_commit",
+        risk: "purchase",
+        semanticSceneItem: {
+          role: "transaction_commit",
+          semanticType: "transaction_confirmation",
+          factSource: "",
+          requiredness: "progression_required",
+          consequence: "transaction_commit",
+          confidence: "high",
+          evidence: description.slice(0, 300),
+          relatedControlIds: [control.controlId].filter(Boolean),
+          grounded: true,
+          deterministic: true
+        }
+      };
+    }
+    const optionalCredential = isTextEntry && (
+      /\b(?:promotion|promo|voucher|discount|coupon)\s*(?:code|number)?\b/.test(description)
+      || /\b(?:loyalty|frequent\s*flyer|membership)\s*(?:number|code)\b/.test(description)
+    );
+    if (!optionalCredential) return { ...control };
+    const semanticType = /loyalty|frequent\s*flyer|membership/.test(description)
+      ? "loyalty_number"
+      : "promotion_code";
+    return {
+      ...control,
+      semantic: semanticType,
+      semanticIntent: semanticType,
+      required: false,
+      state: { ...(control.state || {}), required: false },
+      fieldClassification: {
+        fieldType: "",
+        source: "deterministic_optional_credential",
+        confidence: 0.99,
+        evidence: [description.slice(0, 300)]
+      },
+      semanticSceneItem: {
+        role: "optional_credential",
+        semanticType,
+        factSource: "",
+        requiredness: "safely_ignorable",
+        consequence: "informational",
+        confidence: "high",
+        evidence: description.slice(0, 300),
+        relatedControlIds: [control.controlId].filter(Boolean),
+        grounded: true,
+        deterministic: true
+      }
+    };
+  }
+
   function compileSemanticCheckout(page = {}) {
-    const controls = (page.controls || []).map((control) => ({ ...control }));
+    // Normalize narrow, universally understood optional credentials before
+    // uncertainty admission. HTML `required` is frequently copied onto promo
+    // widgets even though checkout progression does not require them. Letting
+    // that framework flag invoke scene AI added seconds to obvious review
+    // pages and could manufacture a false obligation.
+    const controls = (page.controls || []).map((control) => normalizeDeterministicSceneControl(control, page));
     const controlsById = new Map(controls.map((control) => [control.controlId, control]));
+    // Closed-ID scene relationships are reconciled after observing the exact
+    // current controls. When they prove that two controls form one local
+    // decision, that relation supersedes an older broad-container grouping;
+    // otherwise the same Yes/No pair can remain owned by an unrelated promo or
+    // summary section.
+    const reconstructedSceneChoices = reconstructSemanticSceneGroups(controls);
+    const sceneOwnedControlIds = new Set(reconstructedSceneChoices.flatMap((group) => (
+      (group.alternatives || []).map((option) => option.controlId)
+    )));
     const existingGroups = (page.decisionGroups || []).map((group) => {
       const declared = group.decisionContract || group;
       const referencedControlIds = [
@@ -1019,7 +1351,7 @@
           controlId,
           label: control.label || controlId,
           structuredPrice: control.structuredPrice || null,
-          selected: control.selected === true || control.state?.checked === true || control.state?.selected === true
+          selected: controlSelectionCommitted(control)
         };
       });
       const decisionContract = normalizeDecisionContract({
@@ -1027,20 +1359,30 @@
         options: declared.options || declared.alternatives || group.alternatives || inferredOptions
       }, controlsById);
       return { ...group, decisionContract };
-    });
+    }).filter((group) => !(
+      group.decisionContract?.options || group.alternatives || []
+    ).some((option) => sceneOwnedControlIds.has(option.controlId)));
     const existingOwned = new Set(existingGroups.flatMap((group) => (group.alternatives || []).map((option) => option.controlId)).filter(Boolean));
     const reconstructedChoices = reconstructSelectionCtaGroups(page, controls).filter((group) => (
-      !(group.alternatives || []).some((option) => existingOwned.has(option.controlId))
+      !(group.alternatives || []).some((option) => (
+        existingOwned.has(option.controlId) || sceneOwnedControlIds.has(option.controlId)
+      ))
     ));
     const reconstructedChoiceControlIds = new Set(reconstructedChoices.flatMap((group) => (
       (group.alternatives || []).map((option) => option.controlId)
     )));
     const reconstructedForegroundChoices = reconstructForegroundChoiceGroups(page, controls).filter((group) => (
       !(group.alternatives || []).some((option) => (
-        existingOwned.has(option.controlId) || reconstructedChoiceControlIds.has(option.controlId)
+        existingOwned.has(option.controlId)
+        || sceneOwnedControlIds.has(option.controlId)
+        || reconstructedChoiceControlIds.has(option.controlId)
       ))
     ));
-    const reconstructed = [...reconstructedChoices, ...reconstructedForegroundChoices];
+    const reconstructed = [
+      ...reconstructedSceneChoices,
+      ...reconstructedChoices,
+      ...reconstructedForegroundChoices
+    ];
     const groups = [...existingGroups, ...reconstructed];
     const reconstructedIds = new Set(reconstructed.map((group) => group.decisionGroupId));
     for (const group of groups) {
@@ -2093,6 +2435,7 @@
   return Object.freeze({
     CONTRACT_VERSION,
     TERMINAL_EVIDENCE_VERSION,
+    CHECKOUT_BOUNDARY,
     CAPABILITY_STATUS,
     INTERACTION_METHOD,
     EXECUTION_LANE,
@@ -2105,6 +2448,10 @@
     PROFILE_FIELD_TYPES,
     canonicalSemanticEffect,
     semanticEffectSatisfies,
+    normalizedValidationMessage,
+    isNonBlockingValidationSummary,
+    validationIssueAdmission,
+    controlSelectionCommitted,
     isPaidCommerceOption,
     classifySelectedCommerceTruth,
     isGenuineSelectedPaidItem,

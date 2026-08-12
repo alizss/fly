@@ -167,13 +167,17 @@ export function createInteractionMechanics(dependencies) {
       };
     }
 
-    // Reuse the same fresh action lease and exact actuator. This is one local
-    // mechanic, not a new semantic decision or a silently rebound target.
-    const freshMap = pageStateStore.observe({ reason: "bounded_local_click_revalidate" }).map;
-    const freshTarget = resolveDecisionTarget(decision, freshMap);
-    const validation = freshTarget && freshTarget === element
-      ? validateResolvedTarget(decision, freshTarget, freshMap)
-      : { ok: false, code: "TARGET_DISAPPEARED" };
+    // Reuse only the exact still-connected actuator from this action lease.
+    // A fallback mechanic does not need to reconstruct the whole checkout
+    // scene; if the node was replaced, canonical re-observation owns recovery
+    // on the next turn rather than silently rebinding here.
+    const currentMap = pageStateStore.current();
+    const freshTarget = element?.isConnected && isVisible(element) ? element : null;
+    const validation = freshTarget && currentMap
+      ? validateResolvedTarget(decision, freshTarget, currentMap)
+      : freshTarget
+        ? { ok: true, code: "SAME_LEASED_ACTUATOR_REUSED" }
+        : { ok: false, code: "TARGET_DISAPPEARED" };
     if (!validation.ok) {
       return { ok: true, method: primary.method || decision.interactionMethod || "pointer_sequence", choiceCommitResult };
     }

@@ -8,7 +8,7 @@ Fly should complete checkout across different airline and OTA websites by dynami
 
 The Chrome extension is the first actuator and proving ground. The long-term product is one reusable checkout-intelligence engine shared by the browser extension, a secure background runtime, and an iOS experience.
 
-### Current priority (2026-08-10)
+### Current priority (2026-08-12)
 
 The single-authority architecture and four-site technical canary are now established. The largest remaining product risk is **external validity**: proving that the same universal contracts transfer beyond EasyJet, GoToGate, Kiwi, and Turkish Airlines. Latency remains a promotion metric, but it is secondary to representative structural coverage. The next gate is a controlled portfolio of approximately 8–10 sites across at least 6 observed checkout families, including 4 direct-airline families and 3 structurally different OTAs. Every new failure must become a trace-derived universal replay and repair; ordinary unfamiliar DOMs, fields, grouping, or controls are not acceptable permanent stop reasons.
 
@@ -29,8 +29,11 @@ Selected flight
 → complete traveler and contact details
 → resolve fares, bags, seats, insurance, and other required choices
 → verify itinerary and price
-→ reach payment review
-→ stop before payment, legal acceptance, or purchase
+→ reconcile pre-payment review
+→ request exact legal approval when required
+→ verify the approved attestation, then separately advance
+→ verify actual payment entry
+→ stop before payment credentials, Pay, or purchase
 ```
 
 “Handle every surprise” does not mean silently completing every situation. It means Fly always responds correctly: recover when safe, ask for the smallest missing decision, or stop clearly at a safety boundary.
@@ -69,9 +72,10 @@ flowchart TD
     O --> P{"Semantic postcondition satisfied?"}
 
     P -->|"Yes"| Q["Persist verified progress"]
-    Q --> R{"Payment review ready?"}
+    Q --> R{"Actual payment entry ready?"}
     R -->|"No"| A
-    R -->|"Yes"| S["Verify itinerary and total, then stop"]
+    R -->|"Legal gate"| J
+    R -->|"Yes"| S["Verify itinerary and total, then stop before credentials"]
 
     P -->|"Recoverable failure"| T["Bounded recovery or alternate actuator"]
     T --> A
@@ -491,7 +495,7 @@ The next work in the current repository is therefore:
 16. ✅ Resolve compact verified results through the exact resolved target snapshot; add a live-shaped no-planned-group regression; preserve parent/child and seat aggregation.
 17. ⏳ Make loaded build/reducer identity observable, restart the backend, re-run GoToGate and Kiwi, and require non-empty journal/ledger coverage whenever the session contains verified consequential actions.
 18. Then test one direct airline and one structurally different OTA.
-19. Keep `payment_review_reached` as the current terminal product boundary and preserve the structural prohibition on payment, billing, legal, card, and purchase mutation.
+19. Keep `payment_entry_reached` as the current terminal product boundary; allow only an exact transaction-bound legal attestation and a separate advance-to-payment action, while preserving the prohibition on payment credentials, Pay, transaction commit, and purchase mutation.
 20. ✅ Live-prove Canonical Requirement Admission on Turkish: optional controls are waived, the composite phone prefix remains the sole unresolved component, and the exact opener executes and verifies.
 21. ✅ Replace the Turkish-shaped replay's manual portal clicks with the real action pipeline and require opener → fresh portal → `Slovenia (+386)` → settled canonical phone → Continue.
 22. ✅ Add one durable bounded adaptive surface episode before the profile `MISSING_EXECUTABLE_ACTUATOR` stop. Preserve the known objective and causal surface; expose only fresh reversible mechanics; reuse the existing selector, governor, executor, and verifier rather than adding a second planner.
@@ -568,10 +572,16 @@ The next work in the current repository is therefore:
 
 76. 🧪 **Add grounded Semantic Scene Reconciliation without creating a second planner.** Croatia trace `chk_msn9sby3n1brzm` proved that the browser could observe a required title sentinel, an explicit combined international-phone instruction, native invalid state, and an optional emergency phone while deterministic compilation still marked `-1` as completed, discarded the country-code format, admitted the optional peer, and left validation unowned. The shared sentinel contract now treats `-1`/`---` as unfinished without invalidating meaningful value-less commerce selections; the phone codec distinguishes full international from split prefix/local representations; native and section validation reopen the exact primary phone; and SOS/emergency fields remain distinct optional owners. An uncertainty-only scene reconciler now runs before final `DecisionFrame` publication, accepts only supplied control/fact/validation IDs, consumes the existing one-call ambiguity budget, and cannot create actions, facts, obligations, policy, transaction truth, or completion. The corrected Croatia fixture uses the deterministic zero-call path, while a deliberately ambiguous fixture proves exactly one closed-ID hypothesis call. **365/365 unit tests, 172/172 uninterrupted browser replays, `npm run check`, and `git diff --check` pass.** Fresh Croatia/Turkish/GoToGate/EasyJet live canaries remain the promotion gate.
 
+77. 🧪 **Extend scene reconciliation from unfamiliar profile fields to whole-page checkout meaning.** Croatia trace `chk_msoittdcd9pyqd` reached the final pre-payment page but the browser still labelled it traveler information, admitted an optional promotion code as a generic profile value, and waited even though the actual scene contained an optional paid Time to Think choice, legal terms, and a final Confirm control. The reconciler now detects a deterministic stage contradiction and may ground closed-vocabulary hypotheses for optional credentials, personal attestations, optional paid/free decisions, validation ownership, legal attestations, navigation, and transaction boundaries. Exact related controls may be reconstructed into one canonical decision group, while unknown textboxes no longer become profile obligations merely because they are actionable. A high-confidence grounded stage may correct the semantic frame, but hypotheses remain evidence only: TaskState alone admits work, commerce policy remains deterministic, unresolved legal terms produce an explicit approval disposition, and legal/payment/purchase actions remain prohibited without the existing approval boundary. Context-dependent age questions can be resolved from the traveler profile even when the HTML does not mark them required. The latest Croatia trace additionally proved that toggle-button commitment (`aria-pressed`) was being discarded, causing an already selected free decline to be clicked again, and that exact-choice settlement repeatedly rebuilt the entire page graph. Choice commitment is now one shared fact across browser and backend; settled reversible choices verify locally, custom cards compile once after their exact stage exit becomes enabled, and paid corrections retain full canonical verification. The exact recorded run now requests scene interpretation only for its genuinely contradictory final surface rather than all nine ordinary turns. Known deterministic scenes still use zero model calls. **374/374 unit tests, 173/173 uninterrupted browser replays, `npm run check`, and `git diff --check` pass.** A fresh Croatia live canary is required to promote this item from test-complete to accepted.
+
+78. 🧪 **Recognize approved pre-payment review before legal acceptance and close the mutation-before-wait race.** Croatia trace `chk_mson15mb0x7emx` had already reached `PAY CURRENT STEP`, displayed the owned booking total and itinerary, exposed an unchecked conditions attestation, and presented a transaction-level `CONFIRM`; Fly nevertheless retained the prior traveler stage, requested another semantic model turn, and stopped at `LEGAL_ATTESTATION_REQUIRED`. The terminal observer now admits accessible current-step copy, `Your booking`/`Total to be paid` review ownership, and a plain Confirm only inside the independently proven review-plus-legal envelope. Narrow promo/loyalty credentials, legal checkboxes, and review-level transaction commits compile deterministically. Legal-document links inside a checkbox owner remain explanatory context instead of competing actuators. TaskState latches the verified payment-review goal before lower-priority legal work and leaves both the terms checkbox and transaction commit untouched. The destination lifecycle also buffers external material mutations from the instant an exit is dispatched, so a page change that lands before wait registration wakes one settled observation rather than falling through to the 20-second deadline. Fresh live trace `chk_msor7mbh4577y0` proved those corrections worked—the terminal contract produced five agreeing signals and no legal/purchase action—but exposed a second transaction-reconciliation constraint: Croatia repeats the exact traveler, currency, and approved total at review without repeating the itinerary route. The immutable `SelectedBooking` now remains route/date authority when review omits route copy; any route the review does expose is still compared and stops on contradiction. Optional informational buttons after the verified terminal boundary can no longer trigger a scene-model call, removing the recorded 15.5-second interpretation turn. **376/376 unit tests, 174/174 uninterrupted browser replays, and `npm run check` pass.** The scoped source diff is clean; the unrelated user-owned `Todo For Me.md` still contains its pre-existing whitespace. One final fresh Croatia rerun remains the product acceptance gate.
+
+79. 🧪 **Expand the milestone from pre-payment review to actual payment entry with exact legal approval.** Item 78 correctly recognized Croatia's review/legal scene but used the wrong terminal: review ownership plus terms plus plain Confirm was being called completion before an actual payment method or hosted payment component appeared. The shared observer now reports `PRE_PAYMENT_REVIEW`, `LEGAL_GATE`, `PAYMENT_ENTRY`, or `PURCHASE_COMMIT`. TaskState terminal success is `PAYMENT_ENTRY_REACHED` only when owned payment-method, credential, or hosted-provider evidence exists and the transaction is reconciled. A legal gate publishes one approval request bound to transaction, itinerary, travelers, total/currency, legal-text digest, checkbox owner, next control, and expiry. After approval, TaskState publishes the checkbox as one legal obligation; fresh verification must prove it selected before a separate `advance_to_payment` obligation is published; that action succeeds only when actual payment entry is observed. Changed bound evidence invalidates the token. Payment credentials, Pay, transaction commit, and purchase remain prohibited. This stays inside the existing ObservationFrame → DecisionFrame → TaskState → mechanics → governor → verification chain; it adds no second planner or terminal authority. A persistent booking summary is explicitly transaction evidence only: it cannot classify seat/extras navigation as pre-payment review without a current payment-stage or exact advance-to-payment anchor. The final authority repair makes mechanics bind TaskState's exact admitted legal control without forward-label reinterpretation and preserves the authorization ID/text digest plus payment-entry postcondition through the action lease. Regressions cover the complete legal request → attestation → advance → payment-entry sequence, exact-token rejection, Croatia's legal gate, and retained seat/extras/review flows. **379/379 unit tests, 175/175 uninterrupted browser replays, and `npm run check` pass.** Fresh live Croatia plus retained EasyJet, GoToGate, Kiwi, and Turkish canaries are required to promote this expanded milestone.
+
 ### Current execution checklist
 
-- [x] Return a freshly latched `payment_review_reached` before every lower-priority same-turn profile or planning branch.
-- [x] Publish no payment, billing, legal, newsletter, Edit, or generic candidate after the terminal latch.
+- [x] Superseded by item 79: never latch on review/legal copy; latch `payment_entry_reached` only from owned actual payment-entry evidence and reconciled transaction truth.
+- [x] Publish no credential, Pay, transaction-commit, purchase, billing, newsletter, Edit, or generic candidate after the payment-entry latch.
 - [x] Remove mutable values from stable logical identity and verify phone rerender continuity.
 - [x] Reject unowned generic route pairs and certify the owned Kiwi itinerary.
 - [x] Fix foreground ownership and readiness with the Kiwi seat-modal replay.
@@ -686,7 +696,7 @@ The next work in the current repository is therefore:
 
 ## Success metrics
 
-- Percentage of eligible checkouts reaching verified payment review without intervention.
+- Percentage of eligible checkouts reaching verified payment entry, with exact legal-approval handoffs measured separately.
 - Percentage completed after safe autonomous recovery.
 - User handoffs per checkout and whether each handoff was necessary and actionable.
 - Incorrect field, extra, fare, seat, itinerary, price, and completion decisions.

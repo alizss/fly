@@ -41,6 +41,7 @@
  * @property {boolean} [boundedRecovery]
  * @property {string} [value]
  * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}} [inputRequest]
+ * @property {Object} [approvalRequest]
  * @property {number} [x]
  * @property {number} [y]
  * @property {VisualRegion} [visualRegion]
@@ -243,6 +244,23 @@ function normalizeAction(raw = {}) {
           label: String(raw.inputRequest.label || "").slice(0, 160),
           subjectId: String(raw.inputRequest.subjectId || "").slice(0, 160),
           sensitive: raw.inputRequest.sensitive === true
+        }
+      : null,
+    approvalRequest: raw.approvalRequest && typeof raw.approvalRequest === "object"
+      ? {
+          contractVersion: String(raw.approvalRequest.contractVersion || "").slice(0, 80),
+          authorizationId: String(raw.approvalRequest.authorizationId || "").slice(0, 160),
+          transactionId: String(raw.approvalRequest.transactionId || "").slice(0, 160),
+          itineraryDigest: String(raw.approvalRequest.itineraryDigest || "").slice(0, 160),
+          travelerIds: Array.isArray(raw.approvalRequest.travelerIds) ? raw.approvalRequest.travelerIds.map(String).slice(0, 12) : [],
+          total: Number.isFinite(Number(raw.approvalRequest.total)) ? Number(raw.approvalRequest.total) : null,
+          currency: String(raw.approvalRequest.currency || "").slice(0, 12),
+          legalText: String(raw.approvalRequest.legalText || "").slice(0, 1600),
+          legalTextDigest: String(raw.approvalRequest.legalTextDigest || "").slice(0, 160),
+          legalControlId: String(raw.approvalRequest.legalControlId || "").slice(0, 160),
+          legalSemanticOwnerId: String(raw.approvalRequest.legalSemanticOwnerId || "").slice(0, 300),
+          advanceControlId: String(raw.approvalRequest.advanceControlId || "").slice(0, 160),
+          expiresAt: Number(raw.approvalRequest.expiresAt || 0)
         }
       : null,
     x: Number.isFinite(Number(raw.x)) ? Math.round(Number(raw.x)) : null,

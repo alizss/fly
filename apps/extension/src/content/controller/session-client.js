@@ -83,6 +83,7 @@ export function createSessionClient({
         throw new Error("session handshake returned a replacement transaction id");
       }
       agent.sessionId = sessionId;
+      agent.legalAuthorization = session.approvals?.legalAuthorization || null;
       logAgentEvent("agent_session_started", { sessionId: agent.sessionId });
       return session;
     } catch (error) {

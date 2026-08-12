@@ -61,7 +61,7 @@ function compactControl(control = {}) {
     surfaceId: control.surfaceId || "",
     decisionGroupId: control.decisionGroupId || "",
     required: control.required === true,
-    selected: control.selected === true || control.state?.selected === true || control.state?.checked === true,
+    selected: control.selected === true || control.state?.selected === true || control.state?.checked === true || control.state?.pressed === true,
     disabled: control.disabled === true || control.state?.disabled === true,
     state: control.state ? {
       valuePresent: control.state.valuePresent === true,
@@ -69,6 +69,7 @@ function compactControl(control = {}) {
       expanded: control.state.expanded === true,
       selected: control.state.selected === true,
       checked: control.state.checked === true,
+      pressed: control.state.pressed === true,
       disabled: control.state.disabled === true
     } : null,
     structuredPrice: control.structuredPrice || null,

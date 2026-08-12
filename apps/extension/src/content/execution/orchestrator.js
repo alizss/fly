@@ -121,7 +121,14 @@ export function createExecutionOrchestrator({
     return executionResult;
   }
 
-  async function holdDispatchedStageExit(actionId, observationId, decision, expectedOutcome, afterMap = {}) {
+  async function holdDispatchedStageExit(
+    actionId,
+    observationId,
+    decision,
+    expectedOutcome,
+    afterMap = {},
+    dispatchedAt = 0
+  ) {
     const pendingResult = rememberUnexecutedActionResult(
       actionId,
       observationId,
@@ -152,6 +159,7 @@ export function createExecutionOrchestrator({
       semanticIntent: "wait_for_dispatched_stage_exit",
       observationId,
       actionId,
+      dispatchedAt,
       expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
       reobserveRetryToken: `stage_exit:${actionId}`
     });
@@ -172,9 +180,18 @@ export function createExecutionOrchestrator({
     if (isChoiceSelected(target)) {
       return { ready: true, source: "observed_selected_state" };
     }
-    const readyStageExitCandidates = (pageMap?.stageExit?.candidates || []).filter((candidate) => (
-      candidate.status === "ready" || candidate.executable === true
-    ));
+    const stageExitCandidates = pageMap?.stageExit?.candidates || [];
+    const readyStageExitCandidates = stageExitCandidates.filter((candidate) => {
+      if (candidate.status === "ready" || candidate.executable === true) return true;
+      const actuator = elementById(candidate.actuatorId || "");
+      return Boolean(
+        actuator
+        && actuator.isConnected
+        && isVisible(actuator)
+        && actuator.disabled !== true
+        && actuator.getAttribute?.("aria-disabled") !== "true"
+      );
+    });
     if (readyStageExitCandidates.length) {
       return {
         ready: true,
@@ -185,6 +202,71 @@ export function createExecutionOrchestrator({
     return { ready: false, source: "not_ready" };
   }
 
+  function exactChoiceRequiresCanonicalVerification(expectedOutcome = {}, beforeMap = {}) {
+    if (
+      expectedOutcome.requireChargeRemoved === true
+      || expectedOutcome.semanticOwnershipLinkId
+      || expectedOutcome.correctionDecisionGroupId
+    ) return true;
+    const expectedDecisionGroupId = String(
+      expectedOutcome.decisionGroupId
+      || expectedOutcome.requirementId
+      || ""
+    );
+    const group = (beforeMap.decisionGroups || []).find((item) => (
+      String(item.decisionGroupId || item.requirementId || "") === expectedDecisionGroupId
+    ));
+    const selectedAmount = Number(group?.selectedEvidence?.structuredPrice?.amount);
+    return Boolean(
+      group?.selectedEvidence?.selected === true
+      && (
+        group.selectedEvidence.disposition === "paid"
+        || (Number.isFinite(selectedAmount) && selectedAmount > 0)
+      )
+    );
+  }
+
+  function localExactChoiceVerification(expectedOutcome = {}, beforeMap = {}, target = null) {
+    if (
+      expectedOutcome.type !== "exact_free_option_selected"
+      || exactChoiceRequiresCanonicalVerification(expectedOutcome, beforeMap)
+      || !isChoiceSelected(target)
+    ) return null;
+    return {
+      ok: true,
+      code: "EXACT_CHOICE_LOCAL_STATE_VERIFIED",
+      message: "The exact choice exposes a committed selected state on its leased actuator.",
+      evidence: {
+        source: "local_exact_choice_state",
+        controlId: expectedOutcome.controlId || "",
+        expectedSelectedControlId: expectedOutcome.expectedSelectedControlId || "",
+        beforeObservationHash: observationHashForMap(beforeMap),
+        afterObservationHash: "pending_canonical_observation",
+        targetConnected: Boolean(target?.isConnected),
+        selected: true
+      },
+      feedback: {
+        dispatched: true,
+        targetFound: Boolean(target),
+        targetVisible: Boolean(target && isVisible(target)),
+        dispatchSucceeded: true,
+        targetReacted: true,
+        selectionChanged: true,
+        surfaceChanged: false,
+        progressChanged: false,
+        domChanged: true,
+        visualChanged: false,
+        navigationOccurred: false,
+        overlayAppeared: false,
+        validationAppeared: false,
+        priceChanged: false,
+        outcomeVerified: true,
+        expectedOutcomeObserved: true,
+        postconditionSatisfied: true
+      }
+    };
+  }
+
   async function settleExactChoiceOutcome(
     target,
     decision = {},
@@ -193,32 +275,43 @@ export function createExecutionOrchestrator({
     initialAfterMap = null,
     timeoutMs = 4200
   ) {
-    let afterMap = initialAfterMap || buildPageMap();
+    let afterMap = initialAfterMap || agent.pageMap || beforeMap;
     let verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
     if (expectedOutcome.type !== "exact_free_option_selected" || verification.ok) {
       return { afterMap, verification, commitment: null };
     }
+    const immediateLocalVerification = localExactChoiceVerification(expectedOutcome, beforeMap, target);
+    if (immediateLocalVerification) {
+      return { afterMap, verification: immediateLocalVerification, commitment: null };
+    }
+    const initialReadiness = exactChoiceCommitReadiness(target, decision, afterMap);
+    if (initialReadiness.ready) {
+      const commitment = rememberExactChoiceCommitment(target, decision, initialReadiness);
+      verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
+      if (verification.ok) return { afterMap, verification, commitment };
+    }
     const startedAt = performance.now();
     while (performance.now() - startedAt < timeoutMs) {
-      // The site may enable its forward action asynchronously without changing
-      // the selected card itself. Recompile the current surface on every bounded
-      // probe so commitment never depends on an old agent.pageMap snapshot.
-      afterMap = buildPageMap();
+      // Local commitment is cheap and causally exact. The caller already owns
+      // the single canonical post-action observation; never rebuild the whole
+      // checkout graph inside this bounded settlement loop.
+      await sleep(80);
+      const localVerification = localExactChoiceVerification(expectedOutcome, beforeMap, target);
+      if (localVerification) {
+        return { afterMap, verification: localVerification, commitment: null };
+      }
       const readiness = exactChoiceCommitReadiness(target, decision, afterMap);
       if (readiness.ready) {
         const commitment = rememberExactChoiceCommitment(target, decision, readiness);
-        pageStateStore.invalidate("exact_choice_commitment");
-        afterMap = (await observePageStateAfterMutation("verify_exact_choice_commitment", 700)).map;
+        // A custom card may expose no selected state of its own and prove the
+        // commit only by enabling the exact stage exit. Compile once after
+        // that causal local signal so canonical decision truth and unrelated
+        // selection safeguards are both evaluated from the fresh scene.
+        pageStateStore.invalidate("exact_choice_local_commitment");
+        afterMap = buildPageMap();
         verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
-        if (verification.ok) {
-          return { afterMap, verification, commitment };
-        }
+        return { afterMap, verification, commitment };
       }
-      await sleep(120);
-    }
-    if (pageStateStore.isDirty()) {
-      afterMap = (await observePageStateAfterMutation("verify_exact_choice_timeout", 500)).map;
-      verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
     }
     return { afterMap, verification, commitment: null };
   }
@@ -384,6 +477,7 @@ export function createExecutionOrchestrator({
     addAgentMessage("assistant", `Clicking: ${label}.`);
     await showAgentThought(element, "Exit", `Act: click ${label}`, "Checking whether the page advances.");
     flashElement(element);
+    const dispatchedAt = Date.now();
     const dispatch = await dispatchGovernedClickMechanic(element, governedDecision, {
       actionId: options.actionId || agent.activeExecutionActionId || "",
       observationId: options.observationId || agent.activeExecutionObservationId || "",
@@ -433,7 +527,14 @@ export function createExecutionOrchestrator({
     const actionId = options.actionId || agent.activeExecutionActionId || nextFlowId("act");
     const observationId = options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "";
     if (transitionPending && inferCheckoutSite() !== "demo") {
-      await holdDispatchedStageExit(actionId, observationId, governedDecision, expectedOutcome, afterMap);
+      await holdDispatchedStageExit(
+        actionId,
+        observationId,
+        governedDecision,
+        expectedOutcome,
+        afterMap,
+        dispatchedAt
+      );
       return false;
     }
     if (!advanced && inferCheckoutSite() !== "demo") {
@@ -557,7 +658,8 @@ export function createExecutionOrchestrator({
 
     if (decision.risk !== "safe" && decision.needsApproval) {
       await persistControlFlowDecision({ ...decision, action: "ask_user" }, actionId, actionObservationId);
-      agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "payment" ? "final" : "manual";
+      agent.pendingApprovalRequest = decision.approvalRequest || null;
+      agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "payment" ? "final" : decision.risk === "legal" ? "legal" : "manual";
       agent.running = false;
       renderSidebar("agent");
       return;
@@ -566,12 +668,14 @@ export function createExecutionOrchestrator({
     if (decision.action === "ask_user") {
       await persistControlFlowDecision(decision, actionId, actionObservationId);
       agent.pendingInputRequest = decision.inputRequest || null;
-      agent.awaiting = decision.risk === "money" ? "extras" : "manual";
+      agent.pendingApprovalRequest = decision.approvalRequest || null;
+      agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "legal" ? "legal" : "manual";
       agent.running = false;
       renderSidebar("agent");
       return;
     }
     agent.pendingInputRequest = null;
+    agent.pendingApprovalRequest = null;
 
     if (decision.action === "final_review") {
       await persistControlFlowDecision(decision, actionId, actionObservationId);
@@ -950,18 +1054,28 @@ export function createExecutionOrchestrator({
         renderSidebar("agent");
         return;
       }
-      if (button?.risk === "payment" || isDangerousActionLabel(button?.label || "")) {
+      const governedAdvanceToPayment = decision.semanticEffect === "advance_to_payment"
+        && expectedOutcomeForDecision(decision, map, target)?.type === "payment_entry_reached";
+      if (!governedAdvanceToPayment && (button?.risk === "payment" || isDangerousActionLabel(button?.label || ""))) {
         agent.awaiting = "final";
         agent.running = false;
         addAgentMessage("assistant", "I will not click payment or final booking buttons automatically on a real site.");
         renderSidebar("review");
         return;
       }
-      if ((target.matches?.("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']") && isChoiceSelected(target))
-        || /true/.test(target.getAttribute?.("aria-checked") || "")) {
-        const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
-        const verification = verifyExpectedOutcome(expectedOutcome, map, map, target);
-        await finalizeGovernedAction(actionId, actionObservationId, decision, expectedOutcome, verification, 350);
+      const alreadyCommittedOutcome = expectedOutcomeForDecision(decision, map, target);
+      if (
+        (
+          isChoiceSelected(target)
+          && (
+            target.matches?.("input[type='checkbox'], input[type='radio'], [role='checkbox'], [role='radio']")
+            || alreadyCommittedOutcome.type === "exact_free_option_selected"
+          )
+        )
+        || /true/.test(target.getAttribute?.("aria-checked") || "")
+      ) {
+        const verification = verifyExpectedOutcome(alreadyCommittedOutcome, map, map, target);
+        await finalizeGovernedAction(actionId, actionObservationId, decision, alreadyCommittedOutcome, verification, 350);
         return;
       }
       // Diagnostic only. The shared execution-lane gate above consumes the
@@ -1077,7 +1191,8 @@ export function createExecutionOrchestrator({
         return;
       }
       await waitForUiSettle(800);
-      const mechanicalVerification = verificationFromSurfaceFeedback(
+      const localChoiceVerification = localExactChoiceVerification(expectedOutcome, map, target);
+      const mechanicalVerification = localChoiceVerification || verificationFromSurfaceFeedback(
         expectedOutcome,
         map,
         target,
@@ -1086,7 +1201,9 @@ export function createExecutionOrchestrator({
       let afterMap = map;
       let verification = mechanicalVerification;
       if (!verification) {
-        afterMap = (await observePageStateAfterMutation("verify_click", 750)).map;
+        afterMap = (await observePageStateAfterMutation("verify_click", 750, {
+          maxAttempts: expectedOutcome.type === "exact_free_option_selected" ? 1 : 2
+        })).map;
         verification = verifyExpectedOutcome(expectedOutcome, map, afterMap, target);
       }
       if (!verification.ok && expectedOutcome.type === "exact_free_option_selected") {

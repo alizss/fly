@@ -1,6 +1,6 @@
 # Fly — Current Codebase Engineering Handoff
 
-Last updated: 2026-08-10
+Last updated: 2026-08-12
 
 Branch: `dev`
 
@@ -8,9 +8,9 @@ Latest implementation checkpoints before this documentation update: `21b5d57` an
 
 ## 1. Mission and current boundary
 
-Fly takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies saved facts and policy, verifies every material result, reconciles the final transaction, and stops at verified payment review.
+Fly takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies saved facts and policy, verifies every material result, reconciles the final transaction, handles an exact approved legal gate when required, and stops only when actual payment entry is verified.
 
-The current runtime must not accept legal terms, enter payment credentials, click Pay, or purchase. The long-term product adds a background runtime, web/iOS control surfaces, and a separately authorized payment boundary without replacing the checkout engine.
+The current runtime may accept only an exact transaction/text/control-bound legal attestation after explicit approval, then separately advance to payment. It must not enter payment credentials, click Pay, commit the transaction, or purchase. The long-term product adds a background runtime, web/iOS control surfaces, and a separately authorized payment boundary without replacing the checkout engine.
 
 The current engineering priority is cross-airline structural generalization—not another architecture rewrite and not airline-specific selectors.
 
@@ -18,11 +18,11 @@ The current engineering priority is cross-airline structural generalization—no
 
 | Area | Status |
 |---|---|
-| Agent unit suite | 359/359 passing |
-| Browser replay suite | 169/169 passing in one uninterrupted run |
+| Agent unit suite | 379/379 passing |
+| Browser replay suite | 175/175 passing in one uninterrupted run |
 | Build/type/syntax gate | `npm run check` passing |
-| Live sites | EasyJet, GoToGate, Kiwi, and Turkish reached verified payment review in the latest technical canaries |
-| Safety | No payment, card, legal, or purchase action in those review-only flows |
+| Live sites | EasyJet, GoToGate, Kiwi, and Turkish reached the prior verified-review milestone; fresh actual-payment-entry canaries are required |
+| Safety | Narrow exact legal approval is now implemented in replay; payment credentials, Pay, transaction commit, and purchase remain prohibited |
 | Formal autonomous acceptance | Canary reports remain `review_required` until the operator records `--manual none` or `--manual yes` |
 | Architecture | Single semantic compiler, TaskState authority, direct obligation mechanics, one governed action lease, bounded recovery, compact durable state |
 | Main product gap | Representative structural portfolio: 8–10 sites, 6+ families, 4 direct-airline families, 3 OTAs |
@@ -53,7 +53,7 @@ selected booking + traveler policy
 → browser mechanical result
 → semantic transition verification
 → compact TaskState/transaction commit
-→ repeat, hand off, stop, or terminal review
+→ repeat, exact legal handoff, stop, or terminal payment entry
 ```
 
 Responsibility boundaries:
@@ -65,6 +65,8 @@ Responsibility boundaries:
 - The governor checks consequences immediately before dispatch.
 - Browser verification proves the mechanic; backend transition verification proves the obligation.
 - Transaction review independently proves the selected booking still matches the final review.
+- Terminal observation distinguishes `PRE_PAYMENT_REVIEW`, `LEGAL_GATE`, `PAYMENT_ENTRY`, and `PURCHASE_COMMIT`; only reconciled `PAYMENT_ENTRY` completes the current milestone.
+- Legal approval is a narrow expiring token. Checking the attestation and advancing to payment are separate TaskState obligations with separate fresh verification.
 
 Do not add a second readiness meaning layer, planner, verifier, requirement lifecycle, recovery store, or completion receipt.
 
@@ -152,11 +154,12 @@ Valid pause/stop reasons:
 
 - Missing required traveler fact.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or user-only authentication.
-- Legal acceptance, payment, or purchase boundary.
+- Exact required legal acceptance pending explicit approval.
+- Payment entry reached—the current milestone is complete—or a forbidden payment/purchase action is encountered.
 - Consequential ambiguity or unauthorized price/currency/itinerary/identity change.
 - Sold-out inventory, expired session, site outage, or explicit website rejection.
 - No safe grounded mechanic after bounded distinct recovery.
-- Verified payment review under the current milestone.
+- Verified actual payment entry under the current milestone.
 
 For an otherwise eligible journey, exhausted mechanics is an engineering coverage failure. Capture the trace, add the exact replay, repair the universal owner, and rerun retained canaries. Do not add an airline workflow.
 
@@ -174,12 +177,12 @@ npm run canary:report -- --latest-by-site
 Full acceptance after a material core change:
 
 1. Focused trace-derived replay passes.
-2. 359 unit tests pass.
-3. 169 browser replays pass uninterrupted.
+2. 379 unit tests pass.
+3. 175 browser replays pass uninterrupted.
 4. `npm run check` and `git diff --check` pass.
-5. Discovering site reaches verified payment review or the expected typed handoff.
+5. Discovering site reaches verified actual payment entry or the expected typed handoff.
 6. At least one retained canary passes.
-7. No payment/legal/card/purchase action executes.
+7. No unauthorized legal action, payment credential, Pay, transaction commit, or purchase action executes.
 
 ## 8. Storage and diagnostics
 
@@ -215,7 +218,7 @@ The semantic backend is usually fast; browser observation construction, 360–64
 
 ### Formal evidence gap
 
-The latest four traces technically reached payment review and passed safety, but normalized reports still show `review_required` until manual intervention is explicitly annotated. Record `--manual none` only when no human altered the airline page.
+The latest four retained traces technically reached the earlier payment-review milestone and passed safety. They must be rerun to actual payment entry under the expanded contract. Normalized reports also remain `review_required` until manual intervention is explicitly annotated. Record `--manual none` only when no human altered the airline page.
 
 ## 10. Engineering rules
 
@@ -231,4 +234,4 @@ The latest four traces technically reached payment review and passed safety, but
 
 ## 11. One-paragraph handoff
 
-Fly currently has one authoritative checkout loop, compact durable transaction state, strict selected-booking admission, exact action leases, bounded adaptive mechanics, transaction reconciliation, and hard payment/legal/purchase boundaries. The complete automated baseline is green, and the latest EasyJet, GoToGate, Kiwi, and Turkish traces all technically reached verified payment review safely. The next bottleneck is external validity: prove the same universal loop across additional direct-airline and OTA structural families, converting every failure into a trace-derived universal replay while retaining the four canaries. Latency optimization follows measured browser observation and ambiguity hot paths; it should not trigger another authority rewrite.
+Fly currently has one authoritative checkout loop, compact durable transaction state, strict selected-booking admission, exact action leases, bounded adaptive mechanics, transaction reconciliation, exact transaction-bound legal approval, and hard payment/purchase boundaries. The complete automated baseline is green. The retained EasyJet, GoToGate, Kiwi, and Turkish traces safely proved the prior review milestone; they now require fresh actual-payment-entry canaries. The next bottleneck is external validity: prove the expanded milestone across retained canaries and additional direct-airline/OTA structural families, converting every ordinary unfamiliar-site failure into a trace-derived universal replay. Latency optimization follows measured browser observation and ambiguity hot paths; it should not trigger another authority rewrite.

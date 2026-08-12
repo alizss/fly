@@ -70,43 +70,16 @@ test("active semantic grounding admits only the current lifecycle representation
   assert.deepEqual(components.map((component) => component.controlId), ["mystery_age"]);
 });
 
-test("unknown grounding can block only its exact admitted profile obligation", () => {
+test("an unknown input never becomes a profile obligation before semantic scene grounding", () => {
   const observation = activeUnknownProfileObservation();
   const preliminary = reduceTaskState({
     observation,
     traveler: { date_of_birth: "2003-05-31" }
   });
   const admitted = unknownComponentsForObligation(observation, preliminary.currentObligation);
-  assert.deepEqual(admitted.map((component) => component.controlId), ["mystery_age"]);
-
-  const groundedObservation = {
-    ...observation,
-    page: {
-      ...observation.page,
-      activeRequirementGrounding: {
-        contractVersion: "active-component-semantic-grounding/v1",
-        status: "unknown",
-        reasonCode: "ACTIVE_REQUIREMENT_UNRESOLVED",
-        candidateComponentIds: ["mystery_age"],
-        evidence: "The exact admitted component does not expose enough traveler semantics."
-      }
-    }
-  };
-  const finalState = reduceTaskState({
-    observation: groundedObservation,
-    traveler: { date_of_birth: "2003-05-31" }
-  });
-  const candidateSet = buildCurrentCandidateSet({
-    goal: finalState.currentGoal,
-    observation: groundedObservation,
-    traveler: { date_of_birth: "2003-05-31" },
-    state: { taskState: finalState, approvals: {} }
-  });
-
-  assert.equal(finalState.currentObligation.policyDecision.status, "blocked");
-  assert.equal(finalState.currentObligation.policyDecision.ambiguity.code, "ACTIVE_REQUIREMENT_UNRESOLVED");
-  assert.equal(finalState.profileReadiness.ready, true);
-  assert.deepEqual(candidateSet.candidates, []);
+  assert.equal(preliminary.currentObligation, null);
+  assert.deepEqual(admitted, []);
+  assert.equal(preliminary.profileReadiness.ready, true);
 });
 
 test("an unblocked executable stage exit suppresses unknown-component grounding authority", () => {

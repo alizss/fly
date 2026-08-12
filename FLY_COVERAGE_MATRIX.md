@@ -1,12 +1,12 @@
 # Fly — Coverage and Acceptance Matrix
 
-Last updated: 2026-08-10
+Last updated: 2026-08-12
 
 This file is the current acceptance truth. Product scope belongs in [FLY_VISION_PRD.md](./FLY_VISION_PRD.md); architecture in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md); chronological implementation evidence in [FLY_PROGRESS.md](./FLY_PROGRESS.md).
 
 ## 1. Current milestone
 
-For an eligible selected booking, Fly must complete unfamiliar airline/OTA checkout, apply the selected traveler and explicit policy, reconcile the transaction, reach verified payment review, and stop before legal acceptance, payment entry, Pay, or purchase.
+For an eligible selected booking, Fly must complete unfamiliar airline/OTA checkout, apply the selected traveler and explicit policy, reconcile the transaction, obtain narrow approval for any exact required legal attestation, verify actual payment entry, and stop before payment credentials, Pay, transaction commit, or purchase.
 
 Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusual grouping, or reused Continue controls are coverage responsibilities—not expected handoffs.
 
@@ -25,10 +25,10 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Layer | Result | Evidence |
 |---|---:|---|
 | Build, type, and syntax | ✅ | `npm run check` |
-| Agent unit suite | ✅ 365/365 | Semantic authority, scene reconciliation, profile codecs, policy, transaction, recovery, persistence, and architecture invariants |
-| Browser replay suite | ✅ 172/172 | One uninterrupted run including Croatia title/phone/validation and all established canaries |
+| Agent unit suite | ✅ 379/379 | Semantic authority, scene reconciliation, exact legal authorization, profile codecs, policy, transaction, recovery, persistence, and architecture invariants |
+| Browser replay suite | ✅ 175/175 | One uninterrupted run including the complete Croatia approval → legal attestation → advance → actual payment-entry loop and all established structural canaries |
 | Durable session boundary | ✅ | Complete `SelectedBooking/v1`, strict traveler membership, resume identity, typed failures |
-| Irreversible-action boundary | ✅ | No payment, billing, legal, card, Pay, or purchase action in current review-only replays/canaries |
+| Payment/legal boundary | 🧪 | Exact legal token and closed-loop legal → advance → payment-entry regressions pass; fresh live proof pending; credentials, Pay, commit, and purchase remain prohibited |
 
 ## 4. Universal capability status
 
@@ -48,7 +48,7 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Bounded adaptive reversible mechanics | ✅ | Additional previously unseen controls |
 | Single-dispatch navigation and hydration wait | ✅ | Fresh live repeat-guard confirmation after `c7aeb89` |
 | Transaction facts and selected-booking reconciliation | ✅ | More currencies/fare structures and price-change scenarios |
-| Payment-review terminal detection | ✅ | Additional hosted/direct payment-review structures |
+| Pre-payment/legal/payment-entry boundary detection | 🧪 | Four typed boundaries and exact legal-approval flow are covered in focused tests; hosted/direct live payment-entry proof pending |
 | Durable pause/restart/recovery | ✅ replay | Live authentication/OTP resume |
 | Background/cloud execution | ⏳ | Begins after structural and scenario gates |
 | Authorized payment and booking confirmation | ⏳ | Separate security/product gate |
@@ -57,7 +57,7 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 
 `npm run canary:report -- --latest-by-site` currently reports:
 
-| Site | Structural family | Session | Payment review | Safety | Wall time | Formal status |
+| Site | Structural family | Session | Prior review milestone | Safety | Wall time | Current status |
 |---|---|---|---:|---:|---:|---|
 | Kiwi | Custom OTA | `chk_msn4k9vxkh0b6v` | ✅ | ✅ | 1m27s | 🟡 Technical pass; intervention annotation pending |
 | GoToGate | OTA checkout | `chk_msn4gnewrng0ai` | ✅ | ✅ | 2m30s | 🟡 Technical pass; intervention annotation pending |
@@ -65,7 +65,7 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Turkish Airlines | International full-service direct | `chk_msn3eboeqhka33` | ✅ | ✅ | 1m39s | 🟡 Technical pass; intervention annotation pending |
 | Croatia Airlines | Regional direct | `chk_mskklx6tgq8k7l` | ❌ | ✅ | 11s | Not accepted; stale/incomplete discovery trace |
 
-Technical completion means terminal and transaction review are verified and safety is green. Formal autonomous acceptance additionally requires an explicit operator annotation:
+These traces prove the earlier review milestone, not the expanded actual-payment-entry milestone. Fresh live runs must now reach owned payment-method, credential-component, or hosted-payment evidence. Formal autonomous acceptance additionally requires an explicit operator annotation:
 
 ```bash
 npm run canary:report -- --session chk_... --manual none --write
@@ -96,7 +96,7 @@ Controlled baseline for every new primary:
 - No paid extras or additional baggage.
 - Random/no specific seat.
 - Approved starting itinerary, total/currency, and traveler.
-- Stop at verified payment review.
+- Stop only after verified actual payment entry.
 
 Do not combine structural discovery with a new complex profile scenario.
 
@@ -132,9 +132,12 @@ A site/scenario is accepted only when all applicable checks pass:
 - [ ] Reversible decisions match explicit policy.
 - [ ] Unauthorized paid selections are absent or exactly corrected.
 - [ ] Transaction itinerary, traveler, outcomes, currency, and total reconcile.
-- [ ] `terminalStatus=payment_review_reached` and transaction review is ready.
+- [ ] Pre-payment review and legal gate are not reported as terminal completion.
+- [ ] If legal acceptance is required, approval is bound to the exact transaction, itinerary, travelers, total/currency, legal text, checkbox, next control, and expiry.
+- [ ] The exact legal checkbox is freshly verified before a separate advance-to-payment action.
+- [ ] `terminalStatus=payment_entry_reached` only when an owned payment method, credential component, or hosted payment widget is visible and transaction review is ready.
 - [ ] Expected action/outcome coverage is non-vacuous and complete.
-- [ ] No payment, billing, legal, card, Pay, purchase, or unauthorized irreversible action executes.
+- [ ] No payment credentials, billing mutation, Pay, transaction commit, purchase, or unauthorized legal/irreversible action executes.
 - [ ] Every material new failure has an exact replay.
 - [ ] Operator records whether manual page intervention occurred.
 - [ ] Full unit, browser, and repository checks remain green after any repair.
@@ -143,7 +146,7 @@ A site/scenario is accepted only when all applicable checks pass:
 
 | Gate | Requirement | Status |
 |---|---|---|
-| A — Direct-airline generalization | Full-service + low-cost direct reach review; Kiwi/GoToGate retained; no site workflow | 🟡 Technical evidence achieved; formal annotations and confirmation sites pending |
+| A — Direct-airline generalization | Full-service + low-cost direct reach actual payment entry; Kiwi/GoToGate retained; no site workflow | 🧪 Prior review evidence exists; fresh expanded-milestone canaries and confirmation sites pending |
 | B — Structural portfolio | 8–10 sites, 6+ families, 4 direct families, 3 OTAs | ⏳ |
 | C — Profile/policy portfolio | Complex scenarios on 2+ families | ⏳ |
 | D — Background product | Durable isolated jobs and safe handoff/resume equivalent to extension | ⏳ |

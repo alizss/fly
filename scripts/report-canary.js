@@ -154,8 +154,8 @@ function completeTransactionFacts(facts = {}) {
 function terminalTrace(traces) {
   return [...traces].reverse().find((trace) => (
     trace?.plannedAction?.type === "final_review"
-    || trace?.policyDecision?.code === "PAYMENT_REVIEW_REACHED"
-    || trace?.debug?.taskState?.terminalGoalLatch?.terminalStatus === "payment_review_reached"
+    || ["PAYMENT_REVIEW_REACHED", "PAYMENT_ENTRY_REACHED"].includes(trace?.policyDecision?.code)
+    || ["payment_review_reached", "payment_entry_reached"].includes(trace?.debug?.taskState?.terminalGoalLatch?.terminalStatus)
   )) || null;
 }
 
@@ -221,7 +221,7 @@ function summarizeCanary({ workDir = DEFAULT_WORK_DIR, sessionId, manualInterven
   const accepted = technicalPass && manualIntervention === "none";
   const handoffs = traces.filter((trace) => (
     ["ask_user", "request_input", "request_approval"].includes(trace?.plannedAction?.type)
-    && trace?.plannedAction?.intent !== "payment_review_reached"
+    && !["payment_review_reached", "payment_entry_reached"].includes(trace?.plannedAction?.intent)
   ));
 
   return {

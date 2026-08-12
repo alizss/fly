@@ -105,6 +105,7 @@ function createSessionService(agentSessionStore) {
         skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
         paymentApproved: false,
         paymentAuthorization: body.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
+        legalAuthorization: body.approvalState?.legalAuthorization || state.approvals?.legalAuthorization || null,
         priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
       }
     });

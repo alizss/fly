@@ -8,6 +8,7 @@ export function createCheckoutWatcher({
   destinationMutationSettleMs,
   getDestinationWait,
   hasFilledFields,
+  onExternalMaterialMutation = () => {},
   pageStateStore,
   refreshSidebarWarnings,
   scheduleDestinationObservation
@@ -32,6 +33,7 @@ export function createCheckoutWatcher({
           : mutation.target?.parentElement;
         return !target?.closest?.("#atw-sidebar, #atw-agent-cursor, .atw-agent-cursor");
       });
+      if (pageChanged && externalPageMutation) onExternalMaterialMutation(Date.now());
       if (pageChanged && externalPageMutation && getDestinationWait()?.status === "WAITING_FOR_DESTINATION") {
         scheduleDestinationObservation("dom_mutation", destinationMutationSettleMs);
       }

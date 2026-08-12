@@ -1244,15 +1244,15 @@ test("a persisted payment terminal latch suppresses planning on a later unrelate
   state.status = "ready_for_payment";
   state.terminalGoalLatch = {
     locked: true,
-    goalId: "reach_payment_review",
-    terminalStatus: "payment_review_reached",
+    goalId: "reach_payment_entry",
+    terminalStatus: "payment_entry_reached",
     completedObservationId: "obs_payment_complete",
     completionEvidence: "fresh_payment_evidence"
   };
   state.taskState = {
-    terminalStatus: "payment_review_reached",
+    terminalStatus: "payment_entry_reached",
     terminalGoalLatch: state.terminalGoalLatch,
-    goal: { id: "reach_payment_review", status: "completed" }
+    goal: { id: "reach_payment_entry", status: "completed" }
   };
   const redirected = observation("obs_after_terminal_redirect", {
     step: "extras",
@@ -1270,7 +1270,7 @@ test("a persisted payment terminal latch suppresses planning on a later unrelate
     actionHistory: []
   });
   assert.equal(result.clientDecision.action, "final_review");
-  assert.equal(result.clientDecision.intent, "payment_review_reached");
+  assert.equal(result.clientDecision.intent, "payment_entry_reached");
   assert.equal(result.state.status, "ready_for_payment");
   assert.equal(result.state.terminalGoalLatch.locked, true);
   assert.equal(result.debug.terminalGoalLatched, true);

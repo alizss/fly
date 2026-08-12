@@ -46,15 +46,15 @@ function stableOutcome(previous = {}, fallbackId = "", type = "") {
 function durableOutcomeHierarchy(previousTaskState = {}, stage = "unknown", terminalStatus = "active") {
   const transactionBase = stableOutcome(
     previousTaskState.transactionOutcome,
-    "transaction_outcome:checkout_to_payment_review",
-    "checkout_to_payment_review"
+    "transaction_outcome:checkout_to_payment_entry",
+    "checkout_to_payment_entry"
   );
   const stageBase = stableOutcome(
     previousTaskState.stageOutcome,
-    "stage_outcome:reach_payment_review",
-    "reach_payment_review"
+    "stage_outcome:reach_payment_entry",
+    "reach_payment_entry"
   );
-  const completed = terminalStatus === "payment_review_reached";
+  const completed = terminalStatus === "payment_entry_reached";
   const stageOutcome = Object.freeze({
     ...stageBase,
     parentOutcomeId: transactionBase.outcomeId,
@@ -62,16 +62,16 @@ function durableOutcomeHierarchy(previousTaskState = {}, stage = "unknown", term
     observedStage: stage,
     completionEvidence: completed ? "fresh_payment_evidence" : "",
     outcomeContract: outcomeContractForGoal({
-      semanticGoal: "reach payment review",
-      semanticType: "payment_review",
-      desiredValue: "payment_review_reached"
+      semanticGoal: "reach actual payment entry",
+      semanticType: "payment_entry",
+      desiredValue: "payment_entry_reached"
     })
   });
   const transactionOutcome = Object.freeze({
     ...transactionBase,
     status: completed ? "completed" : "active",
     activeStageOutcomeId: stageOutcome.outcomeId,
-    desiredOutcome: "payment_review_reached"
+    desiredOutcome: "payment_entry_reached"
   });
   return { transactionOutcome, stageOutcome };
 }
@@ -355,4 +355,3 @@ module.exports = {
   durableOutcomeHierarchy,
   surfaceClassFrom
 };
-

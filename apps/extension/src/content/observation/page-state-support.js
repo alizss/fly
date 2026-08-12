@@ -14,6 +14,7 @@ export function createPageStateSupport({ applyControlToModel, compactText }) {
     const stateFor = (control = {}) => ({
       checked: Boolean(control.state?.checked),
       selected: Boolean(control.state?.selected || control.selected),
+      pressed: Boolean(control.state?.pressed),
       disabled: Boolean(control.state?.disabled),
       expanded: Boolean(control.state?.expanded),
       valuePresent: Boolean(control.state?.valuePresent),
@@ -92,7 +93,7 @@ export function createPageStateSupport({ applyControlToModel, compactText }) {
       if (/^data-atw-/.test(mutation.attributeName || "")) return false;
       const materialAttributes = new Set([
         "checked", "selected", "value", "disabled", "required", "hidden", "open",
-        "aria-checked", "aria-selected", "aria-expanded", "aria-disabled", "aria-invalid",
+        "aria-checked", "aria-selected", "aria-pressed", "aria-expanded", "aria-disabled", "aria-invalid",
         "aria-hidden", "aria-valuenow", "data-price", "data-selected", "data-value"
       ]);
       if (materialAttributes.has(mutation.attributeName)) return true;

@@ -2,7 +2,7 @@ const { isCandidateGrounded } = require("../../../packages/shared/agent-actions"
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 const INTERACTION_ROLES = new Set(["choice", "command", "opener", "navigation", "field"]);
-const SEMANTIC_EFFECTS = new Set(["select", "waive", "open", "advance", "set_value"]);
+const SEMANTIC_EFFECTS = new Set(["select", "waive", "open", "advance", "set_value", "legal_acceptance", "advance_to_payment", "transaction_commit"]);
 const EXPECTED_EVIDENCE = new Set(["selected", "dismissed", "options_appeared", "progress_changed", "value_changed", "target_visible"]);
 const PHYSICAL_EFFECTS = new Set([
   "open_surface",
@@ -14,6 +14,9 @@ const PHYSICAL_EFFECTS = new Set([
   "advance_surface",
   "advance_checkout_stage",
   "accept_legal_terms",
+  "advance_to_payment",
+  "legal_acceptance_and_advance",
+  "transaction_commit",
   "enter_payment_credentials",
   "submit_purchase",
   "reveal_control",
@@ -26,6 +29,7 @@ const TASK_OUTCOMES = new Set([
   "current_surface_completed",
   "checkout_stage_advanced",
   "payment_review_reached",
+  "payment_entry_reached",
   "booking_confirmed"
 ]);
 const OUTCOME_COMPATIBILITY = Object.freeze({
@@ -66,6 +70,20 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
       taskOutcome: "profile_field_completed",
       acceptablePhysicalEffects: ["set_field_value", "filter_options", "open_surface", "reveal_control"],
       completionEvidence: ["normalized_value_changed", "logical_component_committed", "date_value_committed"]
+    });
+  }
+  if (/legal_attestation|legal_acceptance|accept the exact approved legal/.test(semantic)) {
+    return normalizedOutcomeContract({
+      taskOutcome: "current_surface_completed",
+      acceptablePhysicalEffects: ["accept_legal_terms"],
+      completionEvidence: ["exact_legal_control_selected"]
+    });
+  }
+  if (/payment_entry|reach actual payment|advance_to_payment/.test(semantic)) {
+    return normalizedOutcomeContract({
+      taskOutcome: "payment_entry_reached",
+      acceptablePhysicalEffects: ["advance_to_payment", "advance_checkout_stage", "open_surface", "reveal_control"],
+      completionEvidence: ["fresh_payment_entry", "payment_method_controls", "payment_credentials", "hosted_payment_widget"]
     });
   }
   if (/payment_review|reach payment|review before payment/.test(semantic)) {
@@ -231,13 +249,19 @@ function assessOutcomeCompatibility({
   if (obligationField(goal, "kind") === "adaptive_surface" && mechanicalEffect === "filter_options") {
     return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "bounded_filter_advances_owned_surface_discovery" };
   }
-  if (durableOutcome === "payment_review_reached" && ["submit_purchase", "enter_payment_credentials"].includes(mechanicalEffect)) {
+  if (["payment_review_reached", "payment_entry_reached"].includes(durableOutcome)
+    && ["submit_purchase", "transaction_commit", "enter_payment_credentials"].includes(mechanicalEffect)) {
     return { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "effect_exceeds_payment_review_objective" };
   }
   if (taskOutcome === "profile_field_completed") {
     return mechanicalEffect === "set_field_value"
       ? { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "field_postcondition_matches_obligation" }
       : { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "does_not_complete_profile_field" };
+  }
+  if (obligationField(goal, "semanticType") === "legal_attestation") {
+    return mechanicalEffect === "accept_legal_terms"
+      ? { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "exact_authorized_legal_attestation" }
+      : { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "does_not_complete_legal_attestation" };
   }
   if (["decision_resolved", "optional_extra_declined"].includes(taskOutcome)) {
     if (mechanicalEffect === "select_free_option") return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "exact_safe_choice_matches_decision" };
@@ -453,6 +477,9 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
   if (physicalEffect === "advance_checkout_stage") {
     return { ...existing, ...base, type: "checkout_stage_advanced" };
   }
+  if (physicalEffect === "advance_to_payment") {
+    return { ...existing, ...base, type: "payment_entry_reached" };
+  }
   if (physicalEffect === "advance_surface" || semantics.interactionRole === "navigation") {
     return { ...existing, ...base, type: "current_surface_advanced" };
   }
@@ -478,7 +505,7 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
     };
   }
   if (physicalEffect === "accept_legal_terms") {
-    return { ...existing, ...base, type: "control_selected", expectedSelectedControlId: base.controlId };
+    return { ...existing, ...base, type: "legal_attestation_accepted", expectedSelectedControlId: base.controlId };
   }
   if (physicalEffect === "submit_purchase") {
     return { ...existing, ...base, type: "booking_confirmed" };
@@ -511,6 +538,8 @@ function predictPhysicalEffect({ semantics = {}, control = {}, candidate = {}, g
   const goalContract = outcomeContractForGoal(goal, {
     page: { currentSurface: { type: candidate.surfaceType || control.surfaceType || "page" } }
   });
+  if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT) return "advance_to_payment";
+  if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE) return "accept_legal_terms";
   if (/submit_purchase|confirm_purchase|finalize_booking|book now|pay now|complete purchase/.test(meaning)) return "submit_purchase";
   if (/card_number|cardholder|security_code|cvc|cvv|expiry|payment credential/.test(meaning)) return "enter_payment_credentials";
   if (/accept_legal|accept terms|agree.*terms|legal consent/.test(meaning)) return "accept_legal_terms";
@@ -529,7 +558,7 @@ function predictPhysicalEffect({ semantics = {}, control = {}, candidate = {}, g
   if (semantics.interactionRole === "command") return "unknown";
   if (semantics.interactionRole === "navigation") {
     if (/payment|checkout stage|place order/.test(meaning)
-      || ["checkout_stage_advanced", "payment_review_reached", "booking_confirmed"].includes(goalContract.taskOutcome)) {
+      || ["checkout_stage_advanced", "payment_review_reached", "payment_entry_reached", "booking_confirmed"].includes(goalContract.taskOutcome)) {
       return "advance_checkout_stage";
     }
     return (candidate.surfaceType || control.surfaceType || "page") === "page"

@@ -2,7 +2,7 @@
 
 Fly is a universal, safety-constrained flight-checkout agent.
 
-The user selects a flight and traveler, starts Fly, and Fly completes an unfamiliar airline or OTA checkout according to the traveler profile and booking policy. The current product stops at verified payment review; it does not enter payment credentials, accept legal terms, or purchase.
+The user selects a flight and traveler, starts Fly, and Fly completes an unfamiliar airline or OTA checkout according to the traveler profile and booking policy. When a required legal attestation blocks progress, Fly obtains exact transaction-bound approval, verifies that attestation separately, and stops only after actual payment entry is visible. It does not enter payment credentials, click Pay, commit, or purchase.
 
 ## Product direction
 
@@ -28,9 +28,9 @@ Fly must:
 4. Adapt to unfamiliar but reversible controls and layouts.
 5. Verify every material state change from fresh browser evidence.
 6. Reconcile itinerary, traveler, selections, currency, and total.
-7. Reach verified payment review and stop safely.
+7. Reconcile pre-payment review, obtain exact legal approval when required, and verify actual payment entry before stopping safely.
 
-Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, or unusual grouping are not valid reasons to stop. Valid stops are missing user facts, authentication/challenges, consequential approval, transaction contradiction, website failure, exhausted safe mechanics, or the payment/legal/purchase boundary.
+Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, or unusual grouping are not valid reasons to stop. Valid pauses/stops are missing user facts, authentication/challenges, exact legal or consequential approval, transaction contradiction, website failure, exhausted safe mechanics, verified payment entry, or a forbidden payment/purchase boundary.
 
 ## Runtime model
 
@@ -49,11 +49,12 @@ The model is optional and bounded. Deterministic singleton mechanics use zero mo
 
 ## Current evidence
 
-- 359/359 agent unit tests
-- 169/169 uninterrupted browser replays
-- Fresh technical payment-review passes on EasyJet, GoToGate, Kiwi, and Turkish Airlines
-- No payment, card, legal, or purchase action in the accepted review-only flows
-- Next product gate: expand from four live sites to a representative structural portfolio
+- 379/379 agent unit tests
+- 175/175 uninterrupted browser replays
+- Complete approval → legal attestation → advance → payment-entry replay proof
+- Prior technical review passes on EasyJet, GoToGate, Kiwi, and Turkish Airlines; fresh expanded-milestone canaries remain required
+- No payment credentials, Pay, transaction commit, or purchase capability
+- Next product gate: live-prove actual payment entry, then expand to a representative structural portfolio
 
 A broad `99%` claim requires a defined eligible scope and approximately 300 representative journeys across sites, structural families, routes, dates, currencies, and scenarios.
 

@@ -159,6 +159,93 @@ test("a decision obligation cannot admit navigation that its success condition c
   });
 });
 
+test("an authorized legal obligation binds its exact admitted checkbox without forward-label reinterpretation", () => {
+  const terms = {
+    controlId: "legal_terms",
+    stateElementId: "terms_input",
+    preferredActivationElementId: "terms_label",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_legal",
+    label: "I agree with the conditions of carriage",
+    semantic: "choice",
+    physicalEffect: "unknown",
+    risk: "uncertain",
+    kind: "checkbox",
+    role: "checkbox",
+    operations: { choose: actionable("choose", "terms_label") },
+    state: { checked: false, selected: false }
+  };
+  const confirm = {
+    controlId: "confirm",
+    stateElementId: "confirm_button",
+    preferredActivationElementId: "confirm_button",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    label: "CONFIRM",
+    semantic: "navigation",
+    physicalEffect: "advance_checkout_stage",
+    risk: "safe",
+    kind: "button",
+    role: "button",
+    operations: { activate: actionable("activate", "confirm_button") },
+    state: { disabled: false }
+  };
+  const observation = {
+    observationId: "obs_exact_legal",
+    observationSnapshot: { snapshotHash: "hash_exact_legal" },
+    page: {
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+      controls: [terms, confirm],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+  const authorization = {
+    contractVersion: "legal-authorization/v1",
+    authorizationId: "legal_auth_exact",
+    transactionId: "txn_exact_legal",
+    legalTextDigest: "digest_exact_legal",
+    legalControlId: "legal_terms",
+    expiresAt: Date.now() + 60_000
+  };
+  const obligation = currentObligationFromGoal({
+    goal: {
+      goalId: "goal_exact_legal",
+      kind: "legal_attestation",
+      semanticType: "legal_attestation",
+      semanticEffect: agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE,
+      semanticGoal: "accept the exact approved legal attestation",
+      desiredValue: "accepted",
+      controlId: "legal_terms",
+      actionableControlIds: ["legal_terms"],
+      surfaceId: "surface-page",
+      observationId: observation.observationId,
+      authorization,
+      riskClass: "legal",
+      postcondition: {
+        type: "legal_attestation_accepted",
+        controlId: "legal_terms",
+        authorizationId: authorization.authorizationId,
+        legalTextDigest: authorization.legalTextDigest
+      }
+    }
+  });
+
+  const candidateSet = bindMechanics({
+    obligation,
+    observation,
+    state: { id: authorization.transactionId, taskState: { currentObligation: obligation }, approvals: { legalAuthorization: authorization } },
+    approvals: { legalAuthorization: authorization }
+  });
+
+  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["legal_terms"]);
+  assert.equal(candidateSet.candidates[0].mechanicalEffect, "accept_legal_terms");
+  assert.equal(candidateSet.candidates[0].risk, "legal");
+  assert.equal(candidateSet.contextCapabilities.some((candidate) => candidate.controlId === "confirm"), false);
+});
+
 test("shared semantic effects canonicalize legacy free-choice vocabulary", () => {
   assert.equal(
     agentContract.canonicalSemanticEffect("selected_free_option"),
