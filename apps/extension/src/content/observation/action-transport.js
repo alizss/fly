@@ -71,12 +71,14 @@ export function createActionTransport({ compactText, compactChoiceCommitEvidence
       executed: result.executed === true,
       verified: result.verified === true,
       failureCode: String(result.failureCode || outcome.code || ""),
+      failureScope: String(result.failureScope || outcome.failureScope || ""),
       action: compactActionTransportValue(result.action || {}),
       targetSnapshot: compactActionTransportValue(result.targetSnapshot || {}),
       expectedOutcome: compactActionTransportValue(result.expectedOutcome || {}),
       outcome: {
         ok: outcome.ok === true,
         code: String(outcome.code || result.failureCode || ""),
+        failureScope: String(outcome.failureScope || result.failureScope || ""),
         message: compactText(outcome.message || "", 600),
         feedback: compactActionTransportValue(outcome.feedback || {}),
         evidence: {

@@ -40,7 +40,13 @@ function emptyExecutionEpisode() {
     awaitingClarification: false,
     awaitingDestination: false,
     navigation: false,
+    navigationEpisodeId: "",
+    navigationStatus: "",
     origin: null,
+    sourceDocument: null,
+    destinationDocument: null,
+    destinationObservation: null,
+    expectedPostcondition: null,
     destinationReadiness: null,
     resultCode: "",
     transitionStatus: "",
@@ -100,6 +106,20 @@ function normalizeExecutionEpisode(raw = null) {
     awaitingClarification: source.awaitingClarification === true,
     awaitingDestination: source.awaitingDestination === true,
     navigation: source.navigation === true,
+    navigationEpisodeId: String(source.navigationEpisodeId || ""),
+    navigationStatus: String(source.navigationStatus || ""),
+    sourceDocument: source.sourceDocument && typeof source.sourceDocument === "object"
+      ? { ...source.sourceDocument }
+      : null,
+    destinationDocument: source.destinationDocument && typeof source.destinationDocument === "object"
+      ? { ...source.destinationDocument }
+      : null,
+    destinationObservation: source.destinationObservation && typeof source.destinationObservation === "object"
+      ? { ...source.destinationObservation }
+      : null,
+    expectedPostcondition: source.expectedPostcondition && typeof source.expectedPostcondition === "object"
+      ? { ...source.expectedPostcondition }
+      : null,
     attempts: Math.max(0, Number(source.attempts || 0)),
     phase: String(source.phase || "idle"),
     stateHash: String(source.stateHash || ""),

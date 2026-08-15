@@ -26,7 +26,7 @@ export function createAgentLifecycle({
   function isDestinationReadinessDecision(decision = {}) {
     if (decision.action !== "wait") return false;
     const intent = `${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase();
-    return /wait_for_ready_observation|wait_for_dispatched_stage_exit|reobserve_after_transient_observation|reobserve_degraded_loading_destination|reobserve_after_grounding_rejection|task_state_reobserve/.test(intent)
+    return /wait_for_ready_observation|wait_for_dispatched_stage_exit|reobserve_after_transient_observation|reobserve_degraded_loading_destination|reobserve_after_grounding_rejection|reobserve_after_strategy_exhaustion|task_state_reobserve/.test(intent)
       || (decision.expectedPostconditions || []).some((postcondition) => (
         postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
       ));
@@ -70,7 +70,7 @@ export function createAgentLifecycle({
     const existing = agent.destinationWait;
     const backendStartedAt = Number(decision.readinessStartedAt || 0);
     const backendDeadlineAt = Number(decision.readinessDeadlineAt || 0);
-    const taskStateWait = /task_state_reobserve/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
+    const taskStateWait = /task_state_reobserve|reobserve_after_strategy_exhaustion|reobserve_after_grounding_rejection/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
     const dispatchedStageExitWait = /wait_for_dispatched_stage_exit/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
     const retryToken = String(decision.reobserveRetryToken || "");
     const dispatchedAt = Number(decision.dispatchedAt || 0);
@@ -91,6 +91,7 @@ export function createAgentLifecycle({
       deadlineObservationSent: Boolean(existing?.deadlineObservationSent),
       observationId: decision.observationId || existing?.observationId || "",
       actionId: decision.actionId || decision.id || existing?.actionId || "",
+      navigationEpisodeId: String(decision.navigationEpisodeId || existing?.navigationEpisodeId || ""),
       retryToken: retryToken || existing?.retryToken || ""
     };
     setAgentActivity(

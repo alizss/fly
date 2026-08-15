@@ -123,15 +123,19 @@ function boundedPaidAuthorization(action = {}, merged = {}) {
 
 function boundedLegalAuthorization(action = {}, state = {}, merged = {}) {
   const embedded = action.affordance?.authorization || null;
-  const authorization = embedded?.authorizationId ? embedded : merged.legalAuthorization;
+  const authorization = embedded?.authorizationId ? embedded : null;
   const controlId = String(action.controlId || action.targetSnapshot?.controlId || "");
   const expected = action.expectedOutcome || action.expectedPostconditions?.[0] || {};
-  if (authorization?.contractVersion !== "legal-authorization/v1") return null;
+  if (!["legal-authorization/v1", "mandate-attestation-authorization/v1"].includes(authorization?.contractVersion)) return null;
   if (!authorization.authorizationId || authorization.authorizationId !== expected.authorizationId) return null;
   if (authorization.transactionId && state?.id && authorization.transactionId !== state.id) return null;
   if (!controlId || authorization.legalControlId !== controlId) return null;
   if (!authorization.legalTextDigest || authorization.legalTextDigest !== expected.legalTextDigest) return null;
-  if (Number(authorization.expiresAt || 0) < Date.now()) return null;
+  if (authorization.contractVersion === "legal-authorization/v1" && Number(authorization.expiresAt || 0) < Date.now()) return null;
+  if (authorization.contractVersion === "mandate-attestation-authorization/v1") {
+    if (!authorization.checkoutMandateId || authorization.source !== "checkout_mandate") return null;
+    if (!authorization.sceneItemId || authorization.sceneItemId !== String(action.sceneItemId || action.affordance?.task?.sceneItemId || "")) return null;
+  }
   return authorization;
 }
 
@@ -179,7 +183,7 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
   if (looksLikeLegalAcceptance(action)) {
     const authorization = boundedLegalAuthorization(action, state, merged);
     if (!authorization) {
-      return { allow: false, decision: "ask_user", reason: "This exact legal attestation is not covered by a current transaction-bound approval." };
+      return { allow: false, decision: "ask_user", reason: "This attestation is not covered by the current CheckoutMandate and requires an exceptional handoff." };
     }
     return {
       allow: true,

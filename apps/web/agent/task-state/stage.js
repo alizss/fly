@@ -190,7 +190,7 @@ function decideStage(observation = {}) {
   if (paymentDestination) return { stage: "payment", evidence };
   if (evidence.confirmation) return { stage: "confirmation", evidence };
   // A high-confidence scene correction has already been grounded to current
-  // control IDs and admitted into the one DecisionFrame. It outranks the
+  // control IDs and admitted into the one CheckoutScene. It outranks the
   // browser's contradictory keyword classification, but it still does not
   // prove terminal completion or authorize any action.
   if (groundedStage) return { stage: groundedStage, evidence: { ...evidence, semanticSceneStage: groundedStage } };
@@ -202,7 +202,7 @@ function decideStage(observation = {}) {
   if (evidence.extrasRoute) return { stage: "extras", evidence };
   if (evidence.strongExtras) return { stage: "extras", evidence };
   // The browser's current-step observation is evidence compiled into the one
-  // DecisionFrame, not a durable authority. When it agrees with active local
+  // CheckoutScene, not a durable authority. When it agrees with active local
   // evidence it outranks stale route text and disabled controls retained by a
   // single-page checkout shell (for example /traveler-details on a seat step).
   if (declaredStage === "seats" && evidence.seat) return { stage: "seats", evidence };

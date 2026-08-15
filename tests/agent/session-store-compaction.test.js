@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 
 const { compactSessionState, createStore } = require("../../apps/web/agent/session-store");
 const { createCheckoutSessionState, withUpdate } = require("../../packages/shared/agent-state");
+const { createCheckoutMandate } = require("../../packages/shared/checkout-mandate");
 const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 const { leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
 
@@ -13,7 +14,15 @@ test("session persistence keeps semantic facts and removes ephemeral candidate g
     label: `Option ${index} ${"large context ".repeat(120)}`,
     operations: { activate: { actuatorId: `node_${index}`, strategies: [{ id: `strategy_${index}` }] } }
   }));
+  const checkoutMandate = createCheckoutMandate({
+    contractVersion: "selected-booking/v1",
+    selectionId: "selected_session_compaction",
+    itinerary: { segments: [{ origin: "ZAG", destination: "SJJ", departureDate: "2026-09-15" }] },
+    approvedTotal: { amount: 141.62, currency: "EUR" },
+    travelerIds: ["trav_session_compaction"]
+  });
   const state = withUpdate(createCheckoutSessionState({ goal: "Reach payment review" }), {
+    checkoutMandate,
     aiDecisionCache: { candidateSelection: { controls } },
     currentObservation: { page: { controls } },
     diagnosticReadModel: { controls },
@@ -60,6 +69,7 @@ test("session persistence keeps semantic facts and removes ephemeral candidate g
   assert.equal(persisted.taskState.previousActionResult, undefined);
   assert.equal(persisted.taskState.activeDecisions, undefined);
   assert.equal(persisted.taskState.disposition.kind, "execute");
+  assert.deepEqual(persisted.checkoutMandate, checkoutMandate);
   assert.equal(persisted.taskState.verificationDecisionMemory[0].status, "satisfied");
   assert.ok(Buffer.byteLength(raw) < 30_000, `persisted state was ${Buffer.byteLength(raw)} bytes`);
 });

@@ -91,6 +91,24 @@ function semanticTypesFromLabel(value = "") {
   if (/meal preference|special meal|meal request/.test(evidence)) add("meal_preference");
   if (/special assistance|assistance request|accessibility request/.test(evidence)) add("special_assistance");
   if (/purpose of (?:the )?(?:trip|travel|journey)|(?:trip|travel|journey) purpose|reason for (?:the )?(?:trip|travel|journey)|business or leisure|travell?ing for (?:business|leisure)/.test(evidence)) add("travel_purpose");
+  // Billing/contact forms frequently expose only their local label or name.
+  // Admit those universal address facts here so they enter CheckoutScene as
+  // profile obligations instead of falling through as unknown choices.
+  if (/(?:address|street)[ _-]?(?:line )?(?:2|two)\b|\baddress2\b|\b(?:apartment|apt|unit|suite)\b/.test(evidence)) {
+    add("address_line2");
+  } else if (/(?:^|[\s_-])(?:billing[ _-]?)?(?:street[ _-]?address|address(?:[ _-]?(?:line )?1)?|address1)(?:$|[\s_-])/.test(evidence)) {
+    add("address_line1");
+  }
+  if (/(?:^|[\s_-])(?:billing[ _-]?)?(?:city|town|locality)(?:$|[\s_-])/.test(evidence)
+    && !/birth[ _-]?city/.test(evidence)) add("city");
+  if (/(?:^|[\s_-])(?:billing[ _-]?)?(?:state|province|region)(?:$|[\s_-])/.test(evidence)) add("state");
+  if (/(?:^|[\s_-])(?:billing[ _-]?)?(?:postal[ _-]?(?:code)?|post[ _-]?code|zip(?:[ _-]?code)?)(?:$|[\s_-])/.test(evidence)) {
+    add("postal_code");
+  }
+  if (/(?:^|[\s_-])(?:billing[ _-]?|address[ _-]?)?country(?:[ _-]?name)?(?:$|[\s_-])/.test(evidence)
+    && !/(?:country|dial|calling)[ _-]?code|country of residence|residence country|resident country|nationality|citizenship|issuing|issue country/.test(evidence)) {
+    add("country");
+  }
   if (/(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(evidence)) add("title");
   if (/(?:^|\s)(?:gender|sex)(?:\s|$)/.test(evidence)) add("gender");
   if (/(?:^|\s)(?:country|dial|calling)[ _-]?code(?:\s|$)/.test(evidence)) add("phone_country_code");
@@ -790,6 +808,17 @@ function canonicalOptionMatch(semanticType = "", role = "", desiredValue = "", o
   if (semanticType === "age_at_departure") {
     return raw.some((value) => ageOptionContains(value, desiredValue, questionEvidence));
   }
+  const normalizedSemanticType = normalizeProfileFieldType(semanticType) || semanticType;
+  if (["country", "country_of_residence", "nationality", "issuing_country"].includes(normalizedSemanticType)) {
+    // Profiles normally store ISO codes while checkout controls commonly
+    // expose localized country names. The option is still exact observed
+    // evidence; compatibility only normalizes its representation.
+    return raw.some((value) => agentContract.profileChoiceValueCompatible(
+      value,
+      desiredValue,
+      normalizedSemanticType
+    ));
+  }
   return raw.some((value) => canonicalValue(semanticType, value) === desiredValue);
 }
 
@@ -869,6 +898,18 @@ function componentSelectionTerms(semanticType = "", role = "value", desiredValue
   if (semanticType === "phone_country_code") {
     terms.push(String(desiredValue || "").replace(/\D/g, ""));
   }
+  if (["country", "country_of_residence", "nationality", "issuing_country"].includes(semanticType)
+    && /^[a-z]{2}$/i.test(String(desiredValue || ""))) {
+    const code = String(desiredValue).toUpperCase();
+    for (const locale of ["en"]) {
+      try {
+        const label = new Intl.DisplayNames([locale], { type: "region" }).of(code);
+        if (label) terms.push(label);
+      } catch (_) {
+        // The exact ISO term remains available without Intl.DisplayNames.
+      }
+    }
+  }
   return [...new Set(terms
     .map((value) => String(value || "").trim().toLowerCase())
     .filter(Boolean))];
@@ -903,9 +944,21 @@ function bindResolvedComponentToCurrentPage(page = {}, resolved = {}) {
     .map((control) => ({ control, score: optionMatchScore(control, terms, surface) }))
     .filter((item) => item.score > 0)
     .sort((left, right) => right.score - left.score);
-  if (!ranked.length || (ranked[1] && ranked[0].score === ranked[1].score)) return null;
+  const exactOptionIsUnique = Boolean(ranked.length && !(ranked[1] && ranked[0].score === ranked[1].score));
+  const searchMechanics = (page.controls || []).filter((control) => (
+    (!surface.id || !control.surfaceId || control.surfaceId === surface.id)
+    && control.role === "editable_combobox"
+    && control.operations?.type
+    && /\b(?:search|filter|find)\b/i.test(`${control.label || ""} ${control.accessibleName || ""}`)
+  ));
+  // Prefer the exact outcome control. If a virtualized/custom list has not
+  // rendered it yet, its single owned search box is a discovery mechanic for
+  // the same obligation; typing the exact semantic label causes the outcome
+  // option to appear on the next scene.
+  const usingSearchMechanic = !exactOptionIsUnique && searchMechanics.length === 1;
+  if (!exactOptionIsUnique && !usingSearchMechanic) return null;
 
-  const control = ranked[0].control;
+  const control = exactOptionIsUnique ? ranked[0].control : searchMechanics[0];
   const observedContract = agentContract.observedComponentContract(control, {
     surfaceId: control.surfaceId || surface.id || ""
   });
@@ -941,7 +994,8 @@ function bindResolvedComponentToCurrentPage(page = {}, resolved = {}) {
     capabilityContracts,
     expectedOutcome,
     validationOwnership: resolved.validationOwnership || null,
-    observedOption: true,
+    observedOption: exactOptionIsUnique,
+    searchMechanic: usingSearchMechanic,
     selectionTerms: Object.freeze([...terms]),
     inputValue: resolved.inputValue || resolved.desiredValue || "",
     pipelineBinding: Object.freeze(agentContract.canonicalPipelineContract({

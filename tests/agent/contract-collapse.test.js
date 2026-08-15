@@ -2,10 +2,11 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const vm = require("node:vm");
 
 const { toClientDecision } = require("../../apps/web/agent/loop");
 const { actionFromLease, normalizeAction } = require("../../packages/shared/agent-actions");
-const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { legacyCurrentObligationFromGoal: currentObligationFromGoal } = require("./legacy-scene-item-adapter");
 const { leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { normalizeExecutionEpisode } = require("../../apps/web/agent/execution-episode");
 const {
@@ -482,6 +483,232 @@ test("extension controller modules own session, backend decisions, and checkout 
   assert.match(checkout, /function processCheckoutAgent\s*\(/);
 });
 
+test("active checkout continuity follows one armed governed navigation across same-tab, child, noopener, or replaced destinations", () => {
+  const root = path.resolve(__dirname, "../..");
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "apps/extension/manifest.json"), "utf8"));
+  const worker = fs.readFileSync(path.join(root, "apps/extension/src/background/service-worker.js"), "utf8");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const session = fs.readFileSync(path.join(root, "apps/extension/src/content/controller/session-client.js"), "utf8");
+
+  assert.ok(manifest.permissions.includes("scripting"));
+  assert.ok(manifest.permissions.includes("webNavigation"));
+  assert.ok(manifest.host_permissions.includes("<all_urls>"));
+  assert.match(worker, /chrome\.tabs\.onCreated\.addListener/);
+  assert.match(worker, /tab\.openerTabId/);
+  assert.match(worker, /chrome\.tabs\.onUpdated\.addListener/);
+  assert.match(worker, /chrome\.tabs\.onReplaced\.addListener/);
+  assert.match(worker, /chrome\.webNavigation\.onCreatedNavigationTarget\.addListener/);
+  assert.match(worker, /chrome\.webNavigation\.onCommitted\.addListener/);
+  assert.match(worker, /chrome\.webNavigation\.onHistoryStateUpdated\.addListener/);
+  assert.match(worker, /chrome\.webNavigation\.onReferenceFragmentUpdated\.addListener/);
+  assert.match(worker, /chrome\.webNavigation\.onDOMContentLoaded\.addListener/);
+  assert.match(worker, /const directSource = newest/);
+  assert.match(worker, /routeForCommittedNavigation\(details\)[\s\S]*injectActiveCheckout/);
+  assert.match(worker, /ATW_ARM_NAVIGATION_EPISODE/);
+  assert.match(worker, /ATW_CLAIM_NAVIGATION_EPISODE/);
+  assert.match(worker, /navigationEpisodeKey/);
+  assert.match(worker, /chrome\.scripting\.executeScript/);
+  assert.match(runtime, /__ATW_CONTENT_BOOTING__/);
+  assert.match(runtime, /activateNavigationEpisode/);
+  assert.match(runtime, /armCheckoutHandoff/);
+  assert.match(runtime, /claimNavigationEpisode/);
+  assert.doesNotMatch(runtime, /atwAgentResume/);
+  assert.match(session, /action\.report\.navigation_ack_deferred/);
+});
+
+test("an action-scoped navigation episode is pulled by an active noopener destination without a global resume marker", async () => {
+  const root = path.resolve(__dirname, "../..");
+  const workerSource = fs.readFileSync(path.join(root, "apps/extension/src/background/service-worker.js"), "utf8");
+  const storage = {};
+  const listeners = {};
+  const local = {
+    async get(keys) {
+      const requested = Array.isArray(keys) ? keys : [keys];
+      return Object.fromEntries(requested
+        .filter((key) => Object.prototype.hasOwnProperty.call(storage, key))
+        .map((key) => [key, storage[key]]));
+    },
+    async set(values) {
+      Object.assign(storage, values || {});
+    },
+    async remove(keys) {
+      for (const key of (Array.isArray(keys) ? keys : [keys])) delete storage[key];
+    }
+  };
+  const chrome = {
+    storage: { local },
+    runtime: {
+      lastError: null,
+      onInstalled: { addListener(listener) { listeners.installed = listener; } },
+      onMessage: { addListener(listener) { listeners.message = listener; } }
+    },
+    tabs: {
+      onCreated: { addListener(listener) { listeners.created = listener; } },
+      onUpdated: { addListener(listener) { listeners.updated = listener; } },
+      onReplaced: { addListener(listener) { listeners.replaced = listener; } },
+      onRemoved: { addListener(listener) { listeners.removed = listener; } },
+      async get() { return null; },
+      async sendMessage() { return { ok: true }; },
+      captureVisibleTab() {}
+    },
+    webNavigation: {
+      onCreatedNavigationTarget: { addListener(listener) { listeners.createdNavigationTarget = listener; } },
+      onCommitted: { addListener(listener) { listeners.committed = listener; } },
+      onHistoryStateUpdated: { addListener(listener) { listeners.historyStateUpdated = listener; } },
+      onReferenceFragmentUpdated: { addListener(listener) { listeners.referenceFragmentUpdated = listener; } },
+      onDOMContentLoaded: { addListener(listener) { listeners.domContentLoaded = listener; } }
+    },
+    scripting: {
+      async insertCSS() {},
+      async executeScript() {}
+    },
+    debugger: {
+      attach() {},
+      sendCommand() {},
+      detach() {}
+    }
+  };
+  vm.runInNewContext(workerSource, { chrome, Date, Number, String, Boolean, RegExp, setTimeout, clearTimeout });
+
+  const episode = {
+    episodeId: "navigation:chk_noopener:act_confirm",
+    travelerId: "trav_noopener",
+    sessionId: "chk_noopener",
+    actionId: "act_confirm",
+    observationId: "obs_review",
+    deadlineAt: Date.now() + 120000
+  };
+  const armed = await new Promise((resolve) => {
+    listeners.message({
+      type: "ATW_ARM_NAVIGATION_EPISODE",
+      episode
+    }, {
+      documentId: "document_source",
+      tab: { id: 11, windowId: 3, url: "https://booking.example/review" }
+    }, resolve);
+  });
+  assert.equal(armed?.ok, true);
+  assert.equal(armed?.armed, true);
+
+  const unrelated = await new Promise((resolve) => {
+    listeners.message({ type: "ATW_CLAIM_NAVIGATION_EPISODE" }, {
+      documentId: "document_unrelated",
+      tab: { id: 99, windowId: 8, url: "https://unrelated.example/" }
+    }, resolve);
+  });
+  assert.equal(unrelated?.episode, null);
+
+  listeners.created({
+    id: 12,
+    windowId: 3,
+    active: true,
+    url: "https://payments.example/setup"
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  listeners.committed({
+    tabId: 12,
+    frameId: 0,
+    documentId: "document_destination",
+    url: "https://payments.example/setup"
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const claimed = await new Promise((resolve) => {
+    listeners.message({ type: "ATW_CLAIM_NAVIGATION_EPISODE" }, {
+      documentId: "document_destination",
+      tab: { id: 12, windowId: 3, url: "https://payments.example/setup" }
+    }, resolve);
+  });
+  assert.equal(claimed?.ok, true);
+  assert.equal(claimed?.episode?.episodeId, episode.episodeId);
+  assert.equal(claimed?.episode?.sessionId, episode.sessionId);
+  assert.equal(claimed?.episode?.actionId, episode.actionId);
+  assert.equal(claimed?.destination?.documentId, "document_destination");
+  assert.equal(Object.keys(storage).some((key) => key === "atwAgentResume"), false);
+
+  // The first claimed page can be a short-lived handoff. A new top-level
+  // document in the same routed tab must inherit the same episode until the
+  // usable destination explicitly reports readiness.
+  listeners.committed({
+    tabId: 12,
+    frameId: 0,
+    documentId: "document_destination_final",
+    url: "https://payments.example/form"
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const redirectClaim = await new Promise((resolve) => {
+    listeners.message({
+      type: "ATW_CLAIM_NAVIGATION_EPISODE",
+      claimantId: "controller_destination_final"
+    }, {
+      documentId: "document_destination_final",
+      tab: { id: 12, windowId: 3, url: "https://payments.example/form" }
+    }, resolve);
+  });
+  assert.equal(redirectClaim?.episode?.episodeId, episode.episodeId);
+  assert.equal(redirectClaim?.destination?.documentId, "controller_destination_final");
+
+  const ready = await new Promise((resolve) => {
+    listeners.message({
+      type: "ATW_NAVIGATION_DESTINATION_READY",
+      episodeId: episode.episodeId,
+      claimantId: "controller_destination_final"
+    }, {
+      documentId: "document_destination_final",
+      tab: { id: 12, windowId: 3, url: "https://payments.example/form" }
+    }, resolve);
+  });
+  assert.equal(ready?.ready, true);
+
+  listeners.committed({
+    tabId: 12,
+    frameId: 0,
+    documentId: "document_after_ready",
+    url: "https://unrelated.example/"
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const afterReadyClaim = await new Promise((resolve) => {
+    listeners.message({ type: "ATW_CLAIM_NAVIGATION_EPISODE" }, {
+      documentId: "document_after_ready",
+      tab: { id: 12, windowId: 3, url: "https://unrelated.example/" }
+    }, resolve);
+  });
+  assert.equal(afterReadyClaim?.episode, null);
+
+  const secondEpisode = {
+    ...episode,
+    episodeId: "navigation:chk_noopener:act_payment_continue",
+    actionId: "act_payment_continue",
+    observationId: "obs_payment_setup"
+  };
+  const secondArmed = await new Promise((resolve) => {
+    listeners.message({ type: "ATW_ARM_NAVIGATION_EPISODE", episode: secondEpisode }, {
+      documentId: "document_destination_final",
+      tab: { id: 12, windowId: 3, url: "https://payments.example/form" }
+    }, resolve);
+  });
+  assert.equal(secondArmed?.armed, true);
+  listeners.committed({
+    tabId: 12,
+    frameId: 0,
+    documentId: "document_hosted_payment",
+    url: "https://hosted-payments.example/card"
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const secondClaim = await new Promise((resolve) => {
+    listeners.message({ type: "ATW_CLAIM_NAVIGATION_EPISODE" }, {
+      documentId: "document_hosted_payment",
+      tab: { id: 12, windowId: 3, url: "https://hosted-payments.example/card" }
+    }, resolve);
+  });
+  assert.equal(secondClaim?.episode?.episodeId, secondEpisode.episodeId);
+  assert.equal(secondClaim?.episode?.actionId, secondEpisode.actionId);
+  assert.notEqual(secondClaim?.episode?.actionId, episode.actionId);
+});
+
 test("extension sidebar module owns rendering and diagnostic presentation", () => {
   const root = path.resolve(__dirname, "../..");
   const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
@@ -546,7 +773,7 @@ test("web server remains a composition root instead of a second agent authority"
   }
 });
 
-test("TaskState modules preserve one reducer authority behind the compatibility facade", () => {
+test("TaskState modules preserve one CheckoutScene reducer authority behind the compatibility facade", () => {
   const root = path.resolve(__dirname, "../..");
   const facade = fs.readFileSync(path.join(root, "apps/web/agent/task-state-reducer.js"), "utf8");
   const reducer = fs.readFileSync(path.join(root, "apps/web/agent/task-state/reducer.js"), "utf8");
@@ -560,10 +787,10 @@ test("TaskState modules preserve one reducer authority behind the compatibility 
   ].map((file) => fs.readFileSync(path.join(root, "apps/web/agent/task-state", file), "utf8"));
 
   assert.match(facade, /module\.exports = require\("\.\/task-state\/reducer"\)/);
-  assert.doesNotMatch(facade, /function reduceDecisionFrame\s*\(/);
-  assert.match(reducer, /function reduceDecisionFrame\s*\(/);
+  assert.doesNotMatch(facade, /function reduceCheckoutScene\s*\(/);
+  assert.match(reducer, /function reduceCheckoutScene\s*\(/);
   for (const moduleSource of modules) {
-    assert.doesNotMatch(moduleSource, /function reduceDecisionFrame\s*\(/);
+    assert.doesNotMatch(moduleSource, /function reduceCheckoutScene\s*\(/);
   }
 });
 

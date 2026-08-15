@@ -14,7 +14,7 @@ async function resolveAmbiguity(request = {}) {
     return Object.freeze({
       kind: "semantic_scene",
       reconciliation: result.reconciliation || null,
-      observation: result.observation,
+      scenePatch: result.scenePatch || null,
       meta: result.meta || null
     });
   }

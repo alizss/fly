@@ -265,6 +265,190 @@ test("navigation lifecycle closes on the first mechanically usable destination f
     observationReadiness: ready
   });
   assert.equal(ready.classification, READINESS.READY);
-  assert.equal(closed.transition.status, "progressed");
+  assert.equal(closed.transition.status, "observed_change");
   assert.equal(closed.lifecycle.closed, true);
+});
+
+test("an action-scoped navigation episode cannot be negatively closed by its still-usable source document", () => {
+  const action = {
+    id: "act_cross_document",
+    observationId: "obs_source",
+    type: "click",
+    intent: "navigate_stage",
+    mechanicalEffect: "advance_to_payment",
+    expectedOutcome: { type: "payment_entry_reached" }
+  };
+  const before = observation({
+    id: "obs_source",
+    url: "https://booking.example/review",
+    controls: [{ controlId: "confirm", operations: operation("confirm_node") }]
+  });
+  const pendingResult = {
+    actionId: action.id,
+    dispatched: true,
+    executed: true,
+    action,
+    failureCode: "NAVIGATION_TRANSITION_PENDING"
+  };
+  const sourceAfterDispatch = observation({
+    id: "obs_source_after_dispatch",
+    url: "https://booking.example/review",
+    controls: [{ controlId: "confirm", operations: operation("confirm_node") }],
+    lastActionResult: pendingResult
+  });
+  const ready = classifyObservationReadiness({
+    observation: sourceAfterDispatch,
+    navigationContext: {
+      result: pendingResult,
+      lifecycle: { actionId: action.id, dispatched: true, closed: false, awaitingDestination: true }
+    }
+  });
+  const advanced = advanceActionLifecycle({
+    state: {
+      lastAction: action,
+      executionEpisode: {
+        actionId: action.id,
+        observationId: before.observationId,
+        navigation: true,
+        navigationEpisodeId: `navigation:session:${action.id}`,
+        navigationStatus: "ARMED",
+        status: "navigation_armed",
+        dispatched: false,
+        closed: false,
+        awaitingDestination: true,
+        sourceDocument: { documentId: "source_document", url: before.page.url },
+        destinationDocument: null
+      }
+    },
+    observation: sourceAfterDispatch,
+    previousObservation: before,
+    observationReadiness: ready
+  });
+
+  assert.equal(ready.classification, READINESS.READY);
+  assert.equal(advanced.transition, null);
+  assert.equal(advanced.directive, "reobserve_destination");
+  assert.equal(advanced.lifecycle.status, "waiting_for_destination");
+  assert.equal(advanced.lifecycle.navigationStatus, "DISPATCHED");
+  assert.equal(advanced.lifecycle.closed, false);
+  assert.equal(advanced.lifecycle.awaitingDestination, true);
+});
+
+test("a stale controller result cannot replace the action owned by an open navigation episode", () => {
+  const currentAction = {
+    id: "act_provider_continue",
+    observationId: "obs_payment_setup",
+    type: "click",
+    intent: "navigate_stage",
+    mechanicalEffect: "advance_to_payment",
+    expectedOutcome: { type: "payment_entry_reached" }
+  };
+  const staleAction = {
+    id: "act_previous_confirm",
+    observationId: "obs_review",
+    type: "click",
+    intent: "navigate_stage",
+    mechanicalEffect: "advance_checkout_stage"
+  };
+  const current = observation({
+    id: "obs_payment_setup_after_dispatch",
+    url: "https://airline.example/PaymentForm",
+    controls: [{ controlId: "continue", operations: operation("continue_node") }],
+    lastActionResult: {
+      actionId: staleAction.id,
+      dispatched: true,
+      executed: true,
+      action: staleAction,
+      failureCode: "NAVIGATION_TRANSITION_PENDING"
+    }
+  });
+  const state = {
+    lastAction: currentAction,
+    executionEpisode: {
+      actionId: currentAction.id,
+      observationId: currentAction.observationId,
+      status: "navigation_armed",
+      navigation: true,
+      navigationEpisodeId: `navigation:session:${currentAction.id}`,
+      navigationStatus: "ARMED",
+      dispatched: false,
+      closed: false,
+      awaitingDestination: true,
+      destinationDocument: null
+    }
+  };
+
+  const advanced = advanceActionLifecycle({ state, observation: current });
+
+  assert.equal(advanced.directive, "reobserve_destination");
+  assert.equal(advanced.transition, null);
+  assert.equal(advanced.lifecycle.actionId, currentAction.id);
+  assert.equal(advanced.state.executionEpisode.actionId, currentAction.id);
+  assert.equal(advanced.state.executionEpisode.navigationEpisodeId, `navigation:session:${currentAction.id}`);
+  assert.equal(advanced.observation.lastActionResult.ignoredByExecutionEpisode, true);
+  assert.equal(advanced.observation.lastActionResult.causality.code, "STALE_ACTION_DURING_NAVIGATION");
+});
+
+test("the source document may positively verify a same-document checkout stage transition", () => {
+  const action = {
+    id: "act_spa_continue",
+    observationId: "obs_spa_before",
+    type: "click",
+    intent: "advance_checkout_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    expectedOutcome: { type: "checkout_stage_advanced" }
+  };
+  const before = observation({
+    id: "obs_spa_before",
+    step: "review",
+    url: "https://booking.example/checkout",
+    controls: [{ controlId: "continue", operations: operation("continue_node") }]
+  });
+  const pendingResult = {
+    actionId: action.id,
+    dispatched: true,
+    executed: true,
+    action,
+    failureCode: "NAVIGATION_TRANSITION_PENDING"
+  };
+  const after = observation({
+    id: "obs_spa_after",
+    step: "payment_setup",
+    url: "https://booking.example/checkout#payment",
+    controls: [{ controlId: "payment_method", operations: operation("payment_method_node") }],
+    lastActionResult: pendingResult
+  });
+  const ready = classifyObservationReadiness({
+    observation: after,
+    navigationContext: {
+      result: pendingResult,
+      lifecycle: { actionId: action.id, dispatched: true, closed: false, awaitingDestination: true }
+    }
+  });
+  const advanced = advanceActionLifecycle({
+    state: {
+      lastAction: action,
+      executionEpisode: {
+        actionId: action.id,
+        observationId: before.observationId,
+        navigation: true,
+        navigationEpisodeId: `navigation:session:${action.id}`,
+        navigationStatus: "DISPATCHED",
+        status: "waiting_for_destination",
+        dispatched: true,
+        closed: false,
+        awaitingDestination: true,
+        sourceDocument: { documentId: "same_document", url: before.page.url },
+        destinationDocument: null
+      }
+    },
+    observation: after,
+    previousObservation: before,
+    observationReadiness: ready
+  });
+
+  assert.equal(advanced.transition.status, "achieved");
+  assert.equal(advanced.directive, "advance_goal");
+  assert.equal(advanced.lifecycle.navigationStatus, "VERIFIED");
+  assert.equal(advanced.lifecycle.closed, true);
 });

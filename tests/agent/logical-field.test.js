@@ -6,6 +6,7 @@ const {
   semanticTypeForControl,
   derivedTravelerFacts,
   resolveLogicalFields,
+  bindResolvedComponentToCurrentPage,
   logicalFieldSatisfied,
   verifyLogicalField
 } = require("../../apps/web/agent/logical-field");
@@ -48,6 +49,64 @@ test("travel-purpose radio groups compile as a profile-backed choice", () => {
   assert.equal(normalizeProfileFieldType("business_or_leisure"), "travel_purpose");
   assert.equal(normalizeProfileFieldType("reasonForTravelRadioInput"), "travel_purpose");
   assert.equal(semanticTypeForControl(control, {}), "travel_purpose");
+});
+
+test("an active choice search box is a discovery mechanic for an unrendered exact outcome", () => {
+  const binding = bindResolvedComponentToCurrentPage({
+    currentSurface: { id: "surface_country", type: "dropdown", blocksBackground: true },
+    controls: [{
+      controlId: "country_search",
+      surfaceId: "surface_country",
+      role: "editable_combobox",
+      label: "Search",
+      operations: {
+        type: {
+          actuatorId: "country_search_input",
+          status: "proven_executable",
+          strategies: [{ actuatorId: "country_search_input", method: "direct_input", status: "proven_executable" }]
+        }
+      }
+    }]
+  }, {
+    selectionTerms: ["tr", "turkey"],
+    desiredValue: "tr",
+    desiredCanonicalValue: "tr",
+    inputValue: "Turkey",
+    componentBinding: { controlId: "country_owner", componentRole: "value" }
+  });
+
+  assert.equal(binding.control.controlId, "country_search");
+  assert.equal(binding.searchMechanic, true);
+  assert.equal(binding.observedOption, false);
+  assert.deepEqual(binding.selectionTerms, ["tr", "turkey"]);
+});
+
+test("an exact rendered choice outcome is preferred over its search mechanic", () => {
+  const binding = bindResolvedComponentToCurrentPage({
+    currentSurface: { id: "surface_country", type: "dropdown", blocksBackground: true },
+    controls: [{
+      controlId: "country_search",
+      surfaceId: "surface_country",
+      role: "editable_combobox",
+      label: "Search",
+      operations: { type: { actuatorId: "country_search_input" } }
+    }, {
+      controlId: "country_turkey",
+      surfaceId: "surface_country",
+      role: "option",
+      label: "Turkey",
+      operations: { choose: { actuatorId: "country_turkey_option" } }
+    }]
+  }, {
+    selectionTerms: ["tr", "turkey"],
+    desiredValue: "tr",
+    desiredCanonicalValue: "tr",
+    componentBinding: { controlId: "country_owner", componentRole: "value" }
+  });
+
+  assert.equal(binding.control.controlId, "country_turkey");
+  assert.equal(binding.observedOption, true);
+  assert.equal(binding.searchMechanic, false);
 });
 
 test("typed validation admission separates active owned errors from diagnostic summaries", () => {
@@ -161,6 +220,31 @@ test("activation-only payment command is not inferred as an email field from acc
   };
 
   assert.equal(semanticTypeForControl(pay, {}), "");
+});
+
+test("unfamiliar billing labels compile into universal address profile facts", () => {
+  const cases = [
+    ["customerAddress customer_address address", "address_line1"],
+    ["Address line 2 / apartment", "address_line2"],
+    ["customerCity customer_city city", "city"],
+    ["Billing province / region", "state"],
+    ["customerZip customer_zip zip", "postal_code"],
+    ["COUNTRY", "country"]
+  ];
+  for (const [label, expected] of cases) {
+    const control = {
+      controlId: `ctrl_${expected}`,
+      role: expected === "country" ? "combobox" : "textbox",
+      kind: expected === "country" ? "select" : "text",
+      label,
+      operations: expected === "country"
+        ? { open: { operation: "open", actuatorId: `target_${expected}` } }
+        : { type: { operation: "type", actuatorId: `target_${expected}` } }
+    };
+    assert.equal(semanticTypeForControl(control, {}), expected, label);
+  }
+  assert.equal(semanticTypeForControl({ role: "combobox", label: "Phone country code" }, {}), "phone_country_code");
+  assert.equal(semanticTypeForControl({ role: "combobox", label: "Country of residence" }, {}), "country_of_residence");
 });
 
 test("combined first and middle name input is one given-names requirement and middle name stays optional", () => {
@@ -1335,6 +1419,42 @@ test("age at departure answers a grounded Yes/No age attestation", () => {
   assert.equal(ageField.desiredCanonicalValue, "23");
   assert.equal(ageField.components[0].inputValue, "yes");
   assert.equal(ageField.components[0].exactOption.label, "Yes");
+});
+
+test("country profile codes bind one exact observed localized option", () => {
+  const page = {
+    step: "payment_method_selection",
+    controls: [{
+      controlId: "billing_country",
+      fieldType: "country",
+      label: "Country",
+      role: "select",
+      kind: "select-one",
+      required: true,
+      representationLifecycle: { status: "active_rendered", active: true },
+      options: [
+        { value: "HR", label: "Croatia" },
+        { value: "TR", label: "Turkey" }
+      ],
+      state: { valuePresent: true, selected: false, normalizedValue: "hr" },
+      operations: { select: { actuatorId: "billing_country", status: "executable" } }
+    }],
+    fields: []
+  };
+  page.fields = page.controls.map((control) => ({ ...control, controlState: control.state }));
+
+  const [countryField] = resolveLogicalFields(page, { ...traveler, country: "TR" });
+
+  assert.equal(countryField.semanticType, "country");
+  assert.equal(countryField.currentCanonicalValue, "hr");
+  assert.equal(countryField.desiredCanonicalValue, "tr");
+  assert.deepEqual(countryField.components[0].exactOption, {
+    canonicalValue: "tr",
+    siteValue: "TR",
+    label: "Turkey",
+    controlId: "billing_country",
+    source: "observed_unique_option"
+  });
 });
 
 test("age at departure respects the birthday boundary and is never invented without a departure date", () => {

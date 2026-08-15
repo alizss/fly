@@ -877,6 +877,63 @@ export function createOutcomeVerification({
         }
       };
     }
+    if (expected.type === "control_state_equals") {
+      const desiredState = expected.desiredState || {};
+      const stateKeys = Object.keys(desiredState).filter((key) => typeof desiredState[key] === "boolean");
+      const liveTarget = target && isVisible(target)
+        ? target
+        : elementById(expected.stateElementId || expected.targetId || "");
+      const actualState = {
+        checked: typeof liveTarget?.checked === "boolean"
+          ? liveTarget.checked
+          : liveTarget?.getAttribute?.("aria-checked") != null
+            ? liveTarget.getAttribute("aria-checked") === "true"
+            : Boolean(afterControl?.checked === true || afterControl?.selected === true || afterControlState?.checked === true),
+        selected: typeof liveTarget?.selected === "boolean"
+          ? liveTarget.selected
+          : Boolean(afterControl?.selected === true || afterControlState?.selected === true),
+        pressed: liveTarget?.getAttribute?.("aria-pressed") != null
+          ? liveTarget.getAttribute("aria-pressed") === "true"
+          : Boolean(afterControlState?.pressed === true),
+        expanded: liveTarget?.getAttribute?.("aria-expanded") != null
+          ? liveTarget.getAttribute("aria-expanded") === "true"
+          : Boolean(afterControlState?.expanded === true)
+      };
+      const ok = Boolean(
+        afterControl
+        && stateKeys.length
+        && stateKeys.every((key) => actualState[key] === desiredState[key])
+      );
+      return {
+        ok,
+        code: ok ? "CONTROL_STATE_MATCHED" : "CONTROL_STATE_MISMATCH",
+        message: ok
+          ? "The exact control now matches its authoritative desired state."
+          : "The exact control does not yet match its authoritative desired state.",
+        evidence: { ...evidence, control: afterControl || null, desiredState, actualState }
+      };
+    }
+    if (expected.type === "control_unselected") {
+      const selected = Boolean(
+        afterControl
+        && (
+          afterControl.selected === true
+          || afterControl.checked === true
+          || afterControlState?.selected === true
+          || afterControlState?.checked === true
+          || afterControlState?.pressed === true
+        )
+      );
+      const ok = Boolean(afterControl && !selected);
+      return {
+        ok,
+        code: ok ? "CONTROL_UNSELECTED" : "CONTROL_STILL_SELECTED",
+        message: ok
+          ? "The exact optional consent is no longer selected."
+          : "The optional consent remains selected after the action.",
+        evidence: { ...evidence, control: afterControl || null, selected }
+      };
+    }
     if (expected.type === "section_choice_verified") {
       const group = expectedDecisionGroupId
         ? (afterMap.decisionGroups || []).find((item) => item.decisionGroupId === expectedDecisionGroupId)

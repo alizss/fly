@@ -30,6 +30,27 @@ export function createObservationTransport({
     visit(payload.traveler || {});
     visit(payload.userPolicy || {});
     visit(payload.userIntent || "");
+    const traveler = payload.traveler || {};
+    const regionCodes = [
+      traveler.nationality,
+      traveler.country,
+      traveler.country_of_residence,
+      traveler.address_country,
+      traveler.address?.country,
+      traveler.document?.issuing_country
+    ].map((value) => String(value || "").trim().toUpperCase())
+      .filter((value) => /^[A-Z]{2}$/.test(value));
+    for (const code of regionCodes) {
+      values.push(code.toLowerCase());
+      for (const locale of [globalThis.navigator?.language || "en", "en"]) {
+        try {
+          const label = new Intl.DisplayNames([locale], { type: "region" }).of(code);
+          if (label) values.push(normalizedTransportText(label));
+        } catch (_) {
+          // The ISO code remains available when DisplayNames is unavailable.
+        }
+      }
+    }
     return [...new Set(values)].slice(0, 80);
   }
   
@@ -66,13 +87,25 @@ export function createObservationTransport({
   
   function controlLooksLikeRepeatedChoice(control = {}) {
     const meaning = normalizedTransportText(`${control.kind || ""} ${control.role || ""} ${control.semantic || ""} ${control.physicalEffect || ""}`);
-    if (control.globalChrome === true || control.fieldType) return false;
+    const optionMember = /(?:^| )option(?: |$)|menuitemradio/.test(meaning);
+    // Keep the semantic field owner losslessly, but its hundreds of child
+    // option controls are a collection even when a site copies the owner's
+    // field type onto each option.
+    if (control.globalChrome === true || (control.fieldType && !optionMember)) return false;
     if (/continue|next|proceed|advance|navigation|back|submit|payment|dismiss|open surface/.test(meaning)) return false;
     return /choice|radio|checkbox|option|seat|select paid|select free/.test(meaning);
   }
   
   function repeatedChoiceGroupKey(control = {}) {
     if (!controlLooksLikeRepeatedChoice(control)) return "";
+    const role = normalizedTransportText(`${control.role || ""} ${control.kind || ""}`);
+    // Decision/section ownership is often unreliable for portalled custom
+    // dropdown options. On an active non-page surface, role + surface is the
+    // stable structural collection boundary and prevents one option per
+    // accidental group from bypassing compaction.
+    if ((control.surfaceId || "surface-page") !== "surface-page" && /option|menuitemradio/.test(role)) {
+      return [control.surfaceId, "active_choice_options"].join("|");
+    }
     return [
       control.surfaceId || "surface-page",
       control.decisionGroupId || "",
@@ -226,6 +259,16 @@ export function createObservationTransport({
     if (!repeatedGroups.length) return payload;
   
     const profileValues = transportProfileValues(payload);
+    // The semantic owner may already have resolved the exact site option
+    // (often from an ISO-valued native select) while the visible portalled
+    // option exposes only a localized label. Carry that owned goal evidence
+    // into collection retention rather than trying to infer aliases again.
+    const goalOptionValues = controls.flatMap((control) => (control.options || [])
+      .filter((option) => option.goalMatch === true)
+      .flatMap((option) => [option.value, option.label])
+      .map(normalizedTransportText)
+      .filter(Boolean));
+    const taskValues = [...new Set([...profileValues, ...goalOptionValues])];
     const seatProfileMode = seatTransportProfileMode(payload);
     const omittedIds = new Set();
     const collections = [];
@@ -236,7 +279,7 @@ export function createObservationTransport({
         transportControlSelected(control)
         || control.required === true
         || controlStateForTransport(control).invalid === true
-        || controlMatchesTransportProfile(control, profileValues)
+        || controlMatchesTransportProfile(control, taskValues)
         || /no thanks|without|skip|random|automatic|free assignment/.test(transportControlText(control))
       ));
       const keepLimit = type === "seat_inventory" && profileMode === "random_assignment"
@@ -248,7 +291,7 @@ export function createObservationTransport({
         const score = (control) => {
           const region = control.visualRegion || control.visualRegions?.[0] || {};
           const price = transportControlPrice(control);
-          return (controlMatchesTransportProfile(control, profileValues) ? 1000000 : 0)
+          return (controlMatchesTransportProfile(control, taskValues) ? 1000000 : 0)
             + (!transportControlDisabled(control) ? 100000 : 0)
             + (region.inViewport === true ? 10000 : 0)
             + (price === 0 ? 1000 : 0)
@@ -287,6 +330,15 @@ export function createObservationTransport({
     return {
       ...safePayload,
       transportMode: "compact_retry",
+      observationUpdate: safePayload.observationUpdate ? {
+        ...safePayload.observationUpdate,
+        // A compact retry is a self-contained authoritative snapshot. It must
+        // not carry an incremental base/diff for controls intentionally
+        // omitted by collection compaction.
+        mode: "full_snapshot",
+        baseSnapshotHash: "",
+        diff: emptyPageStateDiff()
+      } : safePayload.observationUpdate,
       page: {
         ...page,
         text: compactText(page.text || "", 2_000),
@@ -394,7 +446,8 @@ export function createObservationTransport({
           observationUpdate: {
             ...(canonicalPayload.observationUpdate || {}),
             mode: "full_snapshot",
-            baseSnapshotHash: ""
+            baseSnapshotHash: "",
+            diff: emptyPageStateDiff()
           }
         }
       : canonicalPayload;
@@ -422,7 +475,8 @@ export function createObservationTransport({
           observationUpdate: {
             ...(fullPayload.observationUpdate || {}),
             mode: "full_snapshot",
-            baseSnapshotHash: ""
+            baseSnapshotHash: "",
+            diff: emptyPageStateDiff()
           }
         };
         bytes = observationTransportBytes(outgoing);

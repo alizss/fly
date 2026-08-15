@@ -33,7 +33,14 @@ function clampText(value, max = 4000) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-const { createAgentSession, reportAgentResult, summarizeAgentSession } = createSessionService(agentSessionStore);
+const {
+  armNavigationEpisode,
+  claimNavigationEpisode,
+  createAgentSession,
+  readyNavigationEpisode,
+  reportAgentResult,
+  summarizeAgentSession
+} = createSessionService(agentSessionStore);
 const { screenshotForObservation, storeScreenshotUpload } = createScreenshotStore();
 const { writeActionLedgerRow, writeClientFlowLog } = createRequestDiagnostics({
   diagnosticDir: DIAGNOSTIC_DIR,
@@ -66,12 +73,15 @@ const handleAgentRoutes = createAgentRoutes({
   agentLoopFailurePayload,
   agentSessionStore,
   agentTraceStore,
+  armNavigationEpisode,
+  claimNavigationEpisode,
   clampText,
   createAgentSession,
   dataDir: DATA_DIR,
   decideAgentNextActionViaLoop,
   logAgent,
   readBody,
+  readyNavigationEpisode,
   reportAgentResult,
   sendJson,
   storeScreenshotUpload,

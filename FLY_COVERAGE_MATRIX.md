@@ -25,10 +25,10 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Layer | Result | Evidence |
 |---|---:|---|
 | Build, type, and syntax | ✅ | `npm run check` |
-| Agent unit suite | ✅ 379/379 | Semantic authority, scene reconciliation, exact legal authorization, profile codecs, policy, transaction, recovery, persistence, and architecture invariants |
-| Browser replay suite | ✅ 175/175 | One uninterrupted run including the complete Croatia approval → legal attestation → advance → actual payment-entry loop and all established structural canaries |
+| Agent unit suite | ✅ 388/388 | Semantic authority, scene reconciliation, exact legal authorization, navigation episodes, profile codecs, policy, transaction, recovery, persistence, and architecture invariants |
+| Browser replay suite | ✅ 178/178 | One uninterrupted run including the real controller/backend Croatia CheckoutMandate → exact attestation → separate advance → actual payment-entry loop, authorized cross-origin resume, and all established structural canaries |
 | Durable session boundary | ✅ | Complete `SelectedBooking/v1`, strict traveler membership, resume identity, typed failures |
-| Payment/legal boundary | 🧪 | Exact legal token and closed-loop legal → advance → payment-entry regressions pass; fresh live proof pending; credentials, Pay, commit, and purchase remain prohibited |
+| Payment/legal boundary | 🧪 | Durable CheckoutMandate, exact AttestationReceipt, and closed-loop attestation → advance → payment-entry regressions pass; fresh live proof pending; credentials, Pay, commit, and purchase remain prohibited |
 
 ## 4. Universal capability status
 
@@ -40,15 +40,16 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Placeholder/sentinel commitment (`-1`, prompt options, punctuation placeholders) | 🧪 | Croatia structural replay is green; fresh live Croatia proof pending |
 | Phone representation codec (combined international vs split prefix/local) | 🧪 | Croatia combined-field replay and Turkish/GoToGate split-phone regressions are green; fresh live proof pending |
 | Validation ownership and exact-field repair | 🧪 | Native-invalid and section-level phone validation reopen the exact primary owner in replay; fresh live proof pending |
-| Grounded Semantic Scene Reconciliation | 🧪 | Known scenes use zero calls; a deliberately ambiguous fixture proves one closed-ID hypothesis call; fresh unfamiliar live proof pending |
+| Immutable CheckoutScene and grounded reconciliation | 🧪 | Known scenes use zero calls; one final scene owns stage/exit; a deliberately ambiguous fixture proves one neutral closed-ID patch; fresh unfamiliar live proof pending |
+| Checkout mandate and standard attestations | 🧪 | Selected booking + traveler identities create one immutable mandate; Croatia replay proves zero prompt, exact checkbox ownership, exact receipt, separate Confirm, and stop at hosted payment entry; fresh live promotion pending |
 | Logical identity across framework rerender | ✅ | Continue live confirmation across new frameworks |
 | Active-surface and dormant-branch ownership | ✅ | New modal/drawer implementations |
 | Repeated passenger/leg decision ownership | ✅ | Multi-traveler live matrix |
 | Fares, baggage, seats, insurance, extras policy | ✅ baseline | Explicit paid budgets and dirty checkout on 2+ families |
 | Bounded adaptive reversible mechanics | ✅ | Additional previously unseen controls |
-| Single-dispatch navigation and hydration wait | ✅ | Fresh live repeat-guard confirmation after `c7aeb89` |
+| Action-scoped navigation, redirects, and hydration wait | ✅ replay | Same-document, cross-origin, noopener/new-tab, redirect, exact-session resume, source non-closure, and hydration regressions pass; fresh Croatia hosted-provider proof pending |
 | Transaction facts and selected-booking reconciliation | ✅ | More currencies/fare structures and price-change scenarios |
-| Pre-payment/legal/payment-entry boundary detection | 🧪 | Four typed boundaries and exact legal-approval flow are covered in focused tests; hosted/direct live payment-entry proof pending |
+| Pre-payment/legal/payment-entry boundary detection | 🧪 | Four typed boundaries and mandate-covered standard attestation → exact receipt → separate advance are covered in focused tests; hosted/direct live payment-entry proof pending |
 | Durable pause/restart/recovery | ✅ replay | Live authentication/OTP resume |
 | Background/cloud execution | ⏳ | Begins after structural and scenario gates |
 | Authorized payment and booking confirmation | ⏳ | Separate security/product gate |

@@ -56,7 +56,7 @@ const {
   normalizedActionSemantics
 } = require("../action-semantics");
 const {
-  reduceDecisionFrame,
+  reduceCheckoutScene,
   taskStateReadModel,
   verifiedCommerceObligationFromActionResult
 } = require("../task-state-reducer");
@@ -69,7 +69,7 @@ const {
 } = require("../profile-context");
 const { canonicalizeUserPolicy, seatPolicyFrom } = require("../policy-profile");
 const {
-  compileDecisionFrame,
+  compileCheckoutScene,
   createObservationFrame,
   currentObligation
 } = require("../authority-frames");
@@ -128,7 +128,10 @@ const {
 } = require("./turn-result");
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  // Absence is a real contract state. Returning an empty truthy object lets
+  // the loop bypass its no-obligation invariant and call mechanics binding
+  // with null, masking the TaskState disposition as a backend exception.
+  return currentObligation(taskState) || null;
 }
 
 function bufferedDiagnosticStore(store = null) {
@@ -203,9 +206,9 @@ async function runLoopTurn({
   }
   traveler = applySessionProfileOverrides(traveler, state.sessionProfileOverrides || {});
   // Capture evidence/mechanics once. Semantic task authority is compiled once
-  // immediately before TaskState reduces the exact DecisionFrame once.
+  // immediately before TaskState reduces the exact CheckoutScene once.
   let observationFrame = null;
-  let decisionFrame = null;
+  let checkoutScene = null;
   const persistedTerminalLatch = state.taskState?.terminalGoalLatch || null;
   if (persistedTerminalLatch?.locked === true
     && persistedTerminalLatch.terminalStatus === "payment_entry_reached") {
@@ -445,10 +448,6 @@ async function runLoopTurn({
     };
   }
 
-  // Reduce the fresh observation before any pending-action recovery. A new
-  // foreground surface or stage invalidates obsolete recovery ownership, so
-  // an old target can never be rebound ahead of the current TaskState.
-  state = recordPreviousActionFacts(state, observation, traveler);
   const effectiveUserPolicy = canonicalizeUserPolicy({
     ...(state.approvals || {}),
     ...(state.userPolicy || {})
@@ -470,19 +469,28 @@ async function runLoopTurn({
     ambiguityModelKind = request.kind || "unknown";
     return resolveAmbiguity(request);
   };
-  // Deterministic semantics remain the fast path. When the current scene has
-  // a required unknown component, an explicit classifier contradiction, or
-  // an unowned local validation, one closed model call may add grounded
-  // hypotheses to fresh observed IDs. It cannot publish work or actions;
-  // DecisionFrame is compiled once from the reconciled evidence and TaskState
-  // remains the sole obligation authority.
+  // Deterministic semantics remain the fast path. Compile a complete draft
+  // scene first, evaluate semantic closure over that draft, and invoke at most
+  // one closed-ID ScenePatch only when closure is open or contradictory.
+  // TaskState sees only the final immutable CheckoutScene.
   const semanticCompileStartedAt = Date.now();
   const deterministicSemanticCompilation = agentContract.compileSemanticCheckout(observation.page || {});
+  observationFrame = createObservationFrame(observation);
+  const deterministicCheckoutScene = compileCheckoutScene({
+    observation,
+    observationFrame,
+    semanticCompilation: deterministicSemanticCompilation,
+    scenePatch: null,
+    state,
+    traveler
+  });
   const sceneUncertainty = semanticSceneUncertainty({
     observation,
     semanticCompilation: deterministicSemanticCompilation,
+    checkoutScene: deterministicCheckoutScene,
     traveler
   });
+  let scenePatch = null;
   if (sceneUncertainty.needed) {
     try {
       const reconciled = await resolveTurnAmbiguity({
@@ -497,7 +505,7 @@ async function runLoopTurn({
           uncertainty: sceneUncertainty
         }
       });
-      observation = reconciled.observation;
+      scenePatch = reconciled.scenePatch || null;
       activeComponentGrounding = reconciled.reconciliation;
       activeComponentGroundingMeta = reconciled.meta;
       latency.classification_model_ms += Number(reconciled.meta?.durationMs || 0);
@@ -508,21 +516,26 @@ async function runLoopTurn({
         reasonCode: "SEMANTIC_SCENE_UNRESOLVED",
         evidence: `Grounded scene reconciliation was unavailable: ${error?.code || error?.message || "unknown error"}`
       };
-      observation = {
-        ...observation,
-        page: {
-          ...(observation.page || {}),
-          semanticSceneReconciliation: activeComponentGrounding
-        }
-      };
     }
   }
-  observationFrame = createObservationFrame(observation);
-  decisionFrame = compileDecisionFrame({ observation, observationFrame, state, traveler });
-  observation = decisionFrame.observation;
+  checkoutScene = scenePatch
+    ? compileCheckoutScene({
+        observation,
+        observationFrame,
+        semanticCompilation: deterministicSemanticCompilation,
+        scenePatch,
+        state,
+        traveler
+      })
+    : deterministicCheckoutScene;
+  observation = checkoutScene.observation;
+  // Transition evaluation receives the same authoritative scene observation
+  // that TaskState will consume. It cannot rediscover stage meaning from the
+  // raw page or accept a generic mutation as semantic progress.
+  state = recordPreviousActionFacts(state, observation, traveler);
   latency.semantic_compile_ms += Date.now() - semanticCompileStartedAt;
   let transactionContext = prepareTransactionInvariants(state, observation, traveler, {
-    authoritativeTransactionFacts: decisionFrame.transactionFacts
+    authoritativeTransactionFacts: checkoutScene.transactionFacts
   });
   state = transactionContext.state;
   const initialTaskState = state.taskState || {};
@@ -532,7 +545,7 @@ async function runLoopTurn({
     paymentPreference: traveler.payment_preference || state.userPolicy?.paymentPreference || ""
   };
   const taskStateStartedAt = Date.now();
-  const taskState = reduceDecisionFrame({
+  const taskState = reduceCheckoutScene({
     previousTaskState: initialTaskState,
     observation,
     previousActionResult: observation.lastActionResult || null,
@@ -543,7 +556,8 @@ async function runLoopTurn({
     transactionId: state.id,
     approvals: state.approvals || {},
     parentObjective,
-    decisionFrame,
+    checkoutScene,
+    checkoutMandate: state.checkoutMandate || null,
     mechanicalEvidence: executionEpisodeFor(state).mechanicalEvidence || null
   });
   const taskReadModel = taskStateReadModel(taskState) || {};
@@ -974,7 +988,7 @@ async function runLoopTurn({
     ? publishedGoal
     : null;
   const publishedMechanicalGoal = publishedProfileGoal || publishedAdaptiveGoal;
-  if (["request_input", "request_approval", "wait_reobserve", "terminal", "stop"].includes(taskDisposition.kind)) {
+  if (["request_input", "request_approval", "handoff", "wait_reobserve", "terminal", "stop"].includes(taskDisposition.kind)) {
     const missingDerivedFact = taskDisposition.missingDerivedFact || null;
     const missingField = String(taskDisposition.field || "");
     const missingLabel = String(
@@ -1013,10 +1027,9 @@ async function runLoopTurn({
             }
           } : {})
         })
-      : taskDisposition.kind === "request_approval"
+      : ["request_approval", "handoff"].includes(taskDisposition.kind)
         ? finalHandoffAction(reason, observation, {
-            approvalRequest: taskDisposition.details?.approvalRequest || null,
-            risk: taskDisposition.code === "LEGAL_APPROVAL_REQUIRED" ? "legal" : "uncertain"
+            risk: "uncertain"
           })
         : normalizeAction({
             observationId: observation.observationId || "",
@@ -1043,7 +1056,7 @@ async function runLoopTurn({
       ? "ready_for_payment"
       : taskDisposition.kind === "wait_reobserve"
       ? "running"
-      : ["request_input", "request_approval"].includes(taskDisposition.kind)
+      : ["request_input", "request_approval", "handoff"].includes(taskDisposition.kind)
         ? "awaiting_user"
         : "stopped";
     const dispositionState = withUpdate(state, {
@@ -1158,7 +1171,7 @@ async function runLoopTurn({
   let canonicalFailedStrategies = failedStrategySignaturesForGoal(state, canonicalGoal, observation);
   let canonicalCandidateSet = groundedObservationCandidateSet(
     taskState.currentObligation,
-    decisionFrame,
+    checkoutScene,
     observation,
     canonicalFailedStrategies,
     {
@@ -1347,7 +1360,7 @@ async function runLoopTurn({
         if (error?.code !== "PLANNER_CANDIDATE_NOT_CURRENT") throw error;
         candidateSet = groundedObservationCandidateSet(
           taskState.currentObligation,
-          decisionFrame,
+          checkoutScene,
           observation,
           failedStrategySignaturesForGoal(state, observationGoal, observation),
           {

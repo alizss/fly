@@ -29,6 +29,7 @@ export function createStageExitCompiler({
         || control.semanticType === "continue"
         || ["advance_surface", "advance_checkout_stage"].includes(control.physicalEffect)
         || /(?:^|\s)(?:continue|next)(?:\s|$)/i.test(control.label || "")
+        || /(?:^|\|)meaning:(?:continue|next|proceed|confirm|submit)(?:\||$)/i.test(control.stableKey || "")
       )
     ));
     const continueControls = [...new Map([
@@ -65,10 +66,12 @@ export function createStageExitCompiler({
         || control.state?.disabled === true
         || proof.code === "ACTUATOR_DISABLED"
       );
-      const status = proof.executable === true
-        ? "ready"
-        : disabled
-          ? "disabled"
+      // Disabled is an absolute mechanical fact. A stale strategy proof must
+      // never make a currently disabled actuator executable.
+      const status = disabled
+        ? "disabled"
+        : proof.executable === true
+          ? "ready"
           : proof.revealable === true
             ? "revealable"
             : proof.code === "ACTUATOR_OCCLUDED"
@@ -88,7 +91,7 @@ export function createStageExitCompiler({
         hitTested: proof.hitTested === true,
         notOccluded: proof.notOccluded === true,
         selfOccluded: proof.selfOccluded === true,
-        executable: proof.executable === true,
+        executable: !disabled && proof.executable === true,
         revealable: proof.revealable === true,
         code: String(proof.code || ""),
         hitTestEvidence: proof.hitTestEvidence || null

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { font: 16px sans-serif; margin: 24px; }
+    main { max-width: 760px; }
+    section, fieldset { margin: 18px 0; padding: 14px; }
+    label, a, button, input { margin: 8px; }
+    a.continue { display: inline-block; padding: 10px 18px; background: #123a77; color: white; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Payment setup</h1>
+    <form id="PaymentForm" action="/PaymentForm" method="post">
+      <section aria-label="Optional login">
+        <h2>Already registered?</h2>
+        <label>Email <input id="txtLoginEmail" name="login_email" type="email"></label>
+        <label>Password <input id="txtLoginPassword" name="login_password" type="password"></label>
+        <button id="btnLogin" type="button">Login</button>
+      </section>
+
+      <fieldset aria-label="Contact">
+        <legend>Contact</legend>
+        <label><input id="natural" type="radio" name="isr1" value="rbr1no" checked> Natural person</label>
+        <label><input id="legal" type="radio" name="isr1" value="rbr1yes"> Legal person</label>
+        <p class="booking-total">Total to be paid <strong>141.62 EUR</strong></p>
+      </fieldset>
+
+      <fieldset aria-label="Contact">
+        <legend>Contact</legend>
+        <label><input id="ordinary-card" type="radio" name="meansOfPayment" value="rbPaymentType_CreditCard" checked> Credit/debit card</label>
+        <label><input id="saved-card" type="radio" name="meansOfPayment" value="rbPaymentType_CreditCardToken" disabled> Saved card</label>
+        <label><input id="save-card" type="checkbox" name="save_card" disabled> Save this card to my account</label>
+      </fieldset>
+
+      <section aria-label="Optional preferences">
+        <label><input id="survey" type="checkbox" name="receiveSurvey" checked> I wish to participate in a customer satisfaction survey. I can opt-out at any time.</label>
+        <label><input id="marketing" type="checkbox" name="showPromoBanners"> I consent to receiving information about third-party offers</label>
+      </section>
+
+      <!-- The real page registers this click out-of-band and exposes no href. -->
+      <a id="btnsubmit" class="continue">Continue</a>
+    </form>
+
+    <section id="hosted-payment" aria-label="Secure card payment" hidden>
+      <h2>Payment details</h2>
+      <iframe title="Secure hosted payment" srcdoc="<p>Hosted card entry</p>"></iframe>
+      <label>Card number <input name="card.number" autocomplete="cc-number"></label>
+      <label>Expiry <input name="card.expiry" autocomplete="cc-exp"></label>
+      <label>CVC <input name="card.cvc" autocomplete="cc-csc"></label>
+    </section>
+  </main>
+  <script>
+    window.__paymentSetup = { loginClicks: 0, continueClicks: 0 };
+    document.getElementById("btnLogin").addEventListener("click", () => { window.__paymentSetup.loginClicks += 1; });
+    document.getElementById("btnsubmit").addEventListener("click", (event) => {
+      event.preventDefault();
+      window.__paymentSetup.continueClicks += 1;
+      document.getElementById("PaymentForm").hidden = true;
+      document.getElementById("hosted-payment").hidden = false;
+      history.pushState({}, "", "/hosted-payment");
+    });
+  </script>
+</body>
+</html>

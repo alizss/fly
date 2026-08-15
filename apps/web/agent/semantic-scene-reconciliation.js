@@ -1,4 +1,5 @@
 const { callStructured } = require("./openai-client");
+const crypto = require("node:crypto");
 const {
   semanticSceneSchemaFor,
   SEMANTIC_SCENE_STAGES,
@@ -13,8 +14,8 @@ const agentContract = require("../../extension/src/shared/agent-contract");
 const MAX_COMPONENTS = 16;
 const MAX_FACTS = 24;
 const MAX_PACKET_BYTES = 32_000;
-const INTERACTIVE_ROLE = /textbox|input|textarea|select|combobox|listbox|radio|checkbox|spinbutton|date|button|link|option|menuitem/i;
-const SCENE_MEANING = /payment|card|cvc|cvv|security code|purchase|pay now|legal|terms|conditions|consent|insurance|bundle|baggage|seat|promotion|promo|voucher|discount|time to think|no thanks|confirm|age|over 18|adult/i;
+const INTERACTIVE_ROLE = /textbox|input|textarea|select|combobox|listbox|radio|checkbox|spinbutton|date|button|link|option|menuitem|^a$/i;
+const SCENE_MEANING = /payment|card|cvc|cvv|security code|purchase|pay now|legal|terms|conditions|consent|insurance|bundle|baggage|seat|promotion|promo|voucher|discount|time to think|no thanks|confirm|continue|next|proceed|submit|age|over 18|adult/i;
 const PROFILE_ROLES = new Set(["profile_field", "personal_attestation"]);
 const PROFILE_TYPES = new Set(agentContract.PROFILE_FIELD_TYPES || []);
 const NON_PROFILE_TYPES_BY_ROLE = Object.freeze({
@@ -62,6 +63,7 @@ function controlSceneText(control = {}) {
     control.description,
     control.helperText,
     control.sectionLabel,
+    control.stableKey,
     control.semantic,
     control.fieldType,
     control.risk
@@ -75,7 +77,6 @@ function activeCurrentControl(control = {}, page = {}) {
     active
     && controlBelongsToCurrentSurface(control, page)
     && INTERACTIVE_ROLE.test(clean(`${control.role || ""} ${control.kind || ""} ${control.domRole || ""}`))
-    && operationNames(control).length
   );
 }
 
@@ -166,7 +167,7 @@ function semanticScenePriority(
   return score;
 }
 
-function semanticSceneUncertainty({ observation = {}, semanticCompilation = null, traveler = {}, transactionReview = null } = {}) {
+function semanticSceneUncertainty({ observation = {}, semanticCompilation = null, checkoutScene = null, traveler = {}, transactionReview = null } = {}) {
   const rawPage = observation.page || {};
   const page = semanticCompilation
     ? { ...rawPage, controls: semanticCompilation.controls, decisionGroups: semanticCompilation.decisionGroups }
@@ -188,9 +189,14 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
     .map((item) => controlsById.get(item.controlId) || item)
     .filter((control) => control?.controlId && semanticallyUnknown(control))
     .map((control) => control.controlId));
+  const semanticClosureIncomplete = Boolean(
+    checkoutScene
+    && checkoutScene.closure?.status !== "closed"
+  );
   const progressionBlocked = Boolean(
     page.stageExit?.continueDisabled === true
     || ["disabled", "blocked", "blocked_by_validation"].includes(page.stageExit?.navigationState)
+    || checkoutScene?.closure?.missingStageExit === true
   );
   const unownedValidationIssues = validationIssues.filter((issue) => (
     !issue.controlId
@@ -246,6 +252,8 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
   });
   return Object.freeze({
     needed: Boolean(candidateControls.length && (
+      semanticClosureIncomplete
+      ||
       stageContradiction.contradictory
       || hasUnknownRequiredControl
       || unownedValidationIssues.length
@@ -269,12 +277,13 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
       activeProgressText: clean(page.sceneContext?.activeProgressText, 500),
       terminalEvidence: page.terminalEvidence || null,
       stageExit: page.stageExit || null,
+      checkoutSceneClosure: checkoutScene?.closure || null,
       price: page.price || null
     })
   });
 }
 
-function applySemanticSceneHypotheses(observation = {}, response = {}, uncertainty = {}) {
+function applyScenePatch(semanticCompilation = {}, response = {}, uncertainty = {}, observation = {}) {
   const allowedBindings = new Set((uncertainty.allowedBindings || []).map((binding) => (
     `${binding.controlId}|${binding.semanticType}|${binding.factSource}`
   )));
@@ -300,30 +309,13 @@ function applySemanticSceneHypotheses(observation = {}, response = {}, uncertain
     return bindingAllowed && ownerAllowed;
   }).slice(0, 10);
   const bindingByControl = new Map(accepted.map((hypothesis) => [hypothesis.controlId, hypothesis]));
-  // Preserve the deterministic fast-path normalization even on turns where
-  // one genuinely ambiguous sibling still needs scene reconciliation. The
-  // model refines only its closed IDs; it must not be required to restate
-  // known promo/legal/commit semantics for them to survive into DecisionFrame.
-  const deterministicControls = agentContract.compileSemanticCheckout(observation.page || {}).controls;
-  const controls = deterministicControls.map((control) => {
+  // ScenePatch is a closed-ID semantic annotation over the already-compiled
+  // deterministic result. It never mutates the raw observation and never
+  // reruns the semantic compiler. In particular it cannot change requiredness,
+  // risk, stage, navigation, permission, transaction truth or completion.
+  const controls = (semanticCompilation.controls || []).map((control) => {
     const hypothesis = bindingByControl.get(control.controlId);
     if (!hypothesis) return control;
-    const ownsValidation = (observation.page?.validationIssues || []).some((issue) => issue.controlId === control.controlId);
-    const invalid = control.state?.invalid === true || Boolean(clean(control.state?.validationMessage));
-    const optionalDemotion = hypothesis.confidence === "high"
-      && hypothesis.role === "optional_credential"
-      && ["optional_meaningful", "safely_ignorable"].includes(hypothesis.requiredness)
-      && !ownsValidation
-      && !invalid;
-    const progressionPromotion = hypothesis.confidence === "high"
-      && PROFILE_ROLES.has(hypothesis.role)
-      && hypothesis.requiredness === "progression_required"
-      && (
-        control.required === true
-        || control.state?.required === true
-        || ownsValidation
-        || observation.page?.stageExit?.continueDisabled === true
-      );
     const sceneItem = {
       role: hypothesis.role,
       semanticType: hypothesis.semanticType,
@@ -335,40 +327,11 @@ function applySemanticSceneHypotheses(observation = {}, response = {}, uncertain
       relatedControlIds: [...new Set([control.controlId, ...(hypothesis.relatedControlIds || [])])],
       grounded: true
     };
-    if (!PROFILE_ROLES.has(hypothesis.role)) {
-      const effect = hypothesis.role === "optional_paid_decline"
-        ? { semantic: "decline_paid_extra", semanticIntent: "decline_paid_extra", risk: "safe_decline" }
-        : hypothesis.role === "optional_paid_accept"
-          ? { semantic: "add_paid_extra", semanticIntent: "add_paid_extra", risk: "money" }
-          : hypothesis.role === "legal_attestation"
-            ? { semantic: "legal_attestation", semanticIntent: "legal_attestation", risk: "legal" }
-            : hypothesis.role === "payment_entry"
-              ? { semantic: "payment_entry", semanticIntent: "payment_entry", risk: "payment" }
-              : hypothesis.role === "navigation"
-                ? { semantic: "safe_continue", semanticIntent: "advance_checkout_stage", risk: "safe" }
-                : hypothesis.role === "transaction_commit"
-                  ? { semantic: "transaction_commit", semanticIntent: "transaction_commit", risk: "purchase" }
-                  : { semantic: hypothesis.semanticType, semanticIntent: hypothesis.semanticType, risk: control.risk || "uncertain" };
-      return {
-        ...control,
-        ...effect,
-        required: optionalDemotion ? false : control.required,
-        state: optionalDemotion ? { ...(control.state || {}), required: false } : control.state,
-        fieldClassification: {
-          fieldType: "",
-          source: "direct_non_profile_control",
-          confidence: hypothesis.confidence === "high" ? 0.95 : 0.82,
-          evidence: [clean(hypothesis.evidence)]
-        },
-        semanticSceneItem: sceneItem
-      };
-    }
+    if (!PROFILE_ROLES.has(hypothesis.role)) return { ...control, semanticSceneItem: sceneItem };
     return {
       ...control,
       fieldType: hypothesis.semanticType,
       semantic: hypothesis.semanticType,
-      required: progressionPromotion ? true : control.required,
-      state: progressionPromotion ? { ...(control.state || {}), required: true } : control.state,
       fieldClassification: {
         fieldType: hypothesis.semanticType,
         source: "grounded_semantic_scene",
@@ -379,122 +342,44 @@ function applySemanticSceneHypotheses(observation = {}, response = {}, uncertain
       semanticSceneItem: sceneItem
     };
   });
-  const fields = (observation.page?.fields || []).map((field) => {
+  const fields = (semanticCompilation.fields || observation.page?.fields || []).map((field) => {
     const hypothesis = bindingByControl.get(field.controlId);
     if (!hypothesis) return field;
-    if (!PROFILE_ROLES.has(hypothesis.role)) {
-      return {
-        ...field,
-        required: hypothesis.confidence === "high"
-          && ["optional_meaningful", "safely_ignorable"].includes(hypothesis.requiredness)
-          ? false
-          : field.required,
-        fieldClassification: { fieldType: "", source: "direct_non_profile_control" },
-        semanticSceneItem: hypothesis
-      };
-    }
+    if (!PROFILE_ROLES.has(hypothesis.role)) return { ...field, semanticSceneItem: hypothesis };
     const control = controls.find((candidate) => candidate.controlId === field.controlId) || {};
     return {
       ...field,
       field: hypothesis.semanticType,
       fieldType: hypothesis.semanticType,
       semantic: hypothesis.semanticType,
-      required: control.required === true || field.required === true,
+      required: field.required,
       semanticSceneItem: hypothesis
     };
   });
-  const validationIssues = (observation.page?.validationIssues || []).map((issue) => {
+  const validationIssues = (semanticCompilation.validationIssues || observation.page?.validationIssues || []).map((issue) => {
     const hypothesis = accepted.find((candidate) => candidate.validationIssueId === issue.issueId);
     return hypothesis
       ? { ...issue, controlId: hypothesis.controlId, semanticType: hypothesis.semanticType, ownershipSource: "grounded_semantic_scene" }
       : issue;
   });
-  const groundedNavigationCandidates = controls.flatMap((control) => {
-    if (control.semanticSceneItem?.role !== "navigation") return [];
-    const operationEntry = Object.entries(control.operations || {}).find(([, capability]) => (
-      capability?.actionability?.executable === true
-      || capability?.actionability?.revealable === true
-      || /proven_executable|recoverable|executable/.test(String(capability?.status || "").toLowerCase())
-    ));
-    if (!operationEntry) return [];
-    const [operation, capability] = operationEntry;
-    const proof = capability.actionability || {};
-    return [{
-      controlId: control.controlId,
-      actuatorId: capability.actuatorId || capability.strategies?.[0]?.actuatorId || "",
-      operation,
-      method: capability.strategies?.[0]?.method || "",
-      status: proof.executable === true ? "ready" : "revealable",
-      rendered: proof.rendered === true,
-      visible: proof.visible === true,
-      enabled: proof.enabled === true,
-      inViewport: proof.inViewport === true,
-      inCurrentSurface: proof.inCurrentSurface === true,
-      hitTested: proof.hitTested === true,
-      notOccluded: proof.notOccluded === true,
-      selfOccluded: proof.selfOccluded === true,
-      executable: proof.executable === true,
-      revealable: proof.revealable === true,
-      code: proof.code || ""
-    }];
-  });
-  const unresolvedLegal = controls.some((control) => (
-    control.semanticSceneItem?.role === "legal_attestation"
-    && ["html_required", "visually_required", "progression_required"].includes(control.semanticSceneItem?.requiredness)
-    && !agentContract.controlSelectionCommitted(control)
-  ));
-  const existingStageExit = observation.page?.stageExit || {};
-  const stageExitCandidates = [...new Map([
-    ...(existingStageExit.candidates || []),
-    ...groundedNavigationCandidates
-  ].map((candidate) => [candidate.controlId, candidate])).values()];
-  const groundedExitExecutable = groundedNavigationCandidates.some((candidate) => candidate.executable === true);
-  const stageExit = groundedNavigationCandidates.length
-    ? {
-        ...existingStageExit,
-        continueObserved: true,
-        continueDisabled: groundedNavigationCandidates.every((candidate) => candidate.enabled === false),
-        continueInViewport: groundedNavigationCandidates.some((candidate) => candidate.inViewport === true),
-        continueAllowed: groundedExitExecutable && !unresolvedLegal,
-        navigationState: unresolvedLegal ? "blocked_by_legal_attestation" : (groundedExitExecutable ? "ready" : "not_safely_actionable"),
-        candidates: stageExitCandidates,
-        blockers: unresolvedLegal ? ["legal attestation requires approval"] : []
-      }
-    : existingStageExit;
   const proposedStage = SEMANTIC_SCENE_STAGES.includes(response.stage) ? response.stage : "unknown";
   const stageGrounded = ["high", "medium"].includes(response.stageConfidence) && proposedStage !== "unknown";
-  const stageMayCorrect = stageGrounded
-    && response.stageConfidence === "high"
-    && uncertainty.stageContradiction?.contradictory === true;
-  const deterministicStage = uncertainty.stageContradiction?.contradictory === true
-    ? uncertainty.stageContradiction?.suggestedStage || "unknown"
-    : "unknown";
-  const deterministicStageMayCorrect = SEMANTIC_SCENE_STAGES.includes(deterministicStage)
-    && deterministicStage !== "unknown";
-  const effectiveStage = deterministicStageMayCorrect
-    ? deterministicStage
-    : (stageMayCorrect ? proposedStage : observation.page?.step);
   const grounded = accepted.length > 0 || stageGrounded;
   return {
-    ...observation,
-    page: {
-      ...(observation.page || {}),
-      step: effectiveStage,
-      controls,
-      fields,
-      validationIssues,
-      stageExit,
-      semanticSceneReconciliation: {
-        status: grounded ? "grounded" : "unknown",
-        authority: "hypothesis_only",
-        declaredStage: clean(observation.page?.step || "unknown"),
-        stage: proposedStage,
-        stageApplied: deterministicStageMayCorrect || stageMayCorrect,
-        stageConfidence: response.stageConfidence || "low",
-        stageEvidence: clean(response.stageEvidence),
-        contradictionReasons: [...(uncertainty.stageContradiction?.reasons || [])],
-        hypotheses: accepted.map((hypothesis) => ({ ...hypothesis, evidence: clean(hypothesis.evidence) }))
-      }
+    ...semanticCompilation,
+    controls,
+    fields,
+    validationIssues,
+    semanticSceneReconciliation: {
+      status: grounded ? "grounded" : "unknown",
+      authority: "hypothesis_only",
+      declaredStage: clean(observation.page?.step || "unknown"),
+      stage: proposedStage,
+      stageApplied: false,
+      stageConfidence: response.stageConfidence || "low",
+      stageEvidence: clean(response.stageEvidence),
+      contradictionReasons: [...(uncertainty.stageContradiction?.reasons || [])],
+      hypotheses: accepted.map((hypothesis) => ({ ...hypothesis, evidence: clean(hypothesis.evidence) }))
     }
   };
 }
@@ -566,7 +451,7 @@ async function reconcileSemanticScene({
   uncertainty = null
 } = {}) {
   const scene = uncertainty || semanticSceneUncertainty({ observation, semanticCompilation, traveler, transactionReview });
-  if (!scene.needed) return { observation, reconciliation: null, meta: null };
+  if (!scene.needed) return { scenePatch: null, reconciliation: null, meta: null };
   const { data, meta } = await callStructured({
     apiKey,
     model,
@@ -604,28 +489,37 @@ async function reconcileSemanticScene({
       evidence: clean(hypothesis?.evidence)
     })) : []
   };
-  const reconciled = response.status === "grounded"
-    ? applySemanticSceneHypotheses(observation, response, scene)
-    : {
-        ...observation,
-        page: {
-          ...(observation.page || {}),
-          semanticSceneReconciliation: {
-            status: "unknown",
-            authority: "hypothesis_only",
-            declaredStage: clean(observation.page?.step || "unknown"),
-            stage: response.stage,
-            stageApplied: false,
-            stageConfidence: response.stageConfidence,
-            stageEvidence: response.stageEvidence,
-            contradictionReasons: [...(scene.stageContradiction?.reasons || [])],
-            hypotheses: []
-          }
-        }
-      };
+  // The model returns a neutral closed-ID patch. It does not mutate the
+  // observation and cannot publish action, risk, permission, completion or a
+  // stage exit. CheckoutScene validates/applies this patch exactly once.
+  const scenePatch = response.status === "grounded"
+    ? Object.freeze({
+        contractVersion: "scene-patch/v1",
+        patchId: `patch:${clean(observation.observationId || "observation")}:${crypto.createHash("sha256").update(JSON.stringify(response)).digest("hex").slice(0, 16)}`,
+        ...response,
+        uncertainty: scene
+      })
+    : null;
+  const reconciliation = scenePatch
+    ? Object.freeze({
+        status: "grounded",
+        authority: "hypothesis_only",
+        stage: response.stage,
+        stageConfidence: response.stageConfidence,
+        stageEvidence: response.stageEvidence,
+        hypothesisCount: response.hypotheses.length
+      })
+    : Object.freeze({
+        status: "unknown",
+        authority: "hypothesis_only",
+        stage: response.stage,
+        stageConfidence: response.stageConfidence,
+        stageEvidence: response.stageEvidence,
+        hypothesisCount: 0
+      });
   return {
-    observation: reconciled,
-    reconciliation: reconciled.page.semanticSceneReconciliation,
+    scenePatch,
+    reconciliation,
     meta
   };
 }
@@ -633,6 +527,6 @@ async function reconcileSemanticScene({
 module.exports = {
   semanticSceneUncertainty,
   semanticScenePayload,
-  applySemanticSceneHypotheses,
+  applyScenePatch,
   reconcileSemanticScene
 };

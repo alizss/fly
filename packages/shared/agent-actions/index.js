@@ -9,8 +9,8 @@
  * @property {string} [intent]
  * @property {"activate"|"open"|"choose"|"type"|"select"|"keyboard"} [operation]
  * @property {"choice"|"command"|"opener"|"navigation"|"field"} [interactionRole]
- * @property {"select"|"waive"|"open"|"advance"|"set_value"} [semanticEffect]
- * @property {"selected"|"dismissed"|"options_appeared"|"progress_changed"|"value_changed"|"target_visible"} [expectedEvidence]
+ * @property {"select"|"set_state"|"waive"|"open"|"advance"|"set_value"} [semanticEffect]
+ * @property {"selected"|"state_matches"|"dismissed"|"options_appeared"|"progress_changed"|"value_changed"|"target_visible"} [expectedEvidence]
  * @property {string} [semanticOutcome]
  * @property {string} [mechanicalEffect]
  * @property {Object[]} [expectedPostconditions]
@@ -19,6 +19,7 @@
  * @property {string} [semanticOwnershipLinkId]
  * @property {string} [policyCorrectionForDecisionGroupId]
  * @property {string} [obligationId]
+ * @property {string} [sceneItemId]
  * @property {Object} [semanticOwner]
  * @property {string} [semanticOwnerId]
  * @property {string} [decisionInstanceId]
@@ -41,7 +42,6 @@
  * @property {boolean} [boundedRecovery]
  * @property {string} [value]
  * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}} [inputRequest]
- * @property {Object} [approvalRequest]
  * @property {number} [x]
  * @property {number} [y]
  * @property {VisualRegion} [visualRegion]
@@ -201,6 +201,7 @@ function normalizeAction(raw = {}) {
     semanticOwnershipLinkId: raw.semanticOwnershipLinkId ? String(raw.semanticOwnershipLinkId).slice(0, 260) : "",
     policyCorrectionForDecisionGroupId: raw.policyCorrectionForDecisionGroupId ? String(raw.policyCorrectionForDecisionGroupId).slice(0, 140) : "",
     obligationId: (raw.obligationId || raw.goalId) ? String(raw.obligationId || raw.goalId).slice(0, 200) : "",
+    sceneItemId: raw.sceneItemId ? String(raw.sceneItemId).slice(0, 300) : "",
     semanticOwner: owner,
     semanticOwnerId: String(raw.semanticOwnerId || (owner ? semanticOwnerId(owner) : "")).slice(0, 300),
     decisionInstanceId: raw.decisionInstanceId ? String(raw.decisionInstanceId).slice(0, 900) : "",
@@ -246,23 +247,6 @@ function normalizeAction(raw = {}) {
           sensitive: raw.inputRequest.sensitive === true
         }
       : null,
-    approvalRequest: raw.approvalRequest && typeof raw.approvalRequest === "object"
-      ? {
-          contractVersion: String(raw.approvalRequest.contractVersion || "").slice(0, 80),
-          authorizationId: String(raw.approvalRequest.authorizationId || "").slice(0, 160),
-          transactionId: String(raw.approvalRequest.transactionId || "").slice(0, 160),
-          itineraryDigest: String(raw.approvalRequest.itineraryDigest || "").slice(0, 160),
-          travelerIds: Array.isArray(raw.approvalRequest.travelerIds) ? raw.approvalRequest.travelerIds.map(String).slice(0, 12) : [],
-          total: Number.isFinite(Number(raw.approvalRequest.total)) ? Number(raw.approvalRequest.total) : null,
-          currency: String(raw.approvalRequest.currency || "").slice(0, 12),
-          legalText: String(raw.approvalRequest.legalText || "").slice(0, 1600),
-          legalTextDigest: String(raw.approvalRequest.legalTextDigest || "").slice(0, 160),
-          legalControlId: String(raw.approvalRequest.legalControlId || "").slice(0, 160),
-          legalSemanticOwnerId: String(raw.approvalRequest.legalSemanticOwnerId || "").slice(0, 300),
-          advanceControlId: String(raw.approvalRequest.advanceControlId || "").slice(0, 160),
-          expiresAt: Number(raw.approvalRequest.expiresAt || 0)
-        }
-      : null,
     x: Number.isFinite(Number(raw.x)) ? Math.round(Number(raw.x)) : null,
     y: Number.isFinite(Number(raw.y)) ? Math.round(Number(raw.y)) : null,
     visualRegion: normalizeVisualRegion(region, {
@@ -303,6 +287,7 @@ function createActionLease(action = {}) {
       hash: action.observationHash || ""
     }),
     obligationId: action.obligationId || "",
+    sceneItemId: action.sceneItemId || "",
     semanticOwner: semanticOwner ? Object.freeze(semanticOwner) : null,
     semanticOwnerId: action.semanticOwnerId || (semanticOwner ? semanticOwnerId(semanticOwner) : ""),
     candidateId: action.candidateId || "",
@@ -355,6 +340,7 @@ function actionFromLease(lease = null) {
     observationId: lease.observation?.id || "",
     observationHash: lease.observation?.hash || "",
     obligationId: lease.obligationId || "",
+    sceneItemId: lease.sceneItemId || "",
     semanticOwner: lease.semanticOwner || null,
     semanticOwnerId: lease.semanticOwnerId || "",
     candidateId: lease.candidateId || "",

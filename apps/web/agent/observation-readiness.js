@@ -132,7 +132,7 @@ function classifyObservationReadiness({
   const mechanicallyUsable = !explicitLoading && controls > 0;
   const temporarilyIncomplete = afterNavigation && !mechanicallyUsable;
   // Readiness owns only browser mechanics. Stage, field, commerce and payment
-  // meaning belongs to DecisionFrame/TaskState and is deliberately absent.
+  // meaning belongs to CheckoutScene/TaskState and is deliberately absent.
   // Stability is diagnostic once a fresh current surface already exposes an
   // executable mechanic. Waiting solely for a quiet-time threshold creates a
   // lost-mutation race: the destination can become usable before the wait is

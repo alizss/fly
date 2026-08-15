@@ -108,6 +108,53 @@ test("agent route rejects planning without replacing the durable session", async
   assert.equal(timings.at(-1).outcome, "durable_session_required");
 });
 
+test("navigation episode routes preserve one session and action identity", async () => {
+  const calls = [];
+  const episode = {
+    episodeId: "navigation:chk_1:act_1",
+    sessionId: "chk_1",
+    actionId: "act_1",
+    status: "ARMED"
+  };
+  const handle = createAgentRoutes({
+    MAX_OBSERVATION_BYTES: 1000,
+    MAX_SCREENSHOT_UPLOAD_BYTES: 1000,
+    agentLoopFailurePayload: (error) => ({ code: error.code }),
+    agentSessionStore: { getSession: () => null },
+    agentTraceStore: { listTraces: () => [] },
+    armNavigationEpisode: (body) => { calls.push(["arm", body]); return episode; },
+    claimNavigationEpisode: (body) => { calls.push(["claim", body]); return { ...episode, status: "DESTINATION_CLAIMED" }; },
+    readyNavigationEpisode: (body) => { calls.push(["ready", body]); return { ...episode, status: "DESTINATION_READY" }; },
+    clampText: (value) => String(value || ""),
+    createAgentSession: () => null,
+    dataDir: "",
+    decideAgentNextActionViaLoop: () => null,
+    logAgent: () => {},
+    readBody,
+    reportAgentResult: () => null,
+    sendJson,
+    storeScreenshotUpload: () => "",
+    summarizeAgentSession: (session) => session,
+    writeActionLedgerRow: async () => ({}),
+    writeClientFlowLog: async () => ({})
+  });
+
+  for (const [phase, pathname, expectedStatus] of [
+    ["arm", "/api/agent/navigation/arm", 201],
+    ["claim", "/api/agent/navigation/claim", 200],
+    ["ready", "/api/agent/navigation/ready", 200]
+  ]) {
+    const req = request(JSON.stringify({ sessionId: "chk_1", actionId: "act_1", episodeId: episode.episodeId }));
+    req.method = "POST";
+    const res = response();
+    assert.equal(await handle(req, res, pathname), true);
+    assert.equal(res.status, expectedStatus);
+    assert.equal(JSON.parse(res.body).actionId, "act_1");
+    assert.equal(calls.at(-1)[0], phase);
+    assert.equal(calls.at(-1)[1].sessionId, "chk_1");
+  }
+});
+
 test("screenshot references remain bounded to their durable session and observation", () => {
   const screenshots = createScreenshotStore({ maxEntries: 2 });
   const screenshotId = screenshots.storeScreenshotUpload({

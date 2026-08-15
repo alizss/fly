@@ -32,23 +32,14 @@ function authorization(overrides = {}) {
   };
 }
 
-test("legal acceptance requires the exact current transaction-bound authorization", () => {
+test("legal acceptance requires the exact authorization embedded by the checkout mandate obligation", () => {
   const state = { id: "chk_exact", approvals: {} };
   assert.equal(evaluateActionPolicy(legalAction(), state).decision, "ask_user");
-  assert.equal(evaluateActionPolicy(legalAction(), state, {}, {
-    legalAuthorization: authorization({ legalTextDigest: "different_terms" })
-  }).decision, "ask_user");
-  assert.equal(evaluateActionPolicy(legalAction(), state, {}, {
-    legalAuthorization: authorization({ legalControlId: "different_control" })
-  }).decision, "ask_user");
-  assert.equal(evaluateActionPolicy(legalAction(), state, {}, {
-    legalAuthorization: authorization({ transactionId: "different_transaction" })
-  }).decision, "ask_user");
+  assert.equal(evaluateActionPolicy(legalAction({ affordance: { authorization: authorization({ legalTextDigest: "different_terms" }) } }), state).decision, "ask_user");
+  assert.equal(evaluateActionPolicy(legalAction({ affordance: { authorization: authorization({ legalControlId: "different_control" }) } }), state).decision, "ask_user");
+  assert.equal(evaluateActionPolicy(legalAction({ affordance: { authorization: authorization({ transactionId: "different_transaction" }) } }), state).decision, "ask_user");
 
-  const allowed = evaluateActionPolicy(legalAction(), state, {}, {
-    legalAuthorization: authorization()
-  });
+  const allowed = evaluateActionPolicy(legalAction({ affordance: { authorization: authorization() } }), state);
   assert.equal(allowed.allow, true);
   assert.equal(allowed.authorization.authorizationId, "legal_auth_exact");
 });
-

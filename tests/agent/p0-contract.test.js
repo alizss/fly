@@ -31,7 +31,7 @@ const {
   canonicalizeUserPolicy,
   seatPolicyFrom
 } = require("../../apps/web/agent/policy-profile");
-const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { legacyCurrentObligationFromGoal: currentObligationFromGoal } = require("./legacy-scene-item-adapter");
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 test("seat preference aliases normalize once into canonical seatPolicy", () => {

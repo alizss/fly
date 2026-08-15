@@ -4,17 +4,19 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const {
-  compileDecisionFrame,
+  compileCheckoutScene,
   createObservationFrame,
   currentObligationFromGoal,
   CURRENT_OBLIGATION_VERSION,
-  DECISION_FRAME_VERSION,
+  CHECKOUT_SCENE_VERSION,
   OBSERVATION_FRAME_VERSION
 } = require("../../apps/web/agent/authority-frames");
 const { reduceTaskState } = require("./task-state-replay-adapter");
-const { reduceDecisionFrame, taskStateReadModel } = require("../../apps/web/agent/task-state-reducer");
+const { reduceCheckoutScene, taskStateReadModel } = require("../../apps/web/agent/task-state-reducer");
 const { bindMechanics, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
+const { semanticSceneUncertainty } = require("../../apps/web/agent/semantic-scene-reconciliation");
+const { createRequestPayloadAdapter } = require("../../apps/web/agent/request-payload");
 
 function actionable(operation, actuatorId) {
   return {
@@ -59,7 +61,42 @@ function option(controlId, label, price = null) {
   };
 }
 
-test("V2 frames compile once and publish one small mechanics-binding obligation", () => {
+test("observation compaction preserves exact executable actuator proof", () => {
+  const { compactAgentPayload } = createRequestPayloadAdapter({
+    agentSessionStore: null,
+    screenshotForObservation: () => ({ screenshotDataUrl: "" })
+  });
+  const control = {
+    controlId: "payment_method",
+    stateElementId: "payment_method_node",
+    preferredActivationElementId: "payment_method_node",
+    surfaceId: "surface-page",
+    role: "combobox",
+    kind: "button",
+    label: "Payment method",
+    state: { disabled: false },
+    operations: { open: actionable("open", "payment_method_node") }
+  };
+  const compact = compactAgentPayload({
+    sessionId: "session_compaction",
+    observationId: "obs_compaction",
+    observationSnapshot: { snapshotHash: "hash_compaction" },
+    traveler: {},
+    page: {
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [control],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  });
+  const proof = compact.page.controls[0].operations.open.actionability;
+  assert.equal(proof.executable, true);
+  assert.equal(proof.targetable, true);
+  assert.equal(proof.operationAuthorized, true);
+  assert.equal(proof.operationProven, true);
+});
+
+test("CheckoutScene compiles once and publishes one small mechanics-binding obligation", () => {
   const free = option("bag_none", "No checked baggage");
   const paid = option("bag_paid", "Add 20 kg — 35 EUR", { amount: 35, currency: "EUR" });
   const observation = {
@@ -89,24 +126,24 @@ test("V2 frames compile once and publish one small mechanics-binding obligation"
   };
 
   const observationFrame = createObservationFrame(observation);
-  const decisionFrame = compileDecisionFrame({ observation, observationFrame });
+  const checkoutScene = compileCheckoutScene({ observation, observationFrame });
   const taskState = reduceTaskState({
     observation,
-    decisionFrame,
+    checkoutScene,
     traveler: { booking_rules: "No paid baggage or extras" },
     userPolicy: { bookingRules: "No paid baggage or extras" }
   });
-  const productionTaskState = reduceDecisionFrame({
+  const productionTaskState = reduceCheckoutScene({
     previousTaskState: {},
     observation,
-    decisionFrame,
+    checkoutScene,
     traveler: { booking_rules: "No paid baggage or extras" },
     userPolicy: { bookingRules: "No paid baggage or extras" }
   });
 
   assert.equal(observationFrame.contractVersion, OBSERVATION_FRAME_VERSION);
-  assert.equal(decisionFrame.contractVersion, DECISION_FRAME_VERSION);
-  assert.equal(taskState.decisionFrameId, decisionFrame.frameId);
+  assert.equal(checkoutScene.contractVersion, CHECKOUT_SCENE_VERSION);
+  assert.equal(taskState.sceneId, checkoutScene.sceneId);
   assert.equal(taskState.currentObligation.contractVersion, CURRENT_OBLIGATION_VERSION);
   assert.equal(taskState.currentObligation.authority, "task_state");
   assert.equal(taskState.currentObligation.bindingContract, undefined);
@@ -125,8 +162,8 @@ test("V2 frames compile once and publish one small mechanics-binding obligation"
 
   const candidateSet = bindMechanics({
     obligation: taskState.currentObligation,
-    decisionFrame,
-    observation: decisionFrame.observation,
+    checkoutScene,
+    observation: checkoutScene.observation,
     state: { taskState, approvals: {} },
     traveler: { booking_rules: "No paid baggage or extras" }
   });
@@ -134,9 +171,135 @@ test("V2 frames compile once and publish one small mechanics-binding obligation"
   assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["bag_none"]);
   assert.throws(() => bindMechanics({
     obligation: taskState.currentObligation,
-    decisionFrame: { ...decisionFrame, observationHash: "stale_hash" },
-    observation: decisionFrame.observation
-  }), /BIND_MECHANICS_DECISION_FRAME_MISMATCH/);
+    checkoutScene: { ...checkoutScene, sourceSnapshotHash: "stale_hash" },
+    observation: checkoutScene.observation
+  }), /BIND_MECHANICS_CHECKOUT_SCENE_MISMATCH/);
+});
+
+test("a stable active checkout stage without an owned exit keeps semantic closure open", () => {
+  const unfamiliarForward = {
+    controlId: "unknown_forward",
+    stateElementId: "unknown_forward_node",
+    preferredActivationElementId: "unknown_forward_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    label: "Complete this section",
+    semantic: "choice",
+    physicalEffect: "unknown",
+    risk: "uncertain",
+    kind: "button",
+    role: "button",
+    operations: { activate: actionable("activate", "unknown_forward_node") },
+    representationLifecycle: { active: true, status: "active_rendered" },
+    state: { disabled: false }
+  };
+  const observation = {
+    observationId: "obs_missing_scene_exit",
+    observationSnapshot: { snapshotHash: "hash_missing_scene_exit" },
+    page: {
+      url: "https://example.test/checkout/extras",
+      step: "extras",
+      readiness: {
+        documentReadyState: "complete",
+        ariaBusy: false,
+        loadingIndicatorCount: 0,
+        stableForMs: 1_000
+      },
+      currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+      controls: [unfamiliarForward],
+      decisionGroups: [],
+      validationIssues: [],
+      stageExit: { continueObserved: false, continueDisabled: false, candidates: [] }
+    }
+  };
+  const scene = compileCheckoutScene({ observation });
+  const uncertainty = semanticSceneUncertainty({
+    observation,
+    semanticCompilation: agentContract.compileSemanticCheckout(observation.page),
+    checkoutScene: scene
+  });
+
+  assert.equal(scene.closure.status, "open");
+  assert.equal(scene.closure.missingStageExit, true);
+  assert.equal(scene.stageExit.authoritativeCandidate, null);
+  assert.equal(uncertainty.needed, true);
+  assert.deepEqual(uncertainty.components.map((control) => control.controlId), ["unknown_forward"]);
+});
+
+test("accessibility skip links cannot make one executable Continue scene exit ambiguous", () => {
+  const accessibilityLink = (controlId, meaning, label) => ({
+    controlId,
+    stateElementId: `${controlId}_node`,
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    label,
+    stableKey: `link|meaning:${meaning}|path:${controlId}`,
+    semantic: "choice",
+    physicalEffect: "unknown",
+    risk: "uncertain",
+    kind: "link",
+    role: "link",
+    operations: {},
+    state: { disabled: false }
+  });
+  const continueControl = {
+    controlId: "continue_checkout",
+    stateElementId: "continue_checkout_node",
+    preferredActivationElementId: "continue_checkout_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    label: "CONTINUE",
+    stableKey: "button|meaning:continue|path:continue_checkout",
+    semantic: "continue",
+    physicalEffect: "advance_checkout_stage",
+    risk: "safe",
+    kind: "button",
+    role: "button",
+    operations: { activate: actionable("activate", "continue_checkout_node") },
+    state: { disabled: false }
+  };
+  const observation = {
+    observationId: "obs_accessibility_skip_links",
+    observationSnapshot: { snapshotHash: "hash_accessibility_skip_links" },
+    page: {
+      url: "https://example.test/checkout/travelers",
+      step: "traveler_information",
+      readiness: {
+        documentReadyState: "complete",
+        ariaBusy: false,
+        loadingIndicatorCount: 0,
+        stableForMs: 1_000
+      },
+      currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+      controls: [
+        accessibilityLink("skip_main", "skip-to-main-content", "Skip to main content"),
+        accessibilityLink("skip_summary", "skip-to-trip-summary", "Skip to booking details"),
+        continueControl
+      ],
+      decisionGroups: [],
+      validationIssues: [],
+      stageExit: {
+        continueAllowed: true,
+        continueObserved: true,
+        continueDisabled: false,
+        navigationState: "ready",
+        candidates: [{
+          controlId: "continue_checkout",
+          actuatorId: "continue_checkout_node",
+          operation: "activate",
+          method: "browser_trusted_input",
+          status: "ready",
+          executable: true
+        }]
+      }
+    }
+  };
+
+  const scene = compileCheckoutScene({ observation });
+
+  assert.equal(scene.closure.status, "closed");
+  assert.equal(scene.stageExit.authoritativeCandidate.controlId, "continue_checkout");
+  assert.deepEqual(scene.stageExit.candidates.map((candidate) => candidate.controlId), ["continue_checkout"]);
 });
 
 test("a decision obligation cannot admit navigation that its success condition cannot satisfy", () => {
@@ -210,6 +373,7 @@ test("an authorized legal obligation binds its exact admitted checkbox without f
     legalControlId: "legal_terms",
     expiresAt: Date.now() + 60_000
   };
+  const checkoutScene = compileCheckoutScene({ observation });
   const obligation = currentObligationFromGoal({
     goal: {
       goalId: "goal_exact_legal",
@@ -230,7 +394,8 @@ test("an authorized legal obligation binds its exact admitted checkbox without f
         authorizationId: authorization.authorizationId,
         legalTextDigest: authorization.legalTextDigest
       }
-    }
+    },
+    checkoutScene
   });
 
   const candidateSet = bindMechanics({
@@ -265,7 +430,7 @@ test("shared semantic effects canonicalize legacy free-choice vocabulary", () =>
   );
 });
 
-test("production runtime contains one semantic compiler and one TaskState reduction site", () => {
+test("production runtime contains one semantic compiler, a draft/final scene closure, and one TaskState reduction site", () => {
   const root = path.resolve(__dirname, "../..");
   const browser = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
   const loop = fs.readFileSync(path.join(root, "apps/web/agent/loop/orchestrator.js"), "utf8");
@@ -274,8 +439,11 @@ test("production runtime contains one semantic compiler and one TaskState reduct
   const governor = fs.readFileSync(path.join(root, "apps/web/agent/action-governor.js"), "utf8");
   const schemas = fs.readFileSync(path.join(root, "apps/web/agent/schemas.js"), "utf8");
   assert.equal((browser.match(/compileSemanticCheckout\s*\(/g) || []).length, 0);
-  assert.equal((loop.match(/compileDecisionFrame\s*\(/g) || []).length, 1);
-  assert.equal((loop.match(/reduceDecisionFrame\s*\(/g) || []).length, 1);
+  // CheckoutScene is materialized once as a deterministic draft and once as
+  // the immutable final scene when an optional grounded patch is present.
+  // Semantic extraction itself and TaskState reduction remain single-pass.
+  assert.equal((loop.match(/compileCheckoutScene\s*\(/g) || []).length, 2);
+  assert.equal((loop.match(/reduceCheckoutScene\s*\(/g) || []).length, 1);
   assert.equal(/\bselectCandidate\b|\bresolveActiveComponentSemantics\b/.test(loop), false);
   assert.equal((ambiguityResolver.match(/require\("\.\/select-candidate"\)/g) || []).length, 1);
   assert.equal((ambiguityResolver.match(/require\("\.\/active-component-grounding"\)/g) || []).length, 0);
@@ -286,7 +454,7 @@ test("production runtime contains one semantic compiler and one TaskState reduct
   assert.equal(/verifyAndPlan|plannerSchema|verifierSchema|pageStateSchema|requirementSchema/.test(schemas), false);
 });
 
-test("a DecisionFrame cannot be reused for a different immutable observation", () => {
+test("a CheckoutScene cannot be reused for a different immutable observation", () => {
   const first = {
     observationId: "obs_one",
     observationSnapshot: { snapshotHash: "hash_one" },
@@ -299,8 +467,8 @@ test("a DecisionFrame cannot be reused for a different immutable observation", (
   };
   const staleFrame = createObservationFrame(first);
   assert.throws(
-    () => compileDecisionFrame({ observation: second, observationFrame: staleFrame }),
-    /DECISION_FRAME_OBSERVATION_MISMATCH/
+    () => compileCheckoutScene({ observation: second, observationFrame: staleFrame }),
+    /CHECKOUT_SCENE_OBSERVATION_MISMATCH/
   );
 });
 
@@ -364,15 +532,260 @@ test("navigation admission excludes a settled decline even when browser stage-ex
       }
     }
   };
-  const decisionFrame = compileDecisionFrame({ observation, observationFrame: createObservationFrame(observation) });
-  const taskState = reduceTaskState({ observation, decisionFrame, traveler: { booking_rules: "No paid extras" } });
+  const checkoutScene = compileCheckoutScene({ observation, observationFrame: createObservationFrame(observation) });
+  const taskState = reduceTaskState({ observation, checkoutScene, traveler: { booking_rules: "No paid extras" } });
   assert.equal(taskState.currentObligation.desiredEffect, "advance_checkout_stage");
   assert.deepEqual(taskState.currentObligation.admittedControlIds, [continueControl.controlId]);
   const candidates = buildCurrentCandidateSet({
     obligation: taskState.currentObligation,
-    observation: decisionFrame.observation,
+    observation: checkoutScene.observation,
     state: { taskState, approvals: {} },
     traveler: { booking_rules: "No paid extras" }
   });
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [continueControl.controlId]);
+});
+
+test("WSPay-like required billing fields resolve before reversible payment setup", () => {
+  const address = {
+    controlId: "customer_address",
+    stateElementId: "customer_address_node",
+    preferredActivationElementId: "customer_address_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_address",
+    label: "customerAddress customer_address address",
+    role: "textbox",
+    kind: "text",
+    required: true,
+    state: { normalizedValue: "", valuePresent: false, disabled: false },
+    representationLifecycle: { active: true, status: "active_rendered" },
+    operations: { type: actionable("type", "customer_address_node") }
+  };
+  const country = {
+    controlId: "customer_country",
+    stateElementId: "customer_country_node",
+    preferredActivationElementId: "customer_country_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_country",
+    label: "COUNTRY",
+    role: "select",
+    kind: "select-one",
+    required: true,
+    state: { normalizedValue: "hr", valuePresent: true, disabled: false },
+    representationLifecycle: { active: true, status: "active_rendered" },
+    operations: { select: actionable("select", "customer_country_node") }
+  };
+  const method = {
+    controlId: "payment_method",
+    stateElementId: "payment_method_node",
+    preferredActivationElementId: "payment_method_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_payment_method",
+    label: "Payment method selector Please select payment method",
+    role: "combobox",
+    kind: "button",
+    required: false,
+    state: { normalizedValue: "", valuePresent: false, disabled: false, expanded: false },
+    representationLifecycle: { active: true, status: "active_rendered" },
+    operations: { open: actionable("open", "payment_method_node") }
+  };
+  const observation = {
+    observationId: "obs_wspay_billing",
+    observationSnapshot: { snapshotHash: "hash_wspay_billing" },
+    page: {
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page", surfaceClass: "checkout" },
+      controls: [address, country, method],
+      fields: [],
+      decisionGroups: [
+        { decisionGroupId: "dg_address", required: true, status: "missing", alternatives: [address] },
+        { decisionGroupId: "dg_country", required: true, status: "satisfied", selectedControlId: country.controlId, alternatives: [country] },
+        {
+          decisionGroupId: "dg_payment_method",
+          requirementId: "payment:method",
+          sectionType: "payment",
+          sectionLabel: "Payment method selector",
+          required: false,
+          status: "optional",
+          selectedControlId: "",
+          alternatives: [method]
+        }
+      ],
+      validationIssues: [],
+      stageExit: { continueAllowed: false, candidates: [] }
+    }
+  };
+  const traveler = {
+    address: { line1: "100 Test Avenue", country: "TR" },
+    booking_rules: "Reach payment entry without purchasing."
+  };
+  const scene = compileCheckoutScene({ observation, traveler });
+  assert.equal(scene.stage, "payment_method_selection");
+  assert.equal(scene.closure.status, "closed");
+  assert.ok(scene.profileItems.some((item) => (
+    item.semanticType === "address_line1" && item.control.controlId === address.controlId
+  )));
+  assert.ok(scene.profileItems.some((item) => (
+    item.semanticType === "country"
+    && item.currentNormalizedValue === "hr"
+    && item.desiredNormalizedValue === "tr"
+  )));
+  const paymentItem = scene.items.find((item) => item.role === "payment_method");
+  const addressItem = scene.items.find((item) => (
+    item.role === "profile_field" && item.subject === "address_line1"
+  ));
+  assert.equal(paymentItem.status, "unresolved");
+  assert.equal(paymentItem.requiredness, "progression_required");
+  assert.equal(addressItem.status, "unresolved");
+
+  const taskState = reduceTaskState({ observation, checkoutScene: scene, traveler });
+  assert.equal(taskState.currentObligation.sceneItemId, addressItem.sceneItemId);
+  assert.deepEqual(taskState.currentObligation.admittedControlIds, [address.controlId]);
+  const billingCandidates = buildCurrentCandidateSet({
+    obligation: taskState.currentObligation,
+    observation: scene.observation,
+    state: { taskState, approvals: {} },
+    traveler
+  });
+  assert.deepEqual(billingCandidates.candidates.map((candidate) => candidate.controlId), [address.controlId]);
+
+  const settledAddress = { ...address, state: { ...address.state, normalizedValue: "100 Test Avenue", valuePresent: true } };
+  const settledCountry = { ...country, state: { ...country.state, normalizedValue: "tr", valuePresent: true } };
+  const settledObservation = {
+    ...observation,
+    observationId: "obs_wspay_billing_settled",
+    observationSnapshot: { snapshotHash: "hash_wspay_billing_settled" },
+    page: {
+      ...observation.page,
+      controls: [settledAddress, settledCountry, method],
+      decisionGroups: [
+        { decisionGroupId: "dg_address", required: true, status: "satisfied", selectedControlId: address.controlId, alternatives: [settledAddress] },
+        { decisionGroupId: "dg_country", required: true, status: "satisfied", selectedControlId: country.controlId, alternatives: [settledCountry] },
+        observation.page.decisionGroups[2]
+      ]
+    }
+  };
+  const settledScene = compileCheckoutScene({ observation: settledObservation, traveler });
+  const settledPaymentItem = settledScene.items.find((item) => item.role === "payment_method");
+  const paymentState = reduceTaskState({ observation: settledObservation, checkoutScene: settledScene, traveler });
+  assert.equal(paymentState.currentObligation.sceneItemId, settledPaymentItem.sceneItemId);
+  assert.deepEqual(paymentState.currentObligation.admittedControlIds, [method.controlId]);
+  const candidates = buildCurrentCandidateSet({
+    obligation: paymentState.currentObligation,
+    observation: settledScene.observation,
+    state: { taskState: paymentState, approvals: {} },
+    traveler
+  });
+  assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [method.controlId]);
+  assert.equal(candidates.candidates[0].mechanicalEffect, "open_surface");
+});
+
+test("owned payment method on a durable provider handoff is terminal before provider billing work", () => {
+  const billing = {
+    controlId: "provider_address",
+    stateElementId: "provider_address_node",
+    preferredActivationElementId: "provider_address_node",
+    surfaceId: "surface-page",
+    label: "ADDRESS",
+    role: "textbox",
+    kind: "text",
+    required: true,
+    state: { normalizedValue: "", valuePresent: false, disabled: false },
+    representationLifecycle: { active: true, status: "active_rendered" },
+    operations: { type: actionable("type", "provider_address_node") }
+  };
+  const method = {
+    controlId: "provider_payment_method",
+    stateElementId: "provider_payment_method_node",
+    preferredActivationElementId: "provider_payment_method_node",
+    surfaceId: "surface-page",
+    label: "Payment method selector Please select payment method",
+    role: "combobox",
+    kind: "select",
+    state: { normalizedValue: "", valuePresent: false, disabled: false },
+    representationLifecycle: { active: true, status: "active_rendered" },
+    operations: { open: actionable("open", "provider_payment_method_node") }
+  };
+  const terminalEvidence = agentContract.compileTerminalEvidence({
+    url: "https://form.payment-provider.test/authorization",
+    structuralEvidence: {
+      paymentMethodPresent: true,
+      ownedPaymentMethodPresent: true,
+      paymentMethodControlIds: [method.stateElementId],
+      providerHandoffPresent: true,
+      terminalEvidenceSources: ["visible_owned_payment_method", "durable_provider_handoff"]
+    }
+  });
+  assert.equal(terminalEvidence.boundary, "PAYMENT_ENTRY");
+  assert.equal(terminalEvidence.boundaryObserved, true);
+  assert.deepEqual(terminalEvidence.paymentMethodControlIds, [method.stateElementId]);
+
+  const genericCopy = agentContract.compileTerminalEvidence({
+    url: "https://example.test/authorization",
+    visibleText: "Credit card payment is available"
+  });
+  assert.equal(genericCopy.boundary, "UNKNOWN");
+
+  const transaction = {
+    itinerary: {
+      completeness: "complete",
+      segments: [{ segmentId: "segment_1", origin: "ZAG", destination: "SJJ", departureDate: "2026-09-15" }]
+    },
+    travelers: [{ travelerId: "trav_provider", name: "Ali SIFRAR" }],
+    currency: "EUR",
+    totalPrice: { amount: 141.62, currency: "EUR" },
+    selectedExtras: []
+  };
+  const transactionReview = {
+    ready: true,
+    baselineStatus: "approved",
+    missingFacts: [],
+    contradictions: [],
+    unauthorizedPaidExtras: [],
+    baseline: transaction,
+    current: transaction
+  };
+  const observation = {
+    observationId: "obs_provider_payment_entry",
+    observationSnapshot: { snapshotHash: "hash_provider_payment_entry" },
+    page: {
+      url: "https://form.payment-provider.test/authorization",
+      step: "payment_method_selection",
+      terminalEvidence,
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [billing, method],
+      fields: [],
+      decisionGroups: [{
+        decisionGroupId: "dg_provider_payment_method",
+        requirementId: "payment:method",
+        sectionType: "payment",
+        required: false,
+        status: "optional",
+        alternatives: [method]
+      }],
+      validationIssues: [],
+      stageExit: { continueAllowed: false, candidates: [] }
+    }
+  };
+  const scene = compileCheckoutScene({
+    observation,
+    state: { transactionInvariants: { baseline: transaction } },
+    traveler: { id: "trav_provider", address: { line1: "100 Test Avenue" } }
+  });
+  assert.equal(scene.stage, "payment_entry");
+  assert.equal(scene.terminalState.paymentEntry, true);
+  assert.deepEqual(scene.terminalState.pendingRequiredSceneItemIds, []);
+  assert.deepEqual(scene.terminalState.pendingRequiredProfileControlIds, []);
+
+  const state = reduceTaskState({
+    observation,
+    checkoutScene: scene,
+    traveler: { id: "trav_provider", address: { line1: "100 Test Avenue" } },
+    transactionReview
+  });
+  assert.equal(state.terminalStatus, "payment_entry_reached");
+  assert.equal(state.disposition.code, "PAYMENT_ENTRY_REACHED");
+  assert.equal(state.currentObligation, null);
 });

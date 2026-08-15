@@ -285,6 +285,10 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
   return Object.freeze({
     kind: "adaptive_surface",
     goalId: `${episodeId}:step:${ADAPTIVE_SURFACE_MAX_STEPS - remainingSteps + 1}`,
+    // The child surface is mechanics for the same semantic scene item. Carry
+    // its immutable identity forward instead of asking the fresh child DOM to
+    // manufacture a second owner.
+    sceneItemId: clean(obligationField(sourceGoal, "sceneItemId")),
     sourceGoalId,
     semanticType: clean(obligationField(sourceGoal, "semanticType")),
     desiredValue: obligationField(sourceGoal, "desiredValue"),
@@ -300,6 +304,7 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
     sourceGoal: Object.freeze({
       kind: obligationField(sourceGoal, "kind") || "profile_field",
       goalId: sourceGoalId,
+      sceneItemId: clean(obligationField(sourceGoal, "sceneItemId")),
       semanticGoal: clean(obligationField(sourceGoal, "semanticGoal")),
       semanticType: clean(obligationField(sourceGoal, "semanticType")),
       desiredValue: obligationField(sourceGoal, "desiredValue"),

@@ -41,6 +41,16 @@ export function profileFieldTypesFromText(value = "", { editable = true } = {}) 
   if (editable && /(?:^|\s)(?:place of birth|birth place|birth city)(?:\s|$)/.test(evidence)) add("place_of_birth");
   if (editable && /(?:^|\s)(?:nationality|citizenship|country of citizenship)(?:\s|$)/.test(evidence)) add("nationality");
   if (editable && /country of residence|residence country|resident country/.test(evidence)) add("country_of_residence");
+  // A checkout/billing control labelled simply "Country" owns the address
+  // country value. More specific meanings (nationality, residence, issuing
+  // country, and dial code) are admitted by their explicit evidence above or
+  // below. Keeping the plain label semantic prevents large country widgets
+  // from degrading into a generic choice before goal-aware option ranking.
+  if (
+    editable
+    && boundedPhrase(evidence, "country")
+    && !/(?:nationality|citizenship|residen|issuing|issue|phone|dial|calling|code)/.test(evidence)
+  ) add("country");
   if (editable && /(?:travel|identity)?\s*document type|passport or id|id type/.test(evidence)) add("document_type");
   if (editable && /passport.*(?:number|no)|(?:number|no).*passport/.test(evidence)) add("passport_number");
   if (editable && /(?:travel|identity)?.*document.*(?:number|no)|(?:number|no).*document/.test(evidence)) add("document_number");

@@ -51,6 +51,8 @@ export function createSidebarUi({
       ? agent.skipRoutineRunning
         ? "Acting"
         : "Thinking"
+      : agent.awaiting === "final"
+        ? "Payment entry reached"
       : agent.awaiting
         ? "Waiting"
         : "Ready";
@@ -188,7 +190,11 @@ export function createSidebarUi({
       ${agentProcessDiagnosticsHtml()}
       ${agentSectionsHtml(map)}
       ${agent.running ? agentReasoningHtml() : ""}
-      ${agent.awaiting ? `<div class="atw-mini-note">Waiting for you — answer next to the AI cursor on the page.</div>` : ""}
+      ${agent.awaiting === "final"
+        ? `<div class="atw-mini-note">Payment entry is ready. Fly stopped before entering credentials or purchasing.</div>`
+        : agent.awaiting
+          ? `<div class="atw-mini-note">Waiting for you — answer next to the AI cursor on the page.</div>`
+          : ""}
     `;
   }
 
@@ -241,19 +247,6 @@ export function createSidebarUi({
           <button id="atw-stop">Review manually</button>
           <button class="atw-primary" id="atw-skip-extras">Skip paid extras</button>
           ${demoAddBag}
-        </div>
-      `;
-    }
-    if (agent.awaiting === "legal") {
-      const request = agent.pendingApprovalRequest || {};
-      const amount = Number.isFinite(Number(request.total))
-        ? `${request.currency || ""} ${Number(request.total).toFixed(2)}`.trim()
-        : "the approved booking total";
-      return `
-        <div class="atw-mini-note"><strong>Exact legal approval</strong><br>${escapeHtml(request.legalText || "The airline requires acceptance of legal terms.")}<br>Booking total: ${escapeHtml(amount)}</div>
-        <div class="atw-choice-grid">
-          <button id="atw-stop">Do not accept</button>
-          <button class="atw-primary" id="atw-approve-legal">Approve exact terms</button>
         </div>
       `;
     }
@@ -498,7 +491,6 @@ export function createSidebarUi({
     document.getElementById("atw-stop")?.addEventListener("click", () => handleAgentChoice("stop"));
     document.getElementById("atw-retry")?.addEventListener("click", () => handleAgentChoice("retry"));
     document.getElementById("atw-skip-paid")?.addEventListener("click", () => handleAgentChoice("skip_paid"));
-    document.getElementById("atw-approve-legal")?.addEventListener("click", () => handleAgentChoice("approve_legal"));
     document.getElementById("atw-chat-form")?.addEventListener("submit", handleChatSubmit);
     document.getElementById("atw-traveler").addEventListener("change", async (event) => {
       const nextTravelerId = event.target.value;

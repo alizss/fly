@@ -203,27 +203,55 @@ export function createDecisionGroupCompiler(dependencies) {
     );
   }
 
-  function ownedDecisionElement(section = {}, choices = [], byControlId = new Map()) {
-    const nodes = choices.map((choice) => decisionChoiceElement(choice, byControlId)).filter(Boolean);
-    const selected = choices.find((choice) => choice.selected) || choices[0] || null;
-    const source = selected ? decisionChoiceElement(selected, byControlId) : nodes[0];
+  function ownedSelectedOptionElement(section = {}, choices = [], byControlId = new Map()) {
+    const selected = choices.find((choice) => choice.selected) || null;
+    const source = selected ? decisionChoiceElement(selected, byControlId) : null;
+    const peerNodes = choices
+      .filter((choice) => choice !== selected)
+      .map((choice) => decisionChoiceElement(choice, byControlId))
+      .filter(Boolean);
     const sectionElement = elementById(section.id || "") || section.element || null;
     if (!source || !sectionElement) return null;
-    for (let current = source.parentElement; current; current = current.parentElement) {
+    for (let current = source; current; current = current.parentElement) {
       if (!sectionElement.contains(current) && current !== sectionElement) break;
-      const ownsEveryChoice = nodes.every((node) => current.contains(node));
+      // Price evidence belongs to a selected option only while its owner does
+      // not also contain a sibling option. A price on the shared fieldset,
+      // form, basket, or page is transaction evidence—not an option delta.
+      const ownsPeer = peerNodes.some((node) => current === node || current.contains(node));
       const prices = structuredPricesFromText(current.innerText || current.textContent || "");
-      if (ownsEveryChoice && prices.length) return current;
+      if (!ownsPeer && prices.length) return current;
       if (current === sectionElement) break;
     }
     return null;
   }
 
-  function selectedDisposition({ selected = null, selectedControl = {}, structuredPrice = null } = {}) {
+  function nonEconomicGroupEffectRole(group = {}, choices = [], byControlId = new Map()) {
+    const optionText = normalizeMatchText(choices.map((choice) => {
+      const control = byControlId.get(choice.controlId) || {};
+      return `${choice.label || ""} ${control.name || ""} ${control.semantic || ""}`;
+    }).join(" "));
+    const groupText = normalizeMatchText([
+      group.sectionLabel,
+      group.sectionType,
+      group.requirementId,
+      optionText
+    ].filter(Boolean).join(" "));
+    if (/natural person/.test(optionText) && /legal person/.test(optionText)) return "presentation_mode";
+    if (/payment/.test(groupText) && /credit debit card|saved (?:credit )?debit card|meansofpayment/.test(optionText)) {
+      return "presentation_mode";
+    }
+    if (/survey|marketing|promotional|third party offers|receive information/.test(groupText)) return "information_only";
+    return "";
+  }
+
+  function selectedDisposition({ selected = null, selectedControl = {}, structuredPrice = null, effectRole = "" } = {}) {
     if (!selected) return "unknown";
-    const effectRole = selected.effectRole || selectedControl.effectRole || canonicalDecisionEffectRole(selectedControl);
-    if (NON_ECONOMIC_EFFECT_ROLES.has(effectRole)) return "non_economic";
-    if (effectRole === "free_decline" || effectRole === "included_entitlement") return "free";
+    const resolvedEffectRole = effectRole
+      || selected.effectRole
+      || selectedControl.effectRole
+      || canonicalDecisionEffectRole(selectedControl);
+    if (NON_ECONOMIC_EFFECT_ROLES.has(resolvedEffectRole)) return "non_economic";
+    if (resolvedEffectRole === "free_decline" || resolvedEffectRole === "included_entitlement") return "free";
     if (Number(structuredPrice?.amount) > 0) return "paid";
     if (Number(structuredPrice?.amount) === 0) return "free";
     const selectedLabel = normalizeMatchText(selected.label || selectedControl.ownText || "");
@@ -249,25 +277,28 @@ export function createDecisionGroupCompiler(dependencies) {
     const selected = choices.find((choice) => choice.selected) || null;
     if (!selected) return group;
     const selectedControl = byControlId.get(selected.controlId) || {};
-    const effectRole = selected.effectRole || selectedControl.effectRole || canonicalDecisionEffectRole(selectedControl);
+    const effectRole = nonEconomicGroupEffectRole(group, choices, byControlId)
+      || selected.effectRole
+      || selectedControl.effectRole
+      || canonicalDecisionEffectRole(selectedControl);
     const economic = !NON_ECONOMIC_EFFECT_ROLES.has(effectRole);
     const directPrice = economic ? (selectedControl.structuredPrice
       || structuredPriceFromText(selected.priceText || "")
       || structuredPriceFromText(selected.label || "")) : null;
-    const exactDisposition = selectedDisposition({ selected, selectedControl, structuredPrice: directPrice });
+    const exactDisposition = selectedDisposition({ selected, selectedControl, structuredPrice: directPrice, effectRole });
     // Nearby price ownership is legal only for an exact commerce option.
     // Scope/applicability toggles and informational controls must never inherit
     // a sibling product's price from their shared visual section.
     const owner = directPrice || !economic
       ? null
-      : ownedDecisionElement(section, choices, byControlId);
+      : ownedSelectedOptionElement(section, choices, byControlId);
     const ownedPrices = owner ? structuredPricesFromText(owner.innerText || owner.textContent || "") : [];
     const eligibleOwnedPrices = exactDisposition === "free"
       ? ownedPrices.filter((price) => Number(price.amount) === 0)
       : ownedPrices;
     const ownedPrice = eligibleOwnedPrices.length === 1 ? eligibleOwnedPrices[0] : null;
     const structuredPrice = directPrice || ownedPrice || null;
-    const disposition = selectedDisposition({ selected, selectedControl, structuredPrice });
+    const disposition = selectedDisposition({ selected, selectedControl, structuredPrice, effectRole });
     return {
       ...group,
       selectedEvidence: {
@@ -1257,6 +1288,36 @@ export function createDecisionGroupCompiler(dependencies) {
       const selected = selectionInvariantValid && selectedChoices.length === 1
         ? selectedChoices[0]
         : null;
+      const selectedControl = selected ? (byControlId.get(selected.controlId) || {}) : {};
+      const selectedEffectRole = selected
+        ? (nonEconomicGroupEffectRole(group, alternatives, byControlId)
+          || selected.effectRole
+          || selectedControl.effectRole
+          || canonicalDecisionEffectRole(selectedControl))
+        : "";
+      const selectedIsEconomic = selected && !NON_ECONOMIC_EFFECT_ROLES.has(selectedEffectRole);
+      const selectedStructuredPrice = selectedIsEconomic
+        ? (selectedControl.structuredPrice || selected.structuredPrice || null)
+        : null;
+      const selectedEvidence = selected
+        ? (group.selectedEvidence || {
+            selected: true,
+            disposition: selectedDisposition({
+              selected,
+              selectedControl,
+              structuredPrice: selectedStructuredPrice,
+              effectRole: selectedEffectRole
+            }),
+            effectRole: selectedEffectRole,
+            economicEffect: selectedIsEconomic ? "decision_outcome" : "none",
+            structuredPrice: selectedStructuredPrice,
+            source: selectedStructuredPrice ? "selected_control" : "selected_control_state",
+            selectedControlId: selected.controlId || "",
+            selectedLabel: selected.label || "",
+            semantic: selected.semantic || selectedControl.semantic || "",
+            risk: selected.risk || selectedControl.risk || ""
+          })
+        : null;
       return [{
         ...group,
         alternatives,
@@ -1269,6 +1330,7 @@ export function createDecisionGroupCompiler(dependencies) {
           selectedCount: selectedChoices.length
         },
         status: selected ? "satisfied" : (group.required ? "missing" : "optional"),
+        ...(selectedEvidence ? { selectedEvidence } : {}),
         evidence: selected
           ? [`Selected: ${selected.label}`]
           : [`No selected option for ${group.sectionLabel || group.requirementId || "decision"}`]
@@ -1285,7 +1347,7 @@ export function createDecisionGroupCompiler(dependencies) {
     choiceLikeModelFromDecisionField,
     choiceLikeModelFromDecisionControl,
     decisionChoiceElement,
-    ownedDecisionElement,
+    ownedDecisionElement: ownedSelectedOptionElement,
     selectedDisposition,
     withOwnedSelectedEvidence,
     attachExactCommerceOptionPrices,

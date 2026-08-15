@@ -2,7 +2,6 @@
  * @typedef {Object} ApprovalState
  * @property {boolean} skipPaidExtrasApproved
  * @property {boolean} paymentApproved
- * @property {Object|null} legalAuthorization
  * @property {boolean} priceIncreaseApproved
  *
  * @typedef {Object} PriceSnapshot
@@ -54,6 +53,7 @@
  * @property {Object} sessionProfileOverrides
  * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}|null} pendingUserInput
  * @property {Object|null} transactionInvariants
+ * @property {Object|null} checkoutMandate
  * @property {Object} paymentState
  * @property {string} createdAt
  * @property {string} updatedAt
@@ -112,13 +112,14 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
       updatedAt: ""
     },
     aiDecisionCache: null,
-    approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalAuthorization: null, priceIncreaseApproved: false },
+    approvals: { skipPaidExtrasApproved: false, paymentApproved: false, priceIncreaseApproved: false },
     lastAction: null,
     lastVerification: null,
     traceIds: [],
     currentObservationId: "",
     currentObservationHash: "",
     transactionInvariants: null,
+    checkoutMandate: null,
     paymentState: { status: "not_authorized", authorizationId: "", attempts: 0, lastAttemptAt: "" },
     createdAt: at,
     updatedAt: at
