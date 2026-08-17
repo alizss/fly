@@ -3,7 +3,6 @@ export function createAgentLifecycle({
   DESTINATION_WAIT_TIMEOUT_MS,
   addAgentMessage,
   agent,
-  getLastExternalMaterialMutationAt = () => 0,
   logFlow,
   processCheckoutAgent,
   renderSidebar,
@@ -73,9 +72,6 @@ export function createAgentLifecycle({
     const taskStateWait = /task_state_reobserve/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
     const dispatchedStageExitWait = /wait_for_dispatched_stage_exit/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
     const retryToken = String(decision.reobserveRetryToken || "");
-    const dispatchedAt = Number(decision.dispatchedAt || 0);
-    const bufferedMutationAt = Number(getLastExternalMaterialMutationAt() || 0);
-    const bufferedDispatchMutation = dispatchedAt > 0 && bufferedMutationAt >= dispatchedAt;
     agent.destinationWait = {
       status: "WAITING_FOR_DESTINATION",
       kind: taskStateWait ? "current_surface" : dispatchedStageExitWait ? "dispatched_stage_exit" : "destination",
@@ -83,11 +79,9 @@ export function createAgentLifecycle({
       deadlineAt: backendDeadlineAt > 0 ? backendDeadlineAt : (existing?.deadlineAt || (now + DESTINATION_WAIT_TIMEOUT_MS)),
       attempts: Number(existing?.attempts || 0),
       backendWaits: Number(existing?.backendWaits || 0) + 1,
-      wakeRequested: decision.wakeRequested === true || bufferedDispatchMutation,
-      lastWakeReason: bufferedDispatchMutation ? "dom_mutation" : (decision.lastWakeReason || "backend_wait"),
-      lastMutationAt: bufferedDispatchMutation
-        ? bufferedMutationAt
-        : Number(decision.lastMutationAt || existing?.lastMutationAt || 0),
+      wakeRequested: decision.wakeRequested === true,
+      lastWakeReason: decision.lastWakeReason || "backend_wait",
+      lastMutationAt: Number(decision.lastMutationAt || existing?.lastMutationAt || 0),
       deadlineObservationSent: Boolean(existing?.deadlineObservationSent),
       observationId: decision.observationId || existing?.observationId || "",
       actionId: decision.actionId || decision.id || existing?.actionId || "",

@@ -496,29 +496,8 @@ function rawControlValue(control = {}) {
   );
 }
 
-function ageAttestationAnswer(questionEvidence = "", desiredAge = "") {
-  const question = String(questionEvidence || "").toLowerCase().replace(/\s+/g, " ");
-  const age = Number(String(desiredAge || "").match(/\d{1,3}/)?.[0]);
-  if (!Number.isInteger(age)) return "";
-  let match = question.match(/(?:over|older than|more than)\s*(\d{1,3})/);
-  if (match) return age > Number(match[1]) ? "yes" : "no";
-  match = question.match(/(?:at least|aged?)\s*(\d{1,3})\s*(?:or older|and over|\+)?/);
-  if (match) return age >= Number(match[1]) ? "yes" : "no";
-  match = question.match(/(\d{1,3})\s*(?:or older|and over|and above|\+)/);
-  if (match) return age >= Number(match[1]) ? "yes" : "no";
-  match = question.match(/(?:under|younger than|less than)\s*(\d{1,3})/);
-  if (match) return age < Number(match[1]) ? "yes" : "no";
-  if (/\b(?:adult|of legal age)\b/.test(question)) return age >= 18 ? "yes" : "no";
-  return "";
-}
-
-function ageOptionContains(value = "", desiredAge = "", questionEvidence = "") {
-  if (agentContract.profileChoiceValueCompatible(value, desiredAge, "age_at_departure")) return true;
-  const expected = ageAttestationAnswer(questionEvidence, desiredAge);
-  const actual = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  if (!expected || !/^(?:yes|no|true|false|1|0)$/.test(actual)) return false;
-  const normalizedActual = /^(?:yes|true|1)$/.test(actual) ? "yes" : "no";
-  return normalizedActual === expected;
+function ageOptionContains(value = "", desiredAge = "") {
+  return agentContract.profileChoiceValueCompatible(value, desiredAge, "age_at_departure");
 }
 
 function currentComponentValue(semanticType = "", role = "", control = {}, field = {}, desiredValue = "") {
@@ -782,13 +761,13 @@ function optionsForMembers(members = []) {
   ));
 }
 
-function canonicalOptionMatch(semanticType = "", role = "", desiredValue = "", option = {}, questionEvidence = "") {
+function canonicalOptionMatch(semanticType = "", role = "", desiredValue = "", option = {}) {
   const raw = [option.value, option.label].map((value) => String(value || "").trim()).filter(Boolean);
   if (DATE_FIELDS.has(semanticType) && role !== "value") {
     return raw.some((value) => dateComponentValue(role, value) === desiredValue);
   }
   if (semanticType === "age_at_departure") {
-    return raw.some((value) => ageOptionContains(value, desiredValue, questionEvidence));
+    return raw.some((value) => ageOptionContains(value, desiredValue));
   }
   return raw.some((value) => canonicalValue(semanticType, value) === desiredValue);
 }
@@ -798,12 +777,11 @@ function exactObservedOptionContract({
   role = "value",
   desiredValue = "",
   controlId = "",
-  options = [],
-  questionEvidence = ""
+  options = []
 } = {}) {
   if (!desiredValue || !Array.isArray(options) || !options.length) return null;
   const matches = options
-    .filter((option) => canonicalOptionMatch(semanticType, role, desiredValue, option, questionEvidence))
+    .filter((option) => canonicalOptionMatch(semanticType, role, desiredValue, option))
     .filter((option, index, list) => list.findIndex((candidate) => (
       String(candidate.value || "") === String(option.value || "")
       && String(candidate.label || "") === String(option.label || "")
@@ -841,8 +819,7 @@ function executableComponentValue({
     semanticType,
     role,
     desiredValue,
-    option,
-    `${control.label || ""} ${control.accessibleName || ""} ${control.accessibleDescription || ""} ${field.label || ""} ${field.description || ""}`
+    option
   ));
   if (matching) return String(matching.value || matching.label || desiredValue);
   if (DATE_FIELDS.has(semanticType) && role === "value") {
@@ -1297,8 +1274,7 @@ function resolveLogicalFields(page = {}, profile = {}) {
         role,
         desiredValue,
         controlId: control.controlId,
-        options: componentObservedOptions,
-        questionEvidence: `${control.label || ""} ${control.accessibleName || ""} ${control.accessibleDescription || ""} ${field.label || ""} ${field.description || ""}`
+        options: componentObservedOptions
       });
       const validationOwnership = Object.freeze({
         ownerId: logicalFieldId,

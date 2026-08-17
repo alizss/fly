@@ -730,12 +730,6 @@ test("typed terminal evidence is the sole final-review authority when provenance
   state.id = "txn_terminal_evidence_review";
   state = prepareTransactionInvariants(state, observation("obs_baseline", facts()), { id: "trav_1" }).state;
   const paymentFacts = facts();
-  // Croatia's final review repeats the traveler and exact approved total but
-  // does not repeat the route. The immutable SelectedBooking remains route
-  // authority while any explicitly observed conflicting route would still
-  // fail reconciliation.
-  paymentFacts.itinerary = { completeness: "unknown", segments: [] };
-  paymentFacts.factEvidence = { ...(paymentFacts.factEvidence || {}), itinerary: [] };
   paymentFacts.provenance = [{ source: "unknown", observationId: "obs_payment", confidence: 0 }];
   const paymentObservation = observation("obs_payment", paymentFacts);
   paymentObservation.page.step = "payment";
@@ -752,7 +746,6 @@ test("typed terminal evidence is the sole final-review authority when provenance
   assert.ok(reviewed.envelope.reviewFacts);
   assert.equal(reviewed.envelope.reviewFacts.provenance.some((entry) => entry.source === "payment_summary"), true);
   assert.equal(reviewed.review.missingFacts.includes("payment_review"), false);
-  assert.equal(reviewed.review.missingFacts.includes("review_itinerary_route"), false);
   assert.equal(reviewed.review.ready, true);
 });
 

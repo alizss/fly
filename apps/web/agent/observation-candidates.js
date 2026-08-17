@@ -3,10 +3,7 @@ const { controlBelongsToCurrentSurface, currentSurface, surfaceBinding } = requi
 const { deriveActionSemantics } = require("./action-semantics");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
-const {
-  currentObligationValue: obligationField,
-  isCurrentObligation
-} = require("./current-obligation");
+const { currentObligationValue: obligationField } = require("./current-obligation");
 
 function slug(value = "") {
   return String(value || "")
@@ -190,24 +187,6 @@ function controlsForGoal(page = {}, goal = {}) {
   if (obligationField(goal, "kind") === "adaptive_interaction") {
     const exactIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
     return controls.filter((control) => exactIds.has(control.controlId));
-  }
-  if (isCurrentObligation(goal)) {
-    const exactIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
-    const exactCurrentControls = controls.filter((control) => (
-      exactIds.has(control.controlId)
-      && controlBelongsToCurrentSurface(control, page)
-    ));
-    if (exactCurrentControls.length) return exactCurrentControls;
-
-    // TaskState has already admitted the semantic work. Mechanics must bind
-    // those exact controls without rediscovering their meaning through the
-    // legacy decision-group or forward-label filters below. A profile/custom
-    // widget is the sole bounded exception: after its admitted parent opens,
-    // fresh child options may live on a portalled foreground surface and are
-    // still mechanics for that same obligation.
-    if (exactIds.size && !["profile_field", "adaptive_surface"].includes(obligationField(goal, "kind"))) {
-      return [];
-    }
   }
   if (obligationField(goal, "semanticType") === "surface_ambiguity" || obligationField(goal, "selectionMode") === "ai_ambiguity") {
     // Selected values are current state, not executable alternatives. If the

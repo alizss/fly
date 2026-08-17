@@ -81,7 +81,6 @@ function createNextActionService({
         ...(state.approvals || {}),
         skipPaidExtrasApproved: Boolean(payload.approvalState?.skipPaidExtrasApproved || state.approvals?.skipPaidExtrasApproved),
         paymentAuthorization: payload.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
-        legalAuthorization: payload.approvalState?.legalAuthorization || state.approvals?.legalAuthorization || null,
         priceAuthorization: payload.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
       }
     });

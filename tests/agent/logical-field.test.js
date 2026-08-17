@@ -50,36 +50,6 @@ test("travel-purpose radio groups compile as a profile-backed choice", () => {
   assert.equal(semanticTypeForControl(control, {}), "travel_purpose");
 });
 
-test("typed validation admission separates active owned errors from diagnostic summaries", () => {
-  const phone = {
-    controlId: "ctrl_phone",
-    surfaceId: "surface-page",
-    representationLifecycle: { status: "active_rendered", active: true },
-    state: { invalid: true }
-  };
-  const context = {
-    controls: [phone],
-    currentSurface: { id: "surface-page", type: "page" },
-    stageExit: { navigationState: "ready", continueDisabled: false }
-  };
-
-  assert.equal(agentContract.validationIssueAdmission({
-    message: "Please enter a valid phone number",
-    controlId: phone.controlId,
-    stageWide: false
-  }, context).blocking, true);
-  assert.equal(agentContract.validationIssueAdmission({
-    message: "0 error Please check the information below marked in red",
-    controlId: "",
-    stageWide: false
-  }, context).blocking, false);
-  assert.equal(agentContract.validationIssueAdmission({
-    message: "Please check the information below marked in red",
-    controlId: "",
-    stageWide: false
-  }, context).blocking, false);
-});
-
 function dateControl(role, value = "", options = {}) {
   const controlId = options.controlId || `ctrl_${role}`;
   const operation = options.operation || (role === "month" ? "select" : "type");
@@ -1300,41 +1270,6 @@ test("age at departure is derived from DOB and the selected booking date and mat
   assert.equal(ageField.components[0].desiredValue, "23");
   assert.equal(ageField.components[0].inputValue, "18_24");
   assert.equal(ageField.components[0].exactOption.label, "18–24");
-});
-
-test("age at departure answers a grounded Yes/No age attestation", () => {
-  const page = {
-    step: "traveler_information",
-    selectedBooking: {
-      itinerary: {
-        segments: [{ origin: "SJJ", destination: "IST", departureDate: "2026-10-15" }]
-      }
-    },
-    controls: [{
-      controlId: "adult_attestation",
-      fieldType: "age_at_departure",
-      label: "Are you over 18?",
-      role: "select",
-      kind: "select-one",
-      required: true,
-      representationLifecycle: { status: "active_rendered", active: true },
-      options: [
-        { value: "", label: "Choose" },
-        { value: "yes", label: "Yes" },
-        { value: "no", label: "No" }
-      ],
-      state: { valuePresent: false, selected: false, normalizedValue: "" },
-      operations: { select: { actuatorId: "adult_attestation", status: "executable" } }
-    }],
-    fields: []
-  };
-  page.fields = page.controls.map((control) => ({ ...control, controlState: control.state }));
-
-  const [ageField] = resolveLogicalFields(page, traveler);
-
-  assert.equal(ageField.desiredCanonicalValue, "23");
-  assert.equal(ageField.components[0].inputValue, "yes");
-  assert.equal(ageField.components[0].exactOption.label, "Yes");
 });
 
 test("age at departure respects the birthday boundary and is never invented without a departure date", () => {

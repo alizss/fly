@@ -278,7 +278,10 @@ function forwardControlIds(observation = {}) {
       || explicitStageExitIds.has(control.stateElementId)
       || explicitStageExitIds.has(control.preferredActivationElementId);
     const typedNavigation = isTypedNavigationControl(control, { explicitStageExit: false });
-    const alreadySelected = agentContract.controlSelectionCommitted(control);
+    const state = control.state || {};
+    const alreadySelected = control.selected === true
+      || state.selected === true
+      || state.checked === true;
     const choiceLike = /checkbox|radio|option|choice/.test(lower(
       `${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`
     ));
@@ -483,91 +486,6 @@ function navigationGoal(observation = {}, controlIds = []) {
   });
 }
 
-function legalApprovalRequest({ transactionId = "", control = {}, paymentBoundary = {}, transactionReview = null } = {}) {
-  if (!control?.controlId) return null;
-  const baseline = transactionReview?.baseline || transactionReview?.current || {};
-  const legalText = clean(paymentBoundary.legalAcceptanceText || control.label || control.accessibleName).slice(0, 1600);
-  const legalTextDigest = stableSemanticToken(legalText, 64);
-  const itineraryDigest = stableSemanticToken(JSON.stringify(baseline.itinerary || baseline.segments || []), 64);
-  const travelerIds = (baseline.travelers || baseline.travelerIds || []).map((item) => clean(item?.id || item)).filter(Boolean);
-  const total = baseline.totalPrice || {};
-  const advanceControlId = clean(paymentBoundary.advanceToPaymentControlIds?.[0]);
-  const authorizationId = `legal_${stableSemanticToken([
-    transactionId,
-    itineraryDigest,
-    travelerIds.join(","),
-    total.amount,
-    total.currency,
-    legalTextDigest,
-    control.controlId,
-    advanceControlId
-  ].join("|"), 72)}`;
-  return Object.freeze({
-    contractVersion: "legal-approval-request/v1",
-    authorizationId,
-    transactionId: clean(transactionId),
-    itineraryDigest,
-    travelerIds: Object.freeze(travelerIds),
-    total: Number.isFinite(Number(total.amount)) ? Number(total.amount) : null,
-    currency: clean(total.currency || baseline.currency).toUpperCase(),
-    legalText,
-    legalTextDigest,
-    legalControlId: clean(control.controlId),
-    legalSemanticOwnerId: clean(control.semanticOwnerId || control.semanticSceneItem?.ownerId),
-    advanceControlId,
-    expiresAt: Date.now() + 10 * 60 * 1000
-  });
-}
-
-function legalAuthorizationMatches(authorization = null, request = null) {
-  return Boolean(
-    authorization?.contractVersion === "legal-authorization/v1"
-    && request?.authorizationId
-    && authorization.authorizationId === request.authorizationId
-    && authorization.transactionId === request.transactionId
-    && authorization.legalTextDigest === request.legalTextDigest
-    && authorization.legalControlId === request.legalControlId
-    && Number(authorization.expiresAt || 0) >= Date.now()
-  );
-}
-
-function legalAttestationGoal(observation = {}, control = {}, authorization = null) {
-  return Object.freeze({
-    goalId: `${observation.observationId || "observation"}:goal:legal_attestation`,
-    kind: "legal_attestation",
-    semanticGoal: "accept the exact approved legal attestation",
-    semanticType: "legal_attestation",
-    semanticEffect: agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE,
-    desiredValue: "accepted",
-    controlId: clean(control.controlId),
-    actionableControlIds: Object.freeze([clean(control.controlId)]),
-    surfaceId: clean(control.surfaceId || currentSurface(observation.page || {}).id || "surface-page"),
-    observationId: observation.observationId || "",
-    authorization,
-    riskClass: "legal",
-    postcondition: Object.freeze({
-      type: "legal_attestation_accepted",
-      controlId: clean(control.controlId),
-      authorizationId: clean(authorization?.authorizationId),
-      legalTextDigest: clean(authorization?.legalTextDigest)
-    })
-  });
-}
-
-function advanceToPaymentGoal(observation = {}, controlIds = [], authorization = null) {
-  const goal = navigationGoal(observation, controlIds);
-  return Object.freeze({
-    ...goal,
-    goalId: `${observation.observationId || "observation"}:goal:advance_to_payment`,
-    semanticGoal: "advance from approved review to actual payment entry",
-    semanticEffect: agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT,
-    desiredValue: "payment_entry",
-    authorization,
-    riskClass: "reversible",
-    postcondition: Object.freeze({ type: "payment_entry_reached" })
-  });
-}
-
 function completedChoiceSurfaceGoal(observation = {}, episode = {}) {
   const surface = currentSurface(observation.page || {});
   return Object.freeze({
@@ -623,8 +541,6 @@ function reduceDecisionFrame({
   userPolicy = {},
   traveler = {},
   transactionReview = null,
-  transactionId = "",
-  approvals = {},
   parentObjective = null,
   mechanicalEvidence = null,
   decisionFrame = null
@@ -849,59 +765,9 @@ function reduceDecisionFrame({
   const suspendedDecisions = foreground
     ? canonicalDecisions.filter((decision) => decision.surfaceId !== surface.id && GOAL_CREATING.has(decision.status))
     : [];
-  const validationClassifications = (page.validationIssues || []).map((issue) => Object.freeze({
-    issue,
-    admission: agentContract.validationIssueAdmission(issue, {
-      controls: page.controls || [],
-      currentSurface: page.currentSurface || surface,
-      stageExit: page.stageExit || {}
-    })
-  }));
-  const validationBlockers = validationClassifications
-    .filter((entry) => entry.admission.blocking === true)
-    .map((entry) => entry.issue);
-  const validationDiagnostics = validationClassifications
-    .filter((entry) => entry.admission.blocking !== true)
-    .map((entry) => Object.freeze({
-      issue: entry.issue,
-      code: entry.admission.code,
-      classification: entry.admission.classification
-    }));
-  const semanticScene = page.semanticSceneReconciliation || null;
-  const semanticLegalAttestation = (page.controls || []).find((control) => {
-    const item = control.semanticSceneItem || {};
-    return item.grounded === true
-      && item.role === "legal_attestation"
-      && ["html_required", "visually_required", "progression_required"].includes(item.requiredness)
-      && controlBelongsToCurrentSurface(control, page)
-      && !agentContract.controlSelectionCommitted(control);
-  }) || null;
-  const legalAttestationControl = semanticLegalAttestation || (page.controls || []).find((control) => (
-    paymentReviewBoundary.legalAcceptanceControlIds.includes(control.controlId)
-    || (control.semanticSceneItem?.grounded === true && control.semanticSceneItem?.role === "legal_attestation")
-    || agentContract.isLegalAcceptanceText(`${control.semantic || ""} ${control.label || ""} ${control.accessibleName || ""}`)
-  )) || null;
-  const unresolvedLegalAttestation = legalAttestationControl && !agentContract.controlSelectionCommitted(legalAttestationControl)
-    ? legalAttestationControl
-    : null;
-  const currentLegalApprovalRequest = paymentReviewBoundary.legalGate && legalAttestationControl
-    ? legalApprovalRequest({
-        transactionId,
-        control: legalAttestationControl,
-        paymentBoundary: paymentReviewBoundary,
-        transactionReview
-      })
-    : null;
-  const legalAuthorization = legalAuthorizationMatches(approvals?.legalAuthorization, currentLegalApprovalRequest)
-    ? approvals.legalAuthorization
-    : null;
-  const semanticSceneUnresolved = Boolean(
-    semanticScene?.status === "unknown"
-    && (
-      (semanticScene.contradictionReasons || []).length
-      || semanticCompilation.semanticReadiness === agentContract.SEMANTIC_READINESS.UNRESOLVED
-    )
-  );
+  const validationBlockers = (page.validationIssues || []).filter((issue) => issue.stageWide === true || !issue.controlId || (page.controls || []).some((control) => (
+    control.controlId === issue.controlId && controlBelongsToCurrentSurface(control, page)
+  )));
   const controlIds = forwardControlIds(observation);
   const readyStageExitControlIds = (page.stageExit?.candidates || [])
     .filter((candidate) => candidate.executable === true || candidate.status === "ready")
@@ -1021,24 +887,24 @@ function reduceDecisionFrame({
   const transactionEvidenceReady = transactionReview?.ready === true
     && outcomeCoverage.complete === true;
   const paymentCompletionObserved = !siteFailure
-    && paymentReviewBoundary.paymentEntry
+    && paymentReviewBoundary.observed
     && !pendingPaymentReviewContact
     && transactionEvidenceReady;
   const transactionReviewBlocked = !siteFailure
-    && paymentReviewBoundary.paymentEntry
+    && paymentReviewBoundary.observed
     && !pendingPaymentReviewContact
     && !transactionEvidenceReady;
   const terminalGoalLatch = Object.freeze(paymentCompletionObserved || previousTerminalLatch.locked === true
     ? {
         locked: true,
-        goalId: "reach_payment_entry",
-        terminalStatus: "payment_entry_reached",
+        goalId: "reach_payment_review",
+        terminalStatus: "payment_review_reached",
         completedObservationId: previousTerminalLatch.completedObservationId || observation.observationId || "",
         completionEvidence: previousTerminalLatch.completionEvidence || "fresh_payment_evidence"
       }
     : {
         locked: false,
-        goalId: "reach_payment_entry",
+        goalId: "reach_payment_review",
         terminalStatus: "active",
         completedObservationId: "",
         completionEvidence: ""
@@ -1055,11 +921,11 @@ function reduceDecisionFrame({
   // may complete and latch the task.
   const effectiveObservedTerminalStatus = (siteFailure
     || transactionReviewBlocked
-    || observedTerminalStatus === "payment_entry_reached")
+    || observedTerminalStatus === "payment_review_reached")
     ? "active"
     : observedTerminalStatus;
   const terminalStatus = terminalGoalLatch.locked
-    ? "payment_entry_reached"
+    ? "payment_review_reached"
     : (leftActiveCheckout ? "checkout_left" : effectiveObservedTerminalStatus);
   const { transactionOutcome, stageOutcome } = durableOutcomeHierarchy(
     previousTaskState,
@@ -1112,21 +978,8 @@ function reduceDecisionFrame({
       // decisions remain durable facts, but they cannot create an action goal
       // until the failure surface is gone.
       currentGoal = null;
-    } else if (paymentReviewBoundary.paymentEntry && !profileGoal) {
+    } else if (paymentReviewBoundary.observed && !profileGoal) {
       currentGoal = null;
-    } else if (paymentReviewBoundary.legalGate && unresolvedLegalAttestation && legalAuthorization) {
-      currentGoal = legalAttestationGoal(observation, unresolvedLegalAttestation, legalAuthorization);
-    } else if (paymentReviewBoundary.legalGate && unresolvedLegalAttestation) {
-      currentGoal = null;
-      ambiguityReason = "LEGAL_APPROVAL_REQUIRED";
-    } else if ((paymentReviewBoundary.legalGate || paymentReviewBoundary.prePaymentReview) && !profileGoal) {
-      const advanceControlIds = paymentReviewBoundary.advanceToPaymentControlIds.length
-        ? paymentReviewBoundary.advanceToPaymentControlIds
-        : readyStageExitControlIds;
-      currentGoal = advanceControlIds.length
-        ? advanceToPaymentGoal(observation, advanceControlIds, legalAuthorization)
-        : null;
-      if (!currentGoal) ambiguityReason = "ADVANCE_TO_PAYMENT_UNAVAILABLE";
       ambiguityReason = pendingPaymentReviewContact
         ? "payment_review_contact_incomplete"
         : transactionReviewBlocked
@@ -1200,12 +1053,6 @@ function reduceDecisionFrame({
       }
     } else if (decisionEpisode?.status === "completed_pending_surface_exit") {
       currentGoal = completedChoiceSurfaceGoal(observation, decisionEpisode);
-    } else if (unresolvedLegalAttestation) {
-      currentGoal = null;
-      ambiguityReason = "LEGAL_APPROVAL_REQUIRED";
-    } else if (semanticSceneUnresolved) {
-      currentGoal = null;
-      ambiguityReason = "SEMANTIC_SCENE_UNRESOLVED";
     } else if (validationBlockers.length) {
       currentGoal = null;
       ambiguityReason = "contradictory_or_validation_evidence";
@@ -1443,8 +1290,6 @@ function reduceDecisionFrame({
   const unresolved = [
     ...(profileReadiness.missingUserData || []).map((field) => `profile:${clean(field)}`),
     ...activeDecisions.map((decision) => `decision:${clean(decision.decisionGroupId || decision.decisionId)}`),
-    ...(unresolvedLegalAttestation ? [`legal:${clean(unresolvedLegalAttestation.controlId)}`] : []),
-    ...(semanticSceneUnresolved ? ["semantic_scene:unresolved"] : []),
     ...(paymentReviewBoundary.observed ? (transactionReview?.missingFacts || []).map((fact) => `transaction:${clean(fact)}`) : []),
     ...(paymentReviewBoundary.observed ? (transactionReview?.contradictions || []).map((fact) => `contradiction:${clean(fact)}`) : [])
   ].filter(Boolean);
@@ -1457,20 +1302,14 @@ function reduceDecisionFrame({
           ? "verifying_final_transaction"
           : "in_progress",
     currentPosition: Object.freeze({
-      stage: paymentReviewBoundary.paymentEntry
-        ? "payment_entry"
-        : paymentReviewBoundary.legalGate
-          ? "legal_gate"
-          : paymentReviewBoundary.prePaymentReview
-            ? "pre_payment_review"
-            : stage,
+      stage: paymentReviewBoundary.observed ? "payment_review" : stage,
       surfaceId: clean(surface.id || "surface-page"),
       surfaceType: clean(surface.type || "page"),
       surfaceClass
     }),
     currentObjective: clean(
       obligationField(currentGoal, "semanticGoal")
-      || (transactionReviewBlocked ? "verify the final transaction" : "reach actual payment entry")
+      || (transactionReviewBlocked ? "verify the final transaction" : "reach verified payment review")
     ),
     achievements: Object.freeze(achievements),
     unresolved: Object.freeze([...new Set(unresolved)].slice(0, 160)),
@@ -1502,7 +1341,7 @@ function reduceDecisionFrame({
   );
   const dispositionCode = clean(
     siteFailure ? "SITE_FAILURE_OBSERVED"
-      : terminalStatus === "payment_entry_reached" ? "PAYMENT_ENTRY_REACHED"
+      : terminalStatus === "payment_review_reached" ? "PAYMENT_REVIEW_REACHED"
       : terminalStatus === "checkout_left" ? "CHECKOUT_LEFT"
       : transactionReviewBlocked ? "TRANSACTION_REVIEW_INCOMPLETE"
       : authorizationConflict ? "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT"
@@ -1542,11 +1381,11 @@ function reduceDecisionFrame({
       reason: clean(siteFailure.message || "The active checkout surface reports a site failure."),
       userActionRequired: false
     };
-  } else if (terminalStatus === "payment_entry_reached") {
+  } else if (terminalStatus === "payment_review_reached") {
     disposition = {
       kind: "terminal",
       code: dispositionCode,
-      reason: "The approved transaction is reconciled and actual payment entry is visible.",
+      reason: "The approved transaction is reconciled at payment review.",
       userActionRequired: true
     };
   } else if (terminalStatus === "checkout_left") {
@@ -1578,30 +1417,6 @@ function reduceDecisionFrame({
         conflict: authorizationConflict.reopenEvidence
           ? Object.freeze({ ...authorizationConflict.reopenEvidence })
           : null
-      })
-    };
-  } else if (unresolvedLegalAttestation && !currentObligation) {
-    disposition = {
-      kind: "request_approval",
-      code: "LEGAL_APPROVAL_REQUIRED",
-      reason: "The current checkout stage requires approval of this exact legal attestation before Fly may accept it.",
-      userActionRequired: true,
-      details: Object.freeze({
-        controlId: clean(unresolvedLegalAttestation.controlId),
-        label: clean(unresolvedLegalAttestation.label).slice(0, 600),
-        consequence: "legal_attestation",
-        approvalRequest: currentLegalApprovalRequest
-      })
-    };
-  } else if (semanticSceneUnresolved) {
-    disposition = {
-      kind: "request_approval",
-      code: "SEMANTIC_SCENE_UNRESOLVED",
-      reason: "The current foreground checkout scene remains semantically unresolved after bounded reconciliation.",
-      userActionRequired: true,
-      details: Object.freeze({
-        declaredStage: clean(semanticScene?.declaredStage || page.step),
-        contradictionReasons: Object.freeze([...(semanticScene?.contradictionReasons || [])])
       })
     };
   } else if (admittedMechanicsExhausted) {
@@ -1696,7 +1511,6 @@ function reduceDecisionFrame({
     canonicalDecisions,
     suspendedDecisions: Object.freeze(suspendedDecisions),
     validationBlockers: Object.freeze(validationBlockers),
-    validationDiagnostics: Object.freeze(validationDiagnostics),
     stageDecisionEvidence: Object.freeze(stageDecisionEvidence),
     previousActionResult: previousActionResult || null,
     ambiguityReason,
@@ -1713,7 +1527,7 @@ function reduceDecisionFrame({
   });
   const taskState = Object.freeze({
     contractVersion: "task-state/v2",
-    goal: Object.freeze({ id: "reach_payment_entry", status: terminalGoalLatch.locked ? "completed" : "active" }),
+    goal: Object.freeze({ id: "reach_payment_review", status: terminalGoalLatch.locked ? "completed" : "active" }),
     userPreferences: Object.freeze({
       bookingRules: clean(userPolicy.bookingRules || traveler.booking_rules),
       extras: clean(userPolicy.extras),

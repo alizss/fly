@@ -1,6 +1,8 @@
 export function createStageExitCompiler({
   meaningfulActionBox,
-  controlMemberNodeIds
+  controlMemberNodeIds,
+  unfilledRequiredFields,
+  actionableCheckoutErrors
 }) {
   function buildStageExit(decisionGroups, fields, buttons, errors, step, controls = []) {
     const isUnboundSelectionCta = (control) => (
@@ -118,10 +120,15 @@ export function createStageExitCompiler({
       stageExitCandidates.length
       && stageExitCandidates.every((candidate) => candidate.status === "disabled")
     );
+    const actionableErrors = actionableCheckoutErrors(errors);
     const blockers = [];
     const unresolvedGroup = (decisionGroups || []).find((group) => (
       group.required && !["satisfied", "waived", "waived_by_policy"].includes(group.status)
     ));
+    const unresolvedField = unfilledRequiredFields(fields)[0];
+    if (unresolvedGroup) blockers.push(`unresolved decision: ${unresolvedGroup.sectionLabel || unresolvedGroup.requirementId || unresolvedGroup.decisionGroupId}`);
+    if (unresolvedField) blockers.push(`required field: ${unresolvedField.label || unresolvedField.field || unresolvedField.controlId}`);
+    if (actionableErrors.length) blockers.push(`visible errors: ${actionableErrors.slice(0, 2).join("; ")}`);
     if (!continueObserved) blockers.push("Continue not observed");
     else if (continueDisabled) blockers.push("Continue is disabled");
     else if (!safeContinueObserved) blockers.push("Continue is not safely actionable");
@@ -129,6 +136,9 @@ export function createStageExitCompiler({
       continueAllowed: Boolean(
         safeContinueObserved
         && !continueDisabled
+        && !unresolvedGroup
+        && !unresolvedField
+        && !actionableErrors.length
         && !["payment", "confirmation"].includes(step)
       ),
       candidates: Object.freeze(stageExitCandidates),
@@ -142,14 +152,7 @@ export function createStageExitCompiler({
           : safeContinueObserved
             ? "ready"
             : "not_safely_actionable",
-      blockers,
-      diagnostics: Object.freeze({
-        unresolvedDecision: unresolvedGroup
-          ? unresolvedGroup.sectionLabel || unresolvedGroup.requirementId || unresolvedGroup.decisionGroupId || "unknown"
-          : "",
-        unfilledRequiredFieldCount: (fields || []).filter((field) => field.required && !field.hasValue).length,
-        reportedValidationCount: (errors || []).length
-      })
+      blockers
     };
   }
 

@@ -1,10 +1,10 @@
 # Fly — Agent and Engineering Rulebook
 
-Last updated: 2026-08-12
+Last updated: 2026-08-10
 
 ## Core mission
 
-Given an approved selected booking, traveler, and policy, Fly must complete an unfamiliar airline/OTA checkout to verified actual payment entry, ask only when user facts or authority are genuinely required, and never enter payment credentials, click Pay, commit, or purchase under the current milestone. An exact required legal attestation may execute only through the narrow transaction-bound approval flow.
+Given an approved selected booking, traveler, and policy, Fly must complete an unfamiliar airline/OTA checkout to verified payment review, ask only when user facts or authority are genuinely required, and never perform payment, legal, or purchase actions under the current milestone.
 
 Fly learns reusable checkout mechanics—not airline workflows.
 
@@ -19,7 +19,7 @@ fresh immutable observation
 → execute one leased action
 → fresh mechanical and semantic verification
 → persist compact verified facts
-→ continue, recover, ask, stop, or finish at payment entry
+→ continue, recover, ask, stop, or finish review
 ```
 
 Do not add a second semantic compiler, requirement lifecycle, planner, readiness authority, verifier, recovery store, or completion receipt.
@@ -56,10 +56,10 @@ The absence of an airline-specific skill is never a stop reason.
 
 - Required traveler data is genuinely missing.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge is active.
-- Exact legal, payment, purchase, identity, itinerary, price, currency, or paid-choice authority is missing or contradictory.
+- Legal, payment, purchase, identity, itinerary, price, currency, or paid-choice authority is missing or contradictory.
 - Inventory is sold out, the session expired, the airline is unavailable, or valid completed input is rejected.
 - Distinct safe grounded mechanics are exhausted after bounded recovery.
-- Verified actual payment entry is reached under the current milestone.
+- Verified payment review is reached under the current milestone.
 
 Exhausted mechanics on an otherwise eligible journey is an engineering coverage defect, not a desired product handoff.
 
@@ -76,8 +76,7 @@ Always preserve:
 - Fresh semantic postcondition verification.
 - Bounded recovery and failed-strategy memory.
 - Transaction and outcome reconciliation.
-- Legal acceptance only through an unexpired exact transaction/text/control-bound authorization and separate verification.
-- Zero payment-credential/card-entry/Pay/transaction-commit/purchase capability under the current milestone.
+- Zero payment/legal/card/Pay/purchase capability under the current milestone.
 
 Never weaken safety to make a site pass.
 
@@ -112,8 +111,8 @@ Do not remove distinct safety roles merely because they inspect related evidence
 - The exact failure replay passes.
 - No completed work reopens or loops.
 - Correct profile/policy state survives navigation and rerender.
-- 379/379 unit tests pass.
-- 175/175 browser replays pass uninterrupted.
+- 359/359 unit tests pass.
+- 169/169 browser replays pass uninterrupted.
 - `npm run check` and `git diff --check` pass.
 - The discovering site and one retained canary pass.
 - No unauthorized irreversible action executes.

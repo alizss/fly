@@ -88,8 +88,6 @@ export function createCheckoutController({
     agent.pendingUserMessage = "";
     agent.pendingUserResponse = null;
     agent.pendingInputRequest = null;
-    agent.pendingApprovalRequest = null;
-    agent.legalAuthorization = null;
     agent.sessionProfileOverrides = {};
     agent.skipPaidExtrasApproved = shouldAutoDeclinePaidExtras();
     agent.actionHistory = [];
@@ -136,7 +134,6 @@ export function createCheckoutController({
     agent.pendingUserMessage = "";
     agent.pendingUserResponse = null;
     agent.pendingInputRequest = null;
-    agent.pendingApprovalRequest = null;
     agent.sessionProfileOverrides = {};
     agent.actionHistory = [];
     agent.processDiagnostics = null;
@@ -376,28 +373,6 @@ export function createCheckoutController({
       agent.pendingUserMessage = "Use my saved no-extras preference and continue safely.";
       await processCheckoutAgent();
     }
-
-    if (choice === "approve_legal") {
-      const request = agent.pendingApprovalRequest;
-      if (!request?.authorizationId || request.contractVersion !== "legal-approval-request/v1") {
-        addAgentMessage("assistant", "That legal approval request is no longer current. I will rescan before asking again.");
-        agent.awaiting = "";
-        agent.running = true;
-        await processCheckoutAgent();
-        return;
-      }
-      agent.legalAuthorization = Object.freeze({
-        ...request,
-        contractVersion: "legal-authorization/v1",
-        approvedAt: Date.now()
-      });
-      agent.pendingApprovalRequest = null;
-      addAgentMessage("user", "Approve these exact terms and continue to payment entry.");
-      agent.running = true;
-      agent.awaiting = "";
-      renderSidebar("agent");
-      await processCheckoutAgent();
-    }
   }
 
   async function handleChatSubmit(event) {
@@ -441,12 +416,6 @@ export function createCheckoutController({
       renderSidebar("agent");
       await sleep(300);
       processCheckoutAgent();
-      return;
-    }
-
-    if (agent.awaiting === "legal") {
-      addAgentMessage("assistant", "Use the Approve exact terms button so the approval is bound to the displayed text, booking, total, and exact checkbox.");
-      renderSidebar("agent");
       return;
     }
 

@@ -1,6 +1,6 @@
 # Fly — Current Progress
 
-Last updated: 2026-08-12
+Last updated: 2026-08-10
 
 This is the concise chronological engineering record. Current acceptance truth belongs in [FLY_COVERAGE_MATRIX.md](./FLY_COVERAGE_MATRIX.md); stable product scope in [FLY_VISION_PRD.md](./FLY_VISION_PRD.md); architecture and sequence in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md).
 
@@ -8,11 +8,11 @@ This is the concise chronological engineering record. Current acceptance truth b
 
 | Question | Answer |
 |---|---|
-| Product milestone | Universal unfamiliar checkout to actual payment entry; exact legal approval when required; no credentials/Pay/commit/purchase |
+| Product milestone | Universal unfamiliar checkout to verified payment review; no legal/payment/purchase action |
 | Architecture | One ObservationFrame → DecisionFrame → TaskState/CurrentObligation → mechanics → governor → ActionLease → verification loop |
-| Automated baseline | 379/379 unit, 175/175 browser, `npm run check` |
-| Live evidence | EasyJet, GoToGate, Kiwi, and Turkish reached the prior review milestone; Croatia exposed the legal-approval execution gap now closed in replay |
-| Formal evidence gap | Fresh actual-payment-entry canaries and explicit intervention annotations |
+| Automated baseline | 359/359 unit, 169/169 browser, `npm run check` |
+| Live evidence | EasyJet, GoToGate, Kiwi, and Turkish technically reached verified payment review safely |
+| Formal evidence gap | Latest normalized canary reports require explicit intervention annotation |
 | Highest-priority product gap | Cross-airline structural portfolio, not another architecture rewrite |
 | Secondary gap | Browser observation/rescan and ambiguity latency |
 | Safety target | Zero false terminal completion and zero unauthorized irreversible mutation |
@@ -112,8 +112,7 @@ The canary tool reports these as `review_required` until operator intervention i
 - Exact action freshness, duplicate refusal, semantic verification, and bounded recovery.
 - Fare, baggage, seat, insurance, and extras handling for the current baseline policies.
 - Payment-review detection without exposing executable payment controls.
-- Exact transaction-bound legal approval, one verified attestation action, and a separate advance to actual payment entry are covered by the closed-loop Croatia replay.
-- No payment credential entry, Pay, transaction commit, or purchase.
+- No autonomous legal acceptance, payment entry, Pay, or purchase.
 
 ## What is not yet proven
 

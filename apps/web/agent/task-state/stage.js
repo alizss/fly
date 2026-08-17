@@ -161,14 +161,6 @@ function decideStage(observation = {}) {
   const evidence = stageEvidence(observation);
   const page = observation.page || {};
   const surface = currentSurface(page);
-  const reconciledStage = page.semanticSceneReconciliation?.stageApplied === true
-    ? lower(page.semanticSceneReconciliation.stage)
-    : "";
-  const groundedStage = reconciledStage === "review"
-    ? "payment"
-    : ["flight_selection", "traveler_information", "seats", "extras", "payment", "confirmation"].includes(reconciledStage)
-      ? reconciledStage
-      : "";
   const declaredStep = lower(page.step || page.pageStep);
   const declaredStage = /payment/.test(declaredStep)
     ? "payment"
@@ -181,19 +173,9 @@ function decideStage(observation = {}) {
           : /travell?er|passenger|contact/.test(declaredStep)
             ? "traveler_information"
             : "";
-  // Legal and final-review surfaces belong to the payment stage even though
-  // they are deliberately not terminal. The shared boundary compiler has
-  // already required owned final-review evidence, so stage detection must not
-  // rediscover this from loose page text.
-  const paymentDestination = evidence.terminalEvidence?.boundary
-    && evidence.terminalEvidence.boundary !== agentContract.CHECKOUT_BOUNDARY.UNKNOWN;
+  const paymentDestination = evidence.terminalEvidence?.boundaryObserved === true;
   if (paymentDestination) return { stage: "payment", evidence };
   if (evidence.confirmation) return { stage: "confirmation", evidence };
-  // A high-confidence scene correction has already been grounded to current
-  // control IDs and admitted into the one DecisionFrame. It outranks the
-  // browser's contradictory keyword classification, but it still does not
-  // prove terminal completion or authorize any action.
-  if (groundedStage) return { stage: groundedStage, evidence: { ...evidence, semanticSceneStage: groundedStage } };
   // Search/start routes are outside an active checkout. Route structure is
   // stronger than stale extras copy retained in a rerendered shell.
   if (evidence.newSearchRoute) return { stage: "flight_selection", evidence };

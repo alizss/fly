@@ -208,13 +208,13 @@ async function runLoopTurn({
   let decisionFrame = null;
   const persistedTerminalLatch = state.taskState?.terminalGoalLatch || null;
   if (persistedTerminalLatch?.locked === true
-    && persistedTerminalLatch.terminalStatus === "payment_entry_reached") {
+    && persistedTerminalLatch.terminalStatus === "payment_review_reached") {
     const terminalAction = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
       type: "final_review",
-      intent: "payment_entry_reached",
-      reason: "Actual payment entry was already verified for this booking request. The completed checkout goal remains closed.",
+      intent: "payment_review_reached",
+      reason: "Payment review was already verified for this booking request. The completed checkout goal remains closed.",
       risk: "payment",
       requiresApproval: true
     });
@@ -540,8 +540,6 @@ async function runLoopTurn({
     userPolicy: effectiveUserPolicy,
     traveler,
     transactionReview: transactionContext.review,
-    transactionId: state.id,
-    approvals: state.approvals || {},
     parentObjective,
     decisionFrame,
     mechanicalEvidence: executionEpisodeFor(state).mechanicalEvidence || null
@@ -994,11 +992,11 @@ async function runLoopTurn({
           observationId: observation.observationId || "",
           observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
           type: "final_review",
-          intent: taskDisposition.code === "PAYMENT_ENTRY_REACHED" ? "payment_entry_reached" : "task_terminal",
+          intent: taskDisposition.code === "PAYMENT_REVIEW_REACHED" ? "payment_review_reached" : "task_terminal",
           mechanicalEffect: "none",
           expectedPostconditions: [],
           reason,
-          risk: taskDisposition.code === "PAYMENT_ENTRY_REACHED" ? "payment" : "safe",
+          risk: taskDisposition.code === "PAYMENT_REVIEW_REACHED" ? "payment" : "safe",
           requiresApproval: true
         })
       : taskDisposition.kind === "request_input"
@@ -1015,8 +1013,6 @@ async function runLoopTurn({
         })
       : taskDisposition.kind === "request_approval"
         ? finalHandoffAction(reason, observation, {
-            approvalRequest: taskDisposition.details?.approvalRequest || null,
-            risk: taskDisposition.code === "LEGAL_APPROVAL_REQUIRED" ? "legal" : "uncertain"
           })
         : normalizeAction({
             observationId: observation.observationId || "",

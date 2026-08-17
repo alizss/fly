@@ -251,15 +251,6 @@ function transactionFactGaps(facts = {}) {
   return gaps;
 }
 
-function reviewFactGaps(facts = {}) {
-  // A final airline review does not always repeat the itinerary. The durable
-  // SelectedBooking owns route/date identity; any route the review does expose
-  // is still compared below and may contradict it. Requiring absent route copy
-  // made a valid terminal page impossible to complete even when it explicitly
-  // repeated the traveler, currency, and exact approved total.
-  return transactionFactGaps(facts).filter((fact) => fact !== "itinerary_route");
-}
-
 function reviewTransactionEnvelope(envelope = {}, state = {}) {
   const baseline = envelope.baseline || normalizeFacts({});
   const current = envelope.current || baseline;
@@ -267,7 +258,7 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
   const comparison = reviewFacts || current;
   const missing = transactionFactGaps(baseline);
   if (!reviewFacts) missing.push("payment_review");
-  else missing.push(...reviewFactGaps(reviewFacts).map((fact) => `review_${fact}`));
+  else missing.push(...transactionFactGaps(reviewFacts).map((fact) => `review_${fact}`));
   const contradictions = [];
   const itineraryConflict = explicitItineraryConflict(baseline, comparison);
   if (itineraryConflict) contradictions.push(itineraryConflict.code);

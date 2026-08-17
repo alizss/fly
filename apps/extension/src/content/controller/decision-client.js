@@ -273,8 +273,7 @@ export function createDecisionClient({
         } : null,
 	      approvalState: {
 	        skipPaidExtrasApproved: shouldAutoDeclinePaidExtras(),
-	        paymentApproved: false,
-	        legalAuthorization: agent.legalAuthorization || null
+	        paymentApproved: false
 	      },
         // Best-effort context for the backend verifier — it independently judges
         // whether the last action actually worked from fresh browser evidence.

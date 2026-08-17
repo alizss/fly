@@ -13,7 +13,6 @@ export function createDecisionGroupCompiler(dependencies) {
     directControlName,
     elementById,
     elementId,
-    isChoiceSelected,
     isGlobalChromeControl,
     isPlaceholderChoiceValue,
     isVisible,
@@ -986,8 +985,7 @@ export function createDecisionGroupCompiler(dependencies) {
           physicalEffect: control.physicalEffect || "unknown",
           risk: control.risk || "uncertain",
           effectRole: control.effectRole || "unknown",
-          selected: isChoiceSelected(elementById(control.stateElementId || control.preferredActivationElementId || ""))
-            || Boolean(control.selected || control.state?.checked || control.state?.selected || control.state?.pressed),
+          selected: Boolean(control.selected || control.state?.checked || control.state?.selected),
           structuredPrice: control.structuredPrice || null,
           priceText: control.structuredPrice
             ? `${control.structuredPrice.amount} ${control.structuredPrice.currency || ""}`.trim()
@@ -1153,8 +1151,7 @@ export function createDecisionGroupCompiler(dependencies) {
           physicalEffect: control.physicalEffect || "unknown",
           risk: control.risk || "uncertain",
           effectRole: roleFor(control),
-          selected: isChoiceSelected(elementById(control.stateElementId || control.preferredActivationElementId || ""))
-            || Boolean(control.selected || control.state?.checked || control.state?.selected || control.state?.pressed),
+          selected: Boolean(control.selected || control.state?.checked || control.state?.selected),
           structuredPrice: control.structuredPrice || null,
           priceText: control.structuredPrice
             ? `${control.structuredPrice.amount} ${control.structuredPrice.currency || ""}`.trim()

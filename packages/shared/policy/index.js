@@ -121,20 +121,6 @@ function boundedPaidAuthorization(action = {}, merged = {}) {
   return authorization;
 }
 
-function boundedLegalAuthorization(action = {}, state = {}, merged = {}) {
-  const embedded = action.affordance?.authorization || null;
-  const authorization = embedded?.authorizationId ? embedded : merged.legalAuthorization;
-  const controlId = String(action.controlId || action.targetSnapshot?.controlId || "");
-  const expected = action.expectedOutcome || action.expectedPostconditions?.[0] || {};
-  if (authorization?.contractVersion !== "legal-authorization/v1") return null;
-  if (!authorization.authorizationId || authorization.authorizationId !== expected.authorizationId) return null;
-  if (authorization.transactionId && state?.id && authorization.transactionId !== state.id) return null;
-  if (!controlId || authorization.legalControlId !== controlId) return null;
-  if (!authorization.legalTextDigest || authorization.legalTextDigest !== expected.legalTextDigest) return null;
-  if (Number(authorization.expiresAt || 0) < Date.now()) return null;
-  return authorization;
-}
-
 /**
  * @param {import("../agent-actions").AgentAction} action
  * @param {import("../agent-state").CheckoutSessionState} state
@@ -176,17 +162,8 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
   if (looksLikeFinalPayment(action) && !merged.paymentAuthorization?.authorizationId) {
     return { allow: false, decision: "ask_user", reason: "This looks like a final purchase/payment action and needs your explicit confirmation." };
   }
-  if (looksLikeLegalAcceptance(action)) {
-    const authorization = boundedLegalAuthorization(action, state, merged);
-    if (!authorization) {
-      return { allow: false, decision: "ask_user", reason: "This exact legal attestation is not covered by a current transaction-bound approval." };
-    }
-    return {
-      allow: true,
-      decision: "allow",
-      reason: `Exact legal attestation is covered by ${authorization.authorizationId}.`,
-      authorization
-    };
+  if (looksLikeLegalAcceptance(action) && !merged.legalApproved) {
+    return { allow: false, decision: "ask_user", reason: "This looks like accepting legal terms/fare rules and needs your explicit confirmation." };
   }
   // Paid extras: allow declining freely; allow *selecting* only with explicit approval.
   if (looksLikePaidExtraSelection(action)) {
@@ -225,7 +202,6 @@ module.exports = {
   looksLikePaidExtraSelection,
   profileWantsNoExtras,
   boundedPaidAuthorization,
-  boundedLegalAuthorization,
   isDeclineOrSkipAction,
   isNonMutatingAction,
   isOpenChoiceControlAction

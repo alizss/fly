@@ -2,7 +2,6 @@
 
 const { controlBelongsToCurrentSurface, currentSurface } = require("./surface-contract");
 const { SEAT_POLICIES, seatPolicyFrom } = require("./policy-profile");
-const agentContract = require("../../extension/src/shared/agent-contract");
 
 const ALLOWED_OPERATIONS = Object.freeze(["open", "choose", "activate", "keyboard"]);
 const FORBIDDEN_RISKS = Object.freeze(["money", "paid", "payment", "legal", "destructive"]);
@@ -100,7 +99,7 @@ function lowConsequenceControl(control = {}, page = {}) {
   if (!control?.controlId || explicitlyDormant(control)) return false;
   if (!controlBelongsToCurrentSurface(control, page)) return false;
   if (control.globalChrome === true || control.disabled === true || control.state?.disabled === true) return false;
-  if (agentContract.controlSelectionCommitted(control)) return false;
+  if (control.selected === true || control.state?.selected === true || control.state?.checked === true) return false;
   // Profile facts already have one authoritative logical-field adapter and
   // verifier. The adaptive interaction fallback must not reopen or rewrite a
   // completed identity/contact component merely because it is clickable.

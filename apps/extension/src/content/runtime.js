@@ -719,7 +719,6 @@ import {
     DESTINATION_WAIT_TIMEOUT_MS,
     addAgentMessage,
     agent: runtimeScopes.lifecycle,
-    getLastExternalMaterialMutationAt: () => agent.lastExternalMaterialMutationAt,
     logFlow,
     processCheckoutAgent: (...args) => processCheckoutAgent(...args),
     renderSidebar: (...args) => renderSidebar(...args),
@@ -1417,7 +1416,6 @@ import {
     directControlName,
     elementById,
     elementId,
-    isChoiceSelected,
     isGlobalChromeControl,
     isPlaceholderChoiceValue,
     isVisible,
@@ -1654,10 +1652,7 @@ import {
 
     if (newSearchRoute) return result("flight_selection", 0.98, ["route_path"]);
     if (repeatedSeatInventory && strongSeatEvidence) return result("seats", 0.98, ["seat_inventory", "seat_copy"]);
-    if (terminalEvidence?.boundary
-      && terminalEvidence.boundary !== AGENT_CONTRACT?.CHECKOUT_BOUNDARY?.UNKNOWN) {
-      return result("payment", 0.99, ["terminal_evidence_contract"]);
-    }
+    if (terminalEvidence?.boundaryObserved === true) return result("payment", 0.99, ["terminal_evidence_contract"]);
     if (confirmationEvidence) return result("confirmation", 0.95, ["confirmation_copy"]);
     if (paymentFormEvidence) return result("payment", 0.95, ["payment_controls_copy"]);
     // The active destination route outranks checkout-progress links retained
@@ -1705,33 +1700,12 @@ import {
       AGENT_CONTRACT?.isPaymentCommitText?.(actionElementLabel(element))
       || /^(?:pay(?:\s+now|\s+securely|\s+by\s+(?:card|bank|wallet)|\s+[\d.,]+)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase|place\s+order)\b/i.test(actionElementLabel(element))
     ));
-    const explicitActiveProgressText = visibleTerminalNodes
+    const activeProgressText = visibleTerminalNodes
       .filter((element) => element.matches("[aria-current='step'], [data-current='true'], [data-active='true']"))
       .map((element) => actionElementLabel(element) || element.textContent || "")
       .join(" ")
       .slice(0, 500);
     const normalized = String(fullText || "").replace(/\s+/g, " ");
-    // Several airline progress steppers expose the active state only through
-    // accessible copy such as "PAY CURRENT STEP". That is still explicit
-    // ownership evidence; requiring framework-specific aria/data attributes
-    // left the final review looking like the preceding traveler page.
-    const accessibleCurrentStep = normalized.match(/\b([\p{L}][\p{L}0-9&/-]{0,30})\s+CURRENT\s+STEP\b/iu)?.[1] || "";
-    const activeProgressText = `${explicitActiveProgressText} ${accessibleCurrentStep}`.trim().slice(0, 500);
-    const reviewSummaryPresent = /\b(?:amount\s+to\s+pay|total(?:\s+to\s+be\s+paid)?)\b/i.test(normalized)
-      && /\b(?:departure|return|itinerary|travel\s+details|your\s+order|your\s+booking|booking\s+details)\b/i.test(normalized);
-    const legalAcceptanceControls = visibleInputs.filter((input) => input.type === "checkbox" && (
-      AGENT_CONTRACT?.isLegalAcceptanceText?.(labelText(input))
-      || /terms|conditions|privacy|purchase/i.test(labelText(input))
-    ));
-    const legalAcceptancePresent = legalAcceptanceControls.length > 0;
-    // A plain Confirm on a review/legal page advances to payment; it is not a
-    // purchase commit until actual payment entry is independently present.
-    const advanceToPaymentControls = visibleActions.filter((element) => (
-      /^(?:confirm|confirm\s+(?:booking|transaction|reservation)|review\s+and\s+confirm)$/i.test(
-        actionElementLabel(element).trim()
-      )
-    ));
-    const transactionCommitControlPresent = payControlPresent;
     const activePaymentProgress = /\bpayment\b|\bpay\b/i.test(activeProgressText);
     const paymentRoute = /(?:^|\/)payments?(?:\/|$)/i.test(String(location.pathname || ""));
     const visiblePaymentOwners = queryAllDeep([
@@ -1784,11 +1758,7 @@ import {
       ...(hostedPaymentWidgetPresent ? ["visible_hosted_payment_widget"] : []),
       ...(activePaymentProgress ? ["active_payment_progress"] : []),
       ...(paymentRoute ? ["payment_route"] : []),
-      ...(progressivePaymentEntryPresent ? ["visible_progressive_payment_entry"] : []),
-      ...(reviewSummaryPresent ? ["visible_booking_review_summary"] : []),
-      ...(legalAcceptancePresent ? ["visible_legal_acceptance"] : []),
-      ...(advanceToPaymentControls.length ? ["visible_advance_to_payment"] : []),
-      ...(transactionCommitControlPresent ? ["visible_transaction_commit"] : [])
+      ...(progressivePaymentEntryPresent ? ["visible_progressive_payment_entry"] : [])
     ];
     return {
       paymentCredentialKinds: [...credentialKinds],
@@ -1802,13 +1772,12 @@ import {
       visibleTextFallbackAllowed: paymentOwnerPresent,
       paymentMethodPresent: /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/i.test(normalized),
       payControlPresent,
-      transactionCommitControlPresent,
-      advanceToPaymentControlPresent: advanceToPaymentControls.length > 0,
-      advanceToPaymentControlIds: advanceToPaymentControls.map((element) => elementId(element)).filter(Boolean),
-      legalAcceptancePresent,
-      legalAcceptanceControlIds: legalAcceptanceControls.map((element) => elementId(element)).filter(Boolean),
-      legalAcceptanceText: legalAcceptanceControls.map((element) => labelText(element)).filter(Boolean).join(" | ").slice(0, 1600),
-      reviewSummaryPresent,
+      legalAcceptancePresent: visibleInputs.some((input) => input.type === "checkbox" && (
+        AGENT_CONTRACT?.isLegalAcceptanceText?.(labelText(input))
+        || /terms|conditions|privacy|purchase/i.test(labelText(input))
+      )),
+      reviewSummaryPresent: /\b(?:amount\s+to\s+pay|total)\b/i.test(normalized)
+        && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/i.test(normalized),
       paymentHeadingPresent: /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/i.test(normalized),
       activePaymentProgress,
       activeProgressText,
@@ -2526,15 +2495,11 @@ import {
     visualPageState
   });
 
-  async function observePageStateAfterMutation(
-    reason = "post_action_verification",
-    maxWaitMs = 800,
-    { maxAttempts = 2 } = {}
-  ) {
+  async function observePageStateAfterMutation(reason = "post_action_verification", maxWaitMs = 800) {
     const observed = await pageStateStore.observeFresh({
       reason,
       maxWaitMs,
-      maxAttempts,
+      maxAttempts: 2,
       postBuildGraceMs: 120
     });
     agent.pageMap = rememberPagePlan(observed.map);
@@ -2660,7 +2625,6 @@ import {
     const addIssue = (message, element = null, explicitOwner = {}) => {
       const normalizedMessage = String(message || "").replace(/\s+/g, " ").trim();
       if (!normalizedMessage) return;
-      if (AGENT_CONTRACT?.isNonBlockingValidationSummary?.(normalizedMessage)) return;
       const owner = element ? issueOwnership(element) : {};
       const issue = {
         issueId: element ? `validation:${elementId(element)}` : `validation:${explicitOwner.controlId || explicitOwner.semanticType || issues.length}`,
@@ -3085,7 +3049,6 @@ import {
       coverage: map.coverage || null,
       readiness: map.readiness || null,
       terminalEvidence: map.terminalEvidence || null,
-      sceneContext: map.sceneContext || null,
       stageExit: map.stageExit || null,
       text: map.text || map.fullText,
       snapshotHash: observationHashForMap(map),
@@ -3485,7 +3448,6 @@ import {
     destinationMutationSettleMs: DESTINATION_MUTATION_SETTLE_MS,
     getDestinationWait: () => agent.destinationWait,
     hasFilledFields: () => Boolean(filledFields.length),
-    onExternalMaterialMutation: (at) => { agent.lastExternalMaterialMutationAt = Number(at || Date.now()); },
     pageStateStore,
     refreshSidebarWarnings: () => {
       warnings = runRiskChecks();
@@ -3518,9 +3480,6 @@ import {
       },
       setAgentRunningForTest: (running) => { agent.running = Boolean(running); },
       setAgentSessionForTest: (sessionId) => { agent.sessionId = String(sessionId || ""); },
-      setLastExternalMaterialMutationAtForTest: (at) => {
-        agent.lastExternalMaterialMutationAt = Number(at || 0);
-      },
       setProcessDiagnosticsForTest: (diagnostics = null) => { agent.processDiagnostics = diagnostics; },
       renderSidebarForTest: (mode = "agent") => renderSidebar(mode),
       repeatGuardFor,

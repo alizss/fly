@@ -425,7 +425,7 @@ test("durable payment outcome survives base page and review-modal subgoals", () 
   });
   assert.equal(completed.stageOutcome.outcomeId, second.stageOutcome.outcomeId);
   assert.equal(completed.stageOutcome.status, "completed");
-  assert.equal(completed.terminalStatus, "payment_entry_reached");
+  assert.equal(completed.terminalStatus, "payment_review_reached");
 });
 
 test("no-paid-seat policy with only paid seats creates navigation, not a fake free-seat obligation", () => {

@@ -354,7 +354,7 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
           semantic: control.semantic || "",
           physicalEffect: control.physicalEffect || "unknown",
           risk: control.risk || "",
-          selected: Boolean(control.selected || control.state?.selected || control.state?.checked || control.state?.pressed),
+          selected: Boolean(control.selected || control.state?.selected || control.state?.checked),
           structuredPrice: compactStructuredPrice(control.structuredPrice),
           priceText: ""
         }];
@@ -549,7 +549,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
     return {
       contractVersion: clampText(compiled.contractVersion, 80),
       stage: clampText(compiled.stage, 80),
-      boundary: clampText(compiled.boundary, 40),
       signals: Object.fromEntries(Object.entries(signals).map(([key, value]) => [clampText(key, 40), value === true])),
       signalStates: Object.fromEntries(Object.entries(signalStates).map(([key, value]) => [clampText(key, 40), clampText(value, 20)])),
       signalCount: Number(compiled.signalCount || 0),
@@ -561,13 +560,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         : [],
       evidenceSources: Array.isArray(compiled.evidenceSources)
         ? compiled.evidenceSources.map((source) => clampText(source, 80)).slice(0, 16)
-        : [],
-      legalAcceptanceControlIds: Array.isArray(compiled.legalAcceptanceControlIds)
-        ? compiled.legalAcceptanceControlIds.map((id) => clampText(id, 140)).slice(0, 8)
-        : [],
-      legalAcceptanceText: clampText(compiled.legalAcceptanceText, 1600),
-      advanceToPaymentControlIds: Array.isArray(compiled.advanceToPaymentControlIds)
-        ? compiled.advanceToPaymentControlIds.map((id) => clampText(id, 140)).slice(0, 8)
         : [],
       capabilities: { paymentActionsAllowed: false }
     };
@@ -657,9 +649,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         paymentApproved: Boolean(body.approvalState?.paymentApproved),
         paymentAuthorization: body.approvalState?.paymentAuthorization && typeof body.approvalState.paymentAuthorization === "object"
           ? body.approvalState.paymentAuthorization
-          : null,
-        legalAuthorization: body.approvalState?.legalAuthorization && typeof body.approvalState.legalAuthorization === "object"
-          ? body.approvalState.legalAuthorization
           : null,
         priceAuthorization: body.approvalState?.priceAuthorization && typeof body.approvalState.priceAuthorization === "object"
           ? body.approvalState.priceAuthorization

@@ -108,7 +108,6 @@ function toClientDecision(action) {
     capabilityStatus: action.capabilityStatus || "",
     executionChannel: action.executionChannel || "",
     inputRequest: action.inputRequest || null,
-    approvalRequest: action.approvalRequest || null,
     readinessStartedAt: Number(action.readinessStartedAt || 0),
     readinessDeadlineAt: Number(action.readinessDeadlineAt || 0),
     readinessAttempts: Number(action.readinessAttempts || 0),
@@ -270,3 +269,4 @@ module.exports = {
   toClientDecision,
   withLatencyDebug
 };
+

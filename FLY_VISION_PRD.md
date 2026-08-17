@@ -1,6 +1,6 @@
 # Fly — Product Requirements
 
-Last updated: 2026-08-12
+Last updated: 2026-08-10
 
 This is Fly's stable product contract. Implementation status belongs in [FLY_COVERAGE_MATRIX.md](./FLY_COVERAGE_MATRIX.md), engineering sequence in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md), and current code orientation in [FLY_CURRENT_CODEBASE_ENGINEERING_HANDOFF.md](./FLY_CURRENT_CODEBASE_ENGINEERING_HANDOFF.md).
 
@@ -12,7 +12,7 @@ The intended experience is approximately 1–3 user interactions. Fly is not an 
 
 ## 2. Current product boundary
 
-The current milestone ends when actual payment entry is verified:
+The current milestone ends at verified payment review:
 
 ```text
 approved selected booking
@@ -20,11 +20,8 @@ approved selected booking
 → fares, bags, seats, insurance, and extras
 → correction of unauthorized selections
 → itinerary/traveler/currency/total reconciliation
-→ pre-payment review
-→ exact legal approval when required
-→ accept only the approved attestation and advance
-→ verify actual payment entry
-→ stop before entering payment credentials, Pay, or purchase
+→ verified payment review
+→ stop before legal acceptance, payment entry, Pay, or purchase
 ```
 
 Payment and confirmed booking are later product gates requiring explicit per-booking authorization, a secure payment provider, idempotency, OTP/3DS handling, and independent PNR/ticket evidence.
@@ -52,7 +49,7 @@ A journey is eligible for autonomous checkout-to-review when:
 - The starting total/currency and selected traveler are approved.
 - Required traveler facts are available or can be requested.
 - The site is reachable and exposes a usable browser/accessibility surface.
-- Any required legal attestation can be shown exactly and approved for this booking; payment-entry and purchase authority remain unavailable.
+- No unresolved legal, payment, identity, itinerary, or price authority is required.
 
 A `99%` claim must always name this eligibility scope. It must not count sold-out inventory, airline outages, mandatory human challenges, or unsupported purchase authority as ordinary agent-navigation failures.
 
@@ -92,9 +89,9 @@ Known scenes remain deterministic with no model call. Semantic reconciliation co
 - Fresh evidence must verify the same semantic postcondition before progress persists.
 - Failed mechanics use bounded distinct recovery; loops and stale action replay are prohibited.
 
-### Pre-payment, legal, and payment-entry boundaries
+### Transaction review
 
-Before advancing through a legal gate or reporting payment entry, Fly must reconcile:
+Before reporting payment review, Fly must reconcile:
 
 - Route, dates, segments, and traveler identities.
 - Fare and approved selections when authoritative evidence exists.
@@ -102,9 +99,7 @@ Before advancing through a legal gate or reporting payment entry, Fly must recon
 - Currency and total.
 - Expected verified-action/outcome coverage.
 
-The observed boundaries are distinct: `PRE_PAYMENT_REVIEW`, `LEGAL_GATE`, `PAYMENT_ENTRY`, and `PURCHASE_COMMIT`. Review copy plus a legal checkbox plus a Confirm button is never payment-entry proof. `PAYMENT_ENTRY_REACHED` requires an owned payment-method component, card-number/expiry/CVC controls, or a hosted payment widget/frame. Generic payment wording, a URL, a click acknowledgement, or a page change is not completion evidence.
-
-A legal approval is narrow: transaction, itinerary, travelers, total/currency, exact legal-text digest, checkbox owner, next control, and expiry. Fly first verifies the approved checkbox, then separately advances, then verifies payment entry. Changed legal text, price, traveler, itinerary, control, transaction, or an expired token invalidates the approval.
+Generic payment wording, a URL, a click acknowledgement, or a page change is not completion evidence.
 
 ### Durability and background operation
 
@@ -116,12 +111,11 @@ Fly may stop or pause for:
 
 - A genuinely missing required traveler fact.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge.
-- A required legal attestation that the user declines or cannot be bound to exact current evidence.
-- Payment credentials, Pay, transaction commit, or another purchase authority boundary.
+- Required legal consent or payment/purchase authority.
 - A paid choice, price/currency change, itinerary change, or identity ambiguity not covered by explicit policy.
 - Sold-out inventory, expired session, airline outage, or a site that rejects valid completed input.
 - No safe grounded actuator after bounded adaptation and fresh verification attempts.
-- Verified actual payment entry under the current milestone.
+- Verified payment review under the current milestone.
 
 The last mechanical case is an engineering coverage defect for an otherwise eligible journey. It must create a reusable replay and universal repair, not an airline branch.
 
@@ -135,8 +129,7 @@ Fly must never:
 - Change route, dates, airports, passengers, or currency without authority.
 - Add or retain an unauthorized paid product.
 - Infer price permission from page wording or an observed total.
-- Accept legal terms without the exact current transaction-bound approval.
-- Enter payment credentials, activate Pay, or commit a purchase under the current boundary.
+- Accept legal terms, enter payment credentials, or purchase under the current boundary.
 - Execute a stale, hidden, occluded, mismatched, or ungrounded target.
 - Treat dispatch, navigation, or visual change as semantic success.
 - Claim completion with missing or vacuous transaction/outcome evidence.
@@ -182,7 +175,7 @@ At least two structurally different families must prove:
 
 Track separately:
 
-- Autonomous verified-payment-entry rate for defined eligible journeys, with legal approvals counted separately as necessary user interaction.
+- Autonomous verified-payment-review rate for defined eligible journeys.
 - Safe-resolution and necessary-handoff rate.
 - False completion and unauthorized-mutation rate.
 - Recovery rate and duration.
@@ -194,11 +187,11 @@ A defensible broad `99%` target requires approximately 300 representative eligib
 
 | Gate | Required evidence | Unlocks |
 |---|---|---|
-| A — Direct-airline generalization | Full-service and low-cost direct airlines reach verified actual payment entry; Kiwi and GoToGate stay green; no site workflow | Structural portfolio expansion |
-| B — Structural portfolio | 8–10 sites, 6+ families, 4 direct-airline families, 3 OTA families | Internal/allowlisted checkout-to-payment-entry alpha |
+| A — Direct-airline generalization | Full-service and low-cost direct airlines reach verified payment review; Kiwi and GoToGate stay green; no site workflow | Structural portfolio expansion |
+| B — Structural portfolio | 8–10 sites, 6+ families, 4 direct-airline families, 3 OTA families | Internal/allowlisted checkout-to-review alpha |
 | C — Profile and policy matrix | Multi-traveler, child, baggage, seat, dirty-checkout, missing-data, and auth scenarios on 2+ families | Limited review-only beta and payment sandbox work |
 | D — Background product | Isolated durable jobs, secure state, restart safety, notification/handoff/resume, extension-equivalent behavior | Background web and iOS control experience |
-| E — Broad payment-entry production | Defined reliability window, confidence analysis, observability, kill switch, rollback, zero false completion/irreversible mutation | Broader checkout-to-payment-entry availability |
+| E — Broad review-only production | Defined reliability window, confidence analysis, observability, kill switch, rollback, zero false completion/irreversible mutation | Broader checkout-to-review availability |
 | F — Payment pilot | Gate E plus payment vault/provider, authorization checksum, idempotency, 3DS/OTP, compliance review, and independent confirmation | Narrow controlled purchase pilot |
 
 ## 11. Decision filter

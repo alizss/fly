@@ -76,7 +76,6 @@ async function runLoopTurn(args = {}) {
 const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "seat-baggage.html");
 const profileFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "profile-form.html");
 const croatiaFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "croatia-passenger.html");
-const croatiaReviewFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "croatia-review.html");
 const contentScriptPath = path.join(__dirname, "..", "..", "apps", "extension", "dist", "content.js");
 const TEST_API = `http://127.0.0.1:${Number(process.env.ATW_TEST_PORT || 4273)}/api`;
 
@@ -1399,67 +1398,6 @@ test("three sibling extras resolve as an exact decision-group queue before Conti
   }
 });
 
-test("an already pressed decline choice is settled and cannot be toggled again before Continue", async ({ page }) => {
-  await loadHtmlProducer(page, `
-    <main>
-      <h1>Review your choices</h1>
-      <section role="group" aria-label="Time to think" aria-required="true">
-        <h2>Do you need time to think?</h2>
-        <button id="time-yes" type="button" aria-pressed="false">Yes — add Time to Think for 8 EUR</button>
-        <button id="time-no" type="button" aria-pressed="true">No, thanks</button>
-      </section>
-      <button id="continue" type="button">Continue</button>
-    </main>
-    <script>
-      window.__declineClicks = 0;
-      document.getElementById("time-no").addEventListener("click", () => {
-        window.__declineClicks += 1;
-        const selected = document.getElementById("time-no").getAttribute("aria-pressed") === "true";
-        document.getElementById("time-no").setAttribute("aria-pressed", String(!selected));
-      });
-    </script>
-  `);
-
-  const traveler = { id: "trav_pressed_decline", booking_rules: "no paid extras" };
-  const state = createCheckoutSessionState({
-    goal: "Keep the declined optional product and continue",
-    travelerId: traveler.id,
-    site: { host: "example.test", url: page.url() }
-  });
-  state.id = "txn_pressed_decline";
-  state.approvals.skipPaidExtrasApproved = true;
-  const observation = await browserObservation(page, "obs_pressed_decline");
-  const group = observation.page.decisionGroups.find((item) => (
-    /time to think/i.test(`${item.sectionLabel || ""} ${item.label || ""} ${item.requirementId || ""}`)
-  ));
-
-  expect(group, JSON.stringify(observation.page.decisionGroups, null, 2)).toBeTruthy();
-  expect(group.status).toBe("satisfied");
-  expect(group.selectedControlId).toBeTruthy();
-  const selected = observation.page.controls.find((control) => control.controlId === group.selectedControlId);
-  expect(selected.label).toMatch(/no,? thanks/i);
-  expect(selected.state.pressed).toBe(true);
-
-  const store = inMemoryGovernorStore();
-  store.remember(state.id, observation);
-  const turn = await runLoopTurn({
-    apiKey: "",
-    model: "must-not-be-called",
-    dataDir: "",
-    state,
-    observation,
-    traveler,
-    transactionStore: store,
-    clientTurnId: "turn_pressed_decline"
-  });
-
-  expect(turn.debug.modelUsage.calls).toHaveLength(0);
-  expect(turn.clientDecision.action).toBe("click");
-  expect(turn.clientDecision.targetLabel).toMatch(/continue/i);
-  expect(turn.clientDecision.controlId).not.toBe(group.selectedControlId);
-  expect(await page.evaluate(() => window.__declineClicks)).toBe(0);
-});
-
 test("paid product detail buttons remain context and never become singleton required decisions", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
@@ -2487,265 +2425,6 @@ test("Croatia-style title, combined phone, and validation compile through the un
   expect(settled.page.controls.find((control) => (
     control.controlId === settledCandidates.candidates[0].controlId
   ))?.label).toBe("Continue");
-});
-
-test("Croatia pre-payment review publishes an exact legal gate instead of a false terminal", async ({ page }) => {
-  await loadProducer(page, croatiaReviewFixturePath);
-  const observation = await browserObservation(page, "obs_croatia_review");
-
-  expect(observation.page.step).toBe("payment");
-  expect(observation.page.terminalEvidence).toMatchObject({
-    stage: "legal_gate",
-    boundary: "LEGAL_GATE",
-    boundaryObserved: false,
-    verified: false
-  });
-  expect(observation.page.terminalEvidence?.signals).toMatchObject({
-    progress: true,
-    review: true,
-    legal: true,
-    commit: false
-  });
-  expect(observation.page.graphIntegrity?.actionableConflictCount).toBe(0);
-  expect((observation.page.buttons || []).some((button) => (
-    ["General Conditions of Carriage", "Purchase conditions"].includes(button.label)
-  ))).toBe(false);
-
-  const compiled = agentContract.compileSemanticCheckout(observation.page);
-  const promo = compiled.controls.find((control) => control.name === "promotion_code");
-  const terms = compiled.controls.find((control) => control.semanticSceneItem?.role === "legal_attestation");
-  const confirm = compiled.controls.find((control) => control.label === "CONFIRM");
-  expect(compiled.semanticReadiness).toBe(agentContract.SEMANTIC_READINESS.READY);
-  expect(promo).toMatchObject({
-    required: false,
-    semantic: "promotion_code",
-    fieldClassification: { source: "deterministic_optional_credential" }
-  });
-  expect(terms?.semanticSceneItem?.deterministic).toBe(true);
-  expect(confirm).toBeTruthy();
-  expect(await page.locator("#terms").isChecked()).toBe(false);
-
-  const state = reduceTaskState({
-    observation,
-    transactionId: "txn_croatia_review",
-    transactionReview: verifiedTransactionReview(141.62)
-  });
-  expect(state.terminalStatus).toBe("active");
-  expect(state.currentGoal).toBeNull();
-  expect(state.ambiguityReason).toBe("LEGAL_APPROVAL_REQUIRED");
-  expect(state.disposition.details.approvalRequest).toMatchObject({
-    contractVersion: "legal-approval-request/v1",
-    transactionId: "txn_croatia_review",
-    legalControlId: terms.controlId,
-    advanceControlId: confirm.controlId
-  });
-});
-
-test("Croatia legal approval executes the exact checkbox, advances separately, and stops at payment entry", async ({ page }) => {
-  await loadHtmlProducer(page, `
-    <style>[hidden] { display: none !important; }</style>
-    <main>
-      <section id="review">
-        <nav aria-label="Checkout progress"><span>BOOK COMPLETED STEP</span><span aria-current="step">PAY CURRENT STEP</span></nav>
-        <h1>Your booking</h1>
-        <p>Zagreb (ZAG) to Sarajevo (SJJ)</p>
-        <p>Total to be paid <strong>EUR 141.62</strong></p>
-        <label>
-          <input id="terms" name="termsAndCondition" type="checkbox" required>
-          Yes, I have examined the information and agree with the General Conditions of Carriage and Purchase conditions.
-        </label>
-        <button id="confirm" type="button">CONFIRM</button>
-      </section>
-      <section id="payment" aria-label="Payment details" hidden>
-        <h1>Payment details</h1>
-        <fieldset><legend>Payment method</legend><label><input type="radio" name="payment-method"> Credit card</label></fieldset>
-        <label>Card number <input name="card.number" autocomplete="cc-number"></label>
-        <label>Expiry <input name="card.expiry" autocomplete="cc-exp"></label>
-        <label>CVC <input name="card.cvc" autocomplete="cc-csc"></label>
-        <button id="pay" type="button">Pay 141.62 EUR</button>
-      </section>
-    </main>
-    <script>
-      window.__legalFlow = { confirmClicks: 0, paymentInputs: 0, payClicks: 0 };
-      document.getElementById("confirm").addEventListener("click", () => {
-        window.__legalFlow.confirmClicks += 1;
-        if (!document.getElementById("terms").checked) return;
-        document.getElementById("review").hidden = true;
-        document.getElementById("payment").hidden = false;
-        history.pushState({}, "", "/checkout/payment");
-      });
-      for (const input of document.querySelectorAll("#payment input")) {
-        input.addEventListener("input", () => { window.__legalFlow.paymentInputs += 1; });
-      }
-      document.getElementById("pay").addEventListener("click", () => { window.__legalFlow.payClicks += 1; });
-    </script>
-  `);
-
-  const transactionId = "txn_croatia_legal_closed_loop";
-  const traveler = { id: "trav_replay", booking_rules: "No paid extras" };
-  const transactionReview = verifiedTransactionReview(141.62);
-  let observation = await browserObservation(page, "obs_croatia_legal_request");
-  const requestState = reduceTaskState({
-    observation,
-    transactionId,
-    traveler,
-    transactionReview
-  });
-  const request = requestState.disposition.details.approvalRequest;
-  expect(requestState.disposition.code).toBe("LEGAL_APPROVAL_REQUIRED");
-  expect(request).toMatchObject({
-    transactionId,
-    legalControlId: expect.any(String),
-    advanceControlId: expect.any(String),
-    total: 141.62,
-    currency: "EUR"
-  });
-
-  const authorization = Object.freeze({
-    ...request,
-    contractVersion: "legal-authorization/v1",
-    approvedAt: Date.now()
-  });
-  const approvedState = reduceTaskState({
-    previousTaskState: requestState,
-    observation,
-    transactionId,
-    approvals: { legalAuthorization: authorization },
-    traveler,
-    transactionReview
-  });
-  expect(approvedState.currentObligation).toMatchObject({
-    kind: "legal_attestation",
-    desiredEffect: "legal_acceptance",
-    admittedControlIds: [request.legalControlId]
-  });
-
-  let sessionState = createCheckoutSessionState({
-    goal: "Reach actual payment entry",
-    travelerId: traveler.id,
-    site: { host: "example.test", url: page.url() }
-  });
-  sessionState = {
-    ...sessionState,
-    id: transactionId,
-    approvals: { ...sessionState.approvals, legalAuthorization: authorization },
-    taskState: approvedState
-  };
-  const store = inMemoryGovernorStore();
-  const legalSet = buildCurrentCandidateSet({
-    obligation: approvedState.currentObligation,
-    observation,
-    traveler,
-    state: sessionState,
-    approvals: sessionState.approvals
-  });
-  expect(new Set(legalSet.candidates.map((candidate) => candidate.controlId))).toEqual(new Set([request.legalControlId]));
-  const legalCandidate = legalSet.candidates[0];
-  expect(legalCandidate).toMatchObject({
-    mechanicalEffect: "accept_legal_terms",
-    risk: "legal",
-    requiresApproval: false
-  });
-  const legalAction = loopPrivate.bindTargetSnapshot(
-    actionForCurrentCandidate(approvedState.currentObligation, legalCandidate, observation),
-    observation
-  );
-  expect(legalAction.expectedOutcome).toMatchObject({
-    type: "legal_attestation_accepted",
-    controlId: request.legalControlId,
-    authorizationId: authorization.authorizationId,
-    legalTextDigest: authorization.legalTextDigest
-  });
-  expect(legalAction.affordance.authorization).toMatchObject({
-    authorizationId: authorization.authorizationId,
-    transactionId
-  });
-  store.remember(transactionId, observation);
-  const governedLegal = governAction({
-    action: legalAction,
-    state: sessionState,
-    observation,
-    traveler,
-    store,
-    turnId: "turn_croatia_legal_accept",
-    preparedCandidateSet: legalSet
-  });
-  expect(governedLegal.allow, `${governedLegal.code}: ${governedLegal.reason}`).toBe(true);
-  const legalExecution = await executeAtomicBrowserDecision(
-    page,
-    toClientDecision(legalAction),
-    "obs_croatia_legal_accepted"
-  );
-  expect(legalExecution.result.dispatched).toBe(true);
-  expect(legalExecution.verification.ok, legalExecution.verification.code).toBe(true);
-  expect(await page.locator("#terms").isChecked()).toBe(true);
-
-  observation = legalExecution.observation;
-  const acceptedState = reduceTaskState({
-    previousTaskState: approvedState,
-    observation,
-    previousActionResult: legalExecution.result,
-    transactionId,
-    approvals: { legalAuthorization: authorization },
-    traveler,
-    transactionReview
-  });
-  expect(acceptedState.currentObligation).toMatchObject({
-    kind: "navigation",
-    desiredEffect: "advance_to_payment",
-    admittedControlIds: [request.advanceControlId]
-  });
-  sessionState = { ...sessionState, taskState: acceptedState };
-  const advanceSet = buildCurrentCandidateSet({
-    obligation: acceptedState.currentObligation,
-    observation,
-    traveler,
-    state: sessionState,
-    approvals: sessionState.approvals
-  });
-  expect(new Set(advanceSet.candidates.map((candidate) => candidate.controlId))).toEqual(new Set([request.advanceControlId]));
-  const advanceCandidate = advanceSet.candidates[0];
-  expect(advanceCandidate).toMatchObject({ mechanicalEffect: "advance_to_payment", risk: "safe" });
-  const advanceAction = loopPrivate.bindTargetSnapshot(
-    actionForCurrentCandidate(acceptedState.currentObligation, advanceCandidate, observation),
-    observation
-  );
-  expect(advanceAction.expectedOutcome).toMatchObject({ type: "payment_entry_reached" });
-  store.remember(transactionId, observation);
-  const governedAdvance = governAction({
-    action: advanceAction,
-    state: sessionState,
-    observation,
-    traveler,
-    store,
-    turnId: "turn_croatia_advance_to_payment",
-    preparedCandidateSet: advanceSet
-  });
-  expect(governedAdvance.allow, `${governedAdvance.code}: ${governedAdvance.reason}`).toBe(true);
-  const advanceExecution = await executeAtomicBrowserDecision(
-    page,
-    toClientDecision(advanceAction),
-    "obs_croatia_payment_entry"
-  );
-  expect(advanceExecution.result.dispatched).toBe(true);
-  expect(advanceExecution.verification.ok, advanceExecution.verification.code).toBe(true);
-
-  const terminalState = reduceTaskState({
-    previousTaskState: acceptedState,
-    observation: advanceExecution.observation,
-    previousActionResult: advanceExecution.result,
-    transactionId,
-    approvals: { legalAuthorization: authorization },
-    traveler,
-    transactionReview
-  });
-  expect(terminalState.terminalStatus).toBe("payment_entry_reached");
-  expect(terminalState.currentObligation).toBeNull();
-  expect(await page.evaluate(() => window.__legalFlow)).toEqual({
-    confirmClicks: 1,
-    paymentInputs: 0,
-    payClicks: 0
-  });
 });
 
 test("stage advancement prefers governed browser-level pointer input", async ({ page }) => {
@@ -5155,7 +4834,7 @@ test("required reason-for-travel radios use one profile-backed travel-purpose re
   expect(profileStageReadiness(selected.observation, traveler).ready).toBe(true);
 });
 
-test("final terms review with Pay by card is an explicit legal gate before payment entry", async ({ page }) => {
+test("final terms review with Pay by card is terminal before legal acceptance", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <h1>Review your booking</h1>
@@ -5177,9 +4856,8 @@ test("final terms review with Pay by card is an explicit legal gate before payme
 
   const observation = await browserObservation(page, "obs_final_terms_payment_review");
   expect(observation.page.terminalEvidence).toMatchObject({
-    stage: "legal_gate",
-    boundary: "LEGAL_GATE",
-    boundaryObserved: false,
+    stage: "payment_review",
+    boundaryObserved: true,
     signals: { legal: true, review: true, commit: true }
   });
   expect(observation.page.step).toBe("payment");
@@ -5190,13 +4868,8 @@ test("final terms review with Pay by card is an explicit legal gate before payme
     transactionReview: verifiedTransactionReview(361.97)
   });
   expect(state.stage).toBe("payment");
-  expect(state.terminalStatus).toBe("active");
+  expect(state.terminalStatus).toBe("payment_review_reached");
   expect(state.currentGoal).toBeNull();
-  expect(state.ambiguityReason).toBe("LEGAL_APPROVAL_REQUIRED");
-  expect(state.disposition.details.approvalRequest).toMatchObject({
-    contractVersion: "legal-approval-request/v1",
-    legalControlId: termsControl.controlId
-  });
 });
 
 test("opaque native choice completes open and select as one trusted episode", async ({ page }) => {
@@ -5639,24 +5312,12 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
     };
     const referencePayload = hooks.referenceObservationTransport(fullPayload);
     hooks.clearDestinationWait("test_complete");
-    hooks.setLastExternalMaterialMutationAtForTest(startedAt + 250);
-    hooks.beginDestinationWait({
-      action: "wait",
-      intent: "wait_for_dispatched_stage_exit",
-      semanticIntent: "wait_for_dispatched_stage_exit",
-      dispatchedAt: startedAt,
-      observationId: "obs_mutated_before_wait",
-      actionId: "act_mutated_before_wait"
-    });
-    const bufferedMutationState = hooks.agentLoopState().destinationWait;
-    hooks.clearDestinationWait("buffered_mutation_test_complete");
     hooks.setAgentRunningForTest(false);
     return {
       recognized,
       groundingRecoveryRecognized,
       taskStateRecognized,
       state,
-      bufferedMutationState,
       referencePayload,
       fullBytes: hooks.observationTransportBytes(fullPayload),
       referenceBytes: hooks.observationTransportBytes(referencePayload)
@@ -5671,13 +5332,6 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
   expect(result.state.destinationWait.deadlineAt).toBe(now + 8_000);
   expect(result.state.destinationWait.backendWaits).toBe(1);
   expect(result.state.destinationWait.retryToken).toBe("retry_current_surface_once");
-  expect(result.bufferedMutationState).toMatchObject({
-    status: "WAITING_FOR_DESTINATION",
-    kind: "dispatched_stage_exit",
-    wakeRequested: true,
-    lastWakeReason: "dom_mutation",
-    lastMutationAt: now + 250
-  });
   expect(result.referencePayload).toMatchObject({
     transportMode: "observation_reference",
     page: { referenceOnly: true },
@@ -6780,11 +6434,11 @@ test("payment boundary finishes contact prerequisites then publishes no payment 
   });
   expect(afterTask.paymentEvidence.boundaryObserved).toBe(true);
   expect(afterTask.terminalGoalLatch.locked).toBe(true);
-  expect(afterTask.terminalStatus).toBe("payment_entry_reached");
+  expect(afterTask.terminalStatus).toBe("payment_review_reached");
   expect(afterTask.currentGoal).toBeNull();
 });
 
-test("GoToGate-shaped payment entry is terminal evidence without payment capabilities", async ({ page }) => {
+test("GoToGate-shaped payment review is terminal evidence without payment capabilities", async ({ page }) => {
   await loadHtmlProducer(page, `
     <nav aria-label="Checkout progress"><span>Traveller information</span><span aria-current="step">Payment</span></nav>
     <main>
@@ -6837,7 +6491,7 @@ test("GoToGate-shaped payment entry is terminal evidence without payment capabil
     traveler: { id: "trav_terminal", first_name: "Ali", last_name: "SIFRAR" },
     transactionReview: verifiedTransactionReview(448)
   });
-  expect(task.terminalStatus).toBe("payment_entry_reached");
+  expect(task.terminalStatus).toBe("payment_review_reached");
   expect(task.currentGoal).toBeNull();
   expect(task.paymentEvidence.paymentActionsAllowed).toBe(false);
 });
@@ -11286,7 +10940,7 @@ test("checkpoint checkout reaches payment through review without paid, close, ca
     url: observation.page.url,
     controls: observation.page.controls.map((control) => ({ label: control.label, semantic: control.semantic, field: control.field }))
   }, null, 2)).toBe(true);
-  expect(paymentTaskState.terminalStatus).toBe("payment_entry_reached");
+  expect(paymentTaskState.terminalStatus).toBe("payment_review_reached");
   expect(paymentTaskState.currentGoal).toBeNull();
 
   const paymentActionResult = observation.lastActionResult;
@@ -11486,7 +11140,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
       transactionReview: prepared.review
     });
     state = { ...state, taskState };
-    if (taskState.terminalStatus === "payment_entry_reached") break;
+    if (taskState.terminalStatus === "payment_review_reached") break;
     // The durable outcome journal is compiled by TaskState, then consumed by
     // transaction reconciliation on the following turn. Waiting one bounded
     // reconciliation-only turn at the payment boundary is expected and must
@@ -11555,7 +11209,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
     outcomeCoverage: finalTaskState.outcomeCoverage,
     observedDecisions: finalTaskState.observedDecisions,
     counters: await page.evaluate(() => window.__dirtyCounters)
-  }, null, 2)).toBe("payment_entry_reached");
+  }, null, 2)).toBe("payment_review_reached");
   expect(finalTaskState.currentGoal).toBeNull();
   expect(await page.locator("#total-price").textContent()).toContain("200 EUR");
   expect(selectedLabels.slice(0, 4)).toEqual(expect.arrayContaining([
@@ -13519,7 +13173,7 @@ test("live-shaped review modal keeps grounded safe controls selectable and submi
     sections: executed.observation.page.sections,
     surface: executed.observation.page.currentSurface
   }, null, 2)).toBe("completed");
-  expect(paymentTaskState.terminalStatus).toBe("payment_entry_reached");
+  expect(paymentTaskState.terminalStatus).toBe("payment_review_reached");
 });
 
 test("paid-only seat map treats Next as navigation instead of inventing a free-seat obligation", async ({ page }) => {
