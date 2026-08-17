@@ -434,6 +434,7 @@ function compactSessionState(state = {}) {
     travelerIds: eventSummary(state.travelerIds || []),
     userPolicy: eventSummary(state.userPolicy || {}),
     sessionProfileOverrides: eventSummary(state.sessionProfileOverrides || {}),
+    semanticBindingMemory: eventSummary(state.semanticBindingMemory || []),
     pendingUserInput: eventSummary(state.pendingUserInput || null),
     site: eventSummary(state.site || {}),
     approvals: eventSummary(state.approvals || {}),

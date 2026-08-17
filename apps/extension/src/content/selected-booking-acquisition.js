@@ -1,7 +1,8 @@
 import {
   SELECTED_BOOKING_MAX_AGE_MS,
   approvedSelectedBookingAcquisitionFromMap,
-  authoritativeSelectedBookingFacts
+  authoritativeSelectedBookingFacts,
+  selectedBookingCompatibilityWithMap
 } from "./selected-booking.js";
 import { currentNavigationUrl } from "./navigation-identity.js";
 
@@ -24,6 +25,7 @@ export function createSelectedBookingAcquisition({
   let pendingStartAcquisition = null;
   let durableAcquisition = null;
   let durableHydrated = false;
+  let durableMutation = Promise.resolve();
   let selectionCaptureArmed = false;
   let captureAttempt = {
     url: "",
@@ -85,8 +87,27 @@ export function createSelectedBookingAcquisition({
     } catch (error) {
       // Opaque documents may deny sessionStorage; the in-memory result remains valid.
     }
-    Promise.resolve(durableWrite(acquisition)).catch(() => undefined);
+    // Serialize replacement storage. A conflicting checkout may clear the
+    // previous tab acquisition immediately before this write; allowing those
+    // asynchronous operations to race can delete the newly captured booking.
+    durableMutation = durableMutation
+      .catch(() => undefined)
+      .then(() => durableWrite(acquisition))
+      .catch(() => undefined);
     return acquisition;
+  }
+
+  function discard() {
+    durableAcquisition = null;
+    try {
+      sessionStorage.removeItem(SELECTED_BOOKING_KEY);
+    } catch (error) {
+      // The tab-scoped durable copy is cleared below when sessionStorage is unavailable.
+    }
+    durableMutation = durableMutation
+      .catch(() => undefined)
+      .then(() => durableClear())
+      .catch(() => undefined);
   }
 
   function capture(map = null) {
@@ -116,7 +137,16 @@ export function createSelectedBookingAcquisition({
   }
 
   function acquisitionFromMap(map = null) {
-    return read() || capture(map) || approveVisibleSummary(map);
+    const existing = read();
+    if (existing) {
+      const compatibility = selectedBookingCompatibilityWithMap(existing, map);
+      if (compatibility.status !== "conflict") return existing;
+      // A new airline/itinerary in the same tab is a new transaction. The
+      // old acquisition remains authoritative only for resume, which bypasses
+      // fresh acquisition and uses the backend's durable baseline.
+      discard();
+    }
+    return capture(map) || approveVisibleSummary(map);
   }
 
   async function acquireForStart({

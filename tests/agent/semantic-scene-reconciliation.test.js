@@ -3,6 +3,8 @@ const assert = require("node:assert/strict");
 
 const {
   semanticSceneUncertainty,
+  applyRememberedSemanticBindings,
+  rememberSemanticBindings,
   applySemanticSceneHypotheses,
   reconcileSemanticScene
 } = require("../../apps/web/agent/semantic-scene-reconciliation");
@@ -111,6 +113,69 @@ test("scene hypotheses may refine supplied evidence but cannot invent owners or 
   assert.equal(reconciled.page.validationIssues[0].controlId, "ctrl_unknown");
   assert.equal(reconciled.page.semanticSceneReconciliation.hypotheses.length, 1);
   assert.equal(reconciled.page.semanticSceneReconciliation.authority, "hypothesis_only");
+});
+
+test("an evidence-identical grounded binding is reused without another model request", () => {
+  const sourceControl = control({
+    controlId: "ctrl_unknown_1",
+    stableKey: "traveler|passenger_1|opaque_1",
+    sectionId: "passenger_1",
+    sectionType: "passenger",
+    sectionLabel: "Passenger 1"
+  });
+  const source = observation([sourceControl]);
+  const uncertainty = semanticSceneUncertainty({
+    observation: source,
+    traveler: { first_name: "Ali" }
+  });
+  const reconciled = applySemanticSceneHypotheses(source, {
+    status: "grounded",
+    hypotheses: [{
+      controlId: "ctrl_unknown_1",
+      semanticType: "first_name",
+      factSource: "profile.first_name",
+      validationIssueId: "",
+      confidence: "high",
+      evidence: "The local passenger label identifies the given name."
+    }]
+  }, uncertainty);
+  const memory = rememberSemanticBindings([], reconciled);
+  const nextControl = { ...sourceControl, controlId: "ctrl_unknown_2" };
+  const next = applyRememberedSemanticBindings(observation([nextControl]), memory, {
+    traveler: { first_name: "Ali" }
+  });
+
+  assert.equal(memory.length, 1);
+  assert.equal(next.page.controls[0].fieldType, "first_name");
+  assert.equal(next.page.controls[0].fieldClassification.source, "remembered_grounded_semantic_scene");
+  assert.equal(semanticSceneUncertainty({ observation: next, traveler: { first_name: "Ali" } }).needed, false);
+});
+
+test("a grounded binding is invalidated when its local semantic evidence changes", () => {
+  const sourceControl = control({
+    stableKey: "traveler|passenger_1|opaque_1",
+    sectionId: "passenger_1",
+    sectionLabel: "Passenger 1"
+  });
+  const source = observation([sourceControl]);
+  const uncertainty = semanticSceneUncertainty({ observation: source, traveler: { first_name: "Ali" } });
+  const reconciled = applySemanticSceneHypotheses(source, {
+    status: "grounded",
+    hypotheses: [{
+      controlId: "ctrl_unknown",
+      semanticType: "first_name",
+      factSource: "profile.first_name",
+      validationIssueId: "",
+      confidence: "high",
+      evidence: "Passenger given name"
+    }]
+  }, uncertainty);
+  const memory = rememberSemanticBindings([], reconciled);
+  const changed = observation([{ ...sourceControl, label: "Passenger nationality", placeholder: "Choose country" }]);
+  const next = applyRememberedSemanticBindings(changed, memory, { traveler: { first_name: "Ali" } });
+
+  assert.equal(next.page.controls[0].fieldType, "");
+  assert.equal(semanticSceneUncertainty({ observation: next, traveler: { first_name: "Ali" } }).needed, true);
 });
 
 test("an ambiguous scene uses one closed-ID hypothesis call and returns no action authority", async () => {

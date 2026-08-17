@@ -60,7 +60,7 @@ function semanticTypesFromLabel(value = "") {
   };
   if (/confirm.*e[ -]?mail|repeat.*e[ -]?mail/.test(evidence)) add("confirm_email");
   else if (/(?:^|\s)e[ -]?mail(?:\s|$)/.test(evidence)) add("email");
-  if (/(?:^|\s)surname(?:\s|$)|family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
+  if (/(?:^|\s)surnames?(?:\s|$)|family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
   const combinedGivenNames = /(?:first|given)\s*(?:\/|and|&)\s*middle\s+names?\b|\bgiven names\b|\bforenames\b/.test(evidence);
   if (combinedGivenNames) add("given_names");
   else {
@@ -152,10 +152,20 @@ function semanticTypeForControl(control = {}, field = {}) {
     field.fieldClassification?.fieldType,
     control.fieldType,
     control.field,
+    control.semantic,
+    control.meaning,
     field.fieldType,
     field.field,
+    field.semantic,
+    field.meaning,
     control.name,
-    field.name
+    control.id,
+    control.testId,
+    control.autocomplete,
+    field.name,
+    field.id,
+    field.testId,
+    field.autocomplete
   ].map(normalizeProfileFieldType).filter(Boolean);
   if (
     explicitTypes.length === 1
@@ -169,10 +179,20 @@ function semanticTypeForControl(control = {}, field = {}) {
     field.fieldClassification?.fieldType,
     control.fieldType,
     control.field,
+    control.semantic,
+    control.meaning,
     field.fieldType,
     field.field,
+    field.semantic,
+    field.meaning,
     control.name,
-    field.name
+    control.id,
+    control.testId,
+    control.autocomplete,
+    field.name,
+    field.id,
+    field.testId,
+    field.autocomplete
   ].map(normalizeProfileFieldType).includes("country");
   if (declaredCountry && explicitTypes.length === 1 && explicitTypes[0] === "phone_country_code") {
     return "phone_country_code";
@@ -187,11 +207,19 @@ function semanticTypeForControl(control = {}, field = {}) {
   const raw = [
     control.fieldType,
     control.field,
+    control.semantic,
+    control.meaning,
     field.fieldType,
     field.field,
+    field.semantic,
+    field.meaning,
     control.name,
+    control.id,
+    control.testId,
     control.autocomplete,
     field.name,
+    field.id,
+    field.testId,
     field.autocomplete
   ].map(normalizeProfileFieldType).filter(Boolean);
   const rawTypes = [...new Set(raw)];

@@ -29,6 +29,123 @@ function operationNames(control = {}) {
     .map(([operation]) => operation);
 }
 
+function semanticBindingIdentity(control = {}) {
+  return clean(
+    control.stableKey
+    || control.semanticIdentity
+    || control.componentContract?.logicalIdentity
+    || control.name
+    || control.controlId,
+    500
+  );
+}
+
+function semanticBindingEvidenceSignature(control = {}) {
+  const options = (control.options || control.choiceOptions || control.dateField?.options || [])
+    .slice(0, 24)
+    .map((option) => clean(typeof option === "string" ? option : `${option?.value || ""}|${option?.label || ""}`, 120));
+  return JSON.stringify({
+    identity: semanticBindingIdentity(control),
+    role: clean(`${control.role || ""}|${control.kind || ""}|${control.domRole || ""}`, 120),
+    name: clean(`${control.name || ""}|${control.id || ""}|${control.testId || ""}|${control.autocomplete || ""}`, 240),
+    label: clean(`${control.label || ""}|${control.accessibleName || ""}|${control.placeholder || ""}`, 360),
+    helper: clean(control.accessibleDescription, 240),
+    owner: clean(`${control.sectionId || ""}|${control.sectionType || ""}|${control.sectionLabel || ""}|${control.semanticOwnerKey || ""}`, 300),
+    operations: operationNames(control).sort(),
+    options
+  });
+}
+
+function applyRememberedSemanticBindings(observation = {}, memory = [], {
+  traveler = {},
+  transactionReview = null
+} = {}) {
+  if (!Array.isArray(memory) || !memory.length) return observation;
+  const page = observation.page || {};
+  const allowedFacts = new Set(availableSemanticFacts(traveler, { page, transactionReview }).map((fact) => (
+    `${fact.semanticType}|${fact.factSource}`
+  )));
+  const receipts = new Map(memory.flatMap((entry) => {
+    const identity = clean(entry?.identity, 500);
+    const signature = String(entry?.evidenceSignature || "");
+    const semanticType = clean(entry?.semanticType, 120);
+    const factSource = clean(entry?.factSource, 180);
+    if (!identity || !signature || !allowedFacts.has(`${semanticType}|${factSource}`)) return [];
+    return [[`${identity}|${signature}`, { ...entry, semanticType, factSource }]];
+  }));
+  if (!receipts.size) return observation;
+  const bindingByControl = new Map();
+  const controls = (page.controls || []).map((control) => {
+    const existing = clean(control.fieldType || control.semantic).toLowerCase();
+    const mayNeedBinding = !existing || ["unknown", "choice", "field", "value_field", "input", "control"].includes(existing)
+      || Boolean(control.fieldClassification?.ambiguity);
+    if (!mayNeedBinding || !controlBelongsToCurrentSurface(control, page)) return control;
+    const identity = semanticBindingIdentity(control);
+    const evidenceSignature = semanticBindingEvidenceSignature(control);
+    const receipt = receipts.get(`${identity}|${evidenceSignature}`);
+    if (!receipt) return control;
+    bindingByControl.set(control.controlId, receipt);
+    return {
+      ...control,
+      fieldType: receipt.semanticType,
+      semantic: receipt.semanticType,
+      fieldClassification: {
+        fieldType: receipt.semanticType,
+        source: "remembered_grounded_semantic_scene",
+        confidence: Number(receipt.confidence || 0.82),
+        evidence: ["Reused an evidence-identical grounded semantic binding."],
+        semanticGrounding: { factSource: receipt.factSource }
+      }
+    };
+  });
+  if (!bindingByControl.size) return observation;
+  const fields = (page.fields || []).map((field) => {
+    const receipt = bindingByControl.get(field.controlId);
+    return receipt
+      ? { ...field, field: receipt.semanticType, fieldType: receipt.semanticType, semantic: receipt.semanticType }
+      : field;
+  });
+  return {
+    ...observation,
+    page: {
+      ...page,
+      controls,
+      fields,
+      semanticBindingReuse: {
+        status: "reused",
+        controlIds: [...bindingByControl.keys()],
+        authority: "evidence_identical_hypothesis"
+      }
+    }
+  };
+}
+
+function rememberSemanticBindings(memory = [], observation = {}) {
+  const hypotheses = observation.page?.semanticSceneReconciliation?.hypotheses || [];
+  if (!hypotheses.length) return Array.isArray(memory) ? memory : [];
+  const controls = new Map((observation.page?.controls || []).map((control) => [control.controlId, control]));
+  const additions = hypotheses.flatMap((hypothesis) => {
+    const control = controls.get(hypothesis.controlId);
+    if (!control || !["high", "medium"].includes(hypothesis.confidence)) return [];
+    const identity = semanticBindingIdentity(control);
+    const evidenceSignature = semanticBindingEvidenceSignature(control);
+    if (!identity || !evidenceSignature) return [];
+    return [{
+      identity,
+      evidenceSignature,
+      semanticType: hypothesis.semanticType,
+      factSource: hypothesis.factSource,
+      confidence: hypothesis.confidence === "high" ? 0.95 : 0.82
+    }];
+  });
+  const combined = [...(Array.isArray(memory) ? memory : []), ...additions];
+  const deduped = new Map(combined.map((entry) => [
+    `${entry.identity}|${entry.evidenceSignature}`,
+    entry
+  ]));
+  return [...deduped.values()].slice(-64);
+}
+
 function semanticSceneUncertainty({ observation = {}, semanticCompilation = null, traveler = {}, transactionReview = null } = {}) {
   const rawPage = observation.page || {};
   const page = semanticCompilation
@@ -246,6 +363,9 @@ async function reconcileSemanticScene({
 
 module.exports = {
   semanticSceneUncertainty,
+  semanticBindingEvidenceSignature,
+  applyRememberedSemanticBindings,
+  rememberSemanticBindings,
   applySemanticSceneHypotheses,
   reconcileSemanticScene
 };

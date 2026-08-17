@@ -25,6 +25,64 @@ function authoritativeSelectedBookingItinerary(facts = null) {
   return complete ? facts : null;
 }
 
+function itineraryIdentity(value = null) {
+  const segments = Array.isArray(value?.itinerary?.segments) ? value.itinerary.segments : [];
+  if (!segments.length) return "";
+  const normalized = segments.map((segment) => ({
+    origin: String(segment?.origin || "").trim().toUpperCase(),
+    destination: String(segment?.destination || "").trim().toUpperCase(),
+    departureDate: String(segment?.departureDate || segment?.departure_date || "").trim()
+  }));
+  if (normalized.some((segment) => !segment.origin || !segment.destination || !segment.departureDate)) return "";
+  return JSON.stringify(normalized);
+}
+
+function bookingFactsFromCandidate(candidate = null) {
+  if (!candidate || typeof candidate !== "object") return null;
+  if (candidate.facts?.itinerary) return candidate.facts;
+  if (candidate.itinerary && candidate.approvedTotal) {
+    return {
+      itinerary: candidate.itinerary,
+      currency: candidate.approvedTotal.currency || "",
+      totalPrice: candidate.approvedTotal
+    };
+  }
+  return candidate.itinerary ? candidate : null;
+}
+
+export function selectedBookingCompatibilityWithMap(candidate = null, map = null) {
+  const currentFacts = authoritativeSelectedBookingItinerary(map?.transactionFacts);
+  if (!currentFacts) {
+    return Object.freeze({ status: "unknown", reason: "CURRENT_CHECKOUT_IDENTITY_UNAVAILABLE" });
+  }
+  const candidateFacts = bookingFactsFromCandidate(candidate);
+  const candidateIdentity = itineraryIdentity(candidateFacts);
+  const currentIdentity = itineraryIdentity(currentFacts);
+  if (!candidateIdentity || !currentIdentity || candidateIdentity !== currentIdentity) {
+    return Object.freeze({ status: "conflict", reason: "CURRENT_CHECKOUT_ITINERARY_MISMATCH" });
+  }
+  const candidateAmount = Number(candidateFacts?.totalPrice?.amount);
+  const candidateCurrency = String(
+    candidateFacts?.totalPrice?.currency || candidateFacts?.currency || ""
+  ).trim().toUpperCase();
+  const currentAmount = Number(currentFacts?.totalPrice?.amount);
+  const currentCurrency = String(
+    currentFacts?.totalPrice?.currency || currentFacts?.currency || ""
+  ).trim().toUpperCase();
+  const currentTotalAuthoritative = Number.isFinite(currentAmount)
+    && Boolean(currentCurrency)
+    && currentFacts?.factEvidence?.totalPrice?.authoritative === true
+    && currentFacts?.factEvidence?.totalPrice?.role === "booking_total";
+  if (currentTotalAuthoritative && (
+    !Number.isFinite(candidateAmount)
+    || candidateCurrency !== currentCurrency
+    || Math.abs(candidateAmount - currentAmount) > 0.005
+  )) {
+    return Object.freeze({ status: "conflict", reason: "CURRENT_CHECKOUT_TOTAL_MISMATCH" });
+  }
+  return Object.freeze({ status: "match", reason: "CURRENT_CHECKOUT_IDENTITY_MATCH" });
+}
+
 export function authoritativeSelectedBookingFacts(facts = null) {
   const itineraryFacts = authoritativeSelectedBookingItinerary(facts);
   if (!itineraryFacts) return null;

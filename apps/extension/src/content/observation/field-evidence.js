@@ -271,6 +271,27 @@ export function createFieldEvidence({
       explicitLabel
     );
     if (explicitResolution) return explicitResolution;
+    if (String(input.tagName || "").toUpperCase() === "SELECT") {
+      const optionLabels = [...(input.options || [])]
+        .flatMap((option) => [option.value, choiceLabel(option)])
+        .filter(Boolean)
+        .slice(0, 24);
+      const titleValues = optionLabels.map((label) => normalizedProfileChoiceValue(label, "title"));
+      const genderValues = optionLabels.map((label) => normalizedProfileChoiceValue(label, "gender"));
+      const titleOptions = titleValues.includes("mr") && titleValues.includes("mrs/ms");
+      const genderOptions = genderValues.includes("male") && genderValues.includes("female");
+      // Option labels are a deterministic fallback, not a reason to override
+      // stronger machine or explicit-label evidence. If the same values could
+      // mean either title or gender, leave the control unresolved.
+      if (titleOptions !== genderOptions) {
+        return result(
+          titleOptions ? "title" : "gender",
+          "native_select_options",
+          0.9,
+          optionLabels.join(" ")
+        );
+      }
+    }
     if (type === "tel") return result("phone", "input_type", 0.9, type);
 
     const titleGroup = /(?:^|\s)(?:title|salutation|honorific)(?:\s|$)/.test(group.label.toLowerCase());

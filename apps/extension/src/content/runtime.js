@@ -2,6 +2,7 @@ import {
   approvedSelectedBookingAcquisitionFromMap,
   authoritativeSelectedBookingFacts,
   composeSelectedBookingContract,
+  selectedBookingCompatibilityWithMap,
   validStoredSelectedBookingContract
 } from "./selected-booking.js";
 import { createAgentRuntimeContext } from "./runtime-context.js";
@@ -2351,6 +2352,7 @@ import {
     renderSidebar: (...args) => renderSidebar(...args),
     resetAgentLoopLifecycle,
     setAgentActivity,
+    selectedBookingCompatibilityWithMap,
     storageGet,
     traveler,
     userIntentText,

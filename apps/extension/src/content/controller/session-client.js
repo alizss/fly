@@ -19,6 +19,7 @@ export function createSessionClient({
   renderSidebar,
   resetAgentLoopLifecycle,
   setAgentActivity,
+  selectedBookingCompatibilityWithMap,
   storageGet,
   traveler,
   userIntentText,
@@ -36,20 +37,26 @@ export function createSessionClient({
       }
       let selectedBookingContract = null;
       if (!resumeSessionId) {
-        selectedBookingContract = validStoredSelectedBookingContract(settings.selectedBookingContract, selectedTraveler);
+        const currentMap = agent.pageMap || pageStateStore.current() || pageStateStore.observe({ reason: "session_start_booking" }).map;
+        // Current-tab acquisition owns a fresh transaction. A globally cached
+        // contract is only a bounded fallback when the current page proves the
+        // exact same itinerary; freshness plus traveler identity is not enough.
+        const acquisition = await acquireSelectedBookingForStart({
+          initialMap: currentMap,
+          timeoutMs: options.bookingAcquisitionTimeoutMs
+        });
+        selectedBookingContract = composeSelectedBookingContract(acquisition, selectedTraveler);
+        if (!selectedBookingContract) {
+          const cached = validStoredSelectedBookingContract(settings.selectedBookingContract, selectedTraveler);
+          const compatibility = selectedBookingCompatibilityWithMap(cached, currentMap);
+          if (cached && compatibility.status === "match") selectedBookingContract = cached;
+        }
         if (!selectedBookingContract) {
           setAgentActivity(
             "Confirming the selected booking",
-            "Waiting briefly for the selected itinerary and displayed starting total."
+            "The current tab must expose the selected itinerary and displayed starting total."
           );
           renderSidebar("agent");
-          const acquisition = await acquireSelectedBookingForStart({
-            initialMap: agent.pageMap || pageStateStore.current(),
-            timeoutMs: options.bookingAcquisitionTimeoutMs
-          });
-          selectedBookingContract = composeSelectedBookingContract(acquisition, selectedTraveler);
-        }
-        if (!selectedBookingContract) {
           const error = new Error(
             "The selected itinerary and starting total are not available yet. Return to the approved flight selection or make its booking summary visible, then start again."
           );

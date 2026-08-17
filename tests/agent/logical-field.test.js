@@ -133,6 +133,48 @@ test("activation-only payment command is not inferred as an email field from acc
   assert.equal(semanticTypeForControl(pay, {}), "");
 });
 
+test("observer semantic evidence keeps a plural surname field deterministic", () => {
+  const surname = {
+    controlId: "ctrl_surname",
+    role: "textbox",
+    kind: "text",
+    label: "Surnames",
+    name: "passengers.0.lastname",
+    semantic: "last_name",
+    operations: { type: { operation: "type", actuatorId: "target_surname" } }
+  };
+
+  assert.equal(semanticTypeForControl(surname, {}), "last_name");
+});
+
+test("a machine-owned title field is not reinterpreted as gender from noisy option prose", () => {
+  const title = {
+    controlId: "ctrl_title",
+    role: "select",
+    kind: "select-one",
+    label: "Gender Male Female",
+    name: "passengers.0.title",
+    semantic: "title",
+    operations: { select: { operation: "select", actuatorId: "target_title" } }
+  };
+
+  assert.equal(semanticTypeForControl(title, {}), "title");
+});
+
+test("compatible first-name and given-names evidence resolves without semantic reconciliation", () => {
+  const names = {
+    controlId: "ctrl_names",
+    role: "textbox",
+    kind: "text",
+    label: "Given names",
+    name: "passengers.0.firstName",
+    semantic: "first_name",
+    operations: { type: { operation: "type", actuatorId: "target_names" } }
+  };
+
+  assert.equal(semanticTypeForControl(names, {}), "given_names");
+});
+
 test("combined first and middle name input is one given-names requirement and middle name stays optional", () => {
   const control = {
     controlId: "ctrl_given_names",

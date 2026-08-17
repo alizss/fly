@@ -485,6 +485,69 @@ test("an invalid stored booking falls back to fresh acquisition for the selected
   expect(requestBody.selectedBookingContract.selectionId).not.toBe("stale_selection");
 });
 
+test("a fresh checkout rejects a recent stored booking from another airline", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Passenger details</h1>
+      <section data-origin="LJU" data-destination="LGW" data-departure-date="2026-10-17">LJU → LGW</section>
+      <section data-origin="LGW" data-destination="LJU" data-departure-date="2026-11-01">LGW → LJU</section>
+      <p class="booking-total">Booking total 76.03 EUR</p>
+      <button type="button">Continue</button>
+    </main>
+  `);
+  let requestBody = null;
+  await page.route("https://agent.test/api/agent/session", async (route) => {
+    requestBody = route.request().postDataJSON();
+    await route.fulfill({
+      status: 201,
+      contentType: "application/json",
+      body: JSON.stringify({ id: "chk_easyjet_after_kiwi" })
+    });
+  });
+  const kiwiContract = {
+    ...testSelectedBooking("trav_cross_airline"),
+    selectionId: "booking_start_kiwi",
+    sourceUrl: "https://www.kiwi.com/en/booking/",
+    itinerary: {
+      segments: [{
+        segmentId: "segment_ayt_esb",
+        origin: "AYT",
+        destination: "ESB",
+        departureDate: "2026-09-15"
+      }]
+    },
+    approvedTotal: { amount: 1658.34, currency: "TRY" },
+    fareBrand: "Basic Saver"
+  };
+  const session = await page.evaluate(async ({ stored }) => {
+    window.chrome = {
+      storage: { local: { get: async () => ({ apiBase: "https://agent.test/api", selectedBookingContract: stored }) } },
+      runtime: { sendMessage: async () => ({ ok: false }) }
+    };
+    const profile = {
+      id: "trav_cross_airline",
+      first_name: "Ali",
+      last_name: "SIFRAR",
+      date_of_birth: "2003-05-31"
+    };
+    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
+    window.__ATW_TEST__.observePageState({ forceFull: true, reason: "easyjet_after_kiwi" });
+    return window.__ATW_TEST__.startAgentSession();
+  }, { stored: kiwiContract });
+  expect(session).toMatchObject({ id: "chk_easyjet_after_kiwi" });
+  expect(requestBody.selectedBookingContract).toMatchObject({
+    itinerary: {
+      segments: [
+        expect.objectContaining({ origin: "LJU", destination: "LGW", departureDate: "2026-10-17" }),
+        expect.objectContaining({ origin: "LGW", destination: "LJU", departureDate: "2026-11-01" })
+      ]
+    },
+    approvedTotal: { amount: 76.03, currency: "EUR" },
+    travelerIds: ["trav_cross_airline"]
+  });
+  expect(requestBody.selectedBookingContract.selectionId).not.toBe("booking_start_kiwi");
+});
+
 test("resume sends no stored booking contract and uses only the durable baseline", async ({ page }) => {
   await loadHtmlProducer(page, "<main><h1>Passenger details</h1></main>");
   let requestBody = null;

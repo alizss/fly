@@ -22,6 +22,10 @@ const {
   semanticSceneUncertainty
 } = require("../ambiguity-resolver");
 const {
+  applyRememberedSemanticBindings,
+  rememberSemanticBindings
+} = require("../semantic-scene-reconciliation");
+const {
   actionForCurrentCandidate,
   bindMechanics
 } = require("../mechanics-binder");
@@ -477,6 +481,10 @@ async function runLoopTurn({
   // DecisionFrame is compiled once from the reconciled evidence and TaskState
   // remains the sole obligation authority.
   const semanticCompileStartedAt = Date.now();
+  observation = applyRememberedSemanticBindings(observation, state.semanticBindingMemory, {
+    traveler,
+    transactionReview: state.transactionInvariants?.review || null
+  });
   const deterministicSemanticCompilation = agentContract.compileSemanticCheckout(observation.page || {});
   const sceneUncertainty = semanticSceneUncertainty({
     observation,
@@ -500,6 +508,9 @@ async function runLoopTurn({
       observation = reconciled.observation;
       activeComponentGrounding = reconciled.reconciliation;
       activeComponentGroundingMeta = reconciled.meta;
+      state = withUpdate(state, {
+        semanticBindingMemory: rememberSemanticBindings(state.semanticBindingMemory, observation)
+      });
       latency.classification_model_ms += Number(reconciled.meta?.durationMs || 0);
     } catch (error) {
       activeComponentGrounding = {

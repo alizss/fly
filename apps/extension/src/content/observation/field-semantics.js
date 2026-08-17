@@ -28,7 +28,7 @@ export function profileFieldTypesFromText(value = "", { editable = true } = {}) 
   if (/(?:emergency|sos)(?: contact)?.*name|name.*(?:emergency|sos)(?: contact)?/.test(evidence)) add("emergency_contact_name");
   if (/emergency contact.*relationship|relationship.*emergency contact/.test(evidence)) add("emergency_contact_relationship");
   if (/(?:emergency|sos)(?: contact)?.*(?:phone|mobile|telephone)|(?:phone|mobile|telephone).*(?:emergency|sos)(?: contact)?/.test(evidence)) add("emergency_contact_phone");
-  if (boundedPhrase(evidence, "surname") || /family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
+  if (boundedPhrase(evidence, "surname") || boundedPhrase(evidence, "surnames") || /family[ _-]?name|last[ _-]?name/.test(evidence)) add("last_name");
   const combinedGivenNames = /(?:first|given)\s*(?:\/|and|&)\s*middle\s+names?\b|\bgiven names\b|\bforenames\b/.test(evidence);
   if (combinedGivenNames) add("given_names");
   else {

@@ -52,6 +52,7 @@
  * @property {{candidateSelection?: Object}|null} aiDecisionCache
  * @property {Object} userPolicy
  * @property {Object} sessionProfileOverrides
+ * @property {Object[]} semanticBindingMemory
  * @property {{requestId:string,field:string,label:string,subjectId?:string,sensitive?:boolean}|null} pendingUserInput
  * @property {Object|null} transactionInvariants
  * @property {Object} paymentState
@@ -83,6 +84,7 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
     travelerIds: travelerId ? [String(travelerId)] : [],
     userPolicy: {},
     sessionProfileOverrides: {},
+    semanticBindingMemory: [],
     pendingUserInput: null,
     site: { host: String(site.host || ""), url: String(site.url || ""), sellerName: site.sellerName || undefined },
     currentObservation: null,
