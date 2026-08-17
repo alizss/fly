@@ -9,16 +9,6 @@ const { reduceTaskState } = require("./task-state-replay-adapter");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
-const { createCheckoutMandate } = require("../../packages/shared/checkout-mandate");
-
-function testCheckoutMandate(total = 208) {
-  return createCheckoutMandate({
-    selectionId: "selection_test",
-    itinerary: { segments: [{ segmentId: "segment_1", origin: "LHR", destination: "LJU", departureDate: "2026-08-10" }] },
-    approvedTotal: { amount: total, currency: "EUR" },
-    travelerIds: ["trav_1"]
-  });
-}
 
 function readyTransactionReview() {
   const transaction = {
@@ -141,7 +131,7 @@ function disabledNavigation(controlId = "continue", options = {}) {
   };
 }
 
-test("grounded standard legal attestation is authorized by the checkout mandate without a user prompt", () => {
+test("grounded legal attestation produces an explicit approval boundary instead of a navigation wait", () => {
   const terms = {
     ...control("terms", { label: "I agree with the General Conditions of Carriage", semantic: "legal_attestation", risk: "legal", kind: "checkbox", role: "checkbox" }),
     state: { required: true, checked: false, selected: false, disabled: false },
@@ -204,19 +194,15 @@ test("grounded standard legal attestation is authorized by the checkout mandate 
     }
   };
 
-  const state = reduceTaskState({
-    observation,
-    checkoutMandate: testCheckoutMandate(),
-    traveler: { id: "trav_1", first_name: "Ali", last_name: "Sifrar" }
-  });
+  const state = reduceTaskState({ observation, traveler: { id: "trav_1", first_name: "Ali", last_name: "Sifrar" } });
 
-  assert.equal(state.disposition.kind, "execute");
-  assert.equal(state.currentObligation.desiredEffect, "legal_acceptance");
-  assert.equal(state.currentObligation.admittedControlIds[0], "terms");
-  assert.equal(state.currentObligation.policyDecision.authorization.source, "checkout_mandate");
+  assert.equal(state.currentGoal, null);
+  assert.equal(state.disposition.kind, "request_approval");
+  assert.equal(state.disposition.code, "LEGAL_APPROVAL_REQUIRED");
+  assert.equal(state.disposition.details.controlId, "terms");
 });
 
-test("legal gate uses one checkout mandate, one attestation action, one advance action, then payment entry", () => {
+test("legal gate uses one exact approval, one attestation action, one advance action, then payment entry", () => {
   const terms = {
     ...control("terms_exact", { label: "I agree with the General Conditions of Carriage", semantic: "legal_attestation", risk: "legal", kind: "checkbox", role: "checkbox" }),
     state: { required: true, checked: false, selected: false, disabled: false },
@@ -256,17 +242,24 @@ test("legal gate uses one checkout mandate, one attestation action, one advance 
     }
   };
   const transactionReview = readyTransactionReview(141.62);
-  const mandate = testCheckoutMandate(141.62);
-  const authorized = reduceTaskState({
+  const requested = reduceTaskState({
     transactionId: "chk_legal_exact",
     transactionReview,
-    checkoutMandate: mandate,
     observation: { observationId: "obs_legal_exact_1", page: reviewPage }
   });
-  const authorization = authorized.currentObligation.policyDecision.authorization;
-  assert.equal(authorization.contractVersion, "mandate-attestation-authorization/v1");
-  assert.equal(authorization.legalControlId, "terms_exact");
-  assert.equal(authorized.disposition.kind, "execute");
+  const request = requested.disposition.details.approvalRequest;
+  assert.equal(request.contractVersion, "legal-approval-request/v1");
+  assert.equal(request.legalControlId, "terms_exact");
+  assert.equal(request.advanceControlId, "confirm_exact");
+
+  const authorization = { ...request, contractVersion: "legal-authorization/v1", approvedAt: Date.now() };
+  const authorized = reduceTaskState({
+    previousTaskState: requested,
+    transactionId: "chk_legal_exact",
+    approvals: { legalAuthorization: authorization },
+    transactionReview,
+    observation: { observationId: "obs_legal_exact_2", page: reviewPage }
+  });
   assert.equal(authorized.currentObligation.desiredEffect, "legal_acceptance");
   assert.equal(authorized.currentObligation.successCondition.type, "legal_attestation_accepted");
 
@@ -278,18 +271,12 @@ test("legal gate uses one checkout mandate, one attestation action, one advance 
   const advance = reduceTaskState({
     previousTaskState: authorized,
     transactionId: "chk_legal_exact",
-    checkoutMandate: mandate,
+    approvals: { legalAuthorization: authorization },
     transactionReview,
     observation: { observationId: "obs_legal_exact_3", page: acceptedPage }
   });
   assert.equal(advance.currentObligation.desiredEffect, "advance_to_payment");
-  // A legal-gate Confirm proves forward checkout progress, not necessarily
-  // payment entry. Some sites insert a payment-method setup scene first.
-  assert.equal(advance.currentObligation.successCondition.type, "checkout_stage_advanced");
-  assert.equal(
-    advance.currentObligation.successCondition.expectedBoundary,
-    "PAYMENT_METHOD_SELECTION_OR_PAYMENT_ENTRY"
-  );
+  assert.equal(advance.currentObligation.successCondition.type, "payment_entry_reached");
 
   const payment = reduceTaskState({
     previousTaskState: advance,
@@ -2220,56 +2207,6 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
   assert.equal(state.safetyRestrictions.paymentCredentialsBlocked, true);
 });
 
-test("verified payment entry stops before required provider contact fields are resolved", () => {
-  const phone = {
-    ...control("provider_phone", { label: "Phone / GSM", semantic: "phone", kind: "text", role: "textbox" }),
-    required: true,
-    state: { normalizedValue: "", valuePresent: false, disabled: false }
-  };
-  const email = {
-    ...control("provider_email", { label: "E-mail", semantic: "email", kind: "email", role: "textbox" }),
-    required: true,
-    state: { normalizedValue: "", valuePresent: false, disabled: false }
-  };
-  const state = reduceTaskState({
-    traveler: { phone: "+38670328922", email: "ali@example.test" },
-    transactionReview: readyTransactionReview(),
-    observation: {
-      observationId: "obs_provider_card_entry_with_blank_contact",
-      page: {
-        step: "payment",
-        url: "https://payments.example/authorization",
-        currentSurface: { id: "surface-page", type: "page" },
-        controls: [
-          phone,
-          email,
-          control("provider_card_number", { label: "Card number", semantic: "card_number", kind: "text", role: "textbox" }),
-          control("provider_card_expiry", { label: "Expiration date", semantic: "card_expiry", kind: "text", role: "textbox" }),
-          control("provider_card_cvc", { label: "CVC number", semantic: "card_cvc", kind: "text", role: "textbox" })
-        ],
-        decisionGroups: [],
-        terminalEvidence: {
-          contractVersion: "terminal-evidence/v1",
-          stage: "payment_entry",
-          boundary: "PAYMENT_ENTRY",
-          boundaryObserved: true,
-          verified: true,
-          paymentCredentialKinds: ["card_number", "card_expiry", "card_security_code"]
-        }
-      }
-    }
-  });
-
-  assert.equal(state.paymentEvidence.pendingContact, true);
-  assert.equal(state.paymentEvidence.pendingRequiredSetup, false);
-  assert.equal(state.paymentEvidence.boundary.paymentEntry, true);
-  assert.equal(state.terminalGoalLatch.locked, true);
-  assert.equal(state.terminalStatus, "payment_entry_reached");
-  assert.equal(state.goal.status, "completed");
-  assert.equal(state.currentGoal, null);
-  assert.equal(state.disposition.code, "PAYMENT_ENTRY_REACHED");
-});
-
 test("a confirmation-labeled final review latches from owned payment evidence", () => {
   const state = reduceTaskState({
     transactionReview: readyTransactionReview(),
@@ -2284,16 +2221,7 @@ test("a confirmation-labeled final review latches from owned payment evidence", 
           control("pay", { label: "Pay 208 EUR", semantic: "submit_purchase" }),
           control("billing_name", { label: "Billing first name", semantic: "first_name", kind: "field", role: "textbox" })
         ],
-        decisionGroups: [],
-        terminalEvidence: {
-          contractVersion: "terminal-evidence/v1",
-          boundary: "PAYMENT_ENTRY",
-          boundaryObserved: true,
-          verified: true,
-          paymentMethodControlIds: ["payment_method_node"],
-          paymentCredentialControlIds: [],
-          transactionCommitControlIds: ["pay_node"]
-        }
+        decisionGroups: []
       }
     }
   });
@@ -2308,10 +2236,9 @@ test("a confirmation-labeled final review latches from owned payment evidence", 
   assert.equal(state.processAwareness.finalOutcome.transactionVerified, true);
 });
 
-test("final checkout with standard terms publishes the exact mandate-owned legal action", () => {
+test("final checkout with terms and no owned payment entry is a legal gate", () => {
   const state = reduceTaskState({
     transactionReview: readyTransactionReview(),
-    checkoutMandate: testCheckoutMandate(),
     observation: {
       observationId: "obs_final_terms_review",
       page: {
@@ -2349,15 +2276,13 @@ test("final checkout with standard terms publishes the exact mandate-owned legal
   assert.equal(state.paymentEvidence.boundary.boundary, "LEGAL_GATE");
   assert.equal(state.paymentEvidence.boundaryObserved, true);
   assert.equal(state.terminalStatus, "active");
-  assert.equal(state.disposition.kind, "execute");
-  assert.equal(state.currentObligation.desiredEffect, "legal_acceptance");
-  assert.equal(state.currentObligation.admittedControlIds[0], "terms");
+  assert.equal(state.currentGoal, null);
+  assert.equal(state.disposition.code, "LEGAL_APPROVAL_REQUIRED");
 });
 
-test("Croatia-style review automatically resolves exact standard legal terms before advancing to payment", () => {
+test("Croatia-style review requests exact legal approval before advancing to payment", () => {
   const state = reduceTaskState({
     transactionReview: readyTransactionReview(141.62),
-    checkoutMandate: testCheckoutMandate(141.62),
     observation: {
       observationId: "obs_croatia_pre_payment_review",
       page: {
@@ -2406,9 +2331,9 @@ test("Croatia-style review automatically resolves exact standard legal terms bef
   assert.equal(state.paymentEvidence.boundary.boundary, "LEGAL_GATE");
   assert.equal(state.paymentEvidence.boundaryObserved, true);
   assert.equal(state.terminalGoalLatch.locked, false);
-  assert.equal(state.disposition.kind, "execute");
-  assert.equal(state.currentObligation.desiredEffect, "legal_acceptance");
-  assert.equal(state.currentObligation.admittedControlIds[0], "terms");
+  assert.equal(state.disposition.kind, "request_approval");
+  assert.equal(state.disposition.code, "LEGAL_APPROVAL_REQUIRED");
+  assert.equal(state.currentGoal, null);
   assert.equal(state.processAwareness.unresolved.some((item) => item.startsWith("profile:")), false);
 });
 

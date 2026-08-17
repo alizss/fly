@@ -8,10 +8,10 @@ This is the concise chronological engineering record. Current acceptance truth b
 
 | Question | Answer |
 |---|---|
-| Product milestone | Universal unfamiliar checkout to actual payment entry; standard mandatory terms covered by the initial CheckoutMandate; no credentials/Pay/commit/purchase |
-| Architecture | One ObservationFrame → immutable CheckoutScene → TaskState/CurrentObligation → mechanics → governor → ActionLease → exact next-scene verification loop |
-| Automated baseline | 388/388 unit, 178/178 uninterrupted browser replays, `npm run check` |
-| Live evidence | EasyJet, GoToGate, Kiwi, and Turkish reached the prior review milestone; a real extension-controller → HTTP backend → governed-action Croatia replay now proves mandate-covered attestation → separate advance → hosted payment entry without a prompt |
+| Product milestone | Universal unfamiliar checkout to actual payment entry; exact legal approval when required; no credentials/Pay/commit/purchase |
+| Architecture | One ObservationFrame → DecisionFrame → TaskState/CurrentObligation → mechanics → governor → ActionLease → verification loop |
+| Automated baseline | 379/379 unit, 175/175 browser, `npm run check` |
+| Live evidence | EasyJet, GoToGate, Kiwi, and Turkish reached the prior review milestone; Croatia exposed the legal-approval execution gap now closed in replay |
 | Formal evidence gap | Fresh actual-payment-entry canaries and explicit intervention annotations |
 | Highest-priority product gap | Cross-airline structural portfolio, not another architecture rewrite |
 | Secondary gap | Browser observation/rescan and ambiguity latency |
@@ -31,30 +31,6 @@ Prove that the current universal loop transfers to unfamiliar structural familie
 Every failure must produce an exact replay and a universal repair. A new DOM, ordinary field, custom control, or unusual grouping is not an expected handoff.
 
 ## Latest implementation checkpoints
-
-### 2026-08-12 — Action-scoped cross-document navigation lifecycle
-
-- Every navigation-producing ActionLease now arms the existing durable `ExecutionEpisode/v2` before dispatch; no second task or semantic authority was added.
-- The episode carries exact session, action, source document, expected postcondition, destination document/observation, status, and a two-minute deadline.
-- The background worker performs browser routing only across same-tab commits, SPA history changes, child/noopener tabs, popup windows, tab replacement, redirects, and unknown HTTPS provider domains.
-- A destination document pulls and claims its assigned episode, resumes the exact durable session with `resumeOnly`, publishes `DESTINATION_READY`, and verifies the original action from its fresh CheckoutScene.
-- The source document may positively verify a same-document transition, but cannot negatively close a still-unclaimed cross-document outcome. Manual Start resumes a pending episode instead of creating a replacement transaction.
-- The global `atwAgentResume` marker and source-page destination-completion authority are removed. Foreground-only scene-exit ownership prevents background controls from competing with a modal, while an executable unresolved choice is not mistaken for a missing stage exit.
-
-Validation: 388/388 unit tests, 178/178 uninterrupted browser replays, and `npm run check`.
-
-### 2026-08-12 — CheckoutScene semantic closure completed offline
-
-- The deterministic scene draft now runs before uncertainty detection; one optional grounded patch is validated into the final immutable scene.
-- A stable active checkout stage with no owned exit is an explicit closure failure, so unfamiliar forward controls receive bounded interpretation instead of an empty wait.
-- TaskState can reconcile only precompiled decision entities; its callable raw-label decision resolver was removed.
-- Page/booking totals remain transaction evidence. Only exact option-local price or delta evidence can make a selected choice economic.
-- Semantic stage-exit ownership is independent of the exact activation mechanic; rendered JavaScript-only anchors can use bounded exact-element activation.
-- One physical control receives one scene meaning. Optional login, purchaser type, payment method, survey, marketing, and navigation no longer compete.
-- Legal Confirm verifies forward checkout progress; payment-setup Continue requires actual hosted/payment-entry evidence.
-- `MECHANICS_EXHAUSTED` enters the bounded mutation-or-deadline recovery lifecycle instead of displaying an indefinite page-change wait.
-
-Validation: 380/380 unit, 178/178 uninterrupted browser replays, and `npm run check`. Fresh live Croatia plus retained canaries remain required.
 
 ### 2026-08-10 — Strict checkout admission and transition settling
 
@@ -136,7 +112,7 @@ The canary tool reports these as `review_required` until operator intervention i
 - Exact action freshness, duplicate refusal, semantic verification, and bounded recovery.
 - Fare, baggage, seat, insurance, and extras handling for the current baseline policies.
 - Payment-review detection without exposing executable payment controls.
-- One immutable CheckoutMandate, one exact verified standard attestation, and a separate advance to actual payment entry are covered by the closed-loop Croatia replay without a mid-checkout question.
+- Exact transaction-bound legal approval, one verified attestation action, and a separate advance to actual payment entry are covered by the closed-loop Croatia replay.
 - No payment credential entry, Pay, transaction commit, or purchase.
 
 ## What is not yet proven

@@ -211,10 +211,7 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       inCurrentSurface: evidence.inCurrentSurface === true,
       hitTested: evidence.hitTested === true,
       notOccluded: evidence.notOccluded === true,
-      targetable: evidence.targetable === true,
       operationAuthorized: evidence.operationAuthorized === true,
-      operationProven: evidence.operationProven === true,
-      operationProof: clampText(evidence.operationProof, 120),
       executable: evidence.executable === true,
       revealable: evidence.revealable === true,
       code: clampText(evidence.code, 80),
@@ -565,9 +562,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       evidenceSources: Array.isArray(compiled.evidenceSources)
         ? compiled.evidenceSources.map((source) => clampText(source, 80)).slice(0, 16)
         : [],
-      paymentMethodControlIds: Array.isArray(compiled.paymentMethodControlIds)
-        ? compiled.paymentMethodControlIds.map((id) => clampText(id, 140)).slice(0, 12)
-        : [],
       legalAcceptanceControlIds: Array.isArray(compiled.legalAcceptanceControlIds)
         ? compiled.legalAcceptanceControlIds.map((id) => clampText(id, 140)).slice(0, 8)
         : [],
@@ -663,6 +657,9 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         paymentApproved: Boolean(body.approvalState?.paymentApproved),
         paymentAuthorization: body.approvalState?.paymentAuthorization && typeof body.approvalState.paymentAuthorization === "object"
           ? body.approvalState.paymentAuthorization
+          : null,
+        legalAuthorization: body.approvalState?.legalAuthorization && typeof body.approvalState.legalAuthorization === "object"
+          ? body.approvalState.legalAuthorization
           : null,
         priceAuthorization: body.approvalState?.priceAuthorization && typeof body.approvalState.priceAuthorization === "object"
           ? body.approvalState.priceAuthorization

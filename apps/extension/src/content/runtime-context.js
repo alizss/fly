@@ -79,6 +79,8 @@ function initialAgentRuntimeState(defaultApi = "") {
     pendingUserMessage: "",
     pendingUserResponse: null,
     pendingInputRequest: null,
+    pendingApprovalRequest: null,
+    legalAuthorization: null,
     sessionProfileOverrides: {},
     currentAction: "",
     currentReason: "",
@@ -102,7 +104,6 @@ function initialAgentRuntimeState(defaultApi = "") {
     lastBackendDebug: null,
     processDiagnostics: null,
     sessionStartFailure: null,
-    resumeContinuity: null,
     pageMap: null,
     lastPageMutationAt: Date.now(),
     lastExternalMaterialMutationAt: 0,
@@ -144,7 +145,7 @@ const RUNTIME_SCOPES = Object.freeze({
   },
   session: {
     write: [
-      "activeExecutionActionId", "activeExecutionObservationId", "awaiting", "lastActionResult", "pageMap",
+      "activeExecutionActionId", "activeExecutionObservationId", "awaiting", "legalAuthorization", "lastActionResult", "pageMap",
       "running", "sessionId", "sessionStartFailure", "userGoal"
     ]
   },
@@ -153,7 +154,7 @@ const RUNTIME_SCOPES = Object.freeze({
     write: [
       "actionHistory", "activeLoopRunId", "activeObservationId", "activePlannerRequest", "activeTurnId",
       "destinationWait", "honoredReobserveRetryTokens", "lastActionResult", "lastBackendDebug",
-      "lastSentFeedbackKey", "lastSentMaterialHash", "lifecycleId", "loopRerunQueued", "processDiagnostics",
+      "lastSentFeedbackKey", "lastSentMaterialHash", "legalAuthorization", "lifecycleId", "loopRerunQueued", "processDiagnostics",
       "screenshotCache", "sessionId"
     ]
   },
@@ -161,21 +162,21 @@ const RUNTIME_SCOPES = Object.freeze({
     write: [
       "actionHistory", "activeExecutionActionId", "activeExecutionDecisionAction", "activeExecutionObservationId",
       "activeObservationId", "awaiting", "lastBackendDebug", "lastClickAt", "lastClickSignature", "messages",
-      "pageMap", "pendingInputRequest", "repeatClickCount", "running", "sessionProfileOverrides"
+      "pageMap", "pendingInputRequest", "pendingApprovalRequest", "legalAuthorization", "repeatClickCount", "running", "sessionProfileOverrides"
     ]
   },
   checkout: {
     write: [
       "actionHistory", "activeLoopRunId", "autopilotMode", "awaiting", "destinationWait", "lastClickAt",
-      "lastActionResult", "lastClickSignature", "lifecycleId", "loopBusy", "loopRerunQueued", "messages", "observerTab", "pageMap",
-      "pageUnderstanding", "pendingInputRequest", "pendingUserMessage", "pendingUserResponse", "processDiagnostics",
+      "lastClickSignature", "lifecycleId", "loopBusy", "loopRerunQueued", "messages", "observerTab", "pageMap",
+      "pageUnderstanding", "pendingInputRequest", "pendingApprovalRequest", "legalAuthorization", "pendingUserMessage", "pendingUserResponse", "processDiagnostics",
       "reasoningLog", "repeatClickCount", "running", "sessionId", "sessionProfileOverrides", "sessionStartFailure",
-      "skipPaidExtrasApproved", "resumeContinuity"
+      "skipPaidExtrasApproved"
     ]
   },
   sidebar: {
     read: [
-      "awaiting", "currentAction", "currentReason", "messages", "observerTab", "pageMap", "pageUnderstanding",
+      "awaiting", "currentAction", "currentReason", "legalAuthorization", "pendingApprovalRequest", "messages", "observerTab", "pageMap", "pageUnderstanding",
       "processDiagnostics", "reasoningLog", "running", "skipRoutineRunning", "userGoal"
     ]
   }

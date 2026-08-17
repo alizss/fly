@@ -1,4 +1,5 @@
 const { evaluateTransition } = require("./transition-evaluator");
+const { decideStage } = require("./task-state-reducer");
 const {
   actionFromLease,
   actuatorSignature,
@@ -130,7 +131,7 @@ function navigationOrigin(observation = {}) {
   const page = observation.page || {};
   return Object.freeze({
     observationId: observation.observationId || "",
-    stage: page.stageExit?.authority === "checkout_scene" ? (page.step || "unknown") : "unknown",
+    stage: decideStage(observation).stage,
     step: page.step || page.pageStep || "unknown",
     url: page.url || observation.url || "",
     surfaceId: (page.currentSurface || page.activeSurface || {}).id || "",
@@ -443,84 +444,17 @@ function advanceActionLifecycle({
   }
 
   const previousLifecycle = executionEpisodeFor(state);
-  const resultActionId = String(result.actionId || action.id || "");
-  const staleDuringOwnedNavigation = Boolean(
-    previousLifecycle.navigationEpisodeId
-    && previousLifecycle.actionId
-    && previousLifecycle.closed !== true
-    && resultActionId
-    && resultActionId !== previousLifecycle.actionId
-  );
-  if (staleDuringOwnedNavigation) {
-    // A second controller may finish reporting the action that opened this
-    // document after the current controller has already armed its next
-    // redirect. That old result is historical evidence only. It must never
-    // replace the action/session identity owned by the open navigation
-    // episode or make the new destination unclaimable.
-    return {
-      state,
-      observation: {
-        ...observation,
-        lastActionResult: {
-          ...result,
-          ignoredByExecutionEpisode: true,
-          causality: {
-            classification: "stale_controller_result",
-            code: "STALE_ACTION_DURING_NAVIGATION",
-            actionId: resultActionId,
-            owningActionId: previousLifecycle.actionId,
-            navigationEpisodeId: previousLifecycle.navigationEpisodeId
-          }
-        }
-      },
-      lifecycle: previousLifecycle,
-      transition: null,
-      directive: "reobserve_destination",
-      exhausted: false
-    };
-  }
   const samePreviouslyObservedAction = Boolean(
     previousLifecycle.actionId
-    && previousLifecycle.actionId === resultActionId
+    && previousLifecycle.actionId === (result.actionId || action.id)
   );
   const dispatched = wasDispatched(result);
   const isNavigation = previousLifecycle.navigation === true || navigationAction(action);
-  // A navigation-producing action may settle inside the same document (SPA
-  // route or DOM-only stage transition). That current document may positively
-  // prove the leased postcondition, but it may never negatively close a
-  // cross-document episode merely because the provider opened elsewhere.
-  const sameDocumentTransition = isNavigation
-    && dispatched
-    && previousObservation?.observationId
-    && observation.observationId
-      ? evaluateTransition({
-          beforeObservation: previousObservation,
-          governedAction: action,
-          browserResult: { ...result, failureCode: canonicalFailureCode(result) },
-          afterObservation: observation,
-          navigationContext: {
-            destinationReady: observationReadiness?.classification === "READY",
-            readiness: observationReadiness,
-            origin: previousLifecycle.origin || navigationOrigin(previousObservation)
-          }
-        })
-      : null;
-  const durableDestinationPending = isNavigation
-    && dispatched
-    && Boolean(previousLifecycle.navigationEpisodeId)
-    && !previousLifecycle.destinationDocument
-    && sameDocumentTransition?.status !== "achieved"
-    && previousLifecycle.closed !== true;
   const destinationPending = isNavigation
     && dispatched
     && previousLifecycle.closed !== true
-    && (
-      durableDestinationPending
-      || (
-        ["TRANSIENT", "UNRESOLVED", "DEGRADED"].includes(String(observationReadiness?.classification || ""))
-        && observationReadiness?.handoffEligible !== true
-      )
-    );
+    && ["TRANSIENT", "UNRESOLVED", "DEGRADED"].includes(String(observationReadiness?.classification || ""))
+    && observationReadiness?.handoffEligible !== true;
   if (destinationPending) {
     const lifecycle = {
       ...baseLifecycle(state, observation, action, result),
@@ -533,7 +467,6 @@ function advanceActionLifecycle({
       awaitingClarification: false,
       awaitingDestination: true,
       navigation: true,
-      navigationStatus: durableDestinationPending ? "DISPATCHED" : (previousLifecycle.navigationStatus || "DISPATCHED"),
       origin: previousLifecycle.origin
         || navigationOrigin(previousObservation || { page: result.beforePage || {}, observationId: action.observationId || "" }),
       destinationReadiness: observationReadiness,
@@ -644,7 +577,7 @@ function advanceActionLifecycle({
     };
     directive = "reobserve_rebind";
   } else {
-    transition = sameDocumentTransition || evaluateTransition({
+    transition = evaluateTransition({
       beforeObservation: previousObservation,
       governedAction: action,
       browserResult: { ...result, failureCode: code },
@@ -662,9 +595,9 @@ function advanceActionLifecycle({
     const observed = true;
     if (transition.status === "achieved") {
       recovery = updateExecutionRecovery(state, { kind: "verified", code });
-      lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, awaitingDestination: false, navigationStatus: isNavigation ? "VERIFIED" : lifecycle.navigationStatus, destinationReadiness: observationReadiness, transitionStatus: "achieved", resultCode: code };
+      lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, awaitingDestination: false, destinationReadiness: observationReadiness, transitionStatus: "achieved", resultCode: code };
       directive = "advance_goal";
-    } else if (["progressed", "observed_change"].includes(transition.status)) {
+    } else if (transition.status === "progressed") {
       recovery = updateExecutionRecovery(state, { kind: "meaningful_progress", code });
       lifecycle = {
         ...lifecycle,
@@ -683,9 +616,8 @@ function advanceActionLifecycle({
         closed: true,
         awaitingClarification: false,
         awaitingDestination: false,
-        navigationStatus: isNavigation ? "VERIFIED" : lifecycle.navigationStatus,
         destinationReadiness: observationReadiness,
-        transitionStatus: transition.status,
+        transitionStatus: "progressed",
         resultCode: code
       };
       directive = "rebuild_candidates";
@@ -733,13 +665,13 @@ function advanceActionLifecycle({
         strategySignature: signature,
         semanticOwnerId
       });
-      lifecycle = { ...lifecycle, status: "failed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, navigationStatus: isNavigation ? "FAILED" : lifecycle.navigationStatus, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
+      lifecycle = { ...lifecycle, status: "failed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
       // A finite no-effect budget suppresses repeated strategies, but it does
       // not justify a handoff while another safe grounded capability exists.
       directive = "try_distinct_capability";
       }
     } else if (transition.status === "unsafe") {
-      lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, navigationStatus: isNavigation ? "FAILED" : lifecycle.navigationStatus, transitionStatus: "unsafe", resultCode: code };
+      lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "unsafe", resultCode: code };
       directive = "stop_for_safety";
     } else {
       recovery = updateExecutionRecovery(state, { kind: "uncertain", code });

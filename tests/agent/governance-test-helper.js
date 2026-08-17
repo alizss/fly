@@ -2,7 +2,7 @@ const { governAction } = require("../../apps/web/agent/action-governor");
 const { prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
 const { currentSurfaceId } = require("../../apps/web/agent/surface-contract");
 const { visualRegionsMatch } = require("../../packages/shared/agent-actions");
-const { legacyCurrentObligationFromGoal: currentObligationFromGoal } = require("./legacy-scene-item-adapter");
+const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
 
 function replayCandidateSet(state = {}, observation = {}, action = null) {
   let candidates = state.taskState?.currentGoal?.candidates || state.currentGoal?.candidates || [];

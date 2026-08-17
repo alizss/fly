@@ -4,15 +4,12 @@ function createAgentRoutes({
   agentLoopFailurePayload,
   agentSessionStore,
   agentTraceStore,
-  armNavigationEpisode,
-  claimNavigationEpisode,
   clampText,
   createAgentSession,
   dataDir,
   decideAgentNextActionViaLoop,
   logAgent,
   readBody,
-  readyNavigationEpisode,
   reportAgentResult,
   sendJson,
   storeScreenshotUpload,
@@ -116,42 +113,6 @@ function createAgentRoutes({
         return true;
       }
       sendJson(res, 201, summarizeAgentSession(session));
-      return true;
-    }
-    if (req.method === "POST" && pathname === "/api/agent/navigation/arm") {
-      const episode = armNavigationEpisode(await readBody(req));
-      if (!episode) {
-        sendJson(res, 409, {
-          error: "The current durable action cannot arm a navigation episode.",
-          code: "NAVIGATION_EPISODE_NOT_ARMED"
-        });
-        return true;
-      }
-      sendJson(res, 201, episode);
-      return true;
-    }
-    if (req.method === "POST" && pathname === "/api/agent/navigation/claim") {
-      const episode = claimNavigationEpisode(await readBody(req));
-      if (!episode) {
-        sendJson(res, 409, {
-          error: "The pending navigation episode is unavailable or expired.",
-          code: "NAVIGATION_EPISODE_NOT_CLAIMABLE"
-        });
-        return true;
-      }
-      sendJson(res, 200, episode);
-      return true;
-    }
-    if (req.method === "POST" && pathname === "/api/agent/navigation/ready") {
-      const episode = readyNavigationEpisode(await readBody(req));
-      if (!episode) {
-        sendJson(res, 409, {
-          error: "The destination no longer owns the pending navigation episode.",
-          code: "NAVIGATION_EPISODE_NOT_CURRENT"
-        });
-        return true;
-      }
-      sendJson(res, 200, episode);
       return true;
     }
     if (req.method === "POST" && pathname === "/api/agent/report") {

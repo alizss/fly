@@ -2,14 +2,13 @@ const { isCandidateGrounded } = require("../../../packages/shared/agent-actions"
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 const INTERACTION_ROLES = new Set(["choice", "command", "opener", "navigation", "field"]);
-const SEMANTIC_EFFECTS = new Set(["select", "set_state", "waive", "open", "advance", "set_value", "legal_acceptance", "advance_to_payment", "transaction_commit"]);
-const EXPECTED_EVIDENCE = new Set(["selected", "state_matches", "dismissed", "options_appeared", "progress_changed", "value_changed", "target_visible"]);
+const SEMANTIC_EFFECTS = new Set(["select", "waive", "open", "advance", "set_value", "legal_acceptance", "advance_to_payment", "transaction_commit"]);
+const EXPECTED_EVIDENCE = new Set(["selected", "dismissed", "options_appeared", "progress_changed", "value_changed", "target_visible"]);
 const PHYSICAL_EFFECTS = new Set([
   "open_surface",
   "dismiss_surface",
   "select_free_option",
   "select_paid_option",
-  "set_control_state",
   "set_field_value",
   "filter_options",
   "advance_surface",
@@ -66,14 +65,6 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
   const surface = observation.page?.currentSurface || observation.page?.activeSurface || {};
   const foreground = (surface.type || obligationField(goal, "surfaceType")) && (surface.type || obligationField(goal, "surfaceType")) !== "page";
 
-  if (obligationField(goal, "kind") === "control_state"
-    || obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.SET_CONTROL_STATE) {
-    return normalizedOutcomeContract({
-      taskOutcome: "current_surface_completed",
-      acceptablePhysicalEffects: ["set_control_state"],
-      completionEvidence: ["control_state_equals"]
-    });
-  }
   if (obligationField(goal, "kind") === "profile_field" || /profile_field|traveler field|contact field/.test(semantic)) {
     return normalizedOutcomeContract({
       taskOutcome: "profile_field_completed",
@@ -353,7 +344,6 @@ function paidChoiceLike(control = {}) {
 function fromExpectedOutcome(expectedOutcome = {}) {
   const type = normalized(expectedOutcome.type);
   if (type === "target_in_view") return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "target_visible" };
-  if (type === "control_state_equals") return { interactionRole: "choice", semanticEffect: "set_state", expectedEvidence: "state_matches" };
   if (/options_surface_appeared|active_surface_change|semantic_progress/.test(type)) return { interactionRole: "opener", semanticEffect: "open", expectedEvidence: "options_appeared" };
   if (/exact_free_option_selected|control_selected|section_choice_verified/.test(type)) return { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" };
   if (/normalized_value_changed|logical_component_committed|field_value_changed|date_value_committed/.test(type)) return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
@@ -364,8 +354,6 @@ function fromExpectedOutcome(expectedOutcome = {}) {
 
 function deriveActionSemantics({ control = {}, operation = "", type = "", goal = {}, expectedOutcome = null } = {}) {
   const op = normalized(operation);
-  const explicit = fromExpectedOutcome(expectedOutcome || {});
-  if (explicit?.semanticEffect === "set_state") return explicit;
   if (type === "scroll") return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "target_visible" };
   if (op === "open") return { interactionRole: "opener", semanticEffect: "open", expectedEvidence: "options_appeared" };
   if (["type", "select"].includes(op) || ["type", "select"].includes(type)) {
@@ -383,6 +371,7 @@ function deriveActionSemantics({ control = {}, operation = "", type = "", goal =
       ? typed
       : { interactionRole: "opener", semanticEffect: "open", expectedEvidence: "options_appeared" };
   }
+  const explicit = fromExpectedOutcome(expectedOutcome || {});
   if (explicit) return explicit;
   if (navigationLike(control, goal)) {
     return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "progress_changed" };
@@ -438,19 +427,6 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
   if (existing.type === "policy_conflict_resolved"
     || (existing.type === "options_surface_appeared" && existing.intendedOutcome === "open_correction_surface")) {
     return { ...base, ...existing, type: existing.type };
-  }
-  if (existing.type === "control_unselected") {
-    return { ...base, ...existing, type: "control_unselected" };
-  }
-  if (existing.type === "control_state_equals") {
-    return {
-      ...base,
-      ...existing,
-      type: "control_state_equals",
-      interactionRole: "choice",
-      semanticEffect: "set_state",
-      expectedEvidence: "state_matches"
-    };
   }
   if (["select_free_option", "select_paid_option"].includes(physicalEffect)) {
     const disposition = normalized(`${action.semantic || ""} ${action.policyOutcome || ""} ${action.risk || ""} ${control.semantic || ""} ${control.risk || ""}`);
@@ -564,7 +540,6 @@ function predictPhysicalEffect({ semantics = {}, control = {}, candidate = {}, g
   });
   if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT) return "advance_to_payment";
   if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE) return "accept_legal_terms";
-  if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.SET_CONTROL_STATE) return "set_control_state";
   if (/submit_purchase|confirm_purchase|finalize_booking|book now|pay now|complete purchase/.test(meaning)) return "submit_purchase";
   if (/card_number|cardholder|security_code|cvc|cvv|expiry|payment credential/.test(meaning)) return "enter_payment_credentials";
   if (/accept_legal|accept terms|agree.*terms|legal consent/.test(meaning)) return "accept_legal_terms";

@@ -5,7 +5,7 @@ const { createCheckoutSessionState } = require("../../packages/shared/agent-stat
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const { factsFromObservation, mergeCommerceSelections, normalizeFacts } = require("../../apps/web/agent/transaction-facts");
 const { explicitItineraryConflict, invariantDecision, prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
-const { legacyCurrentObligationFromGoal: currentObligationFromGoal } = require("./legacy-scene-item-adapter");
+const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
 
 function facts({
   completeness = "complete",

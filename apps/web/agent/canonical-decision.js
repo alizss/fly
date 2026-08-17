@@ -274,27 +274,6 @@ function optionCount(option = {}) {
 }
 
 function exactUserIntent(subject = {}, group = {}, transitions = [], userPolicy = {}, traveler = {}) {
-  if (group.progressionRole === "payment_method") {
-    const ordinaryCard = transitions.filter((transition) => (
-      transition.executable
-      && /(?:credit|debit|payment)\s*(?:\/|or|and|&)?\s*card|card payment/.test(lower(`${transition.label || ""} ${transition.semantic || ""}`))
-      && !/saved|store|remember/.test(lower(`${transition.label || ""} ${transition.semantic || ""}`))
-    ));
-    if (ordinaryCard.length === 1) {
-      return {
-        match: "exact",
-        source: "checkout_milestone",
-        desiredOutcome: "selected",
-        desiredCanonicalValue: ordinaryCard[0].canonicalValue || ordinaryCard[0].controlId,
-        desiredControlIds: [ordinaryCard[0].controlId],
-        eligibleOptionIds: [ordinaryCard[0].controlId],
-        preferredOptionId: ordinaryCard[0].controlId,
-        authorization: null,
-        reason: "Selecting the ordinary card method is a reversible payment-setup step required to reveal payment entry.",
-        evidence: ["target_boundary:payment_entry", "effect:advance_to_payment"]
-      };
-    }
-  }
   const alternativesById = new Map((group.alternatives || []).map((option) => [option.controlId, option]));
   const resolution = resolveProfileDecision({
     decisionGroupId: groupId(group),
@@ -478,37 +457,29 @@ function deferredChoiceCommitment({
 
 function canonicalDecisionForGroup({
   group = {},
-  semanticEntity = null,
   page = {},
   previousCompletion = null,
   userPolicy = {},
   traveler = {},
   decisionEpisode = null
 } = {}) {
-  const rawGroup = semanticEntity?.observed || group;
-  const id = groupId(semanticEntity || rawGroup);
-  const controls = semanticEntity
-    ? (semanticEntity.physicalControlIds || []).map((controlId) => (
-        (page.controls || []).find((control) => control.controlId === controlId)
-      )).filter(Boolean)
-    : controlsForGroup(rawGroup, page);
-  const alternativesById = new Map((rawGroup.alternatives || []).map((option) => [option.controlId, option]));
-  const transitions = semanticEntity?.availableTransitions?.length
-    ? [...semanticEntity.availableTransitions]
-    : controls.map((control) => transitionFor(control, alternativesById.get(control.controlId) || {}));
-  for (const alternative of rawGroup.alternatives || []) {
+  const id = groupId(group);
+  const controls = controlsForGroup(group, page);
+  const alternativesById = new Map((group.alternatives || []).map((option) => [option.controlId, option]));
+  const transitions = controls.map((control) => transitionFor(control, alternativesById.get(control.controlId) || {}));
+  for (const alternative of group.alternatives || []) {
     if (!alternative.controlId || transitions.some((item) => item.controlId === alternative.controlId)) continue;
     transitions.push(transitionFor({}, alternative));
   }
-  const subject = semanticEntity?.subject || exactSubject(rawGroup, controls);
-  const controlType = semanticEntity?.controlType || controlTypeFor(rawGroup, controls);
-  const selected = selectedControl(rawGroup, controls);
-  const selectedId = clean(semanticEntity?.selectedControlId || selected?.controlId || rawGroup.selectedControlId);
+  const subject = exactSubject(group, controls);
+  const controlType = controlTypeFor(group, controls);
+  const selected = selectedControl(group, controls);
+  const selectedId = clean(selected?.controlId || group.selectedControlId);
   const selectedTransition = transitions.find((item) => item.controlId === selectedId) || null;
   const transactionSelection = (page.transactionFacts?.selectedExtras || []).find((item) => (
     clean(item?.decisionGroupId) === id
   )) || null;
-  const selectedEvidence = rawGroup.selectedEvidence || null;
+  const selectedEvidence = group.selectedEvidence || null;
   const selectedEffectRole = clean(selectedEvidence?.effectRole || selectedTransition?.effectRole || "unknown");
   const selectedIsEconomic = !["scope_toggle", "information_only", "navigation", "presentation_mode"].includes(selectedEffectRole);
   const paidTruth = agentContract.classifySelectedCommerceTruth({
@@ -516,8 +487,8 @@ function canonicalDecisionForGroup({
     selectedControlId: selectedId,
     selected: Boolean(selected || selectedEvidence?.selected === true || transactionSelection),
     selectionOwnerId: selectedEvidence?.ownerElementId
-      || rawGroup.semanticOwnership?.ownerElementId
-      || rawGroup.semanticOwnership?.controlId,
+      || group.semanticOwnership?.ownerElementId
+      || group.semanticOwnership?.controlId,
     transactionOwned: Boolean(transactionSelection && clean(transactionSelection.decisionGroupId) === id),
     effectRole: selectedEffectRole,
     disposition: transactionSelection?.disposition || selectedEvidence?.disposition,
@@ -527,7 +498,7 @@ function canonicalDecisionForGroup({
     semanticEffect: selectedTransition?.physicalEffect || selectedTransition?.semantic || selectedEvidence?.semantic
   });
   const evidencePaid = Boolean(selectedIsEconomic && paidTruth.selectedPaid);
-  let intent = exactUserIntent(subject, rawGroup, transitions, userPolicy, traveler);
+  let intent = exactUserIntent(subject, group, transitions, userPolicy, traveler);
   const discoveryControlIds = new Set(controls.filter((control) => (
     executable(control)
     && (
@@ -557,7 +528,7 @@ function canonicalDecisionForGroup({
     };
   }
   const optionPending = deferredChoiceCommitment({
-    group: rawGroup,
+    group,
     page,
     subject,
     selected,
@@ -581,10 +552,10 @@ function canonicalDecisionForGroup({
         : selected
           ? "committed"
           : "unresolved";
-  const required = semanticEntity ? semanticEntity.required === true : rawGroup.required === true;
+  const required = group.required === true;
   const validation = (page.validationIssues || []).find((issue) => (
     issue.stageWide === true
-    || [id, rawGroup.requirementId, rawGroup.sectionId, selectedId].filter(Boolean).includes(
+    || [id, group.requirementId, group.sectionId, selectedId].filter(Boolean).includes(
       clean(issue.decisionGroupId || issue.requirementId || issue.sectionId || issue.controlId)
     )
   )) || null;
@@ -609,7 +580,7 @@ function canonicalDecisionForGroup({
     intent.match === "constraint"
     || intent.match === "ambiguous"
     || (!paidAuthorization && intent.match !== "exact")
-    || rawGroup.semanticOwnership?.policyCompatibility === "conflict"
+    || group.semanticOwnership?.policyCompatibility === "conflict"
   );
   const paidOnlyWithSafeForward = !selected
     && intent.match === "constraint"
@@ -628,7 +599,7 @@ function canonicalDecisionForGroup({
         control.stateElementId,
         control.preferredActivationElementId
       ].map(clean).some((id) => explicitStageExitIds.has(id));
-      return clean(control.surfaceId || "surface-page") === clean(rawGroup.surfaceId || "surface-page")
+      return clean(control.surfaceId || "surface-page") === clean(group.surfaceId || "surface-page")
         && isTypedNavigationControl(control, { explicitStageExit });
     });
   const exactProfileTransitionAvailable = intent.desiredControlIds.some((controlId) => (
@@ -640,11 +611,11 @@ function canonicalDecisionForGroup({
     && (
       required
       || (controlType === CONTROL_TYPES.EXCLUSIVE_CHOICE && exactProfileTransitionAvailable)
-      || clean(rawGroup.surfaceType || "page") !== "page"
+      || clean(group.surfaceType || "page") !== "page"
       || page.stageExit?.continueDisabled === true
       || (
-        clean(rawGroup.surfaceId || "surface-page") !== "surface-page"
-        && clean(page.currentSurface?.id) === clean(rawGroup.surfaceId)
+        clean(group.surfaceId || "surface-page") !== "surface-page"
+        && clean(page.currentSurface?.id) === clean(group.surfaceId)
       )
     );
 
@@ -754,8 +725,8 @@ function canonicalDecisionForGroup({
     status = "active";
     needsAction = true;
     actionReason = "exact_user_intent_requires_transition";
-  } else if (COMPLETED.has(lower(rawGroup.status))) {
-    status = lower(rawGroup.status) === "satisfied" ? "satisfied" : "waived";
+  } else if (COMPLETED.has(lower(group.status))) {
+    status = lower(group.status) === "satisfied" ? "satisfied" : "waived";
     completionReason = "fresh_browser_status";
     actionReason = "fresh_observed_completion";
   } else if (intent.match === "constraint" && !selected && intent.desiredControlIds.length === 0) {
@@ -767,7 +738,7 @@ function canonicalDecisionForGroup({
   return Object.freeze({
     decisionId: id,
     decisionGroupId: id,
-    requirementId: clean(rawGroup.requirementId || id),
+    requirementId: clean(group.requirementId || id),
     subject: Object.freeze(subject),
     family: subject.family,
     controlType,
@@ -775,7 +746,7 @@ function canonicalDecisionForGroup({
     stateControlIds: Object.freeze(controls.map((control) => control.stateElementId || control.controlId).filter(Boolean)),
     currentState: Object.freeze({
       selectedControlId: selectedId,
-      selectedLabel: clean(selectedTransition?.label || rawGroup.selectedLabel),
+      selectedLabel: clean(selectedTransition?.label || group.selectedLabel),
       canonicalValue: selectedTransition?.canonicalValue ?? null,
       selected: Boolean(selected),
       effectRole: selectedEffectRole,
@@ -809,27 +780,18 @@ function canonicalDecisionForGroup({
     status,
     completionReason,
     reopenEvidence,
-    surfaceId: clean(rawGroup.surfaceId || semanticEntity?.surfaceId || "surface-page"),
-    surfaceType: clean(rawGroup.surfaceType || semanticEntity?.surfaceType || "page"),
+    surfaceId: clean(group.surfaceId || "surface-page"),
+    surfaceType: clean(group.surfaceType || "page"),
     selectedControlId: selectedId,
-    selectedLabel: clean(selectedTransition?.label || rawGroup.selectedLabel),
-    observed: rawGroup
+    selectedLabel: clean(selectedTransition?.label || group.selectedLabel),
+    observed: group
   });
 }
 
-function reconcileCompiledDecision({ semanticEntity = null, ...context } = {}) {
-  if (!semanticEntity?.subject || !semanticEntity?.controlType || !Array.isArray(semanticEntity?.availableTransitions)) {
-    throw new Error("TASK_STATE_COMPILED_DECISION_REQUIRED");
-  }
-  // CheckoutScene has already discovered the subject, control family and
-  // available transitions. This pass may reconcile only current observed
-  // state, user policy and durable completion history.
-  return canonicalDecisionForGroup({
-    ...context,
-    group: semanticEntity.observed || {},
-    semanticEntity
-  });
-}
+// DecisionFrame owns discovery of the semantic entity. TaskState calls this
+// resolver only to reconcile that admitted entity with user policy and
+// durable completion history; it must not create entities from raw controls.
+const resolveCanonicalDecision = canonicalDecisionForGroup;
 
 function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
   if (!control.controlId || ownedControlIds.has(control.controlId)) return null;
@@ -932,7 +894,7 @@ module.exports = {
   CONTROL_TYPES,
   buildCanonicalDecisions,
   canonicalDecisionForGroup,
-  reconcileCompiledDecision,
+  resolveCanonicalDecision,
   exactSubject,
   exactUserIntent,
   explicitlyDormantRepresentation,

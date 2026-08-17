@@ -209,7 +209,7 @@ test("opening a warning modal is verified intermediate progress, never checkout 
     afterObservation: after
   });
 
-  assert.equal(transition.status, "observed_change");
+  assert.equal(transition.status, "progressed");
   assert.equal(transition.postcondition.satisfied, false);
   assert.deepEqual(transition.physicalResult.effect, "open_surface");
   assert.equal(transition.taskOutcomeCompleted, false);

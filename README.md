@@ -28,15 +28,15 @@ Fly must:
 4. Adapt to unfamiliar but reversible controls and layouts.
 5. Verify every material state change from fresh browser evidence.
 6. Reconcile itinerary, traveler, selections, currency, and total.
-7. Reconcile pre-payment review, automatically resolve standard mandatory carrier attestations covered by the checkout mandate, and verify actual payment entry before stopping safely.
+7. Reconcile pre-payment review, obtain exact legal approval when required, and verify actual payment entry before stopping safely.
 
-Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, or unusual grouping are not valid reasons to stop. Valid pauses/stops are missing user facts, authentication/challenges, exceptional attestations outside the checkout mandate, consequential ambiguity, transaction contradiction, website failure, exhausted safe mechanics, verified payment entry, or a forbidden payment/purchase boundary.
+Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, or unusual grouping are not valid reasons to stop. Valid pauses/stops are missing user facts, authentication/challenges, exact legal or consequential approval, transaction contradiction, website failure, exhausted safe mechanics, verified payment entry, or a forbidden payment/purchase boundary.
 
 ## Runtime model
 
 ```text
 fresh ObservationFrame
-→ one immutable CheckoutScene
+→ one DecisionFrame
 → TaskState publishes one CurrentObligation
 → bind exact current mechanics
 → consequence governor
@@ -47,13 +47,11 @@ fresh ObservationFrame
 
 The model is optional and bounded. Deterministic singleton mechanics use zero model calls. When ambiguity remains, the model may select only supplied reversible candidates; it cannot invent work, targets, traveler facts, permissions, or transaction truth.
 
-Starting an eligible transaction creates an immutable `CheckoutMandate/v1` from the selected booking, approved total/currency, and selected traveler IDs. It covers ordinary mandatory carrier/fare/purchase/dangerous-goods attestations, while explicitly forbidding marketing consent, optional data sharing, insurance, subscriptions, financing, payment credentials, transaction commit, and purchase. Exceptional attestations outside that mandate are a typed handoff—not a normal checkout prompt.
-
 ## Current evidence
 
 - 379/379 agent unit tests
-- 178/178 uninterrupted browser replays
-- Complete checkout-mandate → exact attestation → separate advance → payment-entry replay proof, with no mid-checkout prompt
+- 175/175 uninterrupted browser replays
+- Complete approval → legal attestation → advance → payment-entry replay proof
 - Prior technical review passes on EasyJet, GoToGate, Kiwi, and Turkish Airlines; fresh expanded-milestone canaries remain required
 - No payment credentials, Pay, transaction commit, or purchase capability
 - Next product gate: live-prove actual payment entry, then expand to a representative structural portfolio

@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const {
   semanticSceneUncertainty,
   semanticScenePayload,
-  applyScenePatch,
+  applySemanticSceneHypotheses,
   reconcileSemanticScene
 } = require("../../apps/web/agent/semantic-scene-reconciliation");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
@@ -161,8 +161,7 @@ test("scene hypotheses may refine supplied evidence but cannot invent owners or 
     observation: source,
     traveler: { first_name: "Ali" }
   });
-  const compilation = agentContract.compileSemanticCheckout(source.page);
-  const reconciled = applyScenePatch(compilation, {
+  const reconciled = applySemanticSceneHypotheses(source, {
     status: "grounded",
     stage: "traveler_information",
     stageConfidence: "high",
@@ -190,14 +189,13 @@ test("scene hypotheses may refine supplied evidence but cannot invent owners or 
       confidence: "high",
       evidence: "Invented"
     }]
-  }, uncertainty, source);
+  }, uncertainty);
 
-  assert.equal(reconciled.controls[0].fieldType, "first_name");
-  assert.equal(reconciled.controls[0].fieldClassification.source, "grounded_semantic_scene");
-  assert.equal(reconciled.validationIssues[0].controlId, "ctrl_unknown");
-  assert.equal(reconciled.semanticSceneReconciliation.hypotheses.length, 1);
-  assert.equal(reconciled.semanticSceneReconciliation.authority, "hypothesis_only");
-  assert.equal(source.page.controls[0].fieldType, "");
+  assert.equal(reconciled.page.controls[0].fieldType, "first_name");
+  assert.equal(reconciled.page.controls[0].fieldClassification.source, "grounded_semantic_scene");
+  assert.equal(reconciled.page.validationIssues[0].controlId, "ctrl_unknown");
+  assert.equal(reconciled.page.semanticSceneReconciliation.hypotheses.length, 1);
+  assert.equal(reconciled.page.semanticSceneReconciliation.authority, "hypothesis_only");
 });
 
 test("an ambiguous scene uses one closed-ID hypothesis call and returns no action authority", async () => {
@@ -252,9 +250,7 @@ test("an ambiguous scene uses one closed-ID hypothesis call and returns no actio
     )), true);
     assert.equal(Object.hasOwn(payload, "allowedSemanticBindings"), false);
     assert.equal(Object.hasOwn(payload, "allowedValidationOwners"), false);
-    assert.equal(result.scenePatch.contractVersion, "scene-patch/v1");
-    assert.equal(result.scenePatch.hypotheses[0].controlId, "ctrl_unknown");
-    assert.equal(Object.hasOwn(result, "observation"), false);
+    assert.equal(result.observation.page.controls[0].fieldType, "first_name");
     assert.equal(Object.hasOwn(result.reconciliation, "action"), false);
     assert.equal(Object.hasOwn(result.reconciliation, "permission"), false);
     assert.equal(Object.hasOwn(result.reconciliation, "completed"), false);
@@ -323,7 +319,7 @@ test("a contradictory Croatia PAY scene is reconciled without inventing a promot
   assert.equal(uncertainty.stageContradiction.contradictory, true);
   assert.deepEqual(new Set(uncertainty.components.map((item) => item.controlId)), new Set(["decline_time", "accept_time", "confirm"]));
 
-  const reconciled = applyScenePatch(compilation, {
+  const reconciled = applySemanticSceneHypotheses(source, {
     status: "grounded",
     stage: "unknown",
     stageConfidence: "low",
@@ -335,21 +331,29 @@ test("a contradictory Croatia PAY scene is reconciled without inventing a promot
     }, {
       controlId: "confirm", role: "navigation", semanticType: "checkout_navigation", factSource: "", validationIssueId: "", relatedControlIds: [], requiredness: "progression_required", consequence: "navigation", confidence: "high", evidence: "Confirm advances from pre-payment review after the terms attestation."
     }]
-  }, uncertainty, source);
+  }, uncertainty);
 
-  assert.equal(reconciled.semanticSceneReconciliation.stageApplied, false);
-  assert.equal(reconciled.controls.find((item) => item.controlId === "promo").required, false);
-  assert.equal(reconciled.controls.find((item) => item.controlId === "promo").fieldClassification.source, "deterministic_optional_credential");
-  assert.equal(reconciled.controls.find((item) => item.controlId === "terms").semanticSceneItem.role, "legal_attestation");
-  assert.equal(reconciled.controls.find((item) => item.controlId === "terms").semanticSceneItem.deterministic, true);
-  assert.equal(Object.hasOwn(reconciled, "stageExit"), false);
-  const compiled = reconciled;
-  const standalone = buildCanonicalDecisions({ page: { ...source.page, controls: compiled.controls, decisionGroups: [] } });
+  assert.equal(reconciled.page.step, "review");
+  assert.equal(reconciled.page.controls.find((item) => item.controlId === "promo").required, false);
+  assert.equal(reconciled.page.controls.find((item) => item.controlId === "promo").fieldClassification.source, "deterministic_optional_credential");
+  assert.equal(reconciled.page.controls.find((item) => item.controlId === "terms").semanticSceneItem.role, "legal_attestation");
+  assert.equal(reconciled.page.controls.find((item) => item.controlId === "terms").semanticSceneItem.deterministic, true);
+  assert.equal(reconciled.page.stageExit.continueObserved, true);
+  assert.equal(reconciled.page.stageExit.continueAllowed, false);
+  assert.equal(reconciled.page.stageExit.navigationState, "blocked_by_legal_attestation");
+  const compiled = agentContract.compileSemanticCheckout(reconciled.page);
+  const standalone = buildCanonicalDecisions({ page: { ...reconciled.page, controls: compiled.controls, decisionGroups: [] } });
   assert.equal(standalone.some((decision) => decision.physicalControlIds?.includes("promo")), false);
-  assert.equal(compiled.controls.find((item) => item.controlId === "decline_time").semanticSceneItem.role, "optional_paid_decline");
-  assert.equal(compiled.controls.find((item) => item.controlId === "accept_time").semanticSceneItem.role, "optional_paid_accept");
-  assert.equal(compiled.controls.find((item) => item.controlId === "confirm").semanticSceneItem.role, "navigation");
-  assert.equal(compiled.decisionGroups.some((group) => group.subject === "optional_product"), false);
+  const timeDecision = compiled.decisionGroups.find((group) => group.subject === "optional_product");
+  assert.ok(timeDecision);
+  assert.equal(timeDecision.required, true);
+  assert.equal(timeDecision.status, "satisfied");
+  assert.equal(timeDecision.selectedControlId, "decline_time");
+  assert.match(timeDecision.decisionGroupId, /^dg_scene_/);
+  assert.equal(compiled.decisionGroups.filter((group) => (
+    (group.alternatives || []).some((item) => item.controlId === "decline_time")
+  )).length, 1);
+  assert.equal(timeDecision.alternatives.find((item) => item.controlId === "decline_time").semantic, "decline_paid_extra");
 });
 
 test("a proven Croatia review scene uses zero semantic model calls", () => {
@@ -424,8 +428,7 @@ test("an optional-looking age attestation may be grounded as progression-require
   });
   const ageFact = uncertainty.facts.find((fact) => fact.semanticType === "age_at_departure");
   assert.ok(ageFact);
-  const compilation = agentContract.compileSemanticCheckout(source.page);
-  const reconciled = applyScenePatch(compilation, {
+  const reconciled = applySemanticSceneHypotheses(source, {
     status: "grounded",
     stage: "traveler_information",
     stageConfidence: "high",
@@ -442,10 +445,9 @@ test("an optional-looking age attestation may be grounded as progression-require
       confidence: "high",
       evidence: "The Yes/No control asks whether this traveler is over 18."
     }]
-  }, uncertainty, source);
-  const grounded = reconciled.controls[0];
+  }, uncertainty);
+  const grounded = reconciled.page.controls[0];
   assert.equal(grounded.fieldType, "age_at_departure");
-  assert.equal(grounded.required, false);
+  assert.equal(grounded.required, true);
   assert.equal(grounded.semanticSceneItem.role, "personal_attestation");
-  assert.equal(grounded.semanticSceneItem.requiredness, "progression_required");
 });

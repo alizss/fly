@@ -8,9 +8,9 @@ Latest implementation checkpoints before this documentation update: `21b5d57` an
 
 ## 1. Mission and current boundary
 
-Fly takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies saved facts and policy, verifies every material result, reconciles the final transaction, resolves standard mandatory attestations through the initial checkout mandate, and stops only when actual payment entry is verified.
+Fly takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies saved facts and policy, verifies every material result, reconciles the final transaction, handles an exact approved legal gate when required, and stops only when actual payment entry is verified.
 
-The current runtime may accept only an exact transaction/text/control-bound standard attestation covered by CheckoutMandate, then separately advance to payment. Exceptional attestations hand off. It must not enter payment credentials, click Pay, commit the transaction, or purchase. The long-term product adds a background runtime, web/iOS control surfaces, and a separately authorized payment boundary without replacing the checkout engine.
+The current runtime may accept only an exact transaction/text/control-bound legal attestation after explicit approval, then separately advance to payment. It must not enter payment credentials, click Pay, commit the transaction, or purchase. The long-term product adds a background runtime, web/iOS control surfaces, and a separately authorized payment boundary without replacing the checkout engine.
 
 The current engineering priority is cross-airline structural generalization—not another architecture rewrite and not airline-specific selectors.
 
@@ -18,13 +18,13 @@ The current engineering priority is cross-airline structural generalization—no
 
 | Area | Status |
 |---|---|
-| Agent unit suite | 388/388 passing |
-| Browser replay suite | 178/178 passing in one uninterrupted run |
+| Agent unit suite | 379/379 passing |
+| Browser replay suite | 175/175 passing in one uninterrupted run |
 | Build/type/syntax gate | `npm run check` passing |
 | Live sites | EasyJet, GoToGate, Kiwi, and Turkish reached the prior verified-review milestone; fresh actual-payment-entry canaries are required |
-| Safety | Standard mandatory carrier attestations are narrowly authorized by the immutable checkout mandate and audited by exact receipts; exceptional attestations hand off; payment credentials, Pay, transaction commit, and purchase remain prohibited |
+| Safety | Narrow exact legal approval is now implemented in replay; payment credentials, Pay, transaction commit, and purchase remain prohibited |
 | Formal autonomous acceptance | Canary reports remain `review_required` until the operator records `--manual none` or `--manual yes` |
-| Architecture | Raw evidence → one immutable CheckoutScene → TaskState authority → direct obligation mechanics → one governed action lease → exact scene transition verification |
+| Architecture | Single semantic compiler, TaskState authority, direct obligation mechanics, one governed action lease, bounded recovery, compact durable state |
 | Main product gap | Representative structural portfolio: 8–10 sites, 6+ families, 4 direct-airline families, 3 OTAs |
 | Main performance gap | Large browser observations and rescans; unnecessary ambiguity/model turns on some sites |
 
@@ -44,37 +44,29 @@ Run `npm run canary:report -- --latest-by-site` for current evidence. A technica
 ```text
 selected booking + traveler policy
 → fresh immutable ObservationFrame
-→ one immutable CheckoutScene semantic compilation
+→ one DecisionFrame semantic compilation
 → one TaskState reduction and disposition
 → one CurrentObligation
 → mechanics-only binding
 → consequence governor
 → one ActionLease
-→ for navigation: arm the same durable ExecutionEpisode and route its destination document
-→ browser mechanical result or destination claim/ready observation
+→ browser mechanical result
 → semantic transition verification
 → compact TaskState/transaction commit
-→ repeat, exceptional handoff, stop, or terminal payment entry
+→ repeat, exact legal handoff, stop, or terminal payment entry
 ```
 
 Responsibility boundaries:
 
 - Observation reports mechanics, state, ownership evidence, transaction evidence, and fresh identity.
-- CheckoutScene compiles page meaning once, owns typed stage and the sole stage exit, and records stable scene items with provenance and contradictions.
-- CheckoutScene first produces a deterministic draft, evaluates semantic closure, accepts at most one neutral closed-ID patch when closure is incomplete, and publishes one final immutable scene. A stable active nonterminal stage without an owned exit cannot silently become an unchanged-page wait.
-- Booking/page totals are transaction evidence only; selected-choice commerce truth requires exact option-local price/delta or another typed owned selection fact.
-- TaskState receives precompiled decision entities and may reconcile them with policy/history, but it has no callable raw-label decision-discovery path.
-- CheckoutMandate is created once from the selected booking, approved total/currency, and real traveler IDs. It authorizes only standard mandatory checkout attestations and carries an explicit forbidden-effect set.
-- Legal copy, validation messages, and links attach to one canonical stateful checkbox owner. TaskState selects that exact scene item first; only verified selection permits the separate advance-to-payment obligation, and success writes an AttestationReceipt.
+- DecisionFrame compiles page meaning once.
 - TaskState is the only publisher of semantic work and terminal disposition.
 - Mechanics binding answers only which current actuator can perform the admitted obligation.
 - The governor checks consequences immediately before dispatch.
 - Browser verification proves the mechanic; backend transition verification proves the obligation.
-- Navigation is one action-scoped asynchronous lifecycle inside `ExecutionEpisode/v2`: `ARMED → DISPATCHED → DESTINATION_CLAIMED → DESTINATION_READY → VERIFIED/FAILED`. The service worker routes browser documents but never interprets checkout meaning.
-- A claimed destination resumes the exact durable transaction and original ActionLease. The source page cannot declare a destination outcome absent, and Start cannot create a replacement transaction while a pending episode is claimable.
 - Transaction review independently proves the selected booking still matches the final review.
 - Terminal observation distinguishes `PRE_PAYMENT_REVIEW`, `LEGAL_GATE`, `PAYMENT_ENTRY`, and `PURCHASE_COMMIT`; only reconciled `PAYMENT_ENTRY` completes the current milestone.
-- Standard legal authority comes only from the immutable checkout mandate. Checking the exact canonical attestation owner and advancing to payment are separate TaskState obligations with separate fresh verification; exceptional attestations hand off.
+- Legal approval is a narrow expiring token. Checking the attestation and advancing to payment are separate TaskState obligations with separate fresh verification.
 
 Do not add a second readiness meaning layer, planner, verifier, requirement lifecycle, recovery store, or completion receipt.
 
@@ -86,7 +78,6 @@ Composition root:
 
 - `apps/extension/src/content/runtime.js` — dependency wiring, startup, shared browser integration, and test hooks.
 - `apps/extension/src/content/runtime-context.js` — sole runtime state owner with scoped capabilities.
-- `apps/extension/src/background/service-worker.js` — action-scoped browser-context routing for top-level commits, SPA history changes, tabs/windows, redirects, and destination injection; no semantic authority.
 
 Observation:
 
@@ -110,12 +101,11 @@ Controller and UI:
 
 ### Backend agent
 
-- `apps/web/agent/authority-frames.js` — ObservationFrame and CheckoutScene composition boundary.
-- `apps/web/agent/checkout-scene.js` — immutable scene, stable semantic items, closure, typed stage, and authoritative stage exit.
-- `apps/web/agent/canonical-decision.js` — policy-neutral decision evidence consumed inside scene compilation.
+- `apps/web/agent/authority-frames.js` — persisted/network authority frames.
+- `apps/web/agent/canonical-decision.js` — semantic DecisionFrame compilation.
 - `apps/web/agent/task-state/reducer.js` — sole TaskState reducer.
 - `apps/web/agent/current-obligation.js` — canonical current work contract.
-- `apps/web/agent/mechanics-binder.js` — direct `CurrentObligation + CheckoutScene → mechanics` path.
+- `apps/web/agent/mechanics-binder.js` — direct `CurrentObligation + DecisionFrame → mechanics` path.
 - `apps/web/agent/ambiguity-resolver.js` — closed-ID optional model boundary; zero calls for deterministic singleton mechanics.
 - `apps/web/agent/action-governor.js` — final consequence authorization.
 - `apps/web/agent/loop/orchestrator.js` — sole backend turn orchestrator.
@@ -244,4 +234,4 @@ The latest four retained traces technically reached the earlier payment-review m
 
 ## 11. One-paragraph handoff
 
-Fly currently has one authoritative checkout loop, compact durable transaction state, strict selected-booking admission, exact action leases, bounded adaptive mechanics, transaction reconciliation, mandate-authorized standard attestations, exact attestation receipts, and hard payment/purchase boundaries. The automated Croatia controller replay proves checkbox-first → exact verification → separate Confirm → hosted payment entry with no prompt and no credential/Pay/purchase action. The retained EasyJet, GoToGate, Kiwi, and Turkish traces safely proved the prior review milestone; they now require fresh actual-payment-entry canaries. The next bottleneck is external validity: prove the expanded milestone across retained canaries and additional direct-airline/OTA structural families, converting every ordinary unfamiliar-site failure into a trace-derived universal replay. Latency optimization follows measured browser observation and ambiguity hot paths; it should not trigger another authority rewrite.
+Fly currently has one authoritative checkout loop, compact durable transaction state, strict selected-booking admission, exact action leases, bounded adaptive mechanics, transaction reconciliation, exact transaction-bound legal approval, and hard payment/purchase boundaries. The complete automated baseline is green. The retained EasyJet, GoToGate, Kiwi, and Turkish traces safely proved the prior review milestone; they now require fresh actual-payment-entry canaries. The next bottleneck is external validity: prove the expanded milestone across retained canaries and additional direct-airline/OTA structural families, converting every ordinary unfamiliar-site failure into a trace-derived universal replay. Latency optimization follows measured browser observation and ambiguity hot paths; it should not trigger another authority rewrite.

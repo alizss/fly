@@ -1,8 +1,7 @@
 // Historical replay adapter for fixtures that still construct goal-shaped
 // inputs. Production binding accepts only CurrentObligation.
-const { compileCheckoutScene, currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
 const { rawObservationCandidates: bindRawObservationCandidates } = require("../../apps/web/agent/observation-candidates");
-const { legacySceneWithGoalItem } = require("./legacy-scene-item-adapter");
 const {
   actionForCurrentCandidate: bindActionForCurrentCandidate,
   bindMechanics
@@ -10,30 +9,7 @@ const {
 
 function obligationForLegacyGoal(goal = {}, observation = {}) {
   if (goal?.contractVersion === "current-obligation/v2") return goal;
-  const explicitControls = [
-    ...(goal.candidateControlIds || []),
-    ...(goal.actionableControlIds || []),
-    goal.controlId,
-    ...(goal.eligibleAlternativeControlIds || [])
-  ].filter(Boolean);
-  const navigationLike = goal.semanticType === "navigation" || goal.kind === "navigation";
-  const decisionAlternativeIds = new Set((observation.page?.decisionGroups || []).flatMap((group) => [
-    ...(group.alternativeControlIds || []),
-    ...(group.alternatives || []).map((option) => option.controlId),
-    ...(group.controls || []).map((option) => option.controlId)
-  ]).filter(Boolean));
-  const inferredControls = navigationLike
-    ? (observation.page?.controls || []).filter((control) => {
-        if (decisionAlternativeIds.has(control.controlId)) return false;
-        const text = String(`${control.label || ""} ${control.semantic || ""} ${control.physicalEffect || ""}`).toLowerCase();
-        return /\b(?:next|continue|proceed|confirm|advance)\b|advance_checkout_stage/.test(text)
-          && !/\bback\b/.test(text);
-      }).map((control) => control.controlId)
-    : (observation.page?.controls || []).map((control) => control.controlId).filter(Boolean);
-  const seedControlIds = [...new Set(explicitControls.length ? explicitControls : inferredControls)];
-  const seedGoal = { ...goal, candidateControlIds: seedControlIds };
-  const checkoutScene = legacySceneWithGoalItem(compileCheckoutScene({ observation }), seedGoal);
-  const seed = currentObligationFromGoal({ goal: seedGoal, checkoutScene });
+  const seed = currentObligationFromGoal({ goal });
   const discoveredControlIds = [...new Set(bindRawObservationCandidates(observation, seed)
     .map((candidate) => candidate.controlId)
     .filter(Boolean))];
@@ -42,21 +18,12 @@ function obligationForLegacyGoal(goal = {}, observation = {}) {
       ...goal,
       candidateControlIds: goal.candidateControlIds?.length
         ? goal.candidateControlIds
-        : discoveredControlIds.length
-          ? discoveredControlIds
-          : seedControlIds
-    },
-    checkoutScene
+        : discoveredControlIds
+    }
   });
 }
 
 function rawObservationCandidates(observation = {}, goal = {}) {
-  if ((goal.semanticType === "navigation" || goal.kind === "navigation")
-    && (observation.page?.decisionGroups || []).some((group) => (
-      group.required === true
-      && !["satisfied", "waived", "waived_by_policy", "optional"].includes(group.status)
-      && !group.selectedControlId
-    ))) return [];
   return bindRawObservationCandidates(observation, obligationForLegacyGoal(goal, observation));
 }
 
@@ -107,6 +74,5 @@ module.exports = {
   bindMechanics,
   buildCurrentCandidateSet,
   groundedObservationCandidateSet,
-  obligationForLegacyGoal,
   rawObservationCandidates
 };

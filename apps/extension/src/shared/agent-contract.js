@@ -52,7 +52,6 @@
   });
   const SEMANTIC_EFFECT = Object.freeze({
     SET_FIELD_VALUE: "set_field_value",
-    SET_CONTROL_STATE: "set_control_state",
     SELECT_FREE_OPTION: "select_free_option",
     SELECT_PAID_OPTION: "select_paid_option",
     DECLINE_PAID_EXTRA: "decline_paid_extra",
@@ -68,8 +67,6 @@
     UNKNOWN: "unknown"
   });
   const SEMANTIC_EFFECT_ALIASES = Object.freeze({
-    desired_control_state: SEMANTIC_EFFECT.SET_CONTROL_STATE,
-    toggle_control_state: SEMANTIC_EFFECT.SET_CONTROL_STATE,
     selected_free_option: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
     select_free_alternative: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
     decline_paid_extra: SEMANTIC_EFFECT.SELECT_FREE_OPTION,
@@ -497,14 +494,7 @@
       || structural.hostedPaymentWidgetPresent === true
       || Number(structural.paymentCredentialCount || 0) >= 2
       || credentialKinds.size >= 2;
-    const paymentMethodControlIds = Array.isArray(structural.paymentMethodControlIds)
-      ? structural.paymentMethodControlIds.filter(Boolean)
-      : [];
-    const ownedMethod = structural.ownedPaymentMethodPresent === true
-      && paymentMethodControlIds.length > 0;
-    const providerHandoff = structural.providerHandoffPresent === true;
-    const method = ownedMethod
-      || structural.paymentMethodPresent === true
+    const method = structural.paymentMethodPresent === true
       || /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/.test(visible);
     const commit = structural.payControlPresent === true
       || structural.transactionCommitControlPresent === true
@@ -522,14 +512,12 @@
     // payment/currency prompt is already the irreversible boundary we promise
     // to stop at. URL or generic payment prose alone can never create it.
     const entry = structural.progressivePaymentEntryPresent === true;
-    const signals = Object.freeze({ route, progress, form, method, ownedMethod, providerHandoff, commit, legal, review, heading, entry });
+    const signals = Object.freeze({ route, progress, form, method, commit, legal, review, heading, entry });
     const signalStates = Object.freeze({
       route: terminalSignalState(route, Boolean(url)),
       progress: terminalSignalState(progress),
       form: terminalSignalState(form, structural.paymentOwnerProbeState === "observed_absent"),
       method: terminalSignalState(method),
-      ownedMethod: terminalSignalState(ownedMethod, paymentMethodControlIds.length === 0),
-      providerHandoff: terminalSignalState(providerHandoff),
       commit: terminalSignalState(commit),
       legal: terminalSignalState(legal),
       review: terminalSignalState(review),
@@ -539,14 +527,7 @@
     const signalCount = Object.values(signals).filter(Boolean).length;
     const stageAnchor = route || progress || heading;
     const paymentEntryObserved = Boolean(
-      // An exact payment-method actuator on the durable provider destination is
-      // already the current product boundary. It proves that the transaction
-      // has entered payment even when the provider asks for billing facts only
-      // after the method is chosen. URL or payment prose cannot create this
-      // signal; browser perception must own the exact control and the durable
-      // navigation episode must own the cross-origin handoff.
-      (ownedMethod && providerHandoff)
-      || (form && (stageAnchor || method || commit))
+      (form && (stageAnchor || method || commit))
       || (stageAnchor && method && commit)
       || (route && progress && (method || commit || review))
       || ((route || progress) && entry)
@@ -591,7 +572,6 @@
       paymentCredentialKinds: Object.freeze([...credentialKinds]),
       signalStates,
       evidenceSources: Object.freeze([...(structural.terminalEvidenceSources || [])]),
-      paymentMethodControlIds: Object.freeze([...paymentMethodControlIds]),
       legalAcceptanceControlIds: Object.freeze([...(structural.legalAcceptanceControlIds || [])]),
       legalAcceptanceText: normalizedText(structural.legalAcceptanceText || "").slice(0, 1600),
       advanceToPaymentControlIds: Object.freeze([...(structural.advanceToPaymentControlIds || [])]),
@@ -1521,12 +1501,6 @@
 
   function normalizedActionability(raw = {}, operation = "") {
     const evidence = raw && typeof raw === "object" ? raw : {};
-    // `executable` is itself the observer's aggregate proof that the exact
-    // target is targetable and the operation is authorized and proven. Older
-    // compact observations omitted those constituent booleans; reconstructing
-    // them from executable=true preserves that proof instead of turning a
-    // proven control into an artificial server-side denial.
-    const executable = evidence.executable === true;
     return {
       ...cloneSerializable(evidence),
       rendered: evidence.rendered === true,
@@ -1536,11 +1510,11 @@
       inCurrentSurface: evidence.inCurrentSurface === true,
       hitTested: evidence.hitTested === true,
       notOccluded: evidence.notOccluded === true,
-      targetable: executable || evidence.targetable === true,
-      operationAuthorized: executable || evidence.operationAuthorized === true,
-      operationProven: executable || evidence.operationProven === true,
+      targetable: evidence.targetable === true,
+      operationAuthorized: evidence.operationAuthorized === true,
+      operationProven: evidence.operationProven === true,
       operationProof: text(evidence.operationProof, 240),
-      executable,
+      executable: evidence.executable === true,
       revealable: evidence.revealable === true,
       code: text(evidence.code, 120),
       operation: text(evidence.operation || operation, 60)

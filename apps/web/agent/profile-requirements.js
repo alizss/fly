@@ -280,6 +280,7 @@ function fieldDescriptors(observation = {}, traveler = {}) {
   const logicalFields = resolveLogicalFields(page, traveler);
   const ordinals = new Map();
   const descriptors = logicalFields.flatMap((logicalField) => {
+    if (!logicalField.desiredCanonicalValue) return [];
     const ordinal = ordinals.get(logicalField.semanticType) || 0;
     ordinals.set(logicalField.semanticType, ordinal + 1);
     const choiceComponents = logicalField.components.filter((component) => component.componentRole === "option");
@@ -326,14 +327,6 @@ function fieldDescriptors(observation = {}, traveler = {}) {
         observedCapabilities: control.capabilities || [],
         capabilityContracts: component.capabilityContracts || [],
         requirementContract: logicalField.requirementContract || component.requirementContract || null,
-        required: Boolean(
-          field.required
-          || control.required
-          || control.state?.required
-          || control.controlState?.required
-          || logicalField.requirementContract?.required
-          || component.requirementContract?.required
-        ),
         bindingContract: component.bindingContract || null,
         expectedOutcome: component.expectedOutcome || null,
         validationOwnership: component.validationOwnership || null,

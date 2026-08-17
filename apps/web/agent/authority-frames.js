@@ -1,31 +1,18 @@
-const crypto = require("node:crypto");
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { factsFromObservation } = require("./transaction-facts");
 const { fieldDescriptors } = require("./profile-requirements");
-const {
-  buildCanonicalDecisions,
-  canonicalDecisionForGroup
-} = require("./canonical-decision");
+const { buildCanonicalDecisions } = require("./canonical-decision");
 const {
   normalizeSemanticOwner,
   semanticOwnerId
 } = require("../../../packages/shared/semantic-owner");
-const {
-  CHECKOUT_SCENE_VERSION,
-  createCheckoutScene,
-  checkoutSceneOwnsObservation
-} = require("./checkout-scene");
-const { applyScenePatch } = require("./semantic-scene-reconciliation");
 
 const OBSERVATION_FRAME_VERSION = "observation-frame/v2";
+const DECISION_FRAME_VERSION = "decision-frame/v2";
 const CURRENT_OBLIGATION_VERSION = "current-obligation/v2";
 
 function clean(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim();
-}
-
-function stableDigest(value) {
-  return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function unique(values = []) {
@@ -46,105 +33,6 @@ function arrayReference(values = []) {
 
 function observationHash(observation = {}) {
   return clean(observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash);
-}
-
-function settleObservedExclusiveGroups(compilation = {}) {
-  const controlsById = new Map((compilation.controls || []).map((control) => [control.controlId, control]));
-  const groups = (compilation.decisionGroups || []).map((group) => {
-    const controlIds = unique([
-      ...(group.alternativeControlIds || []),
-      ...(group.alternatives || []).map((option) => option.controlId),
-      ...(group.decisionContract?.options || []).map((option) => option.controlId)
-    ]);
-    const selected = controlIds.filter((controlId) => (
-      agentContract.controlSelectionCommitted(controlsById.get(controlId) || {})
-    ));
-    if (selected.length !== 1) return group;
-    return Object.freeze({
-      ...group,
-      selectedControlId: selected[0],
-      status: "satisfied",
-      satisfied: true,
-      completionReason: "explicit_current_selected_state"
-    });
-  });
-  const resolvedIds = new Set(groups.filter((group) => (
-    ["satisfied", "waived", "waived_by_policy"].includes(group.status)
-  )).map((group) => clean(group.decisionGroupId || group.requirementId)).filter(Boolean));
-  return Object.freeze({
-    ...compilation,
-    decisionGroups: Object.freeze(groups),
-    currentExecutableObligations: Object.freeze((compilation.currentExecutableObligations || []).filter((id) => !resolvedIds.has(clean(id))))
-  });
-}
-
-function sceneStateDescriptor(group = {}) {
-  const label = clean(`${group.sectionLabel || ""} ${group.decisionContract?.subjectLabel || ""} ${group.requirementId || ""}`).toLowerCase();
-  const options = group.decisionContract?.options || group.alternatives || [];
-  const optionText = clean(options.map((option) => `${option.label || ""} ${option.semantic || ""}`).join(" ")).toLowerCase();
-  const hasEconomicEvidence = options.some((option) => (
-    Number(option.structuredPrice?.amount) > 0
-    || Number(option.priceDelta) > 0
-    || /paid|price|fare|baggage|seat|insurance|extra|bundle/.test(clean(`${option.semantic || ""} ${option.risk || ""}`).toLowerCase())
-  ));
-  if (hasEconomicEvidence) return null;
-  let semanticType = "";
-  if ((/natural person/.test(optionText) && /legal person/.test(optionText))
-    || /you are purchasing as|purchaser(?: type)?/.test(label)) {
-    semanticType = "purchaser_type";
-  } else if (/payment method/.test(label)
-    || /meansofpayment/.test(optionText)
-    || (/credit.*debit.*card/.test(optionText) && /saved card/.test(optionText))
-    || (/payment/.test(`${label} ${group.sectionType || ""}`) && /credit.*debit card|saved card/.test(optionText))) {
-    semanticType = "payment_method";
-  } else if (/survey/.test(`${label} ${optionText}`)) {
-    semanticType = "survey_consent";
-  } else if (/marketing|promotional|third.party offers|receive information/.test(`${label} ${optionText}`)) {
-    semanticType = "marketing_consent";
-  }
-  if (!semanticType) return null;
-  const selected = options.find((option) => option.controlId === group.selectedControlId || option.selected === true) || null;
-  const selectedText = clean(selected?.label || group.selectedLabel).toLowerCase();
-  const optionalConsent = ["survey_consent", "marketing_consent"].includes(semanticType);
-  const selectedValue = semanticType === "purchaser_type"
-    ? (/legal person/.test(selectedText) && !/natural person/.test(selectedText) ? "legal_person" : "natural_person")
-    : semanticType === "payment_method"
-      ? (/saved/.test(selectedText) ? "saved_card" : /credit|debit|card/.test(selectedText) ? "credit_debit_card" : selectedText)
-      : selected ? "selected" : "not_selected";
-  return Object.freeze({
-    semanticType,
-    selectedValue,
-    status: optionalConsent
-      ? (selected ? "unresolved" : "resolved")
-      : selected || ["satisfied", "waived", "waived_by_policy"].includes(group.status)
-        ? "resolved"
-        : "unresolved",
-    consequence: optionalConsent ? "optional_consent" : "non_commerce",
-    requiredness: optionalConsent && selected
-      ? "policy_required"
-      : semanticType === "payment_method" || group.required === true
-        ? "progression_required"
-        : "optional_meaningful"
-  });
-}
-
-function sceneStateOnlyGroup(group = {}) {
-  const descriptor = sceneStateDescriptor(group);
-  // A selected method is scene state. An unresolved method is executable
-  // progression work and must flow through the existing decision mechanics.
-  return Boolean(descriptor && !(descriptor.semanticType === "payment_method" && descriptor.status === "unresolved"));
-}
-
-function progressionDecisionGroup(group = {}) {
-  const descriptor = sceneStateDescriptor(group);
-  if (descriptor?.semanticType !== "payment_method" || descriptor.status !== "unresolved") return group;
-  return Object.freeze({
-    ...group,
-    required: true,
-    material: true,
-    status: "missing",
-    progressionRole: "payment_method"
-  });
 }
 
 function surfaceEvidence(page = {}) {
@@ -191,31 +79,24 @@ function createObservationFrame(observation = {}) {
   });
 }
 
-function compileCheckoutScene({
+function compileDecisionFrame({
   observation = {},
   observationFrame = null,
   semanticCompilation = null,
-  scenePatch = null,
   state = {},
   traveler = {}
 } = {}) {
   const sourceFrame = observationFrame || createObservationFrame(observation);
   if (sourceFrame.observationId !== clean(observation.observationId)
     || sourceFrame.observationHash !== observationHash(observation)) {
-    throw new Error("CHECKOUT_SCENE_OBSERVATION_MISMATCH");
+    throw new Error("DECISION_FRAME_OBSERVATION_MISMATCH");
   }
   const rawPage = observation.page || {};
-  const deterministicCompilation = semanticCompilation || agentContract.compileSemanticCheckout(rawPage);
-  const extractedCompilation = scenePatch
-    ? applyScenePatch(deterministicCompilation, scenePatch, scenePatch.uncertainty || {}, observation)
-    : deterministicCompilation;
-  const compilation = settleObservedExclusiveGroups(extractedCompilation);
+  const compilation = semanticCompilation || agentContract.compileSemanticCheckout(rawPage);
   const semanticPage = {
     ...rawPage,
     selectedBooking: rawPage.selectedBooking || state.transactionInvariants?.baseline || null,
     controls: compilation.controls,
-    fields: compilation.fields || rawPage.fields,
-    validationIssues: compilation.validationIssues || rawPage.validationIssues,
     decisionGroups: compilation.decisionGroups,
     decisionContracts: compilation.decisionContracts,
     semanticReadiness: compilation.semanticReadiness,
@@ -233,54 +114,46 @@ function compileCheckoutScene({
   });
   const page = Object.freeze({ ...semanticPage, transactionFacts });
   const compiledObservation = Object.freeze({ ...semanticObservation, page });
-  // Logical profile descriptors are compiled exactly once into CheckoutScene.
+  // Logical profile descriptors are compiled exactly once into DecisionFrame.
   // TaskState may reconcile them with durable verified outcomes, but must not
   // rediscover field meaning from the DOM a second time.
   const profileRequirements = fieldDescriptors(compiledObservation, traveler);
-  const groupedControlIds = new Set((compilation.decisionGroups || []).flatMap((group) => [
-    ...(group.alternativeControlIds || []),
-    ...(group.alternatives || []).map((option) => option.controlId),
-    ...(group.decisionContract?.options || []).map((option) => option.controlId)
-  ]).filter(Boolean));
   const standaloneDecisions = buildCanonicalDecisions({
     page: { ...page, decisionGroups: [] },
     userPolicy: {},
     traveler: {},
     decisionEpisode: null
-  }).filter((decision) => !(decision.physicalControlIds || []).some((controlId) => groupedControlIds.has(controlId)));
-  const commerceGroups = (compilation.decisionGroups || [])
-    .filter((group) => !sceneStateOnlyGroup(group))
-    .map(progressionDecisionGroup);
-  // CheckoutScene compiles the policy-neutral semantic entity once. TaskState
-  // may reconcile this typed entity with user policy and durable history, but
-  // it cannot rediscover its subject/family by scanning raw labels again.
-  const commerceItems = commerceGroups.map((group) => canonicalDecisionForGroup({
-    group,
-    page,
-    previousCompletion: null,
-    userPolicy: {},
-    traveler: {},
-    decisionEpisode: null
-  }));
-  const stateItems = (compilation.decisionGroups || []).filter(sceneStateOnlyGroup).map((group) => Object.freeze({
-    ...group,
-    sceneState: sceneStateDescriptor(group)
-  }));
-  return createCheckoutScene({
-    observation,
+  });
+  return Object.freeze({
+    contractVersion: DECISION_FRAME_VERSION,
+    frameId: `${sourceFrame.observationId || "observation"}:${sourceFrame.observationHash || "unhashed"}:decision-v2`,
+    observationId: sourceFrame.observationId,
+    observationHash: sourceFrame.observationHash,
     observationFrame: sourceFrame,
-    semanticState: compilation,
-    compiledObservation,
-    profileItems: profileRequirements,
-    decisionItems: standaloneDecisions,
-    stateItems,
-    commerceItems,
+    observation: compiledObservation,
+    semanticCompilation: compilation,
+    profileRequirements: freezeArray(profileRequirements),
+    standaloneDecisions: freezeArray(standaloneDecisions),
+    commerceEntities: freezeArray(compilation.decisionGroups || []),
+    navigationOpportunity: page.stageExit || null,
     transactionFacts,
     terminalEvidence: page.terminalEvidence || null,
     validationBlockers: arrayReference(page.validationIssues),
-    checkoutMandate: state.checkoutMandate || null,
-    patch: scenePatch
+    provenance: Object.freeze({
+      compiler: "agent-contract.compileSemanticCheckout",
+      compilerVersion: clean(compilation.contractVersion || agentContract.CONTRACT_VERSION),
+      sourceObservationId: sourceFrame.observationId,
+      sourceObservationHash: sourceFrame.observationHash
+    })
   });
+}
+
+function decisionFrameOwnsObservation(decisionFrame = null, observation = {}) {
+  return Boolean(
+    decisionFrame?.contractVersion === DECISION_FRAME_VERSION
+    && decisionFrame.observationId === clean(observation.observationId)
+    && decisionFrame.observationHash === observationHash(observation)
+  );
 }
 
 function admittedControlIds(goal = {}) {
@@ -332,53 +205,10 @@ function assertObligationConformance({ goal = {}, controls = [], successConditio
   }
 }
 
-function sceneItemForGoal(goal = {}, checkoutScene = null) {
-  const admitted = new Set(admittedControlIds(goal));
-  const semanticKeys = new Set(unique([
-    goal.sceneItemId,
-    goal.decisionGroupId,
-    goal.requirementId,
-    goal.logicalFieldId,
-    goal.descriptorKey,
-    goal.semanticType,
-    goal.subjectKey
-  ]));
-  const desiredRole = goal.semanticType === "navigation"
-    ? "navigation"
-    : goal.semanticType === "legal_attestation" || goal.kind === "legal_attestation"
-      ? "legal_attestation"
-    : goal.kind === "profile_field"
-      ? "profile_field"
-      : "checkout_decision";
-  return (checkoutScene?.items || [])
-    .map((item) => ({
-      item,
-      overlap: (item.controlIds || []).filter((controlId) => admitted.has(controlId)).length,
-      roleMatch: item.role === desiredRole ? 1 : 0,
-      semanticMatch: semanticKeys.has(clean(item.sceneItemId))
-        || semanticKeys.has(clean(item.subject))
-        || semanticKeys.has(clean(item.repeatedInstance))
-        ? 1
-        : 0
-    }))
-    .filter((entry) => entry.overlap > 0 || entry.semanticMatch > 0)
-    .sort((left, right) => (right.roleMatch - left.roleMatch)
-      || (right.semanticMatch - left.semanticMatch)
-      || (right.overlap - left.overlap))[0]?.item || null;
-}
-
-function currentObligationFromGoal({ goal = null, checkoutScene = null } = {}) {
+function currentObligationFromGoal({ goal = null, decisionFrame = null } = {}) {
   if (!goal) return null;
   const controls = admittedControlIds(goal);
-  const sceneItem = sceneItemForGoal(goal, checkoutScene);
-  const goalSuccessCondition = goal.successCondition || goal.postcondition || goal.outcomeContract || {};
-  assertObligationConformance({ goal, controls, successCondition: goalSuccessCondition });
-  if (!sceneItem?.sceneItemId) {
-    throw new Error("CURRENT_OBLIGATION_SCENE_ITEM_REQUIRED");
-  }
-  const successCondition = sceneItem?.expectedPostcondition
-    ? { ...sceneItem.expectedPostcondition, ...goalSuccessCondition }
-    : goalSuccessCondition;
+  const successCondition = goal.successCondition || goal.postcondition || goal.outcomeContract || {};
   assertObligationConformance({ goal, controls, successCondition });
   const binding = Object.freeze({
     component: Object.freeze({
@@ -444,7 +274,7 @@ function currentObligationFromGoal({ goal = null, checkoutScene = null } = {}) {
     adaptive: goal.adaptiveEnvelope ? Object.freeze({ ...goal.adaptiveEnvelope }) : null
   });
   const owner = normalizeSemanticOwner({
-    stage: goal.stage || goal.owner?.stage || checkoutScene?.observation?.page?.step,
+    stage: goal.stage || goal.owner?.stage || decisionFrame?.observation?.page?.step,
     family: goal.canonicalSubject?.family || goal.subject?.family || goal.family || goal.sectionType || goal.semanticType,
     subjectId: goal.subjectId || "global",
     passengerId: goal.canonicalSubject?.passengerId || goal.passengerId || goal.travelerId,
@@ -457,28 +287,20 @@ function currentObligationFromGoal({ goal = null, checkoutScene = null } = {}) {
       || goal.logicalFieldId
       || goal.goalId
   });
-  const ownerIdentity = semanticOwnerId(owner);
-  const desiredState = goal.desiredState || successCondition.desiredState || null;
-  const stableStateObligationId = goal.kind === "control_state"
-    ? `control-state:${ownerIdentity}:${stableDigest(desiredState || {}).slice(0, 16)}`
-    : "";
   const obligation = {
     contractVersion: CURRENT_OBLIGATION_VERSION,
-    obligationId: clean(stableStateObligationId || goal.goalId || goal.requirementId || goal.decisionGroupId),
-    sceneItemId: clean(sceneItem?.sceneItemId),
+    obligationId: clean(goal.goalId || goal.requirementId || goal.decisionGroupId),
     authority: "task_state",
-    observationId: clean(checkoutScene?.observationId || goal.observationId),
-    observationHash: clean(checkoutScene?.sourceSnapshotHash),
-    surfaceId: clean(goal.owner?.surfaceId || goal.surfaceId || checkoutScene?.observationFrame?.surface?.id || "surface-page"),
+    observationId: clean(decisionFrame?.observationId || goal.observationId),
+    observationHash: clean(decisionFrame?.observationHash),
+    surfaceId: clean(goal.owner?.surfaceId || goal.surfaceId || decisionFrame?.observationFrame?.surface?.id || "surface-page"),
     kind: clean(goal.kind || goal.semanticType || "unknown"),
     semanticOwner: owner,
-    semanticOwnerId: ownerIdentity,
+    semanticOwnerId: semanticOwnerId(owner),
     subject: obligationSubject(goal),
     objective: clean(goal.objective || goal.semanticGoal || "resolve the current checkout obligation"),
     desiredEffect: obligationDesiredEffect(goal),
     desiredValue: goal.desiredValue ?? goal.canonicalValue ?? "",
-    currentState: goal.currentState ? Object.freeze({ ...goal.currentState }) : null,
-    desiredState: desiredState ? Object.freeze({ ...desiredState }) : null,
     admittedControlIds: freezeArray(controls),
     policyDecision: Object.freeze({
       status: goal.admission?.status === "blocked" || goal.ambiguity ? "blocked" : "admitted",
@@ -502,11 +324,11 @@ function currentObligation(taskState = {}) {
 
 module.exports = {
   CURRENT_OBLIGATION_VERSION,
-  CHECKOUT_SCENE_VERSION,
+  DECISION_FRAME_VERSION,
   OBSERVATION_FRAME_VERSION,
-  compileCheckoutScene,
+  compileDecisionFrame,
   createObservationFrame,
   currentObligation,
   currentObligationFromGoal,
-  checkoutSceneOwnsObservation
+  decisionFrameOwnsObservation
 };

@@ -6,7 +6,7 @@ export function createCheckoutController({
   announceSectionQueue,
   beginAgentLoop,
   buildPageUnderstanding,
-  claimNavigationEpisode,
+  clearResumeMarker,
   describePageMap,
   executeAgentDecision,
   finishAgentLoop,
@@ -14,7 +14,6 @@ export function createCheckoutController({
   labelText,
   logAgentEvent,
   logFlow,
-  markNavigationDestinationReady,
   outlineCoreSections,
   pageStateStore,
   persistControlFlowDecision,
@@ -24,6 +23,7 @@ export function createCheckoutController({
   resetAgentLoopLifecycle,
   resetFieldProgress,
   runRiskChecks,
+  saveResumeMarker,
   scheduleDestinationObservation,
   setAgentActivity,
   setWarnings,
@@ -36,30 +36,13 @@ export function createCheckoutController({
   travelerRules,
   travelerValue
 }) {
-  let pendingNavigationReadyMarker = null;
-
-  function hasUsableNavigationDestination(map = {}) {
-    const boundary = String(map.terminalEvidence?.boundary || "").toUpperCase();
-    const surfaceClass = String(map.currentSurface?.surfaceClass || "").toLowerCase();
-    const stage = String(map.step || "").toLowerCase();
-    return ["PRE_PAYMENT_REVIEW", "LEGAL_GATE", "PAYMENT_ENTRY", "PURCHASE_COMMIT"].includes(boundary)
-      || ["site_failure", "authentication", "challenge"].includes(surfaceClass)
-      || (map.controls || []).length > 0
-      || (map.fields || []).length > 0
-      || (map.decisionGroups || []).length > 0
-      || (map.stageExit?.candidates || []).length > 0
-      || (stage && !["unknown", "loading"].includes(stage));
-  }
-
   async function observePageOnly() {
-    pendingNavigationReadyMarker = null;
     agent.running = false;
     agent.awaiting = "";
     agent.messages = [];
     agent.reasoningLog = [];
     agent.actionHistory = [];
     agent.processDiagnostics = null;
-    agent.resumeContinuity = null;
     agent.observerTab = agent.observerTab || "summary";
     setAgentActivity("Observing page (no actions will be taken)", travelerRules() || "Using saved traveler profile");
     agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "observe_only" }).map;
@@ -91,12 +74,6 @@ export function createCheckoutController({
       });
       return;
     }
-    const pendingNavigation = await claimNavigationEpisode();
-    if (pendingNavigation?.sessionId) {
-      await resumeCheckoutAfterNavigation(pendingNavigation);
-      return;
-    }
-    pendingNavigationReadyMarker = null;
     resetAgentLoopLifecycle("start_agent");
     agent.running = true;
     agent.sessionId = "";
@@ -111,11 +88,12 @@ export function createCheckoutController({
     agent.pendingUserMessage = "";
     agent.pendingUserResponse = null;
     agent.pendingInputRequest = null;
+    agent.pendingApprovalRequest = null;
+    agent.legalAuthorization = null;
     agent.sessionProfileOverrides = {};
     agent.skipPaidExtrasApproved = shouldAutoDeclinePaidExtras();
     agent.actionHistory = [];
     agent.processDiagnostics = null;
-    agent.resumeContinuity = null;
     resetFieldProgress();
     setAgentActivity("Starting checkout agent", travelerRules() || "Using saved traveler profile");
     agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "agent_start" }).map;
@@ -124,6 +102,7 @@ export function createCheckoutController({
       stopWatchingCheckoutChanges();
       agent.running = false;
       agent.awaiting = "manual";
+      await clearResumeMarker();
       addAgentMessage(
         "assistant",
         ["SELECTED_BOOKING_REQUIRED", "SELECTED_TRAVELER_REQUIRED"].includes(agent.sessionStartFailure?.code)
@@ -134,6 +113,7 @@ export function createCheckoutController({
       return;
     }
     startWatchingCheckoutChanges();
+    await saveResumeMarker();
     addAgentMessage("assistant", `${describePageMap(agent.pageMap)} I will work step by step and ask when money, payment, or uncertainty appears.`);
     renderSidebar("agent");
     await announceSectionQueue();
@@ -156,16 +136,10 @@ export function createCheckoutController({
     agent.pendingUserMessage = "";
     agent.pendingUserResponse = null;
     agent.pendingInputRequest = null;
+    agent.pendingApprovalRequest = null;
     agent.sessionProfileOverrides = {};
     agent.actionHistory = [];
     agent.processDiagnostics = null;
-    agent.resumeContinuity = Object.freeze({
-      previousBoundary: marker.previousBoundary || "UNKNOWN",
-      expectedTransition: marker.expectedTransition || null,
-      currentObjective: marker.currentObjective || "reach_actual_payment_entry",
-      sourceOrigin: marker.sourceOrigin || ""
-    });
-    pendingNavigationReadyMarker = marker;
     resetFieldProgress();
     setAgentActivity("Continuing checkout agent after page change", travelerRules() || "Using saved traveler profile");
     // A newly loaded checkout document is still hydrating when the content
@@ -187,17 +161,17 @@ export function createCheckoutController({
       stopWatchingCheckoutChanges();
       agent.running = false;
       agent.awaiting = "manual";
+      await clearResumeMarker();
       addAgentMessage("assistant", "The prior checkout session could not be resumed, so I stopped instead of starting a replacement transaction.");
       renderSidebar("agent");
       return;
     }
     startWatchingCheckoutChanges();
-    agent.lastActionResult = marker.pendingResult || null;
+    await saveResumeMarker();
     addAgentMessage("assistant", "Picking back up where I left off after the page changed.");
     renderSidebar("agent");
     await announceSectionQueue();
-    await processCheckoutAgent();
-    agent.resumeContinuity = null;
+    processCheckoutAgent();
   }
 
   async function processCheckoutAgent() {
@@ -245,19 +219,6 @@ export function createCheckoutController({
       }
       const stableMap = rememberPagePlan(observed.map);
       agent.pageMap = stableMap;
-      if (pendingNavigationReadyMarker && hasUsableNavigationDestination(stableMap)) {
-        const readyMarker = pendingNavigationReadyMarker;
-        const ready = await markNavigationDestinationReady(readyMarker, stableMap);
-        if (ready) {
-          pendingNavigationReadyMarker = null;
-          logFlow("checkout_handoff.destination_ready", {
-            episodeId: readyMarker.navigationEpisode?.episodeId || "",
-            boundary: stableMap.terminalEvidence?.boundary || "UNKNOWN",
-            step: stableMap.step || "unknown",
-            controls: stableMap.controls?.length || 0
-          });
-        }
-      }
       const observationBuildMs = observed.timings.observationBuildMs;
       const observationElapsedMs = Math.round(performance.now() - observationStartedAt);
       logFlow("latency.span", {
@@ -416,6 +377,27 @@ export function createCheckoutController({
       await processCheckoutAgent();
     }
 
+    if (choice === "approve_legal") {
+      const request = agent.pendingApprovalRequest;
+      if (!request?.authorizationId || request.contractVersion !== "legal-approval-request/v1") {
+        addAgentMessage("assistant", "That legal approval request is no longer current. I will rescan before asking again.");
+        agent.awaiting = "";
+        agent.running = true;
+        await processCheckoutAgent();
+        return;
+      }
+      agent.legalAuthorization = Object.freeze({
+        ...request,
+        contractVersion: "legal-authorization/v1",
+        approvedAt: Date.now()
+      });
+      agent.pendingApprovalRequest = null;
+      addAgentMessage("user", "Approve these exact terms and continue to payment entry.");
+      agent.running = true;
+      agent.awaiting = "";
+      renderSidebar("agent");
+      await processCheckoutAgent();
+    }
   }
 
   async function handleChatSubmit(event) {

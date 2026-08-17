@@ -1,6 +1,7 @@
 const { diffObservations } = require("./observation-diff");
 const { currentSurface } = require("./surface-contract");
 const { normalizedActionSemantics, outcomeContractForGoal } = require("./action-semantics");
+const { decideStage } = require("./task-state-reducer");
 const { resolveLogicalFields, verifyLogicalField } = require("./logical-field");
 const { decodeDateFromField } = require("./date-field-codec");
 const agentContract = require("../../extension/src/shared/agent-contract");
@@ -552,18 +553,13 @@ function observationProgressFingerprint(observation = {}) {
   );
 }
 
-function authoritativeSceneStage(observation = {}) {
-  const page = pageOf(observation);
-  return page.stageExit?.authority === "checkout_scene" ? (page.step || "unknown") : "unknown";
-}
-
 function destinationProgressFromOrigin(afterObservation = {}, navigationContext = null) {
   if (!navigationContext?.destinationReady || !navigationContext.origin) {
     return { ready: false, progressed: false };
   }
   const origin = navigationContext.origin;
   const afterPage = pageOf(afterObservation);
-  const afterStage = authoritativeSceneStage(afterObservation);
+  const afterStage = decideStage(afterObservation).stage;
   const afterUrl = afterPage.url || afterObservation.url || "";
   const afterSurfaceId = surfaceOf(afterPage).id || "";
   const afterProgress = observationProgressFingerprint(afterObservation);
@@ -807,34 +803,6 @@ function evaluatePostcondition(
       }
     };
   }
-  if (type === "control_state_equals") {
-    const desiredState = expected.desiredState || {};
-    const state = afterControl?.state || afterControl?.controlState || {};
-    const actualState = {
-      checked: Boolean(afterControl?.checked === true || afterControl?.selected === true || state.checked === true),
-      selected: Boolean(afterControl?.selected === true || state.selected === true),
-      pressed: Boolean(state.pressed === true),
-      expanded: Boolean(state.expanded === true)
-    };
-    const stateKeys = Object.keys(desiredState).filter((key) => typeof desiredState[key] === "boolean");
-    const satisfied = Boolean(
-      afterControl
-      && stateKeys.length
-      && stateKeys.every((key) => actualState[key] === desiredState[key])
-    );
-    return { type, satisfied, evidence: { controlId, desiredState, actualState } };
-  }
-  if (type === "control_unselected") {
-    const state = afterControl?.state || {};
-    const unselected = Boolean(afterControl) && !(
-      afterControl.selected === true
-      || afterControl.checked === true
-      || state.selected === true
-      || state.checked === true
-      || state.pressed === true
-    );
-    return { type, satisfied: unselected, evidence: { controlId, unselected } };
-  }
   if (["options_surface_appeared", "active_surface_change", "semantic_progress"].includes(type)) {
     const expanded = afterControl?.state?.expanded === true && beforeControl?.state?.expanded !== true;
     const optionAppeared = (diff.appeared || []).some((item) => /option|choice|radio|menuitem/.test(text(item.role)));
@@ -904,30 +872,15 @@ function evaluatePostcondition(
     };
   }
   if (type === "payment_entry_reached") {
-    const boundary = String(afterPage.checkoutSceneTerminalState?.boundary || "");
+    const boundary = String(afterPage.terminalEvidence?.boundary || "");
     const satisfied = ["PAYMENT_ENTRY", "PURCHASE_COMMIT"].includes(boundary);
-    return { type, satisfied, evidence: { boundary, terminalState: afterPage.checkoutSceneTerminalState || null } };
+    return { type, satisfied, evidence: { boundary, terminalEvidence: afterPage.terminalEvidence || null } };
   }
   if (type === "legal_attestation_accepted") {
     const control = controlById(afterPage, expected.controlId || action.controlId || "");
     const state = control?.state || {};
-    const sceneItemId = expected.sceneItemId || action.sceneItemId || "";
-    const nextItem = (afterPage.checkoutSceneItems || []).find((item) => item.sceneItemId === sceneItemId) || null;
-    const exactOwner = Boolean(nextItem && nextItem.controlIds?.includes(control?.controlId));
-    const selected = Boolean(control && (control.selected === true || state.checked === true || state.selected === true));
-    const satisfied = Boolean(sceneItemId && exactOwner && selected && nextItem.status === "resolved");
-    return {
-      type,
-      satisfied,
-      evidence: {
-        sceneItemId,
-        controlId: control?.controlId || "",
-        exactOwner,
-        selected,
-        nextSceneStatus: nextItem?.status || "missing",
-        authorizationId: expected.authorizationId || ""
-      }
-    };
+    const satisfied = Boolean(control && (control.selected === true || state.checked === true || state.selected === true));
+    return { type, satisfied, evidence: { controlId: control?.controlId || "", selected: satisfied, authorizationId: expected.authorizationId || "" } };
   }
   if (type === "checkout_stage_advanced") {
     const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
@@ -1031,19 +984,15 @@ function blockerFrom(afterObservation = {}, diff = {}) {
   return null;
 }
 
-function parentProgressFor(action = {}, afterObservation = {}, localEffect = {}, diff = {}, postcondition = {}) {
+function parentProgressFor(action = {}, afterObservation = {}, localEffect = {}, diff = {}) {
   const afterPage = pageOf(afterObservation);
   const task = action.affordance?.task || {};
   const contract = task.parentOutcomeContract || task.outcomeContract || {};
   const outcomeId = task.stageOutcomeId || contract.outcomeId || task.transactionOutcomeId || "";
   const taskOutcome = contract.taskOutcome || "";
-  const observedStage = authoritativeSceneStage(afterObservation);
-  const semanticBoundary = String(afterPage.checkoutSceneTerminalState?.boundary || "");
-  const exactPaymentPostconditionFailed = postcondition.type === "payment_entry_reached"
-    && postcondition.satisfied !== true;
+  const observedStage = decideStage(afterObservation).stage;
   const completed = taskOutcome === "payment_entry_reached"
-    ? ["PAYMENT_ENTRY", "PURCHASE_COMMIT"].includes(semanticBoundary)
-      && !exactPaymentPostconditionFailed
+    ? ["PAYMENT_ENTRY", "PURCHASE_COMMIT"].includes(afterPage.terminalEvidence?.boundary)
     : taskOutcome === "payment_review_reached"
     ? observedStage === "payment"
     : taskOutcome === "booking_confirmed"
@@ -1056,16 +1005,7 @@ function parentProgressFor(action = {}, afterObservation = {}, localEffect = {},
     taskOutcome,
     status: completed ? "completed" : (usefulLocalProgress || usefulObservedProgress ? "progress" : "no_progress"),
     completed,
-    evidence: Object.freeze({
-      observedStage,
-      semanticBoundary,
-      exactPaymentPostconditionSatisfied: postcondition.type === "payment_entry_reached"
-        ? postcondition.satisfied === true
-        : null,
-      stageChanged: diff.stageChanged,
-      urlChanged: diff.urlChanged,
-      progressChanged: diff.progressChanged
-    })
+    evidence: Object.freeze({ observedStage, stageChanged: diff.stageChanged, urlChanged: diff.urlChanged, progressChanged: diff.progressChanged })
   });
 }
 
@@ -1095,13 +1035,7 @@ function evaluateTransition({
     || outcomeContractForGoal(governedAction.goal || {}, beforeObservation || {});
   const localMechanicalResult = verifiedPhysicalResult(governedAction, postcondition, diff);
   const currentObligationResult = currentObligationResultFor(governedAction, postcondition, localMechanicalResult, diff);
-  const durableObjectiveProgress = parentProgressFor(
-    governedAction,
-    afterObservation,
-    localMechanicalResult,
-    diff,
-    postcondition
-  );
+  const durableObjectiveProgress = parentProgressFor(governedAction, afterObservation, localMechanicalResult, diff);
   const dispatched = browserResult.dispatched === true || browserResult.executed === true;
   const beforeMaterialHash = materialObservationHash(beforeObservation || {});
   const afterMaterialHash = materialObservationHash(afterObservation);
@@ -1157,10 +1091,7 @@ function evaluateTransition({
     status = "no_effect";
     nextDirective = "try_distinct_capability";
   } else if (meaningfulDiff(diff)) {
-    // A material mutation is useful scheduling evidence, but it is not
-    // semantic success for the current obligation. Only an exact satisfied
-    // postcondition may produce `progressed` or `achieved`.
-    status = "observed_change";
+    status = "progressed";
     nextDirective = "rebuild_from_fresh_observation";
   } else if (dispatched) {
     status = "no_effect";

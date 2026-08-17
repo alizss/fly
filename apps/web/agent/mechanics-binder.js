@@ -342,7 +342,6 @@ function bindCandidateEnvelope(candidate = {}, index, observation = {}, binding 
 // new checkout objective or consequence policy from labels/DOM shape.
 function localMechanicalEffect(goal = {}, candidate = {}, control = {}) {
   const operation = candidateOperation(candidate);
-  if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.SET_CONTROL_STATE) return "set_control_state";
   if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.LEGAL_ACCEPTANCE) return "accept_legal_terms";
   if (obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.ADVANCE_TO_PAYMENT) return "advance_to_payment";
   if (obligationField(goal, "kind") === "profile_field" && control.role === "editable_combobox"
@@ -469,14 +468,6 @@ function buildCurrentCandidateSet({
     ].includes(obligationEffect)
       ? goalComponentOutcome
       : null;
-    // Policy-required deselection is an exact obligation outcome too. A
-    // checkbox's generic `choose` capability describes only the actuator; it
-    // must not rewrite "this consent is now off" into "some choice is
-    // selected". Keeping the TaskState postcondition authoritative makes a
-    // preselected survey/marketing opt-in settle against its actual state.
-    const authoritativePolicyOutcome = ["control_unselected", "control_state_equals"].includes(goalComponentOutcome.type)
-      ? goalComponentOutcome
-      : null;
     const exactComponentExpectedOutcome = editableProfileQuery ? {
       ...(bound.expectedOutcome || {}),
       type: "semantic_progress",
@@ -511,7 +502,7 @@ function buildCurrentCandidateSet({
       surfaceId: binding.surfaceId || "",
       requireSurfaceDismissed: true,
       mustNotIncreasePrice: true
-    } : (authoritativeBoundaryOutcome || authoritativePolicyOutcome || bound.expectedOutcome || boundedInteractionOutcome);
+    } : (authoritativeBoundaryOutcome || bound.expectedOutcome || boundedInteractionOutcome);
     const compiledExpectedOutcome = compileTypedExpectedOutcome({
       ...bound,
       expectedOutcome: exactComponentExpectedOutcome,
@@ -535,7 +526,6 @@ function buildCurrentCandidateSet({
       || obligation?.desiredEffect
       || "perform_current_obligation"
     );
-    const desiredControlState = obligationField(goal, "semanticEffect") === agentContract.SEMANTIC_EFFECT.SET_CONTROL_STATE;
     const expectedPostconditions = expectedPostconditionsForAction({
       expectedOutcome,
       semanticIntent,
@@ -616,11 +606,6 @@ function buildCurrentCandidateSet({
     );
     const grounded = {
       ...laneInput,
-      ...(desiredControlState ? {
-        interactionRole: "choice",
-        semanticEffect: "set_state",
-        expectedEvidence: "state_matches"
-      } : {}),
       executionChannel,
       candidateClass: discoveryEnvelope ? "mechanical_hypothesis" : "proven_action",
       mechanicalHypothesis: Boolean(discoveryEnvelope),
@@ -740,17 +725,6 @@ function buildCurrentCandidateSet({
   const selectablePool = provenSelectablePool.length ? provenSelectablePool : policySelectablePool;
   const oneCurrentStrategyPerOperation = (items = []) => {
     const strategyRank = (candidate) => {
-      // A deselection obligation must mutate the state-owning checkbox, not a
-      // visually larger wrapper/label that merely advertises the same choose
-      // capability. Live Croatia proved that such wrappers can be observable
-      // during compilation but unavailable at fresh dispatch time, while the
-      // canonical state element remains stable and executable.
-      if (["control_unselected", "control_state_equals"].includes(candidate.expectedOutcome?.type)) {
-        if (candidate.targetId && candidate.targetId === candidate.expectedOutcome.stateElementId) return 10;
-        if (candidate.interactionMethod === "native_click") return 2;
-        if (candidate.interactionMethod === "browser_trusted_input") return 1;
-        return 0;
-      }
       if (candidate.intent !== "navigate_stage" || candidateOperation(candidate) !== "activate") return 0;
       if (candidate.interactionMethod === "browser_trusted_input") return 3;
       if (candidate.interactionMethod === "native_click") return 2;
@@ -871,7 +845,7 @@ function buildCurrentCandidateSet({
 
 function bindMechanics({
   obligation,
-  checkoutScene = null,
+  decisionFrame = null,
   observation = {},
   traveler = {},
   state = {},
@@ -884,12 +858,12 @@ function bindMechanics({
     error.code = "BIND_MECHANICS_CURRENT_OBLIGATION_REQUIRED";
     throw error;
   }
-  if (checkoutScene && (
-    checkoutScene.observationId !== obligation.observationId
-    || checkoutScene.sourceSnapshotHash !== obligation.observationHash
+  if (decisionFrame && (
+    decisionFrame.observationId !== obligation.observationId
+    || decisionFrame.observationHash !== obligation.observationHash
   )) {
-    const error = new Error("BIND_MECHANICS_CHECKOUT_SCENE_MISMATCH");
-    error.code = "BIND_MECHANICS_CHECKOUT_SCENE_MISMATCH";
+    const error = new Error("BIND_MECHANICS_DECISION_FRAME_MISMATCH");
+    error.code = "BIND_MECHANICS_DECISION_FRAME_MISMATCH";
     throw error;
   }
   return buildCurrentCandidateSet({
@@ -913,7 +887,6 @@ function draftForBoundMechanic(obligation = {}, candidate = {}, observation = {}
     intent: profile ? "satisfy_semantic_goal" : candidate.intent,
     operation: candidate.operation,
     obligationId: obligationField(obligation, "goalId"),
-    sceneItemId: obligation.sceneItemId || "",
     semanticOwner: semanticOwner(obligation),
     candidateId: candidate.candidateId,
     candidateClass: candidate.candidateClass || "proven_action",

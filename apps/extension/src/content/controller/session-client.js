@@ -83,6 +83,7 @@ export function createSessionClient({
         throw new Error("session handshake returned a replacement transaction id");
       }
       agent.sessionId = sessionId;
+      agent.legalAuthorization = session.approvals?.legalAuthorization || null;
       logAgentEvent("agent_session_started", { sessionId: agent.sessionId });
       return session;
     } catch (error) {
@@ -113,24 +114,15 @@ export function createSessionClient({
       result,
       page: pageSnapshot("report-action-result")
     });
-    let navigationReportPending = false;
     try {
       const settings = await storageGet(["apiBase"]);
-      // Reporting is persistence, not observation. Rebuilding the DOM here
-      // can take several seconds on large checkout documents and, for a
-      // navigation-producing action, the source document may disappear while
-      // the report is still being prepared. Use the immutable map that was
-      // already captured for execution/verification; the next planning turn
-      // (or claimed destination) owns the next fresh observation.
-      const map = pageStateStore.current() || agent.pageMap || {};
+      const map = pageStateStore.observe({ reason: "action_report" }).map;
       const authoritativeResult = compactActionResultForTransport({
         ...(agent.lastActionResult || {}),
         ...result,
         actionId: result.actionId || agent.lastActionResult?.actionId || agent.activeExecutionActionId || "",
         observationId: result.observationId || agent.lastActionResult?.observationId || agent.activeExecutionObservationId || ""
       });
-      navigationReportPending = authoritativeResult.dispatched === true
-        && authoritativeResult.failureCode === "NAVIGATION_TRANSITION_PENDING";
       const pageReference = {
         site: map.site || location.host,
         url: currentNavigationUrl(),
@@ -163,7 +155,6 @@ export function createSessionClient({
             method: "POST",
             headers: { "content-type": "application/json" },
             body: reportBody,
-            keepalive: authoritativeResult.dispatched === true,
             signal: controller.signal
           });
           if (!response.ok) {
@@ -202,20 +193,6 @@ export function createSessionClient({
       }
       return true;
     } catch (error) {
-      if (navigationReportPending) {
-        // The navigation episode was durably armed before dispatch. During a
-        // real document transition Chrome can finish the keepalive request at
-        // the server while destroying this document before its response is
-        // delivered. Do not turn that lost acknowledgement into a manual stop:
-        // the routed destination proves dispatch and claims the exact durable
-        // episode. A missing destination still expires at the backend-owned
-        // episode deadline.
-        logFlow("action.report.navigation_ack_deferred", {
-          actionId: result.actionId || agent.activeExecutionActionId || "",
-          error: error.message || error.name || "Navigation acknowledgement moved to destination"
-        });
-        return false;
-      }
       logAgentEvent("agent_report_failed", { error: error.message });
       resetAgentLoopLifecycle("action_result_persistence_failed");
       agent.running = false;

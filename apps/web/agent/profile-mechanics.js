@@ -173,7 +173,7 @@ function descriptorForAtom(atom, observation = {}, traveler = {}, {
       label: currentBinding.control.label || atom.label,
       field: { kind: currentBinding.control.kind || currentBinding.control.role || "option" },
       control: currentBinding.control,
-      observedOption: currentBinding.observedOption === true,
+      observedOption: true,
       exactOption: currentBinding.componentBinding?.exactOption || base?.exactOption || null,
       choiceTerms: currentBinding.selectionTerms,
       value: currentBinding.inputValue,
@@ -795,10 +795,6 @@ function selectNextProfileRequirement(observation = {}, traveler = {}, currentGo
     : fieldDescriptors(observation, traveler))
     .filter((descriptor) => descriptorOwnsActiveRequirement(descriptor, page))
     .filter((descriptor) => !descriptor.hasValue)
-    // Missing profile truth is a typed TaskState handoff, never an executable
-    // empty-value fill. Keep the descriptor in CheckoutScene for semantic
-    // closure while excluding it from mechanical goal selection.
-    .filter((descriptor) => Boolean(descriptor.desiredNormalizedValue || descriptor.value))
     .filter((descriptor) => !(verifiedProfileComponents || []).some((completion) => (
       verifiedProfileComponentMatchesDescriptor(completion, descriptor)
     )));
@@ -811,7 +807,6 @@ function selectNextProfileRequirement(observation = {}, traveler = {}, currentGo
       rebound
       && descriptorOwnsActiveRequirement(rebound, page)
       && !rebound.hasValue
-      && Boolean(rebound.desiredNormalizedValue || rebound.value)
       && !(verifiedProfileComponents || []).some((completion) => (
         verifiedProfileComponentMatchesDescriptor(completion, rebound)
       ))

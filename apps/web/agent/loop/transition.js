@@ -81,21 +81,9 @@ function applyTransitionStatus(
     || observation.lastActionResult?.outcome?.code
     || ""
   );
-  const browserFailureScope = String(
-    advanced.observation?.lastActionResult?.failureScope
-    || advanced.observation?.lastActionResult?.outcome?.failureScope
-    || observation.lastActionResult?.failureScope
-    || observation.lastActionResult?.outcome?.failureScope
-    || ""
-  );
-  // Any failed exact local mechanic belongs to that mechanic on the unchanged
-  // semantic target state. Observation freshness must not erase the failure
-  // and regenerate the same candidate forever. Legacy results without an
-  // explicit scope retain the two codes that predate this contract.
-  const localMechanicalFailure = browserFailureScope === "local_mechanic"
-    || ["CANONICAL_ACTUATOR_UNAVAILABLE", "FAILED_STRATEGY_REUSE"].includes(browserFailureCode);
+  const failedStrategyReuse = browserFailureCode === "FAILED_STRATEGY_REUSE";
   if (
-    (transition?.status === "no_effect" || localMechanicalFailure)
+    (transition?.status === "no_effect" || failedStrategyReuse)
     && governedAction.type !== "scroll"
     && governedAction.controlId
     && signature
@@ -155,10 +143,11 @@ function applyTransitionStatus(
         failedStrategies: failedStrategies.slice(-80),
         failedStrategySignatures: attemptedStrategySignatures
       }),
-      ...(transition?.status === "no_effect" || localMechanicalFailure ? { aiDecisionCache: null } : {})
+      ...(transition?.status === "no_effect" || failedStrategyReuse ? { aiDecisionCache: null } : {})
     }),
     transition: transition || null
   };
 }
 
 module.exports = { applyTransitionStatus, deterministicTransitionVerification };
+

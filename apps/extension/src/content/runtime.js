@@ -6,11 +6,7 @@ import {
 } from "./selected-booking.js";
 import { createAgentRuntimeContext } from "./runtime-context.js";
 import { createSelectedBookingAcquisition } from "./selected-booking-acquisition.js";
-import {
-  currentNavigationUrl,
-  registrableSite,
-  sameRegistrableSite
-} from "./navigation-identity.js";
+import { currentNavigationUrl } from "./navigation-identity.js";
 import { createActionTransport } from "./observation/action-transport.js";
 import { createAccessibilityProjection } from "./observation/accessibility.js";
 import {
@@ -65,8 +61,7 @@ import {
 } from "./observation/prices.js";
 
 (async function bootAirTravelWallet() {
-  if (globalThis.__ATW_CONTENT_BOOTING__ === true || document.getElementById("atw-sidebar")) return;
-  globalThis.__ATW_CONTENT_BOOTING__ = true;
+  if (document.getElementById("atw-sidebar")) return;
 
   const DEFAULT_API = "http://localhost:4173/api";
   const MAX_OBSERVATION_TRANSPORT_BYTES = 5_250_000;
@@ -74,29 +69,9 @@ import {
   const ACTION_REPORT_MAX_ATTEMPTS = 2;
   const AGENT_SINGLE_BRAIN = true;
   const AGENT_CONTRACT = globalThis.AtwAgentContract || null;
-  const DOCUMENT_CONTEXT_ID = globalThis.crypto?.randomUUID?.() || `document_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const PAYMENT_TERMS = ["card", "cvc", "cvv", "security code", "payment", "cc-number", "cc-csc"];
   const SLOW_STEP_MS = 160;
   const VERIFY_STEP_MS = 120;
-  const pendingResumeWakeResponses = [];
-  let activateResumeFromMessage = null;
-  let suspendSourceAfterDestinationClaim = null;
-  globalThis.chrome?.runtime?.onMessage?.addListener?.((message, sender, sendResponse) => {
-    if (message?.type === "ATW_NAVIGATION_DESTINATION_CLAIMED") {
-      suspendSourceAfterDestinationClaim?.(message);
-      sendResponse({ ok: true });
-      return false;
-    }
-    if (message?.type !== "ATW_CLAIM_NAVIGATION_EPISODE") return false;
-    if (!activateResumeFromMessage) {
-      pendingResumeWakeResponses.push(sendResponse);
-      return true;
-    }
-    activateResumeFromMessage()
-      .then((resumed) => sendResponse({ ok: true, resumed }))
-      .catch((error) => sendResponse({ ok: false, error: error?.message || "resume failed" }));
-    return true;
-  });
   const VALIDATION_TERMS = [
     "required",
     "must enter",
@@ -357,140 +332,43 @@ import {
     return true;
   }
 
+  const RESUME_KEY = "atwAgentResume";
+  const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
   const DESTINATION_RETRY_INTERVAL_MS = 300;
   const DESTINATION_MUTATION_SETTLE_MS = 450;
-  async function armCheckoutHandoff(decision = {}, expectedOutcome = null) {
-    if (!agent.running || !agent.sessionId) return false;
+  async function saveResumeMarker() {
     try {
-      const actionId = String(decision.actionId || decision.id || "");
-      const observationId = String(decision.observationId || agent.activeObservationId || "");
-      const settings = await storageGet(["apiBase"]);
-      const apiBase = settings.apiBase || agent.apiBase || DEFAULT_API;
-      const armedResponse = await fetch(`${apiBase}/agent/navigation/arm`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          sessionId: agent.sessionId,
-          actionId,
-          observationId,
-          sourceDocumentId: DOCUMENT_CONTEXT_ID,
-          sourceUrl: currentNavigationUrl(),
-          sourceOrigin: location.origin,
-          expectedPostcondition: expectedOutcome || decision.expectedOutcome || null
-        })
-      });
-      const episode = await armedResponse.json().catch(() => ({}));
-      if (!armedResponse.ok || !episode?.episodeId) {
-        throw new Error(episode?.error || `navigation arm returned ${armedResponse.status}`);
+      if (!agent.running || !agent.sessionId) {
+        await chrome.storage.local.remove(RESUME_KEY);
+        return;
       }
-      const response = await chrome.runtime.sendMessage({
-        type: "ATW_ARM_NAVIGATION_EPISODE",
-        episode,
-        sourceDocumentId: DOCUMENT_CONTEXT_ID,
-        sourceUrl: currentNavigationUrl()
-      });
-      logFlow("checkout_handoff.arm", {
-        actionId,
-        observationId,
-        episodeId: episode.episodeId,
-        armed: response?.armed === true,
-        code: response?.code || ""
-      });
-      return response?.armed === true ? episode : false;
-    } catch (error) {
-      // A navigation-producing action is not dispatched unless this durable
-      // lifecycle and its browser route are both armed. Losing continuity is
-      // not a valid fallback mechanic.
-      logFlow("checkout_handoff.arm_failed", {
-        actionId: decision.actionId || decision.id || "",
-        message: error?.message || "handoff unavailable"
-      });
-      return false;
-    }
-  }
-
-  async function claimNavigationEpisode() {
-    try {
-      const routed = await chrome.runtime.sendMessage({
-        type: "ATW_CLAIM_NAVIGATION_EPISODE",
-        claimantId: DOCUMENT_CONTEXT_ID
-      });
-      if (!routed?.episode?.episodeId) return null;
-      const destination = routed.destination || {};
-      const settings = await storageGet(["apiBase"]);
-      const apiBase = settings.apiBase || agent.apiBase || DEFAULT_API;
-      const response = await fetch(`${apiBase}/agent/navigation/claim`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          sessionId: routed.episode.sessionId,
-          episodeId: routed.episode.episodeId,
-          actionId: routed.episode.actionId,
-          destinationDocumentId: destination.documentId || DOCUMENT_CONTEXT_ID,
-          tabContextId: destination.tabContextId || await tabContextId(),
-          destinationUrl: currentNavigationUrl(),
-          destinationOrigin: location.origin,
-          redirectContinuation: destination.redirectContinuation === true
-        })
-      });
-      const episode = await response.json().catch(() => ({}));
-      if (!response.ok || !episode?.episodeId) return null;
-      return {
-        sessionId: episode.sessionId,
-        travelerId: episode.travelerId,
-        skipPaidExtrasApproved: false,
-        previousBoundary: "UNKNOWN",
-        expectedTransition: episode.expectedPostcondition || null,
-        currentObjective: episode.currentObjective || "reach_actual_payment_entry",
-        sourceOrigin: episode.sourceDocument?.origin || "",
-        navigationEpisode: episode,
-        pendingResult: {
-          actionId: episode.actionId,
-          observationId: episode.observationId,
-          dispatched: true,
-          executed: true,
-          targetResolved: true,
-          clickReachedPage: true,
-          verified: false,
-          code: "NAVIGATION_DESTINATION_CLAIMED",
-          failureCode: "NAVIGATION_TRANSITION_PENDING",
-          expectedOutcome: episode.expectedPostcondition || null,
-          transitionStatus: "waiting_for_destination"
+      await chrome.storage.local.set({
+        [RESUME_KEY]: {
+          tabContextId: await tabContextId(),
+          travelerId: selectedTravelerId,
+          sessionId: agent.sessionId,
+          skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
+          navigationUrl: currentNavigationUrl(),
+          savedAt: Date.now()
         }
-      };
+      });
     } catch (error) {
-      logFlow("checkout_handoff.claim_failed", { message: error?.message || "claim unavailable" });
-      return null;
+      // Best-effort: if the page is already tearing down, storage may be unavailable. Nothing to do.
     }
   }
 
-  async function markNavigationDestinationReady(marker = {}, map = {}) {
-    const episode = marker.navigationEpisode;
-    if (!episode?.episodeId) return false;
-    const settings = await storageGet(["apiBase"]);
-    const apiBase = settings.apiBase || agent.apiBase || DEFAULT_API;
-    const response = await fetch(`${apiBase}/agent/navigation/ready`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        sessionId: episode.sessionId,
-        episodeId: episode.episodeId,
-        actionId: episode.actionId,
-        destinationDocumentId: episode.destinationDocument?.documentId || DOCUMENT_CONTEXT_ID,
-        tabContextId: episode.destinationDocument?.tabContextId || await tabContextId(),
-        observationId: map.observationId || "",
-        observationHash: observationHashForMap(map),
-        destinationUrl: currentNavigationUrl()
-      })
-    });
-    if (!response.ok) return false;
-    const browserReady = await chrome.runtime.sendMessage({
-      type: "ATW_NAVIGATION_DESTINATION_READY",
-      episodeId: episode.episodeId,
-      claimantId: DOCUMENT_CONTEXT_ID
-    }).catch(() => null);
-    return browserReady?.ready === true;
+  async function clearResumeMarker() {
+    try {
+      await chrome.storage.local.remove(RESUME_KEY);
+    } catch (error) {
+      // ignore
+    }
+  }
+
+  async function readResumeMarker() {
+    const stored = await chrome.storage.local.get(RESUME_KEY);
+    return stored?.[RESUME_KEY] || null;
   }
 
   async function fetchData() {
@@ -652,23 +530,8 @@ import {
   }
 
   function isPaymentField(input) {
-    const editable = input?.matches?.("input, select, textarea, [contenteditable='true']");
-    if (editable) {
-      const text = labelText(input);
-      return input.type === "password" || PAYMENT_TERMS.some((term) => text.includes(term));
-    }
-    // Consequential payment commands are excluded by their own accessible
-    // identity. Ancestor form action/copy is deliberately absent here so a
-    // harmless Continue anchor inside /PaymentForm remains observable.
-    if (!input?.matches?.("button, a, [role='button'], input[type='button'], input[type='submit']")) return false;
-    const direct = String([
-      input.innerText,
-      input.textContent,
-      input.getAttribute?.("aria-label"),
-      input.getAttribute?.("title"),
-      input.getAttribute?.("value")
-    ].filter(Boolean).join(" ")).replace(/\s+/g, " ").trim().toLowerCase();
-    return /\b(?:pay|purchase|buy|submit payment|confirm payment|complete purchase)\b/.test(direct);
+    const text = labelText(input);
+    return input.type === "password" || PAYMENT_TERMS.some((term) => text.includes(term));
   }
 
   function candidateInputs() {
@@ -862,19 +725,6 @@ import {
     renderSidebar: (...args) => renderSidebar(...args),
     setAgentActivity
   });
-  suspendSourceAfterDestinationClaim = (message = {}) => {
-    if (!agent.destinationWait?.navigationEpisodeId
-      || agent.destinationWait.navigationEpisodeId !== message.episodeId) return false;
-    clearDestinationWait("destination_claimed_elsewhere");
-    runtimeScopes.lifecycle.running = false;
-    runtimeScopes.lifecycle.awaiting = "navigation";
-    setAgentActivity(
-      "Checkout continued in the destination page",
-      "The same durable transaction is now owned by the newly opened checkout document."
-    );
-    renderSidebar("agent");
-    return true;
-  };
 
   function pushActionLedger(entry = {}) {
     const row = {
@@ -1107,35 +957,16 @@ import {
   }
 
   async function rejectMechanicalAction(actionId, observationId, decision = {}, outcome = {}, target = null) {
-    const code = String(outcome.code || "ACTION_NOT_DISPATCHED");
-    const infrastructureOrAuthorityFailure = new Set([
-      "NAVIGATION_EPISODE_ARM_FAILED",
-      "CAPABILITY_EXECUTION_LANE_DENIED",
-      "OBSERVATION_HASH_MISMATCH",
-      "OBSERVATION_ID_MISMATCH",
-      "ACTION_LEASE_INVALID",
-      "ACTION_LEASE_EXPIRED"
-    ]).has(code);
-    const failureScope = outcome.failureScope
-      || (infrastructureOrAuthorityFailure ? "infrastructure_or_authority" : "local_mechanic");
-    const classifiedOutcome = { ...outcome, failureScope };
-    const result = rememberUnexecutedActionResult(actionId, observationId, decision, classifiedOutcome);
-    if (failureScope === "local_mechanic") {
-      rememberFailedLocalStrategy(
-        decision,
-        agent.pageMap || buildPageMap(),
-        code
-      );
-    }
+    const result = rememberUnexecutedActionResult(actionId, observationId, decision, outcome);
     pushActionLedger({
       actionId,
       observationId,
       stage: "rejected",
       action: decision,
       targetFingerprint: target ? targetFingerprint(target, decision) : null,
-      result: { ok: false, ...classifiedOutcome }
+      result: { ok: false, ...outcome }
     });
-    logFlow("mechanical_action.rejected", { actionId, observationId, outcome: classifiedOutcome, result });
+    logFlow("mechanical_action.rejected", { actionId, observationId, outcome, result });
     await reportActionResult(result);
     await continueAfterAction(150);
     return result;
@@ -1296,11 +1127,6 @@ import {
       ));
     return {
       testId: compactText(element?.getAttribute?.("data-testid") || element?.getAttribute?.("data-test-id") || element?.getAttribute?.("data-test") || "", 160),
-      // `controlAction` belongs to this actuator. `formAction` is relationship
-      // context owned by the ancestor form. Keeping them separate prevents a
-      // /PaymentForm parent from turning every email, radio and checkbox into
-      // a checkout-navigation command.
-      controlAction: compactText(element?.getAttribute?.("formaction") || "", 300),
       formAction: compactText(element?.getAttribute?.("formaction") || form?.getAttribute?.("action") || "", 300),
       formMethod: compactText(element?.getAttribute?.("formmethod") || form?.getAttribute?.("method") || "", 40).toLowerCase(),
       formId: compactText(form?.getAttribute?.("id") || form?.getAttribute?.("name") || "", 160),
@@ -1321,10 +1147,7 @@ import {
   }
 
   function resolveOwnedControlMeaning(evidence = {}, fallbackSemantic = "", surfaceType = "page") {
-    // Only evidence owned by the control may classify its action. Ancestor
-    // form metadata remains available to the scene compiler as context, but
-    // cannot be inherited as the child's semantic meaning.
-    const identity = `${evidence.testId || ""} ${evidence.controlAction || ""}`.trim().toLowerCase();
+    const identity = `${evidence.testId || ""} ${evidence.formId || ""} ${evidence.formAction || ""}`.trim().toLowerCase();
     const ownMeaning = `${evidence.ownText || ""} ${evidence.title || ""}`.trim().toLowerCase();
     const accessibleHint = String(evidence.ariaLabel || "").trim().toLowerCase();
     const strongDismiss = /(?:^|[-_])(dialog|modal|seatmap)?[-_]?close(?:$|[-_])|dismiss|close-button/.test(identity)
@@ -1878,33 +1701,6 @@ import {
       credentialKindsFromText(descriptor).forEach((kind) => credentialKinds.add(kind));
     }
     const visibleActions = visibleTerminalNodes.filter((element) => element.matches("button, input[type='button'], input[type='submit'], [role='button']"));
-    const visiblePaymentMethodControls = queryAllDeep("select, [role='combobox'], input[type='radio'], [role='radio']")
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
-      .filter((element) => {
-        if (element.disabled === true || element.getAttribute?.("aria-disabled") === "true") return false;
-        const descriptor = `${labelText(element)} ${element.getAttribute?.("name") || ""} ${element.getAttribute?.("aria-label") || ""} ${element.id || ""}`
-          .toLowerCase()
-          .replace(/\s+/g, " ");
-        const exactMethodOwner = /\b(?:payment method|payment option|method of payment|means of payment|how (?:would you like|do you want) to pay)\b/.test(descriptor);
-        const paymentNamedChoice = /payment|meansofpayment|paymethod/.test(descriptor)
-          && /card|bank|wallet|paypal|keks|apple pay|google pay/.test(descriptor);
-        return exactMethodOwner || paymentNamedChoice;
-      });
-    const paymentMethodControlIds = visiblePaymentMethodControls.map((element) => elementId(element)).filter(Boolean);
-    const expectedTransition = agent.resumeContinuity?.expectedTransition || {};
-    const expectedPaymentEntry = expectedTransition.type === "payment_entry_reached"
-      || expectedTransition.expectedBoundary === "PAYMENT_ENTRY"
-      || expectedTransition.successCondition?.type === "payment_entry_reached"
-      || expectedTransition.successCondition?.expectedBoundary === "PAYMENT_ENTRY";
-    const sourceOrigin = String(agent.resumeContinuity?.sourceOrigin || "");
-    const sourceSite = registrableSite(sourceOrigin);
-    const destinationSite = registrableSite(location.origin);
-    const providerHandoffPresent = Boolean(
-      expectedPaymentEntry
-      && sourceOrigin
-      && sourceOrigin !== location.origin
-      && !sameRegistrableSite(sourceOrigin, location.origin)
-    );
     const payControlPresent = visibleActions.some((element) => (
       AGENT_CONTRACT?.isPaymentCommitText?.(actionElementLabel(element))
       || /^(?:pay(?:\s+now|\s+securely|\s+by\s+(?:card|bank|wallet)|\s+[\d.,]+)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase|place\s+order)\b/i.test(actionElementLabel(element))
@@ -1986,8 +1782,6 @@ import {
       ...(credentialKinds.size ? ["visible_native_payment_credentials"] : []),
       ...(paymentOwnerPresent ? ["visible_owned_payment_labels"] : []),
       ...(hostedPaymentWidgetPresent ? ["visible_hosted_payment_widget"] : []),
-      ...(paymentMethodControlIds.length ? ["visible_owned_payment_method"] : []),
-      ...(providerHandoffPresent ? ["durable_provider_handoff"] : []),
       ...(activePaymentProgress ? ["active_payment_progress"] : []),
       ...(paymentRoute ? ["payment_route"] : []),
       ...(progressivePaymentEntryPresent ? ["visible_progressive_payment_entry"] : []),
@@ -2007,11 +1801,6 @@ import {
       hostedPaymentWidgetPresent,
       visibleTextFallbackAllowed: paymentOwnerPresent,
       paymentMethodPresent: /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/i.test(normalized),
-      ownedPaymentMethodPresent: paymentMethodControlIds.length > 0,
-      paymentMethodControlIds,
-      providerHandoffPresent,
-      handoffSourceSite: sourceSite,
-      handoffDestinationSite: destinationSite,
       payControlPresent,
       transactionCommitControlPresent,
       advanceToPaymentControlPresent: advanceToPaymentControls.length > 0,
@@ -3507,7 +3296,6 @@ import {
     activeOverlayElements,
     addAgentMessage,
     agent: runtimeScopes.execution,
-    armCheckoutHandoff,
     beginDestinationWait,
     buildPageMap,
     buttonText,
@@ -3620,7 +3408,7 @@ import {
     announceSectionQueue,
     beginAgentLoop,
     buildPageUnderstanding,
-    claimNavigationEpisode,
+    clearResumeMarker,
     describePageMap,
     executeAgentDecision,
     finishAgentLoop,
@@ -3628,7 +3416,6 @@ import {
     labelText,
     logAgentEvent,
     logFlow,
-    markNavigationDestinationReady,
     outlineCoreSections,
     pageStateStore,
     persistControlFlowDecision,
@@ -3638,6 +3425,7 @@ import {
     resetAgentLoopLifecycle,
     resetFieldProgress,
     runRiskChecks,
+    saveResumeMarker,
     scheduleDestinationObservation,
     setAgentActivity,
     setWarnings: (nextWarnings) => {
@@ -3710,6 +3498,10 @@ import {
     stopWatchingCheckoutChanges();
     cancelSelectedBookingCapture();
     disarmSelectedBookingCapture();
+    saveResumeMarker();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") saveResumeMarker();
   });
 
   if (window.__ATW_ENABLE_TEST_HOOKS__ === true) {
@@ -3726,7 +3518,6 @@ import {
       },
       setAgentRunningForTest: (running) => { agent.running = Boolean(running); },
       setAgentSessionForTest: (sessionId) => { agent.sessionId = String(sessionId || ""); },
-      setResumeContinuityForTest: (continuity = null) => { agent.resumeContinuity = continuity; },
       setLastExternalMaterialMutationAtForTest: (at) => {
         agent.lastExternalMaterialMutationAt = Number(at || 0);
       },
@@ -3849,10 +3640,7 @@ import {
       withOverlayProgressEvidence,
       withChoiceCommitEvidence
     });
-    if (window.__ATW_TEST_BOOT__ !== true) {
-      globalThis.__ATW_CONTENT_BOOTING__ = false;
-      return;
-    }
+    if (window.__ATW_TEST_BOOT__ !== true) return;
   }
 
   try {
@@ -3860,41 +3648,23 @@ import {
     await hydrateSelectedBookingAcquisition();
     armSelectedBookingCapture();
     warnings = [];
-    let navigationActivation = null;
-    const activateNavigationEpisode = async () => {
-      if (agent.running || navigationActivation) return false;
-      navigationActivation = (async () => {
-        const marker = await claimNavigationEpisode();
-        if (!marker?.sessionId || !marker?.travelerId) return false;
-        selectedTravelerId = marker.travelerId;
-        // Acknowledge activation once the same durable controller has taken
-        // ownership. The resumed checkout turn continues asynchronously; the
-        // service-worker message channel must not stay open through page
-        // observation, backend planning, or another navigation.
-        resumeCheckoutAfterNavigation(marker);
-        return true;
-      })();
-      try {
-        return await navigationActivation;
-      } finally {
-        navigationActivation = null;
-      }
-    };
-    activateResumeFromMessage = () => activateNavigationEpisode();
-    const resumed = await activateNavigationEpisode();
-    for (const sendResponse of pendingResumeWakeResponses.splice(0)) {
-      sendResponse({ ok: true, resumed });
+    const resumeMarker = await readResumeMarker();
+    const currentTabContextId = await tabContextId();
+    const resumeIsFresh = Boolean(resumeMarker)
+      && Boolean(currentTabContextId)
+      && resumeMarker.tabContextId === currentTabContextId
+      && (Date.now() - (resumeMarker.savedAt || 0) < RESUME_MAX_AGE_MS);
+    if (resumeIsFresh && resumeMarker.travelerId) {
+      selectedTravelerId = resumeMarker.travelerId;
+      resumeCheckoutAfterNavigation(resumeMarker);
+    } else {
+      if (resumeMarker) await clearResumeMarker();
+      renderSidebar();
     }
-    if (!resumed) renderSidebar();
   } catch (error) {
     const root = document.createElement("aside");
     root.id = "atw-sidebar";
     root.innerHTML = `<div class="atw-panel"><h2>Air Travel Wallet</h2><p class="atw-muted">${error.message}</p></div>`;
     document.body.appendChild(root);
-  } finally {
-    // This guards only concurrent injection while the content script is
-    // initializing. Once boot settles, the document-owned sidebar is the
-    // duplicate authority; a genuinely new document may initialize again.
-    globalThis.__ATW_CONTENT_BOOTING__ = false;
   }
 })();

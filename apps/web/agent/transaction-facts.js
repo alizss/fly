@@ -483,7 +483,7 @@ function factsFromObservation(state = {}, observation = {}, traveler = {}, {
   const verifiedObligationSelections = commerceSelectionsFromVerifiedObligations(state);
   return {
     ...normalized,
-    // CheckoutScene transaction evidence and exact verified receipts are the
+    // DecisionFrame transaction evidence and exact verified receipts are the
     // only production commerce authorities. A selected checkbox/toggle in the
     // current control graph is UI state, not proof that a paid item entered
     // the booking.

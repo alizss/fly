@@ -21,8 +21,8 @@ const {
 const { candidateSelectionSchemaFor } = require("../../apps/web/agent/schemas");
 const {
   currentObligation,
+  currentObligationFromGoal
 } = require("../../apps/web/agent/authority-frames");
-const { legacyCurrentObligationFromGoal: currentObligationFromGoal } = require("./legacy-scene-item-adapter");
 const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 
@@ -827,7 +827,7 @@ test("DOB transition requires the exact canonical date and no owned validation e
     validationIssues: [{ issueId: "dob_error", controlId: "ctrl_dob", message: "Invalid date" }]
   }, result("act_dob"));
   const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: invalid });
-  assert.equal(blocked.status, "observed_change");
+  assert.equal(blocked.status, "progressed");
   assert.equal(blocked.postcondition.satisfied, false);
 });
 
@@ -857,7 +857,7 @@ test("authoritative transition treats popup and reversible price changes as fres
     browserResult: result(),
     afterObservation: progressedAfter
   });
-  assert.equal(progressed.status, "observed_change");
+  assert.equal(progressed.status, "progressed");
   assert.equal(progressed.nextDirective, "rebuild_from_fresh_observation");
 
   const unchanged = observation("unchanged", before.page, result());
@@ -945,58 +945,8 @@ test("a foreground site-failure modal cannot satisfy checkout-stage advancement"
 
   assert.equal(transition.postcondition.satisfied, false);
   assert.equal(transition.currentObligationResult.completed, false);
-  assert.equal(transition.status, "observed_change");
+  assert.equal(transition.status, "progressed");
   assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
-});
-
-test("a URL change and raw payment hint cannot complete payment entry while the CheckoutScene postcondition is false", () => {
-  const before = observation("croatia_review", {
-    step: "payment",
-    url: "https://booking.croatiaairlines.com/review",
-    currentSurface: { id: "surface-page", type: "page", label: "Review" },
-    controls: [{ controlId: "confirm", label: "CONFIRM" }]
-  });
-  const after = observation("croatia_payment_setup", {
-    step: "payment_method_selection",
-    url: "https://www.croatiaairlines.com/en/PaymentForm",
-    currentSurface: { id: "surface-page", type: "page", label: "Payment setup" },
-    // This models the exact conflicting evidence from the live regression: a
-    // raw observer guessed terminal, while the canonical scene did not.
-    terminalEvidence: { boundary: "PAYMENT_ENTRY", boundaryObserved: true },
-    checkoutSceneTerminalState: { boundary: "UNKNOWN", paymentEntry: false },
-    controls: [
-      { controlId: "method", label: "Credit/debit card", selected: true },
-      { controlId: "continue", label: "Continue" }
-    ]
-  }, result("act_confirm"));
-  const transition = evaluateTransition({
-    beforeObservation: before,
-    governedAction: {
-      id: "act_confirm",
-      type: "click",
-      controlId: "confirm",
-      mechanicalEffect: "advance_to_payment",
-      expectedOutcome: { type: "payment_entry_reached", expectedBoundary: "PAYMENT_ENTRY" },
-      affordance: {
-        task: {
-          stageOutcomeId: "stage_outcome:reach_payment_entry",
-          outcomeContract: { taskOutcome: "payment_entry_reached" }
-        }
-      }
-    },
-    browserResult: result("act_confirm"),
-    afterObservation: after
-  });
-
-  assert.equal(transition.postcondition.satisfied, false);
-  assert.equal(transition.durableObjectiveProgress.completed, false);
-  assert.equal(transition.taskOutcomeCompleted, false);
-  assert.equal(transition.status, "observed_change");
-  assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
-  assert.deepEqual(transition.diff.urlChanged, {
-    from: "https://booking.croatiaairlines.com/review",
-    to: "https://www.croatiaairlines.com/en/PaymentForm"
-  });
 });
 
 test("the same modal instance verifies progress when its foreground marker advances", () => {
@@ -1198,82 +1148,6 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   });
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), unrelatedProgress),
-    [signature]
-  );
-});
-
-test("an unavailable canonical actuator is excluded on the unchanged semantic state instead of looping", () => {
-  const before = observation("consent_before", {
-    step: "payment_method_selection",
-    currentSurface: { id: "surface-page", type: "page", label: "Payment setup" },
-    controls: [{
-      controlId: "ctrl_survey",
-      stableKey: "checkbox:survey",
-      label: "Customer satisfaction survey",
-      state: { checked: true, selected: true },
-      operations: {
-        choose: {
-          strategies: [{
-            actuatorId: "survey_wrapper",
-            actuatorStableKey: "checkbox:survey::choose::wrapper",
-            status: "proven_executable",
-            proof: { visible: true, enabled: true, hitTested: true, notOccluded: true }
-          }]
-        }
-      }
-    }]
-  });
-  const action = {
-    id: "act_survey_wrapper",
-    type: "click",
-    controlId: "ctrl_survey",
-    operation: "choose",
-    interactionMethod: "native_click",
-    expectedOutcome: {
-      type: "control_state_equals",
-      controlId: "ctrl_survey",
-      desiredState: { checked: false }
-    },
-    pipelineContract: {
-      component: { componentIdentity: "checkbox:survey:value" },
-      capability: {
-        selectedStrategy: {
-          actuatorId: "survey_wrapper",
-          actuatorStableKey: "checkbox:survey::choose::wrapper"
-        }
-      }
-    }
-  };
-  const rejected = {
-    actionId: action.id,
-    dispatched: false,
-    executed: false,
-    verified: false,
-    failureCode: "CANONICAL_ACTUATOR_UNAVAILABLE",
-    outcome: { code: "CANONICAL_ACTUATOR_UNAVAILABLE", failureScope: "local_mechanic" },
-    action
-  };
-  const after = observation("consent_after", before.page, rejected);
-  const goal = { goalId: "goal_decline_survey", semanticType: "survey_consent" };
-  const state = withExecutionFixture({
-    currentGoal: goal,
-    taskState: { currentObligation: currentObligationFromGoal({ goal }) },
-    lastAction: action,
-    aiDecisionCache: { candidateSelection: { candidateId: "stale_wrapper" } }
-  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
-
-  const applied = loopPrivate.applyTransitionStatus(state, after, before);
-  const failures = recovery(applied.state).failedStrategies;
-  const signature = "native_click:choose:checkbox:survey:value:checkbox:survey::choose::wrapper";
-  assert.equal(applied.transition, null);
-  assert.equal(applied.directive, "rebuild_candidates");
-  assert.equal(failures.length, 1);
-  assert.equal(failures[0].strategySignature, signature);
-  assert.equal(failures[0].failureCount, 1);
-  assert.equal(recovery(applied.state).attempts, 0);
-  assert.equal(applied.state.aiDecisionCache, null);
-  assert.deepEqual(
-    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), after),
     [signature]
   );
 });
@@ -2274,7 +2148,7 @@ test("generic command acknowledgement cannot complete a decision or parent outco
     afterObservation: after
   });
 
-  assert.equal(transition.status, "observed_change");
+  assert.equal(transition.status, "progressed");
   assert.equal(transition.postcondition.satisfied, false);
   assert.equal(transition.taskOutcomeCompleted, false);
   assert.equal(after.page.decisionGroups[0].selectedControlId, "");

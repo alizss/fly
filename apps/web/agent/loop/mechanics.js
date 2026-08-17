@@ -278,9 +278,6 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
   });
   const targetLocalStateKey = JSON.stringify({
     stableControlKey,
-    desiredState: obligationField(goal, "desiredState")
-      || obligationField(goal, "successCondition")?.desiredState
-      || null,
     state: control ? {
       disabled: control.state?.disabled === true || control.disabled === true,
       expanded: control.state?.expanded === true,
@@ -337,11 +334,11 @@ function failedStrategySignaturesForGoal(state = {}, goal = {}, observation = {}
     .filter(Boolean);
 }
 
-function groundedObservationCandidateSet(obligation = null, checkoutScene = null, observation = {}, attemptedStrategySignatures = [], context = {}) {
+function groundedObservationCandidateSet(obligation = null, decisionFrame = null, observation = {}, attemptedStrategySignatures = [], context = {}) {
   const binding = surfaceBinding(observation);
   const built = bindMechanics({
     obligation,
-    checkoutScene,
+    decisionFrame,
     observation,
     state: context.state || {},
     traveler: context.traveler || {},
@@ -467,3 +464,4 @@ module.exports = {
   targetLocalRecoveryScope,
   targetSnapshotForAction
 };
+

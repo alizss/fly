@@ -4,7 +4,7 @@ Last updated: 2026-08-12
 
 ## Core mission
 
-Given an approved selected booking, traveler, and policy, Fly must complete an unfamiliar airline/OTA checkout to verified actual payment entry, ask only when user facts or exceptional authority are genuinely required, and never enter payment credentials, click Pay, commit, or purchase under the current milestone. Starting the transaction creates an exact checkout mandate that covers ordinary mandatory carrier, fare, purchase-condition, booking-accuracy, and dangerous-goods attestations; it never authorizes optional consent or purchase.
+Given an approved selected booking, traveler, and policy, Fly must complete an unfamiliar airline/OTA checkout to verified actual payment entry, ask only when user facts or authority are genuinely required, and never enter payment credentials, click Pay, commit, or purchase under the current milestone. An exact required legal attestation may execute only through the narrow transaction-bound approval flow.
 
 Fly learns reusable checkout mechanics—not airline workflows.
 
@@ -12,7 +12,7 @@ Fly learns reusable checkout mechanics—not airline workflows.
 
 ```text
 fresh immutable observation
-→ compile one immutable CheckoutScene
+→ compile meaning once
 → TaskState publishes one obligation/disposition
 → bind exact mechanics for that obligation
 → consequence governor
@@ -27,7 +27,7 @@ Do not add a second semantic compiler, requirement lifecycle, planner, readiness
 ## Responsibility rules
 
 1. **Observation** reports mechanics, current state, ownership evidence, and transaction evidence.
-2. **CheckoutScene** is the sole compiled semantic authority for the observation; any DecisionFrame that remains is mechanical/compatibility evidence only.
+2. **DecisionFrame** compiles semantic entities once.
 3. **TaskState** alone decides what work exists and how the turn ends.
 4. **Mechanics binder** finds actuators only for the admitted obligation.
 5. **Governor** checks consequences immediately before execution.

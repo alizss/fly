@@ -32,7 +32,7 @@ const { reduceTaskState } = require("./task-state-replay-adapter");
 const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { semanticGoalKey } = require("../../packages/shared/agent-actions");
-const { legacyCurrentObligationFromGoal: currentObligationFromGoal } = require("./legacy-scene-item-adapter");
+const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
 const {
   leasedAction,
   lifecycle,
@@ -1999,7 +1999,7 @@ test("completed form reports unavailable navigation internally instead of asking
 
   assert.equal(result.clientDecision.action, "wait");
   assert.equal(result.clientDecision.intent, "task_state_reobserve");
-  assert.match(result.clientDecision.reason, /navigation_disabled_without_active_requirement/);
+  assert.match(result.clientDecision.reason, /no_goal_relevant_candidate/);
   assert.equal(result.state.status, "running");
   assert.equal("navigationSettling" in result.state, false);
   assert.equal(result.state.currentObligation, undefined);

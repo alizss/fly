@@ -5,7 +5,6 @@ export function createExecutionOrchestrator({
   activeOverlayElements,
   addAgentMessage,
   agent,
-  armCheckoutHandoff,
   beginDestinationWait,
   buildPageMap,
   buttonText,
@@ -74,22 +73,6 @@ export function createExecutionOrchestrator({
   withChoiceCommitEvidence,
   withOverlayProgressEvidence
 }) {
-  function requiresCheckoutHandoff(decision = {}, expectedOutcome = {}) {
-    const intent = `${decision.intent || ""} ${decision.semanticIntent || ""} ${decision.mechanicalEffect || ""}`.toLowerCase();
-    return decision.interactionRole === "navigation"
-      || /navigate|advance_to_payment|advance_checkout_stage/.test(intent)
-      || [
-        "checkout_stage_advanced",
-        "payment_entry_reached",
-        "navigation_completed"
-      ].includes(String(expectedOutcome?.type || ""));
-  }
-
-  async function armHandoffBeforeDispatch(decision = {}, expectedOutcome = {}) {
-    if (!requiresCheckoutHandoff(decision, expectedOutcome)) return false;
-    return armCheckoutHandoff(decision, expectedOutcome);
-  }
-
   async function pushVerificationLedger(actionId, observationId, decision, expectedOutcome, verification) {
     const executionResult = rememberActionExecutionResult(actionId, observationId, decision, expectedOutcome, verification);
     pushActionLedger({
@@ -144,8 +127,7 @@ export function createExecutionOrchestrator({
     decision,
     expectedOutcome,
     afterMap = {},
-    dispatchedAt = 0,
-    navigationEpisode = null
+    dispatchedAt = 0
   ) {
     const pendingResult = rememberUnexecutedActionResult(
       actionId,
@@ -178,8 +160,6 @@ export function createExecutionOrchestrator({
       observationId,
       actionId,
       dispatchedAt,
-      navigationEpisodeId: navigationEpisode?.episodeId || "",
-      readinessDeadlineAt: Number(navigationEpisode?.deadlineAt || 0),
       expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
       reobserveRetryToken: `stage_exit:${actionId}`
     });
@@ -497,22 +477,6 @@ export function createExecutionOrchestrator({
     addAgentMessage("assistant", `Clicking: ${label}.`);
     await showAgentThought(element, "Exit", `Act: click ${label}`, "Checking whether the page advances.");
     flashElement(element);
-    const navigationRequiresHandoff = requiresCheckoutHandoff(governedDecision, expectedOutcome);
-    const navigationEpisode = await armHandoffBeforeDispatch(governedDecision, expectedOutcome);
-    if (navigationRequiresHandoff && !navigationEpisode) {
-      await rejectMechanicalAction(
-        options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
-        options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
-        governedDecision,
-        {
-          code: "NAVIGATION_EPISODE_ARM_FAILED",
-          message: "The durable cross-document navigation lifecycle could not be armed before dispatch.",
-          dispatched: false
-        },
-        element
-      );
-      return false;
-    }
     const dispatchedAt = Date.now();
     const dispatch = await dispatchGovernedClickMechanic(element, governedDecision, {
       actionId: options.actionId || agent.activeExecutionActionId || "",
@@ -540,18 +504,6 @@ export function createExecutionOrchestrator({
       action: governedDecision,
       targetFingerprint: targetFingerprint(element, governedDecision)
     });
-    if (navigationEpisode) {
-      await holdDispatchedStageExit(
-        options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
-        options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
-        governedDecision,
-        expectedOutcome,
-        beforeMap,
-        dispatchedAt,
-        navigationEpisode
-      );
-      return false;
-    }
     await waitForUiSettle(700);
     const postActionObservation = await observePageStateAfterMutation("verify_advance", 900);
     let afterMap = postActionObservation.map;
@@ -686,11 +638,7 @@ export function createExecutionOrchestrator({
       await continueAfterAction(150);
       return;
     }
-    const mechanicsExhaustedStop = decision.action === "stop"
-      && decision.policyDecision?.code === "MECHANICS_EXHAUSTED";
-    const message = mechanicsExhaustedStop
-      ? "Unable to activate the identified control"
-      : decision.message || "I have a next action.";
+    const message = decision.message || "I have a next action.";
     if (!agent.messages.at(-1) || agent.messages.at(-1).text !== message) {
       addAgentMessage("assistant", message);
     }
@@ -710,7 +658,8 @@ export function createExecutionOrchestrator({
 
     if (decision.risk !== "safe" && decision.needsApproval) {
       await persistControlFlowDecision({ ...decision, action: "ask_user" }, actionId, actionObservationId);
-      agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "payment" ? "final" : "manual";
+      agent.pendingApprovalRequest = decision.approvalRequest || null;
+      agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "payment" ? "final" : decision.risk === "legal" ? "legal" : "manual";
       agent.running = false;
       renderSidebar("agent");
       return;
@@ -719,12 +668,14 @@ export function createExecutionOrchestrator({
     if (decision.action === "ask_user") {
       await persistControlFlowDecision(decision, actionId, actionObservationId);
       agent.pendingInputRequest = decision.inputRequest || null;
-      agent.awaiting = decision.risk === "money" ? "extras" : "manual";
+      agent.pendingApprovalRequest = decision.approvalRequest || null;
+      agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "legal" ? "legal" : "manual";
       agent.running = false;
       renderSidebar("agent");
       return;
     }
     agent.pendingInputRequest = null;
+    agent.pendingApprovalRequest = null;
 
     if (decision.action === "final_review") {
       await persistControlFlowDecision(decision, actionId, actionObservationId);
@@ -1040,17 +991,7 @@ export function createExecutionOrchestrator({
 
     if (decision.action === "click") {
       const targetResolutionStartedAt = performance.now();
-      let target = resolveDecisionTarget(decision, map);
-      // Desired-state transitions are owned by the node that exposes the
-      // state, not by a larger label/wrapper sharing the choose capability.
-      // Rebind that exact state node before validation and dispatch. Besides
-      // making the action idempotent, this lets local reaction detection read
-      // the property that actually changed and prevents a fallback click from
-      // toggling the checkbox a second time.
-      if (decision.expectedOutcome?.type === "control_state_equals") {
-        const exactStateTarget = elementById(decision.expectedOutcome.stateElementId || "");
-        if (exactStateTarget?.isConnected && isVisible(exactStateTarget)) target = exactStateTarget;
-      }
+      const target = resolveDecisionTarget(decision, map);
       logFlow("latency.span", {
         target_resolution_ms: Math.round(performance.now() - targetResolutionStartedAt),
         actionId,
@@ -1123,42 +1064,7 @@ export function createExecutionOrchestrator({
         return;
       }
       const alreadyCommittedOutcome = expectedOutcomeForDecision(decision, map, target);
-      const desiredControlState = alreadyCommittedOutcome.type === "control_state_equals"
-        ? (alreadyCommittedOutcome.desiredState || {})
-        : null;
-      const stateControlId = alreadyCommittedOutcome.controlId || decision.controlId || "";
-      const stateControl = stateControlId
-        ? (map.controls || []).find((control) => control.controlId === stateControlId)
-        : null;
-      const observedControlState = desiredControlState ? {
-        checked: typeof target.checked === "boolean"
-          ? target.checked
-          : target.getAttribute?.("aria-checked") != null
-            ? target.getAttribute("aria-checked") === "true"
-            : Boolean(stateControl?.checked === true || stateControl?.selected === true || stateControl?.state?.checked === true),
-        selected: typeof target.selected === "boolean"
-          ? target.selected
-          : Boolean(stateControl?.selected === true || stateControl?.state?.selected === true),
-        pressed: target.getAttribute?.("aria-pressed") != null
-          ? target.getAttribute("aria-pressed") === "true"
-          : Boolean(stateControl?.state?.pressed === true),
-        expanded: target.getAttribute?.("aria-expanded") != null
-          ? target.getAttribute("aria-expanded") === "true"
-          : Boolean(stateControl?.state?.expanded === true)
-      } : null;
-      const desiredStateKeys = desiredControlState
-        ? Object.keys(desiredControlState).filter((key) => typeof desiredControlState[key] === "boolean")
-        : [];
-      const desiredControlStateAlreadySatisfied = Boolean(
-        desiredStateKeys.length
-        && desiredStateKeys.every((key) => observedControlState?.[key] === desiredControlState[key])
-      );
-      if (desiredControlStateAlreadySatisfied) {
-        const verification = verifyExpectedOutcome(alreadyCommittedOutcome, map, map, target);
-        await finalizeGovernedAction(actionId, actionObservationId, decision, alreadyCommittedOutcome, verification, 350);
-        return;
-      }
-      if (!desiredControlState && (
+      if (
         (
           isChoiceSelected(target)
           && (
@@ -1167,7 +1073,7 @@ export function createExecutionOrchestrator({
           )
         )
         || /true/.test(target.getAttribute?.("aria-checked") || "")
-      )) {
+      ) {
         const verification = verifyExpectedOutcome(alreadyCommittedOutcome, map, map, target);
         await finalizeGovernedAction(actionId, actionObservationId, decision, alreadyCommittedOutcome, verification, 350);
         return;
@@ -1212,17 +1118,6 @@ export function createExecutionOrchestrator({
       flashElement(target);
       rememberChoiceVisualStateBeforeDispatch(target, decision);
       rememberCanonicalSelectionCommitment(target, decision);
-      const navigationRequiresHandoff = requiresCheckoutHandoff(decision, expectedOutcome);
-      const navigationEpisode = await armHandoffBeforeDispatch(decision, expectedOutcome);
-      if (navigationRequiresHandoff && !navigationEpisode) {
-        await rejectMechanicalAction(actionId, actionObservationId, decision, {
-          code: "NAVIGATION_EPISODE_ARM_FAILED",
-          message: "The durable cross-document navigation lifecycle could not be armed before dispatch.",
-          dispatched: false
-        }, target);
-        return;
-      }
-      const dispatchedAt = Date.now();
       const clickDispatch = await dispatchGovernedClickMechanic(target, decision, {
         actionId,
         observationId: actionObservationId,
@@ -1243,7 +1138,6 @@ export function createExecutionOrchestrator({
         && (
           decision.interactionRole === "choice"
           || decision.semanticEffect === "select"
-          || decision.semanticEffect === "set_state"
           || ["choose", "select"].includes(decision.operation)
         )
       );
@@ -1261,18 +1155,6 @@ export function createExecutionOrchestrator({
         action: decision,
         targetFingerprint: targetFingerprint(target, decision)
       });
-      if (navigationEpisode) {
-        await holdDispatchedStageExit(
-          actionId,
-          actionObservationId,
-          decision,
-          expectedOutcome,
-          map,
-          dispatchedAt,
-          navigationEpisode
-        );
-        return;
-      }
       if (surfaceWasActive) {
         const progress = await waitForOverlayProgress(beforeOverlay, beforeOverlaySignature, 2200);
         const verification = verificationFromSurfaceFeedback(

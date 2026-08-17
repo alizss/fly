@@ -6,7 +6,7 @@ This is Fly's stable product contract. Implementation status belongs in [FLY_COV
 
 ## 1. North star
 
-> A user selects a flight and traveler, starts Fly, and receives an independently verified booking confirmation with no normal checkout interruption. Fly asks only for genuinely missing facts, authentication, exceptional authority, or a later payment/purchase authorization.
+> A user selects a flight and traveler, starts Fly, answers only genuinely missing or consequential questions, approves the exact transaction, and receives an independently verified booking confirmation.
 
 The intended experience is approximately 1–3 user interactions. Fly is not an airline autofill script; it is one reusable checkout engine shared by the extension, background web runtime, and future iOS product.
 
@@ -21,8 +21,8 @@ approved selected booking
 → correction of unauthorized selections
 → itinerary/traveler/currency/total reconciliation
 → pre-payment review
-→ automatically resolve standard mandatory attestations covered by the checkout mandate
-→ verify the exact attestation and advance separately
+→ exact legal approval when required
+→ accept only the approved attestation and advance
 → verify actual payment entry
 → stop before entering payment credentials, Pay, or purchase
 ```
@@ -52,7 +52,7 @@ A journey is eligible for autonomous checkout-to-review when:
 - The starting total/currency and selected traveler are approved.
 - Required traveler facts are available or can be requested.
 - The site is reachable and exposes a usable browser/accessibility surface.
-- Standard mandatory checkout attestations are covered by the exact initial CheckoutMandate; any exceptional attestation can be handed off with its exact text and owner. Payment-entry and purchase authority remain unavailable.
+- Any required legal attestation can be shown exactly and approved for this booking; payment-entry and purchase authority remain unavailable.
 
 A `99%` claim must always name this eligibility scope. It must not count sold-out inventory, airline outages, mandatory human challenges, or unsupported purchase authority as ordinary agent-navigation failures.
 
@@ -78,13 +78,13 @@ Fly must handle reusable patterns including:
 
 Ordinary DOM differences, a new textbox, unfamiliar wording, or the absence of a site-specific skill are not valid reasons to stop.
 
-When deterministic interpretation is uncertain or internally contradictory, Fly may run one bounded **Semantic Scene Reconciliation** pass before publishing the final `CheckoutScene/v1`. The model may propose a neutral closed-ID `ScenePatch/v1` containing grounded hypotheses about fields, component roles, input formats, decisions, attestations, validations, consequences, and ownership, but every hypothesis must reference fresh observed controls, text, surfaces, or regions. A hypothesis is evidence only: it cannot create an action, traveler fact, requirement, permission, stage exit, transaction fact, or completion claim.
+When deterministic interpretation is uncertain or internally contradictory, Fly may run one bounded **Semantic Scene Reconciliation** pass before constructing the final decision frame. The model may propose grounded hypotheses about fields, component roles, input formats, decisions, attestations, validations, consequences, and ownership, but every hypothesis must reference fresh observed controls, text, surfaces, or regions. A hypothesis is evidence only: it cannot create an action, traveler fact, requirement, permission, transaction fact, or completion claim.
 
-Known scenes remain deterministic with no model call. Semantic reconciliation consumes the same at-most-one ambiguity call available for the turn; it does not create a second model path. Raw observation supplies mechanics and context only. The compiler publishes exactly one immutable `CheckoutScene/v1` per observation, including stable scene items, provenance, contradictions, typed stage, and the sole authoritative stage exit. TaskState consumes that scene and remains the only authority that publishes the next obligation.
+Known scenes remain deterministic with no model call. Semantic reconciliation consumes the same at-most-one ambiguity call available for the turn; it does not create a second model path. The deterministic compiler remains responsible for producing exactly one final `DecisionFrame`, and TaskState remains the only authority that publishes the next obligation.
 
 ### Planning, action, and verification
 
-- One fresh observation compiles deterministically when possible; bounded grounded semantic hypotheses may reconcile an uncertain or contradictory draft before one immutable `CheckoutScene/v1` is published.
+- One fresh observation compiles deterministically when possible; bounded grounded semantic hypotheses may reconcile an uncertain or contradictory draft before one final semantic decision frame is published.
 - TaskState publishes exactly one current obligation or typed disposition.
 - Candidate binding finds mechanics only for that obligation.
 - The governor checks consequences immediately before execution.
@@ -102,11 +102,9 @@ Before advancing through a legal gate or reporting payment entry, Fly must recon
 - Currency and total.
 - Expected verified-action/outcome coverage.
 
-The observed boundaries are distinct: `PRE_PAYMENT_REVIEW`, `LEGAL_GATE`, `PAYMENT_ENTRY`, and `PURCHASE_COMMIT`. Review copy plus a legal checkbox plus a Confirm button is never payment-entry proof. `PAYMENT_ENTRY_REACHED` requires an exact owned actionable payment-method component on the durably owned payment/provider destination, card-number/expiry/CVC controls, or a hosted payment widget/frame. Provider ownership is based on actual site identity, not origin alone: airline subdomains remain the same merchant, while a handoff from the airline's registrable site to an external payment-provider site is distinct. A method selector on an airline's pre-provider setup page is therefore not sufficient. Generic payment wording, a URL, an origin change, a click acknowledgement, or a page change is not completion evidence.
+The observed boundaries are distinct: `PRE_PAYMENT_REVIEW`, `LEGAL_GATE`, `PAYMENT_ENTRY`, and `PURCHASE_COMMIT`. Review copy plus a legal checkbox plus a Confirm button is never payment-entry proof. `PAYMENT_ENTRY_REACHED` requires an owned payment-method component, card-number/expiry/CVC controls, or a hosted payment widget/frame. Generic payment wording, a URL, a click acknowledgement, or a page change is not completion evidence.
 
-Starting Fly creates one immutable `CheckoutMandate/v1` bound to the selected booking, itinerary digest, travelers, approved total, and currency. The mandate authorizes only standard mandatory checkout attestations: booking accuracy, conditions of carriage, selected fare conditions, purchase conditions, and dangerous-goods acknowledgement. It explicitly forbids marketing consent, optional data sharing, insurance, subscriptions, financing, payment credentials, transaction commit, and purchase.
-
-For a covered standard attestation, Fly deterministically binds the exact canonical checkbox owner, verifies its selected state in the next CheckoutScene, records an exact `AttestationReceipt`, and only then separately advances toward payment entry. A link or validation message can be evidence owned by the checkbox but can never replace it as the actuator. Exceptional attestations outside the mandate produce a typed handoff. Changed legal text, transaction, itinerary, travelers, total/currency, scene owner, or control invalidates mandate authorization.
+A legal approval is narrow: transaction, itinerary, travelers, total/currency, exact legal-text digest, checkbox owner, next control, and expiry. Fly first verifies the approved checkbox, then separately advances, then verifies payment entry. Changed legal text, price, traveler, itinerary, control, transaction, or an expired token invalidates the approval.
 
 ### Durability and background operation
 
@@ -118,7 +116,7 @@ Fly may stop or pause for:
 
 - A genuinely missing required traveler fact.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge.
-- An exceptional attestation outside the CheckoutMandate, or a standard attestation that cannot be bound to exact current evidence.
+- A required legal attestation that the user declines or cannot be bound to exact current evidence.
 - Payment credentials, Pay, transaction commit, or another purchase authority boundary.
 - A paid choice, price/currency change, itinerary change, or identity ambiguity not covered by explicit policy.
 - Sold-out inventory, expired session, airline outage, or a site that rejects valid completed input.
@@ -137,7 +135,7 @@ Fly must never:
 - Change route, dates, airports, passengers, or currency without authority.
 - Add or retain an unauthorized paid product.
 - Infer price permission from page wording or an observed total.
-- Accept an attestation without exact current evidence and authority from the transaction-bound CheckoutMandate (or an explicit exceptional handoff).
+- Accept legal terms without the exact current transaction-bound approval.
 - Enter payment credentials, activate Pay, or commit a purchase under the current boundary.
 - Execute a stale, hidden, occluded, mismatched, or ungrounded target.
 - Treat dispatch, navigation, or visual change as semantic success.
@@ -184,7 +182,7 @@ At least two structurally different families must prove:
 
 Track separately:
 
-- Autonomous verified-payment-entry rate for defined eligible journeys, with zero mid-checkout questions for standard mandate-covered attestations and exceptional handoffs counted separately.
+- Autonomous verified-payment-entry rate for defined eligible journeys, with legal approvals counted separately as necessary user interaction.
 - Safe-resolution and necessary-handoff rate.
 - False completion and unauthorized-mutation rate.
 - Recovery rate and duration.

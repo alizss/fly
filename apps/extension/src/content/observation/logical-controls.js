@@ -94,9 +94,9 @@ export function createLogicalControlCompiler(dependencies) {
       || (!AGENT_CONTRACT?.isInsuranceOfferText && /cancellation|voucher refund|insurance|refund/.test(source))) {
       return "cancellation_insurance";
     }
+    if (/continue|protect your personal data/.test(source)) return "continue";
     if (/seat|reserve seating|seat map/.test(source)) return "seat";
     if (/payment|pay|card|cvc/.test(source)) return "payment";
-    if (/continue|protect your personal data/.test(source)) return "continue";
     return "unknown";
   }
   
@@ -533,12 +533,12 @@ export function createLogicalControlCompiler(dependencies) {
   
   function stateElementForControl(element) {
     if (!element) return null;
-    if (element.matches?.("input, select, textarea, a, [role='link'], [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], [role='button'], button")) return element;
+    if (element.matches?.("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], [role='button'], button")) return element;
     const labelledInput = element.getAttribute?.("for")
       ? document.getElementById(element.getAttribute("for"))
       : null;
     if (labelledInput) return labelledInput;
-    return queryAllDeep("input, select, textarea, a, [role='link'], [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], button, [role='button']", element)
+    return queryAllDeep("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], button, [role='button']", element)
       .filter((candidate) => isVisible(candidate) && !candidate.closest("#atw-sidebar"))[0] || element;
   }
   
@@ -920,7 +920,7 @@ export function createLogicalControlCompiler(dependencies) {
       scopes.push(scope);
     }
     for (const container of scopes) {
-      queryAllDeep("button, [role='button'], [role='combobox'], [aria-haspopup='listbox'], [aria-controls], [aria-owns], [tabindex], [onclick], [class*='arrow'], [class*='chevron'], [class*='toggle'], [class*='indicator'], svg", container)
+      queryAllDeep("button, [role='button'], [aria-haspopup='listbox'], [aria-controls], [aria-owns], [tabindex], [onclick], [class*='arrow'], [class*='chevron'], [class*='toggle'], [class*='indicator'], svg", container)
         .forEach((candidate) => {
           if (candidate === stateElement) return;
           const candidateControls = candidate.getAttribute?.("aria-controls") || candidate.getAttribute?.("aria-owns") || "";
@@ -1139,9 +1139,7 @@ export function createLogicalControlCompiler(dependencies) {
     };
     const stateId = elementId(stateElement);
     const activationId = activationElement ? elementId(activationElement) : "";
-    const sourceId = element ? elementId(element) : "";
     const tag = String(stateElement?.tagName || "").toLowerCase();
-    const sourceTag = String(element?.tagName || "").toLowerCase();
     const inputType = String(stateElement?.getAttribute?.("type") || "").toLowerCase();
     const dropdownLike = profileChoiceOpener || tag === "select" || role === "combobox" || role === "listbox" || stateElement?.getAttribute?.("aria-haspopup") === "listbox";
     const editable = stateElement?.isContentEditable
@@ -1160,39 +1158,22 @@ export function createLogicalControlCompiler(dependencies) {
     }
     if (dropdownLike) {
       const openCandidates = (openTargetCandidates || []).filter((candidate) => candidate.operationProven === true);
-      // A hidden native select is frequently only the framework state owner;
-      // a visible ARIA combobox beside it is the real actuator (Select2 and
-      // similar widgets). Preserve native-select as the fast path, but also
-      // publish an exact proven opener when that distinct actuator exists.
-      if (tag !== "select" || state.disabled === true || openCandidates.length > 0) {
+      if (tag !== "select" || state.disabled === true) {
         operations.open = make("open", openCandidates, "options_surface_appeared", { expanded: false });
       }
       if (tag !== "select") {
         operations.keyboard = make("keyboard", [stateId], "semantic_progress", { disabled: false });
       }
     }
-    if ((["option", "radio", "checkbox"].includes(kind) || ["option", "radio", "checkbox"].includes(role))
-      && state.disabled !== true) {
+    if (["option", "radio", "checkbox"].includes(kind) || ["option", "radio", "checkbox"].includes(role)) {
       operations.choose = make(
         "choose",
         [...choiceActuatorCandidates, activationId, stateId],
         "control_selected",
         { disabled: false }
       );
-    } else if (!dropdownLike && (
-      kind === "button"
-      || role === "button"
-      // A rendered anchor is mechanically capable of receiving a pointer
-      // activation even when a framework registers its handler out-of-band
-      // and omits href/onclick/tabindex. This proves only the exact local
-      // dispatch mechanic; CheckoutScene still owns its semantic meaning and
-      // the verifier must observe the declared postcondition afterwards.
-      || kind === "link"
-      || role === "link"
-      || tag === "a"
-      || sourceTag === "a"
-    )) {
-      operations.activate = make("activate", [activationId, stateId, sourceId], "observable_change", { disabled: false });
+    } else if (!dropdownLike && (kind === "button" || role === "button")) {
+      operations.activate = make("activate", [activationId, stateId], "observable_change", { disabled: false });
     }
     return operations;
   }
@@ -2177,14 +2158,7 @@ export function createLogicalControlCompiler(dependencies) {
       ];
     }
     const choiceObservation = selectLike
-      ? observedChoiceOptionsForControl(stateElement, wrapper, {
-          // Profile-field evidence is more specific than the generic final
-          // control semantic (for example a custom select may otherwise be
-          // just "choice"). The observer needs that owned meaning now so it
-          // can retain the exact desired option before applying its cap.
-          semantic: fieldType || fieldSemantic || semantic,
-          dateField
-        })
+      ? observedChoiceOptionsForControl(stateElement, wrapper, { semantic, dateField })
       : { options: [], totalCount: 0, truncated: false, goalMatchedCount: 0 };
     const observedChoiceOptions = choiceObservation.options;
     const operations = controlOperationsForElement({
