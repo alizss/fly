@@ -16,6 +16,7 @@ export function createSessionClient({
   observationHashForMap,
   pageSnapshot,
   pageStateStore,
+  readStartupDiagnostics,
   renderSidebar,
   resetAgentLoopLifecycle,
   setAgentActivity,
@@ -34,6 +35,11 @@ export function createSessionClient({
     try {
       agent.sessionStartFailure = null;
       recordStartEvent("START_CLICKED", { startAttemptId, resume: Boolean(resumeSessionId) });
+      const startupEvents = await readStartupDiagnostics();
+      recordStartEvent("STARTUP_CONTEXT", {
+        startAttemptId,
+        events: startupEvents.slice(-12)
+      });
       const settings = await storageGet(["apiBase"]);
       const selectedTraveler = traveler();
       if (!selectedTraveler?.id) {

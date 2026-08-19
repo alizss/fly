@@ -1,6 +1,6 @@
 # Fly — Current Codebase Engineering Handoff
 
-Last updated: 2026-08-10
+Last updated: 2026-08-19
 
 Branch: `dev`
 
@@ -18,8 +18,8 @@ The current engineering priority is cross-airline structural generalization—no
 
 | Area | Status |
 |---|---|
-| Agent unit suite | 359/359 passing |
-| Browser replay suite | 169/169 passing in one uninterrupted run |
+| Agent unit suite | 383/383 passing |
+| Browser replay suite | 179-replay corpus; 178/178 prior uninterrupted baseline plus focused Croatia PAY-boundary proof |
 | Build/type/syntax gate | `npm run check` passing |
 | Live sites | EasyJet, GoToGate, Kiwi, and Turkish reached verified payment review in the latest technical canaries |
 | Safety | No payment, card, legal, or purchase action in those review-only flows |
@@ -75,6 +75,7 @@ Do not add a second readiness meaning layer, planner, verifier, requirement life
 Composition root:
 
 - `apps/extension/src/content/runtime.js` — dependency wiring, startup, shared browser integration, and test hooks.
+- `apps/extension/src/background/service-worker.js` — tab-scoped checkout lineage, app-supplied booking launch, explicit universal runtime injection, startup diagnostics, and trusted browser input.
 - `apps/extension/src/content/runtime-context.js` — sole runtime state owner with scoped capabilities.
 
 Observation:
@@ -136,6 +137,10 @@ Controller and UI:
 
 A new transaction requires one complete `SelectedBooking/v1`: itinerary, approved total/currency, and selected traveler. Browser acquisition owns site facts; the extension wallet owns traveler selection. Startup waits once for bounded hydration and creates no provisional transaction when the contract is unavailable. Resume uses the durable baseline.
 
+### Explicit universal launch
+
+The extension popup now starts Fly on the active HTTP(S) checkout through `chrome.scripting`, so an explicitly launched unfamiliar domain does not require a manifest content-script entry. The background worker may install an app-supplied complete `SelectedBooking/v1` before injection, or preserve current-tab browser acquisition under the same `CheckoutContext/v1`. It reinjects only an explicitly authorized active checkout with booking/resume evidence across full-page and cross-domain redirects. Startup phases are retained per tab and copied into the start-attempt diagnostic stream before session creation.
+
 ### Single-dispatch stage exit
 
 A dispatched Continue remains `NAVIGATION_TRANSITION_PENDING` until material mutation or deadline. The browser repeat guard is scoped to the exact governed action lease—not DOM signature alone—so a fresh checkout stage may immediately reuse the same physical Continue control while exact duplicate dispatch remains blocked.
@@ -174,8 +179,8 @@ npm run canary:report -- --latest-by-site
 Full acceptance after a material core change:
 
 1. Focused trace-derived replay passes.
-2. 359 unit tests pass.
-3. 169 browser replays pass uninterrupted.
+2. 383 unit tests pass.
+3. The 179-replay browser corpus has a 178/178 uninterrupted baseline plus focused Croatia PAY-boundary proof.
 4. `npm run check` and `git diff --check` pass.
 5. Discovering site reaches verified payment review or the expected typed handoff.
 6. At least one retained canary passes.

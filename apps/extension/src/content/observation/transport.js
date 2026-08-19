@@ -361,7 +361,13 @@ export function createObservationTransport({
       transportMode: "observation_reference",
       page: {
         referenceOnly: true,
-        snapshotHash: update.snapshotHash || update.baseSnapshotHash
+        snapshotHash: update.snapshotHash || update.baseSnapshotHash,
+        // Screenshot references are observation-bound. A reference turn still
+        // has a new observation id, so forward the freshly uploaded reference
+        // instead of inheriting the prior observation's screenshot id.
+        screenshotId: payload.page?.screenshotId || "",
+        screenshotDataUrl: payload.page?.screenshotDataUrl || "",
+        screenshotAnnotations: payload.page?.screenshotAnnotations || []
       }
     };
   }

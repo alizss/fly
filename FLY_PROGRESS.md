@@ -1,6 +1,6 @@
 # Fly — Current Progress
 
-Last updated: 2026-08-10
+Last updated: 2026-08-19
 
 This is the concise chronological engineering record. Current acceptance truth belongs in [FLY_COVERAGE_MATRIX.md](./FLY_COVERAGE_MATRIX.md); stable product scope in [FLY_VISION_PRD.md](./FLY_VISION_PRD.md); architecture and sequence in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md).
 
@@ -10,7 +10,7 @@ This is the concise chronological engineering record. Current acceptance truth b
 |---|---|
 | Product milestone | Universal unfamiliar checkout to verified payment review; no legal/payment/purchase action |
 | Architecture | One ObservationFrame → DecisionFrame → TaskState/CurrentObligation → mechanics → governor → ActionLease → verification loop |
-| Automated baseline | 359/359 unit, 169/169 browser, `npm run check` |
+| Automated baseline | 383/383 unit; 179 browser corpus with 178/178 uninterrupted baseline; `npm run check` |
 | Live evidence | EasyJet, GoToGate, Kiwi, and Turkish technically reached verified payment review safely |
 | Formal evidence gap | Latest normalized canary reports require explicit intervention annotation |
 | Highest-priority product gap | Cross-airline structural portfolio, not another architecture rewrite |
@@ -31,6 +31,15 @@ Prove that the current universal loop transfers to unfamiliar structural familie
 Every failure must produce an exact replay and a universal repair. A new DOM, ordinary field, custom control, or unusual grouping is not an expected handoff.
 
 ## Latest implementation checkpoints
+
+### 2026-08-19 — Explicit universal checkout launch
+
+- The extension action can inject the existing runtime and sidebar into any active HTTP(S) checkout through `chrome.scripting`; a named manifest domain is no longer required for explicit launch.
+- The same launch accepts an optional complete tab-scoped `SelectedBooking/v1`, preserving the existing `BookingAdmission/v1` and `CheckoutContext/v1` authorities rather than adding another mandate.
+- Startup phases are retained per tab and copied into a per-attempt pre-session diagnostic log, so injection, lineage, booking admission, and session failures no longer collapse into one `no-session` log.
+- Runtime injection is idempotent, follows an authorized active checkout across full-page/cross-domain redirects, can auto-start the existing controller after boot, rejects unsupported browser-internal pages with a typed result, and keeps missing booking evidence as a safe startup failure.
+
+Validation: 383/383 unit tests, a 178/178 uninterrupted browser baseline plus focused Croatia PAY-boundary proof, repository checks, and `git diff --check`. Fresh live Lufthansa and Wizz/Ryanair proof remains required; the latest Croatia trace reached PAY and exposed the now-replayed boundary/transport repairs.
 
 ### 2026-08-10 — Strict checkout admission and transition settling
 
@@ -127,11 +136,11 @@ The canary tool reports these as `review_required` until operator intervention i
 
 ## Next work
 
-1. Record explicit intervention annotations for the latest four canaries.
-2. Run Lufthansa controlled baseline; classify any failure before editing code.
+1. Reload the extension and restart the backend so the explicit universal launcher is active.
+2. Run Lufthansa controlled baseline through the popup launch; classify any failure before editing code.
 3. Convert material failure into an exact replay and universal component repair.
 4. Rerun the discovering site plus EasyJet or Kiwi retained canary.
-5. Run Ryanair or Wizz confirmation baseline.
+5. Run Ryanair or Wizz through the same explicit launch as the low-cost confirmation baseline.
 6. Continue the structural portfolio before the complex profile-policy Cartesian matrix.
 7. In parallel, measure observation construction, serialization, transport, persistence, ambiguity calls, dispatch, and verification; optimize only proven hot paths.
 

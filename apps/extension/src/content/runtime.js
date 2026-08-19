@@ -64,7 +64,28 @@ import {
 } from "./observation/prices.js";
 
 (async function bootAirTravelWallet() {
-  if (document.getElementById("atw-sidebar")) return;
+  if (globalThis.__ATW_RUNTIME_V1__ === true) return;
+  globalThis.__ATW_RUNTIME_V1__ = true;
+
+  let explicitStartRequested = false;
+  let runtimeReadyForExplicitStart = false;
+  let executeExplicitStart = null;
+  globalThis.chrome?.runtime?.onMessage?.addListener?.((message, _sender, sendResponse) => {
+    if (message?.type !== "ATW_START_AGENT") return false;
+    explicitStartRequested = true;
+    if (!executeExplicitStart || !runtimeReadyForExplicitStart) {
+      sendResponse({ ok: true, status: "queued" });
+      return false;
+    }
+    Promise.resolve(executeExplicitStart())
+      .then((started) => sendResponse({
+        ok: started !== false,
+        status: started === false ? "failed" : "started",
+        code: started === false ? String(agent.sessionStartFailure?.code || "SESSION_START_FAILED") : ""
+      }))
+      .catch((error) => sendResponse({ ok: false, status: "failed", error: error.message }));
+    return true;
+  });
 
   const DEFAULT_API = "http://localhost:4173/api";
   const MAX_OBSERVATION_TRANSPORT_BYTES = 5_250_000;
@@ -320,6 +341,15 @@ import {
       return response?.ok === true ? response.context || null : null;
     } catch (error) {
       return null;
+    }
+  }
+
+  async function readStartupDiagnostics() {
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "ATW_STARTUP_DIAGNOSTICS" });
+      return response?.ok === true && Array.isArray(response.events) ? response.events : [];
+    } catch (_error) {
+      return [];
     }
   }
 
@@ -1734,13 +1764,25 @@ import {
       AGENT_CONTRACT?.isPaymentCommitText?.(actionElementLabel(element))
       || /^(?:pay(?:\s+now|\s+securely|\s+by\s+(?:card|bank|wallet)|\s+[\d.,]+)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase|place\s+order)\b/i.test(actionElementLabel(element))
     ));
+    const paymentReviewConfirmPresent = visibleActions.some((element) => (
+      /^(?:confirm|review\s+and\s+confirm)$/i.test(actionElementLabel(element).trim())
+    ));
+    const visibleHeadingLabels = queryAllDeep("h1, h2, h3, legend, [role='heading']")
+      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
+      .map((element) => String(element.innerText || element.textContent || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean);
+    const visibleHeadingText = visibleHeadingLabels.join(" ").slice(0, 1200);
+    const exactPaymentHeadingPresent = visibleHeadingLabels.some((label) => (
+      /^(?:\d+\.\s*)?(?:pay|payment)(?:\s+(?:pay|payment))?$/i.test(label)
+    ));
     const activeProgressText = visibleTerminalNodes
       .filter((element) => element.matches("[aria-current='step'], [data-current='true'], [data-active='true']"))
       .map((element) => actionElementLabel(element) || element.textContent || "")
       .join(" ")
       .slice(0, 500);
     const normalized = String(fullText || "").replace(/\s+/g, " ");
-    const activePaymentProgress = /\bpayment\b|\bpay\b/i.test(activeProgressText);
+    const activePaymentProgress = /\bpayment\b|\bpay\b/i.test(activeProgressText)
+      || /\bcurrent\s+step\s+pay\b|(?:^|\s)3\.\s*pay(?:\s+pay)?(?:\s|$)/i.test(normalized);
     const paymentRoute = /(?:^|\/)payments?(?:\/|$)/i.test(String(location.pathname || ""));
     const visiblePaymentOwners = queryAllDeep([
       "main",
@@ -1806,13 +1848,15 @@ import {
       visibleTextFallbackAllowed: paymentOwnerPresent,
       paymentMethodPresent: /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/i.test(normalized),
       payControlPresent,
+      paymentReviewConfirmPresent,
       legalAcceptancePresent: visibleInputs.some((input) => input.type === "checkbox" && (
         AGENT_CONTRACT?.isLegalAcceptanceText?.(labelText(input))
         || /terms|conditions|privacy|purchase/i.test(labelText(input))
       )),
       reviewSummaryPresent: /\b(?:amount\s+to\s+pay|total)\b/i.test(normalized)
-        && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/i.test(normalized),
-      paymentHeadingPresent: /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/i.test(normalized),
+        && /\b(?:departure|return|itinerary|travel\s+details|your\s+(?:order|booking))\b/i.test(normalized),
+      paymentHeadingPresent: exactPaymentHeadingPresent
+        || /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/i.test(visibleHeadingText),
       activePaymentProgress,
       activeProgressText,
       progressivePaymentEntryPresent,
@@ -2388,6 +2432,7 @@ import {
     observationHashForMap,
     pageSnapshot,
     pageStateStore,
+    readStartupDiagnostics,
     renderSidebar: (...args) => renderSidebar(...args),
     resetAgentLoopLifecycle,
     setAgentActivity,
@@ -3470,6 +3515,14 @@ import {
     stopWatchingCheckoutChanges: () => stopWatchingCheckoutChanges(),
     travelerRules
   });
+  executeExplicitStart = async () => {
+    if (!runtimeReadyForExplicitStart) {
+      explicitStartRequested = true;
+      return null;
+    }
+    if (agent.running || agent.loopBusy) return true;
+    return takeOverCheckout();
+  };
 
   const {
     agentDecisionHtml,
@@ -3678,6 +3731,7 @@ import {
     await fetchData();
     await hydrateSelectedBookingAcquisition();
     armSelectedBookingCapture();
+    runtimeReadyForExplicitStart = true;
     warnings = [];
     const resumeMarker = await readResumeMarker();
     const currentTabContextId = await tabContextId();
@@ -3692,6 +3746,7 @@ import {
       if (resumeMarker) await clearResumeMarker();
       renderSidebar();
     }
+    if (explicitStartRequested && !agent.running) await executeExplicitStart();
   } catch (error) {
     const root = document.createElement("aside");
     root.id = "atw-sidebar";

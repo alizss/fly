@@ -3,7 +3,7 @@
   "name": "Air Travel Wallet",
   "version": "0.1.0",
   "description": "Autofill traveler details, flag booking risks, and save trips from checkout pages.",
-  "permissions": ["storage", "activeTab", "tabs", "debugger"],
+  "permissions": ["storage", "activeTab", "tabs", "scripting", "debugger"],
   "host_permissions": [
     "<all_urls>",
     "http://localhost:4173/*",

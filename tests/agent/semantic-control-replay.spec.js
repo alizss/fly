@@ -5125,6 +5125,50 @@ test("final terms review with Pay by card is terminal before legal acceptance", 
   expect(state.currentGoal).toBeNull();
 });
 
+test("Croatia-shaped PAY review with legal terms and Confirm is a terminal payment boundary", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>3. PAY PAY</h1>
+      <nav>SELECT COMPLETED STEP BOOK COMPLETED STEP PAY CURRENT STEP</nav>
+      <section><h2>Promotion code</h2><label>Do you have a promotion code? <input name="promotion_code"></label><button>Apply</button></section>
+      <section>
+        <h2>Payment</h2>
+        <p>Total to be paid is <strong>EUR 152.62</strong></p>
+        <p>Do you need time to think?</p>
+        <button>No, thanks</button><button>Yes</button>
+      </section>
+      <aside aria-label="Your booking">
+        <h2>YOUR BOOKING</h2>
+        <p>1 traveller</p><p>Departure Zagreb (ZAG) to Sarajevo (SJJ)</p><p>Return Sarajevo (SJJ) to Zagreb (ZAG)</p>
+        <strong>TOTAL EUR 152.62</strong>
+      </aside>
+      <section>
+        <h2>Terms and conditions</h2>
+        <label><input id="terms" name="TermsAndCondition" type="checkbox" required>
+          Yes, I have examined all the information and confirm the travellers' names and surnames are accurate.
+          I agree with the General Conditions of Carriage and purchase conditions and understand dangerous goods restrictions.
+        </label>
+      </section>
+      <button id="confirm" type="button">CONFIRM</button>
+    </main>
+  `);
+
+  const observation = await browserObservation(page, "obs_croatia_pay_review");
+  expect(observation.page.terminalEvidence).toMatchObject({
+    stage: "payment_review",
+    boundaryObserved: true,
+    signals: {
+      progress: true,
+      review: true,
+      legal: true,
+      reviewConfirm: true
+    }
+  });
+  expect(observation.page.step).toBe("payment");
+  const termsControl = observation.page.controls.find((control) => control.controlId && /TermsAndCondition/i.test(control.name || control.label || ""));
+  expect(termsControl).toMatchObject({ semantic: "legal_acceptance", risk: "legal" });
+});
+
 test("opaque native choice completes open and select as one trusted episode", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>
@@ -5560,7 +5604,15 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
         snapshotHash: compact.snapshotHash,
         material: false
       },
-      page: compact,
+      page: {
+        ...compact,
+        screenshotId: "shot_current_observation",
+        screenshotAnnotations: [{
+          visualRef: "F1",
+          controlId: compact.controls[0]?.controlId || "ctrl_current",
+          box: { x: 1, y: 2, width: 3, height: 4 }
+        }]
+      },
       destinationReadiness: { retryToken: "retry_current_surface_once" }
     };
     const referencePayload = hooks.referenceObservationTransport(fullPayload);
@@ -5587,7 +5639,10 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
   expect(result.state.destinationWait.retryToken).toBe("retry_current_surface_once");
   expect(result.referencePayload).toMatchObject({
     transportMode: "observation_reference",
-    page: { referenceOnly: true },
+    page: {
+      referenceOnly: true,
+      screenshotId: "shot_current_observation"
+    },
     destinationReadiness: { retryToken: "retry_current_surface_once" }
   });
   expect(result.referenceBytes).toBeLessThan(result.fullBytes / 2);

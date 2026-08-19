@@ -91,11 +91,15 @@ export function createFlowDiagnostics({
 
   function sendFlowLog(entry) {
     const apiBase = agent.apiBase || DEFAULT_API;
+    const diagnosticSessionId = agent.sessionId
+      || entry.payload?.startAttemptId
+      || entry.turnId
+      || "";
     fetch(`${apiBase}/agent/client-log`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        sessionId: agent.sessionId || "",
+        sessionId: diagnosticSessionId,
         clientTurnId: entry.turnId || agent.activeTurnId || "",
         entry
       })

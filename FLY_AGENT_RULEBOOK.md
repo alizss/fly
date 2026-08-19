@@ -111,8 +111,8 @@ Do not remove distinct safety roles merely because they inspect related evidence
 - The exact failure replay passes.
 - No completed work reopens or loops.
 - Correct profile/policy state survives navigation and rerender.
-- 359/359 unit tests pass.
-- 169/169 browser replays pass uninterrupted.
+- The current full unit suite passes.
+- The current full browser replay suite passes uninterrupted.
 - `npm run check` and `git diff --check` pass.
 - The discovering site and one retained canary pass.
 - No unauthorized irreversible action executes.

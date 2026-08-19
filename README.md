@@ -49,8 +49,9 @@ The model is optional and bounded. Deterministic singleton mechanics use zero mo
 
 ## Current evidence
 
-- 359/359 agent unit tests
-- 169/169 uninterrupted browser replays
+- 383/383 agent unit tests
+- 179 browser replays (178/178 uninterrupted baseline plus the focused Croatia PAY-boundary replay)
+- Explicit active-tab runtime launch is replay-proven on an unlisted checkout domain
 - Fresh technical payment-review passes on EasyJet, GoToGate, Kiwi, and Turkish Airlines
 - No payment, card, legal, or purchase action in the accepted review-only flows
 - Next product gate: expand from four live sites to a representative structural portfolio

@@ -7,7 +7,9 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 const CHECKOUT_CONTEXT_PREFIX = "atwCheckoutContextV1";
 const SELECTED_BOOKING_ACQUISITION_PREFIX = "atwSelectedBookingAcquisitionV1";
+const STARTUP_DIAGNOSTICS_PREFIX = "atwStartupDiagnosticsV1";
 const SELECTED_BOOKING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const STARTUP_DIAGNOSTIC_LIMIT = 40;
 
 function checkoutContextKey(tabId) {
   return `${CHECKOUT_CONTEXT_PREFIX}:${tabId}`;
@@ -15,6 +17,35 @@ function checkoutContextKey(tabId) {
 
 function selectedBookingAcquisitionKey(tabId) {
   return `${SELECTED_BOOKING_ACQUISITION_PREFIX}:${tabId}`;
+}
+
+function startupDiagnosticsKey(tabId) {
+  return `${STARTUP_DIAGNOSTICS_PREFIX}:${tabId}`;
+}
+
+async function appendStartupDiagnostic(tabId, code, details = {}) {
+  if (!Number.isInteger(tabId)) return null;
+  const key = startupDiagnosticsKey(tabId);
+  const stored = await chrome.storage.local.get(key);
+  const previous = Array.isArray(stored?.[key]) ? stored[key] : [];
+  const event = {
+    at: new Date().toISOString(),
+    code: String(code || "STARTUP_EVENT"),
+    details: details && typeof details === "object" ? details : {}
+  };
+  await chrome.storage.local.set({ [key]: [...previous, event].slice(-STARTUP_DIAGNOSTIC_LIMIT) });
+  return event;
+}
+
+async function readStartupDiagnostics(tabId) {
+  if (!Number.isInteger(tabId)) return [];
+  const key = startupDiagnosticsKey(tabId);
+  const stored = await chrome.storage.local.get(key);
+  return Array.isArray(stored?.[key]) ? stored[key] : [];
+}
+
+function injectableCheckoutUrl(url = "") {
+  return /^https?:\/\//i.test(String(url || ""));
 }
 
 function checkoutLineageId() {
@@ -96,10 +127,119 @@ async function installSelectedBookingLaunch(tabId, rawContract = null) {
   return { ok: true, context };
 }
 
+async function injectCheckoutRuntime(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!injectableCheckoutUrl(tab?.url)) {
+    await appendStartupDiagnostic(tabId, "RUNTIME_INJECTION_REJECTED", {
+      reason: "UNSUPPORTED_TAB_URL"
+    });
+    return { ok: false, code: "UNSUPPORTED_CHECKOUT_TAB", error: "Fly can run only on an http(s) checkout tab." };
+  }
+  let origin = "";
+  try {
+    origin = new URL(tab.url).origin;
+  } catch (_error) {
+    origin = "";
+  }
+  await appendStartupDiagnostic(tabId, "RUNTIME_INJECTION_STARTED", { origin });
+  await chrome.scripting.insertCSS({
+    target: { tabId },
+    files: ["src/content/sidebar.css"]
+  });
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["dist/content.js"]
+  });
+  await appendStartupDiagnostic(tabId, "RUNTIME_INJECTED");
+  return { ok: true };
+}
+
+async function startCheckoutOnTab(tabId, {
+  selectedBookingContract = null,
+  autoStart = true
+} = {}) {
+  if (!Number.isInteger(tabId)) return { ok: false, code: "CHECKOUT_TAB_REQUIRED" };
+  const launch = selectedBookingContract
+    ? await installSelectedBookingLaunch(tabId, selectedBookingContract)
+    : { ok: true, context: await ensureCheckoutContext(tabId, { source: "explicit_agent_start" }) };
+  if (!launch.ok) {
+    await appendStartupDiagnostic(tabId, "SELECTED_BOOKING_REJECTED", { code: launch.code || "INVALID_SELECTED_BOOKING" });
+    return launch;
+  }
+  await appendStartupDiagnostic(tabId, selectedBookingContract ? "SELECTED_BOOKING_INSTALLED" : "CHECKOUT_CONTEXT_READY", {
+    checkoutLineageId: launch.context?.checkoutLineageId || "",
+    selectionId: launch.context?.selectedBookingContract?.selectionId || ""
+  });
+  try {
+    const injected = await injectCheckoutRuntime(tabId);
+    if (!injected.ok) return injected;
+    let startStatus = "injected";
+    if (autoStart) {
+      try {
+        const response = await chrome.tabs.sendMessage(tabId, { type: "ATW_START_AGENT" });
+        startStatus = response?.status || "queued";
+        const startCode = response?.ok === false ? "AGENT_START_FAILED" : "AGENT_START_REQUESTED";
+        await appendStartupDiagnostic(tabId, startCode, { status: startStatus, code: response?.code || "" });
+        if (response?.ok === false) {
+          return {
+            ok: false,
+            code: response.code || "AGENT_START_FAILED",
+            error: "Fly was injected, but the checkout session could not start.",
+            context: launch.context,
+            startStatus
+          };
+        }
+      } catch (error) {
+        // Injection succeeded. If browser message delivery races initial boot,
+        // the sidebar remains available and the diagnostics identify the seam.
+        await appendStartupDiagnostic(tabId, "AGENT_START_MESSAGE_PENDING", {
+          reason: String(error?.message || "CONTENT_RUNTIME_NOT_READY")
+        });
+      }
+    }
+    return { ok: true, context: launch.context, startStatus };
+  } catch (error) {
+    await appendStartupDiagnostic(tabId, "RUNTIME_INJECTION_FAILED", {
+      reason: String(error?.message || "RUNTIME_INJECTION_FAILED")
+    });
+    return { ok: false, code: "RUNTIME_INJECTION_FAILED", error: String(error?.message || "Fly runtime injection failed.") };
+  }
+}
+
+async function shouldFollowExplicitCheckout(tabId) {
+  const context = await readCheckoutContext(tabId);
+  if (!context || !["explicit_agent_start", "app_launch"].includes(context.source)) return false;
+  if (validSelectedBookingContract(context.selectedBookingContract)) return true;
+  const stored = await chrome.storage.local.get([
+    selectedBookingAcquisitionKey(tabId),
+    "atwAgentResume"
+  ]);
+  if (stored?.[selectedBookingAcquisitionKey(tabId)]) return true;
+  const resume = stored?.atwAgentResume || null;
+  return String(resume?.tabContextId || "") === String(tabId)
+    && Number(resume?.savedAt || 0) > Date.now() - 3 * 60 * 1000
+    && Boolean(String(resume?.sessionId || ""));
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete" || !injectableCheckoutUrl(tab?.url)) return;
+  (async () => {
+    if (!await shouldFollowExplicitCheckout(tabId)) return;
+    await appendStartupDiagnostic(tabId, "RUNTIME_REINJECTION_STARTED", {
+      origin: new URL(tab.url).origin
+    });
+    await injectCheckoutRuntime(tabId);
+    await appendStartupDiagnostic(tabId, "RUNTIME_REINJECTED");
+  })().catch((error) => appendStartupDiagnostic(tabId, "RUNTIME_REINJECTION_FAILED", {
+    reason: String(error?.message || "RUNTIME_REINJECTION_FAILED")
+  }));
+});
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   chrome.storage.local.remove([
     checkoutContextKey(tabId),
-    selectedBookingAcquisitionKey(tabId)
+    selectedBookingAcquisitionKey(tabId),
+    startupDiagnosticsKey(tabId)
   ]).catch(() => undefined);
 });
 
@@ -122,6 +262,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     readCheckoutContext(tabId)
       .then((context) => sendResponse({ ok: true, context }))
       .catch((error) => sendResponse({ ok: false, code: "CHECKOUT_CONTEXT_UNAVAILABLE", error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "ATW_STARTUP_DIAGNOSTICS") {
+    const tabId = sender.tab?.id;
+    if (!Number.isInteger(tabId)) {
+      sendResponse({ ok: false, code: "CHECKOUT_TAB_REQUIRED", events: [] });
+      return false;
+    }
+    readStartupDiagnostics(tabId)
+      .then((events) => sendResponse({ ok: true, events }))
+      .catch((error) => sendResponse({ ok: false, code: "STARTUP_DIAGNOSTICS_UNAVAILABLE", error: error.message, events: [] }));
+    return true;
+  }
+
+  if (message?.type === "ATW_START_CHECKOUT") {
+    const extensionOwnedMessage = sender.id === chrome.runtime.id;
+    const tabId = Number.isInteger(sender.tab?.id)
+      ? sender.tab.id
+      : (extensionOwnedMessage && Number.isInteger(message.tabId) ? message.tabId : null);
+    startCheckoutOnTab(tabId, {
+      selectedBookingContract: message.selectedBookingContract || null,
+      autoStart: message.autoStart !== false
+    })
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, code: "CHECKOUT_START_FAILED", error: error.message }));
     return true;
   }
 

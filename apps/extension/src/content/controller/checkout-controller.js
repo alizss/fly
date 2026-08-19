@@ -68,7 +68,7 @@ export function createCheckoutController({
         activeLoopRunId: agent.activeLoopRunId,
         lifecycleId: agent.lifecycleId
       });
-      return;
+      return true;
     }
     resetAgentLoopLifecycle("start_agent");
     agent.running = true;
@@ -104,7 +104,7 @@ export function createCheckoutController({
           : `I could not establish one durable checkout session, so I stopped before planning or changing the page.${agent.sessionStartFailure?.message ? ` ${agent.sessionStartFailure.message}` : ""}`
       );
       renderSidebar("agent");
-      return;
+      return false;
     }
     startWatchingCheckoutChanges();
     await saveResumeMarker();
@@ -113,6 +113,7 @@ export function createCheckoutController({
     await announceSectionQueue();
     await sleep(650);
     processCheckoutAgent();
+    return true;
   }
 
   async function resumeCheckoutAfterNavigation(marker) {

@@ -396,7 +396,12 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
           ...previous.page,
           referenceOnly: false,
           incremental: false,
-          snapshotHash: previousHash
+          snapshotHash: previousHash,
+          screenshotId: body.page?.screenshotId || "",
+          screenshotDataUrl: body.page?.screenshotDataUrl || "",
+          screenshotAnnotations: Array.isArray(body.page?.screenshotAnnotations)
+            ? body.page.screenshotAnnotations
+            : []
         }
       };
     }

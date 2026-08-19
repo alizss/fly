@@ -10,6 +10,7 @@ const { sendJson } = require("../../apps/web/http/response");
 const { createStaticHandler } = require("../../apps/web/http/static");
 const { createAgentRoutes } = require("../../apps/web/routes/agent");
 const { createScreenshotStore } = require("../../apps/web/agent/screenshot-store");
+const { createRequestPayloadAdapter } = require("../../apps/web/agent/request-payload");
 const {
   summarizeActionLedgerRow,
   summarizeClientFlowLog
@@ -123,6 +124,40 @@ test("screenshot references remain bounded to their durable session and observat
     () => screenshots.screenshotForObservation({ screenshotId }, { sessionId: "chk_2", observationId: "obs_1" }),
     (error) => error.code === "SCREENSHOT_SESSION_MISMATCH"
   );
+});
+
+test("reference observations replace the prior screenshot with the current observation reference", () => {
+  const previous = {
+    observationSnapshot: { snapshotHash: "hash_same_page" },
+    page: {
+      snapshotHash: "hash_same_page",
+      screenshotId: "shot_previous_observation",
+      screenshotAnnotations: [{ visualRef: "F0" }]
+    }
+  };
+  const { hydrateIncrementalAgentBody } = createRequestPayloadAdapter({
+    agentSessionStore: { getCurrentObservation: () => previous },
+    screenshotForObservation: () => ({ screenshotId: "", screenshotDataUrl: "" })
+  });
+  const hydrated = hydrateIncrementalAgentBody({
+    sessionId: "chk_reference",
+    observationId: "obs_current",
+    observationUpdate: {
+      mode: "reference",
+      baseSnapshotHash: "hash_same_page",
+      snapshotHash: "hash_same_page"
+    },
+    page: {
+      referenceOnly: true,
+      snapshotHash: "hash_same_page",
+      screenshotId: "shot_current_observation",
+      screenshotAnnotations: [{ visualRef: "F1" }]
+    }
+  });
+
+  assert.equal(hydrated.page.screenshotId, "shot_current_observation");
+  assert.deepEqual(hydrated.page.screenshotAnnotations, [{ visualRef: "F1" }]);
+  assert.equal(hydrated.page.referenceOnly, false);
 });
 
 test("wallet store owns encrypted persistence and extension-only document disclosure", () => {

@@ -2,6 +2,7 @@ const apiInput = document.getElementById("api-base");
 const statusEl = document.getElementById("status");
 const travelerSelect = document.getElementById("traveler");
 const saveButton = document.getElementById("save");
+const startButton = document.getElementById("start");
 
 async function getSettings() {
   return chrome.storage.local.get(["apiBase", "selectedTravelerId"]);
@@ -36,6 +37,32 @@ saveButton.addEventListener("click", async () => {
     selectedTravelerId: travelerSelect.value
   });
   statusEl.textContent = "Settings saved";
+});
+
+startButton.addEventListener("click", async () => {
+  startButton.disabled = true;
+  statusEl.textContent = "Starting Fly on the current checkout…";
+  try {
+    await chrome.storage.local.set({
+      apiBase: apiInput.value.trim() || "http://localhost:4173/api",
+      selectedTravelerId: travelerSelect.value
+    });
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!Number.isInteger(tab?.id)) throw new Error("No active checkout tab is available.");
+    const result = await chrome.runtime.sendMessage({
+      type: "ATW_START_CHECKOUT",
+      tabId: tab.id,
+      autoStart: true
+    });
+    if (!result?.ok) throw new Error(result?.error || result?.code || "Fly could not start on this tab.");
+    statusEl.textContent = result.startStatus === "started"
+      ? "Fly started on the current checkout"
+      : "Fly was injected and is starting";
+    window.close();
+  } catch (error) {
+    statusEl.textContent = error.message;
+    startButton.disabled = false;
+  }
 });
 
 init();

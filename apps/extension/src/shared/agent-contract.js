@@ -407,6 +407,7 @@
     const method = structural.paymentMethodPresent === true
       || /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/.test(visible);
     const commit = structural.payControlPresent === true || isPaymentCommitText(visible);
+    const reviewConfirm = structural.paymentReviewConfirmPresent === true;
     const legal = structural.legalAcceptancePresent === true;
     const review = structural.reviewSummaryPresent === true
       || (/\b(?:amount\s+to\s+pay|total)\b/.test(visible)
@@ -418,13 +419,14 @@
     // payment/currency prompt is already the irreversible boundary we promise
     // to stop at. URL or generic payment prose alone can never create it.
     const entry = structural.progressivePaymentEntryPresent === true;
-    const signals = Object.freeze({ route, progress, form, method, commit, legal, review, heading, entry });
+    const signals = Object.freeze({ route, progress, form, method, commit, reviewConfirm, legal, review, heading, entry });
     const signalStates = Object.freeze({
       route: terminalSignalState(route, Boolean(url)),
       progress: terminalSignalState(progress),
       form: terminalSignalState(form, structural.paymentOwnerProbeState === "observed_absent"),
       method: terminalSignalState(method),
       commit: terminalSignalState(commit),
+      reviewConfirm: terminalSignalState(reviewConfirm),
       legal: terminalSignalState(legal),
       review: terminalSignalState(review),
       heading: terminalSignalState(heading),
@@ -448,6 +450,11 @@
       // must stop; requiring hydrated card fields here caused the agent to
       // reinterpret final checkout as an earlier traveler/seat page.
       || (review && legal && commit)
+      // A review page can label the irreversible boundary "Confirm" instead
+      // of "Pay". Only admit that otherwise ambiguous control when the page
+      // also proves active payment progress, exact review ownership and legal
+      // acceptance. The control remains evidence-only and is never executed.
+      || (progress && review && legal && reviewConfirm)
     );
     return Object.freeze({
       contractVersion: TERMINAL_EVIDENCE_VERSION,

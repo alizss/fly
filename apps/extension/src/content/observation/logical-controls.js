@@ -2011,8 +2011,16 @@ export function createLogicalControlCompiler(dependencies) {
     const sectionLabel = context.sectionLabel || context.section?.label || "";
     const sectionId = context.sectionId || context.section?.id || "";
     const surface = context.surface || {};
-    const fallbackSemantic = fieldType || (/radio|checkbox|option/.test(kind) || presentationBinding
+    const explicitChoiceSemantic = /radio|checkbox|option/.test(kind)
       ? semanticChoiceType(label)
+      : "";
+    // Consequence-bearing attestations outrank incidental profile words in
+    // their prose. For example, legal copy can mention travelers' surnames;
+    // that must not turn the checkbox into a last-name field.
+    const fallbackSemantic = explicitChoiceSemantic === "legal_acceptance"
+      ? explicitChoiceSemantic
+      : fieldType || (/radio|checkbox|option/.test(kind) || presentationBinding
+      ? explicitChoiceSemantic || semanticChoiceType(label)
       : (fieldSemantic !== "unknown" ? fieldSemantic : semanticChoiceType(label)));
     const ownedMeaning = resolveOwnedControlMeaning(ownedEvidence, fallbackSemantic, surface.type || "page");
     // Once an exclusive option owner has been reconstructed, broad label
@@ -2041,7 +2049,9 @@ export function createLogicalControlCompiler(dependencies) {
       && /^(continue|next|proceed|go without|continue without)\b/i.test(label)) {
       physicalEffect = "dismiss_surface";
     }
-    const semantic = fieldType
+    const semantic = explicitChoiceSemantic === "legal_acceptance"
+      ? explicitChoiceSemantic
+      : fieldType
       || (presentationBinding && Number(structuredPrice?.amount) === 0 ? "select_free_option" : "")
       || (presentationBinding && Number(structuredPrice?.amount) > 0 ? "add_paid_extra" : "")
       || ownedMeaning.semantic
