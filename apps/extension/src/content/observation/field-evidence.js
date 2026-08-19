@@ -154,6 +154,7 @@ export function createFieldEvidence({
   function classifyProfileField(input, hintedField = "") {
     const hinted = canonicalProfileFieldType(hintedField);
     if (!input) return { fieldType: "", source: "none", confidence: 0, evidence: [] };
+    const tag = String(input.tagName || "").toUpperCase();
     const type = String(input.getAttribute?.("type") || input.type || "").toLowerCase();
     const role = String(implicitRole(input) || "").toLowerCase();
     const autocomplete = String(input.getAttribute?.("autocomplete") || "").toLowerCase();
@@ -186,6 +187,25 @@ export function createFieldEvidence({
       }
       return null;
     };
+    // Profile facts belong to value-entry controls. Activation-only controls
+    // and checkboxes often carry long descriptive copy (legal terms are the
+    // important example), so words such as "names", "e-mail", or "age" in
+    // that copy are not evidence that the control edits that profile fact.
+    // Radios remain eligible because tightly-owned option groups can encode
+    // actual profile values such as title or gender.
+    const activationOnly = ["A", "BUTTON"].includes(tag)
+      || ["button", "link", "option"].includes(role)
+      || ["button", "submit", "reset"].includes(type);
+    if (activationOnly || type === "checkbox" || role === "checkbox") {
+      return result(
+        "",
+        "direct_non_profile_control",
+        0.99,
+        [input.name, input.id, input.getAttribute?.("data-testid"), input.getAttribute?.("aria-label")]
+          .filter(Boolean)
+          .join(" ")
+      );
+    }
     if (hinted) return result(hinted, "canonical_hint", 1, hintedField);
 
     const autocompleteAliases = {

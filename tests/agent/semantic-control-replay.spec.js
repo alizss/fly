@@ -5146,7 +5146,8 @@ test("Croatia-shaped PAY review with legal terms and Confirm is a terminal payme
         <h2>Terms and conditions</h2>
         <label><input id="terms" name="TermsAndCondition" type="checkbox" required>
           Yes, I have examined all the information and confirm the travellers' names and surnames are accurate.
-          I agree with the General Conditions of Carriage and purchase conditions and understand dangerous goods restrictions.
+          I agree with the <a href="#conditions">General Conditions of Carriage</a>
+          and <a href="#purchase">purchase conditions</a> and understand dangerous goods restrictions.
         </label>
       </section>
       <button id="confirm" type="button">CONFIRM</button>
@@ -5167,6 +5168,23 @@ test("Croatia-shaped PAY review with legal terms and Confirm is a terminal payme
   expect(observation.page.step).toBe("payment");
   const termsControl = observation.page.controls.find((control) => control.controlId && /TermsAndCondition/i.test(control.name || control.label || ""));
   expect(termsControl).toMatchObject({ semantic: "legal_acceptance", risk: "legal" });
+  expect(termsControl.fieldClassification).toMatchObject({
+    fieldType: "",
+    source: "direct_non_profile_control"
+  });
+  const termsLinks = observation.page.controls.filter((control) => (
+    control.role === "link"
+    && /general conditions|purchase conditions/i.test(control.label || "")
+  ));
+  expect(termsLinks.every((control) => !control.fieldClassification?.fieldType)).toBe(true);
+
+  const state = reduceTaskState({
+    observation,
+    transactionReview: verifiedTransactionReview(152.62)
+  });
+  expect(state.stage).toBe("payment");
+  expect(state.terminalStatus).toBe("payment_review_reached");
+  expect(state.currentGoal).toBeNull();
 });
 
 test("opaque native choice completes open and select as one trusted episode", async ({ page }) => {
