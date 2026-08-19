@@ -2,6 +2,7 @@
 
 const { resolveProfileDecision } = require("./policy-profile");
 const agentContract = require("../../extension/src/shared/agent-contract");
+const { activeValidationIssues } = require("./validation-evidence");
 
 const CONTROL_TYPES = Object.freeze({
   VALUE_FIELD: "value_field",
@@ -552,7 +553,7 @@ function canonicalDecisionForGroup({
           ? "committed"
           : "unresolved";
   const required = group.required === true;
-  const validation = (page.validationIssues || []).find((issue) => (
+  const validation = activeValidationIssues(page.validationIssues || []).find((issue) => (
     issue.stageWide === true
     || [id, group.requirementId, group.sectionId, selectedId].filter(Boolean).includes(
       clean(issue.decisionGroupId || issue.requirementId || issue.sectionId || issue.controlId)

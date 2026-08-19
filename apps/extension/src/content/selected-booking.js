@@ -37,6 +37,93 @@ function itineraryIdentity(value = null) {
   return JSON.stringify(normalized);
 }
 
+function checkoutSiteIdentity(value = "") {
+  try {
+    const hostname = new URL(String(value || ""), globalThis.location?.href || "https://invalid.test").hostname
+      .toLowerCase()
+      .replace(/^www\./, "");
+    const labels = hostname.split(".").filter(Boolean);
+    if (labels.length <= 2) return hostname;
+    const publicSuffix = labels.slice(-2).join(".");
+    return ["co.uk", "com.au", "co.nz", "co.jp"].includes(publicSuffix)
+      ? labels.slice(-3).join(".")
+      : labels.slice(-2).join(".");
+  } catch (error) {
+    return "";
+  }
+}
+
+export function selectedBookingMissingFacts(acquisition = null, map = null) {
+  const facts = acquisition?.facts || map?.transactionFacts || null;
+  const segments = Array.isArray(facts?.itinerary?.segments) ? facts.itinerary.segments : [];
+  const missing = [];
+  if (!segments.length) missing.push("itinerary");
+  else {
+    if (segments.some((segment) => !String(segment?.origin || "").trim() || !String(segment?.destination || "").trim())) missing.push("route");
+    if (segments.some((segment) => !String(segment?.departureDate || segment?.departure_date || "").trim())) missing.push("departure_date");
+  }
+  const amount = Number(facts?.totalPrice?.amount ?? map?.price?.amount);
+  const currency = String(facts?.totalPrice?.currency || facts?.currency || map?.price?.currency || "").trim();
+  if (!Number.isFinite(amount) || amount < 0) missing.push("approved_total");
+  if (!currency) missing.push("currency");
+  return Object.freeze([...new Set(missing)]);
+}
+
+export function selectedBookingAdmissionState(acquisition = null, map = null, {
+  now = Date.now(),
+  currentUrl = globalThis.location?.href || "",
+  currentCheckoutLineageId = "",
+  checkoutLineageAuthoritative = false
+} = {}) {
+  if (!acquisition) {
+    const missingFacts = selectedBookingMissingFacts(null, map);
+    const hasCandidateEvidence = missingFacts.length < 4;
+    return Object.freeze({
+      status: hasCandidateEvidence ? "candidate" : "absent",
+      reason: hasCandidateEvidence ? "CURRENT_TAB_BOOKING_PARTIAL" : "CURRENT_TAB_BOOKING_ABSENT",
+      missingFacts
+    });
+  }
+  const capturedAt = Date.parse(String(acquisition.capturedAt || ""));
+  if (!Number.isFinite(capturedAt) || now - capturedAt > SELECTED_BOOKING_MAX_AGE_MS) {
+    return Object.freeze({ status: "expired", reason: "CURRENT_TAB_BOOKING_EXPIRED", missingFacts: selectedBookingMissingFacts(acquisition, map) });
+  }
+  const compatibility = selectedBookingCompatibilityWithMap(acquisition, map);
+  if (compatibility.status === "conflict") {
+    return Object.freeze({ status: "conflict", reason: compatibility.reason, missingFacts: selectedBookingMissingFacts(acquisition, map) });
+  }
+  const acquisitionLineageId = String(acquisition.checkoutLineageId || "").trim();
+  const activeLineageId = String(currentCheckoutLineageId || "").trim();
+  if (checkoutLineageAuthoritative && (!acquisitionLineageId || acquisitionLineageId !== activeLineageId)) {
+    return Object.freeze({
+      status: "conflict",
+      reason: "CURRENT_TAB_CHECKOUT_LINEAGE_MISMATCH",
+      missingFacts: selectedBookingMissingFacts(acquisition, map)
+    });
+  }
+  // Migration fallback for acquisitions created by older extension builds.
+  // New checkouts use the background-owned lineage above, so a legitimate
+  // airline -> unrelated booking-provider redirect does not look stale merely
+  // because its registrable domain changed.
+  if (!checkoutLineageAuthoritative && compatibility.status === "unknown") {
+    const sourceSite = checkoutSiteIdentity(acquisition.sourceUrl || acquisition.sourceOrigin);
+    const currentSite = checkoutSiteIdentity(currentUrl);
+    if (sourceSite && currentSite && sourceSite !== currentSite) {
+      return Object.freeze({
+        status: "conflict",
+        reason: "CURRENT_TAB_CHECKOUT_LINEAGE_MISMATCH",
+        missingFacts: selectedBookingMissingFacts(acquisition, map)
+      });
+    }
+  }
+  const confirmed = authoritativeSelectedBookingFacts(acquisition.facts);
+  return Object.freeze({
+    status: confirmed ? "confirmed" : "candidate",
+    reason: confirmed ? "CURRENT_TAB_BOOKING_CONFIRMED" : "CURRENT_TAB_BOOKING_PARTIAL",
+    missingFacts: selectedBookingMissingFacts(acquisition, map)
+  });
+}
+
 function bookingFactsFromCandidate(candidate = null) {
   if (!candidate || typeof candidate !== "object") return null;
   if (candidate.facts?.itinerary) return candidate.facts;
@@ -144,11 +231,14 @@ export function approvedSelectedBookingAcquisitionFromMap(map = null, {
   };
   return {
     contractVersion: "selected-booking-acquisition/v1",
+    admissionStatus: "confirmed",
+    checkoutLineageId: `checkout_${String(observationHash || now.toString(36)).slice(0, 48)}`,
     capturedAt: new Date(now).toISOString(),
     sourceOrigin: globalThis.location?.origin || "",
     sourceUrl: String(sourceUrl || ""),
     observationId: `booking_start_${String(observationHash || now.toString(36))}`,
     approvalSource,
+    missingFacts: [],
     facts: approvedFacts
   };
 }

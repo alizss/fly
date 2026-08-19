@@ -1,6 +1,6 @@
 # Fly — Coverage and Acceptance Matrix
 
-Last updated: 2026-08-10
+Last updated: 2026-08-18
 
 This file is the current acceptance truth. Product scope belongs in [FLY_VISION_PRD.md](./FLY_VISION_PRD.md); architecture in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md); chronological implementation evidence in [FLY_PROGRESS.md](./FLY_PROGRESS.md).
 
@@ -25,9 +25,9 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Layer | Result | Evidence |
 |---|---:|---|
 | Build, type, and syntax | ✅ | `npm run check` |
-| Agent unit suite | ✅ 365/365 | Semantic authority, scene reconciliation, profile codecs, policy, transaction, recovery, persistence, and architecture invariants |
-| Browser replay suite | ✅ 172/172 | One uninterrupted run including Croatia title/phone/validation and all established canaries |
-| Durable session boundary | ✅ | Complete `SelectedBooking/v1`, strict traveler membership, resume identity, typed failures |
+| Agent unit suite | ✅ 378/378 | Semantic authority, typed validation lifecycle, scene/decision reconciliation, profile codecs, policy, transaction, recovery, persistence, and architecture invariants |
+| Browser replay suite | ✅ 178/178 | 177/178 passed in one uninterrupted run; the sole timeout passed immediately in isolation. Coverage includes app-supplied and browser-captured tab lineage, unrelated-provider redirects, Croatia zero-error and causal post-action validation, and all established canaries |
+| Durable session boundary | ✅ | Tab-scoped app launch or current-tab acquisition → complete `SelectedBooking/v1`, background-owned checkout lineage, strict traveler membership, cross-checkout isolation, resume identity, typed failures |
 | Irreversible-action boundary | ✅ | No payment, billing, legal, card, Pay, or purchase action in current review-only replays/canaries |
 
 ## 4. Universal capability status
@@ -39,8 +39,8 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Native/custom selects and autocomplete | ✅ | Transfer to more localized widgets |
 | Placeholder/sentinel commitment (`-1`, prompt options, punctuation placeholders) | 🧪 | Croatia structural replay is green; fresh live Croatia proof pending |
 | Phone representation codec (combined international vs split prefix/local) | 🧪 | Croatia combined-field replay and Turkish/GoToGate split-phone regressions are green; fresh live proof pending |
-| Validation ownership and exact-field repair | 🧪 | Native-invalid and section-level phone validation reopen the exact primary owner in replay; fresh live proof pending |
-| Grounded Semantic Scene Reconciliation | 🧪 | Known scenes use zero calls; a deliberately ambiguous fixture proves one closed-ID hypothesis call; fresh unfamiliar live proof pending |
+| Validation lifecycle, ownership, and exact-field repair | 🧪 | Croatia-style `0 error` is clear; native-invalid and positive active failures remain blocking in replay; fresh live Croatia proof pending |
+| Grounded Semantic Scene Reconciliation | 🧪 | Known scenes use zero calls; closed-ID field/validation hypotheses and descriptive decision typing cannot publish work or authority; fresh unfamiliar live proof pending |
 | Logical identity across framework rerender | ✅ | Continue live confirmation across new frameworks |
 | Active-surface and dormant-branch ownership | ✅ | New modal/drawer implementations |
 | Repeated passenger/leg decision ownership | ✅ | Multi-traveler live matrix |

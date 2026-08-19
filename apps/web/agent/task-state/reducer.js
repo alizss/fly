@@ -15,6 +15,7 @@ const {
 const { normalizeProfilePolicy, seatPolicyFrom } = require("../policy-profile");
 const { canonicalDecisionOwnerKey } = require("../transaction-facts");
 const { canonicalOptionMatch, missingDerivedFactDependency } = require("../logical-field");
+const { activeValidationIssues } = require("../validation-evidence");
 const { adaptiveInteractionGoal } = require("../adaptive-interaction");
 const {
   currentObligation,
@@ -92,10 +93,12 @@ function lower(value = "") {
 
 function semanticIdentity(source = {}, fallback = {}) {
   if (!source || typeof source !== "object") return "";
+  // The lease-published canonical owner is already an identity. Never
+  // regenerate it from a legacy repeated-instance alias carried beside it.
+  if (source.semanticOwnerId) return clean(source.semanticOwnerId);
   if (source.semanticOwner) {
     return clean(semanticOwnerId(semanticOwnerFromLegacy(source, fallback)));
   }
-  if (source.semanticOwnerId) return clean(source.semanticOwnerId);
   if (!source.semanticOwner) {
     // One-way migration for receipts written before structured ownership.
     // Preserve their established durable key so a direct receipt and its
@@ -592,7 +595,10 @@ function reduceDecisionFrame({
   );
   if (verifiedFreeSelection) {
     const instanceId = clean(
-      authoritativeActionResult.decisionInstanceId
+      semanticIdentity(authoritativeActionResult)
+      || semanticIdentity(verifiedAction)
+      || semanticIdentity(previousGoal)
+      || authoritativeActionResult.decisionInstanceId
       || verifiedAction.decisionInstanceId
       || verifiedLineage.decisionInstanceId
       || (
@@ -605,6 +611,8 @@ function reduceDecisionFrame({
     completions.set(instanceId, {
       decisionGroupId: verifiedDecisionGroupId,
       instanceId,
+      semanticOwnerId: instanceId,
+      canonicalOwnerId: instanceId,
       requirementId: clean(
         authoritativeActionResult.requirementId
         || verifiedExpectedOutcome.requirementId
@@ -765,7 +773,7 @@ function reduceDecisionFrame({
   const suspendedDecisions = foreground
     ? canonicalDecisions.filter((decision) => decision.surfaceId !== surface.id && GOAL_CREATING.has(decision.status))
     : [];
-  const validationBlockers = (page.validationIssues || []).filter((issue) => issue.stageWide === true || !issue.controlId || (page.controls || []).some((control) => (
+  const validationBlockers = activeValidationIssues(page.validationIssues || []).filter((issue) => issue.stageWide === true || !issue.controlId || (page.controls || []).some((control) => (
     control.controlId === issue.controlId && controlBelongsToCurrentSurface(control, page)
   )));
   const controlIds = forwardControlIds(observation);

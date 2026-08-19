@@ -6,6 +6,7 @@ const {
 } = require("./date-field-codec");
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { currentSurface: authoritativeCurrentSurface } = require("./surface-contract");
+const { activeValidationIssues } = require("./validation-evidence");
 
 const PROFILE_FIELDS = new Set(agentContract.PROFILE_FIELD_TYPES);
 const DATE_FIELDS = new Set(["date_of_birth", "document_issue_date", "passport_expiry", "document_expiry"]);
@@ -581,7 +582,7 @@ function validationIssueContradictedByFreshOwner(issue = {}, control = {}) {
 }
 
 function relevantComponentIssues(page = {}, control = {}, logicalFieldId = "", role = "") {
-  const observed = (page.validationIssues || []).filter((issue) => {
+  const observed = activeValidationIssues(page.validationIssues || []).filter((issue) => {
     const owned = Boolean(control.controlId && issue.controlId === control.controlId)
       || Boolean(
         logicalFieldId
@@ -607,7 +608,7 @@ function relevantComponentIssues(page = {}, control = {}, logicalFieldId = "", r
 }
 
 function relevantLogicalIssues(page = {}, logicalFieldId = "", controlIds = new Set(), ownerKey = "") {
-  return (page.validationIssues || []).filter((issue) => {
+  return activeValidationIssues(page.validationIssues || []).filter((issue) => {
     const owned = Boolean(logicalFieldId && issue.logicalFieldId === logicalFieldId && !issue.componentRole)
       || Boolean(ownerKey && issue.logicalOwnerKey === ownerKey && !issue.componentRole)
       || Boolean(issue.controlId && controlIds.has(issue.controlId));

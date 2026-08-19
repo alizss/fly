@@ -45,7 +45,9 @@ function errorsOf(page = {}) {
     message: clean(issue.message, 220),
     controlId: clean(issue.controlId, 140),
     sectionId: clean(issue.sectionId, 80),
-    stageWide: issue.stageWide === true
+    stageWide: issue.stageWide === true,
+    status: clean(issue.status, 40),
+    active: issue.active === true
   })), ...(page.errors || []).map((message) => ({
     key: clean(message, 240), message: clean(message, 220), controlId: "", sectionId: "", stageWide: true
   }))];

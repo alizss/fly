@@ -9,6 +9,7 @@ const { reduceTaskState } = require("./task-state-replay-adapter");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { semanticOwnerId } = require("../../packages/shared/semantic-owner");
 
 function readyTransactionReview() {
   const transaction = {
@@ -3999,6 +4000,118 @@ test("payment review remains active until every verified decision is present in 
   assert.equal(accepted.terminalStatus, "payment_review_reached");
   assert.equal(accepted.transactionReview.ready, true);
   assert.equal(accepted.outcomeCoverage.complete, true);
+});
+
+test("a verified free choice keeps its canonical semantic owner through receipt journal ledger and rerenders", () => {
+  const semanticOwner = {
+    stage: "extras",
+    family: "extras",
+    subjectId: "kiwi_flexibility_risk",
+    passengerId: "trav_1",
+    segmentId: "segment_1",
+    repeatedInstance: "kiwi-flexibility-risk-owner"
+  };
+  const canonicalOwnerId = semanticOwnerId(semanticOwner);
+  const legacyDecisionInstanceId = "extras:legacy-repeat:kiwi-risk:17";
+  const actionResult = {
+    actionId: "act_kiwi_take_risk",
+    semanticOwner,
+    semanticOwnerId: canonicalOwnerId,
+    decisionInstanceId: legacyDecisionInstanceId,
+    dispatched: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    mechanicalEffect: "select_free_option",
+    expectedOutcome: {
+      type: "exact_free_option_selected",
+      decisionGroupId: "dg_kiwi_risk",
+      expectedSelectedControlId: "kiwi_take_risk",
+      expectedSelectedLabel: "I'll take the risk",
+      expectedDisposition: "decline_free_no_extra"
+    },
+    action: {
+      id: "act_kiwi_take_risk",
+      semanticOwner,
+      semanticOwnerId: canonicalOwnerId,
+      decisionInstanceId: legacyDecisionInstanceId,
+      decisionGroupId: "dg_kiwi_risk",
+      controlId: "kiwi_take_risk",
+      targetLabel: "I'll take the risk",
+      mechanicalEffect: "select_free_option",
+      affordance: {
+        physicalEffect: "select_free_option",
+        task: {
+          semanticOwnerId: canonicalOwnerId,
+          decisionInstanceId: legacyDecisionInstanceId,
+          decisionGroupId: "dg_kiwi_risk",
+          semanticType: "kiwi_flexibility_risk"
+        }
+      }
+    }
+  };
+  const receipt = verifiedCommerceObligationFromActionResult(actionResult, "obs_kiwi_risk_verified");
+  assert.equal(receipt.semanticOwnerId, canonicalOwnerId);
+  assert.equal(receipt.decisionInstanceId, canonicalOwnerId);
+  assert.notEqual(receipt.semanticOwnerId, legacyDecisionInstanceId);
+
+  const ledgerOutcome = {
+    ...receipt,
+    originKind: "verified_commerce_decision",
+    sourceKind: "verified_commerce_decision"
+  };
+  const paymentObservation = {
+    observationId: "obs_kiwi_payment_review",
+    observationSnapshot: { snapshotHash: "hash_kiwi_payment_review" },
+    lastActionResult: actionResult,
+    page: {
+      url: "https://www.kiwi.com/en/booking/payment",
+      step: "payment",
+      heading: "Payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Payment" },
+      controls: [],
+      decisionGroups: [],
+      terminalEvidence: {
+        contractVersion: "terminal-evidence/v1",
+        stage: "payment_review",
+        signals: { route: true, progress: true, form: true, method: true, heading: true },
+        signalCount: 5,
+        boundaryObserved: true,
+        verified: true,
+        evidenceOnly: true,
+        capabilities: { paymentActionsAllowed: false }
+      },
+      validationIssues: []
+    }
+  };
+  const transactionReview = { ...readyTransactionReview(), outcomeLedger: [ledgerOutcome] };
+  const first = reduceTaskState({
+    previousTaskState: {},
+    observation: paymentObservation,
+    previousActionResult: actionResult,
+    verifiedCommerceObligations: [receipt, receipt],
+    transactionReview
+  });
+
+  assert.equal(first.verifiedCommerceObligations.length, 1);
+  assert.equal(first.outcomeJournal.length, 1);
+  assert.equal(first.outcomeJournal[0].semanticOwnerId, canonicalOwnerId);
+  assert.deepEqual(first.outcomeCoverage.missingActionIds, []);
+  assert.deepEqual(first.outcomeCoverage.missingDecisionInstanceIds, []);
+  assert.equal(first.terminalStatus, "payment_review_reached");
+
+  const rerendered = reduceTaskState({
+    previousTaskState: first,
+    observation: { ...paymentObservation, observationId: "obs_kiwi_payment_review_rerender" },
+    verifiedCommerceObligations: [receipt],
+    transactionReview
+  });
+  assert.equal(rerendered.verifiedCommerceObligations.length, 1);
+  assert.equal(rerendered.outcomeJournal.length, 1);
+  assert.equal(rerendered.outcomeJournal[0].semanticOwnerId, canonicalOwnerId);
+  assert.deepEqual(rerendered.outcomeCoverage.missingActionIds, []);
+  assert.deepEqual(rerendered.outcomeCoverage.missingDecisionInstanceIds, []);
+  assert.equal(rerendered.terminalStatus, "payment_review_reached");
 });
 
 test("unknown grounding remains diagnostic and cannot manufacture profile unready state", () => {

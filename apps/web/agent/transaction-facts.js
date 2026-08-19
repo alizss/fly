@@ -64,7 +64,7 @@ function canonicalSubjectKey(extra = {}) {
 
 function canonicalDecisionOwnerKey(extra = {}) {
   const owner = semanticToken(
-    extra.decisionOwnerKey || extra.decisionInstanceId || extra.ownerKey,
+    extra.semanticOwnerId || extra.decisionOwnerKey || extra.decisionInstanceId || extra.ownerKey,
     300
   );
   return owner.length <= 96
@@ -187,11 +187,17 @@ function normalizeExtra(extra = {}, currency = "") {
   const decisionOwnerKey = canonicalDecisionOwnerKey(extra);
   const canonicalKey = canonicalOutcomeKey({ ...extra, family, subjectKey, decisionOwnerKey });
   const sourceKind = text(extra.sourceKind || extra.originKind, 60);
+  const semanticOwnerId = text(extra.semanticOwnerId, 300);
   return {
     decisionGroupId: text(extra.decisionGroupId, 140),
-    ...(extra.decisionInstanceId ? { decisionInstanceId: text(extra.decisionInstanceId, 220) } : {}),
+    ...(semanticOwnerId ? { semanticOwnerId } : {}),
+    ...(semanticOwnerId || extra.decisionInstanceId
+      ? { decisionInstanceId: semanticOwnerId || text(extra.decisionInstanceId, 220) }
+      : {}),
     ...(decisionOwnerKey ? { decisionOwnerKey } : {}),
-    ...(extra.canonicalOwnerId ? { canonicalOwnerId: text(extra.canonicalOwnerId, 220) } : {}),
+    ...(semanticOwnerId || extra.canonicalOwnerId
+      ? { canonicalOwnerId: semanticOwnerId || text(extra.canonicalOwnerId, 220) }
+      : {}),
     ...(sourceKind ? { sourceKind } : {}),
     outcomeKey: text(
       family === "extras" && decisionOwnerKey
@@ -249,7 +255,11 @@ function mergeCommerceSelections(...collections) {
     for (const raw of Array.isArray(collection) ? collection : []) {
       const extra = normalizeExtra(raw, raw?.currency || "");
       if (!extra) continue;
-      const key = extra.outcomeKey || canonicalOutcomeKey(extra);
+      const verifiedOwnerKey = extra.verified === true
+        && extra.sourceKind === "verified_commerce_decision"
+        ? canonicalDecisionOwnerKey(extra)
+        : "";
+      const key = verifiedOwnerKey ? `verified:${verifiedOwnerKey}` : extra.outcomeKey || canonicalOutcomeKey(extra);
       if (!key) continue;
       const previous = merged.get(key) || {};
       merged.set(key, {

@@ -2,6 +2,7 @@ import {
   SELECTED_BOOKING_MAX_AGE_MS,
   approvedSelectedBookingAcquisitionFromMap,
   authoritativeSelectedBookingFacts,
+  selectedBookingAdmissionState,
   selectedBookingCompatibilityWithMap
 } from "./selected-booking.js";
 import { currentNavigationUrl } from "./navigation-identity.js";
@@ -12,6 +13,8 @@ const START_ACQUISITION_TIMEOUT_MS = 10_000;
 const START_MUTATION_SETTLE_MS = 180;
 
 export function createSelectedBookingAcquisition({
+  checkoutContextRead = async () => null,
+  checkoutLineageBegin = async () => null,
   durableClear = async () => undefined,
   durableRead = async () => null,
   durableWrite = async () => undefined,
@@ -26,12 +29,53 @@ export function createSelectedBookingAcquisition({
   let durableAcquisition = null;
   let durableHydrated = false;
   let durableMutation = Promise.resolve();
+  let checkoutContext = null;
   let selectionCaptureArmed = false;
+  let lastAdmissionConflict = null;
   let captureAttempt = {
     url: "",
     snapshotHash: "",
     retryAfter: 0
   };
+
+  function lineageAdmissionOptions() {
+    const checkoutLineageId = String(checkoutContext?.checkoutLineageId || "").trim();
+    return {
+      currentUrl: currentNavigationUrl(),
+      currentCheckoutLineageId: checkoutLineageId,
+      checkoutLineageAuthoritative: Boolean(checkoutLineageId)
+    };
+  }
+
+  async function refreshCheckoutContext() {
+    try {
+      const current = await checkoutContextRead();
+      if (current?.contractVersion === "checkout-context/v1") {
+        checkoutContext = current;
+        if (current.source === "app_launch" && current.selectedBookingContract) {
+          durableAcquisition = null;
+          try {
+            sessionStorage.removeItem(SELECTED_BOOKING_KEY);
+          } catch (error) {
+            // The background tab context remains authoritative.
+          }
+        }
+      }
+    } catch (error) {
+      // Browser-visible acquisition remains available during a background-worker outage.
+    }
+    return checkoutContext;
+  }
+
+  async function beginCheckoutLineage({ rotate = false } = {}) {
+    try {
+      const current = await checkoutLineageBegin({ rotate });
+      if (current?.contractVersion === "checkout-context/v1") checkoutContext = current;
+    } catch (error) {
+      // The legacy same-document fallback below remains bounded to this tab.
+    }
+    return checkoutContext;
+  }
 
   function validAcquisition(acquisition = null, { requireCurrentOrigin = false } = {}) {
     const capturedAt = Date.parse(acquisition?.capturedAt || "");
@@ -49,6 +93,9 @@ export function createSelectedBookingAcquisition({
     try {
       const acquisition = JSON.parse(sessionStorage.getItem(SELECTED_BOOKING_KEY) || "null");
       if (!validAcquisition(acquisition, { requireCurrentOrigin: true })) {
+        if (acquisition) lastAdmissionConflict = selectedBookingAdmissionState(acquisition, pageStateStore.current(), {
+          ...lineageAdmissionOptions()
+        });
         sessionStorage.removeItem(SELECTED_BOOKING_KEY);
         return null;
       }
@@ -61,16 +108,29 @@ export function createSelectedBookingAcquisition({
   async function hydrate() {
     if (durableHydrated) return read();
     durableHydrated = true;
+    await refreshCheckoutContext();
+    if (checkoutContext?.source === "app_launch" && checkoutContext.selectedBookingContract) return null;
     try {
       const acquisition = await durableRead();
       if (validAcquisition(acquisition)) {
-        durableAcquisition = acquisition;
-        try {
-          sessionStorage.setItem(SELECTED_BOOKING_KEY, JSON.stringify(acquisition));
-        } catch (error) {
-          // Cross-origin durable storage is authoritative when sessionStorage is unavailable.
+        const admission = selectedBookingAdmissionState(acquisition, pageStateStore.current(), {
+          ...lineageAdmissionOptions()
+        });
+        if (admission.status === "confirmed") {
+          durableAcquisition = acquisition;
+          try {
+            sessionStorage.setItem(SELECTED_BOOKING_KEY, JSON.stringify(acquisition));
+          } catch (error) {
+            // Cross-origin durable storage is authoritative when sessionStorage is unavailable.
+          }
+        } else {
+          lastAdmissionConflict = admission;
+          await durableClear();
         }
       } else if (acquisition) {
+        lastAdmissionConflict = selectedBookingAdmissionState(acquisition, pageStateStore.current(), {
+          ...lineageAdmissionOptions()
+        });
         await durableClear();
       }
     } catch (error) {
@@ -81,6 +141,7 @@ export function createSelectedBookingAcquisition({
 
   function persist(acquisition = null) {
     if (!acquisition) return null;
+    lastAdmissionConflict = null;
     durableAcquisition = acquisition;
     try {
       sessionStorage.setItem(SELECTED_BOOKING_KEY, JSON.stringify(acquisition));
@@ -110,37 +171,56 @@ export function createSelectedBookingAcquisition({
       .catch(() => undefined);
   }
 
-  function capture(map = null) {
+  function capture(map = null, { checkoutLineageId = "", replaceExisting = false } = {}) {
     const facts = authoritativeSelectedBookingFacts(map?.transactionFacts);
     if (!facts) return null;
     const existing = read();
     // The approved flight is immutable after checkout leaves flight selection.
-    if (existing && map?.step !== "flight_selection") return existing;
+    if (existing && map?.step !== "flight_selection" && !replaceExisting) return existing;
     const acquisition = {
       contractVersion: "selected-booking-acquisition/v1",
+      admissionStatus: "confirmed",
+      checkoutLineageId: String(
+        checkoutLineageId
+        || checkoutContext?.checkoutLineageId
+        || existing?.checkoutLineageId
+        || `checkout_${Date.now().toString(36)}`
+      ),
       capturedAt: new Date().toISOString(),
       sourceOrigin: location.origin,
       sourceUrl: currentNavigationUrl(),
       observationId: `booking_capture_${Date.now().toString(36)}`,
+      approvalSource: "observed_authoritative_booking",
+      missingFacts: [],
       facts
     };
     return persist(acquisition);
   }
 
-  function approveVisibleSummary(map = null, approvalSource = "explicit_agent_start") {
+  function approveVisibleSummary(map = null, approvalSource = "explicit_agent_start", { checkoutLineageId = "" } = {}) {
     const observationHash = String(observationHashForMap(map) || "");
-    return persist(approvedSelectedBookingAcquisitionFromMap(map, {
+    const acquisition = approvedSelectedBookingAcquisitionFromMap(map, {
       approvalSource,
       observationHash,
       sourceUrl: currentNavigationUrl()
-    }));
+    });
+    if (!acquisition) return null;
+    return persist({
+      ...acquisition,
+      checkoutLineageId: String(
+        checkoutLineageId
+        || checkoutContext?.checkoutLineageId
+        || acquisition.checkoutLineageId
+      )
+    });
   }
 
   function acquisitionFromMap(map = null) {
     const existing = read();
     if (existing) {
-      const compatibility = selectedBookingCompatibilityWithMap(existing, map);
-      if (compatibility.status !== "conflict") return existing;
+      const admission = selectedBookingAdmissionState(existing, map, { ...lineageAdmissionOptions() });
+      if (admission.status === "confirmed") return existing;
+      if (admission.status === "conflict") lastAdmissionConflict = admission;
       // A new airline/itinerary in the same tab is a new transaction. The
       // old acquisition remains authoritative only for resume, which bypasses
       // fresh acquisition and uses the backend's durable baseline.
@@ -149,12 +229,43 @@ export function createSelectedBookingAcquisition({
     return capture(map) || approveVisibleSummary(map);
   }
 
+  async function admitForStart(options = {}) {
+    await hydrate();
+    await refreshCheckoutContext();
+    if (checkoutContext?.source === "app_launch" && checkoutContext.selectedBookingContract) {
+      return Object.freeze({
+        contractVersion: "booking-admission/v1",
+        status: "confirmed",
+        reason: "APP_SELECTED_BOOKING_CONFIRMED",
+        missingFacts: [],
+        acquisition: null,
+        selectedBookingContract: checkoutContext.selectedBookingContract,
+        checkoutLineageId: String(checkoutContext.checkoutLineageId || "")
+      });
+    }
+    const acquisition = await acquireForStart(options);
+    const map = options.initialMap || pageStateStore.current();
+    const admission = selectedBookingAdmissionState(acquisition, map, {
+      ...lineageAdmissionOptions()
+    });
+    const authoritativeAdmission = acquisition ? admission : (lastAdmissionConflict || admission);
+    return Object.freeze({
+      contractVersion: "booking-admission/v1",
+      ...authoritativeAdmission,
+      acquisition: authoritativeAdmission.status === "confirmed" ? acquisition : null,
+      selectedBookingContract: null,
+      checkoutLineageId: authoritativeAdmission.status === "confirmed" ? String(acquisition?.checkoutLineageId || "") : ""
+    });
+  }
+
   async function acquireForStart({
     initialMap = null,
     timeoutMs = START_ACQUISITION_TIMEOUT_MS,
     mutationSettleMs = START_MUTATION_SETTLE_MS
   } = {}) {
     await hydrate();
+    await refreshCheckoutContext();
+    if (!checkoutContext?.checkoutLineageId) await beginCheckoutLineage({ rotate: false });
     const immediate = acquisitionFromMap(initialMap || pageStateStore.current());
     if (immediate) return immediate;
     if (pendingStartAcquisition) return pendingStartAcquisition.promise;
@@ -239,32 +350,53 @@ export function createSelectedBookingAcquisition({
     return promise;
   }
 
+  function bookingCommitCopy(owner = null) {
+    return [
+      owner?.innerText,
+      owner?.textContent,
+      owner?.getAttribute?.("aria-label"),
+      owner?.getAttribute?.("title"),
+      owner?.id,
+      owner?.getAttribute?.("name"),
+      owner?.getAttribute?.("data-testid")
+    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 600);
+  }
+
   function potentialBookingCommitTarget(target = null) {
     const owner = target?.closest?.("a, button, [role='button'], [role='radio'], [role='option']");
     if (!owner || owner.closest?.("#atw-sidebar")) return null;
-    const copy = [
-      owner.innerText,
-      owner.textContent,
-      owner.getAttribute?.("aria-label"),
-      owner.getAttribute?.("title"),
-      owner.id,
-      owner.getAttribute?.("name"),
-      owner.getAttribute?.("data-testid")
-    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 600);
+    const copy = bookingCommitCopy(owner);
     return /\b(?:select|choose|continue|proceed|confirm|book|fare|flight|next)\b/i.test(copy)
       ? owner
       : null;
   }
 
   function onPotentialBookingCommit(event) {
-    if (isSessionActive() || !potentialBookingCommitTarget(event.target)) return;
-    queueMicrotask(() => {
+    const commitTarget = potentialBookingCommitTarget(event.target);
+    if (isSessionActive() || !commitTarget) return;
+    const beforeCommit = pageStateStore.observe({
+      forceFull: true,
+      reason: "selected_booking_user_commit"
+    });
+    const explicitSelection = /\b(?:select|choose|book)\b.*\b(?:flight|fare)\b|\b(?:flight|fare)\b.*\b(?:select|choose|book)\b/i
+      .test(bookingCommitCopy(commitTarget));
+    const beginsNewSelection = beforeCommit.map?.step === "flight_selection" || explicitSelection;
+    const lineagePromise = beginCheckoutLineage({ rotate: beginsNewSelection });
+    queueMicrotask(async () => {
       if (isSessionActive()) return;
+      const activeContext = await lineagePromise;
       const observed = pageStateStore.observe({
         forceFull: true,
         reason: "selected_booking_user_commit"
       });
-      capture(observed.map) || approveVisibleSummary(observed.map, "explicit_flight_selection");
+      const lineageOptions = {
+        checkoutLineageId: activeContext?.checkoutLineageId || "",
+        replaceExisting: beginsNewSelection
+      };
+      const captured = capture(observed.map, lineageOptions);
+      if (!captured && (observed.map?.step === "flight_selection" || explicitSelection)) {
+        approveVisibleSummary(observed.map, "explicit_flight_selection", lineageOptions);
+      }
     });
   }
 
@@ -286,11 +418,14 @@ export function createSelectedBookingAcquisition({
     if (isSessionActive() || captureTimer) return false;
     const currentUrl = currentNavigationUrl();
     if (captureAttempt.url === currentUrl && Date.now() < captureAttempt.retryAfter) return false;
-    captureTimer = setTimeout(() => {
+    captureTimer = setTimeout(async () => {
       captureTimer = null;
       if (isSessionActive()) return;
+      const activeContext = await beginCheckoutLineage({ rotate: false });
       const observed = pageStateStore.observe({ reason: `selected_booking_${reason}` });
-      const captured = capture(observed.map);
+      const captured = capture(observed.map, {
+        checkoutLineageId: activeContext?.checkoutLineageId || ""
+      });
       const snapshotHash = String(observed.snapshotHash || observationHashForMap(observed.map));
       const unchangedMiss = !captured
         && captureAttempt.url === currentNavigationUrl()
@@ -322,6 +457,7 @@ export function createSelectedBookingAcquisition({
   }
 
   return Object.freeze({
+    admitForStart,
     acquireForStart,
     approveVisibleSummary,
     armSelectionCapture,

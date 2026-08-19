@@ -8,14 +8,28 @@ const MAX_FACTS = 24;
 const MAX_PACKET_BYTES = 24_000;
 const INPUT_ROLE = /textbox|input|textarea|select|combobox|listbox|radio|checkbox|spinbutton|date/i;
 const FORBIDDEN = /payment|card|cvc|cvv|security code|purchase|pay now|legal|terms|consent|insurance|bundle|baggage|seat/i;
+const DECISION_TYPES = Object.freeze([
+  "baggage",
+  "seat",
+  "insurance",
+  "bundle",
+  "flexible_ticket",
+  "check_in_method",
+  "optional_support",
+  "loyalty_enrollment",
+  "legal_acceptance",
+  "stage_exit"
+]);
 
 const INSTRUCTIONS = [
   "Reconcile uncertain semantic meaning in the supplied current checkout scene.",
   "Return only grounded hypotheses using supplied controlId, semanticType, factSource, and validationIssueId values.",
-  "A hypothesis may identify a traveler field and may attribute a supplied validation issue to that exact control.",
+  "A field hypothesis may identify a traveler field and may attribute a supplied validation issue to that exact control.",
+  "A decision hypothesis may map one supplied decisionGroupId to one supplied closed decisionType.",
   "Every hypothesis must be supported by the control's local label, attributes, helper text, owner region, options, or validation text.",
   "Do not create an action, obligation, fact, permission, transaction claim, requiredness claim, or completion claim.",
-  "Do not bind payment, purchase, legal consent, marketing, loyalty enrollment, or optional products.",
+  "A decision type is descriptive evidence only. Do not decide its requiredness, policy outcome, permission, next action, price effect, or completion.",
+  "Never classify payment credential entry or purchase submission as a checkout decision.",
   "Return unknown when the supplied evidence is insufficient."
 ].join(" ");
 
@@ -151,7 +165,9 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
   const page = semanticCompilation
     ? { ...rawPage, controls: semanticCompilation.controls, decisionGroups: semanticCompilation.decisionGroups }
     : rawPage;
-  const validationIssues = page.validationIssues || [];
+  const validationIssues = (page.validationIssues || []).filter((issue) => (
+    !["clear", "diagnostic"].includes(clean(issue.status).toLowerCase())
+  ));
   const components = (page.controls || []).filter((control) => {
     const lifecycle = control.representationLifecycle || {};
     const active = lifecycle.active === true || lifecycle.status === "active_rendered";
@@ -199,6 +215,11 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
   const candidateMap = new Map([...components, ...validationCandidateControls]
     .map((control) => [control.controlId, control]));
   const candidateControls = [...candidateMap.values()];
+  const uncertainDecisionGroups = (page.decisionGroups || []).filter((group) => {
+    const subject = clean(`${group.subject?.key || group.subject || ""} ${group.sectionType || ""}`).toLowerCase();
+    const material = group.material === true || group.required === true || (group.alternatives || []).length > 0;
+    return material && (!subject || /unknown|decision|additional/.test(subject));
+  }).slice(0, 6);
   const facts = availableSemanticFacts(traveler, { page, transactionReview }).slice(0, MAX_FACTS);
   const allowedBindings = candidateControls.flatMap((control) => facts.map((fact) => ({
     controlId: control.controlId,
@@ -209,13 +230,23 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
     validationIssueId: issue.issueId,
     controlId: control.controlId
   })));
+  const allowedDecisionBindings = uncertainDecisionGroups.flatMap((group) => DECISION_TYPES.map((decisionType) => ({
+    decisionGroupId: clean(group.decisionGroupId || group.requirementId, 180),
+    decisionType
+  }))).filter((binding) => binding.decisionGroupId);
   return Object.freeze({
-    needed: Boolean((components.length || unownedValidationIssues.length) && candidateControls.length && facts.length),
+    needed: Boolean(
+      ((components.length || unownedValidationIssues.length) && candidateControls.length && facts.length)
+      || uncertainDecisionGroups.length
+    ),
     components: candidateControls,
     facts,
     validationIssues: unownedValidationIssues,
     allowedBindings,
-    allowedValidationOwners
+    allowedValidationOwners,
+    decisionGroups: uncertainDecisionGroups,
+    decisionTypes: DECISION_TYPES,
+    allowedDecisionBindings
   });
 }
 
@@ -233,6 +264,13 @@ function applySemanticSceneHypotheses(observation = {}, response = {}, uncertain
       || allowedOwners.has(`${hypothesis.validationIssueId}|${hypothesis.controlId}`);
     return bindingAllowed && ownerAllowed;
   }).slice(0, 4);
+  const allowedDecisionBindings = new Set((uncertainty.allowedDecisionBindings || []).map((binding) => (
+    `${binding.decisionGroupId}|${binding.decisionType}`
+  )));
+  const acceptedDecisionHypotheses = (response.decisionHypotheses || []).filter((hypothesis) => (
+    ["high", "medium"].includes(hypothesis.confidence)
+    && allowedDecisionBindings.has(`${hypothesis.decisionGroupId}|${hypothesis.decisionType}`)
+  )).slice(0, 4);
   const bindingByControl = new Map(accepted.map((hypothesis) => [hypothesis.controlId, hypothesis]));
   const controls = (observation.page?.controls || []).map((control) => {
     const hypothesis = bindingByControl.get(control.controlId);
@@ -270,10 +308,19 @@ function applySemanticSceneHypotheses(observation = {}, response = {}, uncertain
       fields,
       validationIssues,
       semanticSceneReconciliation: {
-        status: accepted.length ? "grounded" : "unknown",
+        status: accepted.length || acceptedDecisionHypotheses.length ? "grounded" : "unknown",
         authority: "hypothesis_only",
-        hypotheses: accepted.map((hypothesis) => ({ ...hypothesis, evidence: clean(hypothesis.evidence) }))
-      }
+        hypotheses: accepted.map((hypothesis) => ({ ...hypothesis, evidence: clean(hypothesis.evidence) })),
+        decisionHypotheses: acceptedDecisionHypotheses.map((hypothesis) => ({
+          ...hypothesis,
+          evidence: clean(hypothesis.evidence)
+        }))
+      },
+      semanticDecisionHints: acceptedDecisionHypotheses.map((hypothesis) => ({
+        ...hypothesis,
+        authority: "grounded_hypothesis_only",
+        evidence: clean(hypothesis.evidence)
+      }))
     }
   };
 }
@@ -311,6 +358,18 @@ async function reconcileSemanticScene({
         validationIssues: scene.validationIssues.map((issue) => ({
           validationIssueId: issue.issueId,
           message: clean(issue.message)
+        })),
+        decisions: scene.decisionGroups.map((group) => ({
+          decisionGroupId: clean(group.decisionGroupId || group.requirementId, 180),
+          label: clean(group.sectionLabel || group.label || group.decisionContract?.subjectLabel),
+          subject: clean(group.subject?.key || group.subject || group.sectionType),
+          requiredObserved: group.required === true,
+          options: (group.alternatives || []).slice(0, 12).map((option) => ({
+            controlId: clean(option.controlId, 160),
+            label: clean(option.label, 180),
+            selected: option.selected === true,
+            price: option.structuredPrice || null
+          }))
         }))
       },
       availableFacts: scene.facts.map((fact) => ({
@@ -320,6 +379,7 @@ async function reconcileSemanticScene({
       })),
       allowedSemanticBindings: scene.allowedBindings,
       allowedValidationOwners: scene.allowedValidationOwners,
+      allowedDecisionBindings: scene.allowedDecisionBindings,
       outputAuthority: "grounded_hypothesis_only"
     },
     screenshotDataUrl,
@@ -327,7 +387,9 @@ async function reconcileSemanticScene({
       scene.components.map((control) => control.controlId),
       scene.facts.map((fact) => fact.semanticType),
       scene.facts.map((fact) => fact.factSource),
-      scene.validationIssues.map((issue) => issue.issueId)
+      scene.validationIssues.map((issue) => issue.issueId),
+      scene.decisionGroups.map((group) => group.decisionGroupId || group.requirementId),
+      scene.decisionTypes
     ),
     schemaName: "semantic_scene_reconciliation",
     maxOutputTokens: 650,
@@ -341,6 +403,12 @@ async function reconcileSemanticScene({
       semanticType: String(hypothesis?.semanticType || "unknown"),
       factSource: String(hypothesis?.factSource || ""),
       validationIssueId: String(hypothesis?.validationIssueId || ""),
+      confidence: String(hypothesis?.confidence || "low").toLowerCase(),
+      evidence: clean(hypothesis?.evidence)
+    })) : [],
+    decisionHypotheses: Array.isArray(data?.decisionHypotheses) ? data.decisionHypotheses.map((hypothesis) => ({
+      decisionGroupId: String(hypothesis?.decisionGroupId || ""),
+      decisionType: String(hypothesis?.decisionType || "unknown"),
       confidence: String(hypothesis?.confidence || "low").toLowerCase(),
       evidence: clean(hypothesis?.evidence)
     })) : []

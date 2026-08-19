@@ -122,6 +122,17 @@ async function loadProducer(page, sourcePath = fixturePath) {
 async function installBootChrome(page, initialStorage = {}, tabId = 42) {
   await page.evaluate(({ stored, contextTabId }) => {
     window.__ATW_BOOT_STORAGE__ = { ...stored };
+    const checkoutContextKey = `atwCheckoutContextV1:${contextTabId}`;
+    const acquisitionKey = `atwSelectedBookingAcquisitionV1:${contextTabId}`;
+    const newCheckoutContext = ({ source = "browser_selection", selectedBookingContract = null } = {}) => ({
+      contractVersion: "checkout-context/v1",
+      tabId: contextTabId,
+      checkoutLineageId: `checkout_test_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+      source,
+      selectedBookingContract,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
     window.chrome = {
       storage: {
         local: {
@@ -140,9 +151,33 @@ async function installBootChrome(page, initialStorage = {}, tabId = 42) {
         }
       },
       runtime: {
-        sendMessage: async (message) => message?.type === "ATW_TAB_CONTEXT"
-          ? { ok: true, tabId: contextTabId, windowId: 1 }
-          : { ok: false }
+        sendMessage: async (message) => {
+          if (message?.type === "ATW_TAB_CONTEXT") {
+            return { ok: true, tabId: contextTabId, windowId: 1 };
+          }
+          if (message?.type === "ATW_CHECKOUT_CONTEXT") {
+            return { ok: true, context: window.__ATW_BOOT_STORAGE__[checkoutContextKey] || null };
+          }
+          if (message?.type === "ATW_CHECKOUT_LINEAGE_BEGIN") {
+            let context = window.__ATW_BOOT_STORAGE__[checkoutContextKey] || null;
+            if (!context || message.rotate === true) {
+              context = newCheckoutContext();
+              window.__ATW_BOOT_STORAGE__[checkoutContextKey] = context;
+              if (message.rotate === true) delete window.__ATW_BOOT_STORAGE__[acquisitionKey];
+            }
+            return { ok: true, context };
+          }
+          if (message?.type === "ATW_SELECTED_BOOKING_LAUNCH") {
+            const context = newCheckoutContext({
+              source: "app_launch",
+              selectedBookingContract: message.selectedBookingContract || null
+            });
+            window.__ATW_BOOT_STORAGE__[checkoutContextKey] = context;
+            delete window.__ATW_BOOT_STORAGE__[acquisitionKey];
+            return { ok: true, context };
+          }
+          return { ok: false };
+        }
       }
     };
   }, { stored: initialStorage, contextTabId: tabId });
@@ -162,7 +197,7 @@ function bootAppData(travelerId = "trav_boot") {
   };
 }
 
-test("idle checkout stays dormant and a user-selected booking survives an airline origin change", async ({ page }) => {
+test("idle checkout stays dormant and a user-selected booking survives an unrelated-provider redirect in the same lineage", async ({ page }) => {
   const bootstrap = bootAppData("trav_cross_origin_booking");
   await page.route("https://book.lufthansa.test/**", async (route) => {
     await route.fulfill({
@@ -229,10 +264,10 @@ test("idle checkout stays dormant and a user-selected booking survives an airlin
 
   const laterPage = await page.context().newPage();
   let laterSessionBody = null;
-  await laterPage.route("https://checkout.lufthansa.test/**", async (route) => {
+  await laterPage.route("https://checkout.booking-provider.test/**", async (route) => {
     await route.fulfill({ status: 200, contentType: "text/html", body: "<main><h1>Passenger details</h1></main>" });
   });
-  await laterPage.route("https://checkout.lufthansa.test/api/extension/bootstrap", async (route) => {
+  await laterPage.route("https://checkout.booking-provider.test/api/extension/bootstrap", async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -240,7 +275,7 @@ test("idle checkout stays dormant and a user-selected booking survives an airlin
       body: JSON.stringify(bootstrap)
     });
   });
-  await laterPage.route("https://checkout.lufthansa.test/api/agent/session", async (route) => {
+  await laterPage.route("https://checkout.booking-provider.test/api/agent/session", async (route) => {
     laterSessionBody = route.request().postDataJSON();
     await route.fulfill({
       status: 201,
@@ -248,14 +283,14 @@ test("idle checkout stays dormant and a user-selected booking survives an airlin
       body: JSON.stringify({ id: "chk_lufthansa_cross_origin" })
     });
   });
-  await laterPage.goto("https://checkout.lufthansa.test/passengers?session=sensitive");
+  await laterPage.goto("https://checkout.booking-provider.test/passengers?session=sensitive");
   await laterPage.evaluate(() => {
     window.__ATW_ENABLE_TEST_HOOKS__ = true;
     window.__ATW_TEST_BOOT__ = true;
   });
   await installBootChrome(laterPage, {
     ...firstPage.storage,
-    apiBase: "https://checkout.lufthansa.test/api"
+    apiBase: "https://checkout.booking-provider.test/api"
   }, 42);
   await laterPage.addScriptTag({ path: contentScriptPath });
   await laterPage.waitForFunction(() => Boolean(window.__ATW_TEST__));
@@ -274,6 +309,84 @@ test("idle checkout stays dormant and a user-selected booking survives an airlin
     travelerIds: ["trav_cross_origin_booking"]
   });
   await laterPage.close();
+});
+
+test("an app-supplied tab-scoped SelectedBooking starts on a passenger page with no visible itinerary", async ({ page }) => {
+  const travelerId = "trav_app_launch";
+  const selectedBookingContract = {
+    ...testSelectedBooking(travelerId),
+    selectionId: "app_selected_lufthansa_1",
+    sourceUrl: "fly://checkout/selection/app_selected_lufthansa_1",
+    itinerary: {
+      segments: [{
+        segmentId: "segment_lju_fra",
+        origin: "LJU",
+        destination: "FRA",
+        departureDate: "2026-10-15"
+      }]
+    },
+    approvedTotal: { amount: 280, currency: "EUR" }
+  };
+  let requestBody = null;
+  await page.route("https://passengers.lufthansa.test/**", async (route) => {
+    const url = route.request().url();
+    if (url.includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    if (url.includes("/api/agent/session")) {
+      requestBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({ id: "chk_app_launch_lufthansa" })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<main><h1>Passenger details</h1><p>The itinerary summary is hidden on this step.</p></main>"
+    });
+  });
+  await page.goto("https://passengers.lufthansa.test/details");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://passengers.lufthansa.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  const launch = await page.evaluate((contract) => window.chrome.runtime.sendMessage({
+    type: "ATW_SELECTED_BOOKING_LAUNCH",
+    tabId: 42,
+    selectedBookingContract: contract
+  }), selectedBookingContract);
+  expect(launch).toMatchObject({
+    ok: true,
+    context: {
+      contractVersion: "checkout-context/v1",
+      source: "app_launch",
+      selectedBookingContract: { selectionId: "app_selected_lufthansa_1" }
+    }
+  });
+
+  const session = await page.evaluate(() => window.__ATW_TEST__.startAgentSession("", {
+    bookingAcquisitionTimeoutMs: 0
+  }));
+
+  expect(session).toMatchObject({ id: "chk_app_launch_lufthansa" });
+  expect(requestBody.selectedBookingContract).toEqual(selectedBookingContract);
+  expect(await page.evaluate(() => window.__ATW_BOOT_STORAGE__["atwSelectedBookingAcquisitionV1:42"] || null)).toBeNull();
 });
 
 test("a resume marker from another tab cannot activate observation", async ({ page }) => {
@@ -438,6 +551,83 @@ test("startup without booking evidence fails once without creating a provisional
   expect(started.session).toBeNull();
   expect(started.elapsedMs).toBeLessThan(1_000);
   expect(requestBody).toBeNull();
+});
+
+test("a tab-scoped booking from another checkout lineage cannot authorize an identity-free start", async ({ page }) => {
+  await page.route("https://checkout.easyjet.test/**", async (route) => {
+    if (route.request().url().includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData("trav_lineage_isolation"))
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<main><h1>Passenger details</h1><p>No itinerary summary is visible.</p></main>"
+    });
+  });
+  await page.goto("https://checkout.easyjet.test/passengers");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  const staleAcquisition = {
+    contractVersion: "selected-booking-acquisition/v1",
+    admissionStatus: "confirmed",
+    checkoutLineageId: "checkout_kiwi_old",
+    capturedAt: new Date().toISOString(),
+    sourceOrigin: "https://www.kiwi.com",
+    sourceUrl: "https://www.kiwi.com/en/booking/",
+    observationId: "booking_kiwi_old",
+    facts: {
+      evidenceMode: "typed",
+      itinerary: {
+        completeness: "complete",
+        segments: [{
+          segmentId: "seg_ayt_esb",
+          origin: "AYT",
+          destination: "ESB",
+          departureDate: "2026-09-15",
+          evidence: { authoritative: true, ownerKey: "kiwi_itinerary" }
+        }]
+      },
+      totalPrice: { amount: 1658.34, currency: "TRY" },
+      currency: "TRY",
+      factEvidence: {
+        itinerary: [{ segmentId: "seg_ayt_esb", authoritative: true, ownerKey: "kiwi_itinerary" }],
+        totalPrice: { authoritative: true, role: "booking_total", ownerKey: "kiwi_total" }
+      }
+    }
+  };
+  await installBootChrome(page, {
+    apiBase: "https://checkout.easyjet.test/api",
+    selectedTravelerId: "trav_lineage_isolation",
+    "atwCheckoutContextV1:42": {
+      contractVersion: "checkout-context/v1",
+      tabId: 42,
+      checkoutLineageId: "checkout_easyjet_new",
+      source: "browser_selection",
+      selectedBookingContract: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    },
+    "atwSelectedBookingAcquisitionV1:42": staleAcquisition
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+  const admission = await page.evaluate(async () => {
+    const map = window.__ATW_TEST__.buildPageMap();
+    return window.__ATW_TEST__.admitSelectedBookingForStart({ initialMap: map, timeoutMs: 0 });
+  });
+  expect(admission).toMatchObject({
+    status: "conflict",
+    reason: "CURRENT_TAB_CHECKOUT_LINEAGE_MISMATCH",
+    acquisition: null
+  });
 });
 
 test("an invalid stored booking falls back to fresh acquisition for the selected wallet traveler", async ({ page }) => {
@@ -8225,6 +8415,82 @@ test("P0 scoped validation publishes canonical control and section ownership", a
   expect(result.baggageIssue.controlId).toBe("");
   expect(result.baggageIssue.sectionType).toBe("baggage");
   expect(result.baggageIssue.stageWide).toBe(false);
+});
+
+test("validation lifecycle treats Croatia-style zero-error summary as clear and preserves safe Continue", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Passenger details</h1>
+      <div role="alert" class="validation-summary">0 error Please check the information below marked in red</div>
+      <button id="continue" type="button">Continue</button>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const map = window.__ATW_TEST__.buildPageMap();
+    return {
+      issues: map.validationIssues,
+      errors: map.errors,
+      stageExit: map.stageExit
+    };
+  });
+  expect(result.issues).toEqual(expect.arrayContaining([
+    expect.objectContaining({ status: "clear", active: false, errorCount: 0 })
+  ]));
+  expect(result.errors).toEqual([]);
+  expect(result.stageExit.continueObserved).toBe(true);
+  expect(result.stageExit.continueAllowed).toBe(true);
+});
+
+test("validation lifecycle keeps an owned invalid field blocking", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Passenger details</h1>
+      <label>Phone <input id="phone" name="phone" value="123" aria-invalid="true" aria-errormessage="phone-error"></label>
+      <div id="phone-error" role="alert">Please enter a valid phone number</div>
+      <button id="continue" type="button">Continue</button>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const map = window.__ATW_TEST__.buildPageMap();
+    const phone = map.controls.find((control) => control.semantic === "phone");
+    return {
+      issue: map.validationIssues.find((candidate) => candidate.controlId === phone?.controlId),
+      errors: map.errors,
+      continueAllowed: map.stageExit.continueAllowed
+    };
+  });
+  expect(result.issue).toMatchObject({ status: "active_control_error", active: true });
+  expect(result.issue.invalidControlIds).toContain(result.issue.controlId);
+  expect(result.errors).toEqual(["Please enter a valid phone number"]);
+  expect(result.continueAllowed).toBe(false);
+});
+
+test("a fresh stage-wide error introduced by a governed action becomes active while stale prose stays diagnostic", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main><h1>Passenger details</h1><button id="continue" type="button">Continue</button></main>
+  `);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    hooks.observePageState({ forceFull: true, reason: "validation_before_action" });
+    hooks.setActiveExecutionForTest("act_continue", "obs_before");
+    const alert = document.createElement("div");
+    alert.id = "stage-error";
+    alert.setAttribute("role", "alert");
+    alert.textContent = "There was an error submitting this form";
+    document.body.appendChild(alert);
+    hooks.notePageMutations([{ type: "childList", target: document.body, addedNodes: [alert], removedNodes: [] }]);
+    const after = hooks.observePageState({ forceFull: true, reason: "validation_after_action" }).map;
+    const issue = after.validationIssues.find((candidate) => /error submitting/i.test(candidate.message));
+    return { issue, errors: after.errors, stageExit: after.stageExit };
+  });
+  expect(result.issue).toMatchObject({
+    status: "active_stage_error",
+    active: true,
+    introducedAfterAction: true,
+    stageWide: true
+  });
+  expect(result.errors).toEqual(["There was an error submitting this form"]);
+  expect(result.stageExit.continueAllowed).toBe(false);
 });
 
 test("P0.7 scroll recovery uses the nearest effective container and fails closed for a missing target", async ({ page }) => {

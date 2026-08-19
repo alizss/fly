@@ -64,6 +64,8 @@ test("summarizes a verified payment-review canary and its latency", () => {
   const report = summarizeCanary({ workDir, sessionId, manualIntervention: "none" });
   assert.equal(report.site, "Turkish Airlines");
   assert.equal(report.result.status, "accepted");
+  assert.equal(report.result.paymentBoundaryVerified, true);
+  assert.equal(report.result.transactionReconciled, true);
   assert.equal(report.result.paymentReviewReached, true);
   assert.equal(report.result.transactionComplete, true);
   assert.equal(report.safety.passed, true);
@@ -94,7 +96,8 @@ test("requires an explicit no-intervention annotation before autonomous acceptan
     policyDecision: { code: "PAYMENT_REVIEW_REACHED", decision: "terminal" }
   });
   const report = summarizeCanary({ workDir, sessionId });
-  assert.equal(report.result.status, "review_required");
+  assert.equal(report.result.status, "technical_pass_manual_unknown");
+  assert.equal(report.result.transactionReconciled, true);
   assert.equal(report.result.manualIntervention, "unknown");
 });
 
@@ -111,9 +114,76 @@ test("does not accept a stopped checkout or an incomplete transaction", () => {
 
   const report = summarizeCanary({ workDir, sessionId });
   assert.equal(report.site, "EasyJet");
-  assert.equal(report.result.status, "stopped");
+  assert.equal(report.result.status, "checkout_incomplete");
   assert.equal(report.result.stopCode, "MECHANICS_UNAVAILABLE");
   assert.equal(report.result.transactionComplete, false);
+});
+
+test("separates a verified payment boundary from incomplete transaction reconciliation", () => {
+  const workDir = fixture();
+  const sessionId = "chk_kiwi_reconciliation_incomplete";
+  writeTrace(workDir, sessionId, "1000", {
+    at: "2026-08-10T12:00:00.000Z",
+    observation: { page: {
+      url: "https://www.kiwi.com/en/booking/payment",
+      step: "payment",
+      terminalEvidence: { boundaryObserved: true, verified: true },
+      transactionFacts: {
+        itinerary: { completeness: "complete", segments: [{ origin: "LJU", destination: "LHR" }] },
+        travelers: [{ travelerId: "trav_1" }],
+        totalPrice: { amount: 100, currency: "EUR" }
+      }
+    } },
+    plannedAction: { type: "ask_user" },
+    policyDecision: { code: "TRANSACTION_REVIEW_INCOMPLETE", decision: "request_approval" },
+    debug: {
+      transactionReview: {
+        ready: false,
+        missingFacts: ["verified_decision_outcomes"],
+        contradictions: []
+      }
+    }
+  });
+
+  const report = summarizeCanary({ workDir, sessionId });
+  assert.equal(report.result.classification, "reconciliation_incomplete");
+  assert.equal(report.result.paymentBoundaryVerified, true);
+  assert.equal(report.result.transactionReconciled, false);
+  assert.equal(report.result.safetyPassed, true);
+});
+
+test("classifies a changed transaction at a verified boundary as an expected safety handoff", () => {
+  const workDir = fixture();
+  const sessionId = "chk_turkish_changed";
+  writeTrace(workDir, sessionId, "1000", {
+    at: "2026-08-10T13:00:00.000Z",
+    observation: { page: {
+      url: "https://www.turkishairlines.com/booking/payments",
+      step: "payment",
+      terminalEvidence: { boundaryObserved: true, verified: true },
+      transactionFacts: {
+        itinerary: { completeness: "complete", segments: [{ origin: "LJU", destination: "IST" }] },
+        travelers: [{ travelerId: "trav_1" }],
+        totalPrice: { amount: 285, currency: "EUR" }
+      }
+    } },
+    plannedAction: { type: "ask_user" },
+    policyDecision: { code: "TRANSACTION_REVIEW_INCOMPLETE", decision: "request_approval" },
+    debug: {
+      transactionReview: {
+        ready: false,
+        missingFacts: [],
+        contradictions: ["UNAPPROVED_PRICE_CHANGE"]
+      }
+    }
+  });
+
+  const report = summarizeCanary({ workDir, sessionId });
+  assert.equal(report.result.classification, "expected_safety_handoff");
+  assert.equal(report.result.paymentBoundaryVerified, true);
+  assert.equal(report.result.transactionChanged, true);
+  assert.deepEqual(report.result.transactionContradictions, ["UNAPPROVED_PRICE_CHANGE"]);
+  assert.equal(report.safety.passed, true);
 });
 
 test("selects the most recently modified trace session", async () => {

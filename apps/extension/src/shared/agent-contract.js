@@ -1042,6 +1042,44 @@
     ));
     const reconstructed = [...reconstructedChoices, ...reconstructedForegroundChoices];
     const groups = [...existingGroups, ...reconstructed];
+    const decisionHintFamily = Object.freeze({
+      baggage: "baggage",
+      seat: "seat",
+      insurance: "insurance",
+      bundle: "extras",
+      flexible_ticket: "extras",
+      check_in_method: "extras",
+      optional_support: "extras",
+      loyalty_enrollment: "extras",
+      legal_acceptance: "legal",
+      stage_exit: "navigation"
+    });
+    const semanticDecisionHints = new Map((page.semanticDecisionHints || []).flatMap((hint) => {
+      const decisionGroupId = text(hint?.decisionGroupId, 240);
+      const decisionType = text(hint?.decisionType, 120);
+      const family = decisionHintFamily[decisionType] || "";
+      if (!decisionGroupId || !family || hint?.authority !== "grounded_hypothesis_only") return [];
+      return [[decisionGroupId, { ...hint, decisionGroupId, decisionType, family }]];
+    }));
+    for (const group of groups) {
+      const hint = semanticDecisionHints.get(text(group.decisionGroupId || group.requirementId, 240));
+      if (!hint) continue;
+      group.subject = hint.decisionType;
+      group.sectionType = hint.decisionType;
+      group.semanticOwnership = {
+        status: "resolved",
+        family: hint.family,
+        subject: hint.decisionType,
+        source: "grounded_semantic_scene",
+        authority: "hypothesis_only",
+        confidence: hint.confidence === "high" ? 0.95 : 0.82,
+        evidence: normalizedText(hint.evidence)
+      };
+      group.decisionContract = {
+        ...(group.decisionContract || {}),
+        subject: hint.decisionType
+      };
+    }
     const reconstructedIds = new Set(reconstructed.map((group) => group.decisionGroupId));
     for (const group of groups) {
       if (!reconstructedIds.has(group.decisionGroupId)) continue;

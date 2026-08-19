@@ -106,7 +106,7 @@ function createCommerceLedger({
         `${postcondition.expectedSelectedLabel || ""} ${action.targetLabel || ""} ${result.targetLabel || ""}`
       ))
     );
-    const decisionInstanceId = clean(
+    const legacyDecisionInstanceId = clean(
       (episodeOwnsReceipt ? decisionEpisode.canonicalOwnerId || decisionEpisode.decisionInstanceId : "")
       || task.canonicalOwnerId
       || task.decisionInstanceId
@@ -116,7 +116,7 @@ function createCommerceLedger({
       || result.decisionInstanceId
       || decisionGroupId
     );
-    if (!actionId || !decisionGroupId || !decisionInstanceId) return null;
+    if (!actionId || !decisionGroupId) return null;
     const episodeIdentityOwnsReceipt = Boolean(
       episodeOwnsReceipt
       || (
@@ -139,9 +139,16 @@ function createCommerceLedger({
           segmentId: task.segmentId || decisionEpisode?.segmentId,
           repeatedInstance: (episodeIdentityOwnsReceipt
             ? decisionEpisode?.canonicalOwnerId || decisionEpisode?.decisionInstanceId
-            : "") || decisionInstanceId
+            : "") || legacyDecisionInstanceId
         });
-    const ownerId = semanticOwnerId(semanticOwner);
+    const ownerId = clean(
+      action.semanticOwnerId
+      || result.semanticOwnerId
+      || task.semanticOwnerId
+      || semanticOwnerId(semanticOwner)
+      || legacyDecisionInstanceId
+    );
+    if (!ownerId) return null;
     return Object.freeze({
       semanticOwner,
       semanticOwnerId: ownerId,
@@ -299,12 +306,12 @@ function createCommerceLedger({
       || (!lineage.explicit ? lineage.fallbackLineage?.parentDecisionGroupId : "")
       || (!lineage.explicit ? lineage.fallbackLineage?.decisionGroupId : "")
     );
-    const decisionInstanceId = clean(
+    const legacyDecisionInstanceId = clean(
       explicit.decisionInstanceId
       || decision?.canonicalOwnerId
       || decisionGroupId
     );
-    if (!decisionGroupId || !decisionInstanceId) return null;
+    if (!decisionGroupId) return null;
     const action = actionResult.action || {};
     const targetSnapshot = actionResult.targetSnapshot || {};
     const effect = clean(
@@ -341,9 +348,15 @@ function createCommerceLedger({
           subjectId: subjectKey,
           passengerId: decision?.subject?.passengerId || explicit.passengerId,
           segmentId: decision?.subject?.segmentId || explicit.segmentId,
-          repeatedInstance: decisionInstanceId
+          repeatedInstance: legacyDecisionInstanceId
         });
-    const ownerId = semanticOwnerId(semanticOwner);
+    const ownerId = clean(
+      action.semanticOwnerId
+      || actionResult.semanticOwnerId
+      || semanticOwnerId(semanticOwner)
+      || legacyDecisionInstanceId
+    );
+    if (!ownerId) return null;
     return Object.freeze({
       semanticOwner,
       semanticOwnerId: ownerId,
@@ -451,9 +464,8 @@ function createCommerceLedger({
         ? 2
         : 1;
     const add = (outcome = {}) => {
-      const decisionInstanceId = clean(outcome?.decisionInstanceId);
       const ownerId = semanticIdentity(outcome);
-      if (!ownerId || !decisionInstanceId || outcome?.verified !== true) return;
+      if (!ownerId || outcome?.verified !== true) return;
       const actionId = clean(outcome.actionId);
       const existingActionOwner = actionId ? actionOwners.get(actionId) : "";
       const existingOwner = existingActionOwner || ownerId;
@@ -474,9 +486,9 @@ function createCommerceLedger({
         semanticOwner: identity.semanticOwner || merged.semanticOwner || null,
         semanticOwnerId: targetOwner,
         decisionGroupId: clean(identity.decisionGroupId || merged.decisionGroupId),
-        decisionInstanceId: clean(identity.decisionInstanceId || merged.decisionInstanceId),
-        decisionOwnerKey: clean(identity.decisionOwnerKey || merged.decisionOwnerKey),
-        canonicalOwnerId: clean(identity.canonicalOwnerId || merged.canonicalOwnerId),
+        decisionInstanceId: targetOwner,
+        decisionOwnerKey: targetOwner,
+        canonicalOwnerId: targetOwner,
         admissionSource: clean(identity.admissionSource || merged.admissionSource),
         actionId: clean(identity.actionId || merged.actionId)
       });
@@ -499,11 +511,12 @@ function createCommerceLedger({
     const coverageId = (entry = "") => canonicalDecisionOwnerKey(
       typeof entry === "object"
         ? {
+            semanticOwnerId: semanticIdentity(entry),
             decisionOwnerKey: entry?.decisionOwnerKey,
             decisionInstanceId: entry?.decisionInstanceId,
             ownerKey: entry?.canonicalOwnerId
           }
-        : { decisionInstanceId: entry }
+        : { semanticOwnerId: entry }
     );
     // The durable receipt register is the sole expectation authority. Rebuild
     // coverage from it every turn rather than copying a second memory or
@@ -515,12 +528,12 @@ function createCommerceLedger({
     // the verified browser action cannot be allowed to disappear with it.
     for (const obligation of obligations) {
       if (obligation?.verified !== true || obligation?.originKind !== "verified_commerce_obligation") continue;
-      expected.add(clean(obligation.decisionInstanceId || obligation.canonicalOwnerId));
+      expected.add(semanticIdentity(obligation));
       expectedActionIds.add(clean(obligation.actionId));
     }
     const journaledDecisionInstanceIds = (Array.isArray(journal) ? journal : [])
       .filter((entry) => entry?.verified === true && entry?.originKind === "verified_commerce_decision")
-      .map((entry) => clean(entry.decisionInstanceId || entry.canonicalOwnerId))
+      .map((entry) => semanticIdentity(entry))
       .filter(Boolean);
     const journaled = new Set((Array.isArray(journal) ? journal : [])
       .filter((entry) => entry?.verified === true && entry?.originKind === "verified_commerce_decision")
@@ -533,7 +546,7 @@ function createCommerceLedger({
       .map(coverageId)
       .filter(Boolean));
     const ledgeredDecisionInstanceIds = ledgerEntries
-      .map((entry) => clean(entry?.decisionInstanceId || entry?.canonicalOwnerId || entry?.decisionOwnerKey))
+      .map((entry) => semanticIdentity(entry))
       .filter(Boolean)
       .slice(-80);
     const missingJournalDecisionInstanceIds = expectedDecisionInstanceIds.filter((id) => !journaled.has(coverageId(id)));
@@ -544,7 +557,7 @@ function createCommerceLedger({
     ])];
     const missingActionIds = [...expectedActionIds].filter((actionId) => {
       const obligation = (Array.isArray(obligations) ? obligations : []).find((entry) => clean(entry?.actionId) === actionId);
-      const ownerId = clean(obligation?.decisionInstanceId || obligation?.canonicalOwnerId);
+      const ownerId = semanticIdentity(obligation);
       return !ownerId || !journaled.has(coverageId(ownerId)) || !ledgered.has(coverageId(ownerId));
     });
     return Object.freeze({

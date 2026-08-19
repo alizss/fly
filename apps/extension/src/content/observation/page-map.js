@@ -188,7 +188,9 @@ export function createPageMapCompiler(dependencies) {
     const controls = buildCanonicalControlGraph(sections, fields, buttons, activeSurface);
     syncRequiredProfileChoiceGroups(fields, controls, sections);
     const validationIssues = collectValidationIssues(text, fields, controls, sections, activeSurface);
-    const errors = validationIssues.map((issue) => issue.message);
+    const errors = validationIssues
+      .filter((issue) => issue.active === true)
+      .map((issue) => issue.message);
     const observationCompilation = currentObservationCompilation();
     const registryConflicts = observationCompilation.controlRegistry?.conflicts || [];
     const unresolvedGraphConflicts = registryConflicts.filter((conflict) => !conflict.resolved);

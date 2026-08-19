@@ -910,6 +910,60 @@ test("final review reconciles the immutable trip and durable semantic outcomes",
   assert.ok(changed.review.contradictions.includes("REVIEW_OUTCOME_CHANGED:seat:seat_assignment"));
 });
 
+test("a verified action receipt is promoted once when it lands directly on final review", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_final_review_receipt";
+  state = prepareTransactionInvariants(
+    state,
+    observation("obs_before_review", facts()),
+    { id: "trav_1" }
+  ).state;
+
+  const canonicalOwnerId = "owner:extras:extras:kiwi_risk:trav_1:segment_1:abc123";
+  const verifiedOutcome = {
+    semanticOwnerId: canonicalOwnerId,
+    decisionInstanceId: "legacy:kiwi-risk:rerender-9",
+    decisionOwnerKey: canonicalOwnerId,
+    canonicalOwnerId,
+    decisionGroupId: "dg_kiwi_risk",
+    sourceKind: "verified_commerce_decision",
+    originKind: "verified_commerce_decision",
+    family: "extras",
+    subjectKey: "kiwi_risk",
+    label: "I'll take the risk",
+    disposition: "declined",
+    outcome: "declined",
+    priceAmount: 0,
+    currency: "EUR",
+    verified: true
+  };
+  state.taskState = {
+    outcomeJournal: [verifiedOutcome],
+    verifiedCommerceObligations: [{
+      ...verifiedOutcome,
+      actionId: "act_kiwi_take_risk",
+      originKind: "verified_commerce_obligation"
+    }]
+  };
+  const reviewFacts = facts();
+  reviewFacts.provenance = [{ source: "payment_summary", observationId: "obs_direct_review", confidence: 0.95 }];
+
+  const first = prepareTransactionInvariants(
+    state,
+    observation("obs_direct_review", reviewFacts),
+    { id: "trav_1" }
+  );
+  assert.equal(first.envelope.outcomeLedger.filter((entry) => entry.semanticOwnerId === canonicalOwnerId).length, 1);
+  assert.equal(first.envelope.outcomeLedger.find((entry) => entry.semanticOwnerId === canonicalOwnerId).decisionInstanceId, canonicalOwnerId);
+
+  const rerendered = prepareTransactionInvariants(
+    first.state,
+    observation("obs_direct_review_rerender", reviewFacts),
+    { id: "trav_1" }
+  );
+  assert.equal(rerendered.envelope.outcomeLedger.filter((entry) => entry.semanticOwnerId === canonicalOwnerId).length, 1);
+});
+
 test("an inflated starting total is evidence, never approval for an existing paid optional item", () => {
   const raw = facts({ totalPrice: 237 });
   raw.selectedExtras = [{

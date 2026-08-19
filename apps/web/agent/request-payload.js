@@ -770,7 +770,15 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
               sectionId: clampText(issue.sectionId, 80),
               sectionType: clampText(issue.sectionType, 80),
               surfaceId: clampText(issue.surfaceId, 80),
-              stageWide: Boolean(issue.stageWide)
+              stageWide: Boolean(issue.stageWide),
+              status: clampText(issue.status, 40),
+              visible: issue.visible !== false,
+              active: issue.active === true,
+              errorCount: Number.isFinite(Number(issue.errorCount)) ? Number(issue.errorCount) : null,
+              introducedAfterAction: issue.introducedAfterAction === true,
+              invalidControlIds: Array.isArray(issue.invalidControlIds)
+                ? issue.invalidControlIds.map((value) => clampText(value, 140)).filter(Boolean).slice(0, 8)
+                : []
             })).filter((issue) => issue.message).slice(0, 12)
           : [],
         paidChoices: Array.isArray(page.paidChoices) ? page.paidChoices.map((item) => clampText(item, 160)).slice(0, 8) : [],

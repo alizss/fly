@@ -2,7 +2,6 @@ import {
   approvedSelectedBookingAcquisitionFromMap,
   authoritativeSelectedBookingFacts,
   composeSelectedBookingContract,
-  selectedBookingCompatibilityWithMap,
   validStoredSelectedBookingContract
 } from "./selected-booking.js";
 import { createAgentRuntimeContext } from "./runtime-context.js";
@@ -30,7 +29,10 @@ import { createTransactionEvidenceCompiler } from "./observation/transaction-evi
 import { createObservationTransport } from "./observation/transport.js";
 import { createScreenshotObservation } from "./observation/screenshot.js";
 import { createObservationSignatures } from "./observation/signatures.js";
-import { actionableCheckoutErrors } from "./observation/validation.js";
+import {
+  actionableCheckoutErrors,
+  validationLifecycle
+} from "./observation/validation.js";
 import {
   boundedPhrase,
   normalizedFieldAlias,
@@ -310,6 +312,27 @@ import {
   async function selectedBookingDurableKey() {
     const contextId = await tabContextId();
     return contextId ? `${SELECTED_BOOKING_DURABLE_PREFIX}:${contextId}` : "";
+  }
+
+  async function readCheckoutContext() {
+    try {
+      const response = await chrome.runtime.sendMessage({ type: "ATW_CHECKOUT_CONTEXT" });
+      return response?.ok === true ? response.context || null : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async function beginCheckoutLineage({ rotate = false } = {}) {
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "ATW_CHECKOUT_LINEAGE_BEGIN",
+        rotate: rotate === true
+      });
+      return response?.ok === true ? response.context || null : null;
+    } catch (error) {
+      return null;
+    }
   }
 
   async function readDurableSelectedBookingAcquisition() {
@@ -827,6 +850,8 @@ import {
       expectedPostconditions: Array.isArray(decision.expectedPostconditions) ? decision.expectedPostconditions : [],
       operation: decision.operation || "",
       goalId: decision.goalId || "",
+      semanticOwner: decision.semanticOwner || null,
+      semanticOwnerId: decision.semanticOwnerId || "",
       decisionInstanceId: decision.decisionInstanceId || "",
       candidateId: decision.candidateId || "",
       controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
@@ -862,6 +887,8 @@ import {
         value: decision.value || "",
         risk: decision.risk || "",
         reason: decision.reason || "",
+        semanticOwner: decision.semanticOwner || null,
+        semanticOwnerId: decision.semanticOwnerId || "",
         decisionInstanceId: decision.decisionInstanceId || ""
       },
       targetSnapshot: decision.targetSnapshot || null,
@@ -902,6 +929,9 @@ import {
       expectedPostconditions: Array.isArray(decision.expectedPostconditions) ? decision.expectedPostconditions : [],
       operation: decision.operation || "",
       goalId: decision.goalId || "",
+      semanticOwner: decision.semanticOwner || null,
+      semanticOwnerId: decision.semanticOwnerId || "",
+      decisionInstanceId: decision.decisionInstanceId || "",
       candidateId: decision.candidateId || "",
       controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
       dispatched: mechanicallyAttempted,
@@ -934,7 +964,10 @@ import {
         targetLabel: decision.targetLabel || "",
         value: decision.value || "",
         risk: decision.risk || "",
-        reason: decision.reason || ""
+        reason: decision.reason || "",
+        semanticOwner: decision.semanticOwner || null,
+        semanticOwnerId: decision.semanticOwnerId || "",
+        decisionInstanceId: decision.decisionInstanceId || ""
       },
       targetSnapshot: decision.targetSnapshot || null,
       expectedOutcome: decision.expectedOutcome || null,
@@ -2291,6 +2324,9 @@ import {
     syncRequiredProfileChoiceGroups,
     buildCanonicalDecisionGroups,
     buildAuthoritativeStageExit,
+    validationLifecycle,
+    actionableCheckoutErrors,
+    hasActiveActionAttempt: () => Boolean(agent.activeExecutionActionId),
     logFlow,
     sleep,
     onMaterialMutation: (timestamp) => {
@@ -2299,6 +2335,7 @@ import {
   });
 
   const {
+    admitForStart: admitSelectedBookingForStart,
     acquireForStart: acquireSelectedBookingForStart,
     approveVisibleSummary: approveVisibleSelectedBookingSummary,
     armSelectionCapture: armSelectedBookingCapture,
@@ -2309,6 +2346,8 @@ import {
     read: readSelectedBookingAcquisition,
     schedule: scheduleSelectedBookingCapture
   } = createSelectedBookingAcquisition({
+    checkoutContextRead: readCheckoutContext,
+    checkoutLineageBegin: beginCheckoutLineage,
     durableClear: clearDurableSelectedBookingAcquisition,
     durableRead: readDurableSelectedBookingAcquisition,
     durableWrite: writeDurableSelectedBookingAcquisition,
@@ -2338,7 +2377,7 @@ import {
     ACTION_REPORT_TIMEOUT_MS,
     DEFAULT_API,
     actionableCheckoutErrors,
-    acquireSelectedBookingForStart,
+    admitSelectedBookingForStart,
     addAgentMessage,
     agent: runtimeScopes.session,
     compactActionResultForTransport,
@@ -2352,7 +2391,6 @@ import {
     renderSidebar: (...args) => renderSidebar(...args),
     resetAgentLoopLifecycle,
     setAgentActivity,
-    selectedBookingCompatibilityWithMap,
     storageGet,
     traveler,
     userIntentText,
@@ -2628,10 +2666,41 @@ import {
       const normalizedMessage = String(message || "").replace(/\s+/g, " ").trim();
       if (!normalizedMessage) return;
       const owner = element ? issueOwnership(element) : {};
+      const referencedByOwner = Boolean(element?.id && fields.some((field) => (
+        `${field.element?.getAttribute?.("aria-errormessage") || ""} ${field.element?.getAttribute?.("aria-describedby") || ""}`
+          .split(/\s+/)
+          .includes(element.id)
+      )));
+      const ownedControlId = explicitOwner.controlId || owner.controlId || "";
+      const ownedState = ownedControlId
+        ? controls.find((control) => control.controlId === ownedControlId)?.state || {}
+        : {};
+      const invalidControlIds = ownedControlId && (
+        ownedState.invalid === true
+        || fields.some((field) => field.controlId === ownedControlId && (
+          field.element?.getAttribute?.("aria-invalid") === "true"
+          || field.element?.matches?.(":invalid")
+        ))
+      ) ? [ownedControlId] : [];
+      const lifecycle = validationLifecycle({
+        message: normalizedMessage,
+        visible: element ? isVisible(element) : true,
+        controlId: ownedControlId,
+        invalidControlIds,
+        ownerReferenced: referencedByOwner,
+        stageWide: explicitOwner.stageWide === true || owner.stageWide === true,
+        active: Boolean(invalidControlIds.length || referencedByOwner || explicitOwner.active === true)
+      });
       const issue = {
         issueId: element ? `validation:${elementId(element)}` : `validation:${explicitOwner.controlId || explicitOwner.semanticType || issues.length}`,
         message: normalizedMessage,
-        controlId: explicitOwner.controlId || owner.controlId || "",
+        status: lifecycle.status,
+        visible: lifecycle.visible,
+        active: lifecycle.active,
+        errorCount: lifecycle.errorCount,
+        introducedAfterAction: lifecycle.introducedAfterAction,
+        invalidControlIds: lifecycle.invalidControlIds,
+        controlId: lifecycle.controlId,
         logicalOwnerKey: explicitOwner.logicalOwnerKey || owner.logicalOwnerKey || "",
         componentRole: explicitOwner.componentRole || owner.componentRole || "",
         semanticType: explicitOwner.semanticType || owner.semanticType || "",
@@ -3367,7 +3436,6 @@ import {
     takeOverCheckout
   } = createCheckoutController({
     DESTINATION_MUTATION_SETTLE_MS,
-    VALIDATION_TERMS,
     addAgentMessage,
     agent: runtimeScopes.checkout,
     announceSectionQueue,
@@ -3377,8 +3445,6 @@ import {
     describePageMap,
     executeAgentDecision,
     finishAgentLoop,
-    isVisible,
-    labelText,
     logAgentEvent,
     logFlow,
     outlineCoreSections,
@@ -3402,8 +3468,7 @@ import {
     startWatchingCheckoutChanges: () => watchForCheckoutChanges(),
     startAgentSession,
     stopWatchingCheckoutChanges: () => stopWatchingCheckoutChanges(),
-    travelerRules,
-    travelerValue
+    travelerRules
   });
 
   const {
@@ -3482,6 +3547,10 @@ import {
       },
       setAgentRunningForTest: (running) => { agent.running = Boolean(running); },
       setAgentSessionForTest: (sessionId) => { agent.sessionId = String(sessionId || ""); },
+      setActiveExecutionForTest: (actionId = "", observationId = "") => {
+        agent.activeExecutionActionId = String(actionId || "");
+        agent.activeExecutionObservationId = String(observationId || "");
+      },
       setProcessDiagnosticsForTest: (diagnostics = null) => { agent.processDiagnostics = diagnostics; },
       renderSidebarForTest: (mode = "agent") => renderSidebar(mode),
       repeatGuardFor,
@@ -3519,6 +3588,7 @@ import {
       compactPageMap,
       authoritativeSelectedBookingFacts,
       approvedSelectedBookingAcquisitionFromMap,
+      admitSelectedBookingForStart,
       composeSelectedBookingContract,
       validStoredSelectedBookingContract,
       captureSelectedBookingFromMap,

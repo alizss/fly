@@ -58,6 +58,8 @@ export function createActionTransport({ compactText, compactChoiceCommitEvidence
       mechanicalEffect: compactText(result.mechanicalEffect || "", 500),
       operation: String(result.operation || ""),
       goalId: String(result.goalId || ""),
+      semanticOwner: compactActionTransportValue(result.semanticOwner || null),
+      semanticOwnerId: String(result.semanticOwnerId || ""),
       decisionInstanceId: String(result.decisionInstanceId || ""),
       candidateId: String(result.candidateId || ""),
       controlId: String(result.controlId || ""),

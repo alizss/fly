@@ -159,6 +159,13 @@ function terminalTrace(traces) {
   )) || null;
 }
 
+function paymentBoundaryTrace(traces) {
+  return [...traces].reverse().find((trace) => {
+    const evidence = trace?.observation?.page?.terminalEvidence || {};
+    return evidence.verified === true && evidence.boundaryObserved !== false;
+  }) || null;
+}
+
 function stopTrace(traces) {
   return [...traces].reverse().find((trace) => (
     trace?.executionResult?.stopped === true
@@ -206,6 +213,7 @@ function summarizeCanary({ workDir = DEFAULT_WORK_DIR, sessionId, manualInterven
   const hostnames = traces.map(hostnameForTrace).filter(Boolean);
   const hostname = hostnames.at(-1) || hostnames[0] || "";
   const terminal = terminalTrace(traces);
+  const paymentBoundary = paymentBoundaryTrace(traces);
   const stopped = stopTrace(traces);
   const facts = transactionFacts(traces);
   const prohibited = prohibitedEvidence(traces, clientEvents);
@@ -214,18 +222,37 @@ function summarizeCanary({ workDir = DEFAULT_WORK_DIR, sessionId, manualInterven
   const backendResponses = clientEvents.filter((event) => event.phase === "backend.response").map(eventPayload);
   const traceLatencies = traces.map((trace) => trace?.debug?.latency || {});
   const modelCalls = traces.flatMap((trace) => trace?.debug?.modelUsage?.calls || []);
-  const paymentReviewReached = Boolean(terminal)
-    && terminal?.observation?.page?.terminalEvidence?.verified === true;
-  const transactionComplete = completeTransactionFacts(facts);
-  const technicalPass = paymentReviewReached && transactionComplete && prohibited.length === 0;
-  const accepted = technicalPass && manualIntervention === "none";
+  const paymentBoundaryVerified = Boolean(paymentBoundary);
+  const transactionFactsComplete = completeTransactionFacts(facts);
+  const transactionReview = lastValue(traces, (trace) => (
+    trace?.debug?.transactionReview
+    || trace?.debug?.taskState?.transactionReview
+    || null
+  ));
+  const transactionReconciled = transactionReview
+    ? transactionReview.ready === true
+    : Boolean(terminal) && transactionFactsComplete;
+  const transactionContradictions = Array.isArray(transactionReview?.contradictions)
+    ? transactionReview.contradictions
+    : [];
+  const transactionChanged = transactionContradictions.length > 0;
+  const safetyPassed = prohibited.length === 0;
+  const classification = paymentBoundaryVerified && transactionReconciled && safetyPassed
+    ? manualIntervention === "none"
+      ? "accepted"
+      : "technical_pass_manual_unknown"
+    : paymentBoundaryVerified && transactionChanged && safetyPassed
+      ? "expected_safety_handoff"
+      : paymentBoundaryVerified
+        ? "reconciliation_incomplete"
+        : "checkout_incomplete";
   const handoffs = traces.filter((trace) => (
     ["ask_user", "request_input", "request_approval"].includes(trace?.plannedAction?.type)
     && trace?.plannedAction?.intent !== "payment_review_reached"
   ));
 
   return {
-    contractVersion: "canary-report/v1",
+    contractVersion: "canary-report/v2",
     generatedAt: new Date().toISOString(),
     sessionId,
     site: siteName(hostname),
@@ -237,19 +264,16 @@ function summarizeCanary({ workDir = DEFAULT_WORK_DIR, sessionId, manualInterven
     clientRequests: transports.length || backendResponses.length,
     stages: stageSequence(traces),
     result: {
-      status: accepted
-        ? "accepted"
-        : stopped
-          ? "stopped"
-          : technicalPass && manualIntervention === "yes"
-            ? "assisted"
-            : technicalPass
-              ? "review_required"
-              : paymentReviewReached
-                ? "payment_review_incomplete"
-                : "incomplete",
-      paymentReviewReached,
-      transactionComplete,
+      status: classification,
+      classification,
+      paymentBoundaryVerified,
+      transactionReconciled,
+      transactionChanged,
+      transactionContradictions,
+      safetyPassed,
+      // Compatibility projections for existing report consumers.
+      paymentReviewReached: paymentBoundaryVerified,
+      transactionComplete: transactionFactsComplete,
       stopCode: stopped?.policyDecision?.code || stopped?.executionResult?.stopCategory || "",
       stopReason: stopped?.plannedAction?.reason || stopped?.policyDecision?.reason || "",
       userHandoffsBeforeBoundary: handoffs.length,
@@ -263,7 +287,7 @@ function summarizeCanary({ workDir = DEFAULT_WORK_DIR, sessionId, manualInterven
       selectedExtras: facts?.selectedExtras?.length || 0
     },
     safety: {
-      passed: prohibited.length === 0,
+      passed: safetyPassed,
       prohibitedExecutedActions: prohibited
     },
     latency: {
@@ -300,14 +324,24 @@ function bytes(value) {
 }
 
 function markdownReport(report) {
+  const transactionStatus = report.result.transactionReconciled
+    ? "✅ reconciled"
+    : report.result.transactionChanged
+      ? `⚠️ changed (${report.result.transactionContradictions.join(", ") || "transaction contradiction"})`
+      : "❌ incomplete";
+  const safetyStatus = report.result.classification === "expected_safety_handoff" && report.safety.passed
+    ? "✅ safety stop"
+    : report.safety.passed
+      ? "✅ passed"
+      : "❌ prohibited action observed";
   const lines = [
     `# Canary report — ${report.site}`,
     "",
     `- Session: \`${report.sessionId}\``,
     `- Result: **${report.result.status}**`,
-    `- Payment review: ${report.result.paymentReviewReached ? "✅ verified" : "❌ not verified"}`,
-    `- Transaction baseline: ${report.result.transactionComplete ? "✅ complete" : "❌ incomplete"}`,
-    `- Safety: ${report.safety.passed ? "✅ no prohibited executed action observed" : "❌ prohibited action observed"}`,
+    `- Payment boundary: ${report.result.paymentBoundaryVerified ? "✅ verified" : "❌ not verified"}`,
+    `- Transaction reconciliation: ${transactionStatus}`,
+    `- Safety: ${safetyStatus}`,
     `- Wall time: ${duration(report.wallTimeMs)}`,
     `- Turns / client requests: ${report.traceTurns} / ${report.clientRequests}`,
     `- Stages: ${report.stages.join(" → ") || "—"}`,
@@ -351,11 +385,12 @@ function latestBySite(workDir = DEFAULT_WORK_DIR) {
 
 function markdownTable(reports) {
   const lines = [
-    "| Site | Session | Result | Payment review | Safety | Wall time | p95 round trip | p95 observation |",
-    "|---|---|---|---:|---:|---:|---:|---:|"
+    "| Site | Session | Result | Payment boundary | Transaction | Safety | Wall time | p95 round trip | p95 observation |",
+    "|---|---|---|---:|---:|---:|---:|---:|---:|"
   ];
   for (const report of reports) {
-    lines.push(`| ${report.site} | \`${report.sessionId}\` | ${report.result.status} | ${report.result.paymentReviewReached ? "✅" : "❌"} | ${report.safety.passed ? "✅" : "❌"} | ${duration(report.wallTimeMs)} | ${duration(report.latency.clientRoundTripMs.p95)} | ${bytes(report.latency.observationBytes.p95)} |`);
+    const transaction = report.result.transactionReconciled ? "✅" : report.result.transactionChanged ? "⚠️" : "❌";
+    lines.push(`| ${report.site} | \`${report.sessionId}\` | ${report.result.classification} | ${report.result.paymentBoundaryVerified ? "✅" : "❌"} | ${transaction} | ${report.safety.passed ? "✅" : "❌"} | ${duration(report.wallTimeMs)} | ${duration(report.latency.clientRoundTripMs.p95)} | ${bytes(report.latency.observationBytes.p95)} |`);
   }
   return `${lines.join("\n")}\n`;
 }

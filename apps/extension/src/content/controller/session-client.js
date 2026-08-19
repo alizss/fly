@@ -5,7 +5,7 @@ export function createSessionClient({
   ACTION_REPORT_TIMEOUT_MS,
   DEFAULT_API,
   actionableCheckoutErrors,
-  acquireSelectedBookingForStart,
+  admitSelectedBookingForStart,
   addAgentMessage,
   agent,
   compactActionResultForTransport,
@@ -19,16 +19,22 @@ export function createSessionClient({
   renderSidebar,
   resetAgentLoopLifecycle,
   setAgentActivity,
-  selectedBookingCompatibilityWithMap,
   storageGet,
   traveler,
   userIntentText,
   validStoredSelectedBookingContract
 }) {
+  function recordStartEvent(type, payload = {}) {
+    logAgentEvent(type, payload);
+    logFlow("booking.admission", { event: type, ...payload });
+  }
+
   async function startAgentSession(resumeSessionId = "", options = {}) {
+    const startAttemptId = String(options.startAttemptId || `start_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`);
     try {
       agent.sessionStartFailure = null;
-      const settings = await storageGet(["apiBase", "selectedBookingContract"]);
+      recordStartEvent("START_CLICKED", { startAttemptId, resume: Boolean(resumeSessionId) });
+      const settings = await storageGet(["apiBase"]);
       const selectedTraveler = traveler();
       if (!selectedTraveler?.id) {
         const error = new Error("Select at least one wallet traveler before starting checkout.");
@@ -38,29 +44,61 @@ export function createSessionClient({
       let selectedBookingContract = null;
       if (!resumeSessionId) {
         const currentMap = agent.pageMap || pageStateStore.current() || pageStateStore.observe({ reason: "session_start_booking" }).map;
-        // Current-tab acquisition owns a fresh transaction. A globally cached
-        // contract is only a bounded fallback when the current page proves the
-        // exact same itinerary; freshness plus traveler identity is not enough.
-        const acquisition = await acquireSelectedBookingForStart({
+        recordStartEvent("BOOKING_CAPTURE_STARTED", { startAttemptId });
+        const admission = await admitSelectedBookingForStart({
           initialMap: currentMap,
           timeoutMs: options.bookingAcquisitionTimeoutMs
         });
-        selectedBookingContract = composeSelectedBookingContract(acquisition, selectedTraveler);
-        if (!selectedBookingContract) {
-          const cached = validStoredSelectedBookingContract(settings.selectedBookingContract, selectedTraveler);
-          const compatibility = selectedBookingCompatibilityWithMap(cached, currentMap);
-          if (cached && compatibility.status === "match") selectedBookingContract = cached;
+        if (admission.status === "candidate") {
+          recordStartEvent("BOOKING_CANDIDATE_FOUND", {
+            startAttemptId,
+            missingFacts: admission.missingFacts || [],
+            reason: admission.reason || ""
+          });
+        } else if (admission.status === "conflict") {
+          recordStartEvent("BOOKING_CONFLICT", { startAttemptId, reason: admission.reason || "" });
+        }
+        const suppliedSelectedBooking = admission.selectedBookingContract || null;
+        selectedBookingContract = validStoredSelectedBookingContract(
+          suppliedSelectedBooking,
+          selectedTraveler
+        ) || composeSelectedBookingContract(admission.acquisition, selectedTraveler);
+        if (suppliedSelectedBooking && !selectedBookingContract) {
+          const error = new Error("The app-selected booking is expired, incomplete, or does not include the selected wallet traveler.");
+          error.code = "APP_SELECTED_BOOKING_INVALID";
+          error.details = {
+            checkoutLineageId: admission.checkoutLineageId || "",
+            selectionId: String(suppliedSelectedBooking.selectionId || "")
+          };
+          throw error;
+        }
+        if (selectedBookingContract) {
+          recordStartEvent("BOOKING_CONFIRMED", {
+            startAttemptId,
+            checkoutLineageId: admission.checkoutLineageId || "",
+            selectionId: selectedBookingContract.selectionId
+          });
         }
         if (!selectedBookingContract) {
+          const missingFacts = admission.missingFacts || [];
+          recordStartEvent("BOOKING_CONFIRMATION_REQUIRED", {
+            startAttemptId,
+            status: admission.status || "absent",
+            reason: admission.reason || "",
+            missingFacts
+          });
           setAgentActivity(
             "Confirming the selected booking",
-            "The current tab must expose the selected itinerary and displayed starting total."
+            missingFacts.length
+              ? `The current tab is missing: ${missingFacts.join(", ")}.`
+              : "The current tab must expose the selected itinerary and displayed starting total."
           );
           renderSidebar("agent");
           const error = new Error(
             "The selected itinerary and starting total are not available yet. Return to the approved flight selection or make its booking summary visible, then start again."
           );
           error.code = "SELECTED_BOOKING_REQUIRED";
+          error.details = { admissionStatus: admission.status || "absent", missingFacts };
           throw error;
         }
       }
@@ -90,13 +128,21 @@ export function createSessionClient({
         throw new Error("session handshake returned a replacement transaction id");
       }
       agent.sessionId = sessionId;
+      recordStartEvent("SESSION_CREATED", { startAttemptId, sessionId: agent.sessionId, resume: Boolean(resumeSessionId) });
       logAgentEvent("agent_session_started", { sessionId: agent.sessionId });
       return session;
     } catch (error) {
       agent.sessionStartFailure = {
         code: String(error.code || "SESSION_START_FAILED"),
-        message: String(error.message || "Checkout session could not be started.")
+        message: String(error.message || "Checkout session could not be started."),
+        details: error.details || null,
+        startAttemptId
       };
+      recordStartEvent("SESSION_START_FAILED", {
+        startAttemptId,
+        code: agent.sessionStartFailure.code,
+        details: agent.sessionStartFailure.details
+      });
       logAgentEvent("agent_session_failed", { error: error.message });
       agent.sessionId = "";
       return null;

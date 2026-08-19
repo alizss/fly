@@ -5,6 +5,11 @@ const { decideStage } = require("./task-state-reducer");
 const { resolveLogicalFields, verifyLogicalField } = require("./logical-field");
 const { decodeDateFromField } = require("./date-field-codec");
 const agentContract = require("../../extension/src/shared/agent-contract");
+const { activeValidationIssues } = require("./validation-evidence");
+
+function blockingValidationIssues(page = {}) {
+  return activeValidationIssues(page.validationIssues || []);
+}
 
 const UNSAFE_CODES = new Set([
   "ITINERARY_ROUTE_CHANGED",
@@ -299,7 +304,7 @@ function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPa
     && control.controlId !== expectedControlId
     && /paid|money|purchase|premium|upgrade/.test(text(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`))
   ));
-  const validation = (afterPage.validationIssues || []).some((issue) => (
+  const validation = blockingValidationIssues(afterPage).some((issue) => (
     issue.stageWide === true
     || issue.controlId === expectedControlId
     || (group?.sectionId && issue.sectionId === group.sectionId)
@@ -416,7 +421,7 @@ function policySafeChoiceTransition(expected = {}, action = {}, beforePage = {},
   const amount = Number(beforeControl.structuredPrice?.amount);
   const explicitlySafe = (Number.isFinite(amount) && amount === 0)
     || /decline|safe decline|free|included|without|skip|no thanks|no extra|none/.test(meaning);
-  const ownedValidation = (afterPage.validationIssues || []).some((issue) => (
+  const ownedValidation = blockingValidationIssues(afterPage).some((issue) => (
     issue.stageWide === true
     || (controlId && issue.controlId === controlId)
   ));
@@ -510,7 +515,7 @@ function policyConflictResolution(expected = {}, action = {}, beforePage = {}, a
   const chargeCleared = beforeTransaction ? !afterTransaction : !afterPaid;
   const unrelated = unrelatedSelectionChanges(beforePage, afterPage, groupId)
     .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
-  const validation = (afterPage.validationIssues || []).some((issue) => (
+  const validation = blockingValidationIssues(afterPage).some((issue) => (
     issue.stageWide === true
     || issue.controlId === (expected.controlId || action.controlId)
   ));
@@ -721,7 +726,7 @@ function evaluatePostcondition(
     );
     const actualComponentValue = String(afterControl?.state?.dateComponentValue || "");
     const verifiedControlId = afterControl?.controlId || controlId;
-    const validation = (afterPage.validationIssues || []).some((issue) => (
+    const validation = blockingValidationIssues(afterPage).some((issue) => (
       Boolean(verifiedControlId && issue.controlId === verifiedControlId)
       || Boolean(
         expected.logicalFieldId
@@ -780,7 +785,7 @@ function evaluatePostcondition(
       const control = controlById(afterPage, controlId);
       return selected(control || {});
     });
-    const validation = (afterPage.validationIssues || []).filter((issue) => (
+    const validation = blockingValidationIssues(afterPage).filter((issue) => (
       issue.stageWide === true || issue.controlId === wanted
     ));
     return {

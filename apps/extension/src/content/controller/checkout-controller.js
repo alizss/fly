@@ -1,6 +1,5 @@
 export function createCheckoutController({
   DESTINATION_MUTATION_SETTLE_MS,
-  VALIDATION_TERMS,
   addAgentMessage,
   agent,
   announceSectionQueue,
@@ -10,8 +9,6 @@ export function createCheckoutController({
   describePageMap,
   executeAgentDecision,
   finishAgentLoop,
-  isVisible,
-  labelText,
   logAgentEvent,
   logFlow,
   outlineCoreSections,
@@ -33,8 +30,7 @@ export function createCheckoutController({
   startWatchingCheckoutChanges,
   startAgentSession,
   stopWatchingCheckoutChanges,
-  travelerRules,
-  travelerValue
+  travelerRules
 }) {
   async function observePageOnly() {
     agent.running = false;
@@ -272,33 +268,6 @@ export function createCheckoutController({
         setTimeout(() => processCheckoutAgent(), 0);
       }
     }
-  }
-
-  function collectBlockingIssues() {
-    const issues = [];
-    const visibleText = [...document.querySelectorAll("body *")]
-      .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
-      .map((element) => (element.innerText || element.textContent || "").trim())
-      .filter(Boolean);
-
-    for (const text of visibleText) {
-      const normalized = text.toLowerCase();
-      if (normalized.length > 180) continue;
-      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /required|must enter|too long|invalid|not valid|error/.test(normalized)) {
-        issues.push(text.replace(/\s+/g, " "));
-      }
-      if (issues.length >= 4) break;
-    }
-
-    const titleAreaVisible = document.body.innerText.toLowerCase().includes("title *") || document.body.innerText.toLowerCase().includes("you must enter a gender");
-    const anyTitleChecked = [...document.querySelectorAll("input[type='radio']")]
-      .filter((radio) => /mr|mrs|ms|title|gender/.test(labelText(radio)))
-      .some((radio) => radio.checked);
-    if (titleAreaVisible && !anyTitleChecked && !travelerValue("title")) {
-      issues.unshift("title/gender is required but no traveler title preference is saved");
-    }
-
-    return [...new Set(issues)];
   }
 
   async function handleAgentChoice(choice) {

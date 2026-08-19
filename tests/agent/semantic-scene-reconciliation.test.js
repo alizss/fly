@@ -8,6 +8,7 @@ const {
   applySemanticSceneHypotheses,
   reconcileSemanticScene
 } = require("../../apps/web/agent/semantic-scene-reconciliation");
+const agentContract = require("../../apps/extension/src/shared/agent-contract");
 
 function control(overrides = {}) {
   return {
@@ -76,6 +77,53 @@ test("uncertain required controls and unowned validation produce a closed hypoth
     validationIssueId: "validation_1",
     controlId: "ctrl_unknown"
   }]);
+});
+
+test("an unfamiliar decision receives only a closed descriptive type and deterministic authority remains unchanged", () => {
+  const source = observation([]);
+  source.page.decisionGroups = [{
+    decisionGroupId: "dg_opaque_offer",
+    sectionType: "unknown",
+    sectionLabel: "Protect this journey",
+    subject: "unknown",
+    required: false,
+    material: true,
+    status: "optional",
+    alternatives: [
+      { controlId: "ctrl_accept", label: "Add protection" },
+      { controlId: "ctrl_decline", label: "Continue without" }
+    ]
+  }];
+  source.page.controls = [
+    control({ controlId: "ctrl_accept", role: "radio", kind: "radio", required: false, label: "Add protection", operations: { select: { actuatorId: "accept" } } }),
+    control({ controlId: "ctrl_decline", role: "radio", kind: "radio", required: false, label: "Continue without", operations: { select: { actuatorId: "decline" } } })
+  ];
+  source.page.fields = [];
+  const uncertainty = semanticSceneUncertainty({ observation: source, traveler: {} });
+  assert.equal(uncertainty.needed, true);
+  assert.equal(uncertainty.allowedDecisionBindings.some((binding) => (
+    binding.decisionGroupId === "dg_opaque_offer" && binding.decisionType === "insurance"
+  )), true);
+
+  const reconciled = applySemanticSceneHypotheses(source, {
+    status: "grounded",
+    hypotheses: [],
+    decisionHypotheses: [{
+      decisionGroupId: "dg_opaque_offer",
+      decisionType: "insurance",
+      confidence: "high",
+      evidence: "The local option pair offers journey protection and an explicit decline."
+    }]
+  }, uncertainty);
+  assert.deepEqual(reconciled.page.semanticDecisionHints.map((hint) => hint.decisionType), ["insurance"]);
+  assert.equal(Object.hasOwn(reconciled.page.semanticDecisionHints[0], "required"), false);
+  assert.equal(Object.hasOwn(reconciled.page.semanticDecisionHints[0], "action"), false);
+
+  const compiled = agentContract.compileSemanticCheckout(reconciled.page);
+  const decision = compiled.decisionGroups.find((group) => group.decisionGroupId === "dg_opaque_offer");
+  assert.equal(decision.semanticOwnership.family, "insurance");
+  assert.equal(decision.required, false);
+  assert.equal(decision.status, "optional");
 });
 
 test("scene hypotheses may refine supplied evidence but cannot invent owners or facts", () => {

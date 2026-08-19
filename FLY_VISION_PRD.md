@@ -58,6 +58,8 @@ A `99%` claim must always name this eligibility scope. It must not count sold-ou
 ### Selected booking and traveler
 
 - A new durable transaction starts only from one complete `SelectedBooking/v1`: itinerary, approved total/currency, and at least one selected traveler.
+- One extension-owned pre-session `BookingAdmission/v1` obtains that strict contract from either an explicit tab-scoped app launch (`ATW_SELECTED_BOOKING_LAUNCH`) or current-tab selection evidence. The background worker owns one `CheckoutContext/v1` lineage per tab: an explicit app launch or new flight selection rotates it, same-tab redirects preserve it across unrelated domains, and closing the tab clears it. Admission derives `absent`, `candidate`, `confirmed`, `conflict`, or `expired`; only `confirmed` may create a transaction. Another tab, a different lineage, or a globally recent contract can never authorize the checkout, and resume uses only the backend's immutable baseline.
+- If current-tab selection identity cannot be proven, Fly reports the exact missing booking facts before session creation. It never creates a partial transaction or asks the running agent/model to invent route, date, total, currency, or traveler identity.
 - Traveler facts are canonical and independent of site wording or layout.
 - Optional facts never become fabricated requirements.
 - Profile silence is not permission for a consequential decision.
@@ -78,6 +80,10 @@ Ordinary DOM differences, a new textbox, unfamiliar wording, or the absence of a
 When deterministic interpretation is uncertain or internally contradictory, Fly may run one bounded **Semantic Scene Reconciliation** pass before constructing the final decision frame. The model may propose grounded hypotheses about fields, component roles, input formats, decisions, attestations, validations, consequences, and ownership, but every hypothesis must reference fresh observed controls, text, surfaces, or regions. A hypothesis is evidence only: it cannot create an action, traveler fact, requirement, permission, transaction fact, or completion claim.
 
 Known scenes remain deterministic with no model call. Semantic reconciliation consumes the same at-most-one ambiguity call available for the turn; it does not create a second model path. The deterministic compiler remains responsible for producing exactly one final `DecisionFrame`, and TaskState remains the only authority that publishes the next obligation.
+
+Unfamiliar observed decision groups may additionally receive one descriptive type from the closed vocabulary `baggage`, `seat`, `insurance`, `bundle`, `flexible_ticket`, `check_in_method`, `optional_support`, `loyalty_enrollment`, `legal_acceptance`, or `stage_exit`. This hypothesis may refine canonical ownership evidence only. It cannot change requiredness, price effect, policy, permission, the next obligation, or completion.
+
+Validation is active state, not matching prose. Each observation classifies validation evidence as `clear`, `diagnostic`, `active_control_error`, `active_stage_error`, or `unresolved`. Zero-error summaries, hidden/dormant alerts, stale instructions, and unowned generic error text cannot block checkout. Blocking requires an exact active invalid owner or explicit active stage failure; a fresh executable Continue remains eligible when only diagnostic validation prose exists.
 
 ### Planning, action, and verification
 

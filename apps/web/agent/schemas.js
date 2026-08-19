@@ -54,15 +54,17 @@ function semanticBindingSchemaFor(componentIds = [], semanticTypes = [], factSou
   };
 }
 
-function semanticSceneSchemaFor(controlIds = [], semanticTypes = [], factSources = [], validationIssueIds = []) {
+function semanticSceneSchemaFor(controlIds = [], semanticTypes = [], factSources = [], validationIssueIds = [], decisionGroupIds = [], decisionTypes = []) {
   const controls = [...new Set(controlIds.map(String).filter(Boolean))];
   const semantics = [...new Set(semanticTypes.map(String).filter(Boolean))];
   const sources = [...new Set(factSources.map(String).filter(Boolean))];
   const issues = [...new Set(validationIssueIds.map(String).filter(Boolean))];
+  const groups = [...new Set(decisionGroupIds.map(String).filter(Boolean))];
+  const decisions = [...new Set(decisionTypes.map(String).filter(Boolean))];
   return {
     type: "object",
     additionalProperties: false,
-    required: ["status", "hypotheses"],
+    required: ["status", "hypotheses", "decisionHypotheses"],
     properties: {
       status: { type: "string", enum: ["grounded", "unknown"] },
       hypotheses: {
@@ -77,6 +79,21 @@ function semanticSceneSchemaFor(controlIds = [], semanticTypes = [], factSources
             semanticType: { type: "string", enum: ["unknown", ...semantics] },
             factSource: { type: "string", enum: ["", ...sources] },
             validationIssueId: { type: "string", enum: ["", ...issues] },
+            confidence: { type: "string", enum: ["high", "medium", "low"] },
+            evidence: { type: "string" }
+          }
+        }
+      },
+      decisionHypotheses: {
+        type: "array",
+        maxItems: 4,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["decisionGroupId", "decisionType", "confidence", "evidence"],
+          properties: {
+            decisionGroupId: { type: "string", enum: ["", ...groups] },
+            decisionType: { type: "string", enum: ["unknown", ...decisions] },
             confidence: { type: "string", enum: ["high", "medium", "low"] },
             evidence: { type: "string" }
           }

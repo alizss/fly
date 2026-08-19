@@ -15,6 +15,9 @@ export function createPageStateStore({
   syncRequiredProfileChoiceGroups,
   buildCanonicalDecisionGroups,
   buildAuthoritativeStageExit,
+  validationLifecycle,
+  actionableCheckoutErrors,
+  hasActiveActionAttempt = () => false,
   logFlow,
   sleep,
   onMaterialMutation = () => {}
@@ -186,6 +189,41 @@ export function createPageStateStore({
       next = rememberPagePlan(buildPageMap());
       incrementalUpdates = 0;
       mode = before && !urlChanged && !forceFull ? "material_rescan" : "full_snapshot";
+    }
+    if (before && hasActiveActionAttempt()) {
+      const previousValidation = new Set((before.validationIssues || []).map((issue) => (
+        `${issue.issueId || ""}|${issue.message || ""}`
+      )));
+      let promoted = false;
+      next.validationIssues = (next.validationIssues || []).map((issue) => {
+        const key = `${issue.issueId || ""}|${issue.message || ""}`;
+        if (previousValidation.has(key) || issue.stageWide !== true || issue.active === true) return issue;
+        const lifecycle = validationLifecycle({
+          ...issue,
+          visible: issue.visible !== false,
+          active: true,
+          introducedAfterAction: true
+        });
+        promoted = promoted || lifecycle.active;
+        return { ...issue, ...lifecycle };
+      });
+      if (promoted) {
+        next.errors = actionableCheckoutErrors(next.validationIssues);
+        next.stageExit = buildAuthoritativeStageExit({
+          decisionGroups: next.decisionGroups,
+          fields: next.fields,
+          buttons: next.buttons,
+          errors: next.errors,
+          step: next.step,
+          controls: next.controls,
+          currentSurface: next.currentSurface
+        });
+        next.summary = {
+          ...(next.summary || {}),
+          errors: next.errors.length,
+          continueAllowed: next.stageExit.continueAllowed
+        };
+      }
     }
     drainMutationRecords();
     const captureEndVersion = mutationVersion;

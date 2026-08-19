@@ -319,6 +319,13 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       })
     : factsFromObservation(state, observation, traveler);
   const admittedOutcomes = durableCommerceSelections(observed.selectedExtras);
+  // Final-review UI may not seed transaction meaning, but a verified governed
+  // browser receipt remains authoritative even when its action lands directly
+  // on that review. Promote those receipts without admitting page-only choices.
+  const verifiedActionOutcomes = admittedOutcomes.filter((outcome) => (
+    outcome?.verified === true
+    && outcome?.sourceKind === "verified_commerce_decision"
+  ));
   const existing = state.transactionInvariants;
   const at = new Date().toISOString();
   const finalReviewObservation = isFinalReviewFacts(observed);
@@ -331,7 +338,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       version: 4,
       baseline,
       current: mergeCurrentFacts({}, observed, baseline),
-      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(admittedOutcomes),
+      outcomeLedger: finalReviewObservation ? mergeCommerceSelections(verifiedActionOutcomes) : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
       baselineStatus: transactionFactGaps(baseline).length ? "collecting" : "approved",
       baselineObservationId: observation.observationId || "",
@@ -352,7 +359,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       baseline,
       current: mergeCurrentFacts(existing.current || existing.baseline, observed, baseline),
       outcomeLedger: finalReviewObservation
-        ? mergeCommerceSelections(existing.outcomeLedger)
+        ? mergeCommerceSelections(existing.outcomeLedger, verifiedActionOutcomes)
         : mergeCommerceSelections(existing.outcomeLedger, admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : (existing.reviewFacts || null),
       baselineStatus: existing.baselineStatus === "approved" || approved ? "approved" : "collecting",
@@ -365,7 +372,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       version: 4,
       baseline,
       current: mergeCurrentFacts(existing.baseline, observed, baseline),
-      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(admittedOutcomes),
+      outcomeLedger: finalReviewObservation ? mergeCommerceSelections(verifiedActionOutcomes) : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
       baselineStatus: approved ? "approved" : "collecting",
       baselineObservationId: existing.baselineObservationId || observation.observationId || "",
@@ -379,7 +386,7 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
       version: 4,
       baseline,
       current: mergeCurrentFacts({}, observed, baseline),
-      outcomeLedger: finalReviewObservation ? [] : mergeCommerceSelections(admittedOutcomes),
+      outcomeLedger: finalReviewObservation ? mergeCommerceSelections(verifiedActionOutcomes) : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
       baselineStatus: approved ? "approved" : "collecting",
       baselineObservationId: existing.baselineObservationId || "",

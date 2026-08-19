@@ -22,6 +22,7 @@ const {
   verifyLogicalField
 } = require("./logical-field");
 const { profileFieldLabel } = require("./profile-context");
+const { activeValidationIssues } = require("./validation-evidence");
 
 const NON_BLOCKING_PROFILE_FIELDS = new Set([
   "middle_name",
@@ -585,7 +586,7 @@ function validationIssueMessage(issue = {}) {
 
 function scopedValidationIssues(page = {}, scope = {}) {
   const issues = Array.isArray(page.validationIssues) && page.validationIssues.length
-    ? page.validationIssues
+    ? activeValidationIssues(page.validationIssues)
     : (page.errors || []).map((message) => ({ message: String(message || ""), stageWide: true }));
   const controlIds = scope.controlIds instanceof Set ? scope.controlIds : new Set(scope.controlIds || []);
   const sectionIds = scope.sectionIds instanceof Set ? scope.sectionIds : new Set(scope.sectionIds || []);
