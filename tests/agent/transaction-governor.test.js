@@ -1999,7 +1999,7 @@ test("completed form reports unavailable navigation internally instead of asking
 
   assert.equal(result.clientDecision.action, "wait");
   assert.equal(result.clientDecision.intent, "task_state_reobserve");
-  assert.match(result.clientDecision.reason, /no_goal_relevant_candidate/);
+  assert.match(result.clientDecision.reason, /SITUATION_RECONCILIATION_REQUIRED/);
   assert.equal(result.state.status, "running");
   assert.equal("navigationSettling" in result.state, false);
   assert.equal(result.state.currentObligation, undefined);

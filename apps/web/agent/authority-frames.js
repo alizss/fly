@@ -1,7 +1,11 @@
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { factsFromObservation } = require("./transaction-facts");
-const { fieldDescriptors } = require("./profile-requirements");
+const {
+  descriptorOwnsActiveRequirement,
+  fieldDescriptors
+} = require("./profile-requirements");
 const { buildCanonicalDecisions } = require("./canonical-decision");
+const { activeValidationIssues } = require("./validation-evidence");
 const {
   normalizeSemanticOwner,
   semanticOwnerId
@@ -10,6 +14,7 @@ const {
 const OBSERVATION_FRAME_VERSION = "observation-frame/v2";
 const DECISION_FRAME_VERSION = "decision-frame/v2";
 const CURRENT_OBLIGATION_VERSION = "current-obligation/v2";
+const CHECKOUT_SITUATION_VERSION = "checkout-situation/v1";
 
 function clean(value = "") {
   return String(value || "").replace(/\s+/g, " ").trim();
@@ -43,6 +48,223 @@ function surfaceEvidence(page = {}) {
     surfaceClass: clean(surface.surfaceClass || "unknown"),
     label: clean(surface.label),
     blocksBackground: surface.blocksBackground === true
+  });
+}
+
+function lower(value = "") {
+  return clean(value).toLowerCase();
+}
+
+function controlEvidenceIds(control = {}) {
+  return Object.freeze(unique([
+    control.controlId,
+    control.stateElementId,
+    control.preferredActivationElementId
+  ]));
+}
+
+function activeRepresentation(control = {}) {
+  const lifecycle = control.representationLifecycle || {};
+  return lifecycle.status !== "dormant_hidden" && lifecycle.active !== false;
+}
+
+function controlConsequence(control = {}) {
+  const explicitMeaning = lower([
+    control.physicalEffect,
+    control.semanticEffect,
+    control.semantic,
+    control.fieldType,
+    control.field,
+    control.risk
+  ].filter(Boolean).join(" "));
+  const evidence = lower([
+    explicitMeaning,
+    control.label,
+    control.name,
+    control.autocomplete
+  ].filter(Boolean).join(" "));
+  const choiceLike = /checkbox|switch/.test(lower(`${control.kind || ""} ${control.role || ""} ${control.inputType || ""}`));
+  if (/accept_legal|legal_acceptance|terms_accept|accept_terms|legal|consent|attestation/.test(explicitMeaning)
+    || (choiceLike && /agree|accept|terms|conditions|dangerous goods|declaration/.test(evidence))) {
+    return "legal_attestation";
+  }
+  if (/enter_payment|card_number|card_expiry|security_code|\bcvc\b|\bcvv\b|cc-number|cc-exp|cc-csc|payment_method/.test(evidence)) {
+    return "payment_entry";
+  }
+  if (/submit_purchase|complete_purchase|confirm_and_pay|pay_now|place_order|book_now/.test(explicitMeaning)
+    || (/button|submit/.test(lower(`${control.kind || ""} ${control.role || ""} ${control.inputType || ""}`))
+      && /confirm and pay|pay now|complete purchase|place order|book now/.test(evidence))) {
+    return "purchase_submission";
+  }
+  if (/select_paid|add_paid|money|paid_extra|upgrade/.test(evidence)) return "monetary_selection";
+  if (/login|log_in|sign_in|authentication|otp|captcha/.test(evidence)) return "authentication";
+  if (/advance_checkout|continue|navigation|proceed|next/.test(evidence)) return "checkout_progress";
+  if (/set_field|textbox|combobox|select|input/.test(evidence)) return "fact_entry";
+  if (/select_free|decline|skip|no_extra/.test(evidence)) return "policy_choice";
+  return "unknown";
+}
+
+function controlAvailable(control = {}) {
+  if (!activeRepresentation(control)) return false;
+  if (control.disabled === true || control.state?.disabled === true) return false;
+  return Object.values(control.operations || {}).some((operation) => (
+    operation?.actionability?.executable === true
+    || operation?.actionability?.targetable === true
+    || (operation?.exactActuators || []).some((actuator) => actuator?.proof?.executable === true)
+  ));
+}
+
+function requiredProfileObligation(descriptor = {}, page = {}) {
+  if (descriptor.hasValue || !descriptorOwnsActiveRequirement(descriptor, page)) return null;
+  return Object.freeze({
+    obligationId: clean(descriptor.key || descriptor.logicalFieldId || descriptor.control?.controlId),
+    kind: "profile_fact",
+    semanticType: clean(descriptor.semanticType),
+    logicalFieldId: clean(descriptor.logicalFieldId),
+    surfaceId: clean(descriptor.control?.surfaceId || "surface-page"),
+    evidenceIds: controlEvidenceIds(descriptor.control),
+    status: "unresolved"
+  });
+}
+
+function groupObligation(group = {}) {
+  const status = lower(group.status);
+  const unresolved = group.requiresResolution === true
+    || (group.required === true && !["satisfied", "waived", "waived_by_policy", "optional"].includes(status));
+  if (!unresolved) return null;
+  return Object.freeze({
+    obligationId: clean(group.decisionGroupId || group.requirementId),
+    kind: "checkout_decision",
+    semanticType: clean(group.sectionType || group.semanticType || "decision"),
+    decisionGroupId: clean(group.decisionGroupId),
+    surfaceId: clean(group.surfaceId || "surface-page"),
+    evidenceIds: Object.freeze(unique([
+      group.selectedControlId,
+      ...(group.alternativeControlIds || []),
+      ...(group.alternatives || []).map((option) => option.controlId)
+    ])),
+    status: "unresolved"
+  });
+}
+
+function consequentialObligation(control = {}) {
+  const consequence = controlConsequence(control);
+  if (!["legal_attestation", "payment_entry", "purchase_submission", "authentication"].includes(consequence)) {
+    return null;
+  }
+  const state = control.state || {};
+  if (consequence === "legal_attestation" && (control.selected === true || state.checked === true || state.selected === true)) {
+    return null;
+  }
+  if (consequence === "payment_entry" && (state.valuePresent === true || clean(state.normalizedValue || state.valueText || state.value))) {
+    return null;
+  }
+  return Object.freeze({
+    obligationId: `consequence:${clean(control.controlId)}`,
+    kind: consequence === "legal_attestation"
+      ? "legal_authorization"
+      : consequence === "payment_entry"
+        ? "payment_authorization"
+        : consequence === "purchase_submission"
+          ? "purchase_authorization"
+          : "authentication",
+    semanticType: consequence,
+    surfaceId: clean(control.surfaceId || "surface-page"),
+    evidenceIds: controlEvidenceIds(control),
+    status: "authorization_required"
+  });
+}
+
+function compileCheckoutSituation({
+  sourceFrame = {},
+  page = {},
+  profileRequirements = [],
+  commerceEntities = [],
+  semanticCompilation = {}
+} = {}) {
+  const controls = (page.controls || []).filter(activeRepresentation);
+  const actions = controls.filter(controlAvailable).map((control) => Object.freeze({
+    controlId: clean(control.controlId),
+    surfaceId: clean(control.surfaceId || "surface-page"),
+    consequence: controlConsequence(control),
+    physicalEffect: clean(control.physicalEffect || control.semanticEffect || control.semantic || "unknown"),
+    risk: clean(control.risk || "unknown"),
+    evidenceIds: controlEvidenceIds(control)
+  }));
+  const profileObligations = profileRequirements
+    .map((descriptor) => requiredProfileObligation(descriptor, page))
+    .filter(Boolean);
+  const decisionObligations = commerceEntities.map(groupObligation).filter(Boolean);
+  const boundaryObligations = controls.map(consequentialObligation).filter(Boolean);
+  const validationBlockers = activeValidationIssues(page.validationIssues || []).map((issue, index) => Object.freeze({
+    blockerId: clean(issue.controlId || issue.sectionId || `validation-${index + 1}`),
+    kind: "validation",
+    controlId: clean(issue.controlId),
+    surfaceId: clean(issue.surfaceId || "surface-page"),
+    evidence: clean(issue.message || issue.text || issue.label || issue)
+  }));
+  const consequentialActions = actions.filter((action) => [
+    "legal_attestation",
+    "payment_entry",
+    "purchase_submission",
+    "monetary_selection",
+    "authentication"
+  ].includes(action.consequence));
+  const contradictions = [
+    ...(semanticCompilation.unownedMaterialControls || []).map((control) => Object.freeze({
+      code: "UNOWNED_MATERIAL_CONTROL",
+      evidenceIds: controlEvidenceIds(control)
+    })),
+    ...(semanticCompilation.unresolvedDecisions || []).map((decision) => Object.freeze({
+      code: "UNRESOLVED_DECISION",
+      evidenceIds: Object.freeze(unique([
+        decision.decisionGroupId,
+        decision.requirementId,
+        ...(decision.alternativeControlIds || [])
+      ]))
+    }))
+  ];
+  const navigationControlIds = Object.freeze(unique([
+    ...(page.stageExit?.candidates || []).map((candidate) => candidate.controlId),
+    ...actions.filter((action) => action.consequence === "checkout_progress").map((action) => action.controlId)
+  ]));
+  const checkoutActive = Boolean(
+    controls.length
+    || commerceEntities.length
+    || profileRequirements.length
+    || navigationControlIds.length
+    || page.transactionFacts
+    || page.terminalEvidence
+  );
+  const obligations = Object.freeze([
+    ...profileObligations,
+    ...decisionObligations,
+    ...boundaryObligations
+  ]);
+  return Object.freeze({
+    contractVersion: CHECKOUT_SITUATION_VERSION,
+    observationId: clean(sourceFrame.observationId),
+    observationHash: clean(sourceFrame.observationHash),
+    surface: surfaceEvidence(page),
+    // Diagnostic context only: this hint never admits, completes, or
+    // identifies an obligation.
+    stageHint: Object.freeze({
+      value: clean(page.step || page.pageStep || "unknown"),
+      evidence: freezeArray(page.stepEvidence || page.stageEvidence || [])
+    }),
+    checkoutActive,
+    obligations,
+    availableActions: Object.freeze(actions),
+    consequentialActions: Object.freeze(consequentialActions),
+    blockers: Object.freeze(validationBlockers),
+    navigationControlIds,
+    transactionEvidence: page.transactionFacts || null,
+    completionEvidence: page.terminalEvidence || null,
+    contradictions: Object.freeze(contradictions),
+    reconciliationRequired: Boolean(
+      contradictions.length
+      || (checkoutActive && !obligations.length && !actions.length && !page.terminalEvidence)
+    )
   });
 }
 
@@ -124,6 +346,13 @@ function compileDecisionFrame({
     traveler: {},
     decisionEpisode: null
   });
+  const checkoutSituation = compileCheckoutSituation({
+    sourceFrame,
+    page,
+    profileRequirements,
+    commerceEntities: compilation.decisionGroups || [],
+    semanticCompilation: compilation
+  });
   return Object.freeze({
     contractVersion: DECISION_FRAME_VERSION,
     frameId: `${sourceFrame.observationId || "observation"}:${sourceFrame.observationHash || "unhashed"}:decision-v2`,
@@ -139,6 +368,7 @@ function compileDecisionFrame({
     transactionFacts,
     terminalEvidence: page.terminalEvidence || null,
     validationBlockers: arrayReference(page.validationIssues),
+    checkoutSituation,
     provenance: Object.freeze({
       compiler: "agent-contract.compileSemanticCheckout",
       compilerVersion: clean(compilation.contractVersion || agentContract.CONTRACT_VERSION),
@@ -173,6 +403,8 @@ function admittedControlIds(goal = {}) {
 
 function obligationSubject(goal = {}) {
   return Object.freeze({
+    // Diagnostic context only. Stable ownership below deliberately excludes
+    // a guessed checkout stage.
     stage: clean(goal.stage || goal.owner?.stage),
     family: clean(goal.canonicalSubject?.family || goal.subject?.family || goal.family || goal.sectionType),
     key: clean(goal.canonicalSubject?.key || goal.subject?.key || goal.subjectKey || goal.semanticType),
@@ -274,17 +506,17 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null } = {}) {
     adaptive: goal.adaptiveEnvelope ? Object.freeze({ ...goal.adaptiveEnvelope }) : null
   });
   const owner = normalizeSemanticOwner({
-    stage: goal.stage || goal.owner?.stage || decisionFrame?.observation?.page?.step,
+    stage: "checkout",
     family: goal.canonicalSubject?.family || goal.subject?.family || goal.family || goal.sectionType || goal.semanticType,
     subjectId: goal.subjectId || "global",
     passengerId: goal.canonicalSubject?.passengerId || goal.passengerId || goal.travelerId,
     segmentId: goal.canonicalSubject?.segmentId || goal.segmentId,
     repeatedInstance: goal.canonicalSubject?.repeatedInstance
-      || goal.decisionInstanceId
+      || goal.logicalFieldId
       || goal.canonicalOwnerId
       || goal.requirementId
       || goal.decisionGroupId
-      || goal.logicalFieldId
+      || goal.decisionInstanceId
       || goal.goalId
   });
   const obligation = {
@@ -323,6 +555,7 @@ function currentObligation(taskState = {}) {
 }
 
 module.exports = {
+  CHECKOUT_SITUATION_VERSION,
   CURRENT_OBLIGATION_VERSION,
   DECISION_FRAME_VERSION,
   OBSERVATION_FRAME_VERSION,

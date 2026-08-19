@@ -485,7 +485,7 @@ function decisionInstanceKey(source = {}, observation = {}) {
     group.selectedEvidence?.selectedLabel || group.selectedLabel || goal.selectedLabel
   ].filter(Boolean).join("|");
   return JSON.stringify({
-    stage: normalizedInstanceFact(page.step || page.pageStep || obligationSubject.stage || goal.stage || "unknown"),
+    scope: "checkout",
     surface: normalizedInstanceFact([
       surface.id || target.surfaceId || group.surfaceId || "surface-page",
       surface.type || target.surfaceType || group.surfaceType || "page",

@@ -10,10 +10,10 @@ This is the concise chronological engineering record. Current acceptance truth b
 |---|---|
 | Product milestone | Universal unfamiliar checkout to verified payment review; no legal/payment/purchase action |
 | Architecture | One ObservationFrame → DecisionFrame → TaskState/CurrentObligation → mechanics → governor → ActionLease → verification loop |
-| Automated baseline | 383/383 unit; 179 browser corpus with 178/178 uninterrupted baseline; `npm run check` |
+| Automated baseline | 386/386 unit; 179/179 uninterrupted browser replays; `npm run check` |
 | Live evidence | EasyJet, GoToGate, Kiwi, and Turkish technically reached verified payment review safely |
 | Formal evidence gap | Latest normalized canary reports require explicit intervention annotation |
-| Highest-priority product gap | Cross-airline structural portfolio, not another architecture rewrite |
+| Highest-priority product gap | Obligation-driven interpretation on mixed/unfamiliar pages, then cross-airline structural proof |
 | Secondary gap | Browser observation/rescan and ambiguity latency |
 | Safety target | Zero false terminal completion and zero unauthorized irreversible mutation |
 
@@ -31,6 +31,16 @@ Prove that the current universal loop transfers to unfamiliar structural familie
 Every failure must produce an exact replay and a universal repair. A new DOM, ordinary field, custom control, or unusual grouping is not an expected handoff.
 
 ## Latest implementation checkpoints
+
+### 2026-08-19 — Obligation-driven checkout situation
+
+- The existing `DecisionFrame/v2` now publishes one grounded `CheckoutSituation/v1` with obligations, available actions, consequential actions, blockers, transaction/completion evidence, contradictions, and a diagnostic-only stage hint.
+- Required profile work is no longer gated by a guessed traveler stage; mixed pages can expose traveler, ancillary, legal, and payment concerns together.
+- Stage was removed from surface fingerprints, stable obligation owners, decision recovery instances, and new episode identities. The old stage-to-terminal shortcut was deleted; verified transaction-boundary evidence remains the payment-review authority.
+- Legal attestation, payment entry, purchase submission, paid selection, and authentication are explicitly separated. Croatia-style terms containing “purchase conditions” remain legal rather than being confused with the Confirm/Pay action.
+- Incomplete transaction evidence, validation ambiguity, missing selected-booking derivations, and unexplained active checkout state now stay engine-owned (`wait_reobserve`/typed stop). They no longer ask the user to diagnose the engine. Only a genuinely missing personal fact or material transaction contradiction requests user input/approval.
+
+Validation: 386/386 unit tests, 179/179 uninterrupted browser replays, `npm run check`, and `git diff --check` pass. Fresh Croatia, Lufthansa, and Wizz/Ryanair live reruns remain.
 
 ### 2026-08-19 — Explicit universal checkout launch
 

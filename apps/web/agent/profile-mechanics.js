@@ -899,6 +899,14 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
     interactionMethod: strategy.interactionMethod || "",
     boundedRecovery: strategy.boundedRecovery === true,
     exactOption: strategy.exactOption || null,
+    // Keep the exact observed choice label on the mechanical candidate. The
+    // semantic value still comes from the admitted profile obligation; this
+    // is grounded actuator evidence used for audit, scoring, and verification.
+    targetLabel: strategy.exactOption?.label
+      || descriptor.exactOption?.label
+      || descriptor.bindingContract?.component?.exactOption?.label
+      || descriptor.control?.label
+      || "",
     value: strategy.value || "",
     keys: strategy.keys || "",
     visualRegion: strategy.visualRegion || null,

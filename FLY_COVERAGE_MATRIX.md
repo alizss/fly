@@ -25,8 +25,8 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Layer | Result | Evidence |
 |---|---:|---|
 | Build, type, and syntax | ✅ | `npm run check` |
-| Agent unit suite | ✅ 383/383 | Semantic authority, typed validation lifecycle, scene/decision reconciliation, profile codecs, policy, transaction, recovery, persistence, universal explicit launch, and architecture invariants |
-| Browser replay suite | ✅ 179 corpus | 178/178 uninterrupted baseline plus the focused Croatia PAY-boundary replay. Coverage includes app-supplied and browser-captured tab lineage, unrelated-provider redirects, Croatia zero-error and causal post-action validation, and all established canaries |
+| Agent unit suite | ✅ 386/386 | Obligation-driven situation authority, typed validation lifecycle, scene/decision reconciliation, profile codecs, policy, transaction, recovery, persistence, universal explicit launch, and architecture invariants |
+| Browser replay suite | ✅ 179/179 | Uninterrupted corpus covering app-supplied and browser-captured tab lineage, unrelated-provider redirects, Croatia traveler/PAY boundaries, mixed controls, causal post-action validation, and all established canaries |
 | Durable session boundary | ✅ | Tab-scoped app launch or current-tab acquisition → complete `SelectedBooking/v1`, background-owned checkout lineage, strict traveler membership, cross-checkout isolation, resume identity, typed failures |
 | Explicit universal runtime launch | 🧪 | Active-tab `chrome.scripting` injection works on an unlisted HTTPS checkout; app-supplied `SelectedBooking/v1` starts an itinerary-free unfamiliar passenger page; fresh live Lufthansa/Wizz proof pending |
 | Irreversible-action boundary | ✅ | No payment, billing, legal, card, Pay, or purchase action in current review-only replays/canaries |

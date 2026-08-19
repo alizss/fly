@@ -4,13 +4,21 @@ Product direction, scope boundaries, and promotion criteria are defined in `FLY_
 
 ## North star
 
-Fly should complete checkout across different airline and OTA websites by dynamically understanding each page, using the selected traveler’s facts, preferences, constraints, and trip-specific instructions, handling unexpected situations safely, and stopping only when payment or explicit user authorization is required.
+Fly should let the user select a flight and confirm Book/Pay once, then complete the unfamiliar airline/OTA checkout—including authorized standard legal terms, payment, purchase, and independent booking verification—using the exact mandate, traveler facts, policy, and transaction limits. Ordinary unfamiliarity and CAPTCHA are engine problems, not desired user handoffs; only genuinely unavailable facts, material mandate changes, or externally required identity/bank challenges may interrupt the target experience.
 
 The Chrome extension is the first actuator and proving ground. The long-term product is one reusable checkout-intelligence engine shared by the browser extension, a secure background runtime, and an iOS experience.
 
-### Current priority (2026-08-10)
+### Current priority (2026-08-19)
 
-The single-authority architecture and four-site technical canary are now established. The largest remaining product risk is **external validity**: proving that the same universal contracts transfer beyond EasyJet, GoToGate, Kiwi, and Turkish Airlines. Latency remains a promotion metric, but it is secondary to representative structural coverage. The next gate is a controlled portfolio of approximately 8–10 sites across at least 6 observed checkout families, including 4 direct-airline families and 3 structurally different OTAs. Every new failure must become a trace-derived universal replay and repair; ordinary unfamiliar DOMs, fields, grouping, or controls are not acceptable permanent stop reasons.
+The universal launch and action infrastructure is established, but Croatia exposed a deeper bottleneck before portfolio promotion: page-stage classification still influenced profile admission, terminal state, fingerprints, and recovery identity. The active package is an **obligation-driven core**. One `CheckoutSituation/v1` inside the existing `DecisionFrame` describes requested facts, unresolved decisions, available actions, blockers, consequences, transaction evidence, completion evidence, and contradictions. Stage remains diagnostic only. Once the Croatia/Lufthansa/Wizz replays prove this core, resume the controlled 8–10-site structural portfolio. Every failure must become a trace-derived universal replay and repair; ordinary unfamiliar DOMs, fields, grouping, or controls are not acceptable permanent stop reasons.
+
+### Obligation-driven correction (2026-08-19)
+
+- Do not create a second scene compiler or airline workflow. Extend the existing `DecisionFrame` compiler.
+- Do not require a page to be one of traveler/seats/extras/review/payment. Combined pages are normal.
+- Requiredness, validation ownership, policy decisions, legal/payment consequences, and exact transaction evidence determine what remains.
+- Page stage is allowed only in diagnostics and progress displays; it cannot gate profile work, define stable semantic ownership, fingerprint a surface, or declare a terminal result.
+- `NO_CURRENT_OBLIGATION` is not a product explanation on an active checkout. Reconcile the situation, attempt bounded safe recovery, then emit a typed engine failure without asking the user to diagnose it.
 
 ### Current architectural concern and correction (2026-08-06)
 

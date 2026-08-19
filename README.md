@@ -2,17 +2,16 @@
 
 Fly is a universal, safety-constrained flight-checkout agent.
 
-The user selects a flight and traveler, starts Fly, and Fly completes an unfamiliar airline or OTA checkout according to the traveler profile and booking policy. The current product stops at verified payment review; it does not enter payment credentials, accept legal terms, or purchase.
+The user selects a flight and confirms Book/Pay once. Fly completes an unfamiliar airline or OTA checkout from saved traveler facts and policy, handles authorized standard terms and payment, purchases exactly the approved transaction, and independently verifies the booking. Today’s engineering milestone stops at verified payment review while the legal, payment, idempotency, and confirmation components are built.
 
 ## Product direction
 
 Long-term user experience:
 
 ```text
-select flight and traveler
-→ tap Fly
-→ answer only genuinely missing or consequential questions
-→ approve the exact transaction
+select flight
+→ confirm Book/Pay once
+→ Fly resolves the checkout under the saved mandate
 → receive independently verified booking confirmation
 ```
 
@@ -37,6 +36,7 @@ Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, 
 ```text
 fresh ObservationFrame
 → one DecisionFrame
+→ grounded CheckoutSituation (obligations + consequences)
 → TaskState publishes one CurrentObligation
 → bind exact current mechanics
 → consequence governor
@@ -49,8 +49,8 @@ The model is optional and bounded. Deterministic singleton mechanics use zero mo
 
 ## Current evidence
 
-- 383/383 agent unit tests
-- 179 browser replays (178/178 uninterrupted baseline plus the focused Croatia PAY-boundary replay)
+- 386/386 agent unit tests
+- 179/179 uninterrupted browser replays
 - Explicit active-tab runtime launch is replay-proven on an unlisted checkout domain
 - Fresh technical payment-review passes on EasyJet, GoToGate, Kiwi, and Turkish Airlines
 - No payment, card, legal, or purchase action in the accepted review-only flows

@@ -534,7 +534,7 @@ function choiceDecisionEpisode({
         ? "completed"
         : (previous ? "awaiting_child_confirmation" : "active");
   const episodeId = clean(previous?.episodeId)
-    || `${clean(observation.page?.step || "unknown")}:${decisionInstanceId}`;
+    || `checkout:${decisionInstanceId}`;
   const progress = page.foreground?.progressMarkers
     || page.visualState?.foreground?.progressMarkers
     || {};
@@ -627,4 +627,3 @@ module.exports = {
   verifiedActionSucceeded,
   verifiedEpisodeAction
 };
-

@@ -9,12 +9,6 @@ function lower(value = "") {
   return clean(value).toLowerCase();
 }
 
-function terminalForStage(stage = "unknown") {
-  if (stage === "payment") return "payment_review_reached";
-  if (stage === "confirmation") return "confirmation_reached";
-  return "active";
-}
-
 function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence = {}, transactionReview = null, traveler = {}) {
   const page = observation.page || {};
   const controls = (page.controls || []).filter((control) => (
@@ -107,4 +101,4 @@ function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence =
   });
 }
 
-module.exports = { paymentReviewBoundaryEvidence, terminalForStage };
+module.exports = { paymentReviewBoundaryEvidence };

@@ -8,24 +8,24 @@ Latest implementation checkpoints before this documentation update: `21b5d57` an
 
 ## 1. Mission and current boundary
 
-Fly takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies saved facts and policy, verifies every material result, reconciles the final transaction, and stops at verified payment review.
+Fly's final product takes one Book/Pay confirmation through authorized standard terms, payment, purchase, and independently verified booking. The active engineering gate takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies saved facts and policy, verifies every material result, reconciles the final transaction, and stops at verified payment review.
 
 The current runtime must not accept legal terms, enter payment credentials, click Pay, or purchase. The long-term product adds a background runtime, web/iOS control surfaces, and a separately authorized payment boundary without replacing the checkout engine.
 
-The current engineering priority is cross-airline structural generalization—not another architecture rewrite and not airline-specific selectors.
+The current engineering priority is live proof of the obligation-driven core on Croatia, Lufthansa, and Wizz/Ryanair, followed by representative structural generalization. Do not add airline-specific selectors or another compiler.
 
 ## 2. Current status
 
 | Area | Status |
 |---|---|
-| Agent unit suite | 383/383 passing |
-| Browser replay suite | 179-replay corpus; 178/178 prior uninterrupted baseline plus focused Croatia PAY-boundary proof |
+| Agent unit suite | 386/386 passing |
+| Browser replay suite | 179/179 uninterrupted |
 | Build/type/syntax gate | `npm run check` passing |
 | Live sites | EasyJet, GoToGate, Kiwi, and Turkish reached verified payment review in the latest technical canaries |
 | Safety | No payment, card, legal, or purchase action in those review-only flows |
 | Formal autonomous acceptance | Canary reports remain `review_required` until the operator records `--manual none` or `--manual yes` |
-| Architecture | Single semantic compiler, TaskState authority, direct obligation mechanics, one governed action lease, bounded recovery, compact durable state |
-| Main product gap | Representative structural portfolio: 8–10 sites, 6+ families, 4 direct-airline families, 3 OTAs |
+| Architecture | Single semantic compiler with `CheckoutSituation/v1`, TaskState authority, direct obligation mechanics, one governed action lease, bounded recovery, compact durable state; stage is diagnostic only |
+| Main product gap | Fresh Croatia/Lufthansa/Wizz proof of obligation-driven mixed-page handling, then representative 8–10-site coverage |
 | Main performance gap | Large browser observations and rescans; unnecessary ambiguity/model turns on some sites |
 
 Latest live report:
@@ -179,7 +179,7 @@ npm run canary:report -- --latest-by-site
 Full acceptance after a material core change:
 
 1. Focused trace-derived replay passes.
-2. 383 unit tests pass.
+2. 386 unit tests pass.
 3. The 179-replay browser corpus has a 178/178 uninterrupted baseline plus focused Croatia PAY-boundary proof.
 4. `npm run check` and `git diff --check` pass.
 5. Discovering site reaches verified payment review or the expected typed handoff.
@@ -236,4 +236,4 @@ The latest four traces technically reached payment review and passed safety, but
 
 ## 11. One-paragraph handoff
 
-Fly currently has one authoritative checkout loop, compact durable transaction state, strict selected-booking admission, exact action leases, bounded adaptive mechanics, transaction reconciliation, and hard payment/legal/purchase boundaries. The complete automated baseline is green, and the latest EasyJet, GoToGate, Kiwi, and Turkish traces all technically reached verified payment review safely. The next bottleneck is external validity: prove the same universal loop across additional direct-airline and OTA structural families, converting every failure into a trace-derived universal replay while retaining the four canaries. Latency optimization follows measured browser observation and ambiguity hot paths; it should not trigger another authority rewrite.
+Fly currently has one authoritative checkout loop, compact durable transaction state, strict selected-booking admission, exact action leases, bounded adaptive mechanics, transaction reconciliation, and hard payment/legal/purchase boundaries for the current milestone. `DecisionFrame/v2` now includes grounded `CheckoutSituation/v1`; stage is diagnostic rather than work, identity, or terminal authority. The immediate bottleneck is to finish and live-prove this obligation-driven correction on Croatia, Lufthansa, and Wizz/Ryanair, then continue the representative direct-airline/OTA portfolio while retaining EasyJet, GoToGate, Kiwi, and Turkish canaries. LegalAuthorization, PaymentAuthorization, idempotent purchase, and independent confirmation follow checkout-to-review proof; they are final-product components, not permanent handoffs.

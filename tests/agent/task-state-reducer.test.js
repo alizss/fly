@@ -1985,6 +1985,7 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
   assert.equal(state.paymentEvidence.signalCount >= 3, true);
   assert.equal(state.safetyRestrictions.paymentSubmissionRequiresApproval, true);
   assert.equal(state.safetyRestrictions.paymentCredentialsBlocked, true);
+  assert.equal(state.disposition.userActionRequired, false);
 });
 
 test("a confirmation-labeled final review latches from owned payment evidence", () => {
@@ -2014,6 +2015,7 @@ test("a confirmation-labeled final review latches from owned payment evidence", 
   assert.equal(state.processAwareness.currentPosition.stage, "payment_review");
   assert.equal(state.processAwareness.finalOutcome.achieved, true);
   assert.equal(state.processAwareness.finalOutcome.transactionVerified, true);
+  assert.equal(state.disposition.userActionRequired, false);
 });
 
 test("final checkout with terms and a disabled pay-by-card control is payment review", () => {
@@ -2096,6 +2098,8 @@ test("an unverified final review freezes payment and billing work without claimi
   assert.equal(state.processAwareness.currentObjective, "verify the final transaction");
   assert.deepEqual(state.processAwareness.unresolved, ["transaction:itinerary_route"]);
   assert.equal(state.processAwareness.finalOutcome.achieved, false);
+  assert.equal(state.disposition.kind, "wait_reobserve");
+  assert.equal(state.disposition.userActionRequired, false);
 });
 
 test("a lone card field outside review does not create a terminal boundary", () => {
@@ -2240,6 +2244,8 @@ test("an active checkout redirected to the search start is classified as checkou
   assert.equal(left.terminalStatus, "checkout_left");
   assert.equal(left.checkoutBoundary.leftActiveCheckout, true);
   assert.equal(left.currentGoal, null);
+  assert.equal(left.disposition.kind, "stop");
+  assert.equal(left.disposition.userActionRequired, false);
 });
 
 test("unknown foreground publishes one bounded reversible goal and excludes consequential controls", () => {
@@ -4143,6 +4149,8 @@ test("unknown grounding remains diagnostic and cannot manufacture profile unread
   assert.equal(taskState.profileReadiness.blockedReasonCode, "");
   assert.equal(taskState.profileReadiness.activeRequirementGrounding.status, "unknown");
   assert.equal(taskState.currentGoal, null);
+  assert.equal(taskState.disposition.kind, "wait_reobserve");
+  assert.equal(taskState.disposition.userActionRequired, false);
 });
 
 test("age at departure uses the authoritative selected-booking baseline when the page date is abbreviated", () => {
@@ -4416,4 +4424,6 @@ test("missing selected-flight date outranks semantic grounding and never asks th
     label: "selected flight departure date"
   }]);
   assert.equal(taskState.currentGoal, null);
+  assert.equal(taskState.disposition.kind, "wait_reobserve");
+  assert.equal(taskState.disposition.userActionRequired, false);
 });

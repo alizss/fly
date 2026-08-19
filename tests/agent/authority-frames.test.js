@@ -7,6 +7,7 @@ const {
   compileDecisionFrame,
   createObservationFrame,
   currentObligationFromGoal,
+  CHECKOUT_SITUATION_VERSION,
   CURRENT_OBLIGATION_VERSION,
   DECISION_FRAME_VERSION,
   OBSERVATION_FRAME_VERSION
@@ -288,4 +289,164 @@ test("navigation admission excludes a settled decline even when browser stage-ex
     traveler: { booking_rules: "No paid extras" }
   });
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [continueControl.controlId]);
+});
+
+test("CheckoutSituation admits grounded obligations and consequences without treating stage as authority", () => {
+  const firstName = {
+    controlId: "first_name",
+    stateElementId: "first_name_node",
+    preferredActivationElementId: "first_name_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    fieldType: "first_name",
+    semantic: "first_name",
+    physicalEffect: "set_field_value",
+    label: "First name",
+    kind: "text",
+    role: "textbox",
+    required: true,
+    state: { required: true, valuePresent: false, normalizedValue: "" },
+    operations: { type: actionable("type", "first_name_node") }
+  };
+  const terms = {
+    controlId: "terms",
+    stateElementId: "terms_node",
+    preferredActivationElementId: "terms_node",
+    surfaceId: "surface-page",
+    semantic: "legal_acceptance",
+    physicalEffect: "accept_legal_terms",
+    risk: "legal",
+    label: "I agree with the General Conditions of Carriage and purchase conditions and understand dangerous goods restrictions",
+    kind: "checkbox",
+    role: "checkbox",
+    state: { checked: false },
+    operations: { choose: actionable("choose", "terms_node") }
+  };
+  const pay = {
+    controlId: "pay",
+    stateElementId: "pay_node",
+    preferredActivationElementId: "pay_node",
+    surfaceId: "surface-page",
+    semantic: "submit_purchase",
+    physicalEffect: "submit_purchase",
+    risk: "payment",
+    label: "Confirm and pay",
+    kind: "button",
+    role: "button",
+    operations: { activate: actionable("activate", "pay_node") }
+  };
+  const observation = {
+    observationId: "obs_mixed_checkout",
+    observationSnapshot: { snapshotHash: "hash_mixed_checkout" },
+    page: {
+      url: "https://example.test/checkout",
+      step: "extras",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [firstName, terms, pay],
+      fields: [{
+        controlId: firstName.controlId,
+        field: "first_name",
+        fieldType: "first_name",
+        label: firstName.label,
+        required: true,
+        hasValue: false,
+        state: firstName.state,
+        controlState: firstName.state
+      }],
+      decisionGroups: [],
+      validationIssues: [{
+        status: "diagnostic",
+        lifecycle: "diagnostic",
+        message: "0 error"
+      }]
+    }
+  };
+  const decisionFrame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation),
+    traveler: { first_name: "Ali" }
+  });
+  const situation = decisionFrame.checkoutSituation;
+  const taskState = reduceTaskState({ observation, decisionFrame, traveler: { first_name: "Ali" } });
+
+  assert.equal(situation.contractVersion, CHECKOUT_SITUATION_VERSION);
+  assert.equal(situation.stageHint.value, "extras");
+  assert.equal(situation.obligations.some((item) => item.semanticType === "first_name"), true);
+  assert.deepEqual(situation.blockers, []);
+  assert.deepEqual(
+    situation.obligations.filter((item) => item.status === "authorization_required").map((item) => item.kind).sort(),
+    ["legal_authorization", "purchase_authorization"]
+  );
+  assert.deepEqual(
+    situation.consequentialActions.map((item) => item.consequence).sort(),
+    ["legal_attestation", "purchase_submission"]
+  );
+  assert.equal(taskState.currentObligation.kind, "profile_field");
+  assert.equal(taskState.currentObligation.subject.semanticType, "first_name");
+});
+
+test("stage hints do not change stable obligation ownership", () => {
+  const makeObservation = (step, observationId, snapshotHash) => ({
+    observationId,
+    observationSnapshot: { snapshotHash },
+    page: {
+      url: "https://example.test/checkout",
+      step,
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [{
+        controlId: "last_name",
+        stateElementId: "last_name_node",
+        preferredActivationElementId: "last_name_node",
+        surfaceId: "surface-page",
+        fieldType: "last_name",
+        semantic: "last_name",
+        physicalEffect: "set_field_value",
+        label: "Last name",
+        kind: "text",
+        role: "textbox",
+        required: true,
+        state: { required: true, valuePresent: false },
+        operations: { type: actionable("type", "last_name_node") }
+      }],
+      fields: [{
+        controlId: "last_name",
+        field: "last_name",
+        fieldType: "last_name",
+        label: "Last name",
+        required: true,
+        hasValue: false
+      }],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  });
+  const traveler = { last_name: "Sifrar" };
+  const extras = reduceTaskState({ observation: makeObservation("extras", "obs_owner_a", "hash_owner_a"), traveler });
+  const travelerHint = reduceTaskState({ observation: makeObservation("traveler_information", "obs_owner_b", "hash_owner_b"), traveler });
+
+  assert.equal(extras.currentObligation.semanticOwner.stage, "checkout");
+  assert.equal(extras.currentObligation.semanticOwnerId, travelerHint.currentObligation.semanticOwnerId);
+  assert.equal(extras.surfaceFingerprint, travelerHint.surfaceFingerprint);
+});
+
+test("an active unexplained checkout produces typed situation reconciliation", () => {
+  const observation = {
+    observationId: "obs_unexplained_checkout",
+    observationSnapshot: { snapshotHash: "hash_unexplained_checkout" },
+    page: {
+      url: "https://example.test/checkout",
+      step: "unknown",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [],
+      decisionGroups: [],
+      validationIssues: [],
+      transactionFacts: { currency: "EUR", totalPrice: { amount: 100, currency: "EUR" } }
+    }
+  };
+  const decisionFrame = compileDecisionFrame({ observation, observationFrame: createObservationFrame(observation) });
+  const taskState = reduceDecisionFrame({ observation, decisionFrame });
+
+  assert.equal(decisionFrame.checkoutSituation.reconciliationRequired, true);
+  assert.equal(taskState.disposition.code, "SITUATION_RECONCILIATION_REQUIRED");
+  assert.equal(taskState.disposition.userActionRequired, false);
 });

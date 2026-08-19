@@ -1,10 +1,10 @@
 # Fly — Agent and Engineering Rulebook
 
-Last updated: 2026-08-10
+Last updated: 2026-08-19
 
 ## Core mission
 
-Given an approved selected booking, traveler, and policy, Fly must complete an unfamiliar airline/OTA checkout to verified payment review, ask only when user facts or authority are genuinely required, and never perform payment, legal, or purchase actions under the current milestone.
+Final product: the user selects a flight and confirms Book/Pay once; Fly completes traveler details, choices, authorized standard legal terms, payment, purchase, and independent booking verification. The active engineering milestone proves unfamiliar checkout to verified payment review and still blocks legal/payment/purchase execution until their transaction-bound authorization components exist.
 
 Fly learns reusable checkout mechanics—not airline workflows.
 
@@ -27,7 +27,7 @@ Do not add a second semantic compiler, requirement lifecycle, planner, readiness
 ## Responsibility rules
 
 1. **Observation** reports mechanics, current state, ownership evidence, and transaction evidence.
-2. **DecisionFrame** compiles semantic entities once.
+2. **DecisionFrame** compiles semantic entities and one grounded `CheckoutSituation/v1` once.
 3. **TaskState** alone decides what work exists and how the turn ends.
 4. **Mechanics binder** finds actuators only for the admitted obligation.
 5. **Governor** checks consequences immediately before execution.
@@ -35,7 +35,7 @@ Do not add a second semantic compiler, requirement lifecycle, planner, readiness
 7. **Transition verifier** proves the same semantic obligation was satisfied.
 8. **Transaction review** independently reconciles the selected booking and outcomes.
 
-Actionability does not create work. A model may choose only supplied fresh reversible candidate IDs. It may not invent targets, facts, obligations, effects, or permission.
+Actionability and a guessed page stage do not create work. Obligations, consequences, blockers, transaction evidence, and completion evidence do. A model may choose only supplied fresh reversible candidate IDs. It may not invent targets, facts, obligations, effects, or permission.
 
 ## Behavior on unfamiliar sites
 
@@ -56,10 +56,12 @@ The absence of an airline-specific skill is never a stop reason.
 
 - Required traveler data is genuinely missing.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge is active.
-- Legal, payment, purchase, identity, itinerary, price, currency, or paid-choice authority is missing or contradictory.
+- A material identity, itinerary, price, currency, or paid-choice decision is outside the mandate.
 - Inventory is sold out, the session expired, the airline is unavailable, or valid completed input is rejected.
 - Distinct safe grounded mechanics are exhausted after bounded recovery.
 - Verified payment review is reached under the current milestone.
+
+Standard legal terms, payment entry, and purchase are temporary milestone boundaries, not desired user handoffs. CAPTCHA is also a future engine capability. Only genuinely missing personal facts, material transaction changes, or external identity/bank challenges may require the user in the target product.
 
 Exhausted mechanics on an otherwise eligible journey is an engineering coverage defect, not a desired product handoff.
 
@@ -103,6 +105,7 @@ Remove or demote anything that independently:
 - Persists turn-local candidate/observation graphs as semantic memory.
 - Polls unchanged full observations instead of waiting for mutation/deadline.
 - Converts diagnostics or compatibility state into runtime authority.
+- Uses a page-stage label to admit work, define obligation identity, or claim completion.
 
 Do not remove distinct safety roles merely because they inspect related evidence. TaskState/governor, browser/backend verification, deterministic/adaptive mechanics, and transaction/payment boundaries serve different purposes.
 

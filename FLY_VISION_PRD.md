@@ -1,16 +1,16 @@
 # Fly — Product Requirements
 
-Last updated: 2026-08-10
+Last updated: 2026-08-19
 
 This is Fly's stable product contract. Implementation status belongs in [FLY_COVERAGE_MATRIX.md](./FLY_COVERAGE_MATRIX.md), engineering sequence in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md), and current code orientation in [FLY_CURRENT_CODEBASE_ENGINEERING_HANDOFF.md](./FLY_CURRENT_CODEBASE_ENGINEERING_HANDOFF.md).
 
 ## 1. North star
 
-> A user selects a flight and traveler, starts Fly, answers only genuinely missing or consequential questions, approves the exact transaction, and receives an independently verified booking confirmation.
+> A user selects a flight, confirms Book/Pay once, and receives an independently verified booking confirmation. Fly handles the checkout—including authorized standard legal terms and payment—without sending the user back to the airline page.
 
-The intended experience is approximately 1–3 user interactions. Fly is not an airline autofill script; it is one reusable checkout engine shared by the extension, background web runtime, and future iOS product.
+Click count is not the architecture. The product contract is that all known facts, saved policies, standard authorized attestations, payment entry, and purchase mechanics are handled by Fly. The user is interrupted only for a genuinely unavailable fact, a material transaction change outside the mandate, or an external identity/bank challenge that technically requires the user. CAPTCHA solving is a future engine capability, not a desired product handoff. Fly is not an airline autofill script; it is one reusable checkout engine shared by the extension, background web runtime, and future iOS product.
 
-## 2. Current product boundary
+## 2. Current engineering milestone
 
 The current milestone ends at verified payment review:
 
@@ -24,7 +24,7 @@ approved selected booking
 → stop before legal acceptance, payment entry, Pay, or purchase
 ```
 
-Payment and confirmed booking are later product gates requiring explicit per-booking authorization, a secure payment provider, idempotency, OTP/3DS handling, and independent PNR/ticket evidence.
+This is a temporary proof gate, not the final user experience. The next gates add transaction-bound `LegalAuthorization`, secure `PaymentAuthorization`, idempotent purchase submission, and independent PNR/ticket verification. Standard booking terms are accepted by the agent under the Book/Pay mandate; the user is not asked to operate the airline checkbox. Unknown factual declarations are never guessed.
 
 ## 3. Product principles
 
@@ -64,7 +64,7 @@ A `99%` claim must always name this eligibility scope. It must not count sold-ou
 - Optional facts never become fabricated requirements.
 - Profile silence is not permission for a consequential decision.
 
-### Universal checkout understanding
+### Obligation-driven checkout understanding
 
 Fly must handle reusable patterns including:
 
@@ -76,6 +76,8 @@ Fly must handle reusable patterns including:
 - Localized labels and unfamiliar grouping when fresh ownership and mechanics can be established.
 
 Ordinary DOM differences, a new textbox, unfamiliar wording, or the absence of a site-specific skill are not valid reasons to stop.
+
+`DecisionFrame` contains one grounded `CheckoutSituation/v1`: requested facts, unresolved obligations, choices, available actions, blockers, transaction evidence, completion evidence, contradictions, and consequences. A stage name may be retained as a diagnostic hint, but it cannot admit work, authorize an action, define identity, or prove completion. Combined pages are normal: traveler fields, extras, legal terms, and payment controls may coexist.
 
 When deterministic interpretation is uncertain or internally contradictory, Fly may run one bounded **Semantic Scene Reconciliation** pass before constructing the final decision frame. The model may propose grounded hypotheses about fields, component roles, input formats, decisions, attestations, validations, consequences, and ownership, but every hypothesis must reference fresh observed controls, text, surfaces, or regions. A hypothesis is evidence only: it cannot create an action, traveler fact, requirement, permission, transaction fact, or completion claim.
 
@@ -111,13 +113,15 @@ Generic payment wording, a URL, a click acknowledgement, or a page change is not
 
 The background product must reuse the same policy, TaskState, governor, action, verification, and transaction contracts. It adds isolated browsers, secure state, checkpoints, notifications, authentication handoff, and resume—not a second checkout engine.
 
-## 6. Valid stop and handoff reasons
+## 6. Valid interruption and stop reasons
+
+In the final product, ordinary legal acceptance, payment entry, purchase submission, and CAPTCHA handling belong to Fly. They are not permanent user handoffs. The current review-only milestone stops at that boundary solely until the corresponding authorization and secure execution components are enabled.
 
 Fly may stop or pause for:
 
 - A genuinely missing required traveler fact.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge.
-- Required legal consent or payment/purchase authority.
+- Legal/payment/purchase authority not yet implemented under the current engineering milestone.
 - A paid choice, price/currency change, itinerary change, or identity ambiguity not covered by explicit policy.
 - Sold-out inventory, expired session, airline outage, or a site that rejects valid completed input.
 - No safe grounded actuator after bounded adaptation and fresh verification attempts.
