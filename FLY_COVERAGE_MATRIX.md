@@ -1,12 +1,12 @@
 # Fly — Coverage and Acceptance Matrix
 
-Last updated: 2026-08-19
+Last updated: 2026-08-23
 
 This file is the current acceptance truth. Product scope belongs in [FLY_VISION_PRD.md](./FLY_VISION_PRD.md); architecture in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md); chronological implementation evidence in [FLY_PROGRESS.md](./FLY_PROGRESS.md).
 
 ## 1. Current milestone
 
-For an eligible selected booking, Fly must complete unfamiliar airline/OTA checkout, apply the selected traveler and explicit policy, reconcile the transaction, reach verified payment review, and stop before legal acceptance, payment entry, Pay, or purchase.
+For an eligible selected booking, Fly must complete unfamiliar airline/OTA checkout, apply the selected traveler and explicit policy, continue through authorized standard pre-payment/legal work, reach verified actual payment entry, and stop before entering payment credentials, submitting Pay, or purchasing. Transaction reconciliation is tracked independently and remains required before any future payment submission; it is not allowed to redefine whether an observed card-entry surface exists.
 
 Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusual grouping, or reused Continue controls are coverage responsibilities—not expected handoffs.
 
@@ -25,11 +25,11 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Layer | Result | Evidence |
 |---|---:|---|
 | Build, type, and syntax | ✅ | `npm run check` |
-| Agent unit suite | ✅ 386/386 | Obligation-driven situation authority, typed validation lifecycle, scene/decision reconciliation, profile codecs, policy, transaction, recovery, persistence, universal explicit launch, and architecture invariants |
-| Browser replay suite | ✅ 179/179 | Uninterrupted corpus covering app-supplied and browser-captured tab lineage, unrelated-provider redirects, Croatia traveler/PAY boundaries, mixed controls, causal post-action validation, and all established canaries |
-| Durable session boundary | ✅ | Tab-scoped app launch or current-tab acquisition → complete `SelectedBooking/v1`, background-owned checkout lineage, strict traveler membership, cross-checkout isolation, resume identity, typed failures |
+| Agent unit suite | ✅ 407/407 | Desired-state delta admission, obligation authority, typed validation, scene/decision reconciliation, profile codecs, policy, transaction, recovery, persistence, universal launch, and architecture invariants |
+| Browser replay suite | ✅ 184/184 | Uninterrupted corpus covering checkout lineage, Croatia PaymentForm delta repair, unrelated-provider redirects, mixed controls, exact optional-consent correction, payment boundaries, and all established canaries |
+| Durable session boundary | ✅ | App launch or current-page acquisition → complete `SelectedBooking/v1`, background-owned checkout lineage across tab/domain handoffs, strict traveler membership, cross-checkout isolation, resume identity, typed failures |
 | Explicit universal runtime launch | 🧪 | Active-tab `chrome.scripting` injection works on an unlisted HTTPS checkout; app-supplied `SelectedBooking/v1` starts an itinerary-free unfamiliar passenger page; fresh live Lufthansa/Wizz proof pending |
-| Irreversible-action boundary | ✅ | No payment, billing, legal, card, Pay, or purchase action in current review-only replays/canaries |
+| Irreversible-action boundary | 🧪 | Prior replays prove no credential/Pay/purchase action; corrected authorized pre-payment/legal continuation and actual payment-entry closure require fresh proof |
 
 ## 4. Universal capability status
 
@@ -42,6 +42,7 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Phone representation codec (combined international vs split prefix/local) | 🧪 | Croatia combined-field replay and Turkish/GoToGate split-phone regressions are green; fresh live proof pending |
 | Validation lifecycle, ownership, and exact-field repair | 🧪 | Croatia-style `0 error` is clear; native-invalid and positive active failures remain blocking in replay; fresh live Croatia proof pending |
 | Grounded Semantic Scene Reconciliation | 🧪 | Known scenes use zero calls; closed-ID field/validation hypotheses and descriptive decision typing cannot publish work or authority; fresh unfamiliar live proof pending |
+| Desired State Delta compiler/scheduler | ✅ replay | Only required missing state, exact profile mismatch, positive incremental-cost conflict, typed required legal work, or owned validation creates decision work; fresh Croatia live rerun pending |
 | Logical identity across framework rerender | ✅ | Continue live confirmation across new frameworks |
 | Active-surface and dormant-branch ownership | ✅ | New modal/drawer implementations |
 | Repeated passenger/leg decision ownership | ✅ | Multi-traveler live matrix |
@@ -49,7 +50,7 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 | Bounded adaptive reversible mechanics | ✅ | Additional previously unseen controls |
 | Single-dispatch navigation and hydration wait | ✅ | Fresh live repeat-guard confirmation after `c7aeb89` |
 | Transaction facts and selected-booking reconciliation | ✅ | More currencies/fare structures and price-change scenarios |
-| Payment-review terminal detection | ✅ | Additional hosted/direct payment-review structures |
+| Actual card-entry terminal detection | 🧪 | Requires owned card-number, expiry, and security-code entry or a specifically owned hosted card-entry widget; Croatia review/legal → WSPay and retained canaries pending |
 | Durable pause/restart/recovery | ✅ replay | Live authentication/OTP resume |
 | Background/cloud execution | ⏳ | Begins after structural and scenario gates |
 | Authorized payment and booking confirmation | ⏳ | Separate security/product gate |
@@ -58,15 +59,15 @@ Ordinary unfamiliar DOMs, new fields, custom widgets, rerenders, overlays, unusu
 
 `npm run canary:report -- --latest-by-site` currently reports:
 
-| Site | Structural family | Session | Payment review | Safety | Wall time | Formal status |
+| Site | Structural family | Session | Prior review-only result | Safety | Wall time | Formal status under corrected milestone |
 |---|---|---|---:|---:|---:|---|
-| Kiwi | Custom OTA | `chk_msn4k9vxkh0b6v` | ✅ | ✅ | 1m27s | 🟡 Technical pass; intervention annotation pending |
-| GoToGate | OTA checkout | `chk_msn4gnewrng0ai` | ✅ | ✅ | 2m30s | 🟡 Technical pass; intervention annotation pending |
-| EasyJet | European low-cost direct | `chk_msn4eao235a7in` | ✅ | ✅ | 1m08s | 🟡 Technical pass; intervention annotation pending |
-| Turkish Airlines | International full-service direct | `chk_msn3eboeqhka33` | ✅ | ✅ | 1m39s | 🟡 Technical pass; intervention annotation pending |
+| Kiwi | Custom OTA | `chk_msn4k9vxkh0b6v` | ✅ | ✅ | 1m27s | 🧪 Reclassify against actual payment-entry evidence |
+| GoToGate | OTA checkout | `chk_msn4gnewrng0ai` | ✅ | ✅ | 2m30s | 🧪 Reclassify against actual payment-entry evidence |
+| EasyJet | European low-cost direct | `chk_msn4eao235a7in` | ✅ | ✅ | 1m08s | 🧪 Reclassify against actual payment-entry evidence |
+| Turkish Airlines | International full-service direct | `chk_msn3eboeqhka33` | ✅ | ✅ | 1m39s | 🧪 Reclassify against actual payment-entry evidence |
 | Croatia Airlines | Regional direct | `chk_mskklx6tgq8k7l` | ❌ | ✅ | 11s | Not accepted; stale/incomplete discovery trace |
 
-Technical completion means terminal and transaction review are verified and safety is green. Formal autonomous acceptance additionally requires an explicit operator annotation:
+The table preserves historical review-only evidence; it does not prove the corrected actual-payment-entry milestone. New technical completion requires owned payment-entry evidence, transaction reconciliation, and safety green. Formal autonomous acceptance additionally requires an explicit operator annotation:
 
 ```bash
 npm run canary:report -- --session chk_... --manual none --write
@@ -97,7 +98,7 @@ Controlled baseline for every new primary:
 - No paid extras or additional baggage.
 - Random/no specific seat.
 - Approved starting itinerary, total/currency, and traveler.
-- Stop at verified payment review.
+- Stop only at verified actual payment entry, before credentials or purchase.
 
 Do not combine structural discovery with a new complex profile scenario.
 
@@ -131,11 +132,14 @@ A site/scenario is accepted only when all applicable checks pass:
 - [ ] Fresh validation reopens its exact active owner before optional or unrelated fields can become work.
 - [ ] Optional/dormant controls do not block progress.
 - [ ] Reversible decisions match explicit policy.
+- [ ] Satisfied/optional visible controls produce no Desired State Delta and cannot delay an executable safe stage exit.
+- [ ] Incremental-cost work is backed by direct exact commerce evidence, never a broad ancestor or booking total.
 - [ ] Unauthorized paid selections are absent or exactly corrected.
 - [ ] Transaction itinerary, traveler, outcomes, currency, and total reconcile.
-- [ ] `terminalStatus=payment_review_reached` and transaction review is ready.
+- [ ] `terminalStatus=card_credential_entry_reached` from a complete owned card-number/expiry/security-code capability (or owned hosted equivalent).
+- [ ] Transaction review readiness, missing facts, and contradictions are reported independently; it must be ready before any future credential/payment authority.
 - [ ] Expected action/outcome coverage is non-vacuous and complete.
-- [ ] No payment, billing, legal, card, Pay, purchase, or unauthorized irreversible action executes.
+- [ ] No payment credentials, Pay, purchase, or unauthorized irreversible action executes.
 - [ ] Every material new failure has an exact replay.
 - [ ] Operator records whether manual page intervention occurred.
 - [ ] Full unit, browser, and repository checks remain green after any repair.
@@ -144,7 +148,7 @@ A site/scenario is accepted only when all applicable checks pass:
 
 | Gate | Requirement | Status |
 |---|---|---|
-| A — Direct-airline generalization | Full-service + low-cost direct reach review; Kiwi/GoToGate retained; no site workflow | 🟡 Technical evidence achieved; formal annotations and confirmation sites pending |
+| A — Direct-airline generalization | Full-service + low-cost direct reach actual card credential entry; Kiwi/GoToGate retained; no site workflow | 🟡 Prior review evidence exists; corrected live card-entry reruns and confirmation sites pending |
 | B — Structural portfolio | 8–10 sites, 6+ families, 4 direct families, 3 OTAs | ⏳ |
 | C — Profile/policy portfolio | Complex scenarios on 2+ families | ⏳ |
 | D — Background product | Durable isolated jobs and safe handoff/resume equivalent to extension | ⏳ |

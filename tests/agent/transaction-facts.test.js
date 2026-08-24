@@ -725,7 +725,7 @@ test("a final payment review cannot establish its own missing itinerary baseline
   assert.ok(reviewed.review.missingFacts.includes("itinerary_route"));
 });
 
-test("typed terminal evidence is the sole final-review authority when provenance wording is absent", () => {
+test("typed card-entry evidence is the sole final-boundary authority when provenance wording is absent", () => {
   let state = createCheckoutSessionState({ travelerId: "trav_1" });
   state.id = "txn_terminal_evidence_review";
   state = prepareTransactionInvariants(state, observation("obs_baseline", facts()), { id: "trav_1" }).state;
@@ -734,9 +734,11 @@ test("typed terminal evidence is the sole final-review authority when provenance
   const paymentObservation = observation("obs_payment", paymentFacts);
   paymentObservation.page.step = "payment";
   paymentObservation.page.terminalEvidence = {
-    contractVersion: "terminal-evidence/v1",
+    contractVersion: "terminal-evidence/v2",
     boundaryObserved: true,
     verified: true,
+    cardCredentialEntryObserved: true,
+    paymentCredentialKinds: ["card_number", "card_expiry", "card_security_code"],
     evidenceOnly: true,
     capabilities: { paymentActionsAllowed: false }
   };

@@ -290,3 +290,49 @@ test("phone country-code choice compatibility tolerates repeated accessible labe
     "phone_country_code"
   ), false);
 });
+
+test("payment-method choice follows the selected profile and is not completion", () => {
+  const decision = {
+    decisionGroupId: "payment-method",
+    subject: { key: "payment_method" },
+    required: true,
+    material: true,
+    alternatives: [
+      { controlId: "card", label: "Credit or debit card", semantic: "payment_method", executable: true },
+      { controlId: "wallet", label: "Apple Pay / Google Pay", semantic: "payment_method", executable: true }
+    ]
+  };
+
+  const card = resolveProfileDecision(decision, {
+    traveler: { payment_preference: "browser saved card" }
+  });
+  const wallet = resolveProfileDecision(decision, {
+    traveler: { payment_preference: "Apple Pay / Google Pay" }
+  });
+
+  assert.equal(card.preferredControlId, "card");
+  assert.equal(wallet.preferredControlId, "wallet");
+});
+
+test("equivalent card-network reveal tiles resolve to one bounded card-entry route", () => {
+  const decision = {
+    decisionGroupId: "payment-method-tiles",
+    subject: { key: "payment_method" },
+    required: true,
+    material: true,
+    alternatives: [
+      { controlId: "amex", label: "American Express", semantic: "payment_method", physicalEffect: "reveal_control", executable: true },
+      { controlId: "visa", label: "Visa", semantic: "payment_method", physicalEffect: "reveal_control", executable: true },
+      { controlId: "mastercard", label: "Mastercard", semantic: "payment_method", physicalEffect: "reveal_control", executable: true },
+      { controlId: "wallet", label: "KEKS Pay", semantic: "payment_method", physicalEffect: "reveal_control", executable: true }
+    ]
+  };
+
+  const resolution = resolveProfileDecision(decision, {
+    traveler: { payment_preference: "manual payment" }
+  });
+
+  assert.equal(resolution.match, "exact");
+  assert.equal(resolution.preferredControlId, "amex");
+  assert.deepEqual(resolution.eligibleOptionIds, ["amex", "visa", "mastercard"]);
+});

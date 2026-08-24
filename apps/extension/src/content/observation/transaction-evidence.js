@@ -428,10 +428,13 @@ export function createTransactionEvidenceCompiler(dependencies) {
     const ownedFare = ownedFareRows[0] || ownedFareSummaryLines[0] || null;
     const fareBrand = canonicalFareLabel(ownedFare?.label || "");
     const currentTraveler = traveler() || {};
-    // Terminal ownership is compiled once above this fact compiler. Do not
-    // maintain a second airline-wording classifier for the same page.
-    const finalReviewSurface = terminalEvidence?.boundaryObserved === true
-      || terminalEvidence?.verified === true;
+    // Payment-summary parsing is diagnostic context, not terminal authority.
+    // A review/method page may be useful for verifying transaction facts while
+    // still being unfinished until the exact card-entry contract is observed.
+    const finalReviewSurface = step === "payment" && (
+      terminalEvidence?.signals?.review === true
+      || terminalEvidence?.boundaryObserved === true
+    );
     const normalizedMonetaryText = (value = "") => String(value || "")
       .replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "")
       .replace(/\b(EUR|USD|GBP|CHF|CAD|AUD)\s+(?:euros?|dollars?|pounds?|francs?)\b/gi, "$1")

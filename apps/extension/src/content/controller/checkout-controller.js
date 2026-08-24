@@ -17,6 +17,7 @@ export function createCheckoutController({
   rememberPagePlan,
   renderSidebar,
   requestAgentDecision,
+  resetAgentSessionState,
   resetAgentLoopLifecycle,
   resetFieldProgress,
   runRiskChecks,
@@ -71,6 +72,7 @@ export function createCheckoutController({
       return true;
     }
     resetAgentLoopLifecycle("start_agent");
+    resetAgentSessionState();
     agent.running = true;
     agent.sessionId = "";
     agent.awaiting = "";
@@ -157,6 +159,17 @@ export function createCheckoutController({
       agent.awaiting = "manual";
       await clearResumeMarker();
       addAgentMessage("assistant", "The prior checkout session could not be resumed, so I stopped instead of starting a replacement transaction.");
+      renderSidebar("agent");
+      return;
+    }
+    if (session.status === "awaiting_user") {
+      stopWatchingCheckoutChanges();
+      agent.running = false;
+      agent.awaiting = "manual";
+      addAgentMessage(
+        "assistant",
+        session.lastAction?.reason || "This checkout is still waiting for your previous answer."
+      );
       renderSidebar("agent");
       return;
     }
@@ -257,13 +270,24 @@ export function createCheckoutController({
       shouldRerun = finishAgentLoop(loopToken);
       if (agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
         const remaining = Math.max(0, agent.destinationWait.deadlineAt - Date.now());
+        const oneShotReobservePending = agent.destinationWait.kind === "one_shot_reobserve"
+          && agent.destinationWait.attempts === 0;
         const materialWakePending = agent.destinationWait.wakeRequested === true
           && agent.destinationWait.lastWakeReason === "dom_mutation";
-        // A material MutationObserver event may wake earlier. Otherwise send
-        // exactly one deadline observation instead of polling every interval.
+        // Strategy exhaustion needs one immediate reducer pass carrying its
+        // mechanical evidence. Other readiness waits wake on a material DOM
+        // mutation or send exactly one observation at the bounded deadline.
         scheduleDestinationObservation(
-          materialWakePending ? "dom_mutation" : "readiness_deadline",
-          materialWakePending ? DESTINATION_MUTATION_SETTLE_MS : remaining
+          oneShotReobservePending
+            ? "one_shot_reobserve"
+            : materialWakePending
+              ? "dom_mutation"
+              : "readiness_deadline",
+          oneShotReobservePending
+            ? 0
+            : materialWakePending
+              ? DESTINATION_MUTATION_SETTLE_MS
+              : remaining
         );
       } else if (shouldRerun) {
         setTimeout(() => processCheckoutAgent(), 0);

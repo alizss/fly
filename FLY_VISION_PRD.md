@@ -1,6 +1,6 @@
 # Fly — Product Requirements
 
-Last updated: 2026-08-19
+Last updated: 2026-08-23
 
 This is Fly's stable product contract. Implementation status belongs in [FLY_COVERAGE_MATRIX.md](./FLY_COVERAGE_MATRIX.md), engineering sequence in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md), and current code orientation in [FLY_CURRENT_CODEBASE_ENGINEERING_HANDOFF.md](./FLY_CURRENT_CODEBASE_ENGINEERING_HANDOFF.md).
 
@@ -12,7 +12,9 @@ Click count is not the architecture. The product contract is that all known fact
 
 ## 2. Current engineering milestone
 
-The current milestone ends at verified payment review:
+The current milestone proves that a new, previously unfamiliar airline or OTA checkout can be added and Fly can work out how to reach actual credit-card credential entry. Every traveler fact and checkout choice comes from the selected user profile and its transaction-bound booking policy. The current simplest acceptance profile declines paid extras, makes no optional selection, and prefers card payment; that is a test profile, not hard-coded product behavior.
+
+The milestone ends only when actual credit-card credential entry is available:
 
 ```text
 approved selected booking
@@ -20,11 +22,14 @@ approved selected booking
 → fares, bags, seats, insurance, and extras
 → correction of unauthorized selections
 → itinerary/traveler/currency/total reconciliation
-→ verified payment review
-→ stop before legal acceptance, payment entry, Pay, or purchase
+→ complete any authorized standard pre-payment/legal step
+→ verified card-number, expiry, and security-code entry surface
+→ stop before entering payment credentials, submitting Pay, or purchasing
 ```
 
-This is a temporary proof gate, not the final user experience. The next gates add transaction-bound `LegalAuthorization`, secure `PaymentAuthorization`, idempotent purchase submission, and independent PNR/ticket verification. Standard booking terms are accepted by the agent under the Book/Pay mandate; the user is not asked to operate the airline checkbox. Unknown factual declarations are never guessed.
+This is a temporary proof gate, not the final user experience. A page title or progress label containing **PAY**, an itinerary/price review, a payment-method selector, a card radio button, a legal checkbox, or a pre-payment **Confirm/Continue** button does not prove that this boundary was reached. Fly must continue until the current owned surface exposes card-number, expiry, and security-code entry, either directly or in a structurally owned hosted card widget. The next gates add secure `PaymentAuthorization`, idempotent purchase submission, and independent PNR/ticket verification. Standard booking terms are handled only under the transaction-bound Book/Pay mandate; unknown factual declarations are never guessed.
+
+`card_credential_entry_reached` is deliberately a browser-capability milestone. Transaction reconciliation remains an independent safety and acceptance diagnostic; missing ledger facts cannot make an observed card form disappear or cause Fly to navigate beyond it. A proven contradiction can still stop the journey earlier, and transaction verification remains mandatory before future payment submission.
 
 ## 3. Product principles
 
@@ -39,7 +44,7 @@ Fly must:
 - Preserve durable progress across rerenders, navigation, pauses, and restarts.
 - Tell the truth about completion, blockage, and uncertainty.
 
-Deterministic systems own traveler identity, itinerary, price, permission, transaction state, execution freshness, safety, and completion. A model may resolve bounded ambiguity among fresh supplied reversible candidates; it may not invent controls, facts, work, permission, or transaction truth.
+Deterministic systems own traveler identity, itinerary, price, permission, transaction state, execution freshness, safety, completion, target selection, and execution-strategy ordering. A model may only propose bounded grounded hypotheses about genuinely uncertain semantic meaning; it never chooses a DOM target, candidate, operation, or mechanic and may not invent controls, facts, work, permission, or transaction truth.
 
 ## 4. Eligible journey
 
@@ -58,7 +63,7 @@ A `99%` claim must always name this eligibility scope. It must not count sold-ou
 ### Selected booking and traveler
 
 - A new durable transaction starts only from one complete `SelectedBooking/v1`: itinerary, approved total/currency, and at least one selected traveler.
-- One extension-owned pre-session `BookingAdmission/v1` obtains that strict contract from either an explicit tab-scoped app launch (`ATW_SELECTED_BOOKING_LAUNCH`) or current-tab selection evidence. The background worker owns one `CheckoutContext/v1` lineage per tab: an explicit app launch or new flight selection rotates it, same-tab redirects preserve it across unrelated domains, and closing the tab clears it. Admission derives `absent`, `candidate`, `confirmed`, `conflict`, or `expired`; only `confirmed` may create a transaction. Another tab, a different lineage, or a globally recent contract can never authorize the checkout, and resume uses only the backend's immutable baseline.
+- One extension-owned pre-session `BookingAdmission/v1` obtains that strict contract from either an explicit app launch (`ATW_SELECTED_BOOKING_LAUNCH`) or current-page selection evidence. The background worker owns one `CheckoutContext/v1` lineage per checkout, not per document or tab: a new app launch or flight selection rotates it; same-tab redirects and proven opener handoffs preserve it across unrelated domains and tabs; resume save/claim/clear is keyed by lineage and session. A different lineage or globally recent contract can never authorize or delete this checkout. Admission derives `absent`, `candidate`, `confirmed`, `conflict`, or `expired`; only `confirmed` may create a transaction, and resume uses only the backend's immutable baseline.
 - If current-tab selection identity cannot be proven, Fly reports the exact missing booking facts before session creation. It never creates a partial transaction or asks the running agent/model to invent route, date, total, currency, or traveler identity.
 - Traveler facts are canonical and independent of site wording or layout.
 - Optional facts never become fabricated requirements.
@@ -79,6 +84,10 @@ Ordinary DOM differences, a new textbox, unfamiliar wording, or the absence of a
 
 `DecisionFrame` contains one grounded `CheckoutSituation/v1`: requested facts, unresolved obligations, choices, available actions, blockers, transaction evidence, completion evidence, contradictions, and consequences. A stage name may be retained as a diagnostic hint, but it cannot admit work, authorize an action, define identity, or prove completion. Combined pages are normal: traveler fields, extras, legal terms, and payment controls may coexist.
 
+Fly schedules semantic work from a **Desired State Delta**, not from every visible choice. The deterministic compiler compares fresh observed state with the selected profile, booking policy, transaction mandate, and verified history. It emits a delta only for a required missing value, an exact profile mismatch, a positively proven incremental charge or transaction conflict, typed required legal work, or an owned active validation error. If no delta exists, a satisfied or optional component is not work and cannot delay an executable stage exit. Visibility, unfamiliar wording, a nearby page total, or a risk noun such as “legal” cannot create a delta by itself.
+
+Optional affirmative survey, newsletter, and marketing consent defaults to unselected unless the selected profile explicitly opts in. A negative opt-out control follows the explicit profile. Exact native requiredness still makes a toggle required. Any selected optional control that conflicts with desired state is corrected and verified as an exact selected-to-unselected transition.
+
 When deterministic interpretation is uncertain or internally contradictory, Fly may run one bounded **Semantic Scene Reconciliation** pass before constructing the final decision frame. The model may propose grounded hypotheses about fields, component roles, input formats, decisions, attestations, validations, consequences, and ownership, but every hypothesis must reference fresh observed controls, text, surfaces, or regions. A hypothesis is evidence only: it cannot create an action, traveler fact, requirement, permission, transaction fact, or completion claim.
 
 Known scenes remain deterministic with no model call. Semantic reconciliation consumes the same at-most-one ambiguity call available for the turn; it does not create a second model path. The deterministic compiler remains responsible for producing exactly one final `DecisionFrame`, and TaskState remains the only authority that publishes the next obligation.
@@ -91,15 +100,16 @@ Validation is active state, not matching prose. Each observation classifies vali
 
 - One fresh observation compiles deterministically when possible; bounded grounded semantic hypotheses may reconcile an uncertain or contradictory draft before one final semantic decision frame is published.
 - TaskState publishes exactly one current obligation or typed disposition.
-- Candidate binding finds mechanics only for that obligation.
+- Candidate binding derives mechanics only from the canonical control graph for that obligation; it cannot admit controls from fields, buttons, stage-exit projections, or model output.
+- Multiple mechanics for the same admitted obligation are ranked deterministically by exact ownership, executable proof, operation directness, and failed-strategy memory.
 - The governor checks consequences immediately before execution.
 - The browser executes one exact leased action.
 - Fresh evidence must verify the same semantic postcondition before progress persists.
 - Failed mechanics use bounded distinct recovery; loops and stale action replay are prohibited.
 
-### Transaction review
+### Payment-entry completion
 
-Before reporting payment review, Fly must reconcile:
+Before reporting `CARD_CREDENTIAL_ENTRY_REACHED`, Fly must reconcile:
 
 - Route, dates, segments, and traveler identities.
 - Fare and approved selections when authoritative evidence exists.
@@ -107,7 +117,12 @@ Before reporting payment review, Fly must reconcile:
 - Currency and total.
 - Expected verified-action/outcome coverage.
 
-Generic payment wording, a URL, a click acknowledgement, or a page change is not completion evidence.
+Completion additionally requires fresh, current-surface ownership of one real card-entry capability:
+
+- Visible card-number, expiry, and security-code controls belonging to the same current payment surface; or
+- A visible, structurally owned hosted card-entry widget whose role is specifically card credential entry.
+
+A payment-method selector is an intermediate obligation. Fly selects the profile-authorized credit/debit-card method and continues until credential controls render. Generic payment wording, a payment-shaped URL, a progress step named PAY, a price/review summary, legal terms plus Confirm, a wallet-only surface, a click acknowledgement, or a page change is not completion evidence. These are pre-payment context and remain unfinished checkout work.
 
 ### Durability and background operation
 
@@ -115,17 +130,17 @@ The background product must reuse the same policy, TaskState, governor, action, 
 
 ## 6. Valid interruption and stop reasons
 
-In the final product, ordinary legal acceptance, payment entry, purchase submission, and CAPTCHA handling belong to Fly. They are not permanent user handoffs. The current review-only milestone stops at that boundary solely until the corresponding authorization and secure execution components are enabled.
+In the final product, ordinary legal acceptance, payment entry, purchase submission, and CAPTCHA handling belong to Fly. They are not permanent user handoffs. Under the current milestone, Fly may stop successfully only after verified actual payment entry; it stops before entering credentials or committing payment.
 
 Fly may stop or pause for:
 
 - A genuinely missing required traveler fact.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge.
-- Legal/payment/purchase authority not yet implemented under the current engineering milestone.
+- A legal or factual attestation not covered by the transaction-bound mandate.
 - A paid choice, price/currency change, itinerary change, or identity ambiguity not covered by explicit policy.
 - Sold-out inventory, expired session, airline outage, or a site that rejects valid completed input.
 - No safe grounded actuator after bounded adaptation and fresh verification attempts.
-- Verified payment review under the current milestone.
+- Verified `CARD_CREDENTIAL_ENTRY_REACHED` under the current milestone.
 
 The last mechanical case is an engineering coverage defect for an otherwise eligible journey. It must create a reusable replay and universal repair, not an airline branch.
 
@@ -139,7 +154,8 @@ Fly must never:
 - Change route, dates, airports, passengers, or currency without authority.
 - Add or retain an unauthorized paid product.
 - Infer price permission from page wording or an observed total.
-- Accept legal terms, enter payment credentials, or purchase under the current boundary.
+- Accept legal or factual attestations outside the transaction-bound mandate.
+- Enter payment credentials, submit Pay, or purchase under the current boundary.
 - Execute a stale, hidden, occluded, mismatched, or ungrounded target.
 - Treat dispatch, navigation, or visual change as semantic success.
 - Claim completion with missing or vacuous transaction/outcome evidence.
@@ -197,7 +213,7 @@ A defensible broad `99%` target requires approximately 300 representative eligib
 
 | Gate | Required evidence | Unlocks |
 |---|---|---|
-| A — Direct-airline generalization | Full-service and low-cost direct airlines reach verified payment review; Kiwi and GoToGate stay green; no site workflow | Structural portfolio expansion |
+| A — Direct-airline generalization | Full-service and low-cost direct airlines reach verified card credential entry; Kiwi and GoToGate stay green; no site workflow | Structural portfolio expansion |
 | B — Structural portfolio | 8–10 sites, 6+ families, 4 direct-airline families, 3 OTA families | Internal/allowlisted checkout-to-review alpha |
 | C — Profile and policy matrix | Multi-traveler, child, baggage, seat, dirty-checkout, missing-data, and auth scenarios on 2+ families | Limited review-only beta and payment sandbox work |
 | D — Background product | Isolated durable jobs, secure state, restart safety, notification/handoff/resume, extension-equivalent behavior | Background web and iOS control experience |

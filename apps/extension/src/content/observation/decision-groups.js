@@ -1,6 +1,7 @@
 export function createDecisionGroupCompiler(dependencies) {
   const {
     NON_ECONOMIC_EFFECT_ROLES,
+    ECONOMIC_EFFECT_ROLES,
     canonicalDecisionEffectRole,
     canonicalProfileFieldType,
     canonicalSelectionCommitments,
@@ -158,11 +159,16 @@ export function createDecisionGroupCompiler(dependencies) {
       || control.state?.pressed
       || committedLabelMatches
     );
-    const buttonLike = /button/.test(`${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase());
+    const controlShape = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
+    const buttonLike = /button/.test(controlShape);
+    const binaryChoice = /radio|checkbox|switch|toggle/.test(controlShape);
     const stateElement = elementById(control.stateElementId || control.preferredActivationElementId || "");
     const selectedLabel = selectedByState
       ? (control.label || observedValue)
-      : (!buttonLike && observedValue && !isPlaceholderChoiceValue(observedValue, stateElement) ? observedValue : "");
+      // A radio/checkbox value attribute identifies the option; it is not
+      // evidence that the option is selected. Exact checked/selected state is
+      // the sole authority for binary choices.
+      : (!buttonLike && !binaryChoice && observedValue && !isPlaceholderChoiceValue(observedValue, stateElement) ? observedValue : "");
     const optionsSurfaceId = stateElement?.getAttribute?.("aria-controls") || "";
     const optionsSurface = optionsSurfaceId ? document.getElementById(optionsSurfaceId) : null;
     const committedEvidence = optionsSurfaceId ? canonicalSelectionCommitments.get(optionsSurfaceId) : null;
@@ -181,6 +187,7 @@ export function createDecisionGroupCompiler(dependencies) {
       targetId: matchingCommitment?.targetId || (committedOption ? elementId(committedOption) : (control.preferredActivationElementId || control.stateElementId || "")),
       label: selectedLabel || control.label || "",
       semantic: matchingCommitment?.semantic || (selectedLabel ? semanticChoiceType(selectedLabel) : (control.semantic || "required_dropdown_choice")),
+      physicalEffect: control.physicalEffect || "unknown",
       risk: matchingCommitment?.risk || (selectedLabel ? choiceRisk(selectedLabel) : (control.risk || "uncertain")),
       effectRole: control.effectRole || canonicalDecisionEffectRole(control),
       selected: Boolean(selectedByState || selectedLabel),
@@ -249,23 +256,17 @@ export function createDecisionGroupCompiler(dependencies) {
     if (!selected) return group;
     const selectedControl = byControlId.get(selected.controlId) || {};
     const effectRole = selected.effectRole || selectedControl.effectRole || canonicalDecisionEffectRole(selectedControl);
-    const economic = !NON_ECONOMIC_EFFECT_ROLES.has(effectRole);
-    const directPrice = economic ? (selectedControl.structuredPrice
+    const economic = ECONOMIC_EFFECT_ROLES.has(effectRole);
+    const directPrice = effectRole === "commerce_option" ? (selectedControl.structuredPrice
       || structuredPriceFromText(selected.priceText || "")
       || structuredPriceFromText(selected.label || "")) : null;
-    const exactDisposition = selectedDisposition({ selected, selectedControl, structuredPrice: directPrice });
-    // Nearby price ownership is legal only for an exact commerce option.
-    // Scope/applicability toggles and informational controls must never inherit
-    // a sibling product's price from their shared visual section.
-    const owner = directPrice || !economic
-      ? null
-      : ownedDecisionElement(section, choices, byControlId);
-    const ownedPrices = owner ? structuredPricesFromText(owner.innerText || owner.textContent || "") : [];
-    const eligibleOwnedPrices = exactDisposition === "free"
-      ? ownedPrices.filter((price) => Number(price.amount) === 0)
-      : ownedPrices;
-    const ownedPrice = eligibleOwnedPrices.length === 1 ? eligibleOwnedPrices[0] : null;
-    const structuredPrice = directPrice || ownedPrice || null;
+    // A selected option may use only its own price evidence. Broad ancestor
+    // text often contains the booking total and unrelated sibling products;
+    // inheriting the sole number found there fabricated paid conflicts on
+    // ordinary purchaser-type, survey, and payment-method controls.
+    const owner = null;
+    const ownedPrice = null;
+    const structuredPrice = directPrice || null;
     const disposition = selectedDisposition({ selected, selectedControl, structuredPrice });
     return {
       ...group,
@@ -497,9 +498,17 @@ export function createDecisionGroupCompiler(dependencies) {
 
   function ownedCollapsedSelectorDecisionGroups(sections = [], controls = [], existingGroups = []) {
     return controls.flatMap((control) => {
-      if (!control?.controlId || !control.operations?.open) return [];
+      const selectorLike = /combobox|listbox|select/.test(
+        `${control?.role || ""} ${control?.domRole || ""} ${control?.kind || ""}`.toLowerCase()
+      );
+      const hasOpenMechanic = Boolean(
+        control?.operations?.open
+        || (selectorLike && (control?.operations?.activate || control?.operations?.keyboard))
+      );
+      if (!control?.controlId || !hasOpenMechanic) return [];
       const existingGroup = existingGroups.find((group) => (group.alternatives || []).some((choice) => choice.controlId === control.controlId));
-      if (existingGroup?.selectedEvidence?.selected === true) return [];
+      if (existingGroup?.selectedEvidence?.selected === true
+        && existingGroup.selectedEvidence.structuredPrice) return [];
       if (control.state?.expanded === true) return [];
       const displayedValue = compactText(
         control.currentValue
@@ -579,8 +588,10 @@ export function createDecisionGroupCompiler(dependencies) {
         selectedEvidence: {
           selected: true,
           disposition,
+          effectRole: "commerce_option",
+          economicEffect: "decision_outcome",
           structuredPrice: ownedPrice,
-          source: "owned_decision_section",
+          source: "exact_selector_owner",
           ownerElementId: elementId(owner),
           selectedControlId: control.controlId,
           selectedLabel: displayedValue,
@@ -594,6 +605,8 @@ export function createDecisionGroupCompiler(dependencies) {
           semantic: "open_choice_control",
           physicalEffect: "open_surface",
           risk: "safe",
+          effectRole: "commerce_option",
+          structuredPrice: ownedPrice,
           selected: true,
           ownership: { ownerElementId: elementId(owner), relation: "collapsed_current_value" }
         }],
@@ -629,6 +642,7 @@ export function createDecisionGroupCompiler(dependencies) {
       );
       return /combobox|listbox|select/.test(role)
         || /required_dropdown_choice/.test(semantic)
+        || semantic === "payment_method"
         || optionalCommand
         || Boolean(control.choiceContract?.decisionInstance)
         || Boolean(control.operations?.open);
@@ -636,6 +650,18 @@ export function createDecisionGroupCompiler(dependencies) {
   }
 
   function decisionControlContext(control = {}, section = {}, controls = []) {
+    const role = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
+    const semantic = String(control.semantic || "").toLowerCase();
+    if (semantic === "payment_method") {
+      return {
+        instance: control.choiceContract?.decisionInstance
+          || `payment-method:${section.id || normalizeMatchText(section.label || "payment method")}`,
+        label: control.choiceContract?.decisionLabel || section.label || "Payment method",
+        // A payment-method selector is a required gateway to card entry even
+        // when the native radio or image tile omits required/aria-required.
+        required: true
+      };
+    }
     if (control.choiceContract?.decisionInstance) {
       const owner = elementById(control.choiceContract.decisionOwnerId || "");
       return {
@@ -652,8 +678,6 @@ export function createDecisionGroupCompiler(dependencies) {
         )
       };
     }
-    const role = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
-    const semantic = String(control.semantic || "").toLowerCase();
     const optionalCommand = /button/.test(role) && (
       /decline_paid_extra|decline_baggage|add_paid_extra/.test(semantic)
       || /safe_decline|money|paid/.test(String(control.risk || "").toLowerCase())
@@ -843,6 +867,7 @@ export function createDecisionGroupCompiler(dependencies) {
               targetId: choice.targetId,
               label: choice.label,
               semantic: choice.semantic,
+              physicalEffect: choice.physicalEffect || byControlId.get(choice.controlId)?.physicalEffect || "unknown",
               risk: choice.risk,
               effectRole: choice.effectRole || byControlId.get(choice.controlId)?.effectRole || "unknown",
               selected: choice.selected,
@@ -950,6 +975,16 @@ export function createDecisionGroupCompiler(dependencies) {
         ? selectedChoices[0]
         : null;
       const decisionLabel = first.choiceContract?.decisionLabel || first.sectionLabel || "choice";
+      const paymentMethodGateway = choices.every((control) => (
+        control.semantic === "payment_method"
+        && control.physicalEffect === "reveal_control"
+      ));
+      const required = paymentMethodGateway || choices.some((control) => (
+        control.choiceContract?.advancesOnSelection === true
+        || control.choiceContract?.required === true
+        || control.required
+        || control.state?.required
+      ));
       return [{
         decisionGroupId,
         surfaceId: first.surfaceId || "surface-page",
@@ -957,18 +992,8 @@ export function createDecisionGroupCompiler(dependencies) {
         sectionType: first.sectionType || "",
         sectionLabel: decisionLabel,
         requirementId: `${first.sectionType || "decision"}:${slugControlPart(decisionLabel)}`,
-        required: choices.some((control) => (
-          control.choiceContract?.advancesOnSelection === true
-          || control.choiceContract?.required === true
-          || control.required
-          || control.state?.required
-        )),
-        status: selected ? "satisfied" : (choices.some((control) => (
-          control.choiceContract?.advancesOnSelection === true
-          || control.choiceContract?.required === true
-          || control.required
-          || control.state?.required
-        )) ? "missing" : "optional"),
+        required,
+        status: selected ? "satisfied" : (required ? "missing" : "optional"),
         selectedControlId: selected?.controlId || "",
         selectedLabel: selected?.label || "",
         selectedSemantic: selected?.semantic || "",
@@ -995,6 +1020,77 @@ export function createDecisionGroupCompiler(dependencies) {
           ? [`Selected: ${selected.label}`]
           : [`No selected option for ${decisionLabel}`]
       }];
+    });
+    const representedControlIds = new Set([
+      ...sectionGroups,
+      ...controlOwnedChoiceGroups
+    ].flatMap((group) => group.alternatives || []).map((choice) => choice.controlId).filter(Boolean));
+    // A current required checkbox/radio is a unary attestation obligation,
+    // not a product choice. Structural evidence keeps the obligation alive
+    // even when its exact semantic classification remains unknown. Meaning
+    // controls authorization; it must not decide whether the blocker exists.
+    const requiredAttestationGroups = (controls || []).filter((control) => (
+      control.controlId
+      // Structural admission uses requiredness owned by the control itself,
+      // never broad required context inherited from a containing form/section.
+      // Some checkout frameworks expose their mandatory legal attestation
+      // through the compiled field/section contract instead of the native
+      // input attribute. Once the exact control is independently proven legal,
+      // that contextual required flag is safe structural evidence as well.
+      && (
+        control.state?.required === true
+        || control.choiceContract?.required === true
+        || (control.required === true && control.semantic === "legal_acceptance")
+      )
+      && /checkbox|radio/.test(`${control.role || ""} ${control.kind || ""}`.toLowerCase())
+      && (
+        /checkbox/.test(`${control.role || ""} ${control.kind || ""}`.toLowerCase())
+        || !representedControlIds.has(control.controlId)
+      )
+      && control.representationLifecycle?.active !== false
+    )).map((control) => {
+      const structuralText = `${control.semantic || ""} ${control.sectionType || ""} ${control.sectionLabel || ""} ${control.decisionGroupId || ""} ${control.stableKey || ""} ${control.label || ""}`;
+      const legalAcceptance = control.semantic === "legal_acceptance"
+        || /legal[_ -]?acceptance|terms?(?:[_ -]?and)?[_ -]?conditions?|termsandcondition/i.test(structuralText);
+      const sectionType = legalAcceptance ? "legal_acceptance" : "unknown_attestation";
+      const attestationSemantic = legalAcceptance ? "legal_acceptance" : "unknown_attestation";
+      const decisionGroupId = control.decisionGroupId || decisionGroupIdForContext({
+        sectionType,
+        sectionLabel: control.sectionLabel || control.label || "required attestation",
+        instance: `required-attestation:${control.controlId}`
+      });
+      control.decisionGroupId = decisionGroupId;
+      const selected = Boolean(control.selected || control.state?.checked || control.state?.selected);
+      return {
+        decisionGroupId,
+        surfaceId: control.surfaceId || "surface-page",
+        sectionId: control.sectionId || control.stateElementId || "",
+        sectionType,
+        sectionLabel: control.sectionLabel || (legalAcceptance ? "Required booking terms" : "Required attestation"),
+        requirementId: `${sectionType}:${slugControlPart(control.label || control.controlId)}`,
+        required: true,
+        status: selected ? "satisfied" : "missing",
+        selectedControlId: selected ? control.controlId : "",
+        selectedLabel: selected ? control.label || "" : "",
+        selectedSemantic: selected ? attestationSemantic : "",
+        selectionInvariant: { exclusive: false, valid: true, selectedCount: selected ? 1 : 0 },
+        alternatives: [{
+          controlId: control.controlId,
+          targetId: control.preferredActivationElementId || control.stateElementId || "",
+          label: control.label || "",
+          semantic: attestationSemantic,
+          physicalEffect: legalAcceptance ? "accept_legal_terms" : (control.physicalEffect || "unknown"),
+          risk: legalAcceptance ? "legal" : "uncertain",
+          effectRole: control.effectRole || "unknown",
+          selected,
+          structuredPrice: null,
+          priceText: ""
+        }],
+        alternativeControlIds: [control.controlId],
+        evidence: selected
+          ? [`Accepted: ${control.label || "required attestation"}`]
+          : [`Required attestation is not yet selected: ${control.label || "required attestation"}`]
+      };
     });
     const structuralSurfaceChoices = (activeSurface?.options || []).filter((option) => (
       option.choiceStructure === true
@@ -1064,7 +1160,80 @@ export function createDecisionGroupCompiler(dependencies) {
     const unrepresentedSurfaceGroups = surfaceGroups.filter((group) => (
       !(group.alternatives || []).some((choice) => choice.controlId && ownedControlIds.has(choice.controlId))
     ));
-    const representedGroups = [...sectionGroups, ...controlOwnedChoiceGroups, ...unrepresentedSurfaceGroups];
+    const requiredCheckboxIds = new Set(requiredAttestationGroups
+      .flatMap((group) => group.alternatives || [])
+      .map((choice) => choice.controlId)
+      .filter(Boolean));
+    const representedGroups = [
+      ...sectionGroups,
+      ...controlOwnedChoiceGroups,
+      ...unrepresentedSurfaceGroups
+    ].filter((group) => !(group.alternatives || []).some((choice) => requiredCheckboxIds.has(choice.controlId)));
+    representedGroups.push(...requiredAttestationGroups);
+    const representedToggleIds = new Set(representedGroups
+      .flatMap((group) => group.alternatives || [])
+      .map((choice) => choice.controlId)
+      .filter(Boolean));
+    const standaloneOptionalToggleGroups = (controls || []).filter((control) => {
+      const shape = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
+      const semantic = `${control.semantic || ""} ${control.risk || ""} ${control.effectRole || ""}`.toLowerCase();
+      return control.controlId
+        && !representedToggleIds.has(control.controlId)
+        && control.representationLifecycle?.active !== false
+        && /checkbox|switch|toggle/.test(shape)
+        && /optional_consent|decline_paid_extra|decline_baggage|safe_decline/.test(semantic);
+    }).map((control) => {
+      const selected = Boolean(control.selected || control.state?.checked || control.state?.selected);
+      const decisionGroupId = control.decisionGroupId || decisionGroupIdForContext({
+        sectionType: control.sectionType || "decision",
+        sectionLabel: control.sectionLabel || control.label || "optional toggle",
+        instance: `optional-toggle:${control.stableKey || control.controlId}`
+      });
+      control.decisionGroupId = decisionGroupId;
+      return {
+        decisionGroupId,
+        surfaceId: control.surfaceId || "surface-page",
+        surfaceType: control.surfaceType || "page",
+        sectionId: control.sectionId || control.stateElementId || "",
+        sectionType: control.sectionType || "decision",
+        sectionLabel: control.sectionLabel || control.label || "Optional toggle",
+        requirementId: `${control.sectionType || "decision"}:${slugControlPart(control.label || control.controlId)}`,
+        required: false,
+        status: selected ? "satisfied" : "optional",
+        selectedControlId: selected ? control.controlId : "",
+        selectedLabel: selected ? control.label || "" : "",
+        selectedSemantic: selected ? control.semantic || "" : "",
+        selectionInvariant: { exclusive: false, valid: true, selectedCount: selected ? 1 : 0 },
+        alternatives: [{
+          controlId: control.controlId,
+          targetId: control.preferredActivationElementId || control.stateElementId || "",
+          label: control.label || "",
+          semantic: control.semantic || "",
+          physicalEffect: control.physicalEffect || "unknown",
+          risk: control.risk || "uncertain",
+          effectRole: control.effectRole || "unknown",
+          selected,
+          structuredPrice: null,
+          priceText: ""
+        }],
+        selectedEvidence: selected ? {
+          selected: true,
+          disposition: "non_economic",
+          effectRole: control.effectRole || "unknown",
+          economicEffect: "none",
+          structuredPrice: null,
+          source: "selected_control_state",
+          selectedControlId: control.controlId,
+          selectedLabel: control.label || "",
+          semantic: control.semantic || "",
+          risk: control.risk || "uncertain"
+        } : null,
+        evidence: selected
+          ? [`Selected: ${control.label || "optional toggle"}`]
+          : [`Optional toggle is unselected: ${control.label || "optional toggle"}`]
+      };
+    });
+    representedGroups.push(...standaloneOptionalToggleGroups);
     const collapsedSelectorGroups = ownedCollapsedSelectorDecisionGroups(sections, controls, representedGroups);
     const removalGroups = ownedRemovalDecisionGroups(sections, controls, [...representedGroups, ...collapsedSelectorGroups], activeSurface);
     return reconcileExclusiveDecisionControlOwnership(
@@ -1096,7 +1265,37 @@ export function createDecisionGroupCompiler(dependencies) {
     // A scope toggle is a mechanic of applying a choice, not a commerce
     // choice itself. Keeping it as a decision creates false selected extras.
     const result = (groups || []).filter((group) => {
+      const requiredAttestation = group.required === true
+        && (group.alternatives || []).some((choice) => /legal_acceptance|unknown_attestation/.test(choice.semantic || ""));
+      if (requiredAttestation) return true;
+      const exactAlternativeControls = (group.alternatives || [])
+        .map((choice) => byControlId.get(choice.controlId))
+        .filter(Boolean);
+      const paymentMethodGateway = exactAlternativeControls.length > 0
+        && exactAlternativeControls.length === (group.alternatives || []).length
+        && exactAlternativeControls.every((control) => (
+          control.semantic === "payment_method"
+          && control.physicalEffect === "reveal_control"
+        ));
+      if (paymentMethodGateway) {
+        // The observer already owns the payment semantic identity. This layer
+        // preserves the required gateway but never repairs or reclassifies
+        // group meaning after its identity and requirement were compiled.
+        group.required = true;
+        if (!group.selectedControlId) group.status = "missing";
+        return true;
+      }
       const roles = (group.alternatives || []).map(roleFor).filter((role) => role && role !== "unknown");
+      if (roles.includes("optional_consent")) {
+        // Requiredness for an optional consent can come only from its own
+        // exact control, never from a required contact/form ancestor.
+        group.required = (group.alternatives || []).some((choice) => {
+          const control = byControlId.get(choice.controlId) || {};
+          return control.state?.required === true;
+        });
+        if (!group.required && !group.selectedControlId) group.status = "optional";
+        return true;
+      }
       return !roles.length || roles.some((role) => !NON_ECONOMIC_EFFECT_ROLES.has(role));
     });
     const subjectFor = (control = {}) => decisionSubjectCue([

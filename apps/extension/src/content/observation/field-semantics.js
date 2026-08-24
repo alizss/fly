@@ -36,6 +36,13 @@ export function profileFieldTypesFromText(value = "", { editable = true } = {}) 
     if (/middle[ _-]?name/.test(evidence)) add("middle_name");
   }
   if (/second (?:last name|surname)|additional surname|maternal surname/.test(evidence)) add("second_last_name");
+  if (editable && /(?:^|\s)(?:address line 2|address 2|second address line)(?:\s|$)/.test(evidence)) add("address_line2");
+  else if (editable
+    && /(?:^|\s)(?:address|address line 1|address 1|street address)(?:\s|$)/.test(evidence)
+    && !/(?:e[ -]?mail|web|internet|ip)\s+address/.test(evidence)) add("address_line1");
+  if (editable && /(?:^|\s)(?:city|town|locality)(?:\s|$)/.test(evidence)
+    && !/(?:birth|departure|arrival|origin|destination)/.test(evidence)) add("city");
+  if (editable && /(?:^|\s)(?:postal code|postcode|zip code|zip)(?:\s|$)/.test(evidence)) add("postal_code");
   if (editable && /(?:^|\s)(?:birth|date of birth|dob|bday)(?:\s|$)/.test(evidence)) add("date_of_birth");
   if (editable && /(?:age at (?:the )?time of travel|age (?:at|on) departure|departure age|travel age|passenger age)/.test(evidence)) add("age_at_departure");
   if (editable && /(?:^|\s)(?:place of birth|birth place|birth city)(?:\s|$)/.test(evidence)) add("place_of_birth");

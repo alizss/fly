@@ -50,6 +50,15 @@ function controlUnavailable(control = {}, candidate = {}) {
 
 function candidateActionabilityFailure(candidate = {}, control = {}, observation = {}, strategyAlreadyFailed = false) {
   if (!["click", "type", "select", "keypress", "scroll", "click_xy"].includes(candidate.type)) return "";
+  const operation = candidateOperation(candidate);
+  const componentBehavior = candidate.pipelineContract?.component?.componentBehavior
+    || agentContract.componentBehaviorFor(control);
+  if (operation
+    && Array.isArray(componentBehavior?.allowedOperations)
+    && componentBehavior.allowedOperations.length
+    && !componentBehavior.allowedOperations.includes(operation)) {
+    return "COMPONENT_OPERATION_UNSUPPORTED";
+  }
   if (!isCandidateGrounded(candidate, observation)) return "ACTIONABILITY_UNPROVEN";
   const lane = agentContract.classifyExecutionLane({
     action: candidate,
@@ -167,6 +176,8 @@ function pipelineContractForCandidate(goal = {}, candidate = {}, control = {}, e
     proof: exact?.proof || capability.proof || capability.actionability || null
   };
   const fallbackComponent = {
+    componentPattern: observed.componentPattern || agentContract.componentPatternFor(control),
+    componentBehavior: observed.componentBehavior || agentContract.componentBehaviorFor(control),
     logicalFieldId: obligationField(goal, "logicalFieldId") || "",
     componentIdentity: `${obligationField(goal, "logicalFieldId") || control.stableKey || control.controlId}:${obligationField(goal, "componentRole") || "value"}`,
     componentRole: obligationField(goal, "componentRole") || "value",
@@ -183,7 +194,11 @@ function pipelineContractForCandidate(goal = {}, candidate = {}, control = {}, e
         componentIdentity: `${obligationField(goal, "logicalFieldId") || "adaptive"}:surface:${control.stableKey || control.controlId}`,
         parentControlId: obligationField(goal, "controlId") || obligationField(goal, "componentBinding")?.controlId || ""
       }
-    : existing?.component || obligationField(goal, "componentBinding") || fallbackComponent;
+    : {
+        ...fallbackComponent,
+        ...(obligationField(goal, "componentBinding") || {}),
+        ...(existing?.component || {})
+      };
   return agentContract.canonicalPipelineContract({
     requirement: existing?.requirement || obligationField(goal, "requirementContract") || {
       requirementId: obligationField(goal, "requirementId") || obligationField(goal, "goalId") || obligationField(goal, "decisionGroupId") || "",
@@ -345,7 +360,7 @@ function localMechanicalEffect(goal = {}, candidate = {}, control = {}) {
   if (obligationField(goal, "kind") === "profile_field" && control.role === "editable_combobox"
     && ["type", "keyboard"].includes(operation)) return "filter_options";
   const observedSemanticEffect = agentContract.canonicalSemanticEffect(control.semantic || "");
-  const explicit = String(
+  const declared = String(
     candidate.physicalEffect
     || candidate.mechanicalEffect
     || control.physicalEffect
@@ -358,14 +373,72 @@ function localMechanicalEffect(goal = {}, candidate = {}, control = {}) {
     ].includes(observedSemanticEffect)
       ? observedSemanticEffect
       : "")
-  );
+  ).trim().toLowerCase();
+  // Observer uncertainty is absence of an effect contract, not an explicit
+  // effect. Let the admitted operation and obligation supply the local
+  // mechanic instead of allowing the sentinel string to erase settlement.
+  const explicit = ["", "unknown", "uncertain", "unclassified", "none", "n/a"]
+    .includes(declared) ? "" : declared;
   if (explicit) return explicit;
+  if (control.semantic === "legal_acceptance" && ["choose", "select", "activate"].includes(operation)) {
+    return "accept_legal_terms";
+  }
   if (["open", "reveal"].includes(operation)) return "open_surface";
   if (["type", "fill"].includes(operation)) return "type_value";
   if (["choose", "select"].includes(operation)) return "select_option";
   if (operation === "keyboard") return "keyboard_input";
   if (operation === "scroll_to") return "scroll_into_view";
   return String(candidate.physicalEffect || candidate.mechanicalEffect || control.physicalEffect || operation || "unknown");
+}
+
+function verifierOutcomeFromObligation(goal = {}, candidate = {}, control = {}, binding = {}) {
+  const success = obligationField(goal, "successCondition")
+    || obligationField(goal, "outcomeContract")
+    || obligationField(goal, "expectedOutcome")
+    || null;
+  if (!success?.type) return null;
+  if (success.type === "decision_group_resolved") {
+    const desiredEffect = agentContract.canonicalSemanticEffect(
+      success.desiredSemanticOutcome || success.desiredPolicyOutcome || obligationField(goal, "desiredSemanticOutcome")
+    );
+    const selected = control.selected === true
+      || control.state?.selected === true
+      || control.state?.checked === true;
+    const admittedCorrection = (obligationField(goal, "semanticCorrectionControlIds") || []).includes(
+      candidate.controlId || control.controlId
+    );
+    if (desiredEffect === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION && selected && admittedCorrection) {
+      return {
+        type: "control_unselected",
+        controlId: candidate.controlId || control.controlId || "",
+        decisionGroupId: success.decisionGroupId
+          || candidate.decisionGroupId
+          || control.decisionGroupId
+          || obligationField(goal, "decisionGroupId")
+          || "",
+        surfaceId: binding.surfaceId || control.surfaceId || "",
+        desiredPolicyOutcome: success.desiredPolicyOutcome || obligationField(goal, "desiredPolicyOutcome") || "",
+        mustNotIncreasePrice: true,
+        obligationSuccessType: success.type
+      };
+    }
+    return {
+      type: "control_selected",
+      controlId: candidate.controlId || control.controlId || "",
+      expectedSelectedControlId: candidate.controlId || control.controlId || "",
+      expectedSelectedLabel: candidate.targetLabel || control.label || "",
+      decisionGroupId: success.decisionGroupId
+        || candidate.decisionGroupId
+        || control.decisionGroupId
+        || obligationField(goal, "decisionGroupId")
+        || "",
+      surfaceId: binding.surfaceId || control.surfaceId || "",
+      desiredPolicyOutcome: success.desiredPolicyOutcome || obligationField(goal, "desiredPolicyOutcome") || "",
+      mustNotIncreasePrice: true,
+      obligationSuccessType: success.type
+    };
+  }
+  return { ...success };
 }
 
 function buildCurrentCandidateSet({
@@ -419,6 +492,8 @@ function buildCurrentCandidateSet({
     const profileChoiceQuery = obligationField(goal, "kind") === "profile_field"
       && control.role === "editable_combobox"
       && ["type", "keyboard"].includes(candidateOperation(bound));
+    const standardTermsMandate = approvals.standardBookingTermsApproved === true
+      && /legal/.test(`${bound.risk || ""} ${control.risk || ""}`.toLowerCase());
     const observedAdaptiveEffect = normalizedMeaning(bound.mechanicalEffect || bound.physicalEffect || control.physicalEffect || "unknown");
     const physicalEffect = profileChoiceQuery
       ? "filter_options"
@@ -451,6 +526,7 @@ function buildCurrentCandidateSet({
       surfaceId: binding.surfaceId || "",
       mustNotIncreasePrice: true
     } : null;
+    const obligationExpectedOutcome = verifierOutcomeFromObligation(goal, bound, control, binding);
     const exactComponentExpectedOutcome = editableProfileQuery ? {
       ...(bound.expectedOutcome || {}),
       type: "semantic_progress",
@@ -485,7 +561,7 @@ function buildCurrentCandidateSet({
       surfaceId: binding.surfaceId || "",
       requireSurfaceDismissed: true,
       mustNotIncreasePrice: true
-    } : (bound.expectedOutcome || boundedInteractionOutcome);
+    } : (bound.expectedOutcome || boundedInteractionOutcome || obligationExpectedOutcome);
     const compiledExpectedOutcome = compileTypedExpectedOutcome({
       ...bound,
       expectedOutcome: exactComponentExpectedOutcome,
@@ -538,7 +614,9 @@ function buildCurrentCandidateSet({
       obligation
       )
         && (obligationField(goal, "kind") !== "adaptive_surface" || adaptiveScore >= 70),
-      requiresApproval: exactProfileOption ? false : Boolean(bound.requiresApproval),
+      requiresApproval: exactProfileOption || standardTermsMandate
+        ? false
+        : Boolean(bound.requiresApproval),
       expectedOutcome,
       localMechanicalPostcondition: expectedOutcome,
       obligationSuccessCondition: outcomeContract,
@@ -639,7 +717,9 @@ function buildCurrentCandidateSet({
     if (!candidate.goalRelevant) return false;
     const nonMutating = ["ask_user", "wait"].includes(candidate.type);
     if (!nonMutating && candidate.policyDecision?.allow !== true) return false;
-    if (!nonMutating && candidate.requiresApproval && !candidate.affordance?.authorization?.authorizationId) return false;
+    // Consequence policy, including ask-user decisions, is owned by the
+    // action governor. Hiding a grounded mechanic here turns an authorization
+    // question into a false "no mechanics" result.
     return !attempted.has(candidate.candidateId)
       && !attempted.has(candidate.strategyId)
       && !attemptedStrategies.has(actuatorSignature(candidate));

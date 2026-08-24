@@ -362,7 +362,7 @@ export function createForegroundSurfaceCompiler(dependencies) {
     if (isDangerousActionLabel(label)) return "payment";
     if (isSafeContinueLabel(label)) return "safe_continue";
     if (isSkipChoiceLabel(label)) return "skip_extra";
-    return "choice";
+    return "unknown";
   }
 
   function overlayOptionSemantic(label = "") {
@@ -374,7 +374,7 @@ export function createForegroundSurfaceCompiler(dependencies) {
     if (/all passengers|all travellers|all travelers|\badult\b|add|cart|upgrade|premium|\b[1-9]\d*([.,]\d+)?\s*(eur|€|usd|\$)/.test(text)) {
       return "add_paid_extra";
     }
-    return "choice";
+    return "unknown";
   }
 
   function overlayOptionRisk(label = "") {

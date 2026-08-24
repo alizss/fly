@@ -28,6 +28,15 @@ export function createOutcomeVerification({
   unfilledRequiredFields,
   visualPageState
 }) {
+  function exactObservedOptionMatches(actualValue = "", expected = {}) {
+    const actual = String(actualValue || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (!actual || !expected.exactOption) return false;
+    return [expected.exactOption.siteValue, expected.exactOption.label]
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase())
+      .filter(Boolean)
+      .includes(actual);
+  }
+
   function stageExitBlockers(map = buildPageMap(), decision = {}) {
     const blockers = [];
     const currentSurface = map.currentSurface || { type: "page" };
@@ -240,7 +249,8 @@ export function createOutcomeVerification({
     const afterVisual = visualPageState(afterMap);
     const visualChanged = beforeVisual?.fingerprint !== afterVisual?.fingerprint;
     const currentUrl = currentNavigationUrl();
-    const navigationOccurred = beforeMap.step !== afterMap.step || (beforeMap.url || currentUrl) !== (afterMap.url || currentUrl);
+    const stepChanged = beforeMap.step !== afterMap.step;
+    const navigationOccurred = (beforeMap.url || currentUrl) !== (afterMap.url || currentUrl);
     const beforeOverlay = Boolean(beforeSurface.type && beforeSurface.type !== "page");
     const afterOverlay = Boolean(afterSurface.type && afterSurface.type !== "page");
     const overlayAppeared = Boolean(afterOverlay && (!beforeOverlay || surfaceChanged));
@@ -259,6 +269,7 @@ export function createOutcomeVerification({
       domChanged,
       visualChanged,
       navigationOccurred,
+      stepChanged,
       overlayAppeared,
       validationAppeared,
       priceChanged: beforePrice !== afterPrice,
@@ -360,7 +371,6 @@ export function createOutcomeVerification({
       && exactCompatibleChoice
       && commit.ok === true
       && commit.popupClosed === true
-      && commit.focusSettled === true
       && evidence.commitSettled === true
       && evidence.activeChoiceSurface === false
       && validationClear
@@ -413,7 +423,7 @@ export function createOutcomeVerification({
         }
       };
     }
-    if (commit.ok && verification.ok) {
+    if (verification.ok && compactCommit.popupClosed === true) {
       return {
         ...verification,
         code: verification.code || "CHOICE_COMMIT_SETTLED",
@@ -724,6 +734,7 @@ export function createOutcomeVerification({
         wantedNormalizedValue,
         canonicalProfileFieldType(semanticType) || semanticType
       ) === true;
+      const exactObservedOption = exactObservedOptionMatches(actualNormalizedValue, expected);
       const currentSurface = afterMap.currentSurface || {};
       const surfaceDismissed = !expected.requireSurfaceDismissed
         || !expected.surfaceId
@@ -739,6 +750,7 @@ export function createOutcomeVerification({
             && actualSemanticValue === wantedSemanticValue
           )
           || compatibleProfileChoice
+          || exactObservedOption
         )
         && surfaceDismissed
         && ownedValidationErrors.length === 0
@@ -753,6 +765,7 @@ export function createOutcomeVerification({
           wantedNormalizedValue,
           actualSemanticValue,
           wantedSemanticValue,
+          exactObservedOption,
           surfaceDismissed,
           ownedValidationErrors,
           control: afterControl || null,
@@ -771,6 +784,7 @@ export function createOutcomeVerification({
         wantedNormalizedValue,
         canonicalProfileFieldType(semanticType) || semanticType
       ) === true;
+      const exactObservedOption = exactObservedOptionMatches(actualNormalizedValue, expected);
       const currentSurface = afterMap.currentSurface || {};
       const expectedChildSurfaceId = String(expected.surfaceId || "");
       const activeChoiceSurface = Boolean(
@@ -784,10 +798,9 @@ export function createOutcomeVerification({
       );
       const commitState = afterControl?.commitState || null;
       const commitSettled = commitState
-        ? Boolean(
+          ? Boolean(
             commitState.status === "settled"
             && commitState.popupClosed !== false
-            && commitState.focusSettled !== false
           )
         : !activeChoiceSurface;
       const ownedValidationErrors = currentOwnedValidationErrors(afterMap, expected, afterControlState);
@@ -801,6 +814,7 @@ export function createOutcomeVerification({
             && actualSemanticValue === wantedSemanticValue
           )
           || compatibleProfileChoice
+          || exactObservedOption
         )
       );
       const ok = Boolean(
@@ -820,6 +834,7 @@ export function createOutcomeVerification({
           wantedNormalizedValue,
           actualSemanticValue,
           wantedSemanticValue,
+          exactObservedOption,
           interactionKind: expected.interactionKind || "choice",
           commitRequirement: expected.commitRequirement || "logical_component_committed",
           activeChoiceSurface,
@@ -873,6 +888,35 @@ export function createOutcomeVerification({
           expectedSelectedControlId,
           selectedControlId,
           conflictingSelected,
+          ownedValidationErrors
+        }
+      };
+    }
+    if (expected.type === "control_unselected") {
+      const beforeControl = (beforeMap.controls || []).find((control) => control.controlId === expectedControlId) || null;
+      const beforeState = beforeControl?.state || beforeControl?.controlState || {};
+      const wasSelected = Boolean(beforeControl && (
+        beforeControl.selected || beforeState.checked || beforeState.selected
+      ));
+      const isSelected = Boolean(afterControl && (
+        afterControl.selected || afterControlState?.checked || afterControlState?.selected
+      ));
+      const ownedValidationErrors = (afterMap.validationIssues || []).filter((issue) => (
+        issue.stageWide === true || (expectedControlId && issue.controlId === expectedControlId)
+      ));
+      const ok = Boolean(expectedControlId && wasSelected && !isSelected && ownedValidationErrors.length === 0);
+      return {
+        ok,
+        code: ok ? "CONTROL_UNSELECTED" : "CONTROL_STILL_SELECTED",
+        message: ok
+          ? "The exact optional control is now unselected."
+          : "The exact optional control was not proven to transition from selected to unselected.",
+        evidence: {
+          ...evidence,
+          control: afterControl || null,
+          expectedControlId,
+          wasSelected,
+          isSelected,
           ownedValidationErrors
         }
       };
@@ -1380,7 +1424,7 @@ export function createOutcomeVerification({
       const beforeUrl = expectedBeforeNavigationUrl;
       const afterUrl = verifiedAfterNavigationUrl;
       const urlChanged = beforeUrl !== afterUrl;
-      const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged || (surfaceChanged && !overlayAppeared));
+      const ok = Boolean(urlChanged || progressMarkerChanged || (surfaceChanged && !overlayAppeared));
       return {
         ok,
         code: ok ? "CURRENT_SURFACE_ADVANCED" : "CURRENT_SURFACE_NOT_ADVANCED",
@@ -1397,20 +1441,17 @@ export function createOutcomeVerification({
       const beforeUrl = expectedBeforeNavigationUrl;
       const afterUrl = verifiedAfterNavigationUrl;
       const urlChanged = beforeUrl !== afterUrl;
-      const ok = Boolean(stepChanged || urlChanged || progressMarkerChanged);
+      const ok = Boolean(urlChanged || progressMarkerChanged || (surfaceChanged && !overlayAppeared));
       return {
         ok,
         code: ok ? "CHECKOUT_STAGE_ADVANCED" : "CHECKOUT_STAGE_NOT_ADVANCED",
-        message: ok ? "Fresh stage, URL, or progress-marker evidence proves checkout advanced." : "No fresh checkout-stage evidence was observed.",
+        message: ok ? "Fresh URL, surface, or progress-marker evidence proves checkout advanced." : "No fresh checkout-progress evidence was observed.",
         evidence: { ...evidence, stepChanged, urlChanged, progressMarkerChanged, overlayAppeared, surfaceChanged }
       };
     }
     if (expected.type === "stage_exit_or_feedback") {
       const errors = actionableCheckoutErrors(afterMap.errors || []);
       const blockers = stageExitBlockers(afterMap, expected);
-      if (changed && beforeMap.step !== afterMap.step) {
-        return { ok: true, code: "STAGE_CHANGED", message: `Stage changed to ${afterMap.step}.`, evidence };
-      }
       if (progressMarkerChanged) {
         return { ok: true, code: "NAVIGATION_PROGRESS_CHANGED", message: "Navigation advanced the current progress marker.", evidence };
       }
@@ -1424,10 +1465,10 @@ export function createOutcomeVerification({
       }
       if (validationAppeared) {
         return {
-          ok: true,
+          ok: false,
           code: "NAVIGATION_VALIDATION_APPEARED",
-          message: "Navigation reached the page and produced fresh validation feedback.",
-          evidence: { ...evidence, errors }
+          message: "Navigation revealed fresh validation that now owns the next obligation.",
+          evidence: { ...evidence, errors, blockers, validationIssues: afterMap.validationIssues || [] }
         };
       }
       if ((changed || visualChanged) && !blockers.length) {

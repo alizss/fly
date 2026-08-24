@@ -9,7 +9,7 @@ function lower(value = "") {
   return clean(value).toLowerCase();
 }
 
-function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence = {}, transactionReview = null, traveler = {}) {
+function cardCredentialEntryBoundaryEvidence(observation = {}, stageDecisionEvidence = {}, transactionReview = null, traveler = {}) {
   const page = observation.page || {};
   const controls = (page.controls || []).filter((control) => (
     controlBelongsToCurrentSurface(control, page)
@@ -29,9 +29,23 @@ function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence =
   const paymentMethodControlIds = controls
     .filter((control) => /payment.?method|apple.?pay|credit.?card|debit.?card/.test(semanticText(control)))
     .map((control) => control.controlId);
-  const paymentCredentialControlIds = controls
-    .filter((control) => /card.?number|card.?expiry|security.?code|card.?cvc|\bcvc\b|\bcvv\b|cc-number|cc-exp|cc-csc/.test(semanticText(control)))
-    .map((control) => control.controlId);
+  const paymentCredentialControls = controls
+    .map((control) => {
+      const semantics = semanticText(control);
+      const kind = /card.?number|cc-number/.test(semantics)
+        ? "card_number"
+        : /card.?expiry|expiration|valid.?through|cc-exp/.test(semantics)
+          ? "card_expiry"
+          : /security.?code|card.?cvc|\bcvc\b|\bcvv\b|cc-csc/.test(semantics)
+            ? "card_security_code"
+            : "";
+      return { control, kind };
+    })
+    .filter((entry) => entry.kind);
+  const paymentCredentialControlIds = paymentCredentialControls.map(({ control }) => control.controlId);
+  const credentialKinds = new Set(paymentCredentialControls.map(({ kind }) => kind));
+  const completeCardCredentialControls = ["card_number", "card_expiry", "card_security_code"]
+    .every((kind) => credentialKinds.has(kind));
   const payControlIds = controls
     .filter((control) => /(?:^|[^a-z0-9])(?:pay(?:\s+(?:now|securely|with)\b|\s+\d)|confirm\s+and\s+pay\b|submit\s+payment\b|complete\s+purchase\b)/.test(semanticText(control)))
     .map((control) => control.controlId);
@@ -50,7 +64,6 @@ function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence =
       return state.invalid === true || ((expectedValue || state.required === true || control.required === true) && missingValue);
     })
     .map((control) => control.controlId);
-  const step = lower(page.step || page.pageStep);
   const transactionFacts = page.transactionFacts
     || transactionReview?.current
     || transactionReview?.baseline
@@ -60,40 +73,26 @@ function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence =
     && transactionFacts.totalPrice?.amount != null
     && (transactionFacts.travelers || []).length
   );
-  const reviewContext = /payment|confirmation|review/.test(step)
-    || (transactionFacts.provenance || []).some((entry) => entry?.source === "payment_summary")
+  const reviewContext = (transactionFacts.provenance || []).some((entry) => entry?.source === "payment_summary")
     || stageDecisionEvidence.payment?.progress === true
     || stageDecisionEvidence.payment?.heading === true;
-  const strongStageEvidence = stageDecisionEvidence.paymentSignals >= 3
-    || (
-      stageDecisionEvidence.paymentSignals >= 2
-      && (paymentMethodControlIds.length || paymentCredentialControlIds.length)
-    );
-  const verifiedPaymentStage = transactionReview?.ready === true
-    && stageDecisionEvidence.paymentSignals >= 2
-    && Boolean(
-      stageDecisionEvidence.payment?.route
-      || stageDecisionEvidence.payment?.progress
-      || stageDecisionEvidence.payment?.heading
-    );
-  // A lone hidden CVV/card field is not a payment-review boundary. Require
-  // either mutually reinforcing payment-stage evidence or an owned final
-  // envelope together with the actual commit and payment-method controls.
-  const observed = Boolean(
-    stageDecisionEvidence.terminalEvidence?.boundaryObserved === true
-    || verifiedPaymentStage
-    || strongStageEvidence
-    || (
-      hasReviewEnvelope
-      && payControlIds.length
-      && (paymentMethodControlIds.length || paymentCredentialControlIds.length)
-    )
+  const hostedCardEntryPresent = stageDecisionEvidence.terminalEvidence?.hostedCardEntryPresent === true;
+  const compiledCredentialKinds = new Set(
+    stageDecisionEvidence.terminalEvidence?.paymentCredentialKinds || []
   );
+  const compiledCompleteCardCredentialSet = ["card_number", "card_expiry", "card_security_code"]
+    .every((kind) => compiledCredentialKinds.has(kind));
+  const compiledCardEntryPresent = stageDecisionEvidence.terminalEvidence?.cardCredentialEntryObserved === true
+    && compiledCompleteCardCredentialSet;
+  const observed = completeCardCredentialControls || compiledCardEntryPresent || hostedCardEntryPresent;
   return Object.freeze({
     observed,
     terminalEvidence: stageDecisionEvidence.terminalEvidence || null,
     reviewContext,
     hasReviewEnvelope,
+    completeCardCredentialControls,
+    compiledCardEntryPresent,
+    hostedCardEntryPresent,
     payControlIds: Object.freeze(payControlIds),
     paymentMethodControlIds: Object.freeze(paymentMethodControlIds),
     paymentCredentialControlIds: Object.freeze(paymentCredentialControlIds),
@@ -101,4 +100,4 @@ function paymentReviewBoundaryEvidence(observation = {}, stageDecisionEvidence =
   });
 }
 
-module.exports = { paymentReviewBoundaryEvidence };
+module.exports = { cardCredentialEntryBoundaryEvidence };

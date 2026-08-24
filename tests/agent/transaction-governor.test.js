@@ -215,7 +215,7 @@ test("pre-surface discovery admits one exact reversible opener and rejects seman
   assert.equal(moved.code, "DISCOVERY_BINDING_STALE");
 });
 
-test("an exhausted false commerce correction yields to remaining safe surface progress", async () => {
+test("an exhausted commerce correction remains the current obligation and stops", async () => {
   const minus = {
     controlId: "ctrl_false_remove",
     decisionGroupId: "dg_false_bag",
@@ -298,7 +298,7 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
       if (!failedSignatures.includes(signature)) failedSignatures.push(signature);
     }
   }
-  assert.ok(failedSignatures.length >= 2);
+  assert.equal(failedSignatures.length, 1);
 
   const { dir, dbPath } = tempDb();
   let state = createCheckoutSessionState({
@@ -335,34 +335,19 @@ test("an exhausted false commerce correction yields to remaining safe surface pr
     clientTurnId: "turn_false_bag_exhausted"
   });
 
-  assert.equal(exhaustedTurn.clientDecision.action, "wait", exhaustedTurn.clientDecision.reason);
-  assert.equal(mechanicalEvidence(exhaustedTurn.state).kind, "goal_strategies_exhausted");
-  const reobserved = {
-    ...observation,
-    observationId: "obs_false_bag_reobserved",
-    observationSnapshot: { snapshotHash: observation.observationSnapshot.snapshotHash }
-  };
-  store.recordObservation(state.id, reobserved);
-  const result = await runLoopTurn({
-    apiKey: "",
-    model: "must-not-be-called",
-    dataDir: dir,
-    state: exhaustedTurn.state,
-    observation: reobserved,
-    traveler,
-    transactionStore: store,
-    clientTurnId: "turn_false_bag_adaptive"
-  });
+  const result = exhaustedTurn;
 
-  assert.equal(result.clientDecision.action, "click", JSON.stringify({
+  assert.equal(result.clientDecision.action, "stop", JSON.stringify({
     reason: result.clientDecision.reason,
     currentGoal: result.state.taskState?.currentGoal,
     currentObligation: result.state.taskState?.currentObligation,
     mechanicalEvidence: mechanicalEvidence(result.state)
   }, null, 2));
-  assert.equal(result.clientDecision.controlId, skip.controlId);
-  assert.equal(result.state.taskState.currentObligation.kind, "adaptive_interaction");
+  assert.equal(result.clientDecision.intent, "strategies_exhausted");
+  assert.equal(result.state.taskState.currentObligation.subject.decisionGroupId, "dg_false_bag");
+  assert.notEqual(result.state.taskState.currentObligation.kind, "adaptive_interaction");
   assert.equal(result.state.taskState.currentObligation.authority, "task_state");
+  assert.equal(mechanicalEvidence(result.state), null);
   assert.equal(result.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1451,13 +1436,14 @@ test("an exhausted Title actuator cannot make the loop skip to Nationality", asy
     clientTurnId: "turn_reschedule_title_to_nationality"
   });
 
-  assert.equal(loopResult.clientDecision.action, "wait", JSON.stringify({
+  assert.equal(loopResult.clientDecision.action, "stop", JSON.stringify({
     action: loopResult.clientDecision.action,
     controlId: loopResult.clientDecision.controlId,
     semanticType: loopResult.state.taskState.currentObligation?.subject?.semanticType
   }));
   assert.equal(loopResult.state.taskState.currentObligation.subject.semanticType, "title");
-  assert.equal(mechanicalEvidence(loopResult.state).kind, "goal_strategies_exhausted");
+  assert.equal(loopResult.state.taskState.disposition.code, "STRATEGIES_EXHAUSTED");
+  assert.equal(mechanicalEvidence(loopResult.state), null);
   assert.equal(loopResult.debug.modelUsage.calls.length, 0);
 
   store.close();
@@ -1609,8 +1595,10 @@ test("profile goal selection preserves the first unresolved semantic obligation"
     transactionStore: store,
     clientTurnId: "turn_all_profile_actuators_blocked"
   });
-  assert.equal(loopResult.clientDecision.action, "wait");
-  assert.equal(mechanicalEvidence(loopResult.state).kind, "goal_strategies_exhausted");
+  assert.equal(loopResult.clientDecision.action, "stop");
+  assert.equal(loopResult.clientDecision.intent, "mechanic_unavailable");
+  assert.equal(loopResult.state.taskState.disposition.code, "NO_EXECUTABLE_MECHANIC");
+  assert.equal(mechanicalEvidence(loopResult.state), null);
   assert.equal(loopResult.debug.modelUsage.calls.length, 0);
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1997,10 +1985,10 @@ test("completed form reports unavailable navigation internally instead of asking
     clientTurnId: "turn_unavailable_navigation"
   });
 
-  assert.equal(result.clientDecision.action, "wait");
-  assert.equal(result.clientDecision.intent, "task_state_reobserve");
+  assert.equal(result.clientDecision.action, "stop");
+  assert.equal(result.clientDecision.intent, "task_state_stop");
   assert.match(result.clientDecision.reason, /SITUATION_RECONCILIATION_REQUIRED/);
-  assert.equal(result.state.status, "running");
+  assert.equal(result.state.status, "stopped");
   assert.equal("navigationSettling" in result.state, false);
   assert.equal(result.state.currentObligation, undefined);
   assert.equal(result.debug.userActionRequired, false);
@@ -3068,7 +3056,7 @@ test("P0.7 measurable viewport progress resets the genuine-failure budget", asyn
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.7 bounded genuine viewport failure returns to TaskState for the final disposition", async () => {
+test("P0.7 bounded genuine viewport failure returns TaskState's final disposition in the same turn", async () => {
   const { dir, dbPath } = tempDb();
   let { state, observation } = fixture();
   observation.page.viewport = { width: 1200, height: 800 };
@@ -3119,23 +3107,11 @@ test("P0.7 bounded genuine viewport failure returns to TaskState for the final d
     clientTurnId: "turn_viewport_genuine_failure"
   });
 
-  assert.equal(result.clientDecision.action, "wait");
+  assert.equal(result.clientDecision.action, "stop");
   assert.equal(leasedAction(result.state), null);
-  assert.equal(result.state.status, "running");
-  assert.equal(mechanicalEvidence(result.state).kind, "goal_strategies_exhausted");
-
-  const final = await runLoopTurn({
-    apiKey: "",
-    model: "must-not-be-called",
-    dataDir: dir,
-    state: result.state,
-    observation,
-    traveler,
-    transactionStore: store,
-    clientTurnId: "turn_viewport_genuine_failure_disposition"
-  });
-  assert.equal(final.clientDecision.action, "stop");
-  assert.equal(final.state.taskState.disposition.code, "STRATEGIES_EXHAUSTED");
+  assert.equal(result.state.status, "stopped");
+  assert.equal(mechanicalEvidence(result.state), null);
+  assert.equal(result.state.taskState.disposition.code, "STRATEGIES_EXHAUSTED");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });

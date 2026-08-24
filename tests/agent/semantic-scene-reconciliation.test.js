@@ -41,6 +41,18 @@ function observation(controls, validationIssues = []) {
   };
 }
 
+function admittedObligation(controlIds = ["ctrl_unknown"], decisionGroupId = "") {
+  return {
+    obligationId: "unknown-required:ctrl_unknown",
+    kind: "unknown_required",
+    objective: "resolve the current unknown required control",
+    authority: "task_state",
+    admittedControlIds: controlIds,
+    policyDecision: { status: "admitted" },
+    subject: { decisionGroupId }
+  };
+}
+
 test("known deterministic profile scenes do not request semantic reconciliation", () => {
   const known = control({
     controlId: "ctrl_first_name",
@@ -65,7 +77,8 @@ test("uncertain required controls and unowned validation produce a closed hypoth
       controlId: "",
       stageWide: false
     }]),
-    traveler: { first_name: "Ali", last_name: "Sifrar" }
+    traveler: { first_name: "Ali", last_name: "Sifrar" },
+    currentObligation: admittedObligation()
   });
 
   assert.equal(scene.needed, true);
@@ -99,7 +112,11 @@ test("an unfamiliar decision receives only a closed descriptive type and determi
     control({ controlId: "ctrl_decline", role: "radio", kind: "radio", required: false, label: "Continue without", operations: { select: { actuatorId: "decline" } } })
   ];
   source.page.fields = [];
-  const uncertainty = semanticSceneUncertainty({ observation: source, traveler: {} });
+  const uncertainty = semanticSceneUncertainty({
+    observation: source,
+    traveler: {},
+    currentObligation: admittedObligation(["ctrl_accept", "ctrl_decline"], "dg_opaque_offer")
+  });
   assert.equal(uncertainty.needed, true);
   assert.equal(uncertainty.allowedDecisionBindings.some((binding) => (
     binding.decisionGroupId === "dg_opaque_offer" && binding.decisionType === "insurance"
@@ -135,7 +152,8 @@ test("scene hypotheses may refine supplied evidence but cannot invent owners or 
   }]);
   const uncertainty = semanticSceneUncertainty({
     observation: source,
-    traveler: { first_name: "Ali" }
+    traveler: { first_name: "Ali" },
+    currentObligation: admittedObligation()
   });
   const reconciled = applySemanticSceneHypotheses(source, {
     status: "grounded",
@@ -174,7 +192,8 @@ test("an evidence-identical grounded binding is reused without another model req
   const source = observation([sourceControl]);
   const uncertainty = semanticSceneUncertainty({
     observation: source,
-    traveler: { first_name: "Ali" }
+    traveler: { first_name: "Ali" },
+    currentObligation: admittedObligation(["ctrl_unknown_1"])
   });
   const reconciled = applySemanticSceneHypotheses(source, {
     status: "grounded",
@@ -206,7 +225,11 @@ test("a grounded binding is invalidated when its local semantic evidence changes
     sectionLabel: "Passenger 1"
   });
   const source = observation([sourceControl]);
-  const uncertainty = semanticSceneUncertainty({ observation: source, traveler: { first_name: "Ali" } });
+  const uncertainty = semanticSceneUncertainty({
+    observation: source,
+    traveler: { first_name: "Ali" },
+    currentObligation: admittedObligation()
+  });
   const reconciled = applySemanticSceneHypotheses(source, {
     status: "grounded",
     hypotheses: [{
@@ -223,7 +246,11 @@ test("a grounded binding is invalidated when its local semantic evidence changes
   const next = applyRememberedSemanticBindings(changed, memory, { traveler: { first_name: "Ali" } });
 
   assert.equal(next.page.controls[0].fieldType, "");
-  assert.equal(semanticSceneUncertainty({ observation: next, traveler: { first_name: "Ali" } }).needed, true);
+  assert.equal(semanticSceneUncertainty({
+    observation: next,
+    traveler: { first_name: "Ali" },
+    currentObligation: admittedObligation()
+  }).needed, true);
 });
 
 test("an ambiguous scene uses one closed-ID hypothesis call and returns no action authority", async () => {
@@ -255,16 +282,32 @@ test("an ambiguous scene uses one closed-ID hypothesis call and returns no actio
   };
   try {
     const source = observation([control()]);
+    const uncertainty = semanticSceneUncertainty({
+      observation: source,
+      traveler: { first_name: "Ali" },
+      currentObligation: admittedObligation()
+    });
+    const obligation = admittedObligation();
     const result = await reconcileSemanticScene({
       apiKey: "test-key",
       model: "test-model",
       observation: source,
-      traveler: { first_name: "Ali" }
+      traveler: { first_name: "Ali" },
+      currentObligation: obligation,
+      policyConstraints: { bookingRules: "no paid extras", declinePaidExtras: true },
+      failedMethods: [{ operation: "open", method: "native_click", result: "NO_EFFECT" }],
+      uncertainty
     });
     const payload = JSON.parse(request.input[0].content[0].text);
 
     assert.equal(calls, 1);
     assert.equal(payload.outputAuthority, "grounded_hypothesis_only");
+    assert.equal(Object.hasOwn(payload.scene, "stage"), false);
+    assert.equal(payload.scene.currentObligation.obligationId, obligation.obligationId);
+    assert.equal(payload.scene.components[0].rawEvidenceChannels.name, "opaque_1");
+    assert.equal(payload.policyConstraints.declinePaidExtras, true);
+    assert.deepEqual(payload.failedMethods, [{ operation: "open", method: "native_click", result: "NO_EFFECT" }]);
+    assert.equal(payload.forbiddenConsequences.includes("grant_permission"), true);
     assert.equal(payload.allowedSemanticBindings.some((binding) => (
       binding.controlId === "ctrl_unknown"
       && binding.semanticType === "first_name"

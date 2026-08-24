@@ -90,8 +90,16 @@ function createSessionService(agentSessionStore) {
       travelerId: primaryTravelerId,
       site: { host: body.page?.site || "", url: body.page?.url || "" }
     });
+    const preserveAwaitingUser = Boolean(
+      existing
+      && body.resumeOnly === true
+      && existing.status === "awaiting_user"
+    );
     let updated = withUpdate(state, {
-      status: "running",
+      // A redirect or reinjection is not a user answer. Preserve a pending
+      // question instead of silently restarting the planner and emitting the
+      // same ask again on the unchanged checkout state.
+      status: preserveAwaitingUser ? "awaiting_user" : "running",
       userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
       travelerId: primaryTravelerId,
       travelerIds: [...new Set([...selectedTravelerIds, primaryTravelerId].filter(Boolean))],
@@ -103,6 +111,11 @@ function createSessionService(agentSessionStore) {
       approvals: {
         ...state.approvals,
         skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
+        // Starting a selected-booking checkout is the transaction-bound
+        // mandate for ordinary carriage/fare/privacy/dangerous-goods terms.
+        // The policy layer still rejects exceptional declarations and bundled
+        // optional consent unless separately authorized.
+        standardBookingTermsApproved: true,
         paymentApproved: false,
         paymentAuthorization: body.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
         priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null

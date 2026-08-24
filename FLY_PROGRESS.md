@@ -1,6 +1,6 @@
 # Fly — Current Progress
 
-Last updated: 2026-08-19
+Last updated: 2026-08-23
 
 This is the concise chronological engineering record. Current acceptance truth belongs in [FLY_COVERAGE_MATRIX.md](./FLY_COVERAGE_MATRIX.md); stable product scope in [FLY_VISION_PRD.md](./FLY_VISION_PRD.md); architecture and sequence in [FLY_FINAL_ROADMAP.md](./FLY_FINAL_ROADMAP.md).
 
@@ -8,10 +8,10 @@ This is the concise chronological engineering record. Current acceptance truth b
 
 | Question | Answer |
 |---|---|
-| Product milestone | Universal unfamiliar checkout to verified payment review; no legal/payment/purchase action |
-| Architecture | One ObservationFrame → DecisionFrame → TaskState/CurrentObligation → mechanics → governor → ActionLease → verification loop |
-| Automated baseline | 386/386 unit; 179/179 uninterrupted browser replays; `npm run check` |
-| Live evidence | EasyJet, GoToGate, Kiwi, and Turkish technically reached verified payment review safely |
+| Product milestone | Universal unfamiliar checkout to actual card credential entry; profile-authorized standard legal work allowed; no credential/Pay/purchase action |
+| Architecture | One canonical control graph → DecisionFrame → DesiredStateDelta → TaskState/CurrentObligation → deterministic mechanics → governor → ActionLease → verification loop; model is semantic-only |
+| Automated baseline | 408/408 unit; 184/184 uninterrupted browser replays; repository checks |
+| Live evidence | Prior EasyJet, GoToGate, Kiwi, and Turkish traces reached the former review boundary; corrected card-entry reclassification/reruns pending |
 | Formal evidence gap | Latest normalized canary reports require explicit intervention annotation |
 | Highest-priority product gap | Obligation-driven interpretation on mixed/unfamiliar pages, then cross-airline structural proof |
 | Secondary gap | Browser observation/rescan and ambiguity latency |
@@ -31,6 +31,38 @@ Prove that the current universal loop transfers to unfamiliar structural familie
 Every failure must produce an exact replay and a universal repair. A new DOM, ordinary field, custom control, or unusual grouping is not an expected handoff.
 
 ## Latest implementation checkpoints
+
+### 2026-08-23 — Exact actuator authority and bounded pre-dispatch recovery
+
+- Removed the executor's second generic `24×16` CTA geometry veto from exact canonical control resolution. A canonical member that the current observation has already proven visible, enabled, hit-tested, targetable, and operation-compatible remains executable even when it is a normal 13px checkbox or 15px label.
+- Kept strict geometry and region validation for visual-coordinate and bounded recovery paths. The simplification applies only to exact current graph members; it does not broaden label search, stale rebinding, or ungrounded clicking.
+- Repeat-prohibited pre-dispatch failures now enter the existing target-local failed-strategy ledger, clear stale candidate selection, consume the finite recovery budget, and force a distinct actuator strategy. Ordinary surface/staleness rejections remain free to reobserve and rebind.
+- Exact `control_unselected` postconditions now normalize the action and ActionLease to `semanticEffect=waive`, preventing a selected optional consent from being transported as a generic selection.
+- The Croatia-shaped PaymentForm replay uses the production failure dimensions: a 15px label with a 13px checkbox. It proves the exact leased target resolves and executes, the survey becomes unchecked, settled person/payment choices remain unchanged, and Continue is scheduled next.
+
+Validation: 408/408 unit tests, 184/184 uninterrupted browser replays, `npm run check`, and the production extension build pass. Fresh live Croatia rerun remains the acceptance evidence gap.
+
+### 2026-08-23 — Desired State Delta scheduling and PaymentForm repair
+
+- Added `DesiredStateDelta/v1` as the only decision-work admission boundary between canonical decisions and TaskState. It emits work only for required missing state, an exact profile mismatch, proven incremental cost/transaction conflict, typed required legal work, or owned active validation.
+- Removed broad ancestor/section-total price inheritance. Economic effect now requires a positively typed commerce role, direct exact price evidence, or an exact bounded paid summary with its owned reversal.
+- Narrowed legal and payment semantics: noun-only “Legal person”, “payment”, “card”, route labels, and payment-method selection cannot create legal authority or prove card credential entry.
+- Standalone survey/newsletter/marketing toggles are canonical optional-consent decisions. The baseline profile defaults affirmative consent off; selected conflicts compile and verify an exact `control_unselected` correction. Native exact requiredness remains authoritative.
+- TaskState schedules stage exit when no delta exists. It no longer reopens satisfied choices merely because they remain visible, and the await-user latch survives passive navigation/resume until explicit input is provided.
+- Exact Croatia-shaped regression proves the selected survey is unchecked first, Natural person and credit-card method remain unchanged, and fresh observation then schedules Continue. Related paid-product, bundle, custom-selector, cross-surface correction, and payment-boundary regressions remain green.
+
+Validation: 407/407 unit tests and 184/184 uninterrupted browser replays pass. Fresh live Croatia and structural portfolio reruns remain the acceptance evidence gap.
+
+### 2026-08-23 — Canonical mechanics and checkout-lineage simplification
+
+- The canonical control graph is now the sole mechanical authority. `fields`, `buttons`, `sections`, `decisionGroups`, and `stageExit` remain derived views and cannot independently admit a target or operation.
+- TaskState derives forward progress directly from executable typed graph controls. Stage classification and the `stageExit` projection are diagnostic only.
+- The production `mechanic_selection` model mode was removed. Once TaskState admits an obligation, exact control ownership, executable proof, direct operation rank, and failed-strategy memory choose the mechanic deterministically.
+- Local command meaning separates safe forward controls from purchase commits: a plain review Confirm may advance toward card entry, while Pay/Book/Purchase/Confirm-and-pay controls compile as purchase submission and never enter navigation.
+- Resume save, claim, clear, popup handoff, and cross-domain reinjection are keyed by `checkoutLineageId`. A tab is an actuator location, not the durable session owner, and one checkout cannot delete another checkout's marker.
+- Exact regressions cover Croatia-shaped PaymentForm ownership, plain Confirm progression, Pay-now exclusion, duplicate/occluded Continue representations, zero-model multi-mechanic selection, popup handoff, and two simultaneous lineage-isolated resume sessions.
+
+Validation: 402/402 unit tests, 184/184 uninterrupted browser replays, `npm run check`, and `git diff --check` pass. Fresh live unfamiliar-site reruns remain the acceptance evidence gap.
 
 ### 2026-08-19 — Obligation-driven checkout situation
 

@@ -17,6 +17,7 @@ const { canonicalDecisionOwnerKey } = require("../transaction-facts");
 const { canonicalOptionMatch, missingDerivedFactDependency } = require("../logical-field");
 const { activeValidationIssues } = require("../validation-evidence");
 const { adaptiveInteractionGoal } = require("../adaptive-interaction");
+const { compileDesiredStateDeltas } = require("../desired-state-delta");
 const {
   currentObligation,
   currentObligationFromGoal,
@@ -31,7 +32,7 @@ const {
 } = require("../../../../packages/shared/semantic-owner");
 const { decideStage, stageEvidence } = require("./stage");
 const { controlHasExecutableCapability } = require("./control-evidence");
-const { paymentReviewBoundaryEvidence } = require("./terminal");
+const { cardCredentialEntryBoundaryEvidence } = require("./terminal");
 const {
   reconcileVerifiedProfileComponents,
   verifiedProfileComponentFromActionResult,
@@ -76,7 +77,6 @@ const {
 const COMPLETED = new Set(["satisfied", "waived", "waived_by_policy"]);
 const GOAL_CREATING = new Set(["active", "conflicted", "blocked"]);
 const DECISION_EPISODE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
-const TASK_STATE_REOBSERVE_DEADLINE_MS = 8_000;
 const taskStateReadModels = new WeakMap();
 
 function taskMechanics(taskState = {}) {
@@ -153,15 +153,6 @@ function taskStateReadModel(taskState = null) {
   return taskState && typeof taskState === "object"
     ? taskStateReadModels.get(taskState) || null
     : null;
-}
-
-function unblockedStageExitReady(page = {}) {
-  const exit = page.stageExit || {};
-  if (exit.continueDisabled === true || exit.navigationState === "disabled") return false;
-  const readyCandidate = (exit.candidates || []).some((candidate) => (
-    candidate.executable === true || candidate.status === "ready"
-  ));
-  return Boolean(readyCandidate && !(exit.blockers || []).length);
 }
 
 function groupId(group = {}) {
@@ -268,17 +259,9 @@ function completedMap(previousTaskState = {}) {
 
 function forwardControlIds(observation = {}) {
   const page = observation.page || {};
-  const explicitStageExitIds = new Set([
-    ...(page.stageExit?.candidates || [])
-      .filter((candidate) => candidate.status === "ready" || candidate.executable === true)
-      .flatMap((candidate) => [candidate.controlId, candidate.actuatorId])
-  ].filter(Boolean));
   return (page.controls || []).filter((control) => {
     if (!controlBelongsToCurrentSurface(control, page)) return false;
     if (!controlHasExecutableCapability(control)) return false;
-    const explicitStageExit = explicitStageExitIds.has(control.controlId)
-      || explicitStageExitIds.has(control.stateElementId)
-      || explicitStageExitIds.has(control.preferredActivationElementId);
     const typedNavigation = isTypedNavigationControl(control, { explicitStageExit: false });
     const state = control.state || {};
     const alreadySelected = control.selected === true
@@ -287,15 +270,12 @@ function forwardControlIds(observation = {}) {
     const choiceLike = /checkbox|radio|option|choice/.test(lower(
       `${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`
     ));
-    // A browser stage-exit heuristic may notice text such as "select this to
-    // continue" on a settled decline checkbox. That does not make the choice
-    // itself a navigation actuator. Exact typed navigation remains eligible;
-    // an explicit stage-exit fallback is admitted only for an unselected
-    // non-choice actuator such as Continue, Skip bags, or Proceed without
-    // seats. Choice settlement belongs to its decision obligation.
+    // Choice settlement belongs to its decision obligation. Navigation is
+    // admitted only from typed meaning on this canonical control; the derived
+    // browser `stageExit` projection cannot add a second authority.
     if (alreadySelected && !typedNavigation) return false;
     if (choiceLike && !typedNavigation) return false;
-    return typedNavigation || explicitStageExit;
+    return typedNavigation;
   }).map((control) => control.controlId).filter(Boolean);
 }
 
@@ -353,6 +333,8 @@ function optionIsBoundedChoice(control = {}) {
 function decisionOptionContract(decision = {}, observation = {}) {
   if (Array.isArray(decision.availableTransitions)) {
     const transitions = decision.availableTransitions.filter((transition) => transition.executable);
+    const desiredIds = new Set(decision.userIntent?.desiredControlIds || []);
+    const unselectDesiredToggle = decision.userIntent?.desiredSelected === false;
     const linkedCorrectionIds = new Set((observation.page?.semanticOwnershipLinks || [])
       .filter((link) => (
         link.status === "resolved"
@@ -363,12 +345,25 @@ function decisionOptionContract(decision = {}, observation = {}) {
       .map((link) => link.correctionControlId));
     const paidIds = transitions.filter((transition) => transition.paid).map((transition) => transition.controlId);
     const generallyFreeIds = transitions.filter((transition) => (
-      !transition.paid && optionLooksExplicitlyFree(transition)
+      !transition.paid && (
+        optionLooksExplicitlyFree(transition)
+        || (unselectDesiredToggle && desiredIds.has(transition.controlId))
+      )
     )).map((transition) => transition.controlId);
-    const desiredIds = new Set(decision.userIntent?.desiredControlIds || []);
     const eligibleIntentIds = new Set(decision.userIntent?.eligibleOptionIds || []);
     const exactFreeIds = generallyFreeIds.filter((controlId) => desiredIds.has(controlId));
-    const policyChoiceBounded = ["constraint", "exact", "ambiguous", "unavailable"].includes(decision.userIntent?.match);
+    const legalDecision = /legal|attestation/.test(lower([
+      decision.family,
+      decision.subject?.key,
+      decision.subject?.family,
+      decision.sectionType
+    ].filter(Boolean).join(" ")));
+    // A legal attestation is an obligation even when the generic preference
+    // resolver has no "desired option" vocabulary for it. Admit its exact
+    // observed actuator here; the typed legal-scope policy remains the sole
+    // authority that may allow or request approval at governance time.
+    const policyChoiceBounded = !legalDecision
+      && ["constraint", "exact", "ambiguous", "unavailable"].includes(decision.userIntent?.match);
     const constrainedFreeIds = generallyFreeIds.filter((controlId) => eligibleIntentIds.has(controlId));
     const freeIds = policyChoiceBounded
       ? (exactFreeIds.length ? exactFreeIds : constrainedFreeIds)
@@ -426,9 +421,13 @@ function decisionOptionContract(decision = {}, observation = {}) {
 function goalForDecision(decision = {}, observation = {}, userPolicy = {}, traveler = {}) {
   const options = decisionOptionContract(decision, observation);
   const explicitDesiredOutcome = clean(decision.userIntent?.desiredOutcome);
+  const unselectOptionalConsent = decision.desiredStateDelta?.desiredState === "unselected"
+    || decision.userIntent?.desiredSelected === false;
   const genericDesiredOutcome = !explicitDesiredOutcome
     || ["selected", "selected_policy_allowed_option"].includes(explicitDesiredOutcome);
-  const desiredSemanticOutcome = genericDesiredOutcome && options.correctionControlIds.length
+  const desiredSemanticOutcome = unselectOptionalConsent
+    ? agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
+    : genericDesiredOutcome && options.correctionControlIds.length
     ? agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
     : genericDesiredOutcome
       && options.policyChoiceBounded
@@ -437,10 +436,16 @@ function goalForDecision(decision = {}, observation = {}, userPolicy = {}, trave
       : explicitDesiredOutcome;
   const desiredPolicyOutcome = desiredSemanticOutcome || "selected_policy_allowed_option";
   const observationId = observation.observationId || "observation";
+  const unknownAttestation = /unknown_attestation/.test(lower(
+    `${decision.sectionType || ""} ${decision.subject?.key || ""} ${decision.semanticType || ""}`
+  ));
   return Object.freeze({
-    goalId: `${observationId}:goal:${decision.decisionGroupId}`,
+    goalId: `decision:${decision.decisionGroupId || decision.decisionId}`,
+    kind: unknownAttestation ? "unknown_attestation" : "checkout_decision",
     semanticGoal: `resolve ${decision.subject?.label || `the exact current ${decision.family || "checkout"} decision`}`,
-    semanticType: decision.subject?.key || decision.family || "decision",
+    semanticType: unknownAttestation
+      ? "unknown_attestation"
+      : decision.subject?.key || decision.family || "decision",
     desiredValue: desiredPolicyOutcome,
     desiredPolicyOutcome,
     desiredSemanticOutcome,
@@ -461,6 +466,7 @@ function goalForDecision(decision = {}, observation = {}, userPolicy = {}, trave
     paidAlternativeControlIds: Object.freeze(options.paidControlIds),
     semanticCorrectionControlIds: Object.freeze(options.correctionControlIds),
     decisionStatus: decision.status,
+    desiredStateDelta: decision.desiredStateDelta || null,
     forceAiResolution: ["conflicted", "blocked"].includes(decision.status),
     postcondition: Object.freeze({
       type: "decision_group_resolved",
@@ -472,10 +478,52 @@ function goalForDecision(decision = {}, observation = {}, userPolicy = {}, trave
   });
 }
 
+function unknownEvidenceGoal(obligation = {}, observation = {}) {
+  const page = observation.page || {};
+  const reconciliation = page.semanticSceneReconciliation || null;
+  const exactIds = new Set([
+    obligation.controlId,
+    ...(obligation.evidenceIds || [])
+  ].map(clean).filter(Boolean));
+  const actionableControlIds = (page.controls || []).filter((control) => (
+    exactIds.has(clean(control.controlId))
+    && controlBelongsToCurrentSurface(control, page)
+    && controlHasExecutableCapability(control)
+  )).map((control) => control.controlId);
+  return Object.freeze({
+    goalId: clean(obligation.obligationId),
+    kind: clean(obligation.kind || "unknown_required"),
+    semanticGoal: `resolve the current ${clean(obligation.kind || "unknown requirement").replace(/_/g, " ")}`,
+    semanticType: clean(obligation.semanticType || "unknown"),
+    desiredValue: "requirement_resolved",
+    surfaceId: clean(obligation.surfaceId || "surface-page"),
+    observationId: observation.observationId || "",
+    actionableControlIds: Object.freeze(actionableControlIds),
+    evidenceStrength: clean(obligation.evidenceStrength || "strong"),
+    rawEvidenceIds: Object.freeze([...(obligation.evidenceIds || [])]),
+    postcondition: Object.freeze({
+      type: "validation_or_requirement_resolved",
+      obligationId: clean(obligation.obligationId),
+      controlId: clean(obligation.controlId),
+      mustNotIncreasePrice: true
+    }),
+    ...(actionableControlIds.length && reconciliation?.status !== "unknown" ? {} : {
+      ambiguity: Object.freeze({
+        code: actionableControlIds.length
+          ? "UNKNOWN_OBLIGATION_UNRESOLVED"
+          : "UNKNOWN_OBLIGATION_HAS_NO_ACTUATOR",
+        reason: actionableControlIds.length
+          ? "Bounded interpretation could not safely resolve the exact current blocker."
+          : "Strong blocker evidence exists, but no exact current-surface actuator owns it."
+      })
+    })
+  });
+}
+
 function navigationGoal(observation = {}, controlIds = []) {
   const surface = currentSurface(observation.page || {});
   return Object.freeze({
-    goalId: `${observation.observationId || "observation"}:goal:continue`,
+    goalId: `navigation:${surface.id || "surface-page"}`,
     semanticGoal: surface.type === "page" ? "continue checkout" : "advance the current foreground surface",
     semanticType: "navigation",
     desiredValue: "next_stage",
@@ -491,7 +539,7 @@ function navigationGoal(observation = {}, controlIds = []) {
 function completedChoiceSurfaceGoal(observation = {}, episode = {}) {
   const surface = currentSurface(observation.page || {});
   return Object.freeze({
-    goalId: `${observation.observationId || "observation"}:goal:close_completed_choice_surface`,
+    goalId: `close:${clean(episode.episodeId || episode.parentDecisionGroupId || surface.id || "surface-page")}`,
     semanticGoal: "close the completed choice surface",
     semanticType: "completed_choice_surface",
     desiredValue: "surface_dismissed",
@@ -558,8 +606,9 @@ function reduceDecisionFrame({
   const page = observation.page || {};
   const normalizedProfilePolicy = userPolicy.profilePolicy || normalizeProfilePolicy({ userPolicy, traveler });
   const surface = currentSurface(page);
-  const { stage, evidence: stageDecisionEvidence } = decideStage(observation);
-  const paymentReviewBoundary = paymentReviewBoundaryEvidence(observation, stageDecisionEvidence, transactionReview, traveler);
+  const { stage: diagnosedStage, evidence: stageDecisionEvidence } = decideStage(observation);
+  const cardEntryBoundary = cardCredentialEntryBoundaryEvidence(observation, stageDecisionEvidence, transactionReview, traveler);
+  const stage = cardEntryBoundary.observed ? "payment" : diagnosedStage;
   const fingerprint = surfaceFingerprint(surface, observation);
   const meaningfulSurfaceChange = Boolean(previousTaskState.surfaceFingerprint
     && previousTaskState.surfaceFingerprint !== fingerprint);
@@ -697,15 +746,34 @@ function reduceDecisionFrame({
   )));
   const canonicalControlDecisions = (authoritativeDecisionFrame.standaloneDecisions || []).filter((decision) => (
     !(decision.physicalControlIds || []).some((controlId) => observedPhysicalControlIds.has(controlId))
-  )).map((decision) => Object.freeze({
-    ...decision,
-    canonicalOwnerId: canonicalDecisionOwnerId(decision, observation),
-    originKind: decision.family === "profile" ? "profile_field" : "commerce_decision"
-  }));
+  )).map((decision) => {
+    const policyResolvedDecision = decision.controlType === CONTROL_TYPES.OPTIONAL_TOGGLE
+      && decision.observed?.decisionGroupId
+      ? resolveCanonicalDecision({
+          group: decision.observed,
+          page,
+          previousCompletion: completions.get(clean(decision.decisionGroupId || decision.decisionId)) || null,
+          userPolicy,
+          traveler,
+          decisionEpisode: previousTaskState.decisionEpisode || null
+        })
+      : decision;
+    return Object.freeze({
+      ...policyResolvedDecision,
+      canonicalOwnerId: canonicalDecisionOwnerId(policyResolvedDecision, observation),
+      originKind: policyResolvedDecision.family === "profile" ? "profile_field" : "commerce_decision"
+    });
+  });
   const canonicalDecisions = Object.freeze([
     ...observedDecisions,
     ...canonicalControlDecisions
   ]);
+  const desiredStateDeltas = compileDesiredStateDeltas({ decisions: canonicalDecisions });
+  const desiredStateDeltaByDecisionId = new Map(desiredStateDeltas.map((delta) => [
+    clean(delta.decisionGroupId),
+    delta
+  ]));
+  const decisionIdentity = (decision = {}) => clean(decision.decisionGroupId || decision.decisionId);
 
   let decisionEpisode = choiceDecisionEpisode({
     previousTaskState,
@@ -752,6 +820,11 @@ function reduceDecisionFrame({
   });
   let activeDecisions = owned
     .filter((decision) => GOAL_CREATING.has(decision.status))
+    .filter((decision) => desiredStateDeltaByDecisionId.has(decisionIdentity(decision)))
+    .map((decision) => Object.freeze({
+      ...decision,
+      desiredStateDelta: desiredStateDeltaByDecisionId.get(decisionIdentity(decision))
+    }))
     .sort((left, right) => {
       const priority = (decision) => {
         if (decision.status === "conflicted" && (
@@ -771,19 +844,24 @@ function reduceDecisionFrame({
   // excluded by canonical ownership when they are absent from activeDecisions.
   let routableActiveDecisions = activeDecisions;
   const suspendedDecisions = foreground
-    ? canonicalDecisions.filter((decision) => decision.surfaceId !== surface.id && GOAL_CREATING.has(decision.status))
+    ? canonicalDecisions.filter((decision) => (
+        decision.surfaceId !== surface.id
+        && GOAL_CREATING.has(decision.status)
+        && desiredStateDeltaByDecisionId.has(decisionIdentity(decision))
+      ))
     : [];
   const validationBlockers = activeValidationIssues(page.validationIssues || []).filter((issue) => issue.stageWide === true || !issue.controlId || (page.controls || []).some((control) => (
     control.controlId === issue.controlId && controlBelongsToCurrentSurface(control, page)
   )));
+  const unknownEvidenceObligations = (checkoutSituation.obligations || []).filter((obligation) => (
+    ["unknown_required", "unknown_validation", "unknown_attestation"].includes(obligation.kind)
+    && ["strong", "structural"].includes(obligation.evidenceStrength)
+    && (!obligation.surfaceId || obligation.surfaceId === surface.id || (surface.type === "page" && obligation.surfaceId === "surface-page"))
+  ));
   const controlIds = forwardControlIds(observation);
-  const readyStageExitControlIds = (page.stageExit?.candidates || [])
-    .filter((candidate) => candidate.executable === true || candidate.status === "ready")
-    .map((candidate) => candidate.controlId)
-    .filter((controlId) => controlIds.includes(controlId));
   const paymentContactControlIds = new Set(
-    paymentReviewBoundary.observed
-      ? paymentReviewBoundary.pendingContactControlIds || []
+    cardEntryBoundary.observed
+      ? cardEntryBoundary.pendingContactControlIds || []
       : []
   );
   // Payment surfaces often contain prose about email confirmations and
@@ -797,7 +875,7 @@ function reduceDecisionFrame({
     // pages whose visible date label omits a year.
     selectedBooking: transactionReview?.baseline || null
   };
-  const profileObservation = paymentReviewBoundary.observed
+  const profileObservation = cardEntryBoundary.observed
     ? {
         ...observation,
         page: {
@@ -828,6 +906,21 @@ function reduceDecisionFrame({
   routableActiveDecisions = routableActiveDecisions.filter((decision) => !verifiedProfileComponents.some((completion) => (
     verifiedProfileComponentMatchesDecision(completion, decision)
   )));
+  const lockedDecisionGroupId = clean(
+    obligationField(previousGoal, "decisionGroupId")
+    || obligationField(previousGoal, "subject")?.decisionGroupId
+  );
+  const lockedActiveDecision = lockedDecisionGroupId
+    ? routableActiveDecisions.find((decision) => clean(decision.decisionGroupId) === lockedDecisionGroupId) || null
+    : null;
+  if (lockedActiveDecision) {
+    // An unresolved obligation owns the next turn. Reclassification, sibling
+    // discovery, and generic progress heuristics may not silently replace it.
+    routableActiveDecisions = [
+      lockedActiveDecision,
+      ...routableActiveDecisions.filter((decision) => decision !== lockedActiveDecision)
+    ];
+  }
   const compiledProfileRequirements = authoritativeDecisionFrame.profileRequirements || [];
   const baseProfileReadiness = profileStageReadiness(
     profileObservation,
@@ -866,7 +959,7 @@ function reduceDecisionFrame({
       : profileSelection.failureCode || ""
   });
   const selectedProfileGoal = profileSelection.goal;
-  const profileGoal = paymentReviewBoundary.observed
+  const profileGoal = cardEntryBoundary.observed
     && selectedProfileGoal
     && !/email|phone|contact/.test(lower(`${selectedProfileGoal.semanticType || ""} ${selectedProfileGoal.logicalFieldId || ""}`))
       ? null
@@ -884,35 +977,38 @@ function reduceDecisionFrame({
       })
     : null;
   const previousTerminalLatch = previousTaskState.terminalGoalLatch || {};
-  const pendingPaymentReviewContact = Boolean(
-    paymentReviewBoundary.observed
-    && paymentReviewBoundary.pendingContactControlIds.length
+  const pendingCardEntryContact = Boolean(
+    cardEntryBoundary.observed
+    && cardEntryBoundary.pendingContactControlIds.length
   );
   const transactionEvidenceReady = transactionReview?.ready === true
     && outcomeCoverage.complete === true;
-  const paymentCompletionObserved = !siteFailure
-    && paymentReviewBoundary.observed
-    && !pendingPaymentReviewContact
-    && transactionEvidenceReady;
+  // The current milestone is a browser capability boundary: the user can now
+  // enter card number, expiry, and security code. Transaction reconciliation
+  // remains visible safety evidence, but it cannot make an observed card form
+  // disappear or cause the agent to continue navigating past that boundary.
+  const cardEntryCompletionObserved = !siteFailure
+    && cardEntryBoundary.observed
+    && !pendingCardEntryContact;
   const transactionReviewBlocked = !siteFailure
-    && paymentReviewBoundary.observed
-    && !pendingPaymentReviewContact
+    && cardEntryBoundary.observed
+    && !pendingCardEntryContact
     && !transactionEvidenceReady;
   const transactionChangeRequiresApproval = Boolean(
     transactionReviewBlocked
     && (transactionReview?.contradictions || []).length
   );
-  const terminalGoalLatch = Object.freeze(paymentCompletionObserved || previousTerminalLatch.locked === true
+  const terminalGoalLatch = Object.freeze(cardEntryCompletionObserved || previousTerminalLatch.locked === true
     ? {
         locked: true,
-        goalId: "reach_payment_review",
-        terminalStatus: "payment_review_reached",
+        goalId: "reach_card_credential_entry",
+        terminalStatus: "card_credential_entry_reached",
         completedObservationId: previousTerminalLatch.completedObservationId || observation.observationId || "",
-        completionEvidence: previousTerminalLatch.completionEvidence || "fresh_payment_evidence"
+        completionEvidence: previousTerminalLatch.completionEvidence || "fresh_card_credential_entry"
       }
     : {
         locked: false,
-        goalId: "reach_payment_review",
+        goalId: "reach_card_credential_entry",
         terminalStatus: "active",
         completedObservationId: "",
         completionEvidence: ""
@@ -922,11 +1018,11 @@ function reduceDecisionFrame({
     && previousTaskState.checkoutBoundary?.status === "checkout"
     && previousTaskState.terminalStatus === "active"
   );
-  // Payment-looking UI is evidence of the stage, not proof that the requested
-  // transaction reached review intact. Only the verified transaction envelope
-  // may complete and latch the task.
+  // Only exact card-entry capability latches the task. Method selectors,
+  // review summaries, legal copy, routes, and Pay buttons remain nonterminal.
+  // Transaction integrity is reported independently below.
   const terminalStatus = terminalGoalLatch.locked
-    ? "payment_review_reached"
+    ? "card_credential_entry_reached"
     : (leftActiveCheckout ? "checkout_left" : "active");
   const { transactionOutcome, stageOutcome } = durableOutcomeHierarchy(
     previousTaskState,
@@ -940,10 +1036,10 @@ function reduceDecisionFrame({
     signalCount: stageDecisionEvidence.terminalEvidence?.signalCount ?? stageDecisionEvidence.paymentSignals,
     evidenceOnly: true,
     paymentActionsAllowed: false,
-    boundaryObserved: paymentReviewBoundary.observed,
-    pendingContact: pendingPaymentReviewContact,
-    boundary: paymentReviewBoundary,
-    currentlyObserved: paymentCompletionObserved,
+    boundaryObserved: cardEntryBoundary.observed,
+    pendingContact: pendingCardEntryContact,
+    boundary: cardEntryBoundary,
+    currentlyObserved: cardEntryCompletionObserved,
     observed: terminalGoalLatch.locked,
     transactionVerified: transactionEvidenceReady,
     missingTransactionFacts: Object.freeze([
@@ -979,9 +1075,9 @@ function reduceDecisionFrame({
       // decisions remain durable facts, but they cannot create an action goal
       // until the failure surface is gone.
       currentGoal = null;
-    } else if (paymentReviewBoundary.observed && !profileGoal) {
+    } else if (cardEntryBoundary.observed && !profileGoal) {
       currentGoal = null;
-      ambiguityReason = pendingPaymentReviewContact
+      ambiguityReason = pendingCardEntryContact
         ? "payment_review_contact_incomplete"
         : transactionReviewBlocked
           ? "transaction_review_incomplete"
@@ -992,7 +1088,7 @@ function reduceDecisionFrame({
       // unfinished objective inside that one foreground surface instead of
       // erasing it and falling into a generic no-actuator stop.
       currentGoal = adaptiveGoal;
-    } else if (profileGoal && (!foreground || foregroundOwnsProfileGoal)) {
+    } else if (profileGoal && !lockedActiveDecision && (!foreground || foregroundOwnsProfileGoal)) {
       currentGoal = Object.freeze(profileGoal);
     } else if (profileReadiness.profileStage && !profileReadiness.ready && !profileGoal) {
       // An unresolved profile field with no executable actuator must not be
@@ -1054,33 +1150,20 @@ function reduceDecisionFrame({
       }
     } else if (decisionEpisode?.status === "completed_pending_surface_exit") {
       currentGoal = completedChoiceSurfaceGoal(observation, decisionEpisode);
+    } else if (unknownEvidenceObligations.length) {
+      currentGoal = unknownEvidenceGoal(unknownEvidenceObligations[0], observation);
     } else if (validationBlockers.length) {
       currentGoal = null;
       ambiguityReason = "contradictory_or_validation_evidence";
-    } else if (unblockedStageExitReady(page) && readyStageExitControlIds.length) {
-      // Decisive stage invariant: after canonical profile/decision/validation
-      // admission has produced no blocker, an exact executable stage exit is
-      // the next task. Optional blank framework representations cannot outrank
-      // it or manufacture a new semantic obligation.
-      currentGoal = navigationGoal(observation, readyStageExitControlIds);
-    } else if (controlIds.length && foreground && (
-      ["review_confirmation", "warning", "navigation", "choice_set"].includes(surfaceClass)
-      || (page.stageExit?.candidates || []).some((candidate) => controlIds.includes(candidate.controlId))
-    )) {
+    } else if (controlIds.length) {
+      // Once canonical profile/decision/validation admission has produced no
+      // blocker, an executable typed forward control is the next task. This
+      // path depends only on the canonical graph, never on stage classification
+      // or a separately rebuilt stage-exit candidate list.
       currentGoal = navigationGoal(observation, controlIds);
     } else if (foreground) {
       currentGoal = null;
       ambiguityReason = "unknown_foreground_surface";
-    } else if (controlIds.length) {
-      currentGoal = navigationGoal(observation, controlIds);
-    } else if (
-      page.stageExit?.continueObserved === true
-      || (page.stageExit?.candidates || []).length > 0
-    ) {
-      currentGoal = null;
-      ambiguityReason = page.stageExit?.continueDisabled === true
-        ? "navigation_disabled_without_active_requirement"
-        : "navigation_actuator_unavailable";
     } else {
       const currentCapabilities = (page.controls || []).filter((control) => controlBelongsToCurrentSurface(control, page));
       if (foreground || currentCapabilities.length) {
@@ -1089,41 +1172,44 @@ function reduceDecisionFrame({
       }
     }
   }
-  // Formal compilation remains the preferred path, but it is no longer a
-  // prerequisite for one harmless reversible mechanic. When the task is
-  // unfinished and no canonical goal survived, publish one bounded adaptive
-  // interaction over exact current-surface actuators. The consequence
-  // governor and fresh postcondition verification remain authoritative.
-  const adaptiveFallbackReasons = new Set([
-    "navigation_actuator_unavailable",
-    "navigation_disabled_without_active_requirement",
+  // Unfamiliarity fallback: create one local reversible obligation only when
+  // no semantic/profile/validation obligation exists at all. This is not a
+  // recovery path and may never replace or preempt existing work.
+  const localFallbackReasons = new Set([
     "no_goal_relevant_candidate",
     "unknown_foreground_surface"
   ]);
+  const previousObligationStillObserved = Boolean(
+    lockedActiveDecision
+    || (obligationField(previousGoal, "kind") === "profile_field" && profileGoal)
+  );
   if (
     terminalStatus === "active"
     && !currentGoal
-    && adaptiveFallbackReasons.has(ambiguityReason)
-    && !siteFailure
-    && !validationBlockers.length
+    && localFallbackReasons.has(ambiguityReason)
+    && !previousObligationStillObserved
+    && activeDecisions.length === 0
+    && unknownEvidenceObligations.length === 0
+    && validationBlockers.length === 0
     && (!profileReadiness.profileStage || profileReadiness.ready === true)
-    && !paymentReviewBoundary.observed
+    && !siteFailure
+    && !cardEntryBoundary.observed
+    && mechanicalEvidence?.kind !== "goal_strategies_exhausted"
   ) {
     const fallback = adaptiveInteractionGoal({
       observation,
       userPolicy,
       traveler,
-      reason: ambiguityReason
+      reason: `no_existing_obligation:${ambiguityReason}`
     });
     if (fallback) {
       currentGoal = fallback;
       ambiguityReason = "";
     }
   }
-  // Candidate exhaustion is mechanical evidence, not authority for the loop
-  // to replace semantic work. When the exact TaskState-published goal has
-  // exhausted its grounded strategies, TaskState alone may yield to one
-  // consequence-gated adaptive goal on the same fresh surface.
+  // Candidate exhaustion is mechanical evidence only. It may stop the exact
+  // obligation, but it is never authority to replace that obligation with a
+  // page-wide "make progress" action.
   const mechanicalEvidenceOwnsGoal = Boolean(
     mechanicalEvidence?.kind === "goal_strategies_exhausted"
     && (
@@ -1146,27 +1232,6 @@ function reduceDecisionFrame({
       )
     )
   );
-  if (
-    terminalStatus === "active"
-    && currentGoal
-    && mechanicalEvidenceOwnsGoal
-    && !["profile_field", "adaptive_surface", "adaptive_interaction"].includes(obligationField(currentGoal, "kind"))
-    && !["payment", "legal"].includes(obligationField(currentGoal, "semanticType"))
-    && !siteFailure
-    && !paymentReviewBoundary.observed
-  ) {
-    const fallback = adaptiveInteractionGoal({
-      observation,
-      userPolicy,
-      traveler,
-      reason: "canonical_goal_exhausted_without_observable_change",
-      excludedControlIds: mechanicalEvidence.excludedControlIds || []
-    });
-    if (fallback) {
-      currentGoal = fallback;
-      ambiguityReason = "";
-    }
-  }
   const unresolvedGroundingControlIds = new Set(
     activeRequirementGrounding?.status !== "bound"
       ? (activeRequirementGrounding?.candidateComponentIds || []).map(clean).filter(Boolean)
@@ -1291,8 +1356,8 @@ function reduceDecisionFrame({
   const unresolved = [
     ...(profileReadiness.missingUserData || []).map((field) => `profile:${clean(field)}`),
     ...activeDecisions.map((decision) => `decision:${clean(decision.decisionGroupId || decision.decisionId)}`),
-    ...(paymentReviewBoundary.observed ? (transactionReview?.missingFacts || []).map((fact) => `transaction:${clean(fact)}`) : []),
-    ...(paymentReviewBoundary.observed ? (transactionReview?.contradictions || []).map((fact) => `contradiction:${clean(fact)}`) : [])
+    ...(cardEntryBoundary.observed ? (transactionReview?.missingFacts || []).map((fact) => `transaction:${clean(fact)}`) : []),
+    ...(cardEntryBoundary.observed ? (transactionReview?.contradictions || []).map((fact) => `contradiction:${clean(fact)}`) : [])
   ].filter(Boolean);
   const processAwareness = Object.freeze({
     status: terminalGoalLatch.locked
@@ -1303,14 +1368,14 @@ function reduceDecisionFrame({
           ? "verifying_final_transaction"
           : "in_progress",
     currentPosition: Object.freeze({
-      stage: paymentReviewBoundary.observed ? "payment_review" : stage,
+      stage: cardEntryBoundary.observed ? "card_credential_entry" : stage,
       surfaceId: clean(surface.id || "surface-page"),
       surfaceType: clean(surface.type || "page"),
       surfaceClass
     }),
     currentObjective: clean(
       obligationField(currentGoal, "semanticGoal")
-      || (transactionReviewBlocked ? "verify the final transaction" : "reach verified payment review")
+      || (transactionReviewBlocked ? "verify the final transaction" : "reach card credential entry")
     ),
     achievements: Object.freeze(achievements),
     unresolved: Object.freeze([...new Set(unresolved)].slice(0, 160)),
@@ -1330,7 +1395,7 @@ function reduceDecisionFrame({
     terminalStatus === "active"
     && !currentObligation
     && !siteFailure
-    && !paymentReviewBoundary.observed
+    && !cardEntryBoundary.observed
     && checkoutSituation.checkoutActive === true
     && (
       checkoutSituation.reconciliationRequired === true
@@ -1346,7 +1411,6 @@ function reduceDecisionFrame({
   const authorizationConflict = activeDecisions.find((decision) => (
     decision.reopenEvidence?.code === "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT"
   )) || null;
-  const previousDisposition = previousTaskState.disposition || {};
   const admittedMechanicsExhausted = Boolean(
     mechanicalEvidenceOwnsGoal
     && currentGoal
@@ -1357,7 +1421,7 @@ function reduceDecisionFrame({
   );
   const dispositionCode = clean(
     siteFailure ? "SITE_FAILURE_OBSERVED"
-      : terminalStatus === "payment_review_reached" ? "PAYMENT_REVIEW_REACHED"
+      : terminalStatus === "card_credential_entry_reached" ? "CARD_CREDENTIAL_ENTRY_REACHED"
       : terminalStatus === "checkout_left" ? "CHECKOUT_LEFT"
       : transactionChangeRequiresApproval ? "TRANSACTION_CHANGE_REQUIRES_APPROVAL"
       : transactionReviewBlocked ? "TRANSACTION_REVIEW_INCOMPLETE"
@@ -1373,44 +1437,17 @@ function reduceDecisionFrame({
       : ambiguityReason ? ambiguityReason
       : "NO_CURRENT_OBLIGATION"
   );
-  const sameReobserveDisposition = Boolean(
-    previousDisposition.kind === "wait_reobserve"
-    && previousDisposition.code === dispositionCode
-    && previousDisposition.surfaceFingerprint === fingerprint
-  );
-  const reobserveNow = Date.now();
-  const reobserveCount = sameReobserveDisposition
-    ? Number(previousDisposition.reobserveCount || 0) + 1
-    : 1;
-  const reobserveStartedAt = sameReobserveDisposition
-    ? Number(previousDisposition.reobserveStartedAt || reobserveNow)
-    : reobserveNow;
-  const reobserveDeadlineAt = sameReobserveDisposition
-    ? Number(previousDisposition.reobserveDeadlineAt || (reobserveStartedAt + TASK_STATE_REOBSERVE_DEADLINE_MS))
-    : reobserveStartedAt + TASK_STATE_REOBSERVE_DEADLINE_MS;
-  const reobserveRetryToken = sameReobserveDisposition
-    ? clean(previousDisposition.retryToken)
-    : `reobserve_${stableSemanticToken(`${dispositionCode}:${fingerprint}`, 42)}_${reobserveStartedAt.toString(36)}`;
-  const waitForEngineReconciliation = (reason) => reobserveDeadlineAt > reobserveNow
-    ? {
-        kind: "wait_reobserve",
-        code: dispositionCode,
-        reason,
-        reobserveCount,
-        retryToken: reobserveRetryToken,
-        reobserveStartedAt,
-        reobserveDeadlineAt,
-        surfaceFingerprint: fingerprint,
-        userActionRequired: false
-      }
-    : {
-        kind: "stop",
-        code: dispositionCode || "READINESS_DEADLINE_EXHAUSTED",
-        reason: `${reason} The bounded engine reconciliation deadline was exhausted.`,
-        reobserveCount,
-        surfaceFingerprint: fingerprint,
-        userActionRequired: false
-      };
+  // TaskState is reduced from a settled observation. It may execute, ask, or
+  // stop, but it must never hope that identical semantic evidence changes by
+  // itself. Positive destination loading is handled before this reducer by
+  // the observation-readiness lifecycle.
+  const stopForEngineReconciliation = (reason) => ({
+    kind: "stop",
+    code: dispositionCode || "NO_EXECUTABLE_OBLIGATION",
+    reason,
+    surfaceFingerprint: fingerprint,
+    userActionRequired: false
+  });
   let disposition;
   if (siteFailure) {
     disposition = {
@@ -1419,11 +1456,11 @@ function reduceDecisionFrame({
       reason: clean(siteFailure.message || "The active checkout surface reports a site failure."),
       userActionRequired: false
     };
-  } else if (terminalStatus === "payment_review_reached") {
+  } else if (terminalStatus === "card_credential_entry_reached") {
     disposition = {
       kind: "terminal",
       code: dispositionCode,
-      reason: "The approved transaction is reconciled at payment review.",
+      reason: "The approved transaction is reconciled and actual card credential entry is visible.",
       userActionRequired: false
     };
   } else if (terminalStatus === "checkout_left") {
@@ -1437,7 +1474,7 @@ function reduceDecisionFrame({
     disposition = {
       kind: "request_approval",
       code: dispositionCode,
-      reason: "The transaction visible at payment review materially conflicts with the approved booking mandate.",
+      reason: "The transaction visible at card credential entry materially conflicts with the approved booking mandate.",
       userActionRequired: true,
       details: Object.freeze({
         missingFacts: Object.freeze([...(transactionReview?.missingFacts || []), ...(outcomeCoverage.complete ? [] : ["verified_decision_outcomes"])]),
@@ -1445,8 +1482,8 @@ function reduceDecisionFrame({
       })
     };
   } else if (transactionReviewBlocked) {
-    disposition = waitForEngineReconciliation(
-      "Payment review is visible, but the engine has not yet reconciled every required transaction fact."
+    disposition = stopForEngineReconciliation(
+      "Card credential entry is visible, but required transaction evidence is still unresolved."
     );
   } else if (authorizationConflict) {
     disposition = {
@@ -1470,8 +1507,8 @@ function reduceDecisionFrame({
       userActionRequired: false
     };
   } else if (obligationField(currentGoal, "ambiguity")) {
-    disposition = waitForEngineReconciliation(
-      clean(obligationField(currentGoal, "ambiguity").reason || "The current admitted checkout obligation requires engine reconciliation.")
+    disposition = stopForEngineReconciliation(
+      clean(obligationField(currentGoal, "ambiguity").reason || "The current checkout obligation remains semantically ambiguous after bounded resolution.")
     );
   } else if (currentObligation) {
     disposition = {
@@ -1482,7 +1519,7 @@ function reduceDecisionFrame({
       userActionRequired: false
     };
   } else if (missingDerivedFact) {
-    disposition = waitForEngineReconciliation(
+    disposition = stopForEngineReconciliation(
       clean(missingDerivedFact.label || "A selected-booking fact required to derive traveler data is missing.")
     );
   } else if (missingProfileFact) {
@@ -1496,34 +1533,17 @@ function reduceDecisionFrame({
       userActionRequired: true
     };
   } else if (validationBlockers.length) {
-    disposition = waitForEngineReconciliation(
-      "The active checkout surface reports validation that is not yet owned by an executable obligation."
+    disposition = stopForEngineReconciliation(
+      "The active checkout surface reports validation with no safely executable owner."
     );
   } else if (["ACTIVE_REQUIREMENT_UNRESOLVED", "SEMANTIC_AMBIGUITY", "active_requirement_unresolved", "contradictory_or_validation_evidence"].includes(dispositionCode)) {
-    disposition = waitForEngineReconciliation(
-      "The active checkout requirement is not yet resolved from the fresh evidence."
+    disposition = stopForEngineReconciliation(
+      "The active checkout requirement remains unresolved after bounded semantic resolution."
     );
-  } else if (reobserveDeadlineAt > reobserveNow) {
-    disposition = {
-      kind: "wait_reobserve",
-      code: dispositionCode,
-      reason: "No executable obligation is proven yet; wait for a material mutation or the bounded deadline before stopping.",
-      reobserveCount,
-      retryToken: reobserveRetryToken,
-      reobserveStartedAt,
-      reobserveDeadlineAt,
-      surfaceFingerprint: fingerprint,
-      userActionRequired: false
-    };
   } else {
-    disposition = {
-      kind: "stop",
-      code: dispositionCode || "READINESS_DEADLINE_EXHAUSTED",
-      reason: "The same settled surface produced no executable obligation after the bounded re-observation deadline.",
-      reobserveCount,
-      surfaceFingerprint: fingerprint,
-      userActionRequired: false
-    };
+    disposition = stopForEngineReconciliation(
+      "The settled surface produced no safely executable obligation."
+    );
   }
   disposition = Object.freeze(disposition);
 
@@ -1544,6 +1564,7 @@ function reduceDecisionFrame({
     activeDecisions: Object.freeze(activeDecisions),
     observedDecisions: Object.freeze(observedDecisions),
     canonicalDecisions,
+    desiredStateDeltas,
     suspendedDecisions: Object.freeze(suspendedDecisions),
     validationBlockers: Object.freeze(validationBlockers),
     stageDecisionEvidence: Object.freeze(stageDecisionEvidence),
@@ -1563,7 +1584,7 @@ function reduceDecisionFrame({
   });
   const taskState = Object.freeze({
     contractVersion: "task-state/v2",
-    goal: Object.freeze({ id: "reach_payment_review", status: terminalGoalLatch.locked ? "completed" : "active" }),
+    goal: Object.freeze({ id: "reach_card_credential_entry", status: terminalGoalLatch.locked ? "completed" : "active" }),
     userPreferences: Object.freeze({
       bookingRules: clean(userPolicy.bookingRules || traveler.booking_rules),
       extras: clean(userPolicy.extras),
@@ -1581,7 +1602,8 @@ function reduceDecisionFrame({
         ])
       )),
       paymentSubmissionRequiresApproval: true,
-      paymentCredentialsBlocked: true
+      paymentCredentialsBlocked: true,
+      standardBookingTermsAuthorized: true
     }),
     terminalGoalLatch,
     checkoutBoundary,

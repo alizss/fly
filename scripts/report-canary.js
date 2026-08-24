@@ -154,15 +154,21 @@ function completeTransactionFacts(facts = {}) {
 function terminalTrace(traces) {
   return [...traces].reverse().find((trace) => (
     trace?.plannedAction?.type === "final_review"
-    || trace?.policyDecision?.code === "PAYMENT_REVIEW_REACHED"
-    || trace?.debug?.taskState?.terminalGoalLatch?.terminalStatus === "payment_review_reached"
+    || ["CARD_CREDENTIAL_ENTRY_REACHED", "PAYMENT_REVIEW_REACHED"].includes(trace?.policyDecision?.code)
+    || ["card_credential_entry_reached", "payment_review_reached"].includes(trace?.debug?.taskState?.terminalGoalLatch?.terminalStatus)
   )) || null;
 }
 
 function paymentBoundaryTrace(traces) {
   return [...traces].reverse().find((trace) => {
     const evidence = trace?.observation?.page?.terminalEvidence || {};
-    return evidence.verified === true && evidence.boundaryObserved !== false;
+    const kinds = new Set(evidence.paymentCredentialKinds || []);
+    const completeCardSet = ["card_number", "card_expiry", "card_security_code"]
+      .every((kind) => kinds.has(kind));
+    return evidence.contractVersion === "terminal-evidence/v2"
+      && evidence.verified === true
+      && evidence.cardCredentialEntryObserved === true
+      && (completeCardSet || evidence.hostedCardEntryPresent === true);
   }) || null;
 }
 
@@ -248,7 +254,7 @@ function summarizeCanary({ workDir = DEFAULT_WORK_DIR, sessionId, manualInterven
         : "checkout_incomplete";
   const handoffs = traces.filter((trace) => (
     ["ask_user", "request_input", "request_approval"].includes(trace?.plannedAction?.type)
-    && trace?.plannedAction?.intent !== "payment_review_reached"
+    && !["card_credential_entry_reached", "payment_review_reached"].includes(trace?.plannedAction?.intent)
   ));
 
   return {
@@ -272,6 +278,7 @@ function summarizeCanary({ workDir = DEFAULT_WORK_DIR, sessionId, manualInterven
       transactionContradictions,
       safetyPassed,
       // Compatibility projections for existing report consumers.
+      cardCredentialEntryReached: paymentBoundaryVerified,
       paymentReviewReached: paymentBoundaryVerified,
       transactionComplete: transactionFactsComplete,
       stopCode: stopped?.policyDecision?.code || stopped?.executionResult?.stopCategory || "",

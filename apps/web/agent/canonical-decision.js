@@ -158,6 +158,21 @@ function explicitlyDormantRepresentation(control = {}) {
   return lifecycle.status === "dormant_hidden" || lifecycle.active === false;
 }
 
+function optionalIncentiveField(control = {}) {
+  const evidence = lower([
+    control.fieldType,
+    control.field,
+    control.semantic,
+    control.meaning,
+    control.name,
+    control.label,
+    control.accessibleName,
+    control.placeholder,
+    control.stableKey
+  ].filter(Boolean).join(" "));
+  return /\b(?:promo(?:tion(?:al)?)?|coupon|voucher|discount)\s*(?:code|number)?\b/.test(evidence);
+}
+
 function controlsForGroup(group = {}, page = {}) {
   const ids = new Set([
     ...(group.alternativeControlIds || []),
@@ -213,8 +228,8 @@ function exactSubject(group = {}, controls = []) {
   if (ownedFamily === "seat") {
     return { key: "seat_selection", label: authoritative || localLabel || "Seat selection", family: "seat" };
   }
-  if (/newsletter|marketing|promotional|email offers/.test(evidence)) {
-    return { key: "marketing_subscription", label: authoritative || localLabel || "Marketing subscription", family: "contact" };
+  if (/newsletter|marketing|promotional|email offers|customer satisfaction survey|participate in (?:a )?survey|third[- ]party offers/.test(evidence)) {
+    return { key: "optional_consent", label: authoritative || localLabel || "Optional consent", family: "contact" };
   }
   if (/\btitle\b|traveler_title|passenger_title/.test(evidence)) {
     return { key: "traveler_title", label: authoritative || localLabel || "Traveler title", family: "profile" };
@@ -235,7 +250,14 @@ function exactSubject(group = {}, controls = []) {
   if (/bundle|support|sms|extra|add.?on/.test(evidence)) {
     return { key: `extras_${slug(localLabel || groupId(group))}`, label: authoritative || localLabel || "Optional extra", family: "extras" };
   }
-  if (/legal|terms|consent/.test(evidence)) {
+  const typedLegalEvidence = lower([
+    authoritative,
+    localLabel,
+    group.sectionType,
+    group.semanticType,
+    ...controls.map((control) => `${control.semantic || ""} ${control.physicalEffect || ""}`)
+  ].filter(Boolean).join(" "));
+  if (/legal_acceptance|unknown_attestation|accept_legal|accept_terms|terms_accept|booking terms|purchase conditions|conditions of carriage/.test(typedLegalEvidence)) {
     return { key: `legal_${slug(localLabel || groupId(group))}`, label: authoritative || localLabel || "Legal acceptance", family: "legal" };
   }
   if (/payment|card|pay/.test(evidence)) {
@@ -274,6 +296,78 @@ function optionCount(option = {}) {
 }
 
 function exactUserIntent(subject = {}, group = {}, transitions = [], userPolicy = {}, traveler = {}) {
+  if (subject.key === "optional_consent") {
+    const policyText = lower([
+      userPolicy.bookingInstruction,
+      userPolicy.oneOffInstruction,
+      userPolicy.userGoal,
+      userPolicy.sessionInstruction,
+      userPolicy.bookingRules,
+      traveler.booking_rules
+    ].filter(Boolean).join(" "));
+    const consentSubject = lower([
+      subject.label,
+      group.sectionLabel,
+      group.sectionType,
+      group.semanticType,
+      ...transitions.map((transition) => `${transition.label || ""} ${transition.semantic || ""}`)
+    ].filter(Boolean).join(" "));
+    const surveySubject = /survey|customer satisfaction/.test(consentSubject);
+    const marketingSubject = /newsletter|marketing|promotional|third[- ]party offers|commercial communication/.test(consentSubject);
+    const surveyOptOut = /(?:do not|don't|no|decline|opt.?out).{0,50}(?:participate|survey)|(?:participate|survey).{0,50}(?:do not|don't|no|decline|opt.?out)/.test(policyText);
+    const marketingOptOut = /(?:do not|don't|no|decline|opt.?out|unsubscribe).{0,50}(?:newsletter|marketing|promotional|third[- ]party offers)|(?:newsletter|marketing|promotional|third[- ]party offers).{0,50}(?:do not|don't|no|decline|opt.?out|unsubscribe)/.test(policyText);
+    const explicitOptOut = surveySubject && surveyOptOut
+      || marketingSubject && marketingOptOut;
+    const surveyOptIn = !surveyOptOut
+      && /(?:opt in|participate).{0,50}(?:survey)|(?:survey).{0,50}(?:yes|allow|want|opt in|participate)/.test(policyText);
+    const marketingOptIn = !marketingOptOut
+      && /(?:opt in|subscribe|receive).{0,50}(?:newsletter|marketing|promotional|third[- ]party offers)|(?:newsletter|marketing|promotional|third[- ]party offers).{0,50}(?:yes|allow|want|opt in|subscribe|receive)/.test(policyText);
+    const explicitOptIn = surveySubject && surveyOptIn
+      || marketingSubject && marketingOptIn;
+    const executable = transitions.filter((transition) => transition.executable);
+    const negativeConsentTransitions = executable.filter((transition) => (
+      /\b(?:i\s+)?(?:do not|don't|do not wish|don't wish|decline to|opt out of|unsubscribe from)\b|\bno (?:newsletter|marketing|offers)\b/.test(lower(
+        `${transition.label || ""} ${transition.semantic || ""}`
+      ))
+    ));
+    if (!explicitOptIn && !explicitOptOut) {
+      // An optional control is observed page state, not a checkout
+      // obligation. Preserve either default; only explicit profile intent,
+      // requiredness, or later validation may turn it into work.
+      return {
+        match: "none",
+        source: "",
+        desiredOutcome: "leave_unchanged",
+        desiredSelected: null,
+        desiredCanonicalValue: null,
+        desiredControlIds: [],
+        eligibleOptionIds: executable.map((transition) => transition.controlId),
+        preferredOptionId: "",
+        authorization: null,
+        reason: "No profile instruction changes this optional control.",
+        evidence: []
+      };
+    }
+    const desiredTransitions = explicitOptOut && negativeConsentTransitions.length
+      ? negativeConsentTransitions
+      : explicitOptIn
+        ? executable.filter((transition) => !negativeConsentTransitions.includes(transition))
+        : executable;
+    const desiredSelected = explicitOptIn || (explicitOptOut && negativeConsentTransitions.length > 0);
+    return {
+      match: "exact",
+      source: "saved_profile",
+      desiredOutcome: desiredSelected ? "selected" : "unselected_optional_consent",
+      desiredSelected,
+      desiredCanonicalValue: null,
+      desiredControlIds: desiredTransitions.map((transition) => transition.controlId),
+      eligibleOptionIds: executable.map((transition) => transition.controlId),
+      preferredOptionId: desiredTransitions.length === 1 ? desiredTransitions[0].controlId : "",
+      authorization: null,
+      reason: "The saved profile explicitly resolves this optional consent.",
+      evidence: [policyText]
+    };
+  }
   const alternativesById = new Map((group.alternatives || []).map((option) => [option.controlId, option]));
   const resolution = resolveProfileDecision({
     decisionGroupId: groupId(group),
@@ -312,6 +406,7 @@ function exactUserIntent(subject = {}, group = {}, transitions = [], userPolicy 
     match: resolution.match,
     source: resolution.source,
     desiredOutcome,
+    desiredSelected: true,
     desiredCanonicalValue: resolution.preferredOptionId || null,
     desiredControlIds,
     eligibleOptionIds: resolution.eligibleOptionIds,
@@ -323,14 +418,31 @@ function exactUserIntent(subject = {}, group = {}, transitions = [], userPolicy 
 }
 
 function transitionFor(control = {}, alternative = {}) {
-  const operation = Object.entries(control.operations || {}).find(([, capability]) => (
+  const executableOperations = Object.entries(control.operations || {}).filter(([, capability]) => (
     capability?.actionability?.executable === true || capability?.actionability?.revealable === true
-  ))?.[0] || "";
-  const effectRole = clean(control.effectRole || alternative.effectRole || "unknown");
-  const nonEconomic = ["scope_toggle", "information_only", "navigation", "presentation_mode"].includes(effectRole);
-  const price = nonEconomic ? null : (control.structuredPrice || alternative.structuredPrice || (
-    optionPrice(control) !== null ? { amount: optionPrice(control), currency: clean(control.currency) } : null
   ));
+  const opensChoice = /open_choice_control|open_surface/.test(lower(
+    `${alternative.semantic || ""} ${alternative.physicalEffect || ""}`
+  ));
+  const operation = (opensChoice
+    ? executableOperations.find(([name]) => ["open", "activate", "keyboard"].includes(name))
+    : executableOperations[0])?.[0] || "";
+  const controlEffectRole = clean(control.effectRole);
+  const effectRole = clean(
+    controlEffectRole && controlEffectRole !== "unknown"
+      ? controlEffectRole
+      : alternative.effectRole || "unknown"
+  );
+  const directStructuredPrice = control.structuredPrice || alternative.structuredPrice || null;
+  const explicitCommerceSemantic = /select_paid|add_paid|purchase|upgrade|money|paid_extra/.test(lower(
+    `${control.semantic || ""} ${alternative.semantic || ""} ${control.risk || ""} ${alternative.risk || ""}`
+  ));
+  const economic = ["commerce_option", "free_decline", "included_entitlement"].includes(effectRole)
+    || Boolean(directStructuredPrice)
+    || explicitCommerceSemantic;
+  const price = economic ? (directStructuredPrice || (
+    optionPrice(control) !== null ? { amount: optionPrice(control), currency: clean(control.currency) } : null
+  )) : null;
   const merged = { ...alternative, ...control, structuredPrice: price };
   return Object.freeze({
     transitionId: `${clean(control.controlId || alternative.controlId)}:${operation || "unavailable"}`,
@@ -341,11 +453,14 @@ function transitionFor(control = {}, alternative = {}) {
     canonicalValue: alternative.canonicalValue ?? control.canonicalValue ?? alternative.value ?? control.currentValue ?? clean(alternative.label || control.label),
     selected: Boolean(control.selected || control.state?.checked || control.state?.selected || alternative.selected),
     executable: executable(control),
-    paid: !nonEconomic && paid(merged),
+    paid: economic && paid(merged),
     price,
     effectRole,
-    risk: clean(control.risk || alternative.risk || "unknown"),
-    semantic: clean(control.semantic || alternative.semantic)
+    risk: clean(control.risk && control.risk !== "uncertain" ? control.risk : alternative.risk || control.risk || "unknown"),
+    semantic: clean(control.semantic && control.semantic !== "unknown" ? control.semantic : alternative.semantic || control.semantic),
+    physicalEffect: clean(control.physicalEffect && control.physicalEffect !== "unknown"
+      ? control.physicalEffect
+      : alternative.physicalEffect || "")
   });
 }
 
@@ -481,7 +596,26 @@ function canonicalDecisionForGroup({
   )) || null;
   const selectedEvidence = group.selectedEvidence || null;
   const selectedEffectRole = clean(selectedEvidence?.effectRole || selectedTransition?.effectRole || "unknown");
-  const selectedIsEconomic = !["scope_toggle", "information_only", "navigation", "presentation_mode"].includes(selectedEffectRole);
+  const hasExactPaidReversal = transitions.some((transition) => (
+    transition.executable && explicitPaidRemoval(transition)
+  ));
+  const selectedSummaryEconomic = Boolean(
+    selectedEvidence?.selected === true
+    && Number(selectedEvidence?.structuredPrice?.amount) > 0
+    && clean(selectedEvidence?.source) !== "owned_decision_section"
+    && (
+      hasExactPaidReversal
+      || ["resolved", "hypothesis"].includes(clean(group.semanticOwnership?.status))
+    )
+  );
+  const selectedIsEconomic = ["commerce_option", "free_decline", "included_entitlement"].includes(selectedEffectRole)
+    || selectedEvidence?.source === "selected_control"
+    || Boolean(transactionSelection)
+    || selectedSummaryEconomic
+    || Boolean(selectedTransition?.price)
+    || /select_paid|add_paid|purchase|upgrade|money|paid_extra/.test(lower(
+      `${selectedTransition?.semantic || ""} ${selectedTransition?.risk || ""}`
+    ));
   const paidTruth = agentContract.classifySelectedCommerceTruth({
     decisionGroupId: id,
     selectedControlId: selectedId,
@@ -523,7 +657,10 @@ function canonicalDecisionForGroup({
       ...intent,
       desiredControlIds: [...new Set([
         ...intent.desiredControlIds,
-        ...transitions.filter((item) => item.executable && explicitPaidRemoval(item)).map((item) => item.controlId)
+        ...transitions.filter((item) => item.executable && (
+          explicitPaidRemoval(item)
+          || /open_choice_control|open_surface/.test(lower(item.semantic))
+        )).map((item) => item.controlId)
       ])]
     };
   }
@@ -565,9 +702,16 @@ function canonicalDecisionForGroup({
     && clean(previousCompletion.selectedControlId) !== selectedId
   );
   const desiredSelected = intent.desiredControlIds.includes(selectedId)
-    || (intent.desiredCanonicalValue !== null
+    && intent.desiredSelected !== false
+    || (intent.desiredSelected !== false
+      && intent.desiredCanonicalValue !== null
       && selectedTransition
       && optionCount(selectedTransition) === intent.desiredCanonicalValue);
+  const selectedOptionalConsentConflict = Boolean(
+    intent.desiredSelected === false
+    && selected
+    && intent.desiredControlIds.includes(selectedId)
+  );
   const policyCompatibleSelected = desiredSelected || Boolean(
     selectedId
     && intent.match === "constraint"
@@ -605,12 +749,24 @@ function canonicalDecisionForGroup({
   const exactProfileTransitionAvailable = intent.desiredControlIds.some((controlId) => (
     transitions.some((transition) => transition.controlId === controlId && transition.executable)
   ));
+  const enabledStageExitAvailable = page.stageExit?.continueAllowed === true
+    && page.stageExit?.continueDisabled !== true;
+  const nonBlockingPageConstraint = !selected
+    && intent.match === "constraint"
+    && enabledStageExitAvailable
+    && clean(group.surfaceType || "page") === "page"
+    && clean(group.surfaceId || "surface-page") === "surface-page"
+    && !validation
+    && !evidencePaid;
   const constraintNeedsResolution = !selected
     && intent.match === "constraint"
     && (intent.desiredControlIds.length > 0 || intent.eligibleOptionIds.length > 0)
+    && !nonBlockingPageConstraint
     && (
-      required
-      || (controlType === CONTROL_TYPES.EXCLUSIVE_CHOICE && exactProfileTransitionAvailable)
+      (required && !enabledStageExitAvailable)
+      || (controlType === CONTROL_TYPES.EXCLUSIVE_CHOICE
+        && exactProfileTransitionAvailable
+        && !enabledStageExitAvailable)
       || clean(group.surfaceType || "page") !== "page"
       || page.stageExit?.continueDisabled === true
       || (
@@ -637,6 +793,15 @@ function canonicalDecisionForGroup({
     status = "pending";
     needsAction = false;
     actionReason = "owned_child_choice_pending";
+  } else if (selectedOptionalConsentConflict) {
+    status = "conflicted";
+    needsAction = true;
+    actionReason = "selected_optional_consent_conflicts_with_profile";
+    reopenEvidence = {
+      code: "OPTIONAL_CONSENT_SELECTED_WITHOUT_OPT_IN",
+      decisionGroupId: id,
+      controlId: selectedId
+    };
   } else if (paidConflict) {
     status = paidAuthorization ? "blocked" : "conflicted";
     needsAction = true;
@@ -656,6 +821,11 @@ function canonicalDecisionForGroup({
       risk: selectedTransition?.risk || "",
       ...(paidAuthorization ? { authorizationId: clean(paidAuthorization.authorizationId) } : {})
     };
+  } else if (!required && intent.desiredSelected === false && !selected) {
+    status = "waived";
+    needsAction = false;
+    actionReason = "optional_profile_default_already_satisfied";
+    completionReason = "optional_state_requires_no_resolution";
   } else if (!required && !selected && !["exact", "constraint"].includes(intent.match)) {
     // Visibility is not an obligation. Unchecked optional consent,
     // enrollment, citizenship and similar toggles remain compatible unless
@@ -705,6 +875,15 @@ function canonicalDecisionForGroup({
     status = "satisfied";
     actionReason = "optional_paid_affirmative_already_declined";
     completionReason = "policy_constraint_already_satisfied";
+  } else if (nonBlockingPageConstraint) {
+    // A no-paid constraint is a set of acceptable states, not an instruction
+    // to click a particular decline representation. An enabled canonical
+    // stage exit proves the page accepts its current state, so an inferred
+    // `required` option group cannot manufacture a redundant selection.
+    status = "waived";
+    needsAction = false;
+    actionReason = "enabled_stage_exit_proves_constraint_non_blocking";
+    completionReason = "policy_constraint_satisfied_without_selection";
   } else if (paidOnlyWithSafeForward) {
     status = "waived";
     actionReason = "constraint_does_not_require_paid_selection";
@@ -762,6 +941,8 @@ function canonicalDecisionForGroup({
     priceRisk: Object.freeze({
       selectedPaid: evidencePaid,
       observedPaidIntent: Boolean(evidencePaid && !explicitlyFree(selectedTransition || {})),
+      evidenceSource: transactionSelection ? "transaction_selection" : clean(selectedEvidence?.source),
+      transactionOwned: Boolean(transactionSelection),
       amount: selectedIsEconomic ? (selectedTransition?.price?.amount
         ?? selectedEvidence?.structuredPrice?.amount
         ?? transactionSelection?.priceAmount
@@ -826,12 +1007,21 @@ function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
   }
   if (/field|textbox|input|combobox|select/.test(shape) || control.fieldType || control.field) {
     const value = meaningfulControlValue(control);
-    const required = control.required === true || control.state?.required === true;
+    const semanticType = agentContract.canonicalProfileFieldType(
+      control.fieldType || control.field || control.semantic || control.meaning || ""
+    );
+    // Native/framework `required` is mechanical evidence, not authority to
+    // invent a user value. A canonically known profile field delegates its
+    // desired value to the Logical Field Adapter; an unknown field may only
+    // request bounded semantic grounding.
+    const required = (control.required === true || control.state?.required === true)
+      && !optionalIncentiveField(control);
+    const groundedProfileField = Boolean(semanticType);
     return Object.freeze({
       decisionId: `control:${control.controlId}`,
       subject: Object.freeze({
-        key: slug(control.fieldType || control.field || control.semantic || control.controlId),
-        label: clean(control.label || control.fieldType || control.field || "Value field"),
+        key: semanticType || "unknown",
+        label: clean(control.label || semanticType || "Value field"),
         family: "profile"
       }),
       controlType: CONTROL_TYPES.VALUE_FIELD,
@@ -843,15 +1033,77 @@ function standaloneControlDecision(control = {}, ownedControlIds = new Set()) {
       currentOutcome: value ? "value_set" : "unresolved",
       availableTransitions: Object.freeze(executable(control) ? [transitionFor(control)] : []),
       priceRisk: Object.freeze({ selectedPaid: false, amount: null, currency: "", risk: control.risk || "safe" }),
-      userIntent: Object.freeze({ match: "delegated_profile_requirement", source: "logical_field_adapter", desiredOutcome: "canonical_value", desiredCanonicalValue: null, desiredControlIds: [] }),
+      userIntent: Object.freeze(groundedProfileField
+        ? { match: "delegated_profile_requirement", source: "logical_field_adapter", desiredOutcome: "canonical_value", desiredCanonicalValue: null, desiredControlIds: [] }
+        : { match: "semantic_grounding_required", source: "semantic_grounding_required", desiredOutcome: "", desiredCanonicalValue: null, desiredControlIds: [] }),
       needsAction: Boolean(required && !value),
-      actionReason: value ? "value_present" : "logical_field_adapter_owns_desired_value",
+      actionReason: value
+        ? "value_present"
+        : groundedProfileField
+          ? "logical_field_adapter_owns_desired_value"
+          : "semantic_grounding_required",
       status: value ? "satisfied" : (required ? "active" : "stale"),
       surfaceId: clean(control.surfaceId || "surface-page"),
       observed: control
     });
   }
   return null;
+}
+
+function standaloneToggleDecision({
+  control = {},
+  ownedControlIds = new Set(),
+  page = {},
+  previousCompletions = new Map(),
+  userPolicy = {},
+  traveler = {},
+  decisionEpisode = null
+} = {}) {
+  if (!control.controlId || ownedControlIds.has(control.controlId) || explicitlyDormantRepresentation(control)) return null;
+  const shape = lower(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""} ${control.inputType || ""}`);
+  if (!/checkbox|switch|toggle/.test(shape)) return null;
+  const id = clean(control.decisionGroupId || `control:${control.controlId}`);
+  const selected = Boolean(control.selected || control.state?.checked || control.state?.selected);
+  const group = {
+    decisionGroupId: id,
+    requirementId: clean(control.requirementId || id),
+    surfaceId: clean(control.surfaceId || "surface-page"),
+    surfaceType: clean(control.surfaceType || "page"),
+    sectionId: clean(control.sectionId),
+    sectionType: clean(control.sectionType),
+    sectionLabel: clean(control.sectionLabel || control.label),
+    required: control.required === true || control.state?.required === true,
+    status: selected ? "satisfied" : "optional",
+    selectedControlId: selected ? control.controlId : "",
+    selectedLabel: selected ? clean(control.label) : "",
+    selectedEvidence: selected ? {
+      selected: true,
+      selectedControlId: control.controlId,
+      selectedLabel: clean(control.label),
+      effectRole: clean(control.effectRole || "unknown"),
+      disposition: "non_economic",
+      source: "selected_control_state",
+      semantic: clean(control.semantic),
+      risk: clean(control.risk)
+    } : null,
+    alternatives: [{
+      controlId: control.controlId,
+      label: clean(control.label),
+      semantic: clean(control.semantic),
+      effectRole: clean(control.effectRole || "unknown"),
+      risk: clean(control.risk),
+      selected
+    }],
+    alternativeControlIds: [control.controlId]
+  };
+  return canonicalDecisionForGroup({
+    group,
+    page,
+    previousCompletion: previousCompletions.get(id) || null,
+    userPolicy,
+    traveler,
+    decisionEpisode
+  });
 }
 
 function buildCanonicalDecisions({
@@ -877,9 +1129,20 @@ function buildCanonicalDecisions({
     })];
   });
   const ownedControlIds = new Set(grouped.flatMap((decision) => decision.physicalControlIds));
-  const standalone = (page.controls || [])
-    .map((control) => standaloneControlDecision(control, ownedControlIds))
-    .filter(Boolean);
+  const standalone = (page.controls || []).flatMap((control) => {
+    const toggle = standaloneToggleDecision({
+      control,
+      ownedControlIds,
+      page,
+      previousCompletions,
+      userPolicy,
+      traveler,
+      decisionEpisode
+    });
+    if (toggle) return [toggle];
+    const decision = standaloneControlDecision(control, ownedControlIds);
+    return decision ? [decision] : [];
+  });
   return Object.freeze([...grouped, ...standalone]);
 }
 

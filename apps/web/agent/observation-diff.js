@@ -166,7 +166,7 @@ function diffObservations(previousObservation = null, currentObservation = {}) {
   const targetDisappeared = targetControlId && disappeared.some((entry) => entry.controlId === targetControlId);
   const targetReacted = Boolean(
     lastResult.dispatched === true
-    && (targetChanged || targetDisappeared || surfaceChanged || progressChanged || stageChanged || urlChanged || errorsAppeared.length || errorsCleared.length)
+    && (targetChanged || targetDisappeared || surfaceChanged || progressChanged || urlChanged || errorsAppeared.length || errorsCleared.length)
   );
 
   return {

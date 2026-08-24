@@ -264,6 +264,9 @@ export function createSectionPerception(dependencies) {
           rejectHuge: true,
           noFallback: true
         }
+      )],
+      ["payment method", /select (?:a )?payment method|choose (?:a )?payment method|credit card payment|pay with/i, () => sectionAnchorByText(
+        /select (?:a )?payment method|choose (?:a )?payment method|credit card payment|pay with/i
       )]
     ];
     const seen = new Set();

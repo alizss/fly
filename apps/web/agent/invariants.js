@@ -688,7 +688,10 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
   }
   pass("SELECTED_EXTRAS_EXPLICITLY_AUTHORIZED");
 
-  const paymentLike = action.risk === "payment" || action.type === "final_review" || /payment|purchase|book_now/.test(`${action.intent || ""} ${action.targetSnapshot?.semantic || ""}`);
+  const paymentLike = action.risk === "payment"
+    || action.type === "final_review"
+    || ["enter_payment_credentials", "submit_purchase"].includes(actionEffect)
+    || /submit_purchase|confirm_purchase|purchase|book_now|pay_now/.test(`${action.intent || ""} ${action.targetSnapshot?.semantic || ""}`);
   if (paymentLike) {
     const authorization = state.approvals?.paymentAuthorization;
     if (!authorization?.authorizationId || authorization.transactionId !== state.id || authorization.singleUse !== true) {

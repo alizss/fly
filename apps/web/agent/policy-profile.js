@@ -1,5 +1,7 @@
 "use strict";
 
+const { legalAcceptanceScope } = require("../../../packages/shared/policy");
+
 const SEAT_POLICIES = Object.freeze({
   RANDOM_ASSIGNMENT: "random_assignment",
   AISLE: "aisle",
@@ -128,6 +130,7 @@ function normalizeProfilePolicy({ userPolicy = {}, traveler = {} } = {}) {
       insurance: clean(userPolicy.insurance || traveler.insurance_preference),
       extras: clean(userPolicy.extras || traveler.extras_preference),
       fare: clean(userPolicy.fare || traveler.fare_preference),
+      payment: clean(userPolicy.paymentPreference || traveler.payment_preference),
       meal: clean(userPolicy.meal || traveler.meal_preference)
     }),
     constraints: Object.freeze({
@@ -190,28 +193,13 @@ function resolveProfileDecision(decision = {}, { userPolicy = {}, traveler = {},
     subject.includes("baggage") ? policy.preferences?.baggage : "",
     subject.includes("insurance") ? policy.preferences?.insurance : "",
     subject.includes("fare") ? policy.preferences?.fare : "",
+    subject.includes("payment") ? policy.preferences?.payment : "",
     policy.preferences?.extras
   ].filter(Boolean).join(" "));
   const sources = [
     { source: "booking_specific", text: bookingSpecific },
     { source: "saved_profile", text: savedText }
   ].filter((item) => item.text);
-
-  for (const source of sources) {
-    const direct = options.filter((option) => {
-      const label = lower(option.label);
-      return label.length >= 3 && new RegExp(`(?:^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^a-z0-9])`, "i").test(source.text);
-    });
-    if (direct.length === 1) {
-      const authorization = authorizationFor({ policy, subject, decision, option: direct[0], sourceText: source.text, source: source.source });
-      if (direct[0].paid && !authorization) {
-        return resolutionResult({ match: "ambiguous", source: source.source, options: direct, reason: "A paid option is preferred but no bounded financial authorization covers it.", evidence: [source.text] });
-      }
-      return resolutionResult({ match: "exact", source: source.source, options: direct, preferred: direct[0], authorization, reason: "An exact option name matches the highest-precedence applicable instruction.", evidence: [source.text] });
-    }
-  }
-
-  const combined = lower(`${bookingSpecific} ${savedText}`);
   const family = subject.includes("seat")
     ? "seat"
     : subject.includes("baggage")
@@ -224,6 +212,97 @@ function resolveProfileDecision(decision = {}, { userPolicy = {}, traveler = {},
   const subjectNoPaid = Boolean(family) && (
     policy.constraints?.noPaidExtras || policy.constraints?.noPaidByFamily?.[family] === true
   );
+
+  for (const source of sources) {
+    const direct = options.filter((option) => {
+      const label = lower(option.label);
+      return label.length >= 3 && new RegExp(`(?:^|[^a-z0-9])${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^a-z0-9])`, "i").test(source.text);
+    });
+    if (direct.length === 1) {
+      if (subjectNoPaid && direct[0].included) {
+        // Negative safety/profile language describes an acceptable state set.
+        // It must not become a command to click a matching "No insurance" or
+        // "No extras" representation when the page already accepts no paid
+        // selection.
+        return resolutionResult({
+          match: "constraint",
+          source: policy.constraints?.noPaidExtras ? "no_paid_extras" : source.source,
+          options: direct,
+          preferred: direct[0],
+          reason: "The no-paid preference constrains the resulting state; it does not require activating this decline representation.",
+          evidence: [source.text]
+        });
+      }
+      const authorization = authorizationFor({ policy, subject, decision, option: direct[0], sourceText: source.text, source: source.source });
+      if (direct[0].paid && !authorization) {
+        return resolutionResult({ match: "ambiguous", source: source.source, options: direct, reason: "A paid option is preferred but no bounded financial authorization covers it.", evidence: [source.text] });
+      }
+      return resolutionResult({ match: "exact", source: source.source, options: direct, preferred: direct[0], authorization, reason: "An exact option name matches the highest-precedence applicable instruction.", evidence: [source.text] });
+    }
+  }
+
+  const combined = lower(`${bookingSpecific} ${savedText}`);
+  if (/legal|terms|conditions|consent|attestation/.test(subject)) {
+    const eligible = options.filter((option) => legalAcceptanceScope({
+      targetLabel: option.label,
+      targetSnapshot: {
+        label: option.label,
+        semantic: option.raw?.semantic,
+        description: option.raw?.description
+      }
+    }) === "standard_terms");
+    if (eligible.length) {
+      return resolutionResult({
+        match: "exact",
+        source: "checkout_mandate",
+        options: eligible,
+        preferred: eligible.length === 1 ? eligible[0] : null,
+        reason: "The transaction-bound Book/Pay mandate covers ordinary required booking terms.",
+        evidence: eligible.map((option) => option.label)
+      });
+    }
+    return resolutionResult({
+      match: "ambiguous",
+      source: "checkout_mandate",
+      options: [],
+      reason: "The legal choice is exceptional, bundled, or not proven to be ordinary booking terms.",
+      evidence: options.map((option) => option.label)
+    });
+  }
+  if (/payment|card|wallet/.test(subject)) {
+    const preference = lower(policy.preferences?.payment || "browser saved card");
+    const wantsWallet = /apple pay|google pay|wallet/.test(preference);
+    const eligible = options.filter((option) => {
+      const label = lower(`${option.label} ${option.raw?.semantic || ""}`);
+      return wantsWallet
+        ? /apple pay|google pay|wallet/.test(label)
+        : /credit|debit|payment card|pay by card|card payment|browser saved card|virtual card|\bvisa\b|mastercard|master card|american express|\bamex\b|\bmaestro\b|diners club|\bdiscover\b/.test(label)
+          && !/gift card|loyalty card/.test(label);
+    });
+    if (eligible.length) {
+      const equivalentCardEntryRoutes = !wantsWallet && eligible.every((option) => (
+        option.paid !== true
+        && option.raw?.physicalEffect === "reveal_control"
+      ));
+      return resolutionResult({
+        match: "exact",
+        source: "saved_profile",
+        options: eligible,
+        preferred: eligible.length === 1 || equivalentCardEntryRoutes ? eligible[0] : null,
+        reason: `Payment-method choice follows the saved profile preference: ${preference}.`,
+        evidence: [preference]
+      });
+    }
+    if (decision.required === true || decision.material === true) {
+      return resolutionResult({
+        match: "unavailable",
+        source: "saved_profile",
+        options: [],
+        reason: `No available payment method matches the saved profile preference: ${preference}.`,
+        evidence: [preference]
+      });
+    }
+  }
   const explicitSeatSkips = subject.includes("seat")
     ? options.filter((option) => /random|automatic|without|skip|no seat|no thanks/.test(lower(option.label)))
     : [];

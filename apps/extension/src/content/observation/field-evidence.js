@@ -196,6 +196,35 @@ export function createFieldEvidence({
     const activationOnly = ["A", "BUTTON"].includes(tag)
       || ["button", "link", "option"].includes(role)
       || ["button", "submit", "reset"].includes(type);
+    const profileChoiceActivator = ["combobox", "listbox"].includes(role)
+      || String(input.getAttribute?.("aria-haspopup") || "").toLowerCase() === "listbox";
+    if (profileChoiceActivator) {
+      const choiceEvidence = [
+        input.name,
+        input.id,
+        input.getAttribute?.("data-testid"),
+        autocomplete,
+        explicitLabel
+      ].filter(Boolean).join(" ");
+      const choiceMachineCandidates = [input.name, input.id, input.getAttribute?.("data-testid"), autocomplete]
+        .map(canonicalProfileFieldType)
+        .filter(Boolean);
+      const exactMachineChoice = resolveTier(
+        choiceMachineCandidates,
+        "profile_choice_machine_identity",
+        1,
+        [input.name, input.id, input.getAttribute?.("data-testid"), autocomplete].filter(Boolean).join(" ")
+      );
+      if (exactMachineChoice) return exactMachineChoice;
+      const choiceCandidates = profileFieldTypesFromText(choiceEvidence, { editable: false });
+      const resolvedChoice = resolveTier(
+        choiceCandidates,
+        "profile_choice_activator",
+        0.98,
+        choiceEvidence
+      );
+      if (resolvedChoice) return resolvedChoice;
+    }
     if (activationOnly || type === "checkbox" || role === "checkbox") {
       return result(
         "",
@@ -236,6 +265,18 @@ export function createFieldEvidence({
     ) {
       return result("given_names", "explicit_composite_label", 0.99, explicitLabel);
     }
+    const radioChoice = type === "radio" || role === "radio";
+    const rawResolution = resolveTier(
+      rawCandidates,
+      autocompleteAliases[autocomplete] ? "autocomplete_or_control_attribute" : "control_attribute",
+      0.99,
+      [input.name, input.id, input.getAttribute?.("data-testid"), autocomplete].filter(Boolean).join(" ")
+    );
+    // Value-entry controls have one machine-owned fact identity. Radios are
+    // different: their name may describe one candidate value while the tight
+    // group owner names another fact (for example name=title in a Gender
+    // group), so that direct contradiction must still fail closed below.
+    if (rawResolution && !radioChoice) return rawResolution;
     const optionCodecCandidates = (() => {
       if (!(type === "radio" || role === "radio") || !group.tight) return [];
       const titleValues = group.optionLabels.map((label) => normalizedProfileChoiceValue(label, "title"));
@@ -264,14 +305,7 @@ export function createFieldEvidence({
         }
       });
     }
-    const rawResolution = resolveTier(
-      rawCandidates,
-      autocompleteAliases[autocomplete] ? "autocomplete_or_control_attribute" : "control_attribute",
-      0.99,
-      [input.name, input.id, input.getAttribute?.("data-testid"), autocomplete].filter(Boolean).join(" ")
-    );
     if (rawResolution) return rawResolution;
-
     const directMachineResolution = resolveTier(
       profileFieldTypesFromText(directMachineText, { editable }),
       "direct_machine_evidence",

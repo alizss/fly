@@ -1,6 +1,6 @@
 # Fly — Current Codebase Engineering Handoff
 
-Last updated: 2026-08-19
+Last updated: 2026-08-23
 
 Branch: `dev`
 
@@ -8,9 +8,9 @@ Latest implementation checkpoints before this documentation update: `21b5d57` an
 
 ## 1. Mission and current boundary
 
-Fly's final product takes one Book/Pay confirmation through authorized standard terms, payment, purchase, and independently verified booking. The active engineering gate takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies saved facts and policy, verifies every material result, reconciles the final transaction, and stops at verified payment review.
+Fly's final product takes one Book/Pay confirmation through authorized standard terms, payment, purchase, and independently verified booking. The active engineering gate takes an approved selected flight and traveler through an unfamiliar airline or OTA checkout, applies the selected profile and policy, verifies every material result, reconciles the final transaction, and stops only when actual card-number, expiry, and security-code entry is visible. A payment-method selector, PAY progress label, review page, or legal-plus-Confirm surface is unfinished checkout.
 
-The current runtime must not accept legal terms, enter payment credentials, click Pay, or purchase. The long-term product adds a background runtime, web/iOS control surfaces, and a separately authorized payment boundary without replacing the checkout engine.
+The current runtime may complete standard transaction-bound legal terms, but must not guess exceptional factual declarations, enter payment credentials, click Pay, or purchase. The long-term product adds a background runtime, web/iOS control surfaces, and a separately authorized payment boundary without replacing the checkout engine.
 
 The current engineering priority is live proof of the obligation-driven core on Croatia, Lufthansa, and Wizz/Ryanair, followed by representative structural generalization. Do not add airline-specific selectors or another compiler.
 
@@ -18,13 +18,13 @@ The current engineering priority is live proof of the obligation-driven core on 
 
 | Area | Status |
 |---|---|
-| Agent unit suite | 386/386 passing |
-| Browser replay suite | 179/179 uninterrupted |
+| Agent unit suite | 407/407 passing |
+| Browser replay suite | 184/184 uninterrupted |
 | Build/type/syntax gate | `npm run check` passing |
-| Live sites | EasyJet, GoToGate, Kiwi, and Turkish reached verified payment review in the latest technical canaries |
-| Safety | No payment, card, legal, or purchase action in those review-only flows |
+| Live sites | Earlier EasyJet, GoToGate, Kiwi, and Turkish traces reached the former review boundary; each must be reclassified or rerun against actual card-entry evidence |
+| Safety | No credential, Pay, purchase, or untyped legal action in the corrected replay corpus |
 | Formal autonomous acceptance | Canary reports remain `review_required` until the operator records `--manual none` or `--manual yes` |
-| Architecture | Single semantic compiler with `CheckoutSituation/v1`, TaskState authority, direct obligation mechanics, one governed action lease, bounded recovery, compact durable state; stage is diagnostic only |
+| Architecture | Canonical control graph → one DecisionFrame → `DesiredStateDelta/v1` → TaskState authority → direct obligation mechanics → governed ActionLease → exact verification; stage is diagnostic only |
 | Main product gap | Fresh Croatia/Lufthansa/Wizz proof of obligation-driven mixed-page handling, then representative 8–10-site coverage |
 | Main performance gap | Large browser observations and rescans; unnecessary ambiguity/model turns on some sites |
 
@@ -45,6 +45,7 @@ Run `npm run canary:report -- --latest-by-site` for current evidence. A technica
 selected booking + traveler policy
 → fresh immutable ObservationFrame
 → one DecisionFrame semantic compilation
+→ minimal DesiredStateDelta compilation
 → one TaskState reduction and disposition
 → one CurrentObligation
 → mechanics-only binding
@@ -60,7 +61,8 @@ Responsibility boundaries:
 
 - Observation reports mechanics, state, ownership evidence, transaction evidence, and fresh identity.
 - DecisionFrame compiles page meaning once.
-- TaskState is the only publisher of semantic work and terminal disposition.
+- Desired State Delta is the only decision-work admission boundary: visibility, unfamiliarity, nearby totals, and satisfied optional controls cannot create work.
+- TaskState is the only scheduler/publisher of admitted semantic work and terminal disposition.
 - Mechanics binding answers only which current actuator can perform the admitted obligation.
 - The governor checks consequences immediately before dispatch.
 - Browser verification proves the mechanic; backend transition verification proves the obligation.
@@ -102,6 +104,7 @@ Controller and UI:
 
 - `apps/web/agent/authority-frames.js` — persisted/network authority frames.
 - `apps/web/agent/canonical-decision.js` — semantic DecisionFrame compilation.
+- `apps/web/agent/desired-state-delta.js` — minimal observed/profile/policy delta compilation and positive-proof admission.
 - `apps/web/agent/task-state/reducer.js` — sole TaskState reducer.
 - `apps/web/agent/current-obligation.js` — canonical current work contract.
 - `apps/web/agent/mechanics-binder.js` — direct `CurrentObligation + DecisionFrame → mechanics` path.
@@ -145,6 +148,10 @@ The extension popup now starts Fly on the active HTTP(S) checkout through `chrom
 
 A dispatched Continue remains `NAVIGATION_TRANSITION_PENDING` until material mutation or deadline. The browser repeat guard is scoped to the exact governed action lease—not DOM signature alone—so a fresh checkout stage may immediately reuse the same physical Continue control while exact duplicate dispatch remains blocked.
 
+### Desired-state delta scheduling
+
+Decision groups no longer become work merely because they remain visible. The compiler admits only a required missing state, exact profile mismatch, proven incremental-cost/transaction conflict, typed required legal work, or owned active validation. Broad ancestor price inheritance is removed; optional affirmative consent defaults off unless the profile opts in; a selected conflict verifies through `control_unselected`. If no delta exists, TaskState can schedule the executable safe stage exit.
+
 ### Runtime modularization without new authority
 
 Extension observation, execution, controller, verification, diagnostics, and UI are separate modules behind one runtime owner. Backend server, loop, and TaskState responsibilities are also split, but `runtime.js`, `loop/orchestrator.js`, and `task-state/reducer.js` remain their sole composition/authority roots.
@@ -157,11 +164,11 @@ Valid pause/stop reasons:
 
 - Missing required traveler fact.
 - Login, OTP, CAPTCHA, 3DS, bank approval, or user-only authentication.
-- Legal acceptance, payment, or purchase boundary.
+- Legal/factual authority outside the transaction-bound mandate, payment credential entry, or purchase boundary.
 - Consequential ambiguity or unauthorized price/currency/itinerary/identity change.
 - Sold-out inventory, expired session, site outage, or explicit website rejection.
 - No safe grounded mechanic after bounded distinct recovery.
-- Verified payment review under the current milestone.
+- Verified `CARD_CREDENTIAL_ENTRY_REACHED` under the current milestone.
 
 For an otherwise eligible journey, exhausted mechanics is an engineering coverage failure. Capture the trace, add the exact replay, repair the universal owner, and rerun retained canaries. Do not add an airline workflow.
 
@@ -179,12 +186,12 @@ npm run canary:report -- --latest-by-site
 Full acceptance after a material core change:
 
 1. Focused trace-derived replay passes.
-2. 386 unit tests pass.
-3. The 179-replay browser corpus has a 178/178 uninterrupted baseline plus focused Croatia PAY-boundary proof.
+2. 407 unit tests pass.
+3. All 184 browser replays pass uninterrupted, including the Croatia PaymentForm delta regression.
 4. `npm run check` and `git diff --check` pass.
-5. Discovering site reaches verified payment review or the expected typed handoff.
+5. Discovering site reaches verified card credential entry or the expected typed handoff.
 6. At least one retained canary passes.
-7. No payment/legal/card/purchase action executes.
+7. No credential/Pay/purchase or unauthorized legal action executes.
 
 ## 8. Storage and diagnostics
 
@@ -220,7 +227,7 @@ The semantic backend is usually fast; browser observation construction, 360–64
 
 ### Formal evidence gap
 
-The latest four traces technically reached payment review and passed safety, but normalized reports still show `review_required` until manual intervention is explicitly annotated. Record `--manual none` only when no human altered the airline page.
+The latest four historical traces reached the former payment-review boundary and passed safety. They are not automatically accepted under the corrected card-entry milestone. Record `--manual none` only when no human altered the airline page, and require exact card-entry evidence before promotion.
 
 ## 10. Engineering rules
 

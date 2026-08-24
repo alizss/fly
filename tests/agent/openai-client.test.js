@@ -18,6 +18,13 @@ const { reduceTaskState } = require("./task-state-replay-adapter");
 const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { plannerFailureReason } = require("../../apps/web/agent/loop/turn-result");
+
+test("planner authentication failures identify configuration instead of generic page uncertainty", () => {
+  const reason = plannerFailureReason(new Error("OpenAI checkout_candidate_selection request failed: 401 Incorrect API key provided"));
+  assert.match(reason, /API key was rejected/);
+  assert.doesNotMatch(reason, /ask the user|multiple current candidates/i);
+});
 
 function activeUnknownProfileObservation() {
   return {
@@ -438,7 +445,7 @@ test("ambiguity selection exposes blocked context but schema permits only safe c
 
     assert.equal(payload.interactionView.contractVersion, "interaction-view/v1");
     assert.equal(payload.interactionView.components.length, 2);
-    assert.equal(payload.interactionView.stage, "extras");
+    assert.equal(Object.hasOwn(payload.interactionView, "stage"), false);
     assert.deepEqual(
       payload.interactionView.components.flatMap((component) => component.actuators).map((actuator) => actuator.selectable),
       [true, false]
@@ -1162,10 +1169,10 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
       browserResult: { actionId: correctionAction.id, dispatched: true, verified: false },
       afterObservation: failedCorrection
     });
-    assert.equal(failedTransition.status, "no_effect");
+    assert.equal(failedTransition.actionOutcome.status, "REVEALED_BLOCKER");
     assert.equal(failedTransition.postcondition.satisfied, false);
     assert.equal(failedTransition.currentObligationResult.completed, false);
-    assert.equal(failedTransition.nextDirective, "try_distinct_capability");
+    assert.equal(failedTransition.nextDirective, "rebuild_task_state");
 
     const afterCorrection = {
       observationId: "obs_cross_surface_after_correction",
@@ -1368,7 +1375,7 @@ test("the existing ambiguity path resolves order summaries, custom dropdowns, an
         traveler,
         taskState: {
           stage: "extras",
-          currentGoal: { goalId: "reach_payment_review" },
+          currentGoal: { goalId: "reach_card_credential_entry" },
           activeDecisions: []
         }
       });

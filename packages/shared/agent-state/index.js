@@ -3,6 +3,7 @@
  * @property {boolean} skipPaidExtrasApproved
  * @property {boolean} paymentApproved
  * @property {boolean} legalApproved
+ * @property {boolean} standardBookingTermsApproved
  * @property {boolean} priceIncreaseApproved
  *
  * @typedef {Object} PriceSnapshot
@@ -114,7 +115,7 @@ function createCheckoutSessionState({ goal = "", travelerId = "", site = {} } = 
       updatedAt: ""
     },
     aiDecisionCache: null,
-    approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalApproved: false, priceIncreaseApproved: false },
+    approvals: { skipPaidExtrasApproved: false, paymentApproved: false, legalApproved: false, standardBookingTermsApproved: false, priceIncreaseApproved: false },
     lastAction: null,
     lastVerification: null,
     traceIds: [],

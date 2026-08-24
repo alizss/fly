@@ -265,6 +265,6 @@ test("navigation lifecycle closes on the first mechanically usable destination f
     observationReadiness: ready
   });
   assert.equal(ready.classification, READINESS.READY);
-  assert.equal(closed.transition.status, "progressed");
+  assert.equal(closed.transition.actionOutcome.status, "PROGRESSED");
   assert.equal(closed.lifecycle.closed, true);
 });

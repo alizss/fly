@@ -123,6 +123,15 @@ import {
   const choiceActuatorBindings = new Map();
   const choiceInteractionStates = new Map();
 
+  function resetAgentSessionState() {
+    canonicalSelectionCommitments.clear();
+    choiceActuatorBindings.clear();
+    choiceInteractionStates.clear();
+    agent.lastActionResult = null;
+    agent.activeExecutionActionId = "";
+    agent.activeExecutionObservationId = "";
+  }
+
   function rememberChoiceActuatorBinding(controlId = "", actuator = null, decision = {}) {
     const canonicalControlId = String(controlId || decision.controlId || "").trim();
     if (!canonicalControlId || !actuator || !isVisible(actuator)) return null;
@@ -276,6 +285,7 @@ import {
     implicitRole,
     buttonText,
     labelText,
+    ownedGraphicControlName,
     isDisabledLike,
     isVisible,
     liveSectionForElement,
@@ -308,8 +318,6 @@ import {
     buildStageExit,
     buildAuthoritativeStageExit
   } = createStageExitCompiler({
-    meaningfulActionBox,
-    controlMemberNodeIds,
     unfilledRequiredFields,
     actionableCheckoutErrors
   });
@@ -394,16 +402,27 @@ import {
   async function saveResumeMarker() {
     try {
       if (!agent.running || !agent.sessionId) {
-        await chrome.storage.local.remove(RESUME_KEY);
+        await clearResumeMarker();
         return;
       }
+      const context = await readCheckoutContext();
+      const marker = {
+        checkoutLineageId: String(context?.checkoutLineageId || ""),
+        travelerId: selectedTravelerId,
+        sessionId: agent.sessionId,
+        skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
+        navigationUrl: currentNavigationUrl()
+      };
+      const response = await chrome.runtime.sendMessage({
+        type: "ATW_CHECKOUT_RESUME_SAVE",
+        marker
+      }).catch(() => null);
+      if (response?.ok === true) return;
+      // Compatibility for test harnesses or an older background worker.
       await chrome.storage.local.set({
         [RESUME_KEY]: {
+          ...marker,
           tabContextId: await tabContextId(),
-          travelerId: selectedTravelerId,
-          sessionId: agent.sessionId,
-          skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
-          navigationUrl: currentNavigationUrl(),
           savedAt: Date.now()
         }
       });
@@ -414,15 +433,49 @@ import {
 
   async function clearResumeMarker() {
     try {
-      await chrome.storage.local.remove(RESUME_KEY);
+      const context = await readCheckoutContext();
+      const response = await chrome.runtime.sendMessage({
+        type: "ATW_CHECKOUT_RESUME_CLEAR",
+        expected: {
+          checkoutLineageId: String(context?.checkoutLineageId || ""),
+          sessionId: String(agent.sessionId || "")
+        }
+      }).catch(() => null);
+      if (response?.ok === true) return response.cleared === true;
+      const contextId = await tabContextId();
+      const stored = await chrome.storage.local.get(RESUME_KEY);
+      const marker = stored?.[RESUME_KEY] || null;
+      const ownsMarker = marker && (
+        (agent.sessionId && String(marker.sessionId || "") === String(agent.sessionId))
+        || (!agent.sessionId && String(marker.tabContextId || "") === String(contextId))
+      ) && (
+        !context?.checkoutLineageId
+        || !marker.checkoutLineageId
+        || String(marker.checkoutLineageId) === String(context.checkoutLineageId)
+      );
+      if (ownsMarker) await chrome.storage.local.remove(RESUME_KEY);
+      return Boolean(ownsMarker);
     } catch (error) {
       // ignore
     }
   }
 
   async function readResumeMarker() {
+    const response = await chrome.runtime.sendMessage({
+      type: "ATW_CHECKOUT_RESUME_CLAIM"
+    }).catch(() => null);
+    if (response?.ok === true) return response.marker || null;
     const stored = await chrome.storage.local.get(RESUME_KEY);
-    return stored?.[RESUME_KEY] || null;
+    const marker = stored?.[RESUME_KEY] || null;
+    if (!marker) return null;
+    const [context, contextId] = await Promise.all([readCheckoutContext(), tabContextId()]);
+    const sameLineage = Boolean(
+      context?.checkoutLineageId
+      && marker.checkoutLineageId
+      && String(context.checkoutLineageId) === String(marker.checkoutLineageId)
+    );
+    const legacySameTab = !marker.checkoutLineageId && String(marker.tabContextId || "") === String(contextId);
+    return sameLineage || legacySameTab ? { ...marker, tabContextId: contextId } : null;
   }
 
   async function fetchData() {
@@ -584,7 +637,24 @@ import {
   }
 
   function isPaymentField(input) {
-    const text = labelText(input);
+    if (!input) return false;
+    if (input.matches?.("button, a, input[type='button'], input[type='submit'], [role='button'], [role='link']")) {
+      if (!AGENT_CONTRACT?.isPaymentCommitText?.(actionElementLabel(input))) return false;
+      const owner = input.closest?.("form, section, [role='region'], main") || document;
+      const credentialKinds = new Set();
+      queryAllDeep("input, textarea", owner)
+        .filter(isVisible)
+        .forEach((field) => {
+          const descriptor = `${labelText(field)} ${field.getAttribute?.("name") || ""} ${field.getAttribute?.("autocomplete") || ""} ${field.getAttribute?.("placeholder") || ""}`.toLowerCase();
+          if (/card.?number|cc-number/.test(descriptor)) credentialKinds.add("card_number");
+          if (/expir|expiration|valid.?through|cc-exp/.test(descriptor)) credentialKinds.add("card_expiry");
+          if (/\bcvc\b|\bcvv\b|security.?code|cc-csc/.test(descriptor)) credentialKinds.add("card_security_code");
+        });
+      return ["card_number", "card_expiry", "card_security_code"]
+        .every((kind) => credentialKinds.has(kind));
+    }
+    if (!input.matches?.("input, select, textarea, [role='textbox']")) return false;
+    const text = String(labelText(input) || "").toLowerCase();
     return input.type === "password" || PAYMENT_TERMS.some((term) => text.includes(term));
   }
 
@@ -867,6 +937,30 @@ import {
     // progress is evaluated by TaskState after the fresh observation, so the
     // result can never claim verified=true while postconditionSatisfied=false.
     const postconditionSatisfied = Boolean(verification.ok);
+    const validationDetails = [
+      ...(verification.evidence?.validationIssues || []),
+      ...(verification.evidence?.errors || []),
+      ...(verification.evidence?.blockers || [])
+    ].map((issue, index) => typeof issue === "string"
+      ? { issueId: `browser-validation-${index + 1}`, message: issue }
+      : issue).filter(Boolean);
+    const browserActionOutcome = AGENT_CONTRACT?.compileActionOutcome?.({
+      status: feedback.validationAppeared === true || validationDetails.length
+        ? AGENT_CONTRACT.ACTION_OUTCOME.REVEALED_BLOCKER
+        : verification.ok
+          ? AGENT_CONTRACT.ACTION_OUTCOME.SATISFIED
+          : pageChanged
+            ? AGENT_CONTRACT.ACTION_OUTCOME.PROGRESSED
+            : AGENT_CONTRACT.ACTION_OUTCOME.NO_EFFECT,
+      causedByActionId: actionId,
+      originalSuccessContract: expectedOutcome,
+      introducedValidation: validationDetails,
+      candidateOwnerControlIds: validationDetails.map((issue) => issue?.controlId),
+      surfaceChanged: feedback.surfaceChanged === true,
+      urlChanged: feedback.navigationOccurred === true,
+      progressChanged: feedback.progressChanged === true,
+      priceChanged: feedback.priceChanged === true
+    }) || null;
     const result = {
       at: new Date().toISOString(),
       actionId,
@@ -897,6 +991,7 @@ import {
       resultObservationHash: String(verification.evidence?.afterObservationHash || ""),
       executed: true,
       verified: Boolean(verification.ok),
+      actionOutcome: browserActionOutcome,
       action: {
         id: decision.actionId || decision.id || actionId,
         action: decision.action || "",
@@ -946,6 +1041,7 @@ import {
 
   function rememberUnexecutedActionResult(actionId, observationId, decision = {}, outcome = {}) {
     const mechanicallyAttempted = outcome.dispatched === true || outcome.executed === true;
+    const freshnessSuperseded = outcome.superseded === true;
     const result = {
       at: new Date().toISOString(),
       actionId,
@@ -972,9 +1068,20 @@ import {
       expectedOutcomeObserved: false,
       postconditionSatisfied: false,
       failureCode: String(outcome.code || "ACTION_NOT_DISPATCHED"),
+      superseded: freshnessSuperseded,
       resultObservationHash: String(outcome.resultObservationHash || ""),
       executed: mechanicallyAttempted,
       verified: false,
+      // Freshness supersession is not an action outcome: no actuator reached
+      // the page, so it cannot prove NO_EFFECT or consume a strategy. Genuine
+      // pre-dispatch failures still receive the single-use NO_EFFECT outcome.
+      actionOutcome: freshnessSuperseded
+        ? null
+        : AGENT_CONTRACT?.compileActionOutcome?.({
+            status: AGENT_CONTRACT.ACTION_OUTCOME.NO_EFFECT,
+            causedByActionId: actionId,
+            originalSuccessContract: decision.expectedOutcome || null
+          }) || null,
       action: {
         id: decision.actionId || decision.id || actionId,
         action: decision.action || "",
@@ -1144,6 +1251,43 @@ import {
     ].filter(Boolean).join(" ");
   }
 
+  function ownedGraphicControlName(element) {
+    if (!element) return "";
+    const role = implicitRole(element);
+    const tag = String(element.tagName || "").toLowerCase();
+    const type = String(element.getAttribute?.("type") || "").toLowerCase();
+    const commandLike = /^(?:a|button)$/.test(tag)
+      || /^(?:button|link)$/.test(String(role || ""))
+      || /^(?:button|submit|reset|image)$/.test(type);
+    if (!commandLike) return "";
+    const assetName = (value = "") => {
+      const raw = String(value || "").trim();
+      if (!raw || /^data:/i.test(raw)) return "";
+      let basename = raw.split(/[?#]/)[0].split("/").pop() || "";
+      try { basename = decodeURIComponent(basename); } catch (_) { /* keep the stable raw basename */ }
+      const normalized = basename
+        .replace(/\.(?:avif|gif|jpe?g|png|svg|webp)$/i, "")
+        .replace(/[-_.]+/g, " ")
+        .replace(/\b(?:icon|image|img|logo|mark)\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!/[a-z]{2}/i.test(normalized) || /^(?:asset|payment|method|card)$/i.test(normalized)) return "";
+      if (/^[a-f\d]{12,}$/i.test(normalized.replace(/\s+/g, ""))) return "";
+      return normalized.replace(/\b[a-z]/g, (character) => character.toUpperCase());
+    };
+    const names = queryAllDeep("img, svg title, svg use", element)
+      .flatMap((graphic) => [
+        graphic.getAttribute?.("alt"),
+        graphic.getAttribute?.("title"),
+        String(graphic.tagName || "").toLowerCase() === "title" ? graphic.textContent : "",
+        assetName(graphic.getAttribute?.("src") || graphic.getAttribute?.("href") || graphic.getAttribute?.("xlink:href"))
+      ])
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim())
+      .filter((value) => value && !/^(?:image|icon|logo)$/i.test(value))
+      .filter((value, index, list) => list.findIndex((item) => item.toLowerCase() === value.toLowerCase()) === index);
+    return compactText(names.join(" "), 220);
+  }
+
   function directControlName(element) {
     if (!element) return "";
     const role = implicitRole(element);
@@ -1155,6 +1299,7 @@ import {
       labelledBy,
       element.getAttribute?.("alt"),
       element.getAttribute?.("title"),
+      ownedGraphicControlName(element),
       /button|submit|reset/.test(type) ? element.value : "",
       tag === "button" || role === "button" ? (element.innerText || element.textContent || "") : "",
       tag === "option" || role === "option" ? (element.innerText || element.textContent || "") : ""
@@ -1172,7 +1317,7 @@ import {
     const role = implicitRole(element);
     const tag = String(element.tagName || "").toLowerCase();
     if (!/button|option|link/.test(`${role} ${tag}`)) return "";
-    return compactText(element.innerText || element.textContent || "", 220);
+    return compactText(element.innerText || element.textContent || ownedGraphicControlName(element) || "", 220);
   }
 
   function controlOwnedEvidence(element) {
@@ -1190,10 +1335,13 @@ import {
       ));
     return {
       testId: compactText(element?.getAttribute?.("data-testid") || element?.getAttribute?.("data-test-id") || element?.getAttribute?.("data-test") || "", 160),
+      id: compactText(element?.getAttribute?.("id") || "", 160),
+      name: compactText(element?.getAttribute?.("name") || "", 160),
       formAction: compactText(element?.getAttribute?.("formaction") || form?.getAttribute?.("action") || "", 300),
       formMethod: compactText(element?.getAttribute?.("formmethod") || form?.getAttribute?.("method") || "", 40).toLowerCase(),
       formId: compactText(form?.getAttribute?.("id") || form?.getAttribute?.("name") || "", 160),
       ownText: controlOwnedText(element),
+      graphicName: ownedGraphicControlName(element),
       ariaLabel: compactText(element?.getAttribute?.("aria-label") || "", 220),
       title: compactText(element?.getAttribute?.("title") || "", 220),
       tagName: String(element?.tagName || "").toLowerCase(),
@@ -1205,21 +1353,39 @@ import {
         : "",
       ariaHasPopup: compactText(element?.getAttribute?.("aria-haspopup") || "", 40).toLowerCase(),
       controlsInformationOnly,
-      iconOnly: Boolean(element?.querySelector?.("svg, [class*='icon'], [data-icon]") && !controlOwnedText(element))
+      iconOnly: Boolean(element?.querySelector?.("img, svg, [class*='icon'], [data-icon]") && !(element.innerText || element.textContent || "").trim())
     };
   }
 
   function resolveOwnedControlMeaning(evidence = {}, fallbackSemantic = "", surfaceType = "page") {
-    const identity = `${evidence.testId || ""} ${evidence.formId || ""} ${evidence.formAction || ""}`.trim().toLowerCase();
+    const ownIdentity = `${evidence.testId || ""} ${evidence.id || ""} ${evidence.name || ""}`.trim().toLowerCase();
+    const identity = `${ownIdentity} ${evidence.formId || ""} ${evidence.formAction || ""}`.trim().toLowerCase();
     const ownMeaning = `${evidence.ownText || ""} ${evidence.title || ""}`.trim().toLowerCase();
     const accessibleHint = String(evidence.ariaLabel || "").trim().toLowerCase();
-    const strongDismiss = /(?:^|[-_])(dialog|modal|seatmap)?[-_]?close(?:$|[-_])|dismiss|close-button/.test(identity)
+    const commandLike = /^(?:a|button)$/.test(String(evidence.tagName || ""))
+      || /^(?:button|link)$/.test(String(evidence.role || ""))
+      || /^(?:button|submit|reset)$/.test(String(evidence.type || ""));
+    const commandIdentity = `${ownIdentity} ${ownMeaning} ${accessibleHint}`.trim();
+    const semanticBlocksAdvance = /(?:selection_cta|add_paid_extra|select_paid_option|decline_paid_extra|decline_baggage|safe_decline|select_free_option)/.test(
+      String(fallbackSemantic || "")
+    );
+    const purchaseCommit = commandLike && (
+      /(?:^|[-_])(?:paynow|booknow|purchase|placeorder|submitpayment|completebooking)(?:$|[-_])/.test(ownIdentity)
+      || /^(?:pay(?: now| securely)?|book now|purchase|place order|submit (?:payment|purchase)|complete (?:booking|purchase)|confirm (?:and pay|booking|payment))(?:\s|$)/.test(ownMeaning)
+    );
+    const strongDismiss = /(?:^|[-_])(dialog|modal|seatmap)?[-_]?close(?:$|[-_])|dismiss|close-button/.test(ownIdentity)
       || /^(close|dismiss)( window| dialog| modal)?$/.test(ownMeaning)
       || (evidence.iconOnly && /^(close|dismiss|x)$/.test(accessibleHint));
-    const strongAdvance = /submit|continue|proceed|next|saveandcontinue|payment/.test(identity)
-      || evidence.type === "submit"
-      || /^(continue|next|proceed|submit)( to payment)?$/.test(ownMeaning);
-    const strongOpen = /edit|change|open/.test(identity)
+    // A form action belongs to the form submission command, not to every
+    // textbox, radio and checkbox contained by the form. Inheriting a URL
+    // such as /PaymentForm made every child look like checkout navigation.
+    const strongAdvance = commandLike && !purchaseCommit && !semanticBlocksAdvance && (
+      /submit|continue|proceed|next|saveandcontinue/.test(commandIdentity)
+      || /^(continue|next|proceed|submit)( to payment)?$/.test(ownMeaning)
+      || /^(confirm|review and confirm)$/.test(ownMeaning)
+      || /^(?:finish|complete) (?:configuration|selection|choices?|options?)$/.test(ownMeaning)
+    );
+    const strongOpen = /edit|change|open/.test(ownIdentity)
       || /^(edit|change|open)\b/.test(ownMeaning);
     const choiceControl = /radio|checkbox|option/.test(`${evidence.role || ""} ${evidence.type || ""}`);
     const informationDisclosure = evidence.controlsInformationOnly === true
@@ -1235,10 +1401,11 @@ import {
     // Conflicting structural identities are not guessed. A misleading ARIA
     // label alone is contextual evidence and cannot overwrite test-id/form/
     // own-text identity (for example an icon X labelled by its parent CTA).
-    if (strongDismiss && (evidence.type === "submit" || /submit|payment/.test(identity))) {
+    if (strongDismiss && (evidence.type === "submit" || /submit/.test(commandIdentity))) {
       return { semantic: "unknown", physicalEffect: "unknown", conflict: true };
     }
     if (strongDismiss) return { semantic: "dismiss_surface", physicalEffect: "dismiss_surface", conflict: false };
+    if (purchaseCommit) return { semantic: "submit_purchase", physicalEffect: "submit_purchase", conflict: false };
     if (informationDisclosure) return { semantic: "reveal_information", physicalEffect: "open_surface", conflict: false };
     if (strongOpen) return { semantic: "open_surface", physicalEffect: "open_surface", conflict: false };
     if (strongAdvance) {
@@ -1443,6 +1610,7 @@ import {
     surfaceLooksLikeSeatSkip: (...args) => surfaceLooksLikeSeatSkip(...args)
   });
   const NON_ECONOMIC_EFFECT_ROLES = logicalControlCompiler.NON_ECONOMIC_EFFECT_ROLES;
+  const ECONOMIC_EFFECT_ROLES = logicalControlCompiler.ECONOMIC_EFFECT_ROLES;
 
   const {
     applyControlToModel,
@@ -1468,6 +1636,7 @@ import {
     reconcileExclusiveDecisionControlOwnership
   } = createDecisionGroupCompiler({
     NON_ECONOMIC_EFFECT_ROLES,
+    ECONOMIC_EFFECT_ROLES,
     canonicalDecisionEffectRole,
     canonicalProfileFieldType,
     canonicalSelectionCommitments,
@@ -1719,6 +1888,17 @@ import {
     if (terminalEvidence?.boundaryObserved === true) return result("payment", 0.99, ["terminal_evidence_contract"]);
     if (confirmationEvidence) return result("confirmation", 0.95, ["confirmation_copy"]);
     if (paymentFormEvidence) return result("payment", 0.95, ["payment_controls_copy"]);
+    const structuredPaymentContext = evidence.structuralEvidence.paymentHeadingPresent === true
+      && [
+        evidence.structuralEvidence.payControlPresent,
+        evidence.structuralEvidence.paymentReviewConfirmPresent,
+        evidence.structuralEvidence.reviewSummaryPresent,
+        evidence.structuralEvidence.legalAcceptancePresent,
+        evidence.structuralEvidence.paymentMethodPresent
+      ].some(Boolean);
+    if (structuredPaymentContext) {
+      return result("payment", 0.93, ["payment_heading", "owned_payment_context"]);
+    }
     // The active destination route outranks checkout-progress links retained
     // in the page shell. A hold-bag page commonly contains a visible "Seat
     // selection" breadcrumb, but that is navigation history, not page state.
@@ -1731,6 +1911,12 @@ import {
     if (travelerEvidence) return result("traveler_information", 0.8, ["traveler_copy"]);
     if (seatEvidence) return result("seats", 0.8, ["seat_copy"]);
     if (extrasEvidence) return result("extras", 0.7, ["extras_copy"]);
+    // Currency/method preparation is diagnostically part of payment, but it
+    // remains unfinished until the separate card-entry capability contract
+    // observes actual credential controls.
+    if (evidence.structuralEvidence.progressivePaymentEntryPresent === true) {
+      return result("payment", 0.7, ["progressive_payment_context"]);
+    }
     if (paymentRouteEvidence) return result("payment", 0.6, ["route_path"]);
     if (flightSelectionEvidence) return result("flight_selection", 0.6, ["flight_selection_copy"]);
     return result("unknown", 0.2, []);
@@ -1781,8 +1967,7 @@ import {
       .join(" ")
       .slice(0, 500);
     const normalized = String(fullText || "").replace(/\s+/g, " ");
-    const activePaymentProgress = /\bpayment\b|\bpay\b/i.test(activeProgressText)
-      || /\bcurrent\s+step\s+pay\b|(?:^|\s)3\.\s*pay(?:\s+pay)?(?:\s|$)/i.test(normalized);
+    const activePaymentProgress = /\bpayment\b|\bpay\b/i.test(activeProgressText);
     const paymentRoute = /(?:^|\/)payments?(?:\/|$)/i.test(String(location.pathname || ""));
     const visiblePaymentOwners = queryAllDeep([
       "main",
@@ -1812,16 +1997,22 @@ import {
     visiblePaymentOwners.forEach((owner) => owner.kinds.forEach((kind) => paymentCredentialLabelKinds.add(kind)));
     const visibleHostedPaymentFrames = queryAllDeep("iframe")
       .filter((frame) => isVisible(frame) && !frame.closest("#atw-sidebar"))
-      .filter((frame) => /payment|card|checkout|secure|adyen|stripe|braintree|worldpay/i.test([
-        frame.title,
-        frame.name,
-        frame.getAttribute("aria-label"),
-        frame.getAttribute("src")
-      ].filter(Boolean).join(" ")));
+      .map((frame) => ({
+        frame,
+        descriptor: [
+          frame.title,
+          frame.name,
+          frame.getAttribute("aria-label"),
+          frame.getAttribute("src")
+        ].filter(Boolean).join(" ")
+      }))
+      .filter(({ descriptor }) => /payment|card|checkout|secure|adyen|stripe|braintree|worldpay/i.test(descriptor));
     const paymentOwnerPresent = visiblePaymentOwners.length > 0;
     const hostedPaymentWidgetPresent = visibleHostedPaymentFrames.length > 0 && (
       paymentOwnerPresent || activePaymentProgress || paymentRoute
     );
+    const hostedCardEntryPresent = hostedPaymentWidgetPresent
+      && visibleHostedPaymentFrames.some(({ descriptor }) => /card|credit|debit|card[-_ ]?number|cc-number/i.test(descriptor));
     const visibleFromToItinerary = /\bFROM\s+[\p{L} .'’-]{1,60}\s*\([A-Z]{3}\).{0,120}\bTO\s+[\p{L} .'’-]{1,60}\s*\([A-Z]{3}\)/iu.test(normalized);
     const visiblePaymentCurrencyPrompt = /\b(?:which|choose|select)\s+(?:the\s+)?currency\b.{0,100}\bpayment\b|\bpayment\b.{0,100}\bcurrency\b/i.test(normalized);
     const visibleExactCurrencyTotal = /\b(?:EUR|USD|GBP|CHF|CAD|AUD)\s*\d+(?:[.,]\d{1,2})\b|\b\d+(?:[.,]\d{1,2})\s*(?:EUR|USD|GBP|CHF|CAD|AUD)\b/i.test(normalized);
@@ -1832,6 +2023,7 @@ import {
       ...(credentialKinds.size ? ["visible_native_payment_credentials"] : []),
       ...(paymentOwnerPresent ? ["visible_owned_payment_labels"] : []),
       ...(hostedPaymentWidgetPresent ? ["visible_hosted_payment_widget"] : []),
+      ...(hostedCardEntryPresent ? ["visible_hosted_card_entry"] : []),
       ...(activePaymentProgress ? ["active_payment_progress"] : []),
       ...(paymentRoute ? ["payment_route"] : []),
       ...(progressivePaymentEntryPresent ? ["visible_progressive_payment_entry"] : [])
@@ -1839,12 +2031,15 @@ import {
     return {
       paymentCredentialKinds: [...credentialKinds],
       paymentCredentialCount: credentialKinds.size,
-      paymentFormPresent: credentialKinds.size >= 2,
-      paymentCredentialProbeState: credentialKinds.size >= 2 ? "observed_present" : "unknown",
+      paymentFormPresent: ["card_number", "card_expiry", "card_security_code"]
+        .every((kind) => credentialKinds.has(kind)),
+      paymentCredentialProbeState: ["card_number", "card_expiry", "card_security_code"]
+        .every((kind) => credentialKinds.has(kind)) ? "observed_present" : "unknown",
       paymentCredentialLabelKinds: [...paymentCredentialLabelKinds],
       paymentOwnerPresent,
       paymentOwnerProbeState: paymentOwnerPresent ? "observed_present" : "unknown",
       hostedPaymentWidgetPresent,
+      hostedCardEntryPresent,
       visibleTextFallbackAllowed: paymentOwnerPresent,
       paymentMethodPresent: /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/i.test(normalized),
       payControlPresent,
@@ -2371,6 +2566,7 @@ import {
     validationLifecycle,
     actionableCheckoutErrors,
     hasActiveActionAttempt: () => Boolean(agent.activeExecutionActionId),
+    activeActionAttemptId: () => agent.activeExecutionActionId || "",
     logFlow,
     sleep,
     onMaterialMutation: (timestamp) => {
@@ -2593,7 +2789,7 @@ import {
 
   function collectValidationIssues(pageText, fields = [], controls = [], sections = [], activeSurface = {}) {
     const step = classifyStep(pageText);
-    if (["extras", "seats", "payment", "confirmation"].includes(step)) {
+    if (step === "confirmation") {
       return [];
     }
     const issues = [];
@@ -2686,9 +2882,28 @@ import {
           .filter((entry) => entry.distance < 260)
           .sort((left, right) => left.distance - right.distance)[0]?.field || null;
       }
-      const control = nearestField
+      let control = nearestField
         ? controls.find((item) => item.controlId === nearestField.controlId || item.stateElementId === nearestField.id)
         : null;
+      if (!control && !logicalGroupOwned) {
+        const ownershipRoot = semanticSectionElement || containingSection?.element || surfaceElement || document.body;
+        const unresolvedRequiredAttestations = controls.filter((item) => {
+          if (!(item.state?.required === true
+            || item.choiceContract?.required === true
+            || (item.required === true && item.semantic === "legal_acceptance"))
+            || item.representationLifecycle?.active === false) return false;
+          if (!/checkbox|radio/.test(`${item.role || ""} ${item.kind || ""}`.toLowerCase())) return false;
+          if (item.selected || item.state?.checked || item.state?.selected) return false;
+          const stateElement = elementById(item.stateElementId);
+          return Boolean(stateElement && ownershipRoot?.contains?.(stateElement) && isVisible(stateElement));
+        });
+        // Unique structural ownership is stronger than guessing from error
+        // prose. It covers inline summaries such as "1 error" next to one
+        // unchecked required attestation on unfamiliar checkout pages.
+        if (unresolvedRequiredAttestations.length === 1) {
+          control = unresolvedRequiredAttestations[0];
+        }
+      }
       const stageWide = !control && !containingSection && !inSurface && Boolean(
         element.matches?.("[role='alert'], [aria-live='assertive']")
         || /error-summary|validation-summary|alert-banner|error-banner/i.test(element.className || "")
@@ -3368,6 +3583,7 @@ import {
     pushVerificationLedger,
     repeatGuardFor,
     settleExactChoiceOutcome,
+    shouldHoldDispatchedStageExit,
     verificationFromSurfaceFeedback,
     visibleValidationElement
   } = createExecutionOrchestrator({
@@ -3498,6 +3714,7 @@ import {
     rememberPagePlan,
     renderSidebar: (...args) => renderSidebar(...args),
     requestAgentDecision,
+    resetAgentSessionState,
     resetAgentLoopLifecycle,
     resetFieldProgress,
     runRiskChecks,
@@ -3589,6 +3806,9 @@ import {
   if (window.__ATW_ENABLE_TEST_HOOKS__ === true) {
     window.__ATW_TEST__ = Object.freeze({
       buildPageMap,
+      compileDecisionGroupsForTest: (sections = [], controls = [], surface = {}) => (
+        buildCanonicalDecisionGroups(sections, controls, surface)
+      ),
       buildCanonicalAliasIndex,
       beginAgentLoop,
       finishAgentLoop,
@@ -3708,6 +3928,7 @@ import {
       settleTrustedChoiceInteraction,
       settleExactChoiceOutcome,
       holdDispatchedStageExit,
+      shouldHoldDispatchedStageExit,
       choiceEpisodeEvidence,
       compactChoiceCommitEvidence,
       structuredPriceFromText,
@@ -3743,7 +3964,11 @@ import {
       selectedTravelerId = resumeMarker.travelerId;
       resumeCheckoutAfterNavigation(resumeMarker);
     } else {
-      if (resumeMarker) await clearResumeMarker();
+      // A content script in a newly opened checkout tab must not delete a
+      // marker owned by its opener. The background worker migrates that
+      // marker across a proven opener handoff before resuming the session.
+      // Only the owning tab may clear its own expired marker.
+      if (resumeMarker && resumeMarker.tabContextId === currentTabContextId) await clearResumeMarker();
       renderSidebar();
     }
     if (explicitStartRequested && !agent.running) await executeExplicitStart();

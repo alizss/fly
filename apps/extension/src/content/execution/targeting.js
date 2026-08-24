@@ -27,7 +27,6 @@ export function createTargeting(dependencies) {
     liveSectionForElement,
     logFlow,
     lookupControlForElement,
-    meaningfulActionBox,
     normalizeMatchText,
     semanticChoiceType,
     stableHash,
@@ -672,13 +671,15 @@ export function createTargeting(dependencies) {
       }
       return true;
     };
+    // These are exact canonical members whose current operation capability
+    // already carries visibility, hit-test, and targetability proof. Generic
+    // CTA minimum dimensions do not apply to native radios and checkboxes.
     const controlTarget = candidateIds
       .map((id) => elementById(id))
       .find((element) => element
         && isVisible(element)
         && !isDisabledLike(element)
-        && operationCompatible(element)
-        && (!["click", "scroll"].includes(decision.action) || meaningfulActionBox(elementBox(element))));
+        && operationCompatible(element));
 
     if (controlTarget) {
       logFlow("target.resolve", {

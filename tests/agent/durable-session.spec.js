@@ -651,15 +651,17 @@ test("authoritative terminal evidence survives HTTP compaction without payment c
         controls: [],
         decisionGroups: [],
         terminalEvidence: {
-          contractVersion: "terminal-evidence/v1",
-          stage: "payment_review",
+          contractVersion: "terminal-evidence/v2",
+          stage: "card_credential_entry",
           signals: { route: true, progress: true, form: true, method: true, commit: false, legal: false, review: true, heading: true },
           signalStates: { route: "present", progress: "present", form: "present", method: "present", commit: "unknown", legal: "unknown", review: "present", heading: "present" },
           signalCount: 6,
           boundaryObserved: true,
           verified: true,
+          cardCredentialEntryObserved: true,
+          hostedCardEntryPresent: true,
           evidenceOnly: true,
-          paymentCredentialKinds: ["card_number", "card_expiry", "card_security_code"],
+          paymentCredentialKinds: [],
           evidenceSources: ["visible_owned_payment_labels", "visible_hosted_payment_widget", "active_payment_progress"],
           capabilities: { paymentActionsAllowed: false }
         }
@@ -670,12 +672,18 @@ test("authoritative terminal evidence survives HTTP compaction without payment c
   expect(response.status(), JSON.stringify(body)).toBe(200);
   expect(body.debug.paymentEvidence).toMatchObject({
     boundaryObserved: true,
-    contractVersion: "terminal-evidence/v1",
+    contractVersion: "terminal-evidence/v2",
     signals: { route: true, progress: true, form: true, method: true, review: true },
-    paymentActionsAllowed: false
+    paymentActionsAllowed: false,
+    boundary: {
+      observed: true,
+      hostedCardEntryPresent: true
+    }
   });
   expect(body.debug.stageDecisionEvidence.terminalEvidence).toMatchObject({
     boundaryObserved: true,
+    cardCredentialEntryObserved: true,
+    hostedCardEntryPresent: true,
     evidenceOnly: true,
     evidenceSources: expect.arrayContaining([
       "visible_owned_payment_labels",

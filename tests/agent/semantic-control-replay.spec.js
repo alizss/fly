@@ -119,6 +119,41 @@ async function loadProducer(page, sourcePath = fixturePath) {
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
 }
 
+test("compact action transport keeps success codes out of failureCode", async ({ page }) => {
+  await loadProducer(page);
+  const transported = await page.evaluate(() => window.__ATW_TEST__.compactActionResultForTransport({
+    actionId: "act_kiwi_given_names_transport",
+    observationId: "obs_kiwi_given_names_transport",
+    dispatched: true,
+    executed: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "",
+    expectedOutcome: {
+      type: "normalized_value_changed",
+      controlId: "ctrl_field_kiwi_given_names",
+      expectedNormalizedValue: "ali"
+    },
+    outcome: {
+      ok: true,
+      code: "NORMALIZED_VALUE_VERIFIED",
+      message: "The canonical control retained the expected normalized value."
+    },
+    // Force the bounded/minimal transport path used by large real pages.
+    oversizedDiagnostic: Array.from({ length: 60 }, (_, index) => `${index}:${"x".repeat(2_000)}`)
+  }));
+
+  expect(transported.failureCode).toBe("");
+  expect(transported.outcome).toMatchObject({
+    ok: true,
+    code: "NORMALIZED_VALUE_VERIFIED"
+  });
+  expect(transported.verified).toBe(true);
+  expect(transported.expectedOutcomeObserved).toBe(true);
+  expect(transported.postconditionSatisfied).toBe(true);
+});
+
 async function installBootChrome(page, initialStorage = {}, tabId = 42) {
   await page.evaluate(({ stored, contextTabId }) => {
     window.__ATW_BOOT_STORAGE__ = { ...stored };
@@ -389,7 +424,7 @@ test("an app-supplied tab-scoped SelectedBooking starts on a passenger page with
   expect(await page.evaluate(() => window.__ATW_BOOT_STORAGE__["atwSelectedBookingAcquisitionV1:42"] || null)).toBeNull();
 });
 
-test("a resume marker from another tab cannot activate observation", async ({ page }) => {
+test("a resume marker from another tab cannot activate observation or be deleted by that tab", async ({ page }) => {
   await page.route("https://resume-scope.test/**", async (route) => {
     await route.fulfill({ status: 200, contentType: "text/html", body: "<main><h1>Passenger details</h1></main>" });
   });
@@ -418,13 +453,168 @@ test("a resume marker from another tab cannot activate observation", async ({ pa
   }, 42);
   await page.addScriptTag({ path: contentScriptPath });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
-  await page.waitForFunction(() => !window.__ATW_BOOT_STORAGE__.atwAgentResume);
   const state = await page.evaluate(() => ({
     update: window.__ATW_TEST__.pageStateStoreState().lastUpdate,
     marker: window.__ATW_BOOT_STORAGE__.atwAgentResume || null
   }));
   expect(state.update.mode).toBe("uninitialized");
-  expect(state.marker).toBeNull();
+  expect(state.marker).toMatchObject({
+    tabContextId: "99",
+    sessionId: "chk_wrong_tab"
+  });
+});
+
+test("PaymentForm advances past optional defaults and changes them only for explicit profile intent", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      #survey-choice { display: flex; align-items: center; height: 15px; line-height: 15px; }
+      #survey-choice input { width: 13px; height: 13px; margin: 0 4px 0 0; }
+    </style>
+    <main>
+      <h1>Select a payment method</h1>
+      <form id="payment-form" action="/PaymentForm" method="post">
+        <section>
+          <h2>Log in and use your profile</h2>
+          <label>E-mail <input id="txtLoginEmail" name="txtLoginEmail" type="email"></label>
+          <button id="btnLogin" type="button">Login</button>
+        </section>
+        <fieldset>
+          <legend>You are purchasing the tickets as</legend>
+          <label><input type="radio" name="IsR1" value="natural" checked> Natural person</label>
+          <label><input type="radio" name="IsR1" value="legal"> Legal person</label>
+        </fieldset>
+        <label id="survey-choice"><input type="checkbox" name="ReceiveSurvey" checked> I wish to participate in a customer satisfaction survey. I can opt-out at any time.</label>
+        <label><input type="checkbox" name="ShowPromoBanners"> I consent to receiving information about third-party offers</label>
+        <fieldset>
+          <legend>Select a payment method</legend>
+          <label><input type="radio" name="MeansOfPayment" value="creditcard" checked> Credit/debit card</label>
+        </fieldset>
+        <a id="btnSubmit" href="#hosted-card-entry">CONTINUE</a>
+      </form>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const map = window.__ATW_TEST__.buildPageMap();
+    const continueControl = map.controls.find((control) => (
+      control.semantic === "continue"
+      && Boolean(control.operations?.activate)
+    ));
+    const unrelated = map.controls.filter((control) => control.controlId !== continueControl?.controlId);
+    return {
+      step: map.step,
+      continueAllowed: map.stageExit?.continueAllowed,
+      stageExitAuthority: map.stageExit?.authority,
+      stageExitProjectionVersion: map.stageExit?.projectionVersion,
+      continueControl,
+      falseNavigation: unrelated.filter((control) => (
+        control.semantic === "continue"
+        || control.physicalEffect === "advance_checkout_stage"
+      )).map((control) => ({ label: control.label, semantic: control.semantic, physicalEffect: control.physicalEffect })),
+      readyCandidates: (map.stageExit?.candidates || []).filter((candidate) => candidate.status === "ready")
+    };
+  });
+
+  expect(result.falseNavigation).toEqual([]);
+  expect(result.stageExitAuthority).toBe("canonical_control_graph");
+  expect(result.stageExitProjectionVersion).toBe("canonical-navigation/v1");
+  expect(result.continueAllowed).toBe(true);
+  expect(result.continueControl).toMatchObject({
+    semantic: "continue",
+    physicalEffect: "advance_checkout_stage"
+  });
+  expect(result.continueControl.operations.activate.actionability.executable).toBe(true);
+  expect(result.readyCandidates).toEqual([
+    expect.objectContaining({ controlId: result.continueControl.controlId, operation: "activate" })
+  ]);
+
+  const observation = await browserObservation(page, "obs_payment_form_owned_navigation");
+  const traveler = { id: "trav_payment_form", payment_preference: "manual payment" };
+  const state = createCheckoutSessionState({
+    goal: "Reach card credential entry",
+    travelerId: traveler.id,
+    site: { host: "unfamiliar-airline.test", url: observation.page.url }
+  });
+  state.id = "txn_payment_form_owned_navigation";
+  const store = inMemoryGovernorStore();
+  store.remember(state.id, observation);
+  const turn = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_payment_form_owned_navigation"
+  });
+  const surveyControl = observation.page.controls.find((control) => control.effectRole === "optional_consent" && control.state?.selected);
+  expect(surveyControl).toBeTruthy();
+  expect(turn.clientDecision).toMatchObject({
+    action: "click",
+    controlId: result.continueControl.controlId
+  });
+  expect(await page.locator('input[name="ReceiveSurvey"]').isChecked()).toBe(true);
+  expect(await page.locator('input[name="ShowPromoBanners"]').isChecked()).toBe(false);
+  expect(await page.locator('input[name="IsR1"][value="natural"]').isChecked()).toBe(true);
+  expect(await page.locator('input[name="IsR1"][value="legal"]').isChecked()).toBe(false);
+
+  const explicitProfileState = createCheckoutSessionState({
+    goal: "Reach card credential entry",
+    travelerId: traveler.id,
+    site: { host: "unfamiliar-airline.test", url: observation.page.url }
+  });
+  explicitProfileState.id = "txn_payment_form_explicit_consent_profile";
+  explicitProfileState.userPolicy = {
+    ...explicitProfileState.userPolicy,
+    bookingRules: "Do not participate in customer satisfaction surveys"
+  };
+  const explicitProfileStore = inMemoryGovernorStore();
+  explicitProfileStore.remember(explicitProfileState.id, observation);
+  const explicitProfileTurn = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state: explicitProfileState,
+    observation,
+    traveler: {
+      ...traveler,
+      booking_rules: "Do not participate in customer satisfaction surveys"
+    },
+    transactionStore: explicitProfileStore,
+    clientTurnId: "turn_payment_form_explicit_consent_profile"
+  });
+  expect(explicitProfileTurn.clientDecision).toMatchObject({
+    action: "click",
+    controlId: surveyControl.controlId,
+    semanticEffect: "waive",
+    expectedOutcome: expect.objectContaining({ type: "control_unselected" })
+  });
+});
+
+test("a purchase submit command never enters the canonical navigation projection", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Payment</h1>
+      <form action="/purchase" method="post">
+        <button id="pay-now" type="submit">Pay now</button>
+      </form>
+    </main>
+  `);
+
+  const result = await page.evaluate(() => {
+    const map = window.__ATW_TEST__.buildPageMap();
+    const pay = map.controls.find((control) => /pay now/i.test(control.label || ""));
+    return {
+      pay,
+      stageExitIds: (map.stageExit?.candidates || []).map((candidate) => candidate.controlId)
+    };
+  });
+
+  expect(result.pay).toMatchObject({
+    semantic: "submit_purchase",
+    physicalEffect: "submit_purchase"
+  });
+  expect(result.stageExitIds).not.toContain(result.pay.controlId);
 });
 
 test("pre-session selected-booking capture backs off on an unchanged incomplete surface", async ({ page }) => {
@@ -1734,6 +1924,7 @@ test("optional negative marketing checkbox stays optional inside a required cont
   expect(marketing.risk).toBe("safe_decline");
   const group = observation.page.decisionGroups.find((candidate) => (
     candidate.alternativeControlIds?.includes(marketing.controlId)
+    || candidate.alternatives?.some((option) => option.controlId === marketing.controlId)
   ));
   expect(group).toBeTruthy();
   expect(group.required).toBe(false);
@@ -2747,6 +2938,8 @@ test("stage exit preserves every Continue representation and advances through th
   observation.page.step = "traveler_information";
   const candidates = observation.page.stageExit.candidates;
   expect(candidates).toHaveLength(2);
+  expect(new Set(candidates.map((candidate) => candidate.controlId)).size).toBe(candidates.length);
+  expect(candidates.every((candidate) => observation.page.controls.some((control) => control.controlId === candidate.controlId))).toBe(true);
   expect(candidates.some((candidate) => (
     candidate.status === "occluded"
     && candidate.code === "ACTUATOR_OCCLUDED"
@@ -2841,7 +3034,10 @@ test("agent-owned UI is transparent to governed site hit-testing and dispatch", 
   expect(candidateSet.candidates).toHaveLength(1);
   // Model a background tab where requestAnimationFrame may never be serviced.
   // Agent/page isolation must not make trusted dispatch depend on tab focus.
-  await page.evaluate(() => { window.requestAnimationFrame = () => 1; });
+  await page.evaluate(() => {
+    window.__atwNativeRequestAnimationFrame = window.requestAnimationFrame;
+    window.requestAnimationFrame = () => 1;
+  });
   const result = await executeAtomicBrowserDecision(
     page,
     toClientDecision(loopPrivate.bindTargetSnapshot(
@@ -2850,6 +3046,10 @@ test("agent-owned UI is transparent to governed site hit-testing and dispatch", 
     )),
     "obs_agent_ui_isolation_after"
   );
+  await page.evaluate(() => {
+    window.requestAnimationFrame = window.__atwNativeRequestAnimationFrame;
+    delete window.__atwNativeRequestAnimationFrame;
+  });
   expect(result.verification.ok, JSON.stringify(result.verification)).toBe(true);
   expect(await page.evaluate(() => window.__agentPointerEventsAtDispatch)).toBe("none");
   expect(await page.evaluate(() => getComputedStyle(document.getElementById("atw-sidebar")).pointerEvents)).toBe("auto");
@@ -3933,7 +4133,7 @@ test("Title visual recovery remains grounded through TaskState, governor, dispat
   });
 });
 
-test("one exact custom-control actuator advances through method-aware retry and semantic option verification", async ({ page }) => {
+test("one exact custom-control actuator does not repeat through a different click method after NO_EFFECT", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>
       [hidden] { display: none !important; }
@@ -4086,7 +4286,7 @@ test("one exact custom-control actuator advances through method-aware retry and 
     currentGoal: firstAuthoritativeGoal,
     lastAction: governedNative.action
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), nativeResult.observation, initial);
-  expect(failedLifecycle.transition.status).toBe("no_effect");
+  expect(failedLifecycle.transition.actionOutcome.status).toBe("NO_EFFECT");
   expect(executionRecovery(failedLifecycle.state).failedStrategies).toHaveLength(1);
   const unchangedRepeat = await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
@@ -4152,78 +4352,13 @@ test("one exact custom-control actuator advances through method-aware retry and 
     approvals: {}
   });
   const pointerCandidate = pointerSet.candidates.find((candidate) => candidate.operation === "open");
-  expect(pointerCandidate?.interactionMethod).toBe("pointer_sequence");
-  expect(pointerCandidate?.targetId).toBe(nativeCandidate.targetId);
-  expect(actuatorSignature(actionForCurrentCandidate(goal, pointerCandidate, retryObservation)))
-    .not.toBe(actuatorSignature(nativeAction));
-
-  const pointerGoal = {
-    ...goal,
-    candidateSet: pointerSet,
-    candidates: pointerSet.candidates
-  };
-  state = {
-    ...failedLifecycle.state,
-    taskState: { ...retryTaskState, currentGoal: pointerGoal },
-    currentGoal: pointerGoal,
-    currentObservation: {
-      observationId: retryObservation.observationId,
-      observationHash: retryObservation.observationSnapshot.snapshotHash
-    }
-  };
-  store.remember(state.id, retryObservation);
-  const pointerAction = loopPrivate.bindTargetSnapshot(
-    actionForCurrentCandidate(goal, pointerCandidate, retryObservation),
-    retryObservation
-  );
-  expect(await page.evaluate((decision) => {
-    const hooks = window.__ATW_TEST__;
-    decision = hooks.decisionFromActionLease(decision);
-    const map = hooks.buildPageMap();
-    return hooks.repeatGuardFor(
-      hooks.resolveDecisionTarget(decision, map),
-      "distinct method",
-      decision,
-      map
-    );
-  }, toClientDecision(pointerAction))).toBe(true);
-  const governedPointer = governAction({
-    action: pointerAction,
-    state,
-    observation: retryObservation,
-    traveler,
-    store,
-    turnId: "turn_method_retry_pointer"
-  });
-  expect(governedPointer.allow, `${governedPointer.code}: ${governedPointer.reason}`).toBe(true);
-  const opened = await executeAtomicBrowserDecision(
-    page,
-    toClientDecision(governedPointer.action),
-    "obs_method_retry_opened"
-  );
-  expect(opened.verification).toMatchObject({ ok: true, code: "OPTIONS_SURFACE_APPEARED" });
-  expect(await page.locator("#strategy-options").isVisible()).toBe(true);
+  expect(pointerCandidate).toBeUndefined();
   expect(await page.evaluate(() => window.__strategyAttempts)).toEqual([
-    { detail: 0, targetId: "strategy-title-wrapper", targetDisabled: false },
-    { detail: 1, targetId: "strategy-title-wrapper", targetDisabled: false }
+    { detail: 0, targetId: "strategy-title-wrapper", targetDisabled: false }
   ]);
-
-  const optionGoal = deriveProfileGoal(opened.observation, traveler, goal);
-  const optionCandidate = candidatesForProfileGoal(optionGoal, opened.observation, traveler)
-    .find((candidate) => candidate.operation === "choose");
-  const selected = await executeAtomicBrowserDecision(
-    page,
-    toClientDecision(actionForProfileCandidate(optionGoal, optionCandidate, opened.observation)),
-    "obs_method_retry_selected"
-  );
-  expect(selected.verification.ok, JSON.stringify(selected.verification)).toBe(true);
-  const titleField = resolveLogicalFields(selected.observation.page, traveler)
-    .find((field) => field.semanticType === "title");
-  expect(titleField.currentCanonicalValue).toBe("mr");
-  expect(logicalFieldSatisfied(titleField)).toBe(true);
 });
 
-test("bounded recovery advances from synthetic open methods to one governed trusted choice without repeating", async ({ page }) => {
+test("bounded recovery tries one opener then advances to a semantically distinct trusted choice", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>
       [hidden] { display: none !important; }
@@ -4264,7 +4399,7 @@ test("bounded recovery advances from synthetic open methods to one governed trus
   const observation = await browserObservation(page, "obs_trusted_strategy");
   const goal = deriveProfileGoal(observation, traveler);
   const attempted = [];
-  for (const expectedMethod of ["native_click", "pointer_sequence"]) {
+  for (const expectedMethod of ["native_click"]) {
     const built = buildCurrentCandidateSet({
       goal,
       observation,
@@ -5087,7 +5222,7 @@ test("required reason-for-travel radios use one profile-backed travel-purpose re
   expect(profileStageReadiness(selected.observation, traveler).ready).toBe(true);
 });
 
-test("final terms review with Pay by card is terminal before legal acceptance", async ({ page }) => {
+test("final terms review with Pay by card remains unfinished before card entry", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <h1>Review your booking</h1>
@@ -5109,33 +5244,34 @@ test("final terms review with Pay by card is terminal before legal acceptance", 
 
   const observation = await browserObservation(page, "obs_final_terms_payment_review");
   expect(observation.page.terminalEvidence).toMatchObject({
-    stage: "payment_review",
-    boundaryObserved: true,
+    stage: "unknown",
+    boundaryObserved: false,
     signals: { legal: true, review: true, commit: true }
   });
-  expect(observation.page.step).toBe("payment");
   const termsControl = observation.page.controls.find((control) => /read and accepted.*terms/i.test(control.label || ""));
   expect(termsControl).toMatchObject({ semantic: "legal_acceptance", risk: "legal" });
   const state = reduceTaskState({
     observation,
     transactionReview: verifiedTransactionReview(361.97)
   });
-  expect(state.stage).toBe("payment");
-  expect(state.terminalStatus).toBe("payment_review_reached");
-  expect(state.currentGoal).toBeNull();
+  expect(state.terminalStatus).toBe("active");
+  expect(state.paymentEvidence.boundaryObserved).toBe(false);
 });
 
-test("Croatia-shaped PAY review with legal terms and Confirm is a terminal payment boundary", async ({ page }) => {
+test("Croatia-shaped PAY review remains unfinished until the hosted card form", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <h1>3. PAY PAY</h1>
       <nav>SELECT COMPLETED STEP BOOK COMPLETED STEP PAY CURRENT STEP</nav>
-      <section><h2>Promotion code</h2><label>Do you have a promotion code? <input name="promotion_code"></label><button>Apply</button></section>
+      <section><h2>Promotion code</h2><label>Do you have a promotion code? <input name="promotion_code" required></label><button>Apply</button></section>
       <section>
         <h2>Payment</h2>
         <p>Total to be paid is <strong>EUR 152.62</strong></p>
         <p>Do you need time to think?</p>
-        <button>No, thanks</button><button>Yes</button>
+        <div role="group" aria-label="Time to think">
+          <button id="time-decline" type="button" aria-pressed="true">No, thanks</button>
+          <button id="time-accept" type="button" aria-pressed="false">Yes</button>
+        </div>
       </section>
       <aside aria-label="Your booking">
         <h2>YOUR BOOKING</h2>
@@ -5145,7 +5281,7 @@ test("Croatia-shaped PAY review with legal terms and Confirm is a terminal payme
       <section>
         <h2>Terms and conditions</h2>
         <label><input id="terms" name="TermsAndCondition" type="checkbox" required>
-          Yes, I have examined all the information and confirm the travellers' names and surnames are accurate.
+          Yes, I have examined all the information shown in the itinerary, verified every traveller's first name, middle name, surname, date of travel, departure airport, arrival airport, and contact detail, and confirm all of those booking details are accurate and complete.
           I agree with the <a href="#conditions">General Conditions of Carriage</a>
           and <a href="#purchase">purchase conditions</a> and understand dangerous goods restrictions.
         </label>
@@ -5155,23 +5291,38 @@ test("Croatia-shaped PAY review with legal terms and Confirm is a terminal payme
   `);
 
   const observation = await browserObservation(page, "obs_croatia_pay_review");
+  expect(observation.page.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
-    stage: "payment_review",
-    boundaryObserved: true,
+    stage: "unknown",
+    boundaryObserved: false,
     signals: {
-      progress: true,
       review: true,
       legal: true,
       reviewConfirm: true
     }
   });
-  expect(observation.page.step).toBe("payment");
   const termsControl = observation.page.controls.find((control) => control.controlId && /TermsAndCondition/i.test(control.name || control.label || ""));
   expect(termsControl).toMatchObject({ semantic: "legal_acceptance", risk: "legal" });
+  expect(termsControl.operations?.choose, JSON.stringify(termsControl, null, 2)).toBeTruthy();
   expect(termsControl.fieldClassification).toMatchObject({
     fieldType: "",
     source: "direct_non_profile_control"
   });
+  const declinedTimeToThink = observation.page.controls.find((control) => /No, thanks/i.test(control.label || ""));
+  const acceptedTimeToThink = observation.page.controls.find((control) => /^Yes$/i.test(control.label || ""));
+  expect(declinedTimeToThink).toBeTruthy();
+  expect(acceptedTimeToThink).toBeTruthy();
+  expect(declinedTimeToThink.state).toMatchObject({
+    selected: true,
+    selectionState: "SELECTED"
+  });
+  expect(acceptedTimeToThink.state).toMatchObject({
+    selected: false,
+    selectionState: "UNSELECTED"
+  });
+  expect(declinedTimeToThink.decisionGroupId).toBe(acceptedTimeToThink.decisionGroupId);
+  expect(declinedTimeToThink.decisionGroupId).not.toBe(termsControl.decisionGroupId);
+  expect(declinedTimeToThink.operations?.activate?.strategies).toHaveLength(1);
   const termsLinks = observation.page.controls.filter((control) => (
     control.role === "link"
     && /general conditions|purchase conditions/i.test(control.label || "")
@@ -5182,9 +5333,126 @@ test("Croatia-shaped PAY review with legal terms and Confirm is a terminal payme
     observation,
     transactionReview: verifiedTransactionReview(152.62)
   });
-  expect(state.stage).toBe("payment");
-  expect(state.terminalStatus).toBe("payment_review_reached");
-  expect(state.currentGoal).toBeNull();
+  expect(state.terminalStatus).toBe("active");
+  expect(state.paymentEvidence.boundaryObserved).toBe(false);
+  expect(observation.page.graphIntegrity.ok).toBe(true);
+  expect(state.currentGoal).toMatchObject({
+    decisionGroupId: termsControl.decisionGroupId
+  });
+  expect(state.currentGoal.semanticType).toMatch(/^legal/);
+  expect(state.currentObligation.admittedControlIds).toContain(termsControl.controlId);
+  const promoControl = observation.page.controls.find((control) => /promotion.code/i.test(control.label || ""));
+  expect(promoControl).toBeTruthy();
+  const frame = compileDecisionFrame({ observation });
+  const promoDecision = frame.standaloneDecisions.find((decision) => (
+    decision.physicalControlIds?.includes(promoControl.controlId)
+  ));
+  expect(promoDecision).toMatchObject({
+    required: false,
+    optional: true,
+    needsAction: false,
+    status: "stale"
+  });
+  const legalCandidates = buildCurrentCandidateSet({
+    goal: state.currentGoal,
+    observation,
+    state: { taskState: state },
+    approvals: { standardBookingTermsApproved: true }
+  });
+  expect(
+    legalCandidates.candidates.map((candidate) => candidate.controlId),
+    JSON.stringify(legalCandidates, null, 2)
+  ).toContain(termsControl.controlId);
+  expect(legalCandidates.candidates.map((candidate) => candidate.controlId)).not.toContain(declinedTimeToThink.controlId);
+
+  await page.locator("#terms").check();
+  const acceptedObservation = await browserObservation(page, "obs_croatia_pay_review_terms_accepted");
+  const confirmControl = acceptedObservation.page.controls.find((control) => /^confirm$/i.test(control.label || ""));
+  expect(confirmControl).toBeTruthy();
+  expect(acceptedObservation.page.stageExit).toMatchObject({
+    continueAllowed: true,
+    navigationState: "ready"
+  });
+  expect(acceptedObservation.page.stageExit.candidates.map((candidate) => candidate.controlId)).toContain(confirmControl.controlId);
+  const acceptedState = reduceTaskState({
+    observation: acceptedObservation,
+    transactionReview: verifiedTransactionReview(152.62)
+  });
+  expect(
+    acceptedState.currentGoal,
+    JSON.stringify({
+      currentGoal: acceptedState.currentGoal,
+      currentObligation: acceptedState.currentObligation,
+      checkoutSituation: acceptedState.checkoutSituation,
+      controls: acceptedObservation.page.controls
+    }, null, 2)
+  ).toMatchObject({ semanticType: "navigation" });
+  expect(acceptedState.currentGoal.actionableControlIds).toContain(confirmControl.controlId);
+});
+
+test("an unfamiliar required attestation survives unknown semantics and blocks navigation", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Review</h1>
+      <label><input id="opaque-attestation" name="confirm_bundle" type="checkbox" required>
+        Everything shown in the panel above is accurate for this request.
+      </label>
+      <button id="continue" type="button">Continue</button>
+    </main>
+  `);
+
+  const observation = await browserObservation(page, "obs_unknown_required_attestation");
+  const control = observation.page.controls.find((candidate) => candidate.stateElementId && candidate.required === true);
+  const group = observation.page.decisionGroups.find((candidate) => (
+    candidate.alternatives?.some((alternative) => alternative.controlId === control?.controlId)
+  ));
+
+  // Even if a noisy first-pass classifier assigns the wrong meaning, current
+  // structural requiredness must keep the obligation alive independently.
+  expect(control).toMatchObject({ required: true });
+  expect(group).toMatchObject({
+    sectionType: "unknown_attestation",
+    required: true,
+    status: "missing"
+  });
+  expect(group.alternatives[0]).toMatchObject({ semantic: "unknown_attestation", risk: "uncertain" });
+  expect(observation.page.stageExit.continueAllowed).toBe(false);
+  expect(observation.page.stageExit.blockers.some((blocker) => /unresolved decision/i.test(blocker))).toBe(true);
+});
+
+test("context-required legal checkbox from the live trace remains an admitted obligation", async ({ page }) => {
+  await loadHtmlProducer(page, `<main><h1>Payment</h1></main>`);
+  const result = await page.evaluate(() => window.__ATW_TEST__.compileDecisionGroupsForTest([], [{
+    controlId: "ctrl_trace_terms",
+    stableKey: "checkbox|name:termsAndCondition|type:checkbox",
+    label: "termsandcondition yes, I confirm the travellers names and agree with the purchase conditions",
+    role: "checkbox",
+    semantic: "legal_acceptance",
+    physicalEffect: "unknown",
+    risk: "legal",
+    surfaceId: "surface-page",
+    decisionGroupId: "dg_trace_terms",
+    required: true,
+    selected: false,
+    state: { checked: false, selected: false, required: false },
+    representationLifecycle: { active: true },
+    stateElementId: "trace-terms-input",
+    preferredActivationElementId: "trace-terms-label",
+    operations: {}
+  }], { id: "surface-page", type: "page" }));
+
+  expect(result).toHaveLength(1);
+  expect(result[0]).toMatchObject({
+    decisionGroupId: "dg_trace_terms",
+    sectionType: "legal_acceptance",
+    required: true,
+    status: "missing"
+  });
+  expect(result[0].alternatives[0]).toMatchObject({
+    controlId: "ctrl_trace_terms",
+    semantic: "legal_acceptance",
+    risk: "legal"
+  });
 });
 
 test("opaque native choice completes open and select as one trusted episode", async ({ page }) => {
@@ -5446,6 +5714,64 @@ test("large country dropdown preserves and selects the profile match beyond the 
   });
 });
 
+test("machine-owned phoneCountry select cannot be reclassified as city by option prose", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Contact details</h1>
+      <section aria-label="Contact information">
+        <label for="phone-country">Prefix</label>
+        <select id="phone-country" name="phoneCountry" required>
+          <option value="si" selected>Slovenia (+386)</option>
+          <option value="va">Vatican City (+39)</option>
+          <option value="gb">United Kingdom (+44)</option>
+        </select>
+        <label>Phone <input name="phone" type="tel" value="70328922" required></label>
+      </section>
+      <button type="button">Continue</button>
+    </main>
+  `);
+
+  const observation = await browserObservation(page, "obs_phone_country_machine_identity");
+  const control = observation.page.controls.find((candidate) => (
+    candidate.fieldType === "phone_country_code"
+    || candidate.semantic === "phone_country_code"
+  ));
+  expect(control).toMatchObject({ fieldType: "phone_country_code", semantic: "phone_country_code" });
+  expect(observation.page.controls.some((candidate) => (
+    candidate.controlId === control.controlId && candidate.fieldType === "city"
+  ))).toBe(false);
+});
+
+test("one physical insurance choice has one decision owner before graph publication", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Extras</h1>
+      <section aria-label="Baggage">
+        <section aria-label="Cancellation insurance">
+          <h2>Cancellation insurance</h2>
+          <button type="button">Travel Plus 24 EUR</button>
+          <button type="button">Travel Basic 12 EUR</button>
+          <button type="button">No insurance</button>
+        </section>
+      </section>
+      <button type="button">Continue</button>
+    </main>
+  `);
+
+  const observation = await browserObservation(page, "obs_single_insurance_owner");
+  const insuranceControls = observation.page.controls.filter((control) => (
+    /travel plus|travel basic|no insurance/i.test(control.label || "")
+  ));
+  expect(insuranceControls).toHaveLength(3);
+  for (const control of insuranceControls) {
+    const owners = observation.page.decisionGroups.filter((group) => (
+      (group.alternatives || []).some((alternative) => alternative.controlId === control.controlId)
+    ));
+    expect(owners, control.label).toHaveLength(1);
+  }
+  expect(observation.page.graphIntegrity?.unresolvedConflictCount || 0).toBe(0);
+});
+
 test("native nationality select executes the exact compiled option instead of a short-code substring", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
@@ -5477,6 +5803,19 @@ test("native nationality select executes the exact compiled option instead of a 
   }, traveler);
 
   const observation = await browserObservation(page, "obs_exact_nationality_initial");
+  const nationalityControl = observation.page.controls.find((control) => (
+    control.name === "passengers.0.nationality"
+  ));
+  // A native select can report container-level selection because its blank
+  // placeholder child is selected. That is not proof that the admitted
+  // profile value is already committed and must not suppress exact selection.
+  Object.assign(nationalityControl.state, {
+    selected: true,
+    selectionState: "SELECTED",
+    valuePresent: false,
+    normalizedValue: "",
+    selectedValue: ""
+  });
   const goal = deriveProfileGoal(observation, traveler);
   const scheduledSet = groundedObservationCandidateSet(goal, observation, [], {
     state: { taskState: { currentGoal: goal }, approvals: {} },
@@ -5567,7 +5906,7 @@ test("stage exit distinguishes an observed disabled Continue from navigation tha
   expect(missing.blockers).toContain("Continue not observed");
 });
 
-test("destination, grounding, and TaskState waits share one mutation-or-deadline lifecycle", async ({ page }) => {
+test("only positive loading enters the mutation-or-deadline lifecycle", async ({ page }) => {
   await loadProducer(page);
   const now = Date.now();
   const result = await page.evaluate(({ startedAt, deadlineAt }) => {
@@ -5595,11 +5934,6 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
       observationId: "obs_navigation_settling",
       actionId: "act_navigation_settling"
     };
-    const taskStateDecision = {
-      ...decision,
-      intent: "task_state_reobserve",
-      reobserveRetryToken: "retry_current_surface_once"
-    };
     const recognized = hooks.isDestinationReadinessDecision(decision);
     const groundingRecoveryRecognized = hooks.isDestinationReadinessDecision({
       action: "wait",
@@ -5609,7 +5943,11 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
       action: "wait",
       intent: "task_state_reobserve"
     });
-    hooks.beginDestinationWait(taskStateDecision);
+    const strategyExhaustionRecognized = hooks.isDestinationReadinessDecision({
+      action: "wait",
+      intent: "reobserve_after_strategy_exhaustion"
+    });
+    hooks.beginDestinationWait(decision);
     const state = hooks.agentLoopState();
     const map = hooks.buildPageMap();
     const compact = hooks.compactPageMap(map, "obs_navigation_settling");
@@ -5640,6 +5978,7 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
       recognized,
       groundingRecoveryRecognized,
       taskStateRecognized,
+      strategyExhaustionRecognized,
       state,
       referencePayload,
       fullBytes: hooks.observationTransportBytes(fullPayload),
@@ -5648,13 +5987,14 @@ test("destination, grounding, and TaskState waits share one mutation-or-deadline
   }, { startedAt: now, deadlineAt: now + 8_000 });
 
   expect(result.recognized).toBe(true);
-  expect(result.groundingRecoveryRecognized).toBe(true);
-  expect(result.taskStateRecognized).toBe(true);
+  expect(result.groundingRecoveryRecognized).toBe(false);
+  expect(result.taskStateRecognized).toBe(false);
+  expect(result.strategyExhaustionRecognized).toBe(false);
   expect(result.state.destinationWait.status).toBe("WAITING_FOR_DESTINATION");
   expect(result.state.destinationWait.startedAt).toBe(now);
   expect(result.state.destinationWait.deadlineAt).toBe(now + 8_000);
   expect(result.state.destinationWait.backendWaits).toBe(1);
-  expect(result.state.destinationWait.retryToken).toBe("retry_current_surface_once");
+  expect(result.state.destinationWait.retryToken).toBe("");
   expect(result.referencePayload).toMatchObject({
     transportMode: "observation_reference",
     page: {
@@ -6049,6 +6389,400 @@ test("direct semantic conflicts fail closed and broad profile context does not o
       }
     });
   }
+});
+
+test("WSPay-shaped customer contact fields bind to profile facts without a generic fallback", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Personal data</h1>
+      <form>
+        <label>ADDRESS <input name="customerAddress" type="text" required></label>
+        <label>CITY <input name="customerCity" type="text" required></label>
+        <label>ZIP <input name="customerZIP" type="text" required></label>
+        <label>COUNTRY
+          <select name="customerCountry" required>
+            <option value="">Select country...</option>
+            <option value="HR">Croatia</option>
+            <option value="TR">Turkey</option>
+          </select>
+        </label>
+      </form>
+    </main>
+  `);
+  const profile = {
+    id: "trav_wspay_contact",
+    address: {
+      line1: "100 Test Avenue",
+      city: "Antalya",
+      postal_code: "07100",
+      country: "Turkey"
+    }
+  };
+  await page.evaluate((traveler) => window.__ATW_TEST__.setAppDataForTest({
+    travelers: [traveler],
+    preferences: {}
+  }, traveler.id), profile);
+
+  let observation = await browserObservation(page, "obs_wspay_contact_0");
+  observation.page.step = "traveler_information";
+  const controlsByName = new Map(observation.page.controls
+    .filter((control) => control.name)
+    .map((control) => [control.name, control]));
+  expect(controlsByName.get("customerAddress")?.fieldType).toBe("address_line1");
+  expect(controlsByName.get("customerCity")?.fieldType).toBe("city");
+  expect(controlsByName.get("customerZIP")?.fieldType).toBe("postal_code");
+  expect(controlsByName.get("customerCountry")?.fieldType).toBe("country");
+
+  const completed = [];
+  for (let index = 0; index < 4; index += 1) {
+    const goal = deriveProfileGoal(observation, profile);
+    expect(goal, JSON.stringify({ completed, controls: observation.page.controls }, null, 2)).toBeTruthy();
+    completed.push(goal.semanticType);
+    const candidates = candidatesForProfileGoal(goal, observation, profile);
+    expect(candidates, JSON.stringify(goal, null, 2)).toHaveLength(1);
+    const action = actionForProfileCandidate(goal, candidates[0], observation);
+    const executed = await executeAtomicBrowserDecision(
+      page,
+      toClientDecision(action),
+      `obs_wspay_contact_${index + 1}`
+    );
+    expect(executed.result.dispatched).toBe(true);
+    expect(executed.verification.ok, JSON.stringify(executed.verification, null, 2)).toBe(true);
+    observation = executed.observation;
+    observation.page.step = "traveler_information";
+  }
+
+  expect(completed).toEqual(["address_line1", "city", "postal_code", "country"]);
+  await expect(page.locator('[name="customerAddress"]')).toHaveValue("100 Test Avenue");
+  await expect(page.locator('[name="customerCity"]')).toHaveValue("Antalya");
+  await expect(page.locator('[name="customerZIP"]')).toHaveValue("07100");
+  await expect(page.locator('[name="customerCountry"]')).toHaveValue("TR");
+});
+
+test("WSPay-shaped image payment methods reveal card entry and stop before credentials", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { font-family: sans-serif; padding: 24px; }
+      #payment-methods { width: 720px; min-height: 180px; }
+      .method { display: inline-flex; width: 130px; height: 56px; margin: 8px; align-items: center; justify-content: center; }
+      .method img { width: 110px; height: 42px; }
+      #card-entry[hidden] { display: none; }
+    </style>
+    <main>
+      <section id="payment-methods" aria-labelledby="payment-method-heading">
+        <h1 id="payment-method-heading">Please select payment method</h1>
+        <a class="method card-method" id="amex-method" href="#card-entry-amex"><img alt="American Express"></a>
+        <a class="method card-method" id="visa-method" href="#card-entry-visa"><img alt="Visa"></a>
+        <a class="method card-method" id="mastercard-method" href="#card-entry-mastercard"><img src="/assets/mastercard-logo.svg"></a>
+        <a class="method" id="wallet-method" href="#wallet"><img alt="KEKS Pay"></a>
+        <button type="button" id="cancel">Cancel</button>
+      </section>
+      <section id="card-entry" aria-label="Credit card details" hidden>
+        <label>Card number <input autocomplete="cc-number"></label>
+        <label>Expiry <input autocomplete="cc-exp"></label>
+        <label>Security code <input autocomplete="cc-csc"></label>
+        <button id="pay" type="button">Pay</button>
+      </section>
+    </main>
+    <script>
+      window.__paymentMethodClicks = 0;
+      window.__payClicks = 0;
+      document.querySelectorAll('.card-method').forEach((method) => method.addEventListener('click', (event) => {
+        event.preventDefault();
+        window.__paymentMethodClicks += 1;
+        document.getElementById('card-entry').hidden = false;
+      }));
+      document.getElementById('pay').addEventListener('click', () => { window.__payClicks += 1; });
+    </script>
+  `);
+  const traveler = { id: "trav_wspay_methods", payment_preference: "manual payment" };
+  let observation = await browserObservation(page, "obs_wspay_methods_0");
+  const methods = observation.page.controls.filter((control) => control.semantic === "payment_method");
+  expect(methods.map((control) => control.label)).toEqual([
+    "American Express",
+    "Visa",
+    "Mastercard",
+    "KEKS Pay"
+  ]);
+  expect(methods.every((control) => (
+    control.physicalEffect === "reveal_control"
+    && control.risk === "safe"
+    && control.operations?.activate?.actionability?.executable === true
+  ))).toBe(true);
+  const paymentGroup = observation.page.decisionGroups.find((group) => group.sectionType === "payment");
+  expect(paymentGroup).toMatchObject({
+    required: true,
+    status: "missing"
+  });
+  expect(paymentGroup.alternatives.map((alternative) => alternative.label)).toEqual(methods.map((control) => control.label));
+  expect(paymentGroup.alternatives.every((alternative) => alternative.physicalEffect === "reveal_control")).toBe(true);
+
+  const state = createCheckoutSessionState({
+    goal: "Reach card credential entry",
+    travelerId: traveler.id,
+    site: { host: "unfamiliar-payment.test", url: observation.page.url }
+  });
+  state.id = "txn_wspay_image_payment_methods";
+  const store = inMemoryGovernorStore();
+  store.remember(state.id, observation);
+  const turn = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_wspay_image_payment_methods"
+  });
+  expect(turn.clientDecision).toMatchObject({
+    action: "click",
+    controlId: methods[0].controlId
+  });
+
+  const executed = await executeAtomicBrowserDecision(
+    page,
+    turn.clientDecision,
+    "obs_wspay_methods_1"
+  );
+  expect(executed.result.dispatched).toBe(true);
+  expect(executed.verification.ok, JSON.stringify(executed.verification, null, 2)).toBe(true);
+  observation = executed.observation;
+  expect(observation.page.terminalEvidence).toMatchObject({
+    cardCredentialEntryObserved: true
+  });
+  await expect(page.locator('[autocomplete="cc-number"]')).toBeVisible();
+  await expect(page.locator('[autocomplete="cc-exp"]')).toBeVisible();
+  await expect(page.locator('[autocomplete="cc-csc"]')).toBeVisible();
+  expect(await page.evaluate(() => ({
+    paymentMethodClicks: window.__paymentMethodClicks,
+    payClicks: window.__payClicks
+  }))).toEqual({ paymentMethodClicks: 1, payClicks: 0 });
+});
+
+test("native payment-method radios follow the saved card preference and reveal credential fields", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <section aria-labelledby="payment-heading">
+        <h1 id="payment-heading">Pay with</h1>
+        <label><input type="radio" name="paymentMethod" value="apple_pay" aria-label="payment-method-apple_pay"> Apple Pay</label>
+        <label><input type="radio" name="paymentMethod" value="card" aria-label="payment-method-card"> Credit or debit card</label>
+        <label><input type="checkbox" name="terms.accepted"> I accept the Terms & Conditions and Privacy Policy</label>
+      </section>
+      <section id="card-entry" aria-label="Credit card details" hidden>
+        <label>Card number <input autocomplete="cc-number"></label>
+        <label>Expiry <input autocomplete="cc-exp"></label>
+        <label>Security code <input autocomplete="cc-csc"></label>
+      </section>
+    </main>
+    <script>
+      document.querySelector('[value="card"]').addEventListener('change', (event) => {
+        document.getElementById('card-entry').hidden = !event.target.checked;
+      });
+    </script>
+  `);
+  const traveler = { id: "trav_native_payment", payment_preference: "browser saved card" };
+  let observation = await browserObservation(page, "obs_native_payment_0");
+  const broadSection = observation.page.sections.find((section) => section.label === "payment method");
+  // The mixed visual container is legitimately legal context because it also
+  // contains terms. Exact payment controls must not inherit that broad type.
+  expect(broadSection?.type).toBe("legal_acceptance");
+  const methods = observation.page.controls.filter((control) => control.semantic === "payment_method");
+  expect(methods).toHaveLength(2);
+  expect(methods.every((control) => (
+    control.physicalEffect === "reveal_control"
+    && control.risk === "safe"
+    && control.sectionType === "payment"
+  ))).toBe(true);
+  const paymentGroup = observation.page.decisionGroups.find((group) => (
+    group.alternatives?.some((alternative) => alternative.semantic === "payment_method")
+  ));
+  expect(paymentGroup).toMatchObject({
+    sectionType: "payment",
+    required: true,
+    status: "missing"
+  });
+  expect(paymentGroup.requirementId).toMatch(/^payment:/);
+  expect(paymentGroup.decisionGroupId).not.toMatch(/legal-acceptance/);
+  const card = methods.find((control) => /card/i.test(control.label));
+  expect(card).toBeTruthy();
+
+  const state = createCheckoutSessionState({
+    goal: "Reach card credential entry",
+    travelerId: traveler.id,
+    site: { host: "native-payment.test", url: observation.page.url }
+  });
+  state.id = "txn_native_payment_method";
+  const store = inMemoryGovernorStore();
+  store.remember(state.id, observation);
+  const turn = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    dataDir: "",
+    state,
+    observation,
+    traveler,
+    transactionStore: store,
+    clientTurnId: "turn_native_payment_method"
+  });
+  expect(turn.clientDecision, JSON.stringify({
+    decision: turn.clientDecision,
+    taskState: turn.state?.taskState,
+    methods: methods.map((control) => ({
+      controlId: control.controlId,
+      label: control.label,
+      semantic: control.semantic,
+      physicalEffect: control.physicalEffect,
+      risk: control.risk
+    })),
+    groups: observation.page.decisionGroups
+  }, null, 2)).toMatchObject({ action: "click", controlId: card.controlId });
+
+  const executed = await executeAtomicBrowserDecision(page, turn.clientDecision, "obs_native_payment_1");
+  expect(executed.verification.ok, JSON.stringify(executed.verification, null, 2)).toBe(true);
+  observation = executed.observation;
+  expect(observation.page.terminalEvidence.cardCredentialEntryObserved).toBe(true);
+  await expect(page.locator('[autocomplete="cc-number"]')).toBeVisible();
+  await expect(page.locator('[autocomplete="cc-exp"]')).toBeVisible();
+  await expect(page.locator('[autocomplete="cc-csc"]')).toBeVisible();
+});
+
+test("exact checked state is authoritative when a native legal checkbox retains focus", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <label><input id="terms" type="checkbox" name="terms.accepted"> I accept the Terms & Conditions</label>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const checkbox = document.getElementById("terms");
+    checkbox.click();
+    checkbox.focus();
+    return hooks.withChoiceCommitEvidence(
+      {
+        ok: checkbox.checked,
+        code: "CONTROL_SELECTED",
+        evidence: {
+          selectedControlId: "terms-control",
+          control: { controlId: "terms-control", selected: checkbox.checked },
+          conflictingSelected: [],
+          ownedValidationErrors: []
+        }
+      },
+      {
+        ok: false,
+        code: "CHOICE_COMMIT_NOT_SETTLED",
+        controlId: "terms-control",
+        popupClosed: true,
+        focusSettled: false
+      },
+      { type: "control_selected", controlId: "terms-control", expectedSelectedControlId: "terms-control" },
+      { controlId: "terms-control" }
+    );
+  });
+
+  expect(result.ok).toBe(true);
+  expect(result.code).toBe("CONTROL_SELECTED");
+  expect(result.evidence.choiceCommit).toMatchObject({ popupClosed: true, focusSettled: false });
+});
+
+test("a generated combobox and its hidden native select compile as one profile control", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <style>
+      body { font-family: sans-serif; padding: 24px; }
+      .select-wrapper { position: relative; width: 260px; }
+      .select-wrapper select { position: absolute; width: 0; height: 0; opacity: 0; }
+      .select-dropdown { display: block; width: 240px; height: 38px; cursor: pointer; }
+      #country-options[hidden] { display: none; }
+    </style>
+    <main>
+      <h1>Personal data</h1>
+      <form>
+        <label>COUNTRY
+          <div class="select-wrapper">
+            <input id="country-presentation" class="select-dropdown" type="text" role="combobox"
+              aria-haspopup="listbox" aria-controls="country-options" aria-expanded="false"
+              value="Croatia" readonly>
+            <select id="country-state" name="customerCountry" required>
+              <option value="">Select country...</option>
+              <option value="HR" selected>Croatia</option>
+              <option value="TR">Turkey</option>
+            </select>
+          </div>
+        </label>
+      </form>
+    </main>
+    <div id="country-options" role="listbox" hidden>
+      <button type="button" role="option" data-value="HR">Croatia</button>
+      <button type="button" role="option" data-value="TR">Turkey</button>
+    </div>
+  `);
+  const profile = {
+    id: "trav_wspay_split_country",
+    address: { country: "Turkey" }
+  };
+  await page.evaluate((traveler) => {
+    window.__ATW_TEST__.setAppDataForTest({ travelers: [traveler], preferences: {} }, traveler.id);
+    window.__ATW_TEST_TRUSTED_CHOICE__ = ({ element, choiceLabel }) => {
+      if (element.id !== "country-presentation" || choiceLabel !== "Turkey") {
+        return { ok: false, code: "OPTION_NOT_FOUND" };
+      }
+      const state = document.getElementById("country-state");
+      state.value = "TR";
+      state.dispatchEvent(new Event("input", { bubbles: true }));
+      state.dispatchEvent(new Event("change", { bubbles: true }));
+      element.value = "Turkey";
+      element.setAttribute("aria-expanded", "false");
+      return { ok: true };
+    };
+  }, profile);
+
+  const observation = await browserObservation(page, "obs_wspay_split_country_initial");
+  observation.page.step = "traveler_information";
+  const stateNodeId = await page.locator("#country-state").getAttribute("data-atw-element-id");
+  const presentationNodeId = await page.locator("#country-presentation").getAttribute("data-atw-element-id");
+  const countryControls = observation.page.controls.filter((control) => (
+    control.name === "customerCountry"
+    || control.stateElementId === stateNodeId
+    || control.preferredActivationElementId === presentationNodeId
+    || (control.actuators || []).some((actuator) => actuator.nodeId === presentationNodeId)
+  ));
+  expect(countryControls, JSON.stringify(observation.page.graphIntegrity, null, 2)).toHaveLength(1);
+  const countryControl = countryControls[0];
+  expect(countryControl).toMatchObject({
+    name: "customerCountry",
+    fieldType: "country",
+    semantic: "country",
+    stateElementId: stateNodeId
+  });
+  expect(observation.page.graphIntegrity.ok).toBe(true);
+  expect(observation.page.graphIntegrity.actionableConflictCount).toBe(0);
+  expect(countryControl.recovery.select.strategies).toEqual(expect.arrayContaining([
+    expect.objectContaining({
+      actuatorId: presentationNodeId,
+      method: "browser_trusted_choice",
+      operation: "select"
+    })
+  ]));
+
+  const goal = deriveProfileGoal(observation, profile);
+  expect(goal).toMatchObject({ semanticType: "country" });
+  const candidate = candidatesForProfileGoal(goal, observation, profile, [], { includeAlternates: true })
+    .find((item) => item.interactionMethod === "browser_trusted_choice");
+  expect(candidate).toMatchObject({
+    controlId: countryControl.controlId,
+    targetId: presentationNodeId,
+    operation: "select",
+    value: "Turkey"
+  });
+  const selected = await executeAtomicBrowserDecision(
+    page,
+    toClientDecision(actionForCurrentCandidate(goal, candidate, observation)),
+    "obs_wspay_split_country_selected"
+  );
+  expect(selected.result.dispatched).toBe(true);
+  expect(selected.verification).toMatchObject({ ok: true, code: "LOGICAL_COMPONENT_COMMITTED" });
+  await expect(page.locator("#country-state")).toHaveValue("TR");
 });
 
 test("delegated React passenger controls ignore optional fields and keep one required obligation current", async ({ page }) => {
@@ -6524,9 +7258,23 @@ test("one dispatched stage exit stays in flight until a mutation or bounded dead
       action: "wait",
       intent: "wait_for_dispatched_stage_exit"
     });
+    const slowSpaWithoutLoadingSignal = hooks.shouldHoldDispatchedStageExit({
+      advanced: false,
+      visibleBlockers: [],
+      readiness: { documentReadyState: "complete", ariaBusy: false, loadingIndicatorCount: 0 },
+      expectedOutcome: { type: "checkout_stage_advanced" },
+      decision
+    });
+    const visibleValidationWins = hooks.shouldHoldDispatchedStageExit({
+      advanced: false,
+      visibleBlockers: ["Select one option"],
+      readiness: { documentReadyState: "complete" },
+      expectedOutcome: { type: "checkout_stage_advanced" },
+      decision
+    });
     hooks.clearDestinationWait("test_complete");
     hooks.setAgentRunningForTest(false);
-    return { pending, state, recognized };
+    return { pending, state, recognized, slowSpaWithoutLoadingSignal, visibleValidationWins };
   });
 
   expect(result.pending).toMatchObject({
@@ -6543,6 +7291,8 @@ test("one dispatched stage exit stays in flight until a mutation or bounded dead
     retryToken: "stage_exit:act_stage_exit_pending"
   });
   expect(result.recognized).toBe(true);
+  expect(result.slowSpaWithoutLoadingSignal).toBe(true);
+  expect(result.visibleValidationWins).toBe(false);
   expect(reported.result).toMatchObject({
     actionId: "act_stage_exit_pending",
     dispatched: true,
@@ -6550,7 +7300,7 @@ test("one dispatched stage exit stays in flight until a mutation or bounded dead
   });
 });
 
-test("payment review compiles a tightly owned city route and canonical booking outcomes", async ({ page }) => {
+test("pre-card payment review compiles a tightly owned city route and canonical booking outcomes", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <h1>Overview &amp; payment</h1>
@@ -6700,6 +7450,11 @@ test("payment boundary finishes contact prerequisites then publishes no payment 
       </section>
       <aside><strong>Total (TRY)</strong><span>1,637.80 TL</span></aside>
       <fieldset><legend>Payment method</legend><label><input type="radio" name="payment-method"> New credit or debit card</label></fieldset>
+      <section aria-label="Card details">
+        <label>Card number <input autocomplete="cc-number"></label>
+        <label>Expiry <input autocomplete="cc-exp"></label>
+        <label>Security code <input autocomplete="cc-csc"></label>
+      </section>
       <label>Billing address <input name="billing.address"></label>
       <button id="review-pay" type="button">Pay 1,637.80 TL</button>
     </main>
@@ -6760,11 +7515,11 @@ test("payment boundary finishes contact prerequisites then publishes no payment 
   });
   expect(afterTask.paymentEvidence.boundaryObserved).toBe(true);
   expect(afterTask.terminalGoalLatch.locked).toBe(true);
-  expect(afterTask.terminalStatus).toBe("payment_review_reached");
+  expect(afterTask.terminalStatus).toBe("card_credential_entry_reached");
   expect(afterTask.currentGoal).toBeNull();
 });
 
-test("GoToGate-shaped payment review is terminal evidence without payment capabilities", async ({ page }) => {
+test("GoToGate-shaped card credential form is terminal evidence without executable payment actions", async ({ page }) => {
   await loadHtmlProducer(page, `
     <nav aria-label="Checkout progress"><span>Traveller information</span><span aria-current="step">Payment</span></nav>
     <main>
@@ -6791,7 +7546,9 @@ test("GoToGate-shaped payment review is terminal evidence without payment capabi
   const observation = await browserObservation(page, "obs_gotogate_payment_terminal");
   expect(observation.page.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
-    contractVersion: "terminal-evidence/v1",
+    contractVersion: "terminal-evidence/v2",
+    stage: "card_credential_entry",
+    cardCredentialEntryObserved: true,
     boundaryObserved: true,
     evidenceOnly: true,
     capabilities: { paymentActionsAllowed: false }
@@ -6817,7 +7574,7 @@ test("GoToGate-shaped payment review is terminal evidence without payment capabi
     traveler: { id: "trav_terminal", first_name: "Ali", last_name: "SIFRAR" },
     transactionReview: verifiedTransactionReview(448)
   });
-  expect(task.terminalStatus).toBe("payment_review_reached");
+  expect(task.terminalStatus).toBe("card_credential_entry_reached");
   expect(task.currentGoal).toBeNull();
   expect(task.paymentEvidence.paymentActionsAllowed).toBe(false);
 });
@@ -6840,7 +7597,7 @@ test("progressive payment entry compiles FROM/TO itinerary and outranks a generi
   const observation = await browserObservation(page, "obs_progressive_payment_entry");
   expect(observation.page.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
-    boundaryObserved: true,
+    boundaryObserved: false,
     signals: { route: true, entry: true },
     capabilities: { paymentActionsAllowed: false }
   });
@@ -6850,7 +7607,10 @@ test("progressive payment entry compiles FROM/TO itinerary and outranks a generi
     expect.objectContaining({ origin: "SJJ", destination: "IST", departureDate: "15 Oct Thu", departureTime: "20:45", arrivalTime: "23:40" }),
     expect.objectContaining({ origin: "IST", destination: "SJJ", departureDate: "19 Nov Thu", departureTime: "20:10", arrivalTime: "20:05" })
   ]);
-  expect(observation.page.transactionFacts.totalPrice).toEqual(expect.objectContaining({ amount: 317.54, currency: "EUR" }));
+  // The currency-preparation page exposes price context, but it is not yet an
+  // owned final card-entry total and therefore cannot rewrite transaction
+  // truth before the actual credential surface appears.
+  expect(observation.page.transactionFacts.totalPrice).toEqual({ amount: null, currency: "" });
   expect(observation.page.controls.every((control) => !/card number|pay now/i.test(control.label || ""))).toBe(true);
 
   const readiness = classifyObservationReadiness({
@@ -6983,7 +7743,9 @@ test("hosted payment widget with opaque native inputs contributes owned terminal
   const observation = await browserObservation(page, "obs_hosted_payment_terminal");
   expect(observation.page.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
-    contractVersion: "terminal-evidence/v1",
+    contractVersion: "terminal-evidence/v2",
+    stage: "card_credential_entry",
+    cardCredentialEntryObserved: true,
     boundaryObserved: true,
     evidenceOnly: true,
     signals: { progress: true, form: true },
@@ -7011,6 +7773,37 @@ test("hosted payment widget with opaque native inputs contributes owned terminal
   });
   expect(readiness.classification).toBe(READINESS.READY);
   expect(readiness.evidence.strongPaymentEvidence).toBeUndefined();
+});
+
+test("an opaque hosted card frame preempts optional billing identity controls", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <nav aria-label="Checkout progress"><span aria-current="step">Payment</span></nav>
+    <main>
+      <h1>Payment</h1>
+      <section aria-label="Billing details">
+        <label><input type="radio" name="billing-kind" value="personal" checked> Personal</label>
+        <label><input type="radio" name="billing-kind" value="company"> Company</label>
+      </section>
+      <iframe title="Secure card fields"></iframe>
+    </main>
+  `);
+
+  const observation = await browserObservation(page, "obs_opaque_hosted_card_with_billing");
+  expect(observation.page.terminalEvidence).toMatchObject({
+    hostedCardEntryPresent: true,
+    cardCredentialEntryObserved: true,
+    boundaryObserved: true,
+    verified: true
+  });
+  expect(observation.page.terminalEvidence.paymentCredentialKinds).toEqual([]);
+
+  const task = reduceTaskState({
+    observation,
+    traveler: { id: "trav_hosted_card", first_name: "Ali", last_name: "SIFRAR" },
+    transactionReview: verifiedTransactionReview()
+  });
+  expect(task.terminalStatus).toBe("card_credential_entry_reached");
+  expect(task.currentGoal).toBeNull();
 });
 
 test("hidden future hosted payment markup does not become terminal evidence", async ({ page }) => {
@@ -8254,7 +9047,8 @@ test("P0.9 registry replacement updates ownership without rekeying the physical 
   expect(result.ownerId).toBe(result.foregroundId);
   expect(result.datasetId).toBe(result.foregroundId);
   expect(result.ownerSurfaceId).toBe("bag-modal");
-  expect(result.ownerDecisionGroupId).toBe("dg_foreground_baggage");
+  expect(result.ownerDecisionGroupId).toMatch(/custom-choice-owner/);
+  expect(result.ownerDecisionGroupId).not.toBe("dg_foreground_baggage");
   expect(result.controlIds).toContain(result.foregroundId);
   expect(result.controlIds.filter((controlId) => controlId === result.foregroundId)).toHaveLength(1);
   expect(result.conflicts).toHaveLength(0);
@@ -8563,6 +9357,43 @@ test("a fresh stage-wide error introduced by a governed action becomes active wh
     stageWide: true
   });
   expect(result.errors).toEqual(["There was an error submitting this form"]);
+  expect(result.stageExit.continueAllowed).toBe(false);
+});
+
+test("fresh section-local payment validation owns the unique required attestation", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Payment</h1>
+      <section id="review-terms">
+        <h2>Review and terms</h2>
+        <label><input id="terms" name="TermsAndCondition" type="checkbox" required>Accept the booking conditions</label>
+        <button id="confirm" type="button">Confirm</button>
+      </section>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const before = hooks.observePageState({ forceFull: true, reason: "payment_validation_before" }).map;
+    const terms = before.controls.find((control) => control.name === "TermsAndCondition" || control.semantic === "legal_acceptance");
+    hooks.setActiveExecutionForTest("act_confirm", "obs_payment_before");
+    const summary = document.createElement("div");
+    summary.id = "inline-payment-error";
+    summary.textContent = "1 error";
+    document.getElementById("review-terms").appendChild(summary);
+    hooks.notePageMutations([{ type: "childList", target: summary.parentElement, addedNodes: [summary], removedNodes: [] }]);
+    const after = hooks.observePageState({ forceFull: true, reason: "payment_validation_after" }).map;
+    const issue = after.validationIssues.find((candidate) => candidate.message === "1 error");
+    return { terms, issue, errors: after.errors, stageExit: after.stageExit };
+  });
+
+  expect(result.issue).toMatchObject({
+    controlId: result.terms.controlId,
+    status: "active_control_error",
+    active: true,
+    introducedAfterAction: true,
+    causedByActionId: "act_confirm"
+  });
+  expect(result.errors).toEqual(["1 error"]);
   expect(result.stageExit.continueAllowed).toBe(false);
 });
 
@@ -9166,7 +9997,23 @@ test("reused modal progress plus a manual paid selection is reconciled and check
   interfered.previousObservation = initial;
   interfered.lastActionResult = firstExecution.result;
   const correctionTurn = await nextTurn(interfered, "turn_reused_modal_correction");
-  expect(correctionTurn.clientDecision.action).toBe("click");
+  expect(correctionTurn.clientDecision.action, JSON.stringify({
+    decision: correctionTurn.clientDecision,
+    currentGoal: correctionTurn.state.taskState?.currentGoal,
+    currentObligation: correctionTurn.state.taskState?.currentObligation,
+    checkoutSituation: correctionTurn.state.taskState?.checkoutSituation,
+    debug: correctionTurn.debug,
+    decisions: correctionTurn.state.taskState?.canonicalDecisions?.map((decision) => ({
+      decisionGroupId: decision.decisionGroupId,
+      semanticType: decision.semanticType,
+      status: decision.status,
+      currentOutcome: decision.currentOutcome,
+      subject: decision.subject,
+      userIntent: decision.userIntent,
+      selectedControlId: decision.selectedControlId,
+      physicalControlIds: decision.physicalControlIds
+    }))
+  }, null, 2)).toBe("click");
   expect(correctionTurn.clientDecision.controlId).not.toBe(firstTurn.clientDecision.controlId);
   expect(correctionTurn.state.taskState.currentObligation).toMatchObject({
     subject: { decisionGroupId: expect.any(String) },
@@ -10540,6 +11387,10 @@ test("action transport strips embedded page maps before the first backend reques
         controlId: "ctrl_nationality",
         value: "Slovenia"
       },
+      transportFiller: Object.fromEntries(Array.from(
+        { length: 20 },
+        (_, index) => [`diagnostic_${index}`, "y".repeat(3_000)]
+      )),
       outcome: {
         ok: true,
         code: "CHOICE_COMMIT_SETTLED",
@@ -10607,6 +11458,8 @@ test("action transport strips embedded page maps before the first backend reques
     popupClosed: true,
     focusSettled: true
   });
+  expect(received.lastActionResult.failureCode).toBe("");
+  expect(received.lastActionResult.outcome.code).toBe("CHOICE_COMMIT_SETTLED");
   expect(received.lastActionResult.outcome.evidence.exactChildSettlement).toMatchObject({
     contractVersion: "exact-child-choice-settlement/v1",
     settled: true,
@@ -11025,7 +11878,7 @@ test("final safe checkout replay advances completed traveler through both seat l
       browserResult: executed.result,
       afterObservation: executed.observation
     });
-    expect(["achieved", "progressed", "blocked"]).toContain(transition.status);
+    expect(["SATISFIED", "PROGRESSED", "REVEALED_BLOCKER"]).toContain(transition.actionOutcome.status);
     actions.push({
       actionId: action.id,
       plannedObservationId: action.observationId,
@@ -11033,7 +11886,7 @@ test("final safe checkout replay advances completed traveler through both seat l
       candidateId: candidate.candidateId,
       controlId: candidate.controlId,
       risk: candidate.risk,
-      transitionStatus: transition.status,
+      actionOutcomeStatus: transition.actionOutcome.status,
       action
     });
     return executed.observation;
@@ -11342,7 +12195,7 @@ test("checkpoint checkout reaches payment through review without paid, close, ca
     url: observation.page.url,
     controls: observation.page.controls.map((control) => ({ label: control.label, semantic: control.semantic, field: control.field }))
   }, null, 2)).toBe(true);
-  expect(paymentTaskState.terminalStatus).toBe("payment_review_reached");
+  expect(paymentTaskState.terminalStatus).toBe("card_credential_entry_reached");
   expect(paymentTaskState.currentGoal).toBeNull();
 
   const paymentActionResult = observation.lastActionResult;
@@ -11542,7 +12395,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
       transactionReview: prepared.review
     });
     state = { ...state, taskState };
-    if (taskState.terminalStatus === "payment_review_reached") break;
+    if (taskState.terminalStatus === "card_credential_entry_reached") break;
     // The durable outcome journal is compiled by TaskState, then consumed by
     // transaction reconciliation on the following turn. Waiting one bounded
     // reconciliation-only turn at the payment boundary is expected and must
@@ -11611,7 +12464,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
     outcomeCoverage: finalTaskState.outcomeCoverage,
     observedDecisions: finalTaskState.observedDecisions,
     counters: await page.evaluate(() => window.__dirtyCounters)
-  }, null, 2)).toBe("payment_review_reached");
+  }, null, 2)).toBe("card_credential_entry_reached");
   expect(finalTaskState.currentGoal).toBeNull();
   expect(await page.locator("#total-price").textContent()).toContain("200 EUR");
   expect(selectedLabels.slice(0, 4)).toEqual(expect.arrayContaining([
@@ -11632,7 +12485,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
   });
 });
 
-test("live-shaped selected bundle inherits paid evidence only from its owned decision section", async ({ page }) => {
+test("live-shaped selected bundle does not inherit a nearby section price and still follows exact commerce/profile intent", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <h1>Optional extras</h1>
@@ -11658,10 +12511,10 @@ test("live-shaped selected bundle inherits paid evidence only from its owned dec
   const group = observation.page.decisionGroups.find((item) => /bundle/i.test(item.sectionLabel));
   expect(group).toBeTruthy();
   expect(group.selectedEvidence).toMatchObject({
-    disposition: "paid",
-    structuredPrice: { amount: 29, currency: "EUR" },
-    source: "owned_decision_section"
+    structuredPrice: null,
+    source: "selected_control_state"
   });
+  expect(group.selectedEvidence.disposition).toBe("paid");
   const selectedControl = observation.page.controls.find((control) => control.controlId === group.selectedControlId);
   expect(selectedControl.structuredPrice).toBeNull();
 
@@ -11687,7 +12540,7 @@ test("live-shaped selected bundle inherits paid evidence only from its owned dec
   expect(taskState.activeDecisions).toHaveLength(0);
   expect(observation.page.decisionGroups.find((item) => item.decisionGroupId === group.decisionGroupId).selectedEvidence).toMatchObject({
     disposition: "free",
-    structuredPrice: { amount: 0, currency: "EUR" }
+    structuredPrice: null
   });
 });
 
@@ -12385,7 +13238,7 @@ test("an active parent card cannot turn an unchecked native paid toggle into a s
   expect(candidateSet.candidates.some((candidate) => candidate.targetLabel === "Continue")).toBe(true);
 });
 
-test("a custom free card remains committed when the site only enables Continue after a delay", async ({ page }) => {
+test("a stable custom choice does not fabricate commitment while Continue changes later", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <h1>Passengers, baggage, insurance</h1>
@@ -12431,16 +13284,13 @@ test("a custom free card remains committed when the site only enables Continue a
     "obs_delayed_custom_choice_selected"
   );
   expect(selected.verification).toMatchObject({
-    ok: true,
-    code: "EXACT_FREE_OPTION_VERIFIED"
+    ok: false,
+    code: "EXACT_FREE_OPTION_NOT_VERIFIED"
   });
-  const group = selected.observation.page.decisionGroups.find((item) => (
+  expect(selected.observation.page.decisionGroups.find((item) => (
     item.decisionGroupId === taskState.currentGoal.decisionGroupId
-  ));
-  expect(group).toMatchObject({
-    status: "satisfied",
-    selectedControlId: candidate.controlId
-  });
+  ))?.selectedControlId || "").toBe("");
+  await page.waitForTimeout(500);
   expect(await page.isEnabled("#continue")).toBe(true);
 });
 
@@ -12756,7 +13606,7 @@ test("collapsed custom selector publishes its displayed paid value without check
     selected: true,
     disposition: "paid",
     structuredPrice: { amount: 29, currency: "EUR" },
-    source: "owned_decision_section"
+    source: "exact_selector_owner"
   });
   const taskState = reduceTaskState({
     observation,
@@ -13391,7 +14241,7 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     currentGoal: goal,
     lastAction: deadAction
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), deadExecution.observation, before);
-  expect(failed.transition.status).toBe("no_effect");
+  expect(failed.transition.actionOutcome.status).toBe("NO_EFFECT");
   expect(executionRecovery(failed.state).attempts).toBe(1);
   expect(executionRecovery(failed.state).failedStrategies).toHaveLength(1);
 
@@ -13412,52 +14262,22 @@ test("task-scoped no-effect memory survives rerender while useful progress reset
     state: { taskState: rerenderedTaskState }
   });
   const distinctMethodRetry = firstRetrySet.candidates.find((candidate) => candidate.targetLabel === "Next");
-  expect(distinctMethodRetry?.interactionMethod).toBe("native_click");
-  const distinctMethodAction = loopPrivate.bindTargetSnapshot(
-    actionForCurrentCandidate(rerenderedGoal, distinctMethodRetry, rerendered),
-    rerendered
-  );
-  const distinctMethodExecution = await executeAtomicBrowserDecision(
-    page,
-    toClientDecision(distinctMethodAction),
-    "obs_memory_second_no_effect"
-  );
-  const twiceFailed = loopPrivate.applyTransitionStatus({
-    ...failed.state,
-    taskState: { ...rerenderedTaskState, currentGoal: rerenderedGoal },
-    currentGoal: rerenderedGoal,
-    lastAction: distinctMethodAction
-  }, distinctMethodExecution.observation, rerendered);
-  expect(twiceFailed.transition.status).toBe("no_effect");
-  expect(executionRecovery(twiceFailed.state).failedStrategies).toHaveLength(2);
-
-  const secondFailureSignatures = loopPrivate.failedStrategySignaturesForGoal(
-    twiceFailed.state,
-    rerenderedGoal,
-    distinctMethodExecution.observation
-  );
-  const secondRetrySet = groundedObservationCandidateSet(
-    rerenderedGoal,
-    distinctMethodExecution.observation,
-    secondFailureSignatures,
-    { state: { taskState: rerenderedTaskState } }
-  );
-  expect(secondRetrySet.candidates.some((candidate) => candidate.targetLabel === "Next")).toBe(false);
-  const next = secondRetrySet.candidates.find((candidate) => candidate.targetLabel === "Continue");
+  expect(distinctMethodRetry).toBeUndefined();
+  const next = firstRetrySet.candidates.find((candidate) => candidate.targetLabel === "Continue");
   expect(next).toBeTruthy();
 
   const nextAction = loopPrivate.bindTargetSnapshot(
-    actionForCurrentCandidate(rerenderedGoal, next, distinctMethodExecution.observation),
-    distinctMethodExecution.observation
+    actionForCurrentCandidate(rerenderedGoal, next, rerendered),
+    rerendered
   );
   const nextExecution = await executeAtomicBrowserDecision(page, toClientDecision(nextAction), "obs_memory_progress");
   const progressed = loopPrivate.applyTransitionStatus({
-    ...twiceFailed.state,
+    ...failed.state,
     taskState: { ...rerenderedTaskState, currentGoal: rerenderedGoal },
     currentGoal: rerenderedGoal,
     lastAction: nextAction
-  }, nextExecution.observation, distinctMethodExecution.observation);
-  expect(progressed.transition.status).toBe("progressed");
+  }, nextExecution.observation, rerendered);
+  expect(progressed.transition.actionOutcome.status).toBe("REVEALED_BLOCKER");
   expect(executionRecovery(progressed.state).attempts).toBe(0);
   expect(executionRecovery(progressed.state).failedStrategies).toHaveLength(0);
 
@@ -13496,6 +14316,8 @@ test("live-shaped review modal keeps grounded safe controls selectable and submi
     <section id="payment" hidden>
       <h1>Payment</h1>
       <label>Card number <input name="cardNumber" autocomplete="cc-number"></label>
+      <label>Expiry <input name="expiry" autocomplete="cc-exp"></label>
+      <label>Security code <input name="cvc" autocomplete="cc-csc"></label>
       <button type="button" data-testid="card-number" aria-label="Card number" autocomplete="cc-number">Card number</button>
       <h2>Payment method</h2><p>Order amount: 430 EUR</p>
     </section>
@@ -13575,7 +14397,7 @@ test("live-shaped review modal keeps grounded safe controls selectable and submi
     sections: executed.observation.page.sections,
     surface: executed.observation.page.currentSurface
   }, null, 2)).toBe("completed");
-  expect(paymentTaskState.terminalStatus).toBe("payment_review_reached");
+  expect(paymentTaskState.terminalStatus).toBe("card_credential_entry_reached");
 });
 
 test("paid-only seat map treats Next as navigation instead of inventing a free-seat obligation", async ({ page }) => {

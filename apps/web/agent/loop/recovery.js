@@ -160,6 +160,30 @@ function rebindPendingRecoveryAction(pending = {}, observation = {}, state = {},
   return { action, candidateSet: reboundSet, candidate: reboundCandidate };
 }
 
+function pendingRecoveryOwnedByCurrentObligation(pending = {}, taskState = {}) {
+  const original = pending.originalAction || {};
+  const lease = pending.actionLease || {};
+  const obligation = currentObligation(taskState);
+  if (!obligation) return false;
+
+  const leasedObligationId = String(lease.obligationId || original.obligationId || "").trim();
+  const currentObligationId = String(obligation.obligationId || "").trim();
+  if (leasedObligationId && currentObligationId && leasedObligationId !== currentObligationId) return false;
+
+  const leasedDecisionGroupId = String(
+    original.decisionGroupId
+      || original.expectedOutcome?.decisionGroupId
+      || original.expectedPostconditions?.[0]?.decisionGroupId
+      || ""
+  ).trim();
+  const currentDecisionGroupId = String(obligation.subject?.decisionGroupId || "").trim();
+  if (leasedDecisionGroupId && currentDecisionGroupId && leasedDecisionGroupId !== currentDecisionGroupId) return false;
+
+  const delta = obligation.desiredStateDelta || obligation.binding?.component?.desiredStateDelta || null;
+  if (delta && delta.actionRequired === false) return false;
+  return true;
+}
+
 function pendingRecoveryTargetStatus(action = {}) {
   const target = action.targetSnapshot || null;
   const region = target?.visualRegion || target?.box || null;
@@ -289,6 +313,7 @@ module.exports = {
   candidateSelectionCacheEntry,
   pendingRecoveryTargetStatus,
   pendingRevealAction,
+  pendingRecoveryOwnedByCurrentObligation,
   rebindPendingRecoveryAction,
   reusableCandidateSelection,
   reusableStaleActionCandidate,
@@ -297,4 +322,3 @@ module.exports = {
   viewportProgressSample,
   viewportRecoveryAction
 };
-

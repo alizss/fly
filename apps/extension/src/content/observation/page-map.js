@@ -243,6 +243,7 @@ export function createPageMapCompiler(dependencies) {
       errors,
       step,
       controls,
+      terminalEvidence,
       currentSurface: surfaceModel.currentSurface
     });
     const transactionFacts = transactionFactsEvidence({

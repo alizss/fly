@@ -11,6 +11,7 @@ function serviceWorkerHarness(tabUrl = "https://checkout.unfamiliar-air.test/pas
   const storage = {};
   const calls = { insertedCss: [], executedScripts: [], tabMessages: [] };
   let messageListener = null;
+  let tabCreatedListener = null;
   let tabUpdatedListener = null;
   let currentTabUrl = tabUrl;
   const chrome = {
@@ -40,6 +41,7 @@ function serviceWorkerHarness(tabUrl = "https://checkout.unfamiliar-air.test/pas
         calls.tabMessages.push({ tabId, message });
         return { ok: true, status: "started" };
       },
+      onCreated: { addListener(listener) { tabCreatedListener = listener; } },
       onUpdated: { addListener(listener) { tabUpdatedListener = listener; } },
       onRemoved: { addListener() {} },
       captureVisibleTab(_windowId, _options, callback) { callback(""); }
@@ -74,6 +76,7 @@ function serviceWorkerHarness(tabUrl = "https://checkout.unfamiliar-air.test/pas
     clearTimeout
   });
   assert.equal(typeof messageListener, "function");
+  assert.equal(typeof tabCreatedListener, "function");
   assert.equal(typeof tabUpdatedListener, "function");
 
   async function send(message, sender = { id: chrome.runtime.id }) {
@@ -105,7 +108,16 @@ function serviceWorkerHarness(tabUrl = "https://checkout.unfamiliar-air.test/pas
     }
   }
 
-  return { calls, completeNavigation, send, storage };
+  async function createTab(tab) {
+    tabCreatedListener(tab);
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (storage[`${CHECKOUT_CONTEXT_PREFIX_FOR_TEST}:${tab.id}`]) return;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  const CHECKOUT_CONTEXT_PREFIX_FOR_TEST = "atwCheckoutContextV1";
+  return { calls, completeNavigation, createTab, send, storage };
 }
 
 function selectedBooking(travelerId = "trav_unfamiliar") {
@@ -153,6 +165,99 @@ test("explicit launch injects Fly on an unlisted http checkout", async () => {
     "RUNTIME_INJECTED",
     "AGENT_START_REQUESTED"
   ]);
+});
+
+test("a sidebar-started checkout popup inherits the opener's durable session before content boot", async () => {
+  const harness = serviceWorkerHarness("https://checkout.unfamiliar-air.test/review");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const lineage = await harness.send({ type: "ATW_CHECKOUT_LINEAGE_BEGIN" }, sender);
+  assert.equal(lineage.context.source, "browser_selection");
+  await harness.send({
+    type: "ATW_CHECKOUT_RESUME_SAVE",
+    marker: { travelerId: "trav_unfamiliar", sessionId: "chk_durable_popup" }
+  }, sender);
+
+  await harness.createTab({ id: 74, openerTabId: 73, url: "about:blank" });
+
+  assert.equal(harness.storage["atwCheckoutContextV1:74"].checkoutLineageId,
+    harness.storage["atwCheckoutContextV1:73"].checkoutLineageId);
+  assert.equal(harness.storage.atwAgentResume.sessionId, "chk_durable_popup");
+  assert.equal(harness.storage.atwAgentResume.tabContextId, "74");
+  assert.equal(harness.storage.atwAgentResume.handoffFromTabContextId, "73");
+  assert.equal(
+    harness.storage.atwAgentResumeByLineageV1[lineage.context.checkoutLineageId].tabContextId,
+    "74"
+  );
+});
+
+test("a sidebar-started active checkout follows a same-tab redirect to an unfamiliar payment provider", async () => {
+  const harness = serviceWorkerHarness("https://booking.supported-air.test/payment");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const lineage = await harness.send({ type: "ATW_CHECKOUT_LINEAGE_BEGIN" }, sender);
+  assert.equal(lineage.context.source, "browser_selection");
+  await harness.send({
+    type: "ATW_CHECKOUT_RESUME_SAVE",
+    marker: { travelerId: "trav_unfamiliar", sessionId: "chk_sidebar_redirect" }
+  }, sender);
+
+  await harness.completeNavigation(73, "https://payments.unfamiliar-provider.test/card-entry");
+
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.calls.insertedCss)), [{
+    target: { tabId: 73 },
+    files: ["src/content/sidebar.css"]
+  }]);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.calls.executedScripts)), [{
+    target: { tabId: 73 },
+    files: ["dist/content.js"]
+  }]);
+  const diagnostics = await harness.send(
+    { type: "ATW_STARTUP_DIAGNOSTICS" },
+    sender
+  );
+  assert.ok(diagnostics.events.some((event) => event.code === "RUNTIME_REINJECTED"));
+});
+
+test("a browser-selection context without an active session does not follow unrelated navigation", async () => {
+  const harness = serviceWorkerHarness("https://booking.supported-air.test/search");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const lineage = await harness.send({ type: "ATW_CHECKOUT_LINEAGE_BEGIN" }, sender);
+  assert.equal(lineage.context.source, "browser_selection");
+
+  await harness.completeNavigation(73, "https://unrelated.example.test/home");
+
+  assert.equal(harness.calls.insertedCss.length, 0);
+  assert.equal(harness.calls.executedScripts.length, 0);
+});
+
+test("resume save claim and clear are isolated by checkout lineage rather than a global tab marker", async () => {
+  const harness = serviceWorkerHarness();
+  const first = await harness.send({ type: "ATW_START_CHECKOUT", tabId: 73, autoStart: true });
+  const second = await harness.send({ type: "ATW_START_CHECKOUT", tabId: 74, autoStart: true });
+  const sender = (tabId) => ({ id: "extension-test", tab: { id: tabId } });
+
+  await harness.send({
+    type: "ATW_CHECKOUT_RESUME_SAVE",
+    marker: { sessionId: "chk_first", travelerId: "trav_first" }
+  }, sender(73));
+  await harness.send({
+    type: "ATW_CHECKOUT_RESUME_SAVE",
+    marker: { sessionId: "chk_second", travelerId: "trav_second" }
+  }, sender(74));
+
+  const claimedFirst = await harness.send({ type: "ATW_CHECKOUT_RESUME_CLAIM" }, sender(73));
+  assert.equal(claimedFirst.marker.sessionId, "chk_first");
+  assert.equal(claimedFirst.marker.checkoutLineageId, first.context.checkoutLineageId);
+
+  const clearedFirst = await harness.send({
+    type: "ATW_CHECKOUT_RESUME_CLEAR",
+    expected: { sessionId: "chk_first" }
+  }, sender(73));
+  assert.equal(clearedFirst.cleared, true);
+  assert.equal(harness.storage.atwAgentResumeByLineageV1[first.context.checkoutLineageId], undefined);
+  assert.equal(harness.storage.atwAgentResumeByLineageV1[second.context.checkoutLineageId].sessionId, "chk_second");
+
+  const claimedSecond = await harness.send({ type: "ATW_CHECKOUT_RESUME_CLAIM" }, sender(74));
+  assert.equal(claimedSecond.marker.sessionId, "chk_second");
 });
 
 test("app-supplied SelectedBooking starts an itinerary-free unfamiliar passenger page", async () => {

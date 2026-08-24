@@ -18,6 +18,7 @@ export function createPageStateStore({
   validationLifecycle,
   actionableCheckoutErrors,
   hasActiveActionAttempt = () => false,
+  activeActionAttemptId = () => "",
   logFlow,
   sleep,
   onMaterialMutation = () => {}
@@ -140,6 +141,7 @@ export function createPageStateStore({
       errors: next.errors,
       step: next.step,
       controls: next.controls,
+      terminalEvidence: next.terminalEvidence,
       currentSurface: next.currentSurface
     });
     next.summary = {
@@ -197,15 +199,34 @@ export function createPageStateStore({
       let promoted = false;
       next.validationIssues = (next.validationIssues || []).map((issue) => {
         const key = `${issue.issueId || ""}|${issue.message || ""}`;
-        if (previousValidation.has(key) || issue.stageWide !== true || issue.active === true) return issue;
+        if (previousValidation.has(key)) return issue;
+        const causedByActionId = String(activeActionAttemptId() || "");
+        if (issue.active === true) {
+          promoted = true;
+          return { ...issue, introducedAfterAction: true, causedByActionId };
+        }
+        // A fresh positive validation response is causal feedback from the
+        // action even when an unfamiliar page has not exposed a trustworthy
+        // owner or global alert container. Keep it stage-wide until a tighter
+        // owner can be established; never discard the only explanation for a
+        // failed transition because classification was uncertain.
+        const positiveUnownedFeedback = !issue.controlId && Number(issue.errorCount || 0) > 0;
+        const attributableControlFeedback = Boolean(issue.controlId);
+        if (issue.stageWide !== true && !positiveUnownedFeedback && !attributableControlFeedback) return issue;
         const lifecycle = validationLifecycle({
           ...issue,
+          stageWide: issue.stageWide === true || positiveUnownedFeedback,
           visible: issue.visible !== false,
           active: true,
           introducedAfterAction: true
         });
         promoted = promoted || lifecycle.active;
-        return { ...issue, ...lifecycle };
+        return {
+          ...issue,
+          ...lifecycle,
+          stageWide: issue.stageWide === true || positiveUnownedFeedback,
+          causedByActionId
+        };
       });
       if (promoted) {
         next.errors = actionableCheckoutErrors(next.validationIssues);
@@ -216,6 +237,7 @@ export function createPageStateStore({
           errors: next.errors,
           step: next.step,
           controls: next.controls,
+          terminalEvidence: next.terminalEvidence,
           currentSurface: next.currentSurface
         });
         next.summary = {
@@ -263,7 +285,9 @@ export function createPageStateStore({
   const waitForQuiet = async ({ maxWaitMs = 650, minQuietMs = 70, awaitMutationMs = 0 } = {}) => {
     const startedAt = performance.now();
     while (!dirty && awaitMutationMs > 0 && performance.now() - startedAt < Math.min(awaitMutationMs, maxWaitMs)) {
-      await new Promise((resolve) => requestAnimationFrame(resolve));
+      // requestAnimationFrame may stop entirely in a background tab. A timer
+      // keeps this mutation wait genuinely bounded when Fly is not focused.
+      await sleep(Math.min(16, Math.max(1, Math.min(awaitMutationMs, maxWaitMs) - (performance.now() - startedAt))));
     }
     while (dirty && performance.now() - startedAt < maxWaitMs) {
       const dynamicQuietMs = Math.min(240, minQuietMs + pendingMutations.length * 3);

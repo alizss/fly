@@ -17,6 +17,21 @@ const {
 const { fieldDescriptors } = require("../../apps/web/agent/profile-requirements");
 const { evaluatePostcondition } = require("../../apps/web/agent/transition-evaluator");
 const { semanticGoalKey, decisionInstanceKey } = require("../../packages/shared/agent-actions");
+
+test("raw and compiled global goals share one semantic recovery key", () => {
+  const raw = {
+    semanticType: "navigation",
+    logicalFieldId: "",
+    desiredValue: "next_stage"
+  };
+  const compiled = {
+    contractVersion: "current-obligation/v2",
+    subject: { semanticType: "navigation", subjectId: "global" },
+    desiredValue: "next_stage",
+    binding: { component: {} }
+  };
+  assert.equal(semanticGoalKey(raw), semanticGoalKey(compiled));
+});
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
 
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
@@ -200,6 +215,37 @@ test("combined first and middle name input is one given-names requirement and mi
   assert.equal(logical.semanticType, "given_names");
   assert.equal(logical.desiredCanonicalValue, "ali");
   assert.equal(logical.components[0].inputValue, "Ali");
+});
+
+test("a scalar textbox reads its normalized input before label-like option metadata", () => {
+  const control = {
+    controlId: "ctrl_given_names",
+    fieldType: "given_names",
+    field: "given_names",
+    semantic: "given_names",
+    role: "textbox",
+    kind: "text",
+    label: "Given names",
+    name: "passengers.0.firstname",
+    state: {
+      valuePresent: true,
+      normalizedValue: "ali",
+      optionValue: "passengers.0.firstname e.g. harry james given names",
+      disabled: false
+    },
+    operations: { type: { operation: "type", actuatorId: "target_given_names" } }
+  };
+
+  const [logical] = resolveLogicalFields({
+    step: "traveler_information",
+    controls: [control],
+    fields: [fieldFor(control)],
+    validationIssues: []
+  }, { first_name: "Ali" });
+
+  assert.equal(logical.currentCanonicalValue, "ali");
+  assert.equal(logical.components[0].currentCanonicalValue, "ali");
+  assert.equal(logicalFieldSatisfied(logical), true);
 });
 
 test("split custom choice compiles visible mechanics and hidden state as one settled logical component", () => {

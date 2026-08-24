@@ -84,11 +84,12 @@ function controlConsequence(control = {}) {
     control.autocomplete
   ].filter(Boolean).join(" "));
   const choiceLike = /checkbox|switch/.test(lower(`${control.kind || ""} ${control.role || ""} ${control.inputType || ""}`));
-  if (/accept_legal|legal_acceptance|terms_accept|accept_terms|legal|consent|attestation/.test(explicitMeaning)
+  if (/accept_legal|legal_acceptance|terms_accept|accept_terms|unknown_attestation/.test(explicitMeaning)
     || (choiceLike && /agree|accept|terms|conditions|dangerous goods|declaration/.test(evidence))) {
     return "legal_attestation";
   }
-  if (/enter_payment|card_number|card_expiry|security_code|\bcvc\b|\bcvv\b|cc-number|cc-exp|cc-csc|payment_method/.test(evidence)) {
+  if (/enter_payment|card_number|card_expiry|security_code|\bcvc\b|\bcvv\b|cc-number|cc-exp|cc-csc/.test(explicitMeaning)
+    || /autocomplete[:= ](?:cc-number|cc-exp|cc-csc)|name[:= ](?:cardnumber|card_number|cvv|cvc)/.test(evidence)) {
     return "payment_entry";
   }
   if (/submit_purchase|complete_purchase|confirm_and_pay|pay_now|place_order|book_now/.test(explicitMeaning)
@@ -123,6 +124,7 @@ function requiredProfileObligation(descriptor = {}, page = {}) {
     logicalFieldId: clean(descriptor.logicalFieldId),
     surfaceId: clean(descriptor.control?.surfaceId || "surface-page"),
     evidenceIds: controlEvidenceIds(descriptor.control),
+    evidenceStrength: "strong",
     status: "unresolved"
   });
 }
@@ -132,10 +134,12 @@ function groupObligation(group = {}) {
   const unresolved = group.requiresResolution === true
     || (group.required === true && !["satisfied", "waived", "waived_by_policy", "optional"].includes(status));
   if (!unresolved) return null;
+  const semanticType = clean(group.sectionType || group.semanticType || "decision");
+  const unknownAttestation = /unknown_attestation/.test(lower(semanticType));
   return Object.freeze({
     obligationId: clean(group.decisionGroupId || group.requirementId),
-    kind: "checkout_decision",
-    semanticType: clean(group.sectionType || group.semanticType || "decision"),
+    kind: unknownAttestation ? "unknown_attestation" : "checkout_decision",
+    semanticType,
     decisionGroupId: clean(group.decisionGroupId),
     surfaceId: clean(group.surfaceId || "surface-page"),
     evidenceIds: Object.freeze(unique([
@@ -143,6 +147,55 @@ function groupObligation(group = {}) {
       ...(group.alternativeControlIds || []),
       ...(group.alternatives || []).map((option) => option.controlId)
     ])),
+    evidenceStrength: group.required === true ? "structural" : "strong",
+    status: "unresolved"
+  });
+}
+
+function controlRequiredEvidence(control = {}, validationIssues = []) {
+  const state = control.state || {};
+  const validation = (validationIssues || []).find((issue) => (
+    issue.controlId && issue.controlId === control.controlId
+  ));
+  if (validation || state.invalid === true || control.invalid === true) return "strong";
+  const shape = lower(`${control.role || ""} ${control.kind || ""} ${control.inputType || ""}`);
+  if ((control.required === true || state.required === true)
+    && /checkbox|radio|switch|option/.test(shape)) return "structural";
+  return (control.required === true || state.required === true) ? "weak" : "none";
+}
+
+function unknownRequiredObligation(control = {}, validationIssues = [], ownedEvidenceIds = new Set()) {
+  if (!control?.controlId || ownedEvidenceIds.has(control.controlId) || !activeRepresentation(control)) return null;
+  const state = control.state || {};
+  if (state.valuePresent === true || state.checked === true || state.selected === true || control.selected === true) return null;
+  const strength = controlRequiredEvidence(control, validationIssues);
+  // Weak HTML-required evidence on an ordinary text field is deliberately
+  // retained as evidence but cannot become a blocker by itself.
+  if (!["strong", "structural"].includes(strength)) return null;
+  const attestation = /checkbox|radio|switch/.test(lower(`${control.role || ""} ${control.kind || ""}`));
+  return Object.freeze({
+    obligationId: `unknown-required:${clean(control.stableKey || control.controlId)}`,
+    kind: attestation ? "unknown_attestation" : "unknown_required",
+    semanticType: clean(control.semantic || control.fieldType || (attestation ? "unknown_attestation" : "unknown")),
+    controlId: clean(control.controlId),
+    surfaceId: clean(control.surfaceId || "surface-page"),
+    evidenceIds: controlEvidenceIds(control),
+    evidenceStrength: strength,
+    status: "unresolved"
+  });
+}
+
+function validationObligation(issue = {}, page = {}, index = 0) {
+  const owner = (page.controls || []).find((control) => control.controlId === issue.controlId) || null;
+  return Object.freeze({
+    obligationId: `unknown-validation:${clean(issue.issueId || issue.controlId || issue.sectionId || index + 1)}`,
+    kind: "unknown_validation",
+    semanticType: clean(issue.semanticType || owner?.semantic || owner?.fieldType || "unknown"),
+    controlId: clean(issue.controlId),
+    surfaceId: clean(issue.surfaceId || owner?.surfaceId || "surface-page"),
+    evidenceIds: Object.freeze(unique([issue.issueId, issue.controlId, issue.sectionId, ...controlEvidenceIds(owner || {})])),
+    evidenceStrength: "strong",
+    evidence: clean(issue.message || issue.text || issue.label || issue),
     status: "unresolved"
   });
 }
@@ -180,6 +233,7 @@ function compileCheckoutSituation({
   page = {},
   profileRequirements = [],
   commerceEntities = [],
+  standaloneDecisions = [],
   semanticCompilation = {}
 } = {}) {
   const controls = (page.controls || []).filter(activeRepresentation);
@@ -196,9 +250,43 @@ function compileCheckoutSituation({
     .filter(Boolean);
   const decisionObligations = commerceEntities.map(groupObligation).filter(Boolean);
   const boundaryObligations = controls.map(consequentialObligation).filter(Boolean);
-  const validationBlockers = activeValidationIssues(page.validationIssues || []).map((issue, index) => Object.freeze({
+  const activeValidation = activeValidationIssues(page.validationIssues || []);
+  const validationObligations = activeValidation.map((issue, index) => validationObligation(issue, page, index));
+  // Unknown-obligation discovery is allowed only after every deterministic
+  // producer has had a chance to claim its controls. Include resolved and
+  // optional entities here as well: an unchecked alternative in a satisfied
+  // radio group, or an already-accepted legal checkbox, must not be reborn as
+  // a parallel "unknown required" obligation merely because it no longer
+  // needs an active obligation of its own.
+  const recognizedEvidenceIds = [
+    ...profileRequirements.flatMap((descriptor) => controlEvidenceIds(descriptor.control || {})),
+    ...commerceEntities.flatMap((group) => unique([
+      group.selectedControlId,
+      ...(group.alternativeControlIds || []),
+      ...(group.alternatives || []).map((option) => option.controlId)
+    ])),
+    ...standaloneDecisions.flatMap((decision) => unique([
+      decision.controlId,
+      decision.selectedControlId,
+      ...(decision.physicalControlIds || []),
+      ...(decision.alternativeControlIds || [])
+    ])),
+    ...controls
+      .filter((control) => controlConsequence(control) !== "unknown")
+      .flatMap(controlEvidenceIds)
+  ];
+  const ownedEvidenceIds = new Set([
+    ...profileObligations,
+    ...decisionObligations,
+    ...boundaryObligations,
+    ...validationObligations
+  ].flatMap((obligation) => obligation.evidenceIds || []).concat(recognizedEvidenceIds).filter(Boolean));
+  const unknownRequiredObligations = controls
+    .map((control) => unknownRequiredObligation(control, activeValidation, ownedEvidenceIds))
+    .filter(Boolean);
+  const validationBlockers = activeValidation.map((issue, index) => Object.freeze({
     blockerId: clean(issue.controlId || issue.sectionId || `validation-${index + 1}`),
-    kind: "validation",
+    kind: "unknown_validation",
     controlId: clean(issue.controlId),
     surfaceId: clean(issue.surfaceId || "surface-page"),
     evidence: clean(issue.message || issue.text || issue.label || issue)
@@ -224,10 +312,14 @@ function compileCheckoutSituation({
       ]))
     }))
   ];
-  const navigationControlIds = Object.freeze(unique([
-    ...(page.stageExit?.candidates || []).map((candidate) => candidate.controlId),
-    ...actions.filter((action) => action.consequence === "checkout_progress").map((action) => action.controlId)
-  ]));
+  // The canonical controls are the only action authority. `stageExit` is a
+  // browser-side diagnostic projection of these same controls and must never
+  // re-admit a target that the graph itself did not publish as available.
+  const navigationControlIds = Object.freeze(unique(
+    actions
+      .filter((action) => action.consequence === "checkout_progress")
+      .map((action) => action.controlId)
+  ));
   const checkoutActive = Boolean(
     controls.length
     || commerceEntities.length
@@ -239,7 +331,9 @@ function compileCheckoutSituation({
   const obligations = Object.freeze([
     ...profileObligations,
     ...decisionObligations,
-    ...boundaryObligations
+    ...boundaryObligations,
+    ...validationObligations,
+    ...unknownRequiredObligations
   ]);
   return Object.freeze({
     contractVersion: CHECKOUT_SITUATION_VERSION,
@@ -287,7 +381,6 @@ function createObservationFrame(observation = {}) {
       // observation hash. Referencing them avoids copying high-cardinality
       // seat maps merely to wrap the frame.
       controls: arrayReference(page.controls),
-      stageExit: page.stageExit || null,
       viewport: page.viewport || null
     }),
     evidence: Object.freeze({
@@ -351,6 +444,7 @@ function compileDecisionFrame({
     page,
     profileRequirements,
     commerceEntities: compilation.decisionGroups || [],
+    standaloneDecisions,
     semanticCompilation: compilation
   });
   return Object.freeze({
@@ -364,7 +458,7 @@ function compileDecisionFrame({
     profileRequirements: freezeArray(profileRequirements),
     standaloneDecisions: freezeArray(standaloneDecisions),
     commerceEntities: freezeArray(compilation.decisionGroups || []),
-    navigationOpportunity: page.stageExit || null,
+    navigationDiagnostics: page.stageExit || null,
     transactionFacts,
     terminalEvidence: page.terminalEvidence || null,
     validationBlockers: arrayReference(page.validationIssues),
@@ -467,7 +561,10 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null } = {}) {
       validationOwnership: goal.validationOwnership ? Object.freeze({ ...goal.validationOwnership }) : null,
       dateCodec: goal.dateCodec ? Object.freeze({ ...goal.dateCodec }) : null,
       codecError: goal.codecError ? Object.freeze({ ...goal.codecError }) : null,
-      reconciliation: goal.reconciliation ? Object.freeze({ ...goal.reconciliation }) : null
+      reconciliation: goal.reconciliation ? Object.freeze({ ...goal.reconciliation }) : null,
+      desiredStateDelta: goal.desiredStateDelta
+        ? Object.freeze({ ...goal.desiredStateDelta })
+        : null
     }),
     choice: Object.freeze({
       mode: clean(goal.selectionMode),
@@ -517,23 +614,34 @@ function currentObligationFromGoal({ goal = null, decisionFrame = null } = {}) {
       || goal.requirementId
       || goal.decisionGroupId
       || goal.decisionInstanceId
-      || goal.goalId
+      || goal.semanticType
+      || goal.kind
+      || "global"
   });
+  const ownerId = semanticOwnerId(owner);
   const obligation = {
     contractVersion: CURRENT_OBLIGATION_VERSION,
-    obligationId: clean(goal.goalId || goal.requirementId || goal.decisionGroupId),
+    // Production goal producers use semantic IDs that survive observation
+    // replacement. Preserve an explicitly supplied ID so leased-action and
+    // result receipts remain compatible across the CurrentObligation bridge.
+    obligationId: clean(goal.goalId || goal.requirementId || goal.decisionGroupId || `obligation:${ownerId}`),
     authority: "task_state",
     observationId: clean(decisionFrame?.observationId || goal.observationId),
     observationHash: clean(decisionFrame?.observationHash),
     surfaceId: clean(goal.owner?.surfaceId || goal.surfaceId || decisionFrame?.observationFrame?.surface?.id || "surface-page"),
     kind: clean(goal.kind || goal.semanticType || "unknown"),
     semanticOwner: owner,
-    semanticOwnerId: semanticOwnerId(owner),
+    semanticOwnerId: ownerId,
     subject: obligationSubject(goal),
     objective: clean(goal.objective || goal.semanticGoal || "resolve the current checkout obligation"),
     desiredEffect: obligationDesiredEffect(goal),
     desiredValue: goal.desiredValue ?? goal.canonicalValue ?? "",
+    desiredStateDelta: goal.desiredStateDelta
+      ? Object.freeze({ ...goal.desiredStateDelta })
+      : null,
     admittedControlIds: freezeArray(controls),
+    evidenceStrength: clean(goal.evidenceStrength),
+    rawEvidenceIds: freezeArray(goal.rawEvidenceIds),
     policyDecision: Object.freeze({
       status: goal.admission?.status === "blocked" || goal.ambiguity ? "blocked" : "admitted",
       profileCompatible: goal.profileCompatible !== false && !goal.ambiguity,

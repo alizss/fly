@@ -88,9 +88,8 @@ function checkoutRelevantControl(control = {}) {
   const effect = lower(`${control.physicalEffect || ""} ${control.semanticEffect || ""}`);
   const risk = lower(control.risk);
   return Boolean(
-    control.choiceContract
-    || /continue|next|advance|navigation|submit_form|dismiss|close|skip|decline|no_thanks|required_dropdown_choice|seat_option|seat_map|seat_selection|baggage|insurance|bundle|optional_extra/.test(meaning)
-    || /open_surface|dismiss_surface|select_free_option|advance_surface|advance_checkout_stage|reveal_control/.test(effect)
+    /continue|next|advance|navigation|submit_form|dismiss|close|skip|decline|no_thanks|required_dropdown_choice|seat_option|seat_map|seat_selection|baggage|insurance|bundle|optional_extra/.test(meaning)
+    || /dismiss_surface|select_free_option|advance_surface|advance_checkout_stage/.test(effect)
     || /safe_continue|safe_decline/.test(risk)
   );
 }
@@ -110,6 +109,10 @@ function lowConsequenceControl(control = {}, page = {}) {
   const risk = lower(control.risk);
   const effect = lower(`${control.physicalEffect || ""} ${control.semanticEffect || ""}`);
   const meaning = controlMeaning(control);
+  // Opening an arbitrary surface is not progress. Edit/change utilities are
+  // reversible, but they move away from the current checkout obligation and
+  // must be owned by a typed obligation before they can execute.
+  if (/^(?:edit|change|back|previous|remove|delete|cancel)(?:\s|$)/.test(lower(control.label))) return false;
   // A fare/product CTA that only resembles Continue is not a reversible
   // navigation action. It needs an owned option/effect contract before it can
   // enter either the canonical path or this fallback.
@@ -130,9 +133,16 @@ function lowConsequenceControl(control = {}, page = {}) {
 
 function interactionObjective({ observation = {}, userPolicy = {}, traveler = {} } = {}) {
   const page = observation.page || {};
-  const stage = lower(page.step || "current checkout");
+  const surface = currentSurface(page);
+  const localEvidence = lower([
+    surface.label,
+    surface.taskHint,
+    ...(page.controls || []).filter((control) => controlBelongsToCurrentSurface(control, page))
+      .slice(0, 20)
+      .map((control) => `${control.sectionLabel || ""} ${control.label || ""} ${control.semantic || ""}`)
+  ].join(" "));
   const seatPolicy = seatPolicyFrom({ userPolicy, traveler });
-  if (/seat/.test(stage)) {
+  if (/seat/.test(localEvidence)) {
     if (seatPolicy === SEAT_POLICIES.RANDOM_ASSIGNMENT) {
       return "Resolve the current seat step using random airline assignment and without selecting a paid seat.";
     }
@@ -141,10 +151,10 @@ function interactionObjective({ observation = {}, userPolicy = {}, traveler = {}
     }
     return "Progress the current seat step without adding an unrequested paid seat.";
   }
-  if (/bag|baggage|luggage/.test(stage)) {
+  if (/bag|baggage|luggage/.test(localEvidence)) {
     return `Resolve the current baggage step using the saved baggage profile (${clean(userPolicy.baggagePreference || traveler.baggage_preference || "no unrequested paid baggage")}).`;
   }
-  if (/insurance|protection|bundle|extra|ancillary/.test(stage)) {
+  if (/insurance|protection|bundle|extra|ancillary/.test(localEvidence)) {
     return "Resolve the current optional-product step according to the traveler profile and decline unrequested paid products.";
   }
   return "Make one reversible action that advances the current checkout without changing the approved itinerary, identity, price, legal state, or payment state.";
@@ -159,7 +169,6 @@ function adaptiveInteractionGoal({
 } = {}) {
   const page = observation.page || {};
   const surface = currentSurface(page);
-  if (["payment", "confirmation"].includes(lower(page.step))) return null;
   const excluded = new Set((excludedControlIds || []).map(clean).filter(Boolean));
   const controls = (page.controls || []).filter((control) => (
     !excluded.has(clean(control.controlId))
@@ -169,7 +178,7 @@ function adaptiveInteractionGoal({
   const controlIds = [...new Set(controls.map((control) => control.controlId).filter(Boolean))];
   const objective = interactionObjective({ observation, userPolicy, traveler });
   return Object.freeze({
-    goalId: `${observation.observationId || "observation"}:adaptive_interaction`,
+    goalId: `adaptive_interaction:${surface.id || "surface-page"}`,
     kind: "adaptive_interaction",
     selectionMode: "bounded_adaptive",
     semanticGoal: objective,
@@ -185,16 +194,14 @@ function adaptiveInteractionGoal({
       mustNotIncreasePrice: true
     }),
     outcomeContract: Object.freeze({
-      outcomeId: `${observation.observationId || "observation"}:bounded_progress`,
+      outcomeId: `bounded_progress:${surface.id || "surface-page"}`,
       taskOutcome: "current_surface_completed",
       acceptablePhysicalEffects: Object.freeze([
-        "open_surface",
         "dismiss_surface",
         "select_free_option",
         "advance_surface",
         "advance_checkout_stage",
-        "reveal_control",
-        "unknown"
+        "reveal_control"
       ]),
       completionEvidence: Object.freeze(["fresh_surface_state", "observable_change"])
     }),

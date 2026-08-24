@@ -1,5 +1,5 @@
 const { evaluateTransition } = require("./transition-evaluator");
-const { decideStage } = require("./task-state-reducer");
+const agentContract = require("../../extension/src/shared/agent-contract");
 const {
   actionFromLease,
   actuatorSignature,
@@ -33,7 +33,23 @@ const UNSAFE_FAILURE_CODES = new Set([
 ]);
 
 function canonicalFailureCode(result = {}) {
-  const raw = String(result.outcome?.code || result.failureCode || result.code || "");
+  const explicitFailure = String(result.failureCode || "");
+  if (explicitFailure) return FAILURE_CODE_ALIASES[explicitFailure] || explicitFailure;
+
+  // outcome.code is a result vocabulary, not a failure channel. Browser
+  // verification deliberately reports success codes such as
+  // NORMALIZED_VALUE_VERIFIED there. Reclassifying that code as a failure
+  // makes the backend reject the exact local proof it just received.
+  const browserVerifiedSuccess = result.outcome?.ok === true || Boolean(
+    result.verified === true
+    && result.expectedOutcomeObserved === true
+    && result.postconditionSatisfied === true
+  );
+  if (browserVerifiedSuccess) return "";
+
+  // Legacy failure reports may only carry outcome.code/result.code. Preserve
+  // those until every producer writes the dedicated failureCode field.
+  const raw = String(result.outcome?.code || result.code || "");
   return FAILURE_CODE_ALIASES[raw] || raw;
 }
 
@@ -131,8 +147,6 @@ function navigationOrigin(observation = {}) {
   const page = observation.page || {};
   return Object.freeze({
     observationId: observation.observationId || "",
-    stage: decideStage(observation).stage,
-    step: page.step || page.pageStep || "unknown",
     url: page.url || observation.url || "",
     surfaceId: (page.currentSurface || page.activeSurface || {}).id || "",
     progressFingerprint: progressFingerprint(observation)
@@ -204,7 +218,6 @@ function semanticStateKey(observation = {}) {
   const surface = page.currentSurface || page.activeSurface || page.foreground || {};
   const progress = page.foreground?.progressMarkers || page.visualState?.foreground?.progressMarkers || {};
   return JSON.stringify({
-    stage: page.step || "unknown",
     surfaceType: surface.type || "page",
     surfaceClass: surface.surfaceClass || "unknown",
     taskHint: surface.taskHint || "",
@@ -272,6 +285,23 @@ function updateExecutionRecovery(state = {}, event = {}) {
   } else if (["grounding_rejection", "planner_rejection"].includes(kind)) {
     next.phase = kind;
     next.lastCode = code;
+    if (event.strategySignature) {
+      const stateHash = String(event.stateHash || "");
+      const semanticOwnerId = String(event.semanticOwnerId || "");
+      const sameSemanticOwner = Boolean(
+        semanticOwnerId
+        && previous.semanticOwnerId
+        && semanticOwnerId === previous.semanticOwnerId
+      );
+      const signatures = !sameSemanticOwner || (stateHash && stateHash !== previous.stateHash)
+        ? []
+        : [...previous.failedStrategySignatures];
+      if (!signatures.includes(event.strategySignature)) signatures.push(event.strategySignature);
+      next.stateHash = stateHash || previous.stateHash;
+      next.semanticOwnerId = semanticOwnerId;
+      next.failedStrategySignatures = signatures;
+      next.attempts = Math.max(previous.attempts + 1, signatures.length);
+    }
     classification = kind;
   } else if (kind === "reveal_started") {
     next.phase = "reveal";
@@ -363,8 +393,10 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
     closed: sameAction ? previous.closed === true : false,
     awaitingClarification: sameAction ? previous.awaitingClarification === true : false,
     awaitingDestination: sameAction ? previous.awaitingDestination === true : false,
-    navigation: sameAction ? previous.navigation === true : navigationAction(action),
-    origin: sameAction && previous.origin
+    navigation: previous.navigation === true || navigationAction(action),
+    origin: sameAction && previous.origin && (
+      previous.origin.observationId || previous.origin.url || previous.origin.surfaceId
+    )
       ? previous.origin
       : (navigationAction(action) ? navigationOrigin({ page: result.beforePage || {}, observationId: action.observationId || "" }) : null),
     destinationReadiness: sameAction ? previous.destinationReadiness || null : null,
@@ -374,8 +406,21 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
   };
 }
 
+function authoritativeTransitionStatus(transition = {}) {
+  const status = transition.actionOutcome?.status || "";
+  const outcome = agentContract.ACTION_OUTCOME;
+  if (status === outcome.SATISFIED) return "achieved";
+  if (status === outcome.PROGRESSED) return "progressed";
+  if (status === outcome.REVEALED_BLOCKER) return "blocked";
+  if (status === outcome.UNSAFE_CHANGE) return transition.causality ? "blocked" : "unsafe";
+  if (status === outcome.DESTINATION_LOADING) return "destination_loading";
+  if (status === outcome.NO_EFFECT) return "no_effect";
+  return "no_effect";
+}
+
 function transitionResult(result = {}, transition = null) {
   if (!transition) return { ...result, failureCode: canonicalFailureCode(result) };
+  const transitionStatus = authoritativeTransitionStatus(transition);
   const interveningMutation = transition.causality?.classification === "intervening_external_mutation";
   const browserCanonicalComponentCommit = Boolean(
     result.verified === true
@@ -402,12 +447,13 @@ function transitionResult(result = {}, transition = null) {
     ...result,
     failureCode: interveningMutation
       ? "INTERVENING_EXTERNAL_MUTATION"
-      : transition.status === "no_effect"
+      : transitionStatus === "no_effect"
       ? "TRANSITION_NO_EFFECT"
       : canonicalFailureCode(result),
-    transitionStatus: transition.status,
+    transitionStatus,
     transitionDirective: transition.nextDirective,
     transition,
+    actionOutcome: transition.actionOutcome || null,
     localMechanicalResult: transition.localMechanicalResult || transition.localEffect || null,
     currentObligationResult: transition.currentObligationResult || null,
     durableObjectiveProgress: transition.durableObjectiveProgress || transition.parentProgress || null,
@@ -417,7 +463,7 @@ function transitionResult(result = {}, transition = null) {
     parentProgress: transition.parentProgress || null,
     taskOutcome: transition.taskOutcome || "",
     taskOutcomeCompleted: (transition.durableObjectiveProgress || transition.parentProgress)?.completed === true,
-    taskProgressStatus: transition.status,
+    taskProgressStatus: transitionStatus,
     localPostconditionSatisfied,
     localExpectedOutcomeObserved: localPostconditionSatisfied,
     localOutcomeVerified,
@@ -558,24 +604,70 @@ function advanceActionLifecycle({
 
   if (!dispatched) {
     const unsafe = UNSAFE_FAILURE_CODES.has(code);
+    const freshnessSuperseded = result.superseded === true
+      && ["OBSERVATION_HASH_MISMATCH", "STALE_OBSERVATION_SUPERSEDED"].includes(code);
     if (unsafe) {
       lifecycle = { ...lifecycle, status: "unsafe", closed: true, awaitingClarification: false, resultCode: code };
       directive = "stop_for_safety";
+    } else if (freshnessSuperseded) {
+      // The planned snapshot expired before dispatch. This closes the lease
+      // and rebuilds from the fresh observation without claiming that the
+      // actuator failed or spending the bounded recovery budget.
+      lifecycle = {
+        ...lifecycle,
+        status: "rejected_before_dispatch",
+        closed: true,
+        awaitingClarification: false,
+        resultCode: code
+      };
+      directive = "rebuild_candidates";
     } else {
-      recovery = updateExecutionRecovery(state, { kind: "grounding_rejection", code: code || "PRE_DISPATCH_REJECTION" });
+      const repeatProhibited = result.actionOutcome?.repeatProhibited === true
+        || code === "FAILED_STRATEGY_REUSE";
+      const stateHash = String(
+        observation.observationSnapshot?.snapshotHash
+        || observation.page?.snapshotHash
+        || previousObservation?.observationSnapshot?.snapshotHash
+        || previousObservation?.page?.snapshotHash
+        || ""
+      );
+      recovery = updateExecutionRecovery(state, {
+        kind: "grounding_rejection",
+        code: code || "PRE_DISPATCH_REJECTION",
+        stateHash,
+        strategySignature: repeatProhibited ? actuatorSignature(action) : "",
+        semanticOwnerId: action.semanticOwnerId || decisionInstanceKey(action, previousObservation || observation)
+      });
       lifecycle = { ...lifecycle, status: "rejected_before_dispatch", closed: true, awaitingClarification: false, resultCode: code || "PRE_DISPATCH_REJECTION" };
       directive = "rebuild_candidates";
     }
   } else if (!previousObservation?.observationId || !observation.observationId) {
+    const stateHash = String(
+      observation.observationSnapshot?.snapshotHash
+      || observation.page?.snapshotHash
+      || previousObservation?.observationSnapshot?.snapshotHash
+      || previousObservation?.page?.snapshotHash
+      || ""
+    );
+    recovery = updateExecutionRecovery(state, {
+      kind: "execution_no_effect",
+      code: "ACTION_CAUSAL_IDENTITY_MISSING",
+      stateHash,
+      strategySignature: actuatorSignature(action),
+      semanticOwnerId: action.semanticOwnerId || decisionInstanceKey(action, observation)
+    });
     lifecycle = {
       ...lifecycle,
-      status: "dispatched",
+      status: "failed",
       dispatched: true,
-      closed: false,
-      awaitingClarification: true,
-      resultCode: code
+      observed: true,
+      verified: false,
+      closed: true,
+      awaitingClarification: false,
+      transitionStatus: "no_effect",
+      resultCode: "ACTION_CAUSAL_IDENTITY_MISSING"
     };
-    directive = "reobserve_rebind";
+    directive = "try_distinct_capability";
   } else {
     transition = evaluateTransition({
       beforeObservation: previousObservation,
@@ -586,18 +678,29 @@ function advanceActionLifecycle({
         ? {
           destinationReady: observationReadiness?.classification === "READY",
           readiness: observationReadiness,
-          origin: previousLifecycle.origin
-            || lifecycle.origin
-            || navigationOrigin(previousObservation)
+          origin: (
+            previousLifecycle.origin?.observationId
+            || previousLifecycle.origin?.url
+            || previousLifecycle.origin?.surfaceId
+          )
+            ? previousLifecycle.origin
+            : (
+                lifecycle.origin?.observationId
+                || lifecycle.origin?.url
+                || lifecycle.origin?.surfaceId
+              )
+              ? lifecycle.origin
+              : navigationOrigin(previousObservation)
         }
         : null
     });
+    const transitionStatus = authoritativeTransitionStatus(transition);
     const observed = true;
-    if (transition.status === "achieved") {
+    if (transitionStatus === "achieved") {
       recovery = updateExecutionRecovery(state, { kind: "verified", code });
       lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, awaitingDestination: false, destinationReadiness: observationReadiness, transitionStatus: "achieved", resultCode: code };
       directive = "advance_goal";
-    } else if (transition.status === "progressed") {
+    } else if (transitionStatus === "progressed") {
       recovery = updateExecutionRecovery(state, { kind: "meaningful_progress", code });
       lifecycle = {
         ...lifecycle,
@@ -621,7 +724,7 @@ function advanceActionLifecycle({
         resultCode: code
       };
       directive = "rebuild_candidates";
-    } else if (transition.status === "blocked") {
+    } else if (transitionStatus === "blocked") {
       const rebuildFromCurrentState = transition.nextDirective === "rebuild_task_state";
       const reconciliationCode = rebuildFromCurrentState
         ? (transition.causality?.code || "FRESH_STATE_RECONCILIATION_REQUIRED")
@@ -642,11 +745,11 @@ function advanceActionLifecycle({
         resultCode: reconciliationCode
       };
       directive = rebuildFromCurrentState ? "rebuild_candidates" : "resolve_blocker";
-    } else if (transition.status === "no_effect") {
+    } else if (transitionStatus === "no_effect") {
       const revealAction = action.type === "scroll" || action.intent === "recover_target_viewport";
       if (revealAction) {
         lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "no_effect", resultCode: "TRANSITION_NO_EFFECT" };
-        directive = "reobserve_rebind";
+        directive = "try_distinct_capability";
       } else {
       const stateHash = String(
         observation.observationSnapshot?.snapshotHash
@@ -670,13 +773,13 @@ function advanceActionLifecycle({
       // not justify a handoff while another safe grounded capability exists.
       directive = "try_distinct_capability";
       }
-    } else if (transition.status === "unsafe") {
-      lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "unsafe", resultCode: code };
+    } else if (transitionStatus === "unsafe") {
+      lifecycle = { ...lifecycle, status: "unsafe", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "unsafe", resultCode: transition.causality?.code || code };
       directive = "stop_for_safety";
     } else {
       recovery = updateExecutionRecovery(state, { kind: "uncertain", code });
-      lifecycle = { ...lifecycle, status: "observed", dispatched: true, observed, verified: false, closed: false, awaitingClarification: true, transitionStatus: "uncertain", resultCode: code };
-      directive = "reobserve_rebind";
+      lifecycle = { ...lifecycle, status: "failed", dispatched: true, observed, verified: false, closed: true, awaitingClarification: false, transitionStatus: "no_effect", resultCode: code || "TRANSITION_NO_EFFECT" };
+      directive = "try_distinct_capability";
     }
   }
 

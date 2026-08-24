@@ -372,19 +372,19 @@ function actionFromLease(lease = null) {
 }
 
 /**
- * Stable identity for one physical actuator attempt.
- * Values and key payloads do not make a retry distinct; only its target,
- * operation, or dispatch method does. Page-state identity is scoped by the
- * caller because the same actuator may become valid after a material change.
+ * Stable identity for one semantic actuator mutation.
+ * Values, key payloads, and dispatch mechanics do not make a retry distinct;
+ * only its target or operation does. A different click implementation on the
+ * same stateful target is still the same mutation. Page-state identity is
+ * scoped by the caller because the actuator may become valid after a material
+ * state change.
  */
 function actuatorSignature(action = {}) {
   const affordance = action.affordance || {};
   const selectedStrategy = action.pipelineContract?.capability?.selectedStrategy || {};
-  const method = action.interactionMethod || action.type || action.action || "";
   const operation = action.operation || affordance.capability || "";
   if (selectedStrategy.actuatorStableKey) {
     return [
-      method,
       operation,
       action.pipelineContract?.component?.componentIdentity || affordance.stableKey || action.controlId || "",
       selectedStrategy.actuatorStableKey
@@ -392,7 +392,6 @@ function actuatorSignature(action = {}) {
   }
   if (affordance.stableKey && affordance.actuator?.stableKey && affordance.effect) {
     return [
-      method,
       operation,
       affordance.stableKey,
       affordance.actuator.stableKey
@@ -400,7 +399,6 @@ function actuatorSignature(action = {}) {
   }
   const target = action.targetSnapshot || {};
   return [
-    method,
     operation,
     action.controlId || target.controlId || "",
     action.actuatorId || action.targetId || target.id || `${action.x ?? ""},${action.y ?? ""}`
@@ -425,7 +423,10 @@ function semanticGoalKey(source = {}) {
   return [
     stableScope,
     component.logicalFieldId || subject.logicalFieldId || goal.logicalFieldId || "",
-    subject.subjectId || goal.subjectId || "",
+    // Raw navigation goals historically omitted a subject while their
+    // compiled CurrentObligation used the explicit global subject. Those two
+    // representations must share recovery memory for the same obligation.
+    subject.subjectId || goal.subjectId || "global",
     component.role || goal.componentRole || "",
     obligation?.desiredValue || goal.desiredValue || "",
     Number.isFinite(Number(component.ordinal ?? goal.ordinal)) ? `ordinal:${Number(component.ordinal ?? goal.ordinal)}` : ""

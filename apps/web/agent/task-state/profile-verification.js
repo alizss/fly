@@ -13,18 +13,68 @@ function verifiedProfileComponentIdentity(value = {}) {
   ].join("::");
 }
 
+// Browser verification owns whether a profile write satisfied its exact
+// postcondition. Project each exact success contract into the one durable
+// TaskState receipt instead of making scalar, date, and choice controls use
+// different completion authorities.
+const VERIFIED_PROFILE_OUTCOME_CODE_BY_TYPE = Object.freeze({
+  normalized_value_changed: "NORMALIZED_VALUE_VERIFIED",
+  logical_component_committed: "LOGICAL_COMPONENT_COMMITTED",
+  date_value_committed: "DATE_VALUE_VERIFIED",
+  field_value_changed: "FIELD_VALUE_VERIFIED"
+});
+
+const VERIFIED_PROFILE_EVIDENCE_SOURCE_BY_TYPE = Object.freeze({
+  normalized_value_changed: "canonical_normalized_value_verifier",
+  logical_component_committed: "canonical_parent_state_verifier",
+  date_value_committed: "canonical_date_verifier",
+  field_value_changed: "canonical_field_value_verifier"
+});
+
+function verifiedProfileSelectedValue(actionResult = {}, expected = {}, proof = {}) {
+  const evidence = actionResult.outcome?.evidence || {};
+  if (expected.type === "logical_component_committed" && proof.selectedCanonicalValue) {
+    return clean(proof.selectedCanonicalValue);
+  }
+  if (expected.type === "date_value_committed") {
+    return clean(
+      evidence.actualCanonicalValue
+      || expected.expectedCanonicalValue
+      || evidence.actualComponentValue
+      || expected.expectedNormalizedValue
+    );
+  }
+  return clean(
+    evidence.actualNormalizedValue
+    || expected.expectedNormalizedValue
+    || expected.expectedCanonicalValue
+    || expected.expectedComponentValue
+    || evidence.value
+    || actionResult.action?.value
+    || actionResult.action?.targetLabel
+  );
+}
+
 function verifiedProfileComponentFromActionResult(actionResult = null, observationId = "") {
   if (!actionResult || typeof actionResult !== "object") return null;
   const expected = actionResult.expectedOutcome || {};
   const proof = actionResult.outcome?.evidence?.exactChildSettlement || {};
+  const expectedSuccessCode = VERIFIED_PROFILE_OUTCOME_CODE_BY_TYPE[clean(expected.type)] || "";
+  // FIELD_VALUE_VERIFIED without an expected normalized value proves only
+  // that some value exists. That is insufficient to retire a profile fact.
+  const exactFieldValueContract = expected.type !== "field_value_changed"
+    || Boolean(clean(expected.expectedNormalizedValue));
   const verified = Boolean(
-    actionResult.verified === true
+    expectedSuccessCode
+    && exactFieldValueContract
+    && actionResult.verified === true
     && actionResult.expectedOutcomeObserved === true
     && actionResult.postconditionSatisfied === true
     && actionResult.outcome?.ok === true
-    && clean(actionResult.outcome?.code || actionResult.failureCode) === "LOGICAL_COMPONENT_COMMITTED"
+    && !clean(actionResult.failureCode)
+    && clean(actionResult.outcome?.code) === expectedSuccessCode
   );
-  if (!verified || expected.type !== "logical_component_committed") return null;
+  if (!verified || !clean(expected.logicalFieldId) || !clean(expected.semanticType)) return null;
   const completion = {
     contractVersion: "verified-profile-component/v1",
     completionId: verifiedProfileComponentIdentity({
@@ -49,14 +99,10 @@ function verifiedProfileComponentFromActionResult(actionResult = null, observati
       || expected.expectedNormalizedValue
       || expected.expectedComponentValue
     ),
-    selectedCanonicalValue: clean(
-      proof.selectedCanonicalValue
-      || actionResult.action?.value
-      || actionResult.action?.targetLabel
-    ),
+    selectedCanonicalValue: verifiedProfileSelectedValue(actionResult, expected, proof),
     evidenceSource: proof.contractVersion === "exact-child-choice-settlement/v1"
       ? "canonical_exact_child_verifier"
-      : "canonical_parent_state_verifier"
+      : VERIFIED_PROFILE_EVIDENCE_SOURCE_BY_TYPE[expected.type]
   };
   if (!completion.completionId || !completion.actionId || !completion.selectedCanonicalValue) return null;
   if (!agentContract.profileChoiceValueCompatible(

@@ -159,9 +159,13 @@ function expectedOutcomeForAction(action = {}, page = {}) {
 function withActionContract(action = {}, page = {}) {
   const intent = action.intent || inferActionIntent(action);
   const expectedOutcome = expectedOutcomeForAction({ ...action, intent }, page);
+  const semantics = normalizedActionSemantics(action, {
+    control: action.targetSnapshot || {},
+    expectedOutcome
+  });
   const mechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect
     || predictPhysicalEffect({
-      semantics: normalizedActionSemantics(action, { control: action.targetSnapshot || {}, expectedOutcome }),
+      semantics,
       control: action.targetSnapshot || {},
       candidate: action,
       goal: {}
@@ -178,6 +182,7 @@ function withActionContract(action = {}, page = {}) {
     : expectedPostconditionsForAction({ expectedOutcome, semanticIntent, mechanicalEffect, goal: {} });
   return normalizeAction({
     ...action,
+    ...semantics,
     intent,
     mechanicalEffect,
     semanticIntent,

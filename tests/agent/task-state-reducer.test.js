@@ -10,6 +10,39 @@ const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legac
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { semanticOwnerId } = require("../../packages/shared/semantic-owner");
+const { decideStage } = require("../../apps/web/agent/task-state/stage");
+const {
+  adaptiveInteractionGoal,
+  checkoutRelevantControl
+} = require("../../apps/web/agent/adaptive-interaction");
+
+test("a pre-card PaymentForm route is payment stage without claiming terminal card entry", () => {
+  const observation = {
+    page: {
+      url: "https://airline.test/en/PaymentForm",
+      step: "unknown",
+      text: "Select a payment method. Credit/debit card. Continue to the checkout form.",
+      currentSurface: { id: "surface-page", type: "page", label: "Select a payment method" },
+      controls: [{
+        controlId: "payment_method",
+        label: "Credit/debit card",
+        semantic: "unknown",
+        representationLifecycle: { status: "active_rendered", active: true }
+      }],
+      fields: [{
+        controlId: "login_email",
+        fieldType: "email",
+        label: "Login email",
+        representationLifecycle: { status: "active_rendered", active: true }
+      }]
+    }
+  };
+
+  const result = decideStage(observation);
+  assert.equal(result.stage, "payment");
+  assert.equal(result.evidence.terminalEvidence.boundaryObserved, false);
+  assert.equal(result.evidence.terminalEvidence.cardCredentialEntryObserved, false);
+});
 
 function readyTransactionReview() {
   const transaction = {
@@ -660,6 +693,24 @@ test("an admitted profile obligation chooses direct mechanics without a model ar
   assert.equal(selected?.candidateId, "country_type");
 });
 
+test("every admitted obligation ranks mechanics locally without model arbitration", () => {
+  const decision = loopPrivate.deterministicTaskCandidate({
+    candidates: [
+      { candidateId: "decline_keyboard", controlId: "decline", operation: "keyboard", actionability: { executable: true } },
+      { candidateId: "decline_click", controlId: "decline", operation: "choose", actionability: { executable: true } }
+    ]
+  }, { kind: "checkout_decision", actionableControlIds: ["decline"] });
+  const navigation = loopPrivate.deterministicTaskCandidate({
+    candidates: [
+      { candidateId: "continue_keyboard", controlId: "continue", operation: "keyboard", actionability: { executable: true } },
+      { candidateId: "continue_click", controlId: "continue", operation: "activate", actionability: { executable: true } }
+    ]
+  }, { kind: "navigation", actionableControlIds: ["continue"] });
+
+  assert.equal(decision?.candidateId, "decline_click");
+  assert.equal(navigation?.candidateId, "continue_click");
+});
+
 test("disabled navigation queues multiple missing traveler facts instead of abandoning the form", () => {
   const blankField = (controlId, semantic, label) => ({
     ...control(controlId, { label, semantic, kind: "select", role: "combobox" }),
@@ -758,10 +809,10 @@ test("unavailable navigation does not become a semantic goal when no profile fie
 
   assert.equal(state.profileReadiness.ready, true);
   assert.equal(state.currentGoal, null);
-  assert.equal(state.ambiguityReason, "navigation_disabled_without_active_requirement");
+  assert.equal(state.ambiguityReason, "no_goal_relevant_candidate");
 });
 
-test("the observed stage exit is scheduled even when its button wording is unfamiliar", () => {
+test("a derived stage-exit projection cannot admit an untyped canonical control", () => {
   const forward = control("opaque_forward_action", {
     label: "Go",
     semantic: "command",
@@ -794,8 +845,8 @@ test("the observed stage exit is scheduled even when its button wording is unfam
 
   const state = reduceTaskState({ observation });
 
-  assert.equal(state.currentGoal.semanticType, "navigation");
-  assert.deepEqual(state.currentGoal.actionableControlIds, [forward.controlId]);
+  assert.equal(state.currentGoal, null);
+  assert.equal(state.ambiguityReason, "no_goal_relevant_candidate");
 });
 
 test("standalone canonical requirements participate in authoritative scheduling", () => {
@@ -1950,7 +2001,7 @@ test("an exact paid-item authorization conflicting with decline policy requires 
   assert.equal(state.activeDecisions[0].reopenEvidence.authorizationId, "auth_bundle");
 });
 
-test("backend payment stage ignores extension hint and suppresses ordinary goals", () => {
+test("a complete owned card credential set is the terminal capability", () => {
   const state = reduceTaskState({
     transactionReview: readyTransactionReview(),
     observation: {
@@ -1962,6 +2013,8 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
         currentSurface: { id: "surface-page", type: "page" },
         controls: [
           control("card", { semantic: "card_number" }),
+          control("expiry", { semantic: "card_expiry" }),
+          control("cvc", { semantic: "card_cvc" }),
           {
             ...control("pay", { label: "Pay", semantic: "submit_purchase" }),
             role: "button",
@@ -1977,10 +2030,10 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
   });
 
   assert.equal(state.stage, "payment");
-  assert.equal(state.terminalStatus, "payment_review_reached");
+  assert.equal(state.terminalStatus, "card_credential_entry_reached");
   assert.equal(state.currentGoal, null);
   assert.equal(state.profileReadiness.ready, true);
-  assert.deepEqual(state.goal, { id: "reach_payment_review", status: "completed" });
+  assert.deepEqual(state.goal, { id: "reach_card_credential_entry", status: "completed" });
   assert.equal(state.paymentEvidence.observed, true);
   assert.equal(state.paymentEvidence.signalCount >= 3, true);
   assert.equal(state.safetyRestrictions.paymentSubmissionRequiresApproval, true);
@@ -1988,7 +2041,7 @@ test("backend payment stage ignores extension hint and suppresses ordinary goals
   assert.equal(state.disposition.userActionRequired, false);
 });
 
-test("a confirmation-labeled final review latches from owned payment evidence", () => {
+test("a payment-method selector is unfinished checkout, not terminal evidence", () => {
   const state = reduceTaskState({
     transactionReview: readyTransactionReview(),
     observation: {
@@ -2007,18 +2060,13 @@ test("a confirmation-labeled final review latches from owned payment evidence", 
     }
   });
 
-  assert.equal(state.paymentEvidence.boundaryObserved, true);
-  assert.equal(state.terminalGoalLatch.locked, true);
-  assert.equal(state.terminalStatus, "payment_review_reached");
-  assert.equal(state.currentGoal, null);
-  assert.equal(state.processAwareness.status, "goal_achieved");
-  assert.equal(state.processAwareness.currentPosition.stage, "payment_review");
-  assert.equal(state.processAwareness.finalOutcome.achieved, true);
-  assert.equal(state.processAwareness.finalOutcome.transactionVerified, true);
-  assert.equal(state.disposition.userActionRequired, false);
+  assert.equal(state.paymentEvidence.boundaryObserved, false);
+  assert.equal(state.terminalGoalLatch.locked, false);
+  assert.equal(state.terminalStatus, "active");
+  assert.equal(state.processAwareness.finalOutcome.achieved, false);
 });
 
-test("final checkout with terms and a disabled pay-by-card control is payment review", () => {
+test("final checkout with terms and disabled pay-by-card remains unfinished", () => {
   const state = reduceTaskState({
     transactionReview: readyTransactionReview(),
     observation: {
@@ -2055,13 +2103,11 @@ test("final checkout with terms and a disabled pay-by-card control is payment re
     }
   });
 
-  assert.equal(state.stage, "payment");
-  assert.equal(state.paymentEvidence.boundaryObserved, true);
-  assert.equal(state.terminalStatus, "payment_review_reached");
-  assert.equal(state.currentGoal, null);
+  assert.equal(state.paymentEvidence.boundaryObserved, false);
+  assert.equal(state.terminalStatus, "active");
 });
 
-test("an unverified final review freezes payment and billing work without claiming success", () => {
+test("an unverified method selector remains unfinished without claiming success", () => {
   const current = readyTransactionReview().current;
   const state = reduceTaskState({
     transactionReview: {
@@ -2089,17 +2135,10 @@ test("an unverified final review freezes payment and billing work without claimi
     }
   });
 
-  assert.equal(state.paymentEvidence.boundaryObserved, true);
+  assert.equal(state.paymentEvidence.boundaryObserved, false);
   assert.equal(state.terminalGoalLatch.locked, false);
   assert.equal(state.terminalStatus, "active");
-  assert.equal(state.currentGoal, null);
-  assert.equal(state.ambiguityReason, "transaction_review_incomplete");
-  assert.equal(state.processAwareness.status, "verifying_final_transaction");
-  assert.equal(state.processAwareness.currentObjective, "verify the final transaction");
-  assert.deepEqual(state.processAwareness.unresolved, ["transaction:itinerary_route"]);
   assert.equal(state.processAwareness.finalOutcome.achieved, false);
-  assert.equal(state.disposition.kind, "wait_reobserve");
-  assert.equal(state.disposition.userActionRequired, false);
 });
 
 test("a lone card field outside review does not create a terminal boundary", () => {
@@ -2123,10 +2162,10 @@ test("a lone card field outside review does not create a terminal boundary", () 
   assert.equal(state.stage, "seats");
   assert.equal(state.paymentEvidence.boundaryObserved, false);
   assert.equal(state.terminalGoalLatch.locked, false);
-  assert.notEqual(state.terminalStatus, "payment_review_reached");
+  assert.notEqual(state.terminalStatus, "card_credential_entry_reached");
 });
 
-test("payment UI alone does not complete checkout without a verified transaction envelope", () => {
+test("exact card entry completes the reach milestone while transaction verification stays diagnostic", () => {
   const state = reduceTaskState({
     transactionReview: {
       ready: false,
@@ -2141,7 +2180,11 @@ test("payment UI alone does not complete checkout without a verified transaction
         url: "https://example.test/checkout/payment",
         text: "Payment details. Choose payment method.",
         currentSurface: { id: "surface-page", type: "page" },
-        controls: [control("card_unverified", { semantic: "card_number" })],
+        controls: [
+          control("card_unverified", { semantic: "card_number" }),
+          control("expiry_unverified", { semantic: "card_expiry" }),
+          control("cvc_unverified", { semantic: "card_cvc" })
+        ],
         foreground: { progressMarkers: { payment: "current" } },
         decisionGroups: []
       }
@@ -2149,9 +2192,9 @@ test("payment UI alone does not complete checkout without a verified transaction
   });
 
   assert.equal(state.stage, "payment");
-  assert.equal(state.terminalStatus, "active");
+  assert.equal(state.terminalStatus, "card_credential_entry_reached");
   assert.equal(state.currentGoal, null);
-  assert.equal(state.paymentEvidence.observed, false);
+  assert.equal(state.paymentEvidence.observed, true);
   assert.equal(state.paymentEvidence.signalCount >= 2, true);
   assert.equal(state.paymentEvidence.transactionVerified, false);
   assert.deepEqual(state.paymentEvidence.missingTransactionFacts, ["itinerary.route", "travelers", "currency", "totalPrice"]);
@@ -2166,7 +2209,11 @@ test("verified payment completion remains latched after redirect to a new search
         url: "https://example.test/rf/payment",
         text: "Payment details. Choose payment method. Total to pay 208 EUR.",
         currentSurface: { id: "surface-page", type: "page" },
-        controls: [control("card_latch", { semantic: "card_number" })],
+        controls: [
+          control("card_latch", { semantic: "card_number" }),
+          control("expiry_latch", { semantic: "card_expiry" }),
+          control("cvc_latch", { semantic: "card_cvc" })
+        ],
         foreground: { progressMarkers: { payment: "current" } },
         decisionGroups: []
       }
@@ -2190,7 +2237,7 @@ test("verified payment completion remains latched after redirect to a new search
   assert.equal(redirected.stage, "flight_selection");
   assert.equal(redirected.checkoutBoundary.status, "new_search_page");
   assert.equal(redirected.terminalGoalLatch.locked, true);
-  assert.equal(redirected.terminalStatus, "payment_review_reached");
+  assert.equal(redirected.terminalStatus, "card_credential_entry_reached");
   assert.equal(redirected.goal.status, "completed");
   assert.equal(redirected.currentGoal, null);
 
@@ -2207,7 +2254,7 @@ test("verified payment completion remains latched after redirect to a new search
       }
     }
   });
-  assert.equal(unrelated.terminalStatus, "payment_review_reached");
+  assert.equal(unrelated.terminalStatus, "card_credential_entry_reached");
   assert.equal(unrelated.currentGoal, null);
 });
 
@@ -2248,7 +2295,7 @@ test("an active checkout redirected to the search start is classified as checkou
   assert.equal(left.disposition.userActionRequired, false);
 });
 
-test("unknown foreground publishes one bounded reversible goal and excludes consequential controls", () => {
+test("an exact safe dismiss on an unknown foreground is deterministic navigation", () => {
   const observation = {
     observationId: "obs_unknown_popup",
     observationSnapshot: { snapshotHash: "hash_popup" },
@@ -2270,9 +2317,8 @@ test("unknown foreground publishes one bounded reversible goal and excludes cons
   };
   const taskState = reduceTaskState({ observation });
 
-  assert.equal(taskState.currentGoal.kind, "adaptive_interaction");
+  assert.equal(taskState.currentGoal.kind, "navigation");
   assert.deepEqual(taskState.currentGoal.actionableControlIds, ["safe_close"]);
-  assert.equal(taskState.ambiguityReason, "");
   const candidates = buildCurrentCandidateSet({
     goal: taskState.currentGoal,
     observation,
@@ -2280,8 +2326,6 @@ test("unknown foreground publishes one bounded reversible goal and excludes cons
     traveler: {}
   }).candidates;
   assert.deepEqual(candidates.map((candidate) => candidate.controlId), ["safe_close"]);
-  assert.equal(candidates[0].localMechanicalPostcondition.type, "observable_change");
-  assert.equal(candidates[0].obligationSuccessCondition.type, "observable_change");
   assert.equal(candidates.some((candidate) => candidate.controlId === "paid_upgrade"), false);
 });
 
@@ -2304,7 +2348,74 @@ test("reversible utility controls do not become adaptive checkout progress", () 
   assert.equal(taskState.ambiguityReason, "no_goal_relevant_candidate");
 });
 
-test("seat page without a decision group uses the consequence-gated fallback instead of stopping", () => {
+test("a summary Edit command cannot become adaptive forward progress", () => {
+  const observation = {
+    observationId: "obs_payment_summary_edit",
+    observationSnapshot: { snapshotHash: "hash_payment_summary_edit" },
+    page: {
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Overview and payment" },
+      controls: [control("edit_passenger", {
+        label: "Edit",
+        semantic: "open_surface",
+        physicalEffect: "open_surface",
+        risk: "uncertain",
+        decisionGroupId: "dg_unknown_unknown_unknown"
+      })],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+
+  const taskState = reduceTaskState({ observation });
+  assert.equal(taskState.currentGoal, null);
+  assert.notEqual(taskState.disposition?.kind, "execute");
+});
+
+test("an already-satisfied optional Personal or Company choice cannot become adaptive progress", () => {
+  const choiceContract = {
+    contractVersion: "choice-contract/v1",
+    required: false,
+    status: "satisfied"
+  };
+  const personal = {
+    ...control("billing_personal", {
+      label: "Personal",
+      semantic: "unknown",
+      risk: "uncertain",
+      selected: true
+    }),
+    choiceContract
+  };
+  const company = {
+    ...control("billing_company", {
+      label: "Company",
+      semantic: "unknown",
+      risk: "uncertain"
+    }),
+    choiceContract
+  };
+  const observation = {
+    observationId: "obs_optional_billing_identity",
+    page: {
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Billing details" },
+      controls: [personal, company],
+      decisionGroups: [{
+        decisionGroupId: "dg_billing_identity",
+        required: false,
+        status: "satisfied",
+        selectedControlIds: [personal.controlId],
+        alternatives: [personal, company]
+      }]
+    }
+  };
+
+  assert.equal(checkoutRelevantControl(company), false);
+  assert.equal(adaptiveInteractionGoal({ observation }), null);
+});
+
+test("seat page without a decision group gets one local fallback when no obligation exists", () => {
   const randomAssignment = control("random_assignment", {
     label: "Choose seats for me",
     semantic: "required_dropdown_choice",
@@ -2351,15 +2462,7 @@ test("seat page without a decision group uses the consequence-gated fallback ins
 
   assert.equal(taskState.currentGoal.kind, "adaptive_interaction");
   assert.deepEqual(taskState.currentGoal.actionableControlIds, [randomAssignment.controlId]);
-  const candidateSet = buildCurrentCandidateSet({
-    goal: taskState.currentGoal,
-    observation,
-    state: { taskState },
-    traveler
-  });
-  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), [randomAssignment.controlId]);
-  assert.equal(candidateSet.candidates[0].mechanicalEffect, "select_free_option");
-  assert.equal(candidateSet.candidates[0].expectedOutcome.type, "exact_free_option_selected");
+  assert.match(taskState.currentGoal.adaptiveEnvelope.triggerReason, /^no_existing_obligation:/);
 });
 
 test("decision planning keeps unrelated surface controls as context and uses one shared safe selectable set", () => {
@@ -3875,7 +3978,7 @@ test("a genuine paid seat conflict never substitutes unrelated Next or Back for 
   assert.equal(candidates.some((candidate) => candidate.controlId === back.controlId), false);
 });
 
-test("TaskState waits through unchanged observations and stops only after the real re-observation deadline", () => {
+test("TaskState never waits on an unchanged settled observation", () => {
   const page = {
     step: "unknown",
     currentSurface: { id: "surface-page", type: "page", surfaceClass: "page", blocksBackground: false },
@@ -3891,10 +3994,9 @@ test("TaskState waits through unchanged observations and stops only after the re
       page
     }
   });
-  assert.equal(first.disposition.kind, "wait_reobserve", JSON.stringify(first.disposition, null, 2));
-  assert.match(first.disposition.retryToken, /^reobserve_/);
-  assert.equal(first.disposition.reobserveCount, 1);
-  assert.ok(first.disposition.reobserveDeadlineAt > first.disposition.reobserveStartedAt);
+  assert.equal(first.disposition.kind, "stop", JSON.stringify(first.disposition, null, 2));
+  assert.equal(first.disposition.code, "SITUATION_RECONCILIATION_REQUIRED");
+  assert.equal(first.disposition.userActionRequired, false);
 
   const second = reduceTaskState({
     previousTaskState: first,
@@ -3904,33 +4006,12 @@ test("TaskState waits through unchanged observations and stops only after the re
       page
     }
   });
-  assert.equal(second.disposition.kind, "wait_reobserve", JSON.stringify(second.disposition, null, 2));
-  assert.equal(second.disposition.reobserveCount, 2);
+  assert.equal(second.disposition.kind, "stop", JSON.stringify(second.disposition, null, 2));
   assert.equal(second.disposition.surfaceFingerprint, first.disposition.surfaceFingerprint);
-  assert.equal(second.disposition.retryToken, first.disposition.retryToken);
-  assert.equal(second.disposition.reobserveDeadlineAt, first.disposition.reobserveDeadlineAt);
-
-  const afterDeadline = reduceTaskState({
-    previousTaskState: {
-      ...second,
-      disposition: {
-        ...second.disposition,
-        reobserveStartedAt: Date.now() - 9_000,
-        reobserveDeadlineAt: Date.now() - 1
-      }
-    },
-    observation: {
-      observationId: "obs_reobserve_after_deadline",
-      observationSnapshot: { snapshotHash: "hash_reobserve_after_deadline" },
-      page
-    }
-  });
-  assert.equal(afterDeadline.disposition.kind, "stop", JSON.stringify(afterDeadline.disposition, null, 2));
-  assert.equal(afterDeadline.disposition.reobserveCount, 3);
-  assert.match(afterDeadline.disposition.reason, /after the bounded re-observation deadline/);
+  assert.match(second.disposition.reason, /no safely executable obligation/i);
 });
 
-test("payment review remains active until every verified decision is present in the transaction ledger", () => {
+test("card entry reaches the milestone while missing decision-ledger coverage remains diagnostic", () => {
   const decisionInstanceId = "traveler_information:extras:airhelp:dg_airhelp:global";
   const outcome = {
     decisionGroupId: "dg_airhelp",
@@ -3958,12 +4039,14 @@ test("payment review remains active until every verified decision is present in 
       controls: [],
       decisionGroups: [],
       terminalEvidence: {
-        contractVersion: "terminal-evidence/v1",
-        stage: "payment_review",
+        contractVersion: "terminal-evidence/v2",
+        stage: "card_credential_entry",
         signals: { route: true, progress: true, form: true, method: true, heading: true },
         signalCount: 5,
         boundaryObserved: true,
         verified: true,
+        cardCredentialEntryObserved: true,
+        paymentCredentialKinds: ["card_number", "card_expiry", "card_security_code"],
         evidenceOnly: true,
         capabilities: { paymentActionsAllowed: false }
       },
@@ -3994,8 +4077,9 @@ test("payment review remains active until every verified decision is present in 
     observation: paymentObservation,
     transactionReview: readyTransactionReview()
   });
-  assert.equal(blocked.terminalStatus, "active");
+  assert.equal(blocked.terminalStatus, "card_credential_entry_reached");
   assert.equal(blocked.transactionReview.ready, false);
+  assert.equal(blocked.processAwareness.finalOutcome.transactionVerified, false);
   assert.ok(blocked.transactionReview.missingFacts.includes("verified_decision_outcomes"));
 
   const accepted = reduceTaskState({
@@ -4003,7 +4087,7 @@ test("payment review remains active until every verified decision is present in 
     observation: paymentObservation,
     transactionReview: { ...readyTransactionReview(), outcomeLedger: [outcome] }
   });
-  assert.equal(accepted.terminalStatus, "payment_review_reached");
+  assert.equal(accepted.terminalStatus, "card_credential_entry_reached");
   assert.equal(accepted.transactionReview.ready, true);
   assert.equal(accepted.outcomeCoverage.complete, true);
 });
@@ -4078,12 +4162,14 @@ test("a verified free choice keeps its canonical semantic owner through receipt 
       controls: [],
       decisionGroups: [],
       terminalEvidence: {
-        contractVersion: "terminal-evidence/v1",
-        stage: "payment_review",
+        contractVersion: "terminal-evidence/v2",
+        stage: "card_credential_entry",
         signals: { route: true, progress: true, form: true, method: true, heading: true },
         signalCount: 5,
         boundaryObserved: true,
         verified: true,
+        cardCredentialEntryObserved: true,
+        paymentCredentialKinds: ["card_number", "card_expiry", "card_security_code"],
         evidenceOnly: true,
         capabilities: { paymentActionsAllowed: false }
       },
@@ -4104,7 +4190,7 @@ test("a verified free choice keeps its canonical semantic owner through receipt 
   assert.equal(first.outcomeJournal[0].semanticOwnerId, canonicalOwnerId);
   assert.deepEqual(first.outcomeCoverage.missingActionIds, []);
   assert.deepEqual(first.outcomeCoverage.missingDecisionInstanceIds, []);
-  assert.equal(first.terminalStatus, "payment_review_reached");
+  assert.equal(first.terminalStatus, "card_credential_entry_reached");
 
   const rerendered = reduceTaskState({
     previousTaskState: first,
@@ -4117,7 +4203,7 @@ test("a verified free choice keeps its canonical semantic owner through receipt 
   assert.equal(rerendered.outcomeJournal[0].semanticOwnerId, canonicalOwnerId);
   assert.deepEqual(rerendered.outcomeCoverage.missingActionIds, []);
   assert.deepEqual(rerendered.outcomeCoverage.missingDecisionInstanceIds, []);
-  assert.equal(rerendered.terminalStatus, "payment_review_reached");
+  assert.equal(rerendered.terminalStatus, "card_credential_entry_reached");
 });
 
 test("unknown grounding remains diagnostic and cannot manufacture profile unready state", () => {
@@ -4144,12 +4230,12 @@ test("unknown grounding remains diagnostic and cannot manufacture profile unread
 
   const taskState = reduceTaskState({ observation, traveler: {} });
 
-  assert.equal(taskState.profileReadiness.profileStage, true);
+  assert.equal(taskState.profileReadiness.profileStage, false);
   assert.equal(taskState.profileReadiness.ready, true);
   assert.equal(taskState.profileReadiness.blockedReasonCode, "");
   assert.equal(taskState.profileReadiness.activeRequirementGrounding.status, "unknown");
   assert.equal(taskState.currentGoal, null);
-  assert.equal(taskState.disposition.kind, "wait_reobserve");
+  assert.equal(taskState.disposition.kind, "stop");
   assert.equal(taskState.disposition.userActionRequired, false);
 });
 
@@ -4349,6 +4435,214 @@ test("a canonically verified child choice durably satisfies its blank parent pro
   assert.equal(contradicted.profileReadiness.ready, false);
 });
 
+test("a compact normalized profile success becomes durable and cannot reissue the same obligation", () => {
+  const controlId = "ctrl_field_hp4hkda";
+  const logicalFieldId = "lf_traveler_1_given_names_passengers_0_firstname";
+  const blankControl = {
+    controlId,
+    surfaceId: "surface-page",
+    label: "passengers.0.firstname e.g. harry james given names",
+    fieldType: "given_names",
+    semantic: "given_names",
+    role: "textbox",
+    kind: "text",
+    required: true,
+    representationLifecycle: { status: "active_rendered", active: true },
+    state: { valuePresent: false, normalizedValue: "", invalid: false },
+    operations: { type: capability("type", "atw-el-6") }
+  };
+  const surnameControl = {
+    ...blankControl,
+    controlId: "ctrl_field_h1djnwu4",
+    label: "passengers.0.surname e.g. brown surnames",
+    fieldType: "last_name",
+    semantic: "last_name",
+    operations: { type: capability("type", "atw-el-8") }
+  };
+  const initialObservation = {
+    observationId: "obs_kiwi_given_names_blank",
+    observationSnapshot: { snapshotHash: "hash_kiwi_given_names_blank" },
+    page: {
+      url: "https://www.kiwi.com/en/booking/",
+      step: "traveler_information",
+      heading: "Primary passenger",
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: [controlId, surnameControl.controlId] },
+      controls: [blankControl, surnameControl],
+      fields: [
+        { ...blankControl, logicalFieldId, controlState: blankControl.state },
+        { ...surnameControl, controlState: surnameControl.state }
+      ],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+  const traveler = { id: "trav_1", given_names: "Ali", last_name: "SIFRAR" };
+  const initial = reduceTaskState({
+    observation: initialObservation,
+    traveler,
+    transactionReview: readyTransactionReview()
+  });
+  assert.equal(initial.currentGoal?.semanticType, "given_names");
+
+  // This is the result shape retained by the failing Kiwi trace: the browser
+  // proved the exact value, while the next control carried label-like option
+  // metadata alongside its real normalized textbox value.
+  const actionResult = {
+    actionId: "act_goal_mt6diqjq_mm81h",
+    observationId: initialObservation.observationId,
+    resultObservationId: "obs_kiwi_given_names_filled",
+    dispatched: true,
+    targetResolved: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "",
+    action: {
+      id: "act_goal_mt6diqjq_mm81h",
+      operation: "type",
+      controlId,
+      targetId: "atw-el-6",
+      value: "Ali"
+    },
+    expectedOutcome: {
+      type: "normalized_value_changed",
+      logicalFieldId,
+      subjectId: "traveler_1",
+      semanticType: "given_names",
+      componentRole: "value",
+      controlId,
+      expectedNormalizedValue: "ali",
+      expectedCanonicalValue: "ali"
+    },
+    outcome: {
+      ok: true,
+      code: "NORMALIZED_VALUE_VERIFIED",
+      evidence: {}
+    }
+  };
+  const receipt = verifiedProfileComponentFromActionResult(actionResult, actionResult.resultObservationId);
+  assert.ok(receipt);
+  assert.equal(receipt.selectedCanonicalValue, "ali");
+  assert.equal(receipt.evidenceSource, "canonical_normalized_value_verifier");
+
+  const compactFilledControl = {
+    ...blankControl,
+    fieldType: undefined,
+    semantic: "unknown",
+    required: false,
+    state: {
+      valuePresent: true,
+      normalizedValue: "ali",
+      optionValue: "passengers.0.firstname e.g. harry james given names",
+      invalid: false
+    }
+  };
+  const settled = reduceTaskState({
+    previousTaskState: initial,
+    previousActionResult: actionResult,
+    observation: {
+      ...initialObservation,
+      observationId: actionResult.resultObservationId,
+      observationSnapshot: { snapshotHash: "hash_kiwi_given_names_filled" },
+      page: {
+        ...initialObservation.page,
+        controls: [compactFilledControl, surnameControl],
+        fields: [
+          {
+            ...blankControl,
+            fieldType: "given_names",
+            logicalFieldId,
+            controlState: compactFilledControl.state
+          },
+          { ...surnameControl, controlState: surnameControl.state }
+        ]
+      }
+    },
+    traveler,
+    transactionReview: readyTransactionReview()
+  });
+  assert.equal(settled.verifiedProfileComponents.length, 1);
+  assert.equal(settled.currentGoal?.semanticType, "last_name", JSON.stringify({
+    completion: settled.verifiedProfileComponents[0],
+    currentGoal: settled.currentGoal
+  }, null, 2));
+});
+
+test("profile completion accepts only exact success contracts", () => {
+  const base = {
+    actionId: "act_exact_profile_contract",
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "",
+    action: { id: "act_exact_profile_contract", value: "Ali" },
+    expectedOutcome: {
+      type: "normalized_value_changed",
+      logicalFieldId: "lf_given_names",
+      subjectId: "traveler_1",
+      semanticType: "given_names",
+      componentRole: "value",
+      controlId: "given_names",
+      expectedNormalizedValue: "ali",
+      expectedCanonicalValue: "ali"
+    },
+    outcome: { ok: true, code: "NORMALIZED_VALUE_VERIFIED", evidence: {} }
+  };
+  assert.ok(verifiedProfileComponentFromActionResult(base, "obs_exact_profile_contract"));
+  for (const exactContract of [
+    {
+      type: "logical_component_committed",
+      code: "LOGICAL_COMPONENT_COMMITTED",
+      evidence: {
+        exactChildSettlement: {
+          contractVersion: "exact-child-choice-settlement/v1",
+          selectedCanonicalValue: "Ali",
+          desiredCanonicalValue: "ali"
+        }
+      }
+    },
+    {
+      type: "date_value_committed",
+      code: "DATE_VALUE_VERIFIED",
+      expectedCanonicalValue: "2003-05-31",
+      expectedNormalizedValue: "",
+      semanticType: "date_of_birth",
+      evidence: { actualCanonicalValue: "2003-05-31" }
+    },
+    {
+      type: "field_value_changed",
+      code: "FIELD_VALUE_VERIFIED",
+      evidence: { value: "Ali" }
+    }
+  ]) {
+    const expectedOutcome = {
+      ...base.expectedOutcome,
+      type: exactContract.type,
+      semanticType: exactContract.semanticType || base.expectedOutcome.semanticType,
+      expectedCanonicalValue: exactContract.expectedCanonicalValue ?? base.expectedOutcome.expectedCanonicalValue,
+      expectedNormalizedValue: exactContract.expectedNormalizedValue ?? base.expectedOutcome.expectedNormalizedValue
+    };
+    assert.ok(verifiedProfileComponentFromActionResult({
+      ...base,
+      expectedOutcome,
+      outcome: { ok: true, code: exactContract.code, evidence: exactContract.evidence }
+    }, `obs_exact_${exactContract.type}`), exactContract.type);
+  }
+  assert.equal(verifiedProfileComponentFromActionResult({
+    ...base,
+    outcome: { ...base.outcome, code: "FIELD_VALUE_VERIFIED" }
+  }, "obs_mismatched_profile_contract"), null);
+  assert.equal(verifiedProfileComponentFromActionResult({
+    ...base,
+    failureCode: "NORMALIZED_VALUE_NOT_VERIFIED"
+  }, "obs_conflicting_profile_contract"), null);
+  assert.equal(verifiedProfileComponentFromActionResult({
+    ...base,
+    expectedOutcome: { ...base.expectedOutcome, type: "field_value_changed", expectedNormalizedValue: "" },
+    outcome: { ...base.outcome, code: "FIELD_VALUE_VERIFIED" }
+  }, "obs_presence_only_profile_contract"), null);
+});
+
 test("popup closure without canonical verification cannot settle a profile requirement", () => {
   const result = verifiedProfileComponentFromActionResult({
     actionId: "act_weak_age_close",
@@ -4424,6 +4718,6 @@ test("missing selected-flight date outranks semantic grounding and never asks th
     label: "selected flight departure date"
   }]);
   assert.equal(taskState.currentGoal, null);
-  assert.equal(taskState.disposition.kind, "wait_reobserve");
+  assert.equal(taskState.disposition.kind, "stop");
   assert.equal(taskState.disposition.userActionRequired, false);
 });

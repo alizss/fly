@@ -516,9 +516,9 @@ function rawControlValue(control = {}) {
     state.canonicalDateValue
       || state.dateComponentValue
       || state.selectedValue
-      || state.optionValue
       || state.normalizedValue
       || state.valueText
+      || state.optionValue
       || control.currentValue
       || control.value
       || ""
@@ -546,6 +546,17 @@ function currentComponentValue(semanticType = "", role = "", control = {}, field
     ));
     const evidence = [raw, selectedOption?.value, selectedOption?.label].filter(Boolean);
     if (evidence.some((value) => ageOptionContains(value, desiredValue))) return String(desiredValue);
+  }
+  if (desiredValue) {
+    const options = [...(control.options || []), ...(field.options || [])];
+    const selectedOption = options.find((option) => (
+      option?.selected === true
+      || String(option?.value || "") === raw
+      || String(option?.label || "") === raw
+    ));
+    if (selectedOption && canonicalOptionMatch(semanticType, role, desiredValue, selectedOption)) {
+      return String(desiredValue);
+    }
   }
   if (DATE_FIELDS.has(semanticType)) {
     if (role !== "value") return dateComponentValue(role, raw);
@@ -1036,7 +1047,6 @@ function componentCommitRequirement(control = {}, page = {}) {
     commitState
     && commitState.status === "settled"
     && commitState.popupClosed !== false
-    && commitState.focusSettled !== false
   );
   const interactionSettled = interactionKind === "scalar"
     ? true

@@ -257,14 +257,14 @@ test("observed control serialization preserves one exact proof without duplicati
   }
 });
 
-test("interaction method is part of stable failed-strategy identity", () => {
+test("interaction method does not make the same semantic mutation a new strategy", () => {
   const action = {
     type: "click",
     operation: "open",
     controlId: "custom_title",
     targetId: "title_wrapper"
   };
-  assert.notEqual(
+  assert.equal(
     loopPrivate.candidateStrategySignature({}, { ...action, interactionMethod: "native_click" }),
     loopPrivate.candidateStrategySignature({}, { ...action, interactionMethod: "pointer_sequence" })
   );

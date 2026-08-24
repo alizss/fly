@@ -176,6 +176,15 @@ function decideStage(observation = {}) {
   const paymentDestination = evidence.terminalEvidence?.boundaryObserved === true;
   if (paymentDestination) return { stage: "payment", evidence };
   if (evidence.confirmation) return { stage: "confirmation", evidence };
+  // Method-selection and payment-review pages are still payment-stage pages,
+  // even before the terminal card credential controls are rendered. This is
+  // stage diagnosis only; terminal completion remains capability-evidenced.
+  if (evidence.payment.route && (
+    evidence.payment.method
+    || evidence.payment.heading
+    || evidence.payment.progress
+    || evidence.payment.orderSection
+  )) return { stage: "payment", evidence };
   // Search/start routes are outside an active checkout. Route structure is
   // stronger than stale extras copy retained in a rerendered shell.
   if (evidence.newSearchRoute) return { stage: "flight_selection", evidence };

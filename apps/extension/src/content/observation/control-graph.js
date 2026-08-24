@@ -173,6 +173,15 @@ export function createControlGraphCompiler(dependencies) {
       && activeSurface.blocksBackground === true
       ? activeSurface
       : null;
+    const closestSectionForElement = (element) => (sections || [])
+      .map((section) => ({ section, owner: elementById(section.id) }))
+      .filter((entry) => entry.owner?.contains?.(element))
+      .sort((left, right) => {
+        if (left.owner === right.owner) return 0;
+        if (left.owner.contains(right.owner)) return 1;
+        if (right.owner.contains(left.owner)) return -1;
+        return 0;
+      })[0]?.section || null;
     if (surface) {
       for (const item of [...(surface.options || []), ...(surface.buttons || [])]) {
         const source = elementById(item.id);
@@ -182,7 +191,7 @@ export function createControlGraphCompiler(dependencies) {
     }
   
     for (const field of fields || []) {
-      const section = (sections || []).find((item) => field.element && elementById(item.id)?.contains?.(field.element));
+      const section = closestSectionForElement(field.element);
       const control = register(field.element, {
         section,
         sectionId: section?.id || "",
@@ -196,10 +205,20 @@ export function createControlGraphCompiler(dependencies) {
     }
   
     for (const button of buttons || []) {
-      const control = register(button.element, {
+      const stageNavigation = button.semantic === "continue"
+        || isSafeContinueLabel(button.label || "")
+        || /^(back|close|done)$/i.test((button.label || "").trim());
+      const section = stageNavigation ? null : closestSectionForElement(button.element);
+      const control = register(button.element, section ? {
+        section,
+        sectionId: section.id,
+        sectionType: section.type,
+        sectionLabel: section.label,
+        required: false
+      } : {
         field: button.semantic,
         required: false
-      }, 10);
+      }, section ? 50 : 10);
       applyControlToModel(button, control);
     }
   
@@ -525,4 +544,3 @@ export function createControlGraphCompiler(dependencies) {
     unfilledRequiredFields
   });
 }
-

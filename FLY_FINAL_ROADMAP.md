@@ -8,9 +8,9 @@ Fly should let the user select a flight and confirm Book/Pay once, then complete
 
 The Chrome extension is the first actuator and proving ground. The long-term product is one reusable checkout-intelligence engine shared by the browser extension, a secure background runtime, and an iOS experience.
 
-### Current priority (2026-08-19)
+### Current priority (2026-08-23)
 
-The universal launch and action infrastructure is established, but Croatia exposed a deeper bottleneck before portfolio promotion: page-stage classification still influenced profile admission, terminal state, fingerprints, and recovery identity. The active package is an **obligation-driven core**. One `CheckoutSituation/v1` inside the existing `DecisionFrame` describes requested facts, unresolved decisions, available actions, blockers, consequences, transaction evidence, completion evidence, and contradictions. Stage remains diagnostic only. Once the Croatia/Lufthansa/Wizz replays prove this core, resume the controlled 8–10-site structural portfolio. Every failure must become a trace-derived universal replay and repair; ordinary unfamiliar DOMs, fields, grouping, or controls are not acceptable permanent stop reasons.
+The universal launch and action infrastructure is established, and the Croatia PaymentForm failure is now repaired across scheduling and execution. A `DesiredStateDelta/v1` compiler compares exact observed state with profile, booking policy, mandate, and verified history. TaskState schedules only proven deltas; satisfied or optional components no longer reopen merely because they are visible or unfamiliar. Broad ancestor price inheritance and noun-only legal/payment authority are removed. Standalone optional toggles compile as canonical decisions, and conflicting selected consent is corrected with an exact verified `control_unselected` outcome. Exact canonical actuator actionability is now the sole feasibility authority: execution revalidates freshness and safety but no longer rejects native 13px checkboxes with a generic CTA-size rule. Repeat-prohibited pre-dispatch failures enter the existing bounded target-local recovery ledger and cannot loop as fresh plans. Completion remains grounded in fresh owned card-entry capability, not a route, progress label, review summary, payment-method selector, legal checkbox, or Confirm button. Full live portfolio proof remains pending.
 
 ### Obligation-driven correction (2026-08-19)
 
@@ -22,13 +22,13 @@ The universal launch and action infrastructure is established, but Croatia expos
 
 ### Current architectural concern and correction (2026-08-06)
 
-Fly must not become so formal at the mechanical browser layer that it suppresses the model's ability to solve a harmless unfamiliar widget. EasyJet trace `chk_msez60hyieyxll` understood the exact objective `title=mr` and observed a unique visible, hit-tested trigger, yet stopped because the hidden state node and visible actuator were not one proven `open` capability. The chosen actuator was then rebound to a different zero-size member and viewport recovery evaluated the logical state owner instead of the selected actuator. This is an infrastructure boundary failure, not missing profile reasoning and not evidence that a site-specific EasyJet workflow is required.
+Fly must not become so formal at the mechanical browser layer that its own canonical control graph suppresses a harmless unfamiliar widget. EasyJet trace `chk_msez60hyieyxll` understood the exact objective `title=mr` and observed a unique visible, hit-tested trigger, yet stopped because the hidden state node and visible actuator were not one proven `open` capability. The chosen actuator was then rebound to a different zero-size member and viewport recovery evaluated the logical state owner instead of the selected actuator. This is a deterministic control-graph boundary failure, not missing model reasoning and not evidence that a site-specific EasyJet workflow is required.
 
 The correction is a **Consequence-Gated Adaptive Operator**: retain canonical semantic planning as the deterministic fast path, but do not require a fully compiled decision before every harmless click. When checkout is unfinished and the current surface contains an exact, enabled, low-consequence reversible control, Fly may try one bounded mechanic through the same governor and verifier. Constrain consequences rather than requiring perfect DOM interpretation before every harmless action. Paid, legal, payment, purchase, identity, itinerary, price, stale-target, and completion authority remain deterministic and independently enforced.
 
 EasyJet trace `chk_mshf1di35xcw1t` exposed the broader form of the problem after traveler fields and Continue had already worked: a persistent positioned price/seat summary containing action text was falsely promoted to exclusive foreground, while the real page-owned safe seat actuator never became a formal decision goal. The universal correction is structural foreground ownership plus a bounded no-goal fallback—not another EasyJet seat rule.
 
-Fly therefore maintains two views of the same fresh browser state: a compact **agent interaction view** containing the objective, relevant controls/regions, recent changes, allowed mechanics, forbidden effects, failed hypotheses, and canonical success condition; and a richer private **authority view** containing provenance, ownership, policy, transaction facts, action receipts, freshness, and completion evidence. The model may propose a short mechanical sequence, but the runtime leases, executes, reobserves, and verifies only one atomic action at a time.
+Fly therefore maintains two views of the same fresh browser state: a compact **semantic reconciliation view** containing uncertain evidence IDs and their local context; and a richer private **authority view** containing the canonical control graph, provenance, ownership, policy, transaction facts, action receipts, freshness, and completion evidence. The model may propose semantic hypotheses only. TaskState and the deterministic mechanics binder select and lease one atomic graph operation at a time.
 
 Current release boundary:
 
@@ -37,8 +37,9 @@ Selected flight
 → complete traveler and contact details
 → resolve fares, bags, seats, insurance, and other required choices
 → verify itinerary and price
-→ reach payment review
-→ stop before payment, legal acceptance, or purchase
+→ complete authorized standard pre-payment/legal work
+→ reach actual payment entry
+→ stop before payment credentials, Pay, or purchase
 ```
 
 “Handle every surprise” does not mean silently completing every situation. It means Fly always responds correctly: recover when safe, ask for the smallest missing decision, or stop clearly at a safety boundary.
@@ -65,8 +66,8 @@ flowchart TD
     G -->|"Payment, legal, CAPTCHA, OTP, or unsafe"| K["Stop or hand off safely"]
 
     H --> L["Compile one atomic action"]
-    I --> I1["Build compact interaction view"]
-    I1 --> I2["AI selects one fresh component/surface-scoped mechanic"]
+    I --> I1["Build one bounded deterministic mechanic set"]
+    I1 --> I2["Rank exact graph operation locally"]
     I2 --> L
     J --> D
 
@@ -77,7 +78,7 @@ flowchart TD
     O --> P{"Semantic postcondition satisfied?"}
 
     P -->|"Yes"| Q["Persist verified progress"]
-    Q --> R{"Payment review ready?"}
+    Q --> R{"Actual card credential entry ready?"}
     R -->|"No"| A
     R -->|"Yes"| S["Verify itinerary and total, then stop"]
 
@@ -107,11 +108,13 @@ flowchart TD
 
 - **Requirement and decision engine** — Converts every unresolved item into a structured field requirement or decision with options, risk, policy status, evidence, and completion state.
 
+- **Desired State Delta compiler and scheduler** — Computes the minimal exact difference between observed state and profile/policy/mandate. It admits only required missing state, exact profile mismatch, proven incremental-cost or transaction conflict, typed required legal work, and owned active validation. No delta means no semantic work, allowing the scheduler to advance through an executable safe stage exit without reopening settled controls.
+
 - **Profile and policy engine** — Applies hard safety rules, user facts, user preferences, trip-specific instructions, product defaults, and bounded agent judgment in that order.
 
 - **Hierarchical planner and reusable skills** — Chooses the journey objective and a reusable skill, but compiles and executes only one freshly verified atomic action at a time.
 
-- **Consequence-gated adaptive interaction operator** — Preserves canonical semantics as the fast path, but when formal planning has no goal and checkout is unfinished, may choose one exact current low-consequence reversible mechanic inside a durable attempt/effect budget. The private governor retains consequence and completion authority.
+- **Consequence-gated adaptive interaction operator** — Preserves canonical semantics as the fast path, but when formal planning has no goal and checkout is unfinished, may deterministically choose one exact current low-consequence reversible graph mechanic inside a durable attempt/effect budget. The private governor retains consequence and completion authority; no model chooses the mechanic.
 
 - **Deterministic execution plane** — Executes tightly specified operations such as click, type, select, scroll, wait, and navigation after local freshness and actionability checks.
 
@@ -135,7 +138,7 @@ flowchart TD
 | Missing required traveler fact | Ask the user; never invent identity information. |
 | Choice resolved by explicit policy | Select deterministically and verify the decision outcome. |
 | Consequential choice without applicable policy | Ask the user before changing price, itinerary, flexibility, or important trip properties. |
-| Known objective on an unfamiliar reversible widget | Preserve the objective and local component/surface, build the compact interaction view, and let AI test one current visible reversible mechanic inside the allowed-effect and attempt budget. Exact semantic completion still requires fresh canonical verification. |
+| Known objective on an unfamiliar reversible widget | Preserve the objective and local component/surface, derive current mechanics from the canonical graph, and deterministically try the highest-ranked fresh reversible operation inside the allowed-effect and attempt budget. Exact semantic completion still requires fresh canonical verification. |
 | Formal goal missing but one exact current low-consequence control exists | Publish one bounded adaptive interaction; execute only after the consequence governor accepts it; reobserve and verify the state change. |
 | Deterministic scene meaning is uncertain or contradictory | Run at most one grounded semantic reconciliation pass over supplied fresh evidence IDs, then let the deterministic compiler publish one final DecisionFrame. The model cannot create work, permission, transaction truth, or completion. |
 | Unfamiliar UI with no exact safe actuator or only consequential/unknown commercial actions | Reobserve or stop precisely; do not grant whole-page exploratory authority. |
@@ -160,6 +163,7 @@ The order below follows technical dependencies. Each item should establish a rel
 |     5 | **Logical field adapter**                             | Scalar fields, split dates, phone components, document fields, custom dropdowns, autocomplete, calendars, validation errors, and hierarchical completion.                                               | Raw controls must become traveler requirements before profile data can be applied safely across different markup.                                                | Known profile values compile into deterministic component-level operations without losing metadata across system boundaries.               |
 |     6 | **Durable task state and reconciliation**             | Verified completions, unresolved requirements, decisions, approvals, selected/declined extras, prices, checkpoints, failures, and contradictions.                                                       | Once observation is trustworthy, Fly needs memory that preserves real progress without overruling fresh evidence.                                                | A fresh contradiction reopens the relevant requirement, while unrelated verified progress remains intact.                                  |
 |     7 | **Requirement and decision engine**                   | Explicit decision IDs, types, options, required/optional status, selected outcome, risk, evidence, policy compatibility, and blockers.                                                                  | Profile policy cannot safely operate on vague page text; it needs structured unresolved decisions.                                                               | Fly can always explain what remains unresolved and why checkout may or may not continue.                                                   |
+|    7A | **Desired State Delta compiler and scheduler**         | Exact observed/desired state comparison, positive economic-effect proof, typed legal proof, profile mismatch, requiredness, owned validation, and one delta identity per component.                       | Scheduling every visible component reopens settled state and turns context into work.                                                                            | TaskState schedules only proven deltas; no delta permits safe stage exit; broad totals, nearby labels, optional visibility, and unfamiliarity cannot create work. |
 |     8 | **Profile and policy engine**                         | Hard safety rules → traveler facts/preferences → trip instructions → product defaults → bounded judgment; plus price and itinerary tolerances.                                                          | Only after decisions are explicit can Fly distinguish facts it knows, choices it may make, and choices requiring the user.                                       | Fly never invents identity or preference data, and identical policy inputs produce consistent decisions.                                   |
 |     9 | **Grounded candidate and capability builder**         | Deterministic goal-owned candidates plus fresh component/surface mechanical hypotheses, each tied to an exact visible control/region, actionability, policy result, risk, expected effect, and causal success test. | The deterministic fast path needs exact semantic candidates; bounded adaptation must still see a unique safe actuator when its framework-specific `open` operation cannot yet be proven. | Deterministic actions remain exact and goal-owned; adaptive hypotheses are freshly grounded, reversible, locally owned, policy-allowed, and independently verifiable without global sibling trust. |
 |    10 | **Hierarchical planner and reusable skills**          | Journey objective, reusable closed-loop skills, and compilation into exactly one atomic action per turn.                                                                                                | Planning becomes useful only after the state, requirement, policy, and available actions are trustworthy.                                                        | Form, fare, baggage, seat, insurance, dialog, review, and navigation skills advance one verified action at a time.                         |
@@ -499,7 +503,7 @@ The next work in the current repository is therefore:
 16. ✅ Resolve compact verified results through the exact resolved target snapshot; add a live-shaped no-planned-group regression; preserve parent/child and seat aggregation.
 17. ⏳ Make loaded build/reducer identity observable, restart the backend, re-run GoToGate and Kiwi, and require non-empty journal/ledger coverage whenever the session contains verified consequential actions.
 18. Then test one direct airline and one structurally different OTA.
-19. Keep `payment_review_reached` as the current terminal product boundary and preserve the structural prohibition on payment, billing, legal, card, and purchase mutation.
+19. **Superseded:** the former `payment_review_reached` boundary was too early. The current terminal is `card_credential_entry_reached`; preserve the structural prohibition on credential entry, Pay, and purchase while allowing profile/mandate-authorized standard legal work.
 20. ✅ Live-prove Canonical Requirement Admission on Turkish: optional controls are waived, the composite phone prefix remains the sole unresolved component, and the exact opener executes and verifies.
 21. ✅ Replace the Turkish-shaped replay's manual portal clicks with the real action pipeline and require opener → fresh portal → `Slovenia (+386)` → settled canonical phone → Continue.
 22. ✅ Add one durable bounded adaptive surface episode before the profile `MISSING_EXECUTABLE_ACTUATOR` stop. Preserve the known objective and causal surface; expose only fresh reversible mechanics; reuse the existing selector, governor, executor, and verifier rather than adding a second planner.
@@ -580,7 +584,10 @@ The next work in the current repository is therefore:
 
 ### Current execution checklist
 
-- [x] Return a freshly latched `payment_review_reached` before every lower-priority same-turn profile or planning branch.
+- [x] Return a freshly latched `card_credential_entry_reached` only from exact direct/hosted card-entry capability, before every lower-priority same-turn planning branch.
+- [x] Compile and schedule only `DesiredStateDelta/v1` work; satisfied/optional visible choices cannot reopen without positive mismatch, cost, legal, requiredness, or validation proof.
+- [x] Remove broad ancestor price inheritance and noun-only legal/payment authority; retain only exact owned positive evidence.
+- [x] Treat standalone consent toggles as canonical decisions and verify selected-to-unselected corrections with `control_unselected`.
 - [x] Publish no payment, billing, legal, newsletter, Edit, or generic candidate after the terminal latch.
 - [x] Remove mutable values from stable logical identity and verify phone rerender continuity.
 - [x] Reject unowned generic route pairs and certify the owned Kiwi itinerary.
@@ -697,7 +704,7 @@ The next work in the current repository is therefore:
 
 ## Success metrics
 
-- Percentage of eligible checkouts reaching verified payment review without intervention.
+- Percentage of eligible checkouts reaching verified actual payment entry without intervention.
 - Percentage completed after safe autonomous recovery.
 - User handoffs per checkout and whether each handoff was necessary and actionable.
 - Incorrect field, extra, fare, seat, itinerary, price, and completion decisions.
@@ -713,14 +720,14 @@ The next work in the current repository is therefore:
 
 1. Fresh combined page evidence is authoritative; durable state is verified memory.
 2. Every logical control has one stable identity and explicit surface ownership.
-3. AI may choose reversible mechanics only inside a known objective, causally owned surface, explicit effect boundary, and bounded budget; it never invents profile facts, permission, or completion truth.
+3. AI never chooses mechanics. It may only refine uncertain semantic meaning inside a known objective and closed fresh evidence set; the canonical graph and deterministic binder own targets, operations, and strategy ordering.
 4. A bounded local component may temporarily substitute for a not-yet-created child surface during actuator discovery, but only for fresh visible reversible hypotheses with explicit forbidden effects and causal verification.
 5. The model reasons over a compact interaction view; the governor and verifier retain the full private authority view. Compactness may not discard the exact target, current objective, recent causal feedback, or safety boundary.
 6. The deterministic fast path remains preferred, and the executor accepts only grounded, current, policy-safe atomic actions from either deterministic planning or the bounded adaptive episode.
 7. Every state-changing action requires a semantic postcondition from a fresh observation.
 8. Recovery is bounded, recorded, and scoped to the exact requirement or control.
 9. A failed requirement does not erase verified progress or block unrelated executable work.
-10. Consequential ambiguity goes to the user; mechanical ambiguity goes to bounded recovery or grounded AI.
+10. Consequential ambiguity goes to the user; mechanical alternatives go to deterministic ranking and bounded recovery; semantic ambiguity may use one grounded hypothesis call.
 11. Site knowledge may improve performance but may not override the universal contracts.
 12. Browser, background, and iOS runtimes share one checkout model, policy system, task state, and verification logic.
 

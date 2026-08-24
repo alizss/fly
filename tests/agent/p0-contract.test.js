@@ -1,7 +1,12 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { evaluateActionPolicy } = require("../../packages/shared/policy");
+const {
+  evaluateActionPolicy,
+  legalAcceptanceScope,
+  LEGAL_ACCEPTANCE_SCOPE,
+  factualAccuracyEvidence
+} = require("../../packages/shared/policy");
 const { __private } = require("../../apps/web/agent/loop");
 const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
@@ -191,6 +196,44 @@ test("viewport recovery never rebinds a stale fare action to the sole control on
   assert.equal(rebound.candidate, null);
   assert.equal(rebound.action.controlId, "ctrl_saver");
   assert.notEqual(rebound.action.controlId, "ctrl_no_thanks");
+});
+
+test("fresh TaskState ownership cancels a viewport recovery whose obligation is no longer current", () => {
+  const pending = {
+    actionLease: { obligationId: "decision:dg_insurance" },
+    originalAction: {
+      id: "act_old_insurance",
+      obligationId: "decision:dg_insurance",
+      decisionGroupId: "dg_insurance",
+      expectedOutcome: { decisionGroupId: "dg_insurance" }
+    }
+  };
+  const current = currentObligationFromGoal({
+    goal: {
+      goalId: "navigation:continue",
+      kind: "navigation",
+      semanticType: "navigation",
+      actionableControlIds: ["continue"],
+      successCondition: { type: "checkout_stage_advanced" }
+    }
+  });
+  const same = currentObligationFromGoal({
+    goal: {
+      goalId: "decision:dg_insurance",
+      kind: "checkout_decision",
+      decisionGroupId: "dg_insurance",
+      eligibleAlternativeControlIds: ["insurance_none"],
+      desiredStateDelta: { actionRequired: true },
+      successCondition: {
+        type: "decision_group_resolved",
+        decisionGroupId: "dg_insurance",
+        eligibleAlternativeControlIds: ["insurance_none"]
+      }
+    }
+  });
+
+  assert.equal(__private.pendingRecoveryOwnedByCurrentObligation(pending, { currentObligation: current }), false);
+  assert.equal(__private.pendingRecoveryOwnedByCurrentObligation(pending, { currentObligation: same }), true);
 });
 
 function observationWithGroups() {
@@ -1597,4 +1640,210 @@ test("P0.11 stale scoped requirements leave the active planning view", () => {
 
   assert.equal(secondLifecycle.some((item) => item.lifecycleStatus === "stale"), true);
   assert.equal(active.some((item) => item.requirementId === "dg_flexible_ticket"), false);
+});
+
+test("standard booking terms are covered by the transaction-bound checkout mandate", () => {
+  const decision = evaluateActionPolicy({
+    type: "click",
+    intent: "accept_legal_terms",
+    risk: "legal",
+    targetSnapshot: {
+      controlId: "terms",
+      risk: "legal",
+      semantic: "accept_legal_terms",
+      label: "I agree to the General Conditions of Carriage, purchase conditions, and dangerous goods restrictions"
+    }
+  }, { approvals: { standardBookingTermsApproved: true } });
+
+  assert.equal(decision.allow, true);
+  assert.match(decision.reason, /Book\/Pay mandate/);
+});
+
+test("required legal checkbox keeps the admitted obligation postcondition when its observed effect is unknown", () => {
+  const controlId = "ctrl_terms_accuracy";
+  const actuatorId = "terms_label";
+  const decisionGroupId = "dg_terms_accuracy";
+  const choose = actionableCapability("choose", actuatorId);
+  choose.status = "proven_executable";
+  choose.strategies = [{
+    strategyId: "terms::choose::label::native_click",
+    operation: "choose",
+    actuatorId,
+    method: "native_click",
+    actionType: "click",
+    status: "proven_executable",
+    expectedOutcome: "control_selected"
+  }];
+  choose.exactActuators = [{ actuatorId, status: "proven_executable", proof: choose.actionability }];
+  const observation = {
+    observationId: "obs_terms_accuracy",
+    observationSnapshot: { snapshotHash: "hash_terms_accuracy" },
+    page: {
+      url: "https://airline.test/purchase",
+      snapshotHash: "hash_terms_accuracy",
+      currentSurface: { id: "surface-page", type: "page", label: "payment" },
+      controls: [{
+        controlId,
+        stableKey: "checkbox:terms-accuracy",
+        label: "I confirm the passenger details are accurate and accept the conditions of carriage",
+        role: "checkbox",
+        kind: "checkbox",
+        semantic: "legal_acceptance",
+        physicalEffect: "unknown",
+        risk: "legal",
+        surfaceId: "surface-page",
+        decisionGroupId,
+        required: true,
+        selected: false,
+        state: { checked: false, selected: false, selectionState: "UNSELECTED", disabled: false },
+        stateElementId: "terms_input",
+        preferredActivationElementId: actuatorId,
+        operations: { choose }
+      }],
+      decisionGroups: [{
+        decisionGroupId,
+        surfaceId: "surface-page",
+        required: true,
+        status: "missing",
+        alternativeControlIds: [controlId],
+        alternatives: [{ controlId, targetId: actuatorId, semantic: "legal_acceptance", risk: "legal", selected: false }]
+      }]
+    }
+  };
+  const goal = {
+    goalId: `decision:${decisionGroupId}`,
+    kind: "checkout_decision",
+    semanticType: "legal_passenger",
+    family: "legal",
+    decisionGroupId,
+    candidateControlIds: [controlId],
+    actionableControlIds: [controlId],
+    desiredPolicyOutcome: "selected_policy_allowed_option",
+    successCondition: { type: "decision_group_resolved", decisionGroupId }
+  };
+  const set = groundedObservationCandidateSet(goal, observation, [], {
+    state: { approvals: { standardBookingTermsApproved: true } },
+    approvals: { standardBookingTermsApproved: true }
+  });
+
+  assert.equal(set.candidates.length, 1, JSON.stringify(set, null, 2));
+  assert.equal(set.candidates[0].controlId, controlId);
+  assert.equal(set.candidates[0].executionChannel, "normal");
+  assert.deepEqual(set.candidates[0].expectedOutcome, {
+    ...set.candidates[0].expectedOutcome,
+    type: "control_selected",
+    expectedSelectedControlId: controlId,
+    decisionGroupId,
+    obligationSuccessType: "decision_group_resolved"
+  });
+});
+
+test("bundled marketing or exceptional declarations remain outside the standard mandate", () => {
+  const decision = evaluateActionPolicy({
+    type: "click",
+    intent: "accept_legal_terms",
+    risk: "legal",
+    targetSnapshot: {
+      controlId: "bundled-consent",
+      risk: "legal",
+      semantic: "accept_legal_terms",
+      label: "I accept the booking terms and agree to marketing and promotional data sharing"
+    }
+  }, { approvals: { standardBookingTermsApproved: true } });
+
+  assert.equal(decision.allow, false);
+  assert.equal(decision.decision, "deny");
+  assert.match(decision.reason, /defaults to unchecked/);
+});
+
+test("legal acceptance uses a closed five-scope contract and verifies factual attestations", () => {
+  const legalAction = (label) => ({
+    type: "click",
+    intent: "accept_legal_terms",
+    risk: "legal",
+    targetSnapshot: { controlId: "legal", risk: "legal", semantic: "accept_legal_terms", label }
+  });
+  assert.equal(legalAcceptanceScope(legalAction("I accept the conditions of carriage")), LEGAL_ACCEPTANCE_SCOPE.STANDARD_TERMS);
+  assert.equal(legalAcceptanceScope(legalAction("I confirm the passenger details are accurate")), LEGAL_ACCEPTANCE_SCOPE.FACTUAL_ACCURACY_ATTESTATION);
+  assert.equal(legalAcceptanceScope(legalAction("I declare that I meet all visa and residency requirements")), LEGAL_ACCEPTANCE_SCOPE.EXCEPTIONAL_PERSONAL_DECLARATION);
+  assert.equal(legalAcceptanceScope(legalAction("Send me marketing offers")), LEGAL_ACCEPTANCE_SCOPE.OPTIONAL_CONSENT);
+  assert.equal(legalAcceptanceScope(legalAction("I acknowledge this declaration")), LEGAL_ACCEPTANCE_SCOPE.UNKNOWN_LEGAL);
+
+  const factual = legalAction("I confirm the passenger names and details are correct and accept the booking terms");
+  const beforeReview = evaluateActionPolicy(factual, { approvals: { standardBookingTermsApproved: true } });
+  assert.equal(beforeReview.allow, false);
+  const afterReview = evaluateActionPolicy(factual, {
+    approvals: { standardBookingTermsApproved: true },
+    transactionInvariants: { review: { ready: true, missingFacts: [], contradictions: [] } }
+  });
+  assert.equal(afterReview.allow, true);
+
+  const exceptional = {
+    ...legalAction("I declare that I am a resident of Slovenia"),
+    targetSnapshot: {
+      ...legalAction("I declare that I am a resident of Slovenia").targetSnapshot,
+      legalScope: LEGAL_ACCEPTANCE_SCOPE.EXCEPTIONAL_PERSONAL_DECLARATION,
+      declarationFact: { field: "residency", expectedValue: "SI" }
+    }
+  };
+  assert.equal(evaluateActionPolicy(exceptional, { approvals: {} }, { residency: "SI" }).allow, true);
+  assert.equal(evaluateActionPolicy(exceptional, { approvals: {} }, { residency: "US" }).decision, "ask_user");
+
+  const optional = {
+    ...legalAction("Send me marketing offers"),
+    targetSnapshot: {
+      ...legalAction("Send me marketing offers").targetSnapshot,
+      legalScope: LEGAL_ACCEPTANCE_SCOPE.OPTIONAL_CONSENT,
+      consentCategory: "marketing"
+    }
+  };
+  assert.equal(evaluateActionPolicy(optional, { approvals: {} }, {}).decision, "deny");
+  assert.equal(evaluateActionPolicy(optional, { approvals: {} }, { marketing_opt_in: true }).allow, true);
+
+  const unknown = legalAction("I acknowledge this declaration");
+  assert.equal(evaluateActionPolicy(unknown, { approvals: {} }).decision, "ask_user");
+});
+
+test("factual attestation uses selected-booking, traveler-profile, and current-total evidence without requiring card-page review", () => {
+  const facts = {
+    itinerary: {
+      completeness: "complete",
+      segments: [{ origin: "ZAG", destination: "SJJ", departureDate: "15 SEP", departureTime: "", arrivalTime: "", flightNumber: "" }]
+    },
+    travelers: [{ travelerId: "traveler_1", name: "Ali SIFRAR" }],
+    totalPrice: { amount: 152.62, currency: "EUR" },
+    currency: "EUR",
+    factEvidence: { travelers: { source: "selected_traveler_profile", authoritative: true } }
+  };
+  const state = {
+    approvals: { standardBookingTermsApproved: true },
+    transactionInvariants: {
+      baselineStatus: "approved",
+      baseline: {
+        ...structuredClone(facts),
+        travelers: [{ travelerId: "traveler_1", name: "" }]
+      },
+      current: structuredClone(facts),
+      review: null
+    }
+  };
+  const action = {
+    type: "click",
+    intent: "choose_option",
+    risk: "legal",
+    targetLabel: "I confirm passenger names, dates, and flight details are accurate and accept the booking conditions",
+    targetSnapshot: {
+      controlId: "terms",
+      risk: "legal",
+      semantic: "legal_acceptance"
+    }
+  };
+
+  assert.deepEqual(factualAccuracyEvidence(state), { verified: true, missingFacts: [], contradictions: [] });
+  assert.equal(evaluateActionPolicy(action, state, {}, state.approvals).allow, true);
+
+  const changed = structuredClone(state);
+  changed.transactionInvariants.current.totalPrice.amount = 162.62;
+  assert.equal(factualAccuracyEvidence(changed).verified, false);
+  assert.equal(evaluateActionPolicy(action, changed, {}, changed.approvals).decision, "ask_user");
 });

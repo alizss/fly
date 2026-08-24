@@ -237,13 +237,19 @@ function safePlannerFailureResult({ dataDir, state, turnId, screenshotDataUrl, t
 
 function plannerFailureReason(error) {
   const message = String(error?.message || error || "");
+  if (/incorrect api key|invalid api key|authentication|\b401\b/i.test(message)) {
+    return "The configured OpenAI API key was rejected while resolving a genuinely ambiguous current surface. Update the development API key, then continue the same checkout session.";
+  }
+  if (/OPENAI_API_KEY is not set/i.test(message)) {
+    return "OPENAI_API_KEY is not configured. A model is used only to reconcile genuinely ambiguous semantic meaning; mechanics remain deterministic.";
+  }
   if (error?.code === "MODEL_PACKET_TOO_LARGE") {
-    return "AI candidate context exceeded its local safety bound before any model call.";
+    return "Semantic-reconciliation context exceeded its local safety bound before any model call.";
   }
   if (/returned no output text|invalid JSON after retry/i.test(message)) {
-    return "AI planner returned no usable candidate selection after a bounded retry.";
+    return "Semantic reconciliation returned no usable grounded hypothesis after a bounded retry.";
   }
-  return "AI planner or model API unavailable while choosing between multiple current candidates.";
+  return "The semantic-reconciliation model is unavailable; no mechanical target or operation depends on it.";
 }
 
 
@@ -269,4 +275,3 @@ module.exports = {
   toClientDecision,
   withLatencyDebug
 };
-

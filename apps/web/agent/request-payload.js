@@ -559,6 +559,8 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       signalCount: Number(compiled.signalCount || 0),
       boundaryObserved: compiled.boundaryObserved === true,
       verified: compiled.verified === true,
+      cardCredentialEntryObserved: compiled.cardCredentialEntryObserved === true,
+      hostedCardEntryPresent: compiled.hostedCardEntryPresent === true,
       evidenceOnly: true,
       paymentCredentialKinds: Array.isArray(compiled.paymentCredentialKinds)
         ? compiled.paymentCredentialKinds.map((kind) => clampText(kind, 60)).slice(0, 12)

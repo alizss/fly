@@ -160,15 +160,44 @@ function rememberSemanticBindings(memory = [], observation = {}) {
   return [...deduped.values()].slice(-64);
 }
 
-function semanticSceneUncertainty({ observation = {}, semanticCompilation = null, traveler = {}, transactionReview = null } = {}) {
+function semanticSceneUncertainty({
+  observation = {},
+  semanticCompilation = null,
+  traveler = {},
+  transactionReview = null,
+  currentObligation = null
+} = {}) {
   const rawPage = observation.page || {};
   const page = semanticCompilation
     ? { ...rawPage, controls: semanticCompilation.controls, decisionGroups: semanticCompilation.decisionGroups }
     : rawPage;
+  const admittedControlIds = new Set(
+    currentObligation?.authority === "task_state"
+      && currentObligation?.policyDecision?.status === "admitted"
+      ? (currentObligation.admittedControlIds || []).map(String).filter(Boolean)
+      : []
+  );
+  const admittedDecisionGroupId = clean(currentObligation?.subject?.decisionGroupId, 180);
+  if (!admittedControlIds.size && !admittedDecisionGroupId) {
+    return Object.freeze({
+      needed: false,
+      reason: "CURRENT_OBLIGATION_REQUIRED",
+      components: [],
+      facts: [],
+      validationIssues: [],
+      allowedBindings: [],
+      allowedValidationOwners: [],
+      decisionGroups: [],
+      decisionTypes: DECISION_TYPES,
+      allowedDecisionBindings: []
+    });
+  }
   const validationIssues = (page.validationIssues || []).filter((issue) => (
     !["clear", "diagnostic"].includes(clean(issue.status).toLowerCase())
+    && (!issue.controlId || admittedControlIds.has(String(issue.controlId)))
   ));
   const components = (page.controls || []).filter((control) => {
+    if (!admittedControlIds.has(String(control.controlId || ""))) return false;
     const lifecycle = control.representationLifecycle || {};
     const active = lifecycle.active === true || lifecycle.status === "active_rendered";
     if (!active || !controlBelongsToCurrentSurface(control, page)) return false;
@@ -206,7 +235,8 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
   const validationCandidateControls = unownedValidationIssues.length
     ? (page.controls || []).filter((control) => {
         const lifecycle = control.representationLifecycle || {};
-        return (lifecycle.active === true || lifecycle.status === "active_rendered")
+        return admittedControlIds.has(String(control.controlId || ""))
+          && (lifecycle.active === true || lifecycle.status === "active_rendered")
           && controlBelongsToCurrentSurface(control, page)
           && INPUT_ROLE.test(clean(`${control.role || ""} ${control.kind || ""} ${control.domRole || ""}`))
           && operationNames(control).length;
@@ -216,6 +246,8 @@ function semanticSceneUncertainty({ observation = {}, semanticCompilation = null
     .map((control) => [control.controlId, control]));
   const candidateControls = [...candidateMap.values()];
   const uncertainDecisionGroups = (page.decisionGroups || []).filter((group) => {
+    if (!admittedDecisionGroupId
+      || clean(group.decisionGroupId || group.requirementId, 180) !== admittedDecisionGroupId) return false;
     const subject = clean(`${group.subject?.key || group.subject || ""} ${group.sectionType || ""}`).toLowerCase();
     const material = group.material === true || group.required === true || (group.alternatives || []).length > 0;
     return material && (!subject || /unknown|decision|additional/.test(subject));
@@ -332,10 +364,19 @@ async function reconcileSemanticScene({
   semanticCompilation = null,
   traveler = {},
   transactionReview = null,
+  currentObligation = null,
+  policyConstraints = {},
+  failedMethods = [],
   screenshotDataUrl = "",
   uncertainty = null
 } = {}) {
-  const scene = uncertainty || semanticSceneUncertainty({ observation, semanticCompilation, traveler, transactionReview });
+  const scene = uncertainty || semanticSceneUncertainty({
+    observation,
+    semanticCompilation,
+    traveler,
+    transactionReview,
+    currentObligation
+  });
   if (!scene.needed) return { observation, reconciliation: null, meta: null };
   const { data, meta } = await callStructured({
     apiKey,
@@ -343,16 +384,52 @@ async function reconcileSemanticScene({
     instructions: INSTRUCTIONS,
     payload: {
       scene: {
-        stage: observation.page?.step || "unknown",
         surface: observation.page?.currentSurface || null,
+        currentObligation: currentObligation ? {
+          obligationId: clean(currentObligation.obligationId, 180),
+          kind: clean(currentObligation.kind, 80),
+          objective: clean(currentObligation.objective, 240),
+          desiredEffect: clean(currentObligation.desiredEffect, 100),
+          admittedControlIds: (currentObligation.admittedControlIds || []).map((id) => clean(id, 160)).filter(Boolean),
+          evidenceStrength: clean(currentObligation.evidenceStrength, 40),
+          successCondition: currentObligation.successCondition || null
+        } : null,
         components: scene.components.map((control) => ({
           controlId: control.controlId,
-          label: clean(control.label || control.accessibleName),
-          name: clean(control.name),
+          rawEvidenceChannels: {
+            name: clean(control.rawEvidenceChannels?.name || control.name),
+            label: clean(control.rawEvidenceChannels?.label || control.label || control.accessibleName),
+            heading: clean(control.rawEvidenceChannels?.heading),
+            section: {
+              id: clean(control.rawEvidenceChannels?.section?.id || control.sectionId, 160),
+              type: clean(control.rawEvidenceChannels?.section?.type || control.sectionType, 100),
+              label: clean(control.rawEvidenceChannels?.section?.label || control.sectionLabel)
+            },
+            validity: {
+              required: control.rawEvidenceChannels?.validity?.required === true
+                || control.required === true
+                || control.state?.required === true,
+              invalid: control.rawEvidenceChannels?.validity?.invalid === true
+                || control.invalid === true
+                || control.state?.invalid === true,
+              validationMessage: clean(
+                control.rawEvidenceChannels?.validity?.validationMessage
+                || control.state?.validationMessage
+              )
+            },
+            relationships: {
+              decisionGroupId: clean(control.rawEvidenceChannels?.relationships?.decisionGroupId || control.decisionGroupId, 180),
+              logicalFieldId: clean(control.rawEvidenceChannels?.relationships?.logicalFieldId || control.logicalFieldId, 180),
+              stateElementId: clean(control.rawEvidenceChannels?.relationships?.stateElementId || control.stateElementId, 160),
+              preferredActivationElementId: clean(
+                control.rawEvidenceChannels?.relationships?.preferredActivationElementId
+                || control.preferredActivationElementId,
+                160
+              )
+            }
+          },
           placeholder: clean(control.placeholder),
           helperText: clean(control.accessibleDescription),
-          sectionLabel: clean(control.sectionLabel),
-          required: control.required === true || control.state?.required === true,
           operations: operationNames(control)
         })),
         validationIssues: scene.validationIssues.map((issue) => ({
@@ -380,6 +457,25 @@ async function reconcileSemanticScene({
       allowedSemanticBindings: scene.allowedBindings,
       allowedValidationOwners: scene.allowedValidationOwners,
       allowedDecisionBindings: scene.allowedDecisionBindings,
+      policyConstraints: {
+        bookingRules: clean(policyConstraints.bookingRules || policyConstraints.booking_rules, 300),
+        seatPolicy: clean(policyConstraints.seatPolicy || policyConstraints.seat_policy, 100),
+        baggage: clean(policyConstraints.baggage || policyConstraints.baggagePreference, 120),
+        declinePaidExtras: policyConstraints.declinePaidExtras === true
+      },
+      failedMethods: (failedMethods || []).map((method) => ({
+        operation: clean(method.operation, 80),
+        method: clean(method.method, 80),
+        result: clean(method.result, 120)
+      })).slice(-8),
+      forbiddenConsequences: [
+        "invent_control_or_fact",
+        "create_obligation",
+        "grant_permission",
+        "declare_payment_completion",
+        "select_unknown_paid_legal_or_payment_action",
+        "unrestricted_page_exploration"
+      ],
       outputAuthority: "grounded_hypothesis_only"
     },
     screenshotDataUrl,

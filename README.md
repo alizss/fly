@@ -2,7 +2,7 @@
 
 Fly is a universal, safety-constrained flight-checkout agent.
 
-The user selects a flight and confirms Book/Pay once. Fly completes an unfamiliar airline or OTA checkout from saved traveler facts and policy, handles authorized standard terms and payment, purchases exactly the approved transaction, and independently verifies the booking. Today’s engineering milestone stops at verified payment review while the legal, payment, idempotency, and confirmation components are built.
+The user selects a flight and confirms Book/Pay once. Fly completes an unfamiliar airline or OTA checkout from saved traveler facts and policy, handles authorized standard terms and payment, purchases exactly the approved transaction, and independently verifies the booking. Today’s engineering milestone proves that a newly added unfamiliar checkout can be solved from the selected profile and policy until actual card-number, expiry, and security-code entry is visible—directly or in an owned hosted card widget—then stops before credentials, Pay, or purchase. The current baseline profile declines paid extras, makes no optional selections, and prefers card payment; different profiles must produce different choices.
 
 ## Product direction
 
@@ -26,10 +26,10 @@ Fly must:
 3. Resolve fares, baggage, seats, insurance, and extras from explicit policy.
 4. Adapt to unfamiliar but reversible controls and layouts.
 5. Verify every material state change from fresh browser evidence.
-6. Reconcile itinerary, traveler, selections, currency, and total.
-7. Reach verified payment review and stop safely.
+6. Reconcile itinerary, traveler, selections, currency, and total as an independent safety projection.
+7. Reach verified actual payment entry and stop safely before credentials or purchase; incomplete reconciliation cannot cause navigation beyond the observed card form.
 
-Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, or unusual grouping are not valid reasons to stop. Valid stops are missing user facts, authentication/challenges, consequential approval, transaction contradiction, website failure, exhausted safe mechanics, or the payment/legal/purchase boundary.
+Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, unusual grouping, or a pre-payment page labeled PAY are not valid reasons to stop. Valid stops are missing user facts, authentication/challenges, authority outside the mandate, transaction contradiction, website failure, exhausted safe mechanics, actual payment entry, or the purchase boundary.
 
 ## Runtime model
 
@@ -37,6 +37,7 @@ Ordinary DOM variation, new text fields, custom dropdowns, rerenders, overlays, 
 fresh ObservationFrame
 → one DecisionFrame
 → grounded CheckoutSituation (obligations + consequences)
+→ minimal DesiredStateDelta from observed state + profile/policy
 → TaskState publishes one CurrentObligation
 → bind exact current mechanics
 → consequence governor
@@ -45,15 +46,16 @@ fresh ObservationFrame
 → persist compact durable facts
 ```
 
-The model is optional and bounded. Deterministic singleton mechanics use zero model calls. When ambiguity remains, the model may select only supplied reversible candidates; it cannot invent work, targets, traveler facts, permissions, or transaction truth.
+The model is optional and semantic-only. Known scenes and deterministic mechanics use zero model calls. When exact required meaning remains unresolved, the model may propose only closed-ID grounded semantic hypotheses; it cannot create work, select targets or mechanics, invent traveler facts, grant permission, or establish transaction truth.
 
 ## Current evidence
 
-- 386/386 agent unit tests
-- 179/179 uninterrupted browser replays
+- 407/407 agent unit tests
+- 184/184 uninterrupted browser replays
 - Explicit active-tab runtime launch is replay-proven on an unlisted checkout domain
-- Fresh technical payment-review passes on EasyJet, GoToGate, Kiwi, and Turkish Airlines
-- No payment, card, legal, or purchase action in the accepted review-only flows
+- Croatia-shaped PaymentForm desired-state repair is replay-proven; fresh live rerun remains pending
+- Earlier EasyJet, GoToGate, Kiwi, and Turkish traces reached the former review boundary and require corrected card-entry reclassification/reruns
+- No credential, Pay, purchase, or unauthorized legal action in the corrected replay corpus
 - Next product gate: expand from four live sites to a representative structural portfolio
 
 A broad `99%` claim requires a defined eligible scope and approximately 300 representative journeys across sites, structural families, routes, dates, currencies, and scenarios.

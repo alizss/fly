@@ -8,6 +8,9 @@ chrome.runtime.onInstalled.addListener(async () => {
 const CHECKOUT_CONTEXT_PREFIX = "atwCheckoutContextV1";
 const SELECTED_BOOKING_ACQUISITION_PREFIX = "atwSelectedBookingAcquisitionV1";
 const STARTUP_DIAGNOSTICS_PREFIX = "atwStartupDiagnosticsV1";
+const RESUME_SESSIONS_KEY = "atwAgentResumeByLineageV1";
+const LEGACY_RESUME_KEY = "atwAgentResume";
+const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
 const SELECTED_BOOKING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DIAGNOSTIC_LIMIT = 40;
 
@@ -91,6 +94,92 @@ async function readCheckoutContext(tabId) {
   const stored = await chrome.storage.local.get(key);
   const context = stored?.[key] || null;
   return context?.contractVersion === "checkout-context/v1" ? context : null;
+}
+
+function freshResumeMarker(marker = null) {
+  return Boolean(
+    marker
+    && String(marker.sessionId || "")
+    && Number(marker.savedAt || 0) > Date.now() - RESUME_MAX_AGE_MS
+  );
+}
+
+async function readResumeSessions() {
+  const stored = await chrome.storage.local.get([RESUME_SESSIONS_KEY, LEGACY_RESUME_KEY]);
+  return {
+    sessions: stored?.[RESUME_SESSIONS_KEY] && typeof stored[RESUME_SESSIONS_KEY] === "object"
+      ? stored[RESUME_SESSIONS_KEY]
+      : {},
+    legacy: stored?.[LEGACY_RESUME_KEY] || null
+  };
+}
+
+async function saveCheckoutResume(tabId, update = {}) {
+  const context = await readCheckoutContext(tabId);
+  const lineageId = String(context?.checkoutLineageId || update.checkoutLineageId || "");
+  const sessionId = String(update.sessionId || "");
+  if (!lineageId || !sessionId) return { ok: false, code: "CHECKOUT_LINEAGE_SESSION_REQUIRED" };
+  const { sessions } = await readResumeSessions();
+  const marker = {
+    ...update,
+    checkoutLineageId: lineageId,
+    tabContextId: String(tabId),
+    sessionId,
+    savedAt: Date.now()
+  };
+  await chrome.storage.local.set({
+    [RESUME_SESSIONS_KEY]: { ...sessions, [lineageId]: marker },
+    // Compatibility pointer for an already-injected older content runtime.
+    [LEGACY_RESUME_KEY]: marker
+  });
+  return { ok: true, marker };
+}
+
+async function claimCheckoutResume(tabId) {
+  const context = await readCheckoutContext(tabId);
+  const lineageId = String(context?.checkoutLineageId || "");
+  if (!lineageId) return { ok: true, marker: null };
+  const { sessions, legacy } = await readResumeSessions();
+  const lineageMarker = sessions[lineageId] || null;
+  const compatibleLegacy = legacy && (
+    String(legacy.checkoutLineageId || "") === lineageId
+    || (!legacy.checkoutLineageId && String(legacy.tabContextId || "") === String(tabId))
+  ) ? legacy : null;
+  const marker = freshResumeMarker(lineageMarker) ? lineageMarker : compatibleLegacy;
+  if (!freshResumeMarker(marker)) return { ok: true, marker: null };
+  const claimed = {
+    ...marker,
+    checkoutLineageId: lineageId,
+    tabContextId: String(tabId),
+    claimedAt: Date.now(),
+    savedAt: Date.now()
+  };
+  await chrome.storage.local.set({
+    [RESUME_SESSIONS_KEY]: { ...sessions, [lineageId]: claimed },
+    [LEGACY_RESUME_KEY]: claimed
+  });
+  return { ok: true, marker: claimed };
+}
+
+async function clearCheckoutResume(tabId, expected = {}) {
+  const context = await readCheckoutContext(tabId);
+  const lineageId = String(context?.checkoutLineageId || expected.checkoutLineageId || "");
+  if (!lineageId) return { ok: true, cleared: false };
+  const { sessions, legacy } = await readResumeSessions();
+  const marker = sessions[lineageId] || null;
+  const expectedSessionId = String(expected.sessionId || "");
+  const ownsMarker = marker && (
+    (!expectedSessionId && String(marker.tabContextId || "") === String(tabId))
+    || (expectedSessionId && String(marker.sessionId || "") === expectedSessionId)
+  );
+  if (!ownsMarker) return { ok: true, cleared: false };
+  const nextSessions = { ...sessions };
+  delete nextSessions[lineageId];
+  await chrome.storage.local.set({ [RESUME_SESSIONS_KEY]: nextSessions });
+  if (legacy && String(legacy.checkoutLineageId || "") === lineageId) {
+    await chrome.storage.local.remove(LEGACY_RESUME_KEY);
+  }
+  return { ok: true, cleared: true };
 }
 
 async function writeCheckoutContext(tabId, update = {}) {
@@ -206,25 +295,94 @@ async function startCheckoutOnTab(tabId, {
   }
 }
 
-async function shouldFollowExplicitCheckout(tabId) {
+async function shouldFollowActiveCheckout(tabId) {
   const context = await readCheckoutContext(tabId);
-  if (!context || !["explicit_agent_start", "app_launch"].includes(context.source)) return false;
+  if (!context) return false;
   if (validSelectedBookingContract(context.selectedBookingContract)) return true;
   const stored = await chrome.storage.local.get([
     selectedBookingAcquisitionKey(tabId),
-    "atwAgentResume"
+    RESUME_SESSIONS_KEY,
+    LEGACY_RESUME_KEY
   ]);
   if (stored?.[selectedBookingAcquisitionKey(tabId)]) return true;
-  const resume = stored?.atwAgentResume || null;
-  return String(resume?.tabContextId || "") === String(tabId)
-    && Number(resume?.savedAt || 0) > Date.now() - 3 * 60 * 1000
-    && Boolean(String(resume?.sessionId || ""));
+  const lineageId = String(context.checkoutLineageId || "");
+  const lineaged = stored?.[RESUME_SESSIONS_KEY]?.[lineageId] || null;
+  const legacy = stored?.[LEGACY_RESUME_KEY] || null;
+  return freshResumeMarker(lineaged)
+    || (String(legacy?.tabContextId || "") === String(tabId) && freshResumeMarker(legacy));
 }
+
+async function adoptCheckoutHandoff(tab = {}) {
+  const tabId = Number(tab.id);
+  const openerTabId = Number(tab.openerTabId);
+  if (!Number.isInteger(tabId) || !Number.isInteger(openerTabId) || tabId === openerTabId) return false;
+  const openerContext = await readCheckoutContext(openerTabId);
+  if (!openerContext) return false;
+  const openerAcquisitionKey = selectedBookingAcquisitionKey(openerTabId);
+  const targetAcquisitionKey = selectedBookingAcquisitionKey(tabId);
+  const stored = await chrome.storage.local.get([
+    openerAcquisitionKey,
+    RESUME_SESSIONS_KEY,
+    LEGACY_RESUME_KEY
+  ]);
+  const lineageId = String(openerContext.checkoutLineageId || "");
+  const lineagedResume = stored?.[RESUME_SESSIONS_KEY]?.[lineageId] || null;
+  const legacyResume = stored?.[LEGACY_RESUME_KEY] || null;
+  const resume = freshResumeMarker(lineagedResume) ? lineagedResume : legacyResume;
+  const resumeIsFresh = freshResumeMarker(resume)
+    && (
+      String(resume.checkoutLineageId || "") === lineageId
+      || (!resume.checkoutLineageId && String(resume.tabContextId || "") === String(openerTabId))
+    );
+  if (!resumeIsFresh) return false;
+  const now = new Date().toISOString();
+  const inheritedContext = {
+    ...openerContext,
+    tabId,
+    updatedAt: now
+  };
+  const update = {
+    [checkoutContextKey(tabId)]: inheritedContext,
+    [RESUME_SESSIONS_KEY]: {
+      ...(stored?.[RESUME_SESSIONS_KEY] || {}),
+      [lineageId]: {
+        ...resume,
+        checkoutLineageId: lineageId,
+        tabContextId: String(tabId),
+        handoffFromTabContextId: String(openerTabId),
+        savedAt: Date.now()
+      }
+    },
+    [LEGACY_RESUME_KEY]: {
+      ...resume,
+      checkoutLineageId: lineageId,
+      tabContextId: String(tabId),
+      handoffFromTabContextId: String(openerTabId),
+      savedAt: Date.now()
+    }
+  };
+  if (stored?.[openerAcquisitionKey]) {
+    update[targetAcquisitionKey] = stored[openerAcquisitionKey];
+  }
+  await chrome.storage.local.set(update);
+  await appendStartupDiagnostic(tabId, "CHECKOUT_HANDOFF_ADOPTED", {
+    openerTabId,
+    checkoutLineageId: inheritedContext.checkoutLineageId || "",
+    sessionId: String(resume.sessionId || "")
+  });
+  return true;
+}
+
+chrome.tabs.onCreated.addListener((tab) => {
+  adoptCheckoutHandoff(tab).catch((error) => appendStartupDiagnostic(tab?.id, "CHECKOUT_HANDOFF_FAILED", {
+    reason: String(error?.message || "CHECKOUT_HANDOFF_FAILED")
+  }));
+});
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete" || !injectableCheckoutUrl(tab?.url)) return;
   (async () => {
-    if (!await shouldFollowExplicitCheckout(tabId)) return;
+    if (!await shouldFollowActiveCheckout(tabId)) return;
     await appendStartupDiagnostic(tabId, "RUNTIME_REINJECTION_STARTED", {
       origin: new URL(tab.url).origin
     });
@@ -262,6 +420,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     readCheckoutContext(tabId)
       .then((context) => sendResponse({ ok: true, context }))
       .catch((error) => sendResponse({ ok: false, code: "CHECKOUT_CONTEXT_UNAVAILABLE", error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "ATW_CHECKOUT_RESUME_SAVE") {
+    const tabId = sender.tab?.id;
+    if (!Number.isInteger(tabId)) {
+      sendResponse({ ok: false, code: "CHECKOUT_TAB_REQUIRED" });
+      return false;
+    }
+    saveCheckoutResume(tabId, message.marker || {})
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, code: "CHECKOUT_RESUME_SAVE_FAILED", error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "ATW_CHECKOUT_RESUME_CLAIM") {
+    const tabId = sender.tab?.id;
+    if (!Number.isInteger(tabId)) {
+      sendResponse({ ok: false, code: "CHECKOUT_TAB_REQUIRED", marker: null });
+      return false;
+    }
+    claimCheckoutResume(tabId)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, code: "CHECKOUT_RESUME_CLAIM_FAILED", error: error.message, marker: null }));
+    return true;
+  }
+
+  if (message?.type === "ATW_CHECKOUT_RESUME_CLEAR") {
+    const tabId = sender.tab?.id;
+    if (!Number.isInteger(tabId)) {
+      sendResponse({ ok: false, code: "CHECKOUT_TAB_REQUIRED", cleared: false });
+      return false;
+    }
+    clearCheckoutResume(tabId, message.expected || {})
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, code: "CHECKOUT_RESUME_CLEAR_FAILED", error: error.message, cleared: false }));
     return true;
   }
 

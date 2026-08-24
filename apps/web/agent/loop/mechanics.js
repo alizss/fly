@@ -269,7 +269,6 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
     : strategies;
   const surface = page.currentSurface || {};
   const surfaceInstanceKey = JSON.stringify({
-    step: page.step || "unknown",
     surfaceId: surface.id || "surface-page",
     surfaceType: surface.type || "page",
     surfaceInstanceId: surface.instanceId || "",
@@ -418,38 +417,54 @@ function groundedObservationCandidateSet(obligation = null, decisionFrame = null
 function deterministicTaskCandidate(candidateSet = {}, goal = {}) {
   const candidates = candidateSet.candidates || [];
   if (candidates.length === 1) return candidates[0];
-  if (obligationField(goal, "kind") !== "profile_field" || !candidates.length) return null;
+  if (!candidates.length) return null;
 
-  // TaskState has already admitted one exact profile obligation and the
-  // candidate builder has already consequence-gated these mechanics. Asking
-  // a model to choose between direct input, an opener and keyboard fallback
-  // adds latency without adding semantic judgment. Prefer the most direct
-  // untried proven mechanic; failed-strategy memory removes it on the next
-  // observation if it does not verify.
+  // TaskState has already admitted one exact obligation and bindMechanics has
+  // consequence/policy-gated every candidate. What remains is execution
+  // strategy, never semantic judgment. Prefer the most direct untried proven
+  // mechanic for every obligation kind; failed-strategy memory removes it on
+  // the next observation if verification fails.
+  const exactControlIds = new Set([
+    obligationField(goal, "controlId"),
+    obligationField(goal, "componentBinding")?.controlId,
+    ...(obligationField(goal, "actionableControlIds") || [])
+  ].filter(Boolean));
+  const goalKind = String(obligationField(goal, "kind") || "");
   const rank = (candidate) => {
     const operation = String(candidate.operation || "");
     const exactChoice = Boolean(candidate.exactOption?.canonicalValue);
-    if (exactChoice && ["choose", "select", "activate"].includes(operation)) return 0;
-    if (operation === "select") return 1;
-    if (operation === "type") return 2;
-    if (operation === "choose") return 3;
-    if (operation === "open") return 4;
-    if (operation === "keyboard") return 5;
-    return 20;
+    const executable = candidate.actionability?.executable === true || candidate.visible === true;
+    const exactControl = exactControlIds.has(candidate.controlId);
+    const recovery = candidate.boundedRecovery === true || candidate.mechanicalHypothesis === true;
+    const operationRank = exactChoice && ["choose", "select", "activate"].includes(operation)
+      ? 0
+      : goalKind === "profile_field"
+        ? ({ select: 1, type: 2, choose: 3, open: 4, activate: 5, keyboard: 6 }[operation] ?? 20)
+        : goalKind === "navigation"
+          ? ({ activate: 1, open: 2, choose: 3, keyboard: 4 }[operation] ?? 20)
+          : ({ choose: 1, activate: 2, select: 3, open: 4, type: 5, keyboard: 6 }[operation] ?? 20);
+    return [
+      candidate.requiresApproval === true ? 1 : 0,
+      exactControl ? 0 : 1,
+      executable ? 0 : 1,
+      recovery ? 1 : 0,
+      operationRank,
+      String(candidate.controlId || ""),
+      String(candidate.targetId || ""),
+      String(candidate.candidateId || "")
+    ];
   };
-  const mechanical = candidates
-    .filter((candidate) => (
-      candidate.requiresApproval !== true
-      && !/money|paid|payment|purchase|legal|consent|login|account|itinerary/i.test([
-        candidate.risk,
-        candidate.physicalEffect,
-        candidate.mechanicalEffect,
-        candidate.semanticIntent
-      ].filter(Boolean).join(" "))
-    ))
-    .sort((left, right) => rank(left) - rank(right));
-  if (!mechanical.length || rank(mechanical[0]) >= 20) return null;
-  return mechanical[0];
+  const compare = (left, right) => {
+    const leftRank = rank(left);
+    const rightRank = rank(right);
+    for (let index = 0; index < leftRank.length; index += 1) {
+      if (leftRank[index] === rightRank[index]) continue;
+      if (typeof leftRank[index] === "number") return leftRank[index] - rightRank[index];
+      return String(leftRank[index]).localeCompare(String(rightRank[index]));
+    }
+    return 0;
+  };
+  return [...candidates].sort(compare)[0] || null;
 }
 
 module.exports = {
@@ -464,4 +479,3 @@ module.exports = {
   targetLocalRecoveryScope,
   targetSnapshotForAction
 };
-

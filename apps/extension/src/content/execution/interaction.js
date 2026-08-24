@@ -373,7 +373,10 @@ export function createInteractionMechanics(dependencies) {
     const afterCleanup = choiceEpisodeEvidence(target, decision);
     const popupClosed = !afterCleanup.popupOpen;
     const focusSettled = !afterCleanup.focusInsideTarget;
-    const settled = popupClosed && focusSettled;
+    // Popup closure is the interaction-level boundary. Focus location is
+    // useful cleanup diagnostics, but it is not selected-value truth and may
+    // not overturn an exact checked/selected state verified from the DOM.
+    const settled = popupClosed;
     const state = updateChoiceInteractionState(decision.controlId, {
       status: settled ? "settled" : "unsettled",
       actuatorId: elementId(target),

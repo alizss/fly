@@ -1,131 +1,98 @@
-# Fly — Agent and Engineering Rulebook
+# Fly — Agent Rulebook
 
-Last updated: 2026-08-19
+## Goal
 
-## Core mission
+Build one reusable checkout agent that works across unfamiliar airline sites. Do not build airline-specific workflows.
 
-Final product: the user selects a flight and confirms Book/Pay once; Fly completes traveler details, choices, authorized standard legal terms, payment, purchase, and independent booking verification. The active engineering milestone proves unfamiliar checkout to verified payment review and still blocks legal/payment/purchase execution until their transaction-bound authorization components exist.
+Current milestone: complete all authorized pre-payment checkout work, verify that real card-entry controls have been reached, and stop before entering payment credentials, paying, or purchasing.
 
-Fly learns reusable checkout mechanics—not airline workflows.
+## How to think
 
-## One runtime loop
+Use this order whenever analyzing a trace, debugging, fixing a failure, or choosing the next step.
+
+Two rules always apply:
+
+1. A visible bug is usually a symptom or evidence. Find the deeper root bottleneck that allowed the whole class of failures, rather than fixing only the surface case.
+2. Keep the solution as simple as possible. Do not add architecture, abstractions, state, or special cases unless they are necessary to remove the root bottleneck.
+
+### 1. Simplify first
+
+Ask:
+
+- What is overcomplicated or overengineered?
+- What duplicate authority, abstraction, workaround, compatibility layer, or stale state is constraining the system?
+- What is blocking the existing solution from working?
+- What can be removed, merged, demoted, or made derived?
+
+Do not propose a new component until this is answered. Prefer deleting the cause over adding code around its symptoms.
+
+### 2. Find the root bottleneck
+
+Before changing code:
+
+1. Define what must be true.
+2. Find the earliest point where it stops being true.
+3. Separate the root bottleneck from later symptoms.
+4. Prove the hypothesis: it must explain the failure and predict which downstream problems the fix will remove.
+5. Make the smallest change that restores the invariant.
+6. Add a test at the owning boundary so the entire failure class cannot silently return.
+
+Then ask:
+
+- Is this the real cause, or only the place where a deeper problem became visible?
+- What single core fact, capability, or contract is missing or wrong?
+- Which owning layer should produce it?
+- If it becomes true, which downstream failures disappear automatically?
+
+Trace the failure upstream until you find the earliest incorrect or missing truth that explains the whole class of symptoms. Fix that root bottleneck first. Do not patch the visible bug and leave its cause in place.
+
+Do not assume the root cause is large. Choose the smallest cause that fully explains the evidence.
+
+### 3. Add only the highest-leverage component
+
+Add something only when removal, simplification, or correction cannot solve the problem.
+
+Choose the smallest universal component that creates an order-of-magnitude improvement. It should solve a class of failures across unfamiliar sites, not one airline or one trace.
+
+Use the simplest design that fully removes the bottleneck. More code, more layers, and more generality are costs—not signs of a better solution.
+
+Complexity must earn its existence. Every new layer, state, abstraction, or fallback must solve a demonstrated problem that a simpler correction cannot solve.
+
+Priority:
 
 ```text
-fresh immutable observation
-→ compile meaning once
-→ TaskState publishes one obligation/disposition
-→ bind exact mechanics for that obligation
-→ consequence governor
-→ execute one leased action
-→ fresh mechanical and semantic verification
-→ persist compact verified facts
-→ continue, recover, ask, stop, or finish review
+remove unnecessary complexity
+→ correct or reconnect existing authority
+→ add one missing universal primitive
+→ never stack patches around symptoms
 ```
 
-Do not add a second semantic compiler, requirement lifecycle, planner, readiness authority, verifier, recovery store, or completion receipt.
+## Engineering rules
 
-## Responsibility rules
+- One authority per fact, decision, obligation, action, and result. Everything else is derived or diagnostic.
+- Follow the last verified fact in the trace. Never treat an intended effect as observed success.
+- Repair the universal owning layer, not the discovering airline.
+- Do not reopen completed or optional work without fresh evidence.
+- Keep recovery bounded and remember failed strategies.
+- One exact canonical actuator has one feasibility authority. Execution may revalidate current identity, visibility, enabled state, hit testing, surface ownership, and operation compatibility, but it must not contradict the observer with a generic CTA-size heuristic; native radios and checkboxes are valid small targets.
+- A repeat-prohibited failure before dispatch is still a failed strategy. Persist it at the target-local semantic scope, clear stale selection, consume the finite budget, and choose a distinct actuator instead of repeating the same plan.
+- Verify the exact fix and its downstream effect with a trace-derived replay, focused tests, the full relevant suite, and a retained canary.
+- Never weaken safety merely to make a site pass.
 
-1. **Observation** reports mechanics, current state, ownership evidence, and transaction evidence.
-2. **DecisionFrame** compiles semantic entities and one grounded `CheckoutSituation/v1` once.
-3. **TaskState** alone decides what work exists and how the turn ends.
-4. **Mechanics binder** finds actuators only for the admitted obligation.
-5. **Governor** checks consequences immediately before execution.
-6. **Browser verifier** proves the mechanic occurred.
-7. **Transition verifier** proves the same semantic obligation was satisfied.
-8. **Transaction review** independently reconciles the selected booking and outcomes.
+## Safety boundary
 
-Actionability and a guessed page stage do not create work. Obligations, consequences, blockers, transaction evidence, and completion evidence do. A model may choose only supplied fresh reversible candidate IDs. It may not invent targets, facts, obligations, effects, or permission.
+- Preserve traveler, itinerary, price, currency, paid-choice, legal, and transaction identity.
+- Respect explicit profile and booking policy; do not hard-code one user's preferences as universal behavior.
+- Stop only when real owned card-number, expiry, and security-code controls—or an owned hosted card widget—are present.
+- A page labeled Pay, a review page, legal consent, or a payment-method selector is not card-entry completion.
+- Under the current milestone, never enter payment credentials, press Pay, or purchase.
+- Ask the user only for genuinely missing personal facts, material transaction decisions, exceptional authority, or external challenges such as login, OTP, CAPTCHA, 3DS, or bank approval.
 
-## Behavior on unfamiliar sites
+## Final check
 
-Fly should autonomously handle:
+Before finishing any analysis or fix, answer:
 
-- New ordinary textboxes and textareas.
-- Different DOM nesting, wrappers, and visual order.
-- Combined or split names, DOB, phone, address, and document fields.
-- Native/custom selects, autocomplete, portal listboxes, radios, cards, switches, and steppers.
-- Rerendered controls with new physical identities.
-- Shadow/portal/overlay surfaces when usable evidence exists.
-- Offscreen controls, delayed hydration, localized labels, and reused Continue buttons.
-- Optional blank fields and dormant login/signup/future-step representations.
-
-The absence of an airline-specific skill is never a stop reason.
-
-## Valid stop or pause reasons
-
-- Required traveler data is genuinely missing.
-- Login, OTP, CAPTCHA, 3DS, bank approval, or another human challenge is active.
-- A material identity, itinerary, price, currency, or paid-choice decision is outside the mandate.
-- Inventory is sold out, the session expired, the airline is unavailable, or valid completed input is rejected.
-- Distinct safe grounded mechanics are exhausted after bounded recovery.
-- Verified payment review is reached under the current milestone.
-
-Standard legal terms, payment entry, and purchase are temporary milestone boundaries, not desired user handoffs. CAPTCHA is also a future engine capability. Only genuinely missing personal facts, material transaction changes, or external identity/bank challenges may require the user in the target product.
-
-Exhausted mechanics on an otherwise eligible journey is an engineering coverage defect, not a desired product handoff.
-
-Do not ask the user to diagnose DOMs, buttons, selectors, readiness, or internal agent mechanics.
-
-## Non-negotiable safety
-
-Always preserve:
-
-- Exact selected traveler and booking identity.
-- Exact target freshness and ActionLease identity.
-- Stale-action and exact-duplicate refusal.
-- Consequence governance for paid extras, route, dates, identity, price, currency, legal, payment, and purchase.
-- Fresh semantic postcondition verification.
-- Bounded recovery and failed-strategy memory.
-- Transaction and outcome reconciliation.
-- Zero payment/legal/card/Pay/purchase capability under the current milestone.
-
-Never weaken safety to make a site pass.
-
-## Failure triage
-
-For every material live failure:
-
-1. Identify the last verified obligation, action, and fresh surface.
-2. Classify it as expected handoff, external website failure, or universal contract/mechanics defect.
-3. Locate the owning layer: observation, semantic compilation, TaskState admission, mechanics binding, governance, execution, verification, recovery, or transaction review.
-4. Add the smallest exact trace-derived replay.
-5. Repair the universal component; never start with an airline conditional.
-6. Run focused test, full unit suite, full browser suite, and repository checks.
-7. Rerun the discovering site and one retained canary.
-8. Confirm important repairs on a related second site.
-
-## Simplification test
-
-Remove or demote anything that independently:
-
-- Re-discovers work after DecisionFrame/TaskState.
-- Reinterprets policy during mechanics binding.
-- Treats a declared effect as observed success.
-- Persists turn-local candidate/observation graphs as semantic memory.
-- Polls unchanged full observations instead of waiting for mutation/deadline.
-- Converts diagnostics or compatibility state into runtime authority.
-- Uses a page-stage label to admit work, define obligation identity, or claim completion.
-
-Do not remove distinct safety roles merely because they inspect related evidence. TaskState/governor, browser/backend verification, deterministic/adaptive mechanics, and transaction/payment boundaries serve different purposes.
-
-## Acceptance after a fix
-
-- The exact failure replay passes.
-- No completed work reopens or loops.
-- Correct profile/policy state survives navigation and rerender.
-- The current full unit suite passes.
-- The current full browser replay suite passes uninterrupted.
-- `npm run check` and `git diff --check` pass.
-- The discovering site and one retained canary pass.
-- No unauthorized irreversible action executes.
-- Manual intervention is explicitly annotated in the canary report.
-
-## Documentation discipline
-
-- PRD changes only for product scope, safety, or promotion gates.
-- Roadmap changes for architecture status or engineering sequence.
-- Coverage matrix changes for material live/site/scenario acceptance evidence.
-- Progress changes for material implementation or root-cause decisions.
-- Handoff stays current with code structure, commands, risks, and next work.
-- Keep historical detail in Git history and sanitized traces, not duplicated across current documents.
+1. What did we remove or simplify?
+2. What was the highest upstream blocker?
+3. Why does this fix solve downstream failures?
+4. Did we add only the smallest necessary universal capability?

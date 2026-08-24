@@ -12,7 +12,6 @@ const {
 const MAX_GROUNDING_COMPONENTS = 6;
 const MAX_GROUNDING_FACTS = 24;
 const GROUNDING_PACKET_BYTES = 24_000;
-const PROFILE_STAGE = /traveler|traveller|passenger|contact|document/i;
 const INPUT_ROLE = /textbox|input|textarea|select|combobox|listbox|radio|checkbox|spinbutton|date/i;
 const FORBIDDEN_MEANING = /payment|card|cvc|cvv|security code|purchase|pay now|legal|terms|consent/i;
 const SENSITIVE_FACT = /passport|document_number|known_traveler|redress/i;
@@ -69,7 +68,6 @@ function unblockedStageExitReady(page = {}) {
 
 function activeUnknownComponents(observation = {}, { admittedControlIds = [] } = {}) {
   const page = observation.page || {};
-  if (!PROFILE_STAGE.test(String(page.step || ""))) return [];
   const admitted = new Set((admittedControlIds || []).map(String).filter(Boolean));
   // Semantic grounding is not a page scanner. TaskState must first admit one
   // exact Current Obligation; only controls owned by that obligation may be

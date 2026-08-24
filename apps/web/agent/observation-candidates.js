@@ -184,6 +184,10 @@ function controlsForGoal(page = {}, goal = {}) {
     const exactIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
     return controls.filter((control) => exactIds.has(control.controlId));
   }
+  if (["unknown_required", "unknown_validation", "unknown_attestation"].includes(obligationField(goal, "kind"))) {
+    const exactIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
+    return controls.filter((control) => exactIds.has(control.controlId));
+  }
   if (obligationField(goal, "kind") === "adaptive_interaction") {
     const exactIds = new Set((obligationField(goal, "actionableControlIds") || []).filter(Boolean));
     return controls.filter((control) => exactIds.has(control.controlId));
@@ -363,7 +367,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
             ? (
                 control.physicalEffect === "advance_checkout_stage"
                 || !foreground
-                || obligationField(goal, "semanticType") === "payment_review"
+                || obligationField(goal, "semanticType") === "card_credential_entry"
                   ? "advance_checkout_stage"
                   : "advance_surface"
               )
@@ -491,13 +495,13 @@ function rawObservationCandidates(observation = {}, goal = {}) {
   if (!raw.length
     && obligationField(goal, "semanticType") !== "surface_ambiguity"
     && !(obligationField(goal, "semanticType") === "navigation" && !allRequiredDecisionGroupsResolved(page, [obligationField(goal, "completedDecisionGroupId")]))) {
-    const paymentReview = obligationField(goal, "semanticType") === "payment_review";
+    const cardEntry = obligationField(goal, "semanticType") === "card_credential_entry";
     raw.push({
       candidateId: "",
       semanticGoal: obligationField(goal, "semanticGoal"),
-      semantic: paymentReview ? "final_review" : "ask_user",
-      type: paymentReview ? "final_review" : "ask_user",
-      operation: paymentReview ? "review" : "handoff",
+      semantic: cardEntry ? "final_review" : "ask_user",
+      type: cardEntry ? "final_review" : "ask_user",
+      operation: cardEntry ? "review" : "handoff",
       interactionRole: "navigation",
       semanticEffect: "advance",
       expectedEvidence: "progress_changed",
@@ -506,13 +510,13 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       targetId: "",
       targetLabel: "",
       requirementId: obligationField(goal, "requirementId") || "",
-      intent: paymentReview ? "final_review" : "ask_user",
-      risk: paymentReview ? "payment" : "uncertain",
+      intent: cardEntry ? "final_review" : "ask_user",
+      risk: cardEntry ? "payment" : "uncertain",
       requiresApproval: true,
       visible: true,
       value: "",
       keys: "",
-      summary: paymentReview ? "Stop for final payment review." : "Ask the user because no current grounded control can satisfy the goal."
+      summary: cardEntry ? "Stop because actual card credential entry is ready." : "Ask the user because no current grounded control can satisfy the goal."
     });
   }
 

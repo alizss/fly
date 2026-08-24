@@ -8,6 +8,7 @@ const {
 } = require("../../../../packages/shared/agent-actions");
 const { withUpdate } = require("../../../../packages/shared/agent-state");
 const { currentObligation } = require("../authority-frames");
+const agentContract = require("../../../extension/src/shared/agent-contract");
 const { leasedActionFor, recoveryFacts, updatedExecutionEpisode } = require("../execution-episode");
 const {
   candidateStrategySignature,
@@ -21,16 +22,18 @@ function taskMechanics(taskState = {}) {
 }
 
 function deterministicTransitionVerification(transition = null) {
-  const achieved = transition?.status === "achieved";
-  const changed = Boolean(transition && ["achieved", "progressed", "blocked"].includes(transition.status));
+  const status = transition?.actionOutcome?.status || "";
+  const outcome = agentContract.ACTION_OUTCOME;
+  const achieved = status === outcome.SATISFIED;
+  const changed = [outcome.SATISFIED, outcome.PROGRESSED, outcome.REVEALED_BLOCKER].includes(status);
   return {
     ok: achieved,
     changed,
     lastActionWorked: achieved,
-    blockers: transition?.status === "blocked" ? [transition.blocker?.label || "A new blocker appeared."] : [],
+    blockers: status === outcome.REVEALED_BLOCKER ? [transition.blocker?.label || "A new blocker appeared."] : [],
     priceChanged: Boolean(transition?.diff?.priceChanged),
-    riskChanged: transition?.status === "unsafe",
-    evidence: transition ? [`Browser transition: ${transition.status}.`] : [],
+    riskChanged: status === outcome.UNSAFE_CHANGE,
+    evidence: transition ? [`Action outcome: ${status}.`] : [],
     confidence: transition ? 1 : 0,
     requirementUpdates: []
   };
@@ -76,14 +79,21 @@ function applyTransitionStatus(
   const failedStrategies = [...(recoveryFacts(advanced.state).failedStrategies || [])];
   const browserFailureCode = String(
     advanced.observation?.lastActionResult?.failureCode
-    || advanced.observation?.lastActionResult?.outcome?.code
     || observation.lastActionResult?.failureCode
-    || observation.lastActionResult?.outcome?.code
     || ""
   );
   const failedStrategyReuse = browserFailureCode === "FAILED_STRATEGY_REUSE";
+  const browserActionOutcome = advanced.observation?.lastActionResult?.actionOutcome
+    || observation.lastActionResult?.actionOutcome
+    || null;
+  const repeatProhibited = transition?.actionOutcome?.repeatProhibited === true
+    || browserActionOutcome?.repeatProhibited === true;
+  const rejectedBeforeDispatch = advanced.lifecycle.status === "rejected_before_dispatch";
+  const failedWithoutDispatch = rejectedBeforeDispatch && repeatProhibited;
   if (
-    (transition?.status === "no_effect" || failedStrategyReuse)
+    ((repeatProhibited && transition?.actionOutcome?.status === agentContract.ACTION_OUTCOME.NO_EFFECT)
+      || failedWithoutDispatch
+      || failedStrategyReuse)
     && governedAction.type !== "scroll"
     && governedAction.controlId
     && signature
@@ -143,11 +153,14 @@ function applyTransitionStatus(
         failedStrategies: failedStrategies.slice(-80),
         failedStrategySignatures: attemptedStrategySignatures
       }),
-      ...(transition?.status === "no_effect" || failedStrategyReuse ? { aiDecisionCache: null } : {})
+      ...(transition?.actionOutcome?.status === agentContract.ACTION_OUTCOME.NO_EFFECT
+        || failedWithoutDispatch
+        || failedStrategyReuse
+        ? { aiDecisionCache: null }
+        : {})
     }),
     transition: transition || null
   };
 }
 
 module.exports = { applyTransitionStatus, deterministicTransitionVerification };
-

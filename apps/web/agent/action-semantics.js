@@ -25,7 +25,7 @@ const TASK_OUTCOMES = new Set([
   "optional_extra_declined",
   "current_surface_completed",
   "checkout_stage_advanced",
-  "payment_review_reached",
+  "card_credential_entry_reached",
   "booking_confirmed"
 ]);
 const OUTCOME_COMPATIBILITY = Object.freeze({
@@ -68,13 +68,13 @@ function outcomeContractForGoal(goal = {}, observation = {}) {
       completionEvidence: ["normalized_value_changed", "logical_component_committed", "date_value_committed"]
     });
   }
-  if (/payment_review|reach payment|review before payment/.test(semantic)) {
+  if (/card_credential_entry|reach (?:card|payment)|review before payment/.test(semantic)) {
     return normalizedOutcomeContract({
-      taskOutcome: "payment_review_reached",
+      taskOutcome: "card_credential_entry_reached",
       // These effects may advance an intermediate stage/surface, but only
-      // fresh payment evidence completes this durable outcome.
+      // only fresh card-entry capability completes this durable outcome.
       acceptablePhysicalEffects: ["open_surface", "dismiss_surface", "select_free_option", "set_field_value", "filter_options", "advance_surface", "advance_checkout_stage", "reveal_control"],
-      completionEvidence: ["fresh_payment_stage", "payment_url", "payment_progress_marker", "payment_controls"]
+      completionEvidence: ["card_credential_controls", "hosted_card_entry_widget"]
     });
   }
   if (/booking_confirm|confirmation/.test(semantic)) {
@@ -231,8 +231,8 @@ function assessOutcomeCompatibility({
   if (obligationField(goal, "kind") === "adaptive_surface" && mechanicalEffect === "filter_options") {
     return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "bounded_filter_advances_owned_surface_discovery" };
   }
-  if (durableOutcome === "payment_review_reached" && ["submit_purchase", "enter_payment_credentials"].includes(mechanicalEffect)) {
-    return { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "effect_exceeds_payment_review_objective" };
+  if (durableOutcome === "card_credential_entry_reached" && ["submit_purchase", "enter_payment_credentials"].includes(mechanicalEffect)) {
+    return { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "effect_exceeds_card_entry_objective" };
   }
   if (taskOutcome === "profile_field_completed") {
     return mechanicalEffect === "set_field_value"
@@ -321,6 +321,7 @@ function fromExpectedOutcome(expectedOutcome = {}) {
   const type = normalized(expectedOutcome.type);
   if (type === "target_in_view") return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "target_visible" };
   if (/options_surface_appeared|active_surface_change|semantic_progress/.test(type)) return { interactionRole: "opener", semanticEffect: "open", expectedEvidence: "options_appeared" };
+  if (type === "control_unselected") return { interactionRole: "choice", semanticEffect: "waive", expectedEvidence: "dismissed" };
   if (/exact_free_option_selected|control_selected|section_choice_verified/.test(type)) return { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" };
   if (/normalized_value_changed|logical_component_committed|field_value_changed|date_value_committed/.test(type)) return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
   if (/stage_exit_or_feedback/.test(type)) return { interactionRole: "navigation", semanticEffect: "advance", expectedEvidence: "progress_changed" };
@@ -335,6 +336,10 @@ function deriveActionSemantics({ control = {}, operation = "", type = "", goal =
   if (["type", "select"].includes(op) || ["type", "select"].includes(type)) {
     return { interactionRole: "field", semanticEffect: "set_value", expectedEvidence: "value_changed" };
   }
+  const explicitUnselect = normalized(expectedOutcome?.type) === "control_unselected"
+    ? fromExpectedOutcome(expectedOutcome)
+    : null;
+  if (explicitUnselect) return explicitUnselect;
   if (op === "choose" || choiceLike(control)) {
     return { interactionRole: "choice", semanticEffect: "select", expectedEvidence: "selected" };
   }
@@ -363,16 +368,23 @@ function deriveActionSemantics({ control = {}, operation = "", type = "", goal =
 }
 
 function normalizedActionSemantics(action = {}, context = {}) {
+  const expectedOutcome = action.expectedOutcome || context.expectedOutcome || {};
+  const explicitUnselect = normalized(expectedOutcome.type) === "control_unselected"
+    ? fromExpectedOutcome(expectedOutcome)
+    : null;
   const derived = deriveActionSemantics({
     ...context,
     operation: action.operation || context.operation,
     type: action.type || action.action || context.type,
-    expectedOutcome: action.expectedOutcome || context.expectedOutcome
+    expectedOutcome
   });
   return {
-    interactionRole: INTERACTION_ROLES.has(action.interactionRole) ? action.interactionRole : derived.interactionRole,
-    semanticEffect: SEMANTIC_EFFECTS.has(action.semanticEffect) ? action.semanticEffect : derived.semanticEffect,
-    expectedEvidence: EXPECTED_EVIDENCE.has(action.expectedEvidence) ? action.expectedEvidence : derived.expectedEvidence
+    interactionRole: explicitUnselect?.interactionRole
+      || (INTERACTION_ROLES.has(action.interactionRole) ? action.interactionRole : derived.interactionRole),
+    semanticEffect: explicitUnselect?.semanticEffect
+      || (SEMANTIC_EFFECTS.has(action.semanticEffect) ? action.semanticEffect : derived.semanticEffect),
+    expectedEvidence: explicitUnselect?.expectedEvidence
+      || (EXPECTED_EVIDENCE.has(action.expectedEvidence) ? action.expectedEvidence : derived.expectedEvidence)
   };
 }
 
@@ -397,12 +409,23 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
     mustNotIncreasePrice: existing.mustNotIncreasePrice !== false
   };
 
+  // A checkout-advance command has two equally useful outcomes: the stage can
+  // advance, or the page can explain which current obligation blocks it. Do
+  // not narrow that feedback contract to `checkout_stage_advanced` merely
+  // because the chosen actuator normally advances checkout.
+  if (existing.type === "stage_exit_or_feedback") {
+    return { ...existing, ...base, type: "stage_exit_or_feedback" };
+  }
+
   if (existing.type === "target_in_view" || semantics.expectedEvidence === "target_visible") {
     return { ...existing, ...base, type: "target_in_view" };
   }
   if (existing.type === "policy_conflict_resolved"
     || (existing.type === "options_surface_appeared" && existing.intendedOutcome === "open_correction_surface")) {
     return { ...base, ...existing, type: existing.type };
+  }
+  if (existing.type === "control_unselected") {
+    return { ...base, ...existing, type: "control_unselected" };
   }
   if (["select_free_option", "select_paid_option"].includes(physicalEffect)) {
     const disposition = normalized(`${action.semantic || ""} ${action.policyOutcome || ""} ${action.risk || ""} ${control.semantic || ""} ${control.risk || ""}`);
@@ -449,6 +472,9 @@ function compileTypedExpectedOutcome(action = {}, page = {}) {
   }
   if (physicalEffect === "open_surface" || semantics.interactionRole === "opener") {
     return { ...existing, ...base, type: "options_surface_appeared" };
+  }
+  if (physicalEffect === "reveal_control") {
+    return { ...existing, ...base, type: "current_surface_advanced" };
   }
   if (physicalEffect === "advance_checkout_stage") {
     return { ...existing, ...base, type: "checkout_stage_advanced" };
@@ -529,7 +555,7 @@ function predictPhysicalEffect({ semantics = {}, control = {}, candidate = {}, g
   if (semantics.interactionRole === "command") return "unknown";
   if (semantics.interactionRole === "navigation") {
     if (/payment|checkout stage|place order/.test(meaning)
-      || ["checkout_stage_advanced", "payment_review_reached", "booking_confirmed"].includes(goalContract.taskOutcome)) {
+      || ["checkout_stage_advanced", "card_credential_entry_reached", "booking_confirmed"].includes(goalContract.taskOutcome)) {
       return "advance_checkout_stage";
     }
     return (candidate.surfaceType || control.surfaceType || "page") === "page"

@@ -5,6 +5,7 @@ const { evaluateTransition } = require("../../apps/web/agent/transition-evaluato
 const { reduceTaskState } = require("./task-state-replay-adapter");
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
+const { compileTypedExpectedOutcome } = require("../../apps/web/agent/action-semantics");
 
 function capability(operation, actuatorId) {
   const actionability = {
@@ -66,18 +67,37 @@ function readyTransactionReview() {
 function paymentGoal(id = "obs_modal") {
   return {
     goalId: `${id}:goal:payment_review`,
-    semanticGoal: "reach payment review",
-    semanticType: "payment_review",
-    desiredValue: "payment_review_reached",
+    semanticGoal: "reach card credential entry",
+    semanticType: "card_credential_entry",
+    desiredValue: "card_credential_entry_reached",
     observationId: id,
     surfaceId: "review_modal",
     outcomeContract: {
-      taskOutcome: "payment_review_reached",
+      taskOutcome: "card_credential_entry_reached",
       acceptablePhysicalEffects: ["advance_checkout_stage", "reveal_control"],
       completionEvidence: ["fresh_payment_stage", "payment_url", "payment_progress_marker", "payment_controls"]
     }
   };
 }
+
+test("checkout advance preserves the stage-exit-or-feedback contract", () => {
+  const compiled = compileTypedExpectedOutcome({
+    controlId: "confirm",
+    intent: "advance_checkout",
+    mechanicalEffect: "advance_checkout_stage",
+    expectedOutcome: {
+      type: "stage_exit_or_feedback",
+      beforeStage: "review",
+      beforePageHash: "hash_before"
+    }
+  }, {
+    controls: [{ controlId: "confirm", semantic: "continue", role: "button" }]
+  });
+
+  assert.equal(compiled.type, "stage_exit_or_feedback");
+  assert.equal(compiled.beforeStage, "review");
+  assert.equal(compiled.beforePageHash, "hash_before");
+});
 
 test("same-label modal close and checkout submit remain safe selectable foreground actions", () => {
   const current = observation("obs_modal", {
@@ -124,14 +144,14 @@ test("same-label modal close and checkout submit remain safe selectable foregrou
   assert.equal(close.physicalEffect, "dismiss_surface");
   assert.equal(close.mechanicalEffect, "dismiss_surface");
   assert.equal(close.semanticIntent, "resolve_current_decision");
-  assert.equal(close.obligationSuccessCondition.taskOutcome, "payment_review_reached");
+  assert.equal(close.obligationSuccessCondition.taskOutcome, "card_credential_entry_reached");
   assert.equal(close.selectable, true);
   assert.equal(close.outcomeCompatibility, "obligation_admitted");
   assert.equal(close.exclusionReason, "");
   assert.equal(submit.physicalEffect, "advance_checkout_stage");
   assert.equal(submit.mechanicalEffect, "advance_checkout_stage");
   assert.equal(submit.semanticIntent, "resolve_current_decision");
-  assert.equal(submit.obligationSuccessCondition.taskOutcome, "payment_review_reached");
+  assert.equal(submit.obligationSuccessCondition.taskOutcome, "card_credential_entry_reached");
   assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["close", "submit"]);
 });
 
@@ -164,7 +184,7 @@ test("governor treats outcome mismatch as diagnostic when the grounded action is
     id: "txn_outcome_contract",
     taskState: {
       currentGoal: authoritativeGoal,
-      stageOutcome: { outcomeId: "stage_outcome:reach_payment_review", outcomeContract: goal.outcomeContract },
+      stageOutcome: { outcomeId: "stage_outcome:reach_card_credential_entry", outcomeContract: goal.outcomeContract },
       activeDecisions: [],
       validationBlockers: []
     },
@@ -209,7 +229,7 @@ test("opening a warning modal is verified intermediate progress, never checkout 
     afterObservation: after
   });
 
-  assert.equal(transition.status, "progressed");
+  assert.equal(transition.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(transition.postcondition.satisfied, false);
   assert.deepEqual(transition.physicalResult.effect, "open_surface");
   assert.equal(transition.taskOutcomeCompleted, false);
@@ -240,7 +260,7 @@ test("closing a review modal cannot prove payment review was reached", () => {
     afterObservation: after
   });
 
-  assert.notEqual(transition.status, "achieved");
+  assert.equal(transition.actionOutcome.status, "PROGRESSED");
   assert.equal(transition.postcondition.satisfied, false);
   assert.equal(transition.physicalResult.effect, "dismiss_surface");
   assert.equal(transition.taskOutcomeCompleted, false);
@@ -285,7 +305,7 @@ test("a verified free choice resolves its decision but TaskState still publishes
     traveler: { booking_rules: "no paid baggage" }
   });
 
-  assert.equal(transition.status, "progressed");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
   assert.equal(transition.physicalResult.effect, "select_free_option");
   assert.equal(transition.taskOutcomeCompleted, false);
   assert.equal(taskState.completedOutcomes.some((outcome) => outcome.decisionGroupId === "bag"), true);
@@ -368,7 +388,7 @@ test("a profile-authorized free choice may complete by safely advancing to the n
     afterObservation: after
   });
 
-  assert.equal(transition.status, "progressed");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
   assert.equal(transition.postcondition.satisfied, true);
   assert.equal(transition.postcondition.evidence.completionMode, "safe_stage_transition");
   assert.equal(transition.physicalResult.effect, "select_free_option");
@@ -415,7 +435,11 @@ test("durable payment outcome survives base page and review-modal subgoals", () 
     url: "https://example.test/checkout/payment",
     currentSurface: { id: "surface-page", type: "page", label: "Payment details", surfaceClass: "form" },
     foreground: { progressMarkers: { current: "Payment" } },
-    controls: [{ controlId: "card", semantic: "card_number", label: "Card number", surfaceId: "surface-page" }],
+    controls: [
+      { controlId: "card", semantic: "card_number", label: "Card number", surfaceId: "surface-page", operations: { type: capability("type", "card") } },
+      { controlId: "expiry", semantic: "card_expiry", label: "Expiry", surfaceId: "surface-page", operations: { type: capability("type", "expiry") } },
+      { controlId: "cvc", semantic: "card_cvc", label: "Security code", surfaceId: "surface-page", operations: { type: capability("type", "cvc") } }
+    ],
     sections: [{ type: "payment", label: "Payment method and order amount" }]
   });
   const completed = reduceTaskState({
@@ -425,7 +449,7 @@ test("durable payment outcome survives base page and review-modal subgoals", () 
   });
   assert.equal(completed.stageOutcome.outcomeId, second.stageOutcome.outcomeId);
   assert.equal(completed.stageOutcome.status, "completed");
-  assert.equal(completed.terminalStatus, "payment_review_reached");
+  assert.equal(completed.terminalStatus, "card_credential_entry_reached");
 });
 
 test("no-paid-seat policy with only paid seats creates navigation, not a fake free-seat obligation", () => {

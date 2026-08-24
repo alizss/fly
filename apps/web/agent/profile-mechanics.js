@@ -226,6 +226,9 @@ function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}
     subjectId: descriptor.subjectId || atom.subjectId || "traveler_1",
     semanticType: descriptor.semanticType || atom.semanticType || "",
     componentRole: descriptor.componentRole || atom.componentRole || "value",
+    exactOption: descriptor.exactOption
+      || descriptor.bindingContract?.component?.exactOption
+      || null,
     expectedComponentValue: atom.expectedNormalizedValue || descriptor.desiredNormalizedValue || "",
     expectedCanonicalValue: atom.expectedCanonicalValue
       || descriptor.logicalDesiredCanonicalValue
@@ -845,7 +848,6 @@ function profileGoalSatisfied(goal = {}, observation = {}, traveler = {}) {
     return Boolean(
       commit.status === "settled"
       && commit.popupClosed === true
-      && commit.focusSettled === true
       && Number(commit.attempts || 0) > Number(obligationField(goal, "reconciliation").priorCommitAttempts || 0)
     );
   }

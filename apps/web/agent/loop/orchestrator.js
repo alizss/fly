@@ -11,7 +11,8 @@
 // previous action did, then plan+policy-check the next one.
 //
 // Zero model calls when task/policy filtering leaves one obvious safe action.
-// Ambiguous turns use at most one closed ambiguity-resolution call.
+// Ambiguous meaning may use at most one closed semantic-reconciliation call.
+// Models never choose DOM targets, operations, or execution strategies.
 // Earlier multi-call versions measured 15-30+ seconds per turn in practice,
 // which is a real cost for a product whose whole point is being fast.
 
@@ -111,6 +112,7 @@ const {
   candidateSelectionCacheEntry,
   pendingRecoveryTargetStatus,
   pendingRevealAction,
+  pendingRecoveryOwnedByCurrentObligation,
   rebindPendingRecoveryAction,
   reusableCandidateSelection,
   reusableStaleActionCandidate,
@@ -189,7 +191,6 @@ async function runLoopTurn({
     final_state_persist_ms: 0,
     turn_total_ms: 0
   };
-  let verifyPlanMeta = null;
   const consumedProfileResponse = consumePendingProfileResponse({
     pendingInput: state.pendingUserInput || null,
     userResponse,
@@ -212,13 +213,13 @@ async function runLoopTurn({
   let decisionFrame = null;
   const persistedTerminalLatch = state.taskState?.terminalGoalLatch || null;
   if (persistedTerminalLatch?.locked === true
-    && persistedTerminalLatch.terminalStatus === "payment_review_reached") {
+    && persistedTerminalLatch.terminalStatus === "card_credential_entry_reached") {
     const terminalAction = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
       type: "final_review",
-      intent: "payment_review_reached",
-      reason: "Payment review was already verified for this booking request. The completed checkout goal remains closed.",
+      intent: "card_credential_entry_reached",
+      reason: "Card credential entry was already verified for this booking request. The completed checkout goal remains closed.",
       risk: "payment",
       requiresApproval: true
     });
@@ -226,7 +227,7 @@ async function runLoopTurn({
       executionEpisode: updatedExecutionEpisode(state, { leasedAction: null }),
       lastAction: terminalAction,
       status: "ready_for_payment",
-      paymentState: { ...(state.paymentState || {}), status: "review_reached" }
+      paymentState: { ...(state.paymentState || {}), status: "card_entry_reached" }
     });
     transactionStore?.saveSession?.(terminalState);
     return {
@@ -305,28 +306,31 @@ async function runLoopTurn({
     });
   }
   if (transition) {
+    const outcomeStatus = transition.actionOutcome?.status || "";
+    const actionOutcome = agentContract.ACTION_OUTCOME;
     const preserveViewportRecovery = normalizeLeasedAction(leasedActionFor(state))?.status === "needs_reveal";
     transactionStore?.recordActionEvent?.(state.id, {
       actionId: transition.actionId,
       observationId: observation.observationId || "",
       turnId: clientTurnId || turnId,
       stage: "transition_evaluated",
-      status: transition.status,
+      status: outcomeStatus,
       nextDirective: transition.nextDirective,
       postcondition: transition.postcondition,
       diff: transition.diff
     });
     state = withUpdate(state, {
-      currentBlocker: transition.status === "blocked" ? transition.blocker : null,
+      currentBlocker: outcomeStatus === actionOutcome.REVEALED_BLOCKER ? transition.blocker : null,
       executionEpisode: updatedExecutionEpisode(state, {
-        leasedAction: ["achieved", "progressed", "blocked"].includes(transition.status) && !preserveViewportRecovery
+        leasedAction: [actionOutcome.SATISFIED, actionOutcome.PROGRESSED, actionOutcome.REVEALED_BLOCKER].includes(outcomeStatus) && !preserveViewportRecovery
           ? null
           : leasedActionFor(state)
       })
     });
   }
 
-  if (lifecycleDirective === "stop_for_safety" || transition?.status === "unsafe") {
+  if (lifecycleDirective === "stop_for_safety"
+    || transition?.actionOutcome?.status === agentContract.ACTION_OUTCOME.UNSAFE_CHANGE) {
     const action = finalHandoffAction(
       "Fresh browser evidence confirmed a policy or transaction-safety conflict. I stopped before another checkout action.",
       observation
@@ -340,17 +344,17 @@ async function runLoopTurn({
     };
   }
 
-  if (transition?.status === "uncertain") {
+  if (transition && !transition.actionOutcome?.status) {
     const action = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "wait",
-      intent: "reobserve_after_grounding_rejection",
-      reason: "The transition evidence is incomplete. Capture one fresh observation and rebind current controls without repeating the action.",
+      type: "stop",
+      intent: "transition_contract_incomplete",
+      reason: "The stable page did not produce a canonical action outcome. Stop without repeating the action.",
       risk: "safe",
       requiresApproval: false
     });
-    const uncertainState = withUpdate(state, { lastAction: action, status: "running" });
+    const uncertainState = withUpdate(state, { lastAction: action, status: "stopped" });
     transactionStore?.saveSession?.(uncertainState);
     return {
       state: uncertainState,
@@ -461,7 +465,6 @@ async function runLoopTurn({
   let activeComponentGrounding = null;
   let activeComponentGroundingMeta = null;
   let ambiguityModelCalls = 0;
-  let ambiguityModelKind = "";
   const resolveTurnAmbiguity = async (request) => {
     if (ambiguityModelCalls >= 1) {
       const error = new Error("The turn-local ambiguity model budget is exhausted.");
@@ -469,29 +472,69 @@ async function runLoopTurn({
       throw error;
     }
     // Consume the budget before awaiting so a failed model transport cannot
-    // silently authorize a second semantic/mechanical interpretation call.
+    // silently authorize a second semantic interpretation call.
     ambiguityModelCalls += 1;
-    ambiguityModelKind = request.kind || "unknown";
     return resolveAmbiguity(request);
   };
-  // Deterministic semantics remain the fast path. When the current scene has
-  // a required unknown component, an explicit classifier contradiction, or
-  // an unowned local validation, one closed model call may add grounded
-  // hypotheses to fresh observed IDs. It cannot publish work or actions;
-  // DecisionFrame is compiled once from the reconciled evidence and TaskState
-  // remains the sole obligation authority.
+  // Deterministic semantics and TaskState run first. A model may enrich only
+  // the exact CurrentObligation that TaskState already admitted; it never
+  // scans the page first and cannot create work.
   const semanticCompileStartedAt = Date.now();
   observation = applyRememberedSemanticBindings(observation, state.semanticBindingMemory, {
     traveler,
     transactionReview: state.transactionInvariants?.review || null
   });
+  const compileCurrentDecisionFrame = (semanticCompilation = null) => {
+    observationFrame = createObservationFrame(observation);
+    decisionFrame = compileDecisionFrame({
+      observation,
+      observationFrame,
+      ...(semanticCompilation ? { semanticCompilation } : {}),
+      state,
+      traveler
+    });
+    observation = decisionFrame.observation;
+  };
   const deterministicSemanticCompilation = agentContract.compileSemanticCheckout(observation.page || {});
+  compileCurrentDecisionFrame(deterministicSemanticCompilation);
+  latency.semantic_compile_ms += Date.now() - semanticCompileStartedAt;
+  let transactionContext = prepareTransactionInvariants(state, observation, traveler, {
+    authoritativeTransactionFacts: decisionFrame.transactionFacts
+  });
+  state = transactionContext.state;
+  const initialTaskState = state.taskState || {};
+  const parentObjective = {
+    goal: state.goal || "Complete this checkout safely to card credential entry.",
+    bookingRules: traveler.booking_rules || state.userPolicy?.bookingRules || "",
+    paymentPreference: traveler.payment_preference || state.userPolicy?.paymentPreference || ""
+  };
+  const taskStateStartedAt = Date.now();
+  const runTaskStateReduction = (previousTaskState, mechanicalEvidence) => reduceDecisionFrame({
+    previousTaskState,
+    observation,
+    previousActionResult: observation.lastActionResult || null,
+    verifiedCommerceObligations: freshVerifiedCommerceReceipt ? [freshVerifiedCommerceReceipt] : [],
+    userPolicy: effectiveUserPolicy,
+    traveler,
+    transactionReview: transactionContext.review,
+    parentObjective,
+    decisionFrame,
+    mechanicalEvidence
+  });
+  let taskState = runTaskStateReduction(
+    initialTaskState,
+    executionEpisodeFor(state).mechanicalEvidence || null
+  );
+  const reconcileMechanicalExhaustion = runTaskStateReduction;
+  const preliminaryObligation = currentObligation(taskState);
   const sceneUncertainty = semanticSceneUncertainty({
     observation,
-    semanticCompilation: deterministicSemanticCompilation,
-    traveler
+    semanticCompilation: decisionFrame.semanticCompilation,
+    traveler,
+    transactionReview: transactionContext.review,
+    currentObligation: preliminaryObligation
   });
-  if (sceneUncertainty.needed) {
+  if (preliminaryObligation && sceneUncertainty.needed) {
     try {
       const reconciled = await resolveTurnAmbiguity({
         kind: "semantic_scene",
@@ -499,8 +542,16 @@ async function runLoopTurn({
           apiKey,
           model: recoveryModel || model,
           observation,
-          semanticCompilation: deterministicSemanticCompilation,
+          semanticCompilation: decisionFrame.semanticCompilation,
           traveler,
+          transactionReview: transactionContext.review,
+          currentObligation: preliminaryObligation,
+          policyConstraints: effectiveUserPolicy,
+          failedMethods: (recoveryFacts(state).failedStrategies || []).map((strategy) => ({
+            operation: strategy.operation || strategy.type || "",
+            method: strategy.method || strategy.interactionMethod || "",
+            result: strategy.code || strategy.result || strategy.outcome || ""
+          })),
           screenshotDataUrl,
           uncertainty: sceneUncertainty
         }
@@ -527,39 +578,20 @@ async function runLoopTurn({
         }
       };
     }
+    compileCurrentDecisionFrame();
+    transactionContext = prepareTransactionInvariants(state, observation, traveler, {
+      authoritativeTransactionFacts: decisionFrame.transactionFacts
+    });
+    state = transactionContext.state;
+    taskState = runTaskStateReduction(
+      initialTaskState,
+      executionEpisodeFor(state).mechanicalEvidence || null
+    );
   }
-  observationFrame = createObservationFrame(observation);
-  decisionFrame = compileDecisionFrame({ observation, observationFrame, state, traveler });
-  observation = decisionFrame.observation;
-  latency.semantic_compile_ms += Date.now() - semanticCompileStartedAt;
-  let transactionContext = prepareTransactionInvariants(state, observation, traveler, {
-    authoritativeTransactionFacts: decisionFrame.transactionFacts
-  });
-  state = transactionContext.state;
-  const initialTaskState = state.taskState || {};
-  const parentObjective = {
-    goal: state.goal || "Complete this checkout safely to payment review.",
-    bookingRules: traveler.booking_rules || state.userPolicy?.bookingRules || "",
-    paymentPreference: traveler.payment_preference || state.userPolicy?.paymentPreference || ""
-  };
-  const taskStateStartedAt = Date.now();
-  const taskState = reduceDecisionFrame({
-    previousTaskState: initialTaskState,
-    observation,
-    previousActionResult: observation.lastActionResult || null,
-    verifiedCommerceObligations: freshVerifiedCommerceReceipt ? [freshVerifiedCommerceReceipt] : [],
-    userPolicy: effectiveUserPolicy,
-    traveler,
-    transactionReview: transactionContext.review,
-    parentObjective,
-    decisionFrame,
-    mechanicalEvidence: executionEpisodeFor(state).mechanicalEvidence || null
-  });
   const taskReadModel = taskStateReadModel(taskState) || {};
   const authoritativeGoal = taskMechanics(taskState);
   latency.task_state_ms = Date.now() - taskStateStartedAt;
 
-  const ambiguityModelAlreadyUsed = () => ambiguityModelCalls > 0;
   if (taskState.clearObsoleteRecovery) {
     state = withUpdate(state, {
       executionEpisode: updatedExecutionEpisode(state, {
@@ -679,7 +711,29 @@ async function runLoopTurn({
   // A recoverable governor result preserves the semantic action across the
   // observation created by scrolling. Rebind that same action to the fresh
   // canonical registry before consulting the model again.
-  const normalizedPending = normalizeLeasedAction(leasedActionFor(state));
+  let normalizedPending = normalizeLeasedAction(leasedActionFor(state));
+  if (normalizedPending?.status === "needs_reveal"
+    && !pendingRecoveryOwnedByCurrentObligation(normalizedPending, taskState)) {
+    transactionStore?.recordActionEvent?.(state.id, {
+      actionId: normalizedPending.originalAction?.id || "",
+      observationId: observation.observationId || "",
+      turnId: clientTurnId || turnId,
+      stage: "pending_recovery_cancelled_by_fresh_obligation",
+      obligationId: normalizedPending.actionLease?.obligationId || "",
+      currentObligationId: authoritativeGoal?.obligationId || "",
+      dispatched: false
+    });
+    state = withUpdate(state, {
+      executionEpisode: updatedExecutionEpisode(state, {
+        leasedAction: null,
+        attemptedCandidateIds: [],
+        failedStrategySignatures: [],
+        failedStrategies: []
+      }),
+      status: "running"
+    });
+    normalizedPending = null;
+  }
   if (normalizedPending?.status === "needs_reveal" && normalizedPending.originalAction) {
     const pending = normalizedPending;
     const rebound = rebindPendingRecoveryAction(pending, observation, state, traveler);
@@ -702,17 +756,17 @@ async function runLoopTurn({
       const action = normalizeAction({
         observationId: observation.observationId || "",
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-        type: "wait",
-        intent: "reobserve_after_grounding_rejection",
+        type: "stop",
+        intent: "stale_binding_rejected",
         obligationId: pending.actionLease?.obligationId || pending.obligationId || "",
-        reason: "The pending target disappeared. Discard its binding, rebuild candidates from the fresh surface, and reselect without consuming an execution attempt.",
+        reason: "The pending target disappeared on a stable fresh surface. Stop instead of waiting or repeating its stale binding.",
         risk: "safe",
         requiresApproval: false
       });
       const recoveryState = withUpdate(grounding.state, {
         executionEpisode: updatedExecutionEpisode(grounding.state, { leasedAction: null }),
         lastAction: action,
-        status: "running"
+        status: "stopped"
       });
       transactionStore?.saveSession?.(recoveryState);
       return {
@@ -822,17 +876,17 @@ async function runLoopTurn({
         finalAction = normalizeAction({
           observationId: observation.observationId || "",
           observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-          type: "wait",
-          intent: "reobserve_after_grounding_rejection",
+          type: "stop",
+          intent: "reveal_binding_rejected",
           obligationId: pending.actionLease?.obligationId || pending.obligationId || "",
-          reason: "The governed reveal binding was rejected before dispatch. Rebuild it from a fresh observation without consuming an execution attempt.",
+          reason: "The governed reveal binding was rejected on the fresh stable surface; no timer wait can make it valid.",
           risk: "safe",
           requiresApproval: false
         });
         recoveryState = withUpdate(recoveryState, {
           executionEpisode: updatedExecutionEpisode(recoveryState, { leasedAction: null }),
           lastAction: finalAction,
-          status: "running"
+          status: "stopped"
         });
       } else {
         recoveryGovernance = scrollGovernance;
@@ -857,24 +911,26 @@ async function runLoopTurn({
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
         excludedControlIds: [reboundAction.controlId].filter(Boolean)
       };
+      taskState = reconcileMechanicalExhaustion(taskState, mechanicalEvidence);
       finalAction = normalizeAction({
         observationId: observation.observationId || "",
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-        type: "wait",
-        intent: "reobserve_after_strategy_exhaustion",
+        type: "stop",
+        intent: "strategies_exhausted",
         mechanicalEffect: "none",
-        expectedPostconditions: [{ type: "fresh_observation_required" }],
-        reason: "The exact viewport-recovery budget is exhausted. Persist compact mechanical evidence and let the next single TaskState reduction publish the final disposition.",
+        expectedPostconditions: [],
+        reason: taskState.disposition?.reason || "The exact viewport-recovery budget is exhausted on the current fresh page state.",
         risk: "safe",
         requiresApproval: false
       });
       recoveryState = withUpdate(recoveryState, {
+        taskState,
         executionEpisode: updatedExecutionEpisode(recoveryState, {
           leasedAction: null,
-          mechanicalEvidence
+          mechanicalEvidence: null
         }),
         lastAction: finalAction,
-        status: "running"
+        status: "stopped"
       });
     } else if (recoveryGovernance.decision === "recoverable") {
       const grounding = recoverBeforeDispatch({
@@ -886,17 +942,17 @@ async function runLoopTurn({
       finalAction = normalizeAction({
         observationId: observation.observationId || "",
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-        type: "wait",
-        intent: "reobserve_after_grounding_rejection",
+        type: "stop",
+        intent: "rebound_binding_rejected",
         obligationId: pending.actionLease?.obligationId || pending.obligationId || "",
-        reason: "The rebound pending action was rejected before dispatch. Rebuild current candidates from fresh browser evidence without consuming an execution attempt.",
+        reason: "The rebound action was rejected on the fresh stable surface; stop without waiting for an unrelated mutation.",
         risk: "safe",
         requiresApproval: false
       });
       recoveryState = withUpdate(recoveryState, {
         executionEpisode: updatedExecutionEpisode(recoveryState, { leasedAction: null }),
         lastAction: finalAction,
-        status: "running"
+        status: "stopped"
       });
     } else {
       finalAction = policyBlockedAction(recoveryGovernance, reboundAction);
@@ -975,15 +1031,7 @@ async function runLoopTurn({
   // translates that decision into a client action; it must not independently
   // reinterpret profile readiness, validation, site state, or missing goals.
   const taskDisposition = taskState.disposition || {};
-  const publishedGoal = authoritativeGoal;
-  const publishedProfileGoal = publishedGoal?.kind === "profile_field"
-    ? publishedGoal
-    : null;
-  const publishedAdaptiveGoal = publishedGoal?.kind === "adaptive_surface"
-    ? publishedGoal
-    : null;
-  const publishedMechanicalGoal = publishedProfileGoal || publishedAdaptiveGoal;
-  if (["request_input", "request_approval", "wait_reobserve", "terminal", "stop"].includes(taskDisposition.kind)) {
+  if (["request_input", "request_approval", "terminal", "stop"].includes(taskDisposition.kind)) {
     const missingDerivedFact = taskDisposition.missingDerivedFact || null;
     const missingField = String(taskDisposition.field || "");
     const missingLabel = String(
@@ -1003,11 +1051,11 @@ async function runLoopTurn({
           observationId: observation.observationId || "",
           observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
           type: "final_review",
-          intent: taskDisposition.code === "PAYMENT_REVIEW_REACHED" ? "payment_review_reached" : "task_terminal",
+          intent: taskDisposition.code === "CARD_CREDENTIAL_ENTRY_REACHED" ? "card_credential_entry_reached" : "task_terminal",
           mechanicalEffect: "none",
           expectedPostconditions: [],
           reason,
-          risk: taskDisposition.code === "PAYMENT_REVIEW_REACHED" ? "payment" : "safe",
+          risk: taskDisposition.code === "CARD_CREDENTIAL_ENTRY_REACHED" ? "payment" : "safe",
           requiresApproval: true
         })
       : taskDisposition.kind === "request_input"
@@ -1028,28 +1076,18 @@ async function runLoopTurn({
         : normalizeAction({
             observationId: observation.observationId || "",
             observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-            type: taskDisposition.kind === "wait_reobserve" ? "wait" : "stop",
+            type: "stop",
             intent: taskDisposition.code === "SITE_FAILURE_OBSERVED"
               ? "site_failure_observed"
-              : taskDisposition.kind === "wait_reobserve"
-              ? "task_state_reobserve"
               : "task_state_stop",
             mechanicalEffect: "none",
-            expectedPostconditions: taskDisposition.kind === "wait_reobserve"
-              ? [{ type: "fresh_observation_required" }]
-              : [],
-            readinessStartedAt: taskDisposition.reobserveStartedAt || 0,
-            readinessDeadlineAt: taskDisposition.reobserveDeadlineAt || 0,
-            readinessAttempts: taskDisposition.reobserveCount || 0,
-            reobserveRetryToken: taskDisposition.retryToken || "",
+            expectedPostconditions: [],
             reason,
             risk: "safe",
             requiresApproval: false
           });
     const status = taskDisposition.kind === "terminal"
       ? "ready_for_payment"
-      : taskDisposition.kind === "wait_reobserve"
-      ? "running"
       : ["request_input", "request_approval"].includes(taskDisposition.kind)
         ? "awaiting_user"
         : "stopped";
@@ -1174,11 +1212,78 @@ async function runLoopTurn({
       approvals: state.approvals
     }
   );
-  // Strategy exhaustion is persisted as compact mechanical evidence for the
-  // next observation. The current turn never invokes TaskState a second time.
-  // On the next turn the single reducer pass may retain the obligation or
-  // publish one bounded adaptive fallback from that evidence.
+  // Candidate exhaustion is already a result on this fresh observation. Feed
+  // it back to TaskState immediately so the same turn either publishes one
+  // bounded adaptive fallback or stops. A page mutation is evidence; waiting
+  // is never a substitute for processing evidence we already have.
   if (!canonicalCandidateSet.candidates.length) {
+    const attemptedExactMechanics = canonicalFailedStrategies.length > 0;
+    if (!attemptedExactMechanics) {
+      const boundButIncomplete = [
+        ...(canonicalCandidateSet.normalCandidates || []),
+        ...(canonicalCandidateSet.recoveryCandidates || [])
+      ].find((candidate) => candidate.goalRelevant === true && !candidate.expectedOutcome);
+      const code = boundButIncomplete
+        ? "CANDIDATE_CONTRACT_INCOMPLETE"
+        : "NO_EXECUTABLE_MECHANIC";
+      const reason = boundButIncomplete
+        ? "The exact admitted control lost its verification contract before dispatch. No strategy was attempted."
+        : "The exact admitted obligation has no executable current-surface mechanic. No strategy was attempted.";
+      const action = normalizeAction({
+        observationId: observation.observationId || "",
+        observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+        type: "stop",
+        intent: boundButIncomplete ? "candidate_contract_incomplete" : "mechanic_unavailable",
+        obligationId: obligationField(canonicalGoal, "goalId") || "",
+        reason,
+        risk: "safe",
+        requiresApproval: false
+      });
+      const stoppedTaskState = Object.freeze({
+        ...taskState,
+        disposition: Object.freeze({
+          kind: "stop",
+          code,
+          reason,
+          obligationId: obligationField(canonicalGoal, "goalId") || "",
+          userActionRequired: false
+        })
+      });
+      const stoppedState = withUpdate(canonicalState, {
+        taskState: stoppedTaskState,
+        lastAction: action,
+        status: "stopped"
+      });
+      return finishTurn({
+        dataDir,
+        sessionId: state.id,
+        turnId,
+        screenshotDataUrl,
+        observation: traceObservation,
+        state: stoppedState,
+        action,
+        debug: withLatencyDebug({
+          taskState: stoppedTaskState,
+          candidateSet: canonicalCandidateSet,
+          attemptedStrategyCount: 0,
+          finalAction: action
+        }, latency, modelUsageFromMetas(model, [])),
+        transactionStore,
+        verification: observation.lastActionResult || null,
+        policyDecision: {
+          allow: false,
+          decision: boundButIncomplete ? "internal_failure" : "stop",
+          code,
+          reason
+        },
+        executionResult: {
+          endingAction: "stop",
+          endingIntent: action.intent,
+          stopped: true,
+          attemptedStrategyCount: 0
+        }
+      });
+    }
     const failedControlIds = [...new Set((recoveryFacts(state).failedStrategies || [])
       .filter((entry) => entry.semanticGoalKey === semanticGoalKey(canonicalGoal))
       .map((entry) => entry.controlId)
@@ -1193,37 +1298,64 @@ async function runLoopTurn({
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
         excludedControlIds: failedControlIds
       };
-    const action = normalizeAction({
-      observationId: observation.observationId || "",
-      observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "wait",
-      intent: "reobserve_after_strategy_exhaustion",
-      mechanicalEffect: "unknown",
-      expectedPostconditions: [{ type: "fresh_observation_required" }],
-      reason: "No exact current mechanic can execute the admitted obligation. Reobserve once so TaskState alone can route bounded recovery or publish the final exhaustion disposition.",
-      risk: "safe",
-      requiresApproval: false
-    });
-    const waitingState = withUpdate(canonicalState, {
+    taskState = reconcileMechanicalExhaustion(taskState, mechanicalEvidence);
+    canonicalState = withUpdate(canonicalState, {
       taskState,
-      executionEpisode: updatedExecutionEpisode(canonicalState, { mechanicalEvidence }),
-      lastAction: action,
-      status: "running"
+      executionEpisode: updatedExecutionEpisode(canonicalState, { mechanicalEvidence: null })
     });
-    return finishTurn({
-      dataDir,
-      sessionId: state.id,
-      turnId,
-      screenshotDataUrl,
-      observation: traceObservation,
-      state: waitingState,
-      action,
-      debug: withLatencyDebug({ taskState, mechanicalEvidence, finalAction: action }, latency, modelUsageFromMetas(model, [])),
-      transactionStore,
-      verification: observation.lastActionResult || null,
-      policyDecision: { allow: false, decision: "reobserve", code: "MECHANICS_EXHAUSTED", reason: action.reason },
-      executionResult: { endingAction: "wait", endingIntent: action.intent, stopped: false }
-    });
+    canonicalGoal = taskMechanics(taskState);
+    if (taskState.disposition?.kind === "execute" && canonicalGoal) {
+      canonicalFailedStrategies = failedStrategySignaturesForGoal(canonicalState, canonicalGoal, observation);
+      canonicalCandidateSet = groundedObservationCandidateSet(
+        taskState.currentObligation,
+        decisionFrame,
+        observation,
+        canonicalFailedStrategies,
+        {
+          state: canonicalState,
+          traveler,
+          approvals: state.approvals
+        }
+      );
+    }
+    if (!canonicalGoal || taskState.disposition?.kind !== "execute" || !canonicalCandidateSet.candidates.length) {
+      const disposition = taskState.disposition || {};
+      const reason = disposition.reason || "No current-surface mechanic can execute the admitted obligation after bounded recovery.";
+      const action = normalizeAction({
+        observationId: observation.observationId || "",
+        observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
+        type: "stop",
+        intent: "strategies_exhausted",
+        mechanicalEffect: "none",
+        expectedPostconditions: [],
+        reason,
+        risk: "safe",
+        requiresApproval: false
+      });
+      const stoppedState = withUpdate(canonicalState, {
+        lastAction: action,
+        status: "stopped"
+      });
+      return finishTurn({
+        dataDir,
+        sessionId: state.id,
+        turnId,
+        screenshotDataUrl,
+        observation: traceObservation,
+        state: stoppedState,
+        action,
+        debug: withLatencyDebug({ taskState, mechanicalEvidence, finalAction: action }, latency, modelUsageFromMetas(model, [])),
+        transactionStore,
+        verification: observation.lastActionResult || null,
+        policyDecision: {
+          allow: false,
+          decision: "stop",
+          code: disposition.code || "STRATEGIES_EXHAUSTED",
+          reason
+        },
+        executionResult: { endingAction: "stop", endingIntent: action.intent, stopped: true }
+      });
+    }
   }
   canonicalState = withUpdate(canonicalState, { taskState });
   const staleReboundCandidate = reusableStaleActionCandidate(
@@ -1232,7 +1364,7 @@ async function runLoopTurn({
     canonicalCandidateSet,
     decisionPolicyFingerprint
   );
-  let obviousCandidate = staleReboundCandidate || deterministicTaskCandidate(canonicalCandidateSet, canonicalGoal);
+  const obviousCandidate = staleReboundCandidate || deterministicTaskCandidate(canonicalCandidateSet, canonicalGoal);
   const staleActionReused = Boolean(staleReboundCandidate);
   if (recoveryFacts(state).staleRebind) {
     state = withUpdate(state, {
@@ -1243,266 +1375,39 @@ async function runLoopTurn({
     });
   }
 
-  let extracted;
-  let verification;
-  let modelPlannedAction;
-  let modelSelection;
-  let observationGoal;
-  let candidateSet;
-  let observationCandidates;
-  let deterministicAction = null;
-  let candidateSelectionDecision = null;
-  let candidateSelectionReused = false;
-  const planningModel = publishedMechanicalGoal ? (recoveryModel || model) : model;
-  let modelUsage;
-
-  if (obviousCandidate) {
-    extracted = {
-      pageState: null,
-      pageStep: taskState.stage,
-      requirements: [],
-      uncertainties: [],
-      summary: "One policy-allowed task candidate remained after canonical filtering."
-    };
-    verification = deterministicTransitionVerification(transition);
-    observationGoal = canonicalGoal;
-    candidateSet = canonicalCandidateSet;
-    observationCandidates = candidateSet.candidates;
-    modelSelection = {
-      candidateId: obviousCandidate.candidateId,
-      candidate: obviousCandidate,
-      confidence: "deterministic",
-      semanticOutcome: obviousCandidate.interactionRole === "navigation"
-        ? "advance_current_surface"
-        : "satisfy_current_decision"
-    };
-    modelPlannedAction = bindTargetSnapshot(
-      { ...actionForCurrentCandidate(observationGoal, obviousCandidate, observation), semanticOutcome: modelSelection.semanticOutcome },
-      observation
-    );
-    deterministicAction = modelPlannedAction;
-    modelUsage = modelUsageFromMetas(planningModel, []);
-    transactionStore?.recordActionEvent?.(state.id, {
-      observationId: observation.observationId || "",
-      turnId: clientTurnId || turnId,
-      stage: "deterministic_task_candidate_selected",
-      candidateId: obviousCandidate.candidateId,
-      candidateCount: 1,
-      modelCalled: false,
-      staleActionReused
-    });
-  } else {
-    // The task context above is the only semantic authority. Classification
-    // cannot replace its remaining goal or reopen a completed obligation.
-    // Genuine ambiguity is a closed selection over current candidate IDs.
-    extracted = {
-      pageState: null,
-      pageStep: taskState.stage,
-      requirements: [],
-      uncertainties: [],
-      summary: "Selection is scoped to the authoritative obligation and current candidate set."
-    };
-    verification = deterministicTransitionVerification(transition);
-    observationGoal = canonicalGoal;
-    candidateSet = canonicalCandidateSet;
-    observationCandidates = candidateSet.candidates;
-    try {
-      let selected;
-      try {
-        selected = reusableCandidateSelection(
-          state.aiDecisionCache,
-          observation,
-          observationGoal,
-          candidateSet,
-          decisionPolicyFingerprint
-        );
-        if (selected) {
-          candidateSelectionReused = true;
-          transactionStore?.recordActionEvent?.(state.id, {
-            observationId: observation.observationId || "",
-            turnId: clientTurnId || turnId,
-            stage: "ai_candidate_decision_reused",
-            candidateId: selected.candidateId,
-            controlId: selected.candidate.controlId,
-            modelCalled: false
-          });
-        } else if (ambiguityModelAlreadyUsed()) {
-          // Semantic binding already consumed this turn's sole ambiguity
-          // budget. Every remaining mechanic is grounded and governed; use
-          // the binder's deterministic order instead of making a second call.
-          const bounded = observationCandidates[0];
-          selected = bounded
-            ? { candidateId: bounded.candidateId, candidate: bounded, confidence: "bounded_deterministic", meta: null }
-            : null;
-        } else {
-          const resolved = await resolveTurnAmbiguity({
-            kind: "mechanic_selection",
-            input: {
-              apiKey,
-              model: planningModel,
-              goal: observationGoal,
-              taskState,
-              candidates: observationCandidates,
-              contextCapabilities: candidateSet.contextCapabilities,
-              observation,
-              screenshotDataUrl
-            }
-          });
-          selected = resolved.selection;
-        }
-      } catch (error) {
-        if (error?.code !== "PLANNER_CANDIDATE_NOT_CURRENT") throw error;
-        candidateSet = groundedObservationCandidateSet(
-          taskState.currentObligation,
-          decisionFrame,
-          observation,
-          failedStrategySignaturesForGoal(state, observationGoal, observation),
-          {
-            state: canonicalState,
-            traveler,
-            approvals: state.approvals
-          }
-        );
-        observationCandidates = candidateSet.candidates;
-        const rebuiltObvious = deterministicTaskCandidate(candidateSet, observationGoal);
-        if (rebuiltObvious) {
-          selected = { candidateId: rebuiltObvious.candidateId, candidate: rebuiltObvious, meta: null };
-        } else if (ambiguityModelAlreadyUsed() && ambiguityModelKind === "semantic_scene" && observationCandidates[0]) {
-          const bounded = observationCandidates[0];
-          selected = { candidateId: bounded.candidateId, candidate: bounded, confidence: "bounded_deterministic", meta: null };
-        } else if (ambiguityModelAlreadyUsed()) {
-          // An invalid mechanical selection consumed the sole model call. Do
-          // not reinterpret ambiguity as permission to choose an arbitrary
-          // first candidate; return through the existing bounded retry path.
-          throw error;
-        } else {
-          const resolved = await resolveTurnAmbiguity({
-            kind: "mechanic_selection",
-            input: {
-              apiKey,
-              model: planningModel,
-              goal: observationGoal,
-              taskState,
-              candidates: observationCandidates,
-              contextCapabilities: candidateSet.contextCapabilities,
-              observation,
-              screenshotDataUrl
-            }
-          });
-          selected = resolved.selection;
-        }
-        transactionStore?.recordActionEvent?.(state.id, {
-          observationId: observation.observationId || "",
-          turnId: clientTurnId || turnId,
-          stage: "candidate_selection_rebuilt",
-          dispatched: false,
-          browserReobserved: false,
-          candidateCount: observationCandidates.length
-        });
-      }
-      verifyPlanMeta = selected.meta || null;
-      latency.verify_plan_model_ms = Number(verifyPlanMeta?.durationMs || 0);
-      const selectedCandidate = selected.candidate
-        || observationCandidates.find((candidate) => candidate.candidateId === selected.candidateId)
-        || null;
-      if (!selectedCandidate) {
-        const error = new Error("The schema-bound planner did not resolve a current candidate.");
-        error.code = "PLANNER_CANDIDATE_NOT_CURRENT";
-        throw error;
-      }
-      modelSelection = {
-        candidateId: selectedCandidate.candidateId,
-        candidate: selectedCandidate,
-        confidence: selected.confidence || "unknown",
-        reused: selected.reused === true,
-        semanticOutcome: selected.semanticOutcome || "satisfy_current_decision"
-      };
-      candidateSelectionDecision = candidateSelectionCacheEntry({
-        observation,
-        goal: observationGoal,
-        candidate: selectedCandidate,
-        selection: modelSelection,
-        policyFingerprint: decisionPolicyFingerprint
-      });
-      modelPlannedAction = bindTargetSnapshot(
-        { ...actionForCurrentCandidate(observationGoal, selectedCandidate, observation), semanticOutcome: modelSelection.semanticOutcome },
-        observation
-      );
-    } catch (error) {
-      if (error?.code === "PLANNER_CANDIDATE_NOT_CURRENT" && observationCandidates.length) {
-        const fallbackCandidate = deterministicTaskCandidate(candidateSet, observationGoal);
-        if (fallbackCandidate) {
-          modelSelection = {
-            candidateId: fallbackCandidate.candidateId,
-            candidate: fallbackCandidate,
-            confidence: "deterministic",
-            semanticOutcome: fallbackCandidate.interactionRole === "navigation"
-              ? "advance_current_surface"
-              : "satisfy_current_decision"
-          };
-          modelPlannedAction = bindTargetSnapshot(
-            { ...actionForCurrentCandidate(observationGoal, fallbackCandidate, observation), semanticOutcome: modelSelection.semanticOutcome },
-            observation
-          );
-          deterministicAction = modelPlannedAction;
-        } else {
-          const retryAction = normalizeAction({
-            observationId: observation.observationId || "",
-            observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-            type: "wait",
-            intent: "retry_planner_current_candidates",
-            obligationId: obligationField(observationGoal, "goalId") || "",
-            reason: "Candidate grounding was rejected before browser dispatch. Retry selection against this same immutable candidate set without reobserving the page.",
-            risk: "safe",
-            requiresApproval: false
-          });
-          const plannerRecovery = updateExecutionRecovery(canonicalState, {
-            kind: "planner_rejection",
-            code: "PLANNER_CANDIDATE_NOT_CURRENT"
-          });
-          const retryState = withUpdate(plannerRecovery.state, {
-            taskState,
-            executionEpisode: updatedExecutionEpisode(plannerRecovery.state, { leasedAction: null }),
-            lastAction: retryAction,
-            status: "running"
-          });
-          transactionStore?.saveSession?.(retryState);
-          transactionStore?.recordActionEvent?.(retryState.id, {
-            observationId: observation.observationId || "",
-            turnId: clientTurnId || turnId,
-            stage: "planner_candidate_grounding_rejected",
-            dispatched: false,
-            browserReobserved: false,
-            candidateCount: observationCandidates.length,
-            executionEpisode: executionEpisodeFor(retryState)
-          });
-          return {
-            state: retryState,
-            clientDecision: toClientDecision(retryAction),
-            debug: withLatencyDebug({
-              candidateGroundingRejected: true,
-              aiServiceUnavailable: false,
-              candidateSet,
-              finalAction: retryAction
-            }, latency, modelUsageFromMetas(planningModel, [verifyPlanMeta]))
-          };
-        }
-      } else {
-        return safePlannerFailureResult({
-          dataDir,
-          state: canonicalState,
-          turnId,
-          screenshotDataUrl,
-          traceObservation,
-          reason: plannerFailureReason(error),
-          error,
-          latency,
-          modelUsage: modelUsageFromMetas(model, [verifyPlanMeta])
-        });
-      }
-    }
-    modelUsage = modelUsageFromMetas(planningModel, [verifyPlanMeta]);
-  }
+  const extracted = {
+    pageState: null,
+    pageStep: taskState.stage,
+    requirements: [],
+    uncertainties: [],
+    summary: "TaskState admitted one obligation; the canonical graph selected its execution mechanic deterministically."
+  };
+  const verification = deterministicTransitionVerification(transition);
+  const observationGoal = canonicalGoal;
+  const candidateSet = canonicalCandidateSet;
+  const modelSelection = {
+    candidateId: obviousCandidate.candidateId,
+    candidate: obviousCandidate,
+    confidence: "deterministic_mechanic",
+    semanticOutcome: obviousCandidate.interactionRole === "navigation"
+      ? "advance_current_surface"
+      : "satisfy_current_decision"
+  };
+  const modelPlannedAction = bindTargetSnapshot(
+    { ...actionForCurrentCandidate(observationGoal, obviousCandidate, observation), semanticOutcome: modelSelection.semanticOutcome },
+    observation
+  );
+  const deterministicAction = modelPlannedAction;
+  const modelUsage = modelUsageFromMetas(recoveryModel || model, [activeComponentGroundingMeta]);
+  transactionStore?.recordActionEvent?.(state.id, {
+    observationId: observation.observationId || "",
+    turnId: clientTurnId || turnId,
+    stage: "deterministic_task_mechanic_selected",
+    candidateId: obviousCandidate.candidateId,
+    candidateCount: candidateSet.candidates.length,
+    modelCalled: false,
+    staleActionReused
+  });
 
   state = withUpdate(canonicalState, {
     taskState,
@@ -1523,10 +1428,10 @@ async function runLoopTurn({
     plannedAction = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "wait",
-      intent: "rebuild_current_action_context",
+      type: "stop",
+      intent: "candidate_compilation_failed",
       obligationId: obligationField(observationGoal, "goalId") || "",
-      reason: "No executable action was compiled. Preserve the current goal and rebuild its grounded candidates without treating this as a browser failure.",
+      reason: "No executable action could be compiled from the settled surface and bounded candidate set.",
       risk: "safe",
       requiresApproval: false
     });
@@ -1632,11 +1537,11 @@ async function runLoopTurn({
     finalAction = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "wait",
-      intent: "reobserve_after_grounding_rejection",
+      type: "stop",
+      intent: "stale_binding_rejected",
       obligationId: obligationField(observationGoal, "goalId"),
       candidateId: modelSelection?.candidateId || "",
-      reason: `Discard ${governance.code}, capture one fresh observation, and rebind the same safe semantic control before considering new reasoning.`,
+      reason: `The fresh stable surface rejected ${governance.code}; stop without scheduling a mutation wait or repeating the binding.`,
       risk: "safe",
       requiresApproval: false
     });
@@ -1665,11 +1570,11 @@ async function runLoopTurn({
     finalAction = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "wait",
-      intent: "reconcile_selected_extra",
+      type: "stop",
+      intent: "obligation_reconciliation_required",
       mechanicalEffect: "unknown",
       expectedPostconditions: [],
-      reason: "Removing an unrequested paid option before continuing. Reobserve and rebuild the exact grounded correction.",
+      reason: "An unrequested paid option has an exact reversal, but the current obligation did not admit it. Stop instead of waiting or advancing.",
       risk: "safe",
       requiresApproval: false
     });
@@ -1693,13 +1598,7 @@ async function runLoopTurn({
   nextState = withUpdate(nextState, {
     executionEpisode: updatedExecutionEpisode(nextState, { leasedAction: authoritativePendingAction }),
     lastAction: finalAction,
-    status: finalAction.type === "ask_user" || finalAction.type === "final_review" ? "awaiting_user" : "running",
-    aiDecisionCache: governance.allow === true && candidateSelectionDecision
-      ? {
-          ...(nextState.aiDecisionCache || {}),
-          candidateSelection: candidateSelectionDecision
-        }
-      : nextState.aiDecisionCache
+    status: finalAction.type === "ask_user" || finalAction.type === "final_review" ? "awaiting_user" : "running"
   });
 
   const debug = withLatencyDebug(
@@ -1710,9 +1609,7 @@ async function runLoopTurn({
       finalAction,
       policyDecision: governance,
       deterministicAction,
-      reusedAiDecision: {
-        candidateSelection: candidateSelectionReused
-      },
+      reusedAiDecision: { candidateSelection: false },
       taskState,
       taskReadModel
     }),
@@ -1748,6 +1645,7 @@ module.exports = {
     buildControlAliasIndex,
     deterministicTaskCandidate,
     expectedOutcomeForAction,
+    pendingRecoveryOwnedByCurrentObligation,
     rebindPendingRecoveryAction,
     updateExecutionRecovery,
     applyTransitionStatus,

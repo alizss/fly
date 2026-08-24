@@ -173,7 +173,6 @@ function compileInteractionView({
   return {
     contractVersion: "interaction-view/v1",
     observationId: clean(observation.observationId),
-    stage: clean(taskState.stage || "unknown"),
     foregroundSurface: compactSurface(currentSurface(observation.page || {})),
     currentObligation: {
       obligationId: clean(obligationField(goal, "goalId")),

@@ -46,32 +46,32 @@ function stableOutcome(previous = {}, fallbackId = "", type = "") {
 function durableOutcomeHierarchy(previousTaskState = {}, stage = "unknown", terminalStatus = "active") {
   const transactionBase = stableOutcome(
     previousTaskState.transactionOutcome,
-    "transaction_outcome:checkout_to_payment_review",
-    "checkout_to_payment_review"
+    "transaction_outcome:checkout_to_card_credential_entry",
+    "checkout_to_card_credential_entry"
   );
   const stageBase = stableOutcome(
     previousTaskState.stageOutcome,
-    "stage_outcome:reach_payment_review",
-    "reach_payment_review"
+    "stage_outcome:reach_card_credential_entry",
+    "reach_card_credential_entry"
   );
-  const completed = terminalStatus === "payment_review_reached";
+  const completed = terminalStatus === "card_credential_entry_reached";
   const stageOutcome = Object.freeze({
     ...stageBase,
     parentOutcomeId: transactionBase.outcomeId,
     status: completed ? "completed" : "active",
     observedStage: stage,
-    completionEvidence: completed ? "fresh_payment_evidence" : "",
+    completionEvidence: completed ? "fresh_card_credential_entry" : "",
     outcomeContract: outcomeContractForGoal({
-      semanticGoal: "reach payment review",
-      semanticType: "payment_review",
-      desiredValue: "payment_review_reached"
+      semanticGoal: "reach card credential entry",
+      semanticType: "card_credential_entry",
+      desiredValue: "card_credential_entry_reached"
     })
   });
   const transactionOutcome = Object.freeze({
     ...transactionBase,
     status: completed ? "completed" : "active",
     activeStageOutcomeId: stageOutcome.outcomeId,
-    desiredOutcome: "payment_review_reached"
+    desiredOutcome: "card_credential_entry_reached"
   });
   return { transactionOutcome, stageOutcome };
 }
@@ -95,7 +95,7 @@ function surfaceContractForGoal(goal = {}, surfaceClass = "unknown", foreground 
       outcomeId: "",
       taskOutcome: "current_surface_completed",
       acceptablePhysicalEffects: Object.freeze(["advance_surface", "advance_checkout_stage", "reveal_control"]),
-      completionEvidence: Object.freeze(["fresh_surface_progress", "fresh_stage_change", "fresh_payment_stage"])
+      completionEvidence: Object.freeze(["fresh_surface_progress", "fresh_stage_change", "fresh_card_credential_entry"])
     });
   }
   if (surfaceClass === "warning" || surfaceClass === "navigation" || surfaceClass === "choice_set") {
@@ -284,7 +284,7 @@ function adaptiveSurfaceGoal({ previousTaskState = {}, actionResult = null, obse
     || `${sourceGoalId || observation.observationId || "profile"}:surface:${surface.id}`;
   return Object.freeze({
     kind: "adaptive_surface",
-    goalId: `${episodeId}:step:${ADAPTIVE_SURFACE_MAX_STEPS - remainingSteps + 1}`,
+    goalId: episodeId,
     sourceGoalId,
     semanticType: clean(obligationField(sourceGoal, "semanticType")),
     desiredValue: obligationField(sourceGoal, "desiredValue"),
@@ -355,4 +355,3 @@ module.exports = {
   durableOutcomeHierarchy,
   surfaceClassFrom
 };
-

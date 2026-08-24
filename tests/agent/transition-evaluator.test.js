@@ -25,6 +25,7 @@ const {
 } = require("../../apps/web/agent/authority-frames");
 const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
+const agentContract = require("../../apps/extension/src/shared/agent-contract");
 
 function taskMechanics(taskState = {}) {
   return currentObligation(taskState);
@@ -128,7 +129,7 @@ test("authoritative transition records exact free selection as fresh visible pro
     browserResult: result(),
     afterObservation: after
   });
-  assert.equal(transition.status, "progressed");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
   assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
   assert.equal(transition.postcondition.evidence.selectedControlId, "ctrl_free");
 
@@ -143,14 +144,16 @@ test("authoritative transition records exact free selection as fresh visible pro
     observation: after,
     previousObservation: before
   });
-  assert.equal(advanced.transition.status, "progressed");
-  assert.equal(advanced.lifecycle.verified, false);
-  assert.equal(advanced.lifecycle.localOutcomeVerified, true, JSON.stringify({
+  assert.equal(advanced.transition.actionOutcome.status, "SATISFIED");
+  assert.equal(advanced.lifecycle.verified, true);
+  assert.equal(advanced.transition.actionOutcome.status, agentContract.ACTION_OUTCOME.SATISFIED);
+  assert.equal(advanced.directive, "advance_goal");
+  assert.equal(advanced.observation.lastActionResult.localOutcomeVerified, true, JSON.stringify({
     postcondition: advanced.transition.postcondition,
     currentObligationResult: advanced.transition.currentObligationResult,
     localMechanicalResult: advanced.transition.localMechanicalResult
   }));
-  assert.equal(advanced.observation.lastActionResult.taskProgressStatus, "progressed");
+  assert.equal(advanced.observation.lastActionResult.taskProgressStatus, "achieved");
   assert.equal(advanced.observation.lastActionResult.localPostconditionSatisfied, true);
   assert.equal(advanced.observation.lastActionResult.localOutcomeVerified, true);
   assert.equal(advanced.observation.lastActionResult.verified, true);
@@ -198,7 +201,7 @@ test("matching browser-verified stage advancement cannot be rewritten as no effe
     browserResult,
     afterObservation: after
   });
-  assert.equal(transition.status, "progressed");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
   assert.equal(transition.currentObligationResult.completed, true);
   assert.equal(transition.localMechanicalResult.verified, true);
 
@@ -209,6 +212,120 @@ test("matching browser-verified stage advancement cannot be rewritten as no effe
   });
   assert.notEqual(advanced.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
   assert.equal(advanced.observation.lastActionResult.verified, true);
+});
+
+test("a transported Kiwi-shaped verified field value advances despite a compact semantic graph", () => {
+  const controlId = "ctrl_field_kiwi_given_names";
+  const logicalFieldId = "lf_traveler_1_given_names_passengers_0_firstname";
+  const before = observation("kiwi_given_names_before", {
+    step: "traveler_information",
+    url: "https://www.kiwi.com/en/booking/",
+    currentSurface: { id: "surface-page", type: "page", label: "Traveler information" },
+    controls: [{
+      controlId,
+      label: "passengers.0.firstname e.g. Harry James Given names",
+      semantic: "given_names",
+      state: { valuePresent: false, normalizedValue: "" }
+    }]
+  });
+  const expectedOutcome = {
+    type: "normalized_value_changed",
+    controlId,
+    logicalFieldId,
+    subjectId: "traveler_1",
+    semanticType: "given_names",
+    componentRole: "value",
+    expectedValue: "Ali",
+    expectedNormalizedValue: "ali",
+    expectedCanonicalValue: "ali"
+  };
+  const action = {
+    id: "act_kiwi_given_names",
+    observationId: before.observationId,
+    type: "type",
+    intent: "satisfy_semantic_goal",
+    operation: "type",
+    controlId,
+    logicalControlId: controlId,
+    value: "Ali",
+    mechanicalEffect: "type_value",
+    expectedOutcome,
+    expectedPostconditions: [expectedOutcome]
+  };
+  const browserResult = {
+    actionId: action.id,
+    observationId: before.observationId,
+    dispatched: true,
+    executed: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "",
+    expectedOutcome,
+    action,
+    outcome: {
+      ok: true,
+      code: "NORMALIZED_VALUE_VERIFIED",
+      feedback: { outcomeVerified: true }
+    }
+  };
+  // This reproduces the compact Kiwi observation seen in the trace: the
+  // logical-field graph is gone and the backend's fallback canonicalizer
+  // mistakes label text for the value. The exact browser proof must remain
+  // sufficient on its own.
+  const after = observation("kiwi_given_names_after", {
+    step: "traveler_information",
+    url: "https://www.kiwi.com/en/booking/",
+    currentSurface: { id: "surface-page", type: "page", label: "Traveler information" },
+    controls: [{
+      controlId,
+      label: "passengers.0.firstname e.g. Harry James Given names",
+      semantic: "unknown",
+      state: {
+        valuePresent: true,
+        normalizedValue: "passengers.0.firstname e.g. harry james given names"
+      }
+    }]
+  }, browserResult);
+
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: action,
+    browserResult,
+    afterObservation: after
+  });
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
+  assert.equal(transition.postcondition.satisfied, true);
+  assert.equal(transition.postcondition.evidence.browserVerified, true);
+
+  const advanced = advanceActionLifecycle({
+    state: { lastAction: action },
+    observation: after,
+    previousObservation: before
+  });
+  assert.equal(advanced.directive, "advance_goal");
+  assert.equal(advanced.lifecycle.verified, true);
+  assert.equal(advanced.observation.lastActionResult.verified, true);
+  assert.equal(advanced.observation.lastActionResult.failureCode, "");
+  assert.notEqual(advanced.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
+});
+
+test("successful outcome codes never become backend failure codes", () => {
+  assert.equal(canonicalFailureCode({
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "",
+    outcome: { ok: true, code: "NORMALIZED_VALUE_VERIFIED" }
+  }), "");
+
+  assert.equal(canonicalFailureCode({
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "OBSERVATION_HASH_MISMATCH",
+    outcome: { ok: true, code: "NORMALIZED_VALUE_VERIFIED" }
+  }), "OBSERVATION_HASH_MISMATCH");
 });
 
 test("child confirmation verifies the selected free outcome on its parent decision", () => {
@@ -482,7 +599,7 @@ test("paid-conflict correction trusts fresh cleared selection and charge over st
   assert.equal(transition.postcondition.evidence.afterPaid, false);
   assert.equal(transition.postcondition.evidence.selectedItemCleared, true);
   assert.equal(transition.postcondition.evidence.chargeCleared, true);
-  assert.notEqual(transition.status, "no_effect");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
 });
 
 test("closed action lifecycle does not claim a later page mutation", () => {
@@ -705,7 +822,7 @@ test("an unrelated fresh paid selection is an intervening mutation, not progress
     browserResult: result(action.id),
     afterObservation: after
   });
-  assert.equal(transition.status, "blocked");
+  assert.equal(transition.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(transition.causality.classification, "intervening_external_mutation");
   assert.deepEqual(transition.causality.decisionGroupIds, ["dg_bundle"]);
   assert.equal(transition.nextDirective, "rebuild_task_state");
@@ -777,7 +894,7 @@ test("a newly exposed destination decision cannot make verified navigation simul
     navigationContext: { destinationReady: true }
   });
   assert.equal(transition.causality, null);
-  assert.equal(transition.status, "achieved");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
 
   let state = createCheckoutSessionState({ goal: "Reach payment without paid extras", travelerId: "trav_destination" });
   state.lastAction = action;
@@ -818,7 +935,7 @@ test("DOB transition requires the exact canonical date and no owned validation e
     controls: [{ controlId: "ctrl_dob", semantic: "date_of_birth", state: { canonicalDateValue: "2003-05-31", normalizedValue: "2003-05-31" } }]
   }, result("act_dob"));
   const achieved = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: exact });
-  assert.equal(achieved.status, "progressed");
+  assert.equal(achieved.actionOutcome.status, "SATISFIED");
 
   const invalid = observation("dob_invalid", {
     step: "traveler_information",
@@ -827,7 +944,7 @@ test("DOB transition requires the exact canonical date and no owned validation e
     validationIssues: [{ issueId: "dob_error", controlId: "ctrl_dob", message: "Invalid date" }]
   }, result("act_dob"));
   const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: invalid });
-  assert.equal(blocked.status, "progressed");
+  assert.equal(blocked.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(blocked.postcondition.satisfied, false);
 });
 
@@ -843,8 +960,8 @@ test("authoritative transition treats popup and reversible price changes as fres
     controls: [{ controlId: "ctrl_continue_without", label: "Continue without seats" }]
   }, result());
   const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(), afterObservation: blockedAfter });
-  assert.equal(blocked.status, "progressed");
-  assert.equal(blocked.nextDirective, "rebuild_from_fresh_observation");
+  assert.equal(blocked.actionOutcome.status, "REVEALED_BLOCKER");
+  assert.equal(blocked.nextDirective, "rebuild_task_state");
   assert.equal(blocked.blocker, null);
 
   const progressedAfter = observation("progressed", {
@@ -857,17 +974,17 @@ test("authoritative transition treats popup and reversible price changes as fres
     browserResult: result(),
     afterObservation: progressedAfter
   });
-  assert.equal(progressed.status, "progressed");
+  assert.equal(progressed.actionOutcome.status, "PROGRESSED");
   assert.equal(progressed.nextDirective, "rebuild_from_fresh_observation");
 
   const unchanged = observation("unchanged", before.page, result());
   const noEffect = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(), afterObservation: unchanged });
-  assert.equal(noEffect.status, "no_effect");
+  assert.equal(noEffect.actionOutcome.status, "NO_EFFECT");
   assert.equal(noEffect.nextDirective, "try_distinct_capability");
 
   const uncertain = evaluateTransition({ beforeObservation: null, governedAction: action, browserResult: result(), afterObservation: unchanged });
-  assert.equal(uncertain.status, "uncertain");
-  assert.equal(uncertain.nextDirective, "reobserve_rebind");
+  assert.equal(uncertain.actionOutcome.status, "NO_EFFECT");
+  assert.equal(uncertain.nextDirective, "try_distinct_capability");
 
   const unsafeAfter = observation("unsafe", { ...before.page, price: { amount: 250, currency: "EUR" } }, result());
   const recoverablePrice = evaluateTransition({
@@ -876,7 +993,7 @@ test("authoritative transition treats popup and reversible price changes as fres
     browserResult: result(),
     afterObservation: unsafeAfter
   });
-  assert.equal(recoverablePrice.status, "blocked");
+  assert.equal(recoverablePrice.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(recoverablePrice.nextDirective, "rebuild_task_state");
   assert.equal(recoverablePrice.causality.classification, "unexpected_reversible_change");
   const recoverableLifecycle = advanceActionLifecycle({
@@ -899,7 +1016,7 @@ test("authoritative transition treats popup and reversible price changes as fres
     browserResult: result(),
     afterObservation: unsafeAfter
   });
-  assert.equal(unsafe.status, "unsafe");
+  assert.equal(unsafe.actionOutcome.status, "UNSAFE_CHANGE");
   assert.equal(unsafe.nextDirective, "stop_or_request_approval");
 });
 
@@ -945,8 +1062,8 @@ test("a foreground site-failure modal cannot satisfy checkout-stage advancement"
 
   assert.equal(transition.postcondition.satisfied, false);
   assert.equal(transition.currentObligationResult.completed, false);
-  assert.equal(transition.status, "progressed");
-  assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
+  assert.equal(transition.actionOutcome.status, "UNSAFE_CHANGE");
+  assert.equal(transition.nextDirective, "stop_or_request_approval");
 });
 
 test("the same modal instance verifies progress when its foreground marker advances", () => {
@@ -975,8 +1092,7 @@ test("the same modal instance verifies progress when its foreground marker advan
   });
   assert.equal(transition.postcondition.satisfied, true);
   assert.equal(transition.postcondition.evidence.advancedInPlace, true);
-  assert.equal(transition.status, "progressed");
-  assert.notEqual(transition.status, "no_effect");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
 });
 
 test("a pre-dispatch price alarm rebuilds from current state instead of stopping before reconciliation", () => {
@@ -1000,6 +1116,34 @@ test("a pre-dispatch price alarm rebuilds from current state instead of stopping
   assert.equal(lifecycle.lifecycle.status, "rejected_before_dispatch");
   assert.equal(lifecycle.directive, "rebuild_candidates");
   assert.notEqual(lifecycle.directive, "stop_for_safety");
+});
+
+test("freshness supersession before dispatch rebuilds without consuming an actuator strategy", () => {
+  const before = observation("freshness_before");
+  const state = {
+    lastAction: {
+      id: "act_freshness_superseded",
+      type: "type",
+      controlId: "ctrl_given_names",
+      semanticOwnerId: "owner_given_names",
+      operation: "type"
+    }
+  };
+  const current = observation("freshness_current", {}, {
+    actionId: "act_freshness_superseded",
+    dispatched: false,
+    executed: false,
+    verified: false,
+    superseded: true,
+    failureCode: "STALE_OBSERVATION_SUPERSEDED",
+    actionOutcome: null
+  });
+
+  const lifecycle = advanceActionLifecycle({ state, observation: current, previousObservation: before });
+  assert.equal(lifecycle.lifecycle.status, "rejected_before_dispatch");
+  assert.equal(lifecycle.directive, "rebuild_candidates");
+  assert.equal(recovery(lifecycle.state).attempts, 0);
+  assert.deepEqual(recovery(lifecycle.state).failedStrategies, []);
 });
 
 test("a fresh page mutation cancels a stale pending prediction but an unchanged snapshot keeps waiting", () => {
@@ -1062,10 +1206,10 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
     aiDecisionCache: { candidateSelection: { candidateId: "cached" } }
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
   const applied = loopPrivate.applyTransitionStatus(state, after, before);
-  assert.equal(applied.transition.status, "no_effect");
+  assert.equal(applied.transition.actionOutcome.status, "NO_EFFECT");
   assert.equal(applied.observation.lastActionResult.verified, false);
   assert.equal(applied.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
-  assert.deepEqual(recovery(applied.state).failedStrategySignatures, ["click:open:ctrl_flex:,"]);
+  assert.deepEqual(recovery(applied.state).failedStrategySignatures, ["open:ctrl_flex:,"]);
   assert.equal(recovery(applied.state).failedStrategies[0].failureCount, 1);
   assert.equal(applied.directive, "try_distinct_capability");
   assert.equal(recovery(applied.state).attempts, 1);
@@ -1074,7 +1218,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
 
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), after),
-    ["click:open:ctrl_flex:,"]
+    ["open:ctrl_flex:,"]
   );
   const changedPage = {
     ...after,
@@ -1083,7 +1227,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
   };
   assert.deepEqual(
     loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), changedPage),
-    ["click:open:ctrl_flex:,"]
+    ["open:ctrl_flex:,"]
   );
   const changedTarget = observation("after_target_changed", {
     ...before.page,
@@ -1127,7 +1271,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
 
   const applied = loopPrivate.applyTransitionStatus(state, after, before);
-  const signature = "native_click:open:ctrl_title:,";
+  const signature = "open:ctrl_title:,";
   assert.equal(applied.transition, null);
   assert.equal(applied.directive, "rebuild_candidates");
   assert.deepEqual(recovery(applied.state).failedStrategySignatures, [signature]);
@@ -1152,7 +1296,63 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   );
 });
 
-test("a retry is distinct only when its target, operation, or dispatch method changes", () => {
+test("a repeat-prohibited pre-dispatch failure is remembered and consumes the bounded recovery budget", () => {
+  const before = observation("predispatch_before", {
+    step: "payment",
+    url: "https://example.test/PaymentForm",
+    controls: [{
+      controlId: "ctrl_survey",
+      label: "Customer satisfaction survey",
+      semantic: "optional_consent",
+      state: { selected: true }
+    }]
+  });
+  const action = {
+    id: "act_unselect_survey",
+    type: "click",
+    controlId: "ctrl_survey",
+    operation: "choose",
+    interactionMethod: "native_click",
+    semanticEffect: "waive",
+    expectedOutcome: { type: "control_unselected", controlId: "ctrl_survey" }
+  };
+  const rejected = {
+    actionId: action.id,
+    dispatched: false,
+    executed: false,
+    verified: false,
+    failureCode: "CANONICAL_ACTUATOR_UNAVAILABLE",
+    outcome: { code: "CANONICAL_ACTUATOR_UNAVAILABLE" },
+    actionOutcome: { status: "NO_EFFECT", repeatProhibited: true },
+    action
+  };
+  const after = observation("predispatch_after", before.page, rejected);
+  const state = withExecutionFixture({
+    currentGoal: { goalId: "goal_survey", semanticType: "optional_consent" },
+    taskState: {
+      currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_survey", semanticType: "optional_consent" } })
+    },
+    lastAction: action,
+    aiDecisionCache: { candidateSelection: { candidateId: "stale_small_checkbox" } }
+  }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
+
+  const applied = loopPrivate.applyTransitionStatus(state, after, before);
+  const signature = loopPrivate.candidateStrategySignature(taskMechanics(state.taskState), action);
+  assert.equal(applied.transition, null);
+  assert.equal(applied.directive, "rebuild_candidates");
+  assert.equal(recovery(applied.state).attempts, 1);
+  assert.equal(recovery(applied.state).remainingAttempts, 2);
+  assert.deepEqual(recovery(applied.state).failedStrategySignatures, [signature]);
+  assert.equal(recovery(applied.state).failedStrategies[0].strategySignature, signature);
+  assert.equal(recovery(applied.state).failedStrategies[0].failureCount, 1);
+  assert.equal(applied.state.aiDecisionCache, null);
+  assert.deepEqual(
+    loopPrivate.failedStrategySignaturesForGoal(applied.state, taskMechanics(state.taskState), after),
+    [signature]
+  );
+});
+
+test("a retry is distinct only when its target or semantic operation changes", () => {
   const base = {
     type: "type",
     operation: "type",
@@ -1173,7 +1373,7 @@ test("a retry is distinct only when its target, operation, or dispatch method ch
     loopPrivate.candidateStrategySignature({}, { ...base, operation: "choose" }),
     signature
   );
-  assert.notEqual(
+  assert.equal(
     loopPrivate.candidateStrategySignature({}, { ...base, type: "keypress" }),
     signature
   );
@@ -1203,7 +1403,7 @@ test("a browser acknowledgement on the same material observation is no effect", 
     afterObservation: after
   });
   assert.equal(transition.postcondition.satisfied, false);
-  assert.equal(transition.status, "no_effect");
+  assert.equal(transition.actionOutcome.status, "NO_EFFECT");
   assert.equal(transition.nextDirective, "try_distinct_capability");
 });
 
@@ -1244,15 +1444,15 @@ test("a persisted payment terminal latch suppresses planning on a later unrelate
   state.status = "ready_for_payment";
   state.terminalGoalLatch = {
     locked: true,
-    goalId: "reach_payment_review",
-    terminalStatus: "payment_review_reached",
+    goalId: "reach_card_credential_entry",
+    terminalStatus: "card_credential_entry_reached",
     completedObservationId: "obs_payment_complete",
     completionEvidence: "fresh_payment_evidence"
   };
   state.taskState = {
-    terminalStatus: "payment_review_reached",
+    terminalStatus: "card_credential_entry_reached",
     terminalGoalLatch: state.terminalGoalLatch,
-    goal: { id: "reach_payment_review", status: "completed" }
+    goal: { id: "reach_card_credential_entry", status: "completed" }
   };
   const redirected = observation("obs_after_terminal_redirect", {
     step: "extras",
@@ -1270,7 +1470,7 @@ test("a persisted payment terminal latch suppresses planning on a later unrelate
     actionHistory: []
   });
   assert.equal(result.clientDecision.action, "final_review");
-  assert.equal(result.clientDecision.intent, "payment_review_reached");
+  assert.equal(result.clientDecision.intent, "card_credential_entry_reached");
   assert.equal(result.state.status, "ready_for_payment");
   assert.equal(result.state.terminalGoalLatch.locked, true);
   assert.equal(result.debug.terminalGoalLatched, true);
@@ -1319,7 +1519,7 @@ test("three distinct no-effect strategies exhaust only one unchanged state and m
     controls: [{ controlId: "ctrl_continue", label: "Continue" }]
   }, result(progressAction.id));
   const reset = advanceActionLifecycle({ state: { ...state, lastAction: progressAction }, observation: progressed, previousObservation: before });
-  assert.equal(reset.transition.status, "progressed");
+  assert.equal(reset.transition.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(recovery(reset.state).attempts, 0);
   assert.deepEqual(recovery(reset.state).failedStrategySignatures, []);
 });
@@ -1389,7 +1589,7 @@ test("useful unexpected transition is observed progress, not verified success", 
     previousObservation: before
   });
 
-  assert.equal(advanced.transition.status, "progressed");
+  assert.equal(advanced.transition.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(advanced.lifecycle.status, "observed");
   assert.equal(advanced.lifecycle.observed, true);
   assert.equal(advanced.lifecycle.verified, false);
@@ -1475,7 +1675,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
     currentGoal: goal,
     lastAction: dispatchedSkip
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), unchanged, before);
-  assert.equal(applied.transition.status, "no_effect");
+  assert.equal(applied.transition.actionOutcome.status, "NO_EFFECT");
   assert.equal(applied.directive, "try_distinct_capability");
 
   const retrySet = groundedObservationCandidateSet(
@@ -1976,7 +2176,7 @@ test("one stale observation mismatch rebinds the same safe stable control withou
   );
 });
 
-test("invalid planner output retries the immutable candidate set without browser handoff", async () => {
+test("multiple admitted mechanics never invoke a planner or require browser handoff", async () => {
   const current = observation("obs_invalid_planner", {
     currentSurface: {
       id: "seat_modal",
@@ -2059,12 +2259,12 @@ test("invalid planner output retries the immutable candidate set without browser
       transactionStore: store,
       clientTurnId: "turn_invalid_planner"
     });
-    assert.equal(calls, 1);
-    assert.equal(turn.clientDecision.action, "wait");
-    assert.equal(turn.clientDecision.intent, "retry_planner_current_candidates");
+    assert.equal(calls, 0);
+    assert.equal(turn.clientDecision.action, "click");
+    assert.ok(["ctrl_free_a", "ctrl_free_b"].includes(turn.clientDecision.controlId));
     assert.equal(turn.state.status, "running");
-    assert.equal(turn.debug.candidateGroundingRejected, true);
-    assert.equal(turn.debug.aiServiceUnavailable, false);
+    assert.equal(turn.debug.deterministic, true);
+    assert.deepEqual(turn.debug.modelUsage.calls, []);
   } finally {
     global.fetch = previousFetch;
   }
@@ -2148,7 +2348,7 @@ test("generic command acknowledgement cannot complete a decision or parent outco
     afterObservation: after
   });
 
-  assert.equal(transition.status, "progressed");
+  assert.equal(transition.actionOutcome.status, "PROGRESSED");
   assert.equal(transition.postcondition.satisfied, false);
   assert.equal(transition.taskOutcomeCompleted, false);
   assert.equal(after.page.decisionGroups[0].selectedControlId, "");
@@ -2167,4 +2367,63 @@ test("waived_by_policy is resolved requirement truth but remains distinct from s
   assert.equal(waived.status, "waived_by_policy");
   assert.equal(allRequiredSatisfied([waived]), true);
   assert.deepEqual(missingRequired([waived]), []);
+});
+
+test("one canonical ActionOutcome carries causal validation ownership without replacing the success contract", () => {
+  const expectedOutcome = { type: "stage_exit_or_feedback", controlId: "continue" };
+  const before = {
+    observationId: "obs_outcome_before",
+    page: {
+      url: "https://example.test/checkout",
+      controls: [{ controlId: "continue", state: { disabled: false } }],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+  const after = {
+    observationId: "obs_outcome_after",
+    page: {
+      ...before.page,
+      validationIssues: [{ issueId: "required_terms", controlId: "terms", message: "Required" }]
+    }
+  };
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: { id: "act_continue", type: "click", controlId: "continue", expectedOutcome },
+    browserResult: { actionId: "act_continue", dispatched: true, executed: true },
+    afterObservation: after
+  });
+  assert.equal(transition.actionOutcome.status, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER);
+  assert.equal(transition.actionOutcome.causedByActionId, "act_continue");
+  assert.deepEqual(transition.actionOutcome.candidateOwnerControlIds, ["terms"]);
+  assert.deepEqual(transition.actionOutcome.originalSuccessContract, expectedOutcome);
+  assert.equal(transition.actionOutcome.repeatProhibited, true);
+  assert.equal(transition.nextDirective, "rebuild_task_state");
+});
+
+test("the shared component-pattern registry classifies unfamiliar mechanics without site names", () => {
+  const pattern = agentContract.componentPatternFor;
+  assert.equal(pattern({ role: "textbox", autocomplete: "cc-number", semantic: "card_number" }), agentContract.COMPONENT_PATTERN.PAYMENT_ENTRY);
+  assert.equal(pattern({ role: "checkbox", semantic: "legal_acceptance", label: "Accept terms" }), agentContract.COMPONENT_PATTERN.LEGAL_ATTESTATION);
+  assert.equal(pattern({ role: "combobox", kind: "editable_combobox" }), agentContract.COMPONENT_PATTERN.CUSTOM_COMBOBOX_LISTBOX);
+  assert.equal(pattern({ role: "button", semantic: "quantity_increment" }), agentContract.COMPONENT_PATTERN.QUANTITY_STEPPER);
+  assert.equal(pattern({ role: "textbox", fieldType: "date_of_birth" }), agentContract.COMPONENT_PATTERN.DATE_INPUT);
+  assert.equal(pattern({ role: "button", surfaceType: "modal" }), agentContract.COMPONENT_PATTERN.MODAL_SURFACE);
+  assert.deepEqual(
+    agentContract.componentBehaviorFor(agentContract.COMPONENT_PATTERN.CUSTOM_COMBOBOX_LISTBOX).allowedOperations,
+    ["open", "choose", "keyboard", "type"]
+  );
+  const serialized = agentContract.serializeObservedControl({
+    controlId: "opaque_widget",
+    role: "combobox",
+    kind: "editable_combobox",
+    name: "opaque",
+    label: "Passenger choice",
+    state: { invalid: true, validationMessage: "Select a value" },
+    operations: {}
+  });
+  assert.equal(serialized.componentContract.componentPattern, agentContract.COMPONENT_PATTERN.CUSTOM_COMBOBOX_LISTBOX);
+  assert.equal(serialized.componentContract.componentBehavior.authorization, "profile_or_policy_for_choice");
+  assert.equal(serialized.rawEvidenceChannels.name, "opaque");
+  assert.equal(serialized.rawEvidenceChannels.validity.invalid, true);
 });

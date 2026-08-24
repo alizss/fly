@@ -505,9 +505,8 @@ function profileStageReadiness(observation = {}, traveler = {}, verifiedProfileC
   const descriptors = Array.isArray(options.descriptors)
     ? options.descriptors
     : fieldDescriptors(observation, traveler);
-  const step = String(page.step || "").toLowerCase();
   const hasProfileControls = fields.some((field) => PROFILE_FIELDS.has(normalizeProfileFieldType(field.fieldType || field.field || "")));
-  const profileStage = hasProfileControls || /traveler|traveller|passenger|contact|document/.test(step);
+  const profileStage = hasProfileControls || descriptors.some((descriptor) => descriptorOwnsActiveRequirement(descriptor, page));
   const unresolvedKnown = descriptors
     .filter((descriptor) => descriptorOwnsActiveRequirement(descriptor, page))
     .filter((descriptor) => !descriptor.hasValue)

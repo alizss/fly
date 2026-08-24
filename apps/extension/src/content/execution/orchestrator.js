@@ -190,37 +190,36 @@ export function createExecutionOrchestrator({
     decision = {},
     expectedOutcome = {},
     beforeMap = {},
-    initialAfterMap = null,
-    timeoutMs = 4200
+    initialAfterMap = null
   ) {
     let afterMap = initialAfterMap || buildPageMap();
     let verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
     if (expectedOutcome.type !== "exact_free_option_selected" || verification.ok) {
       return { afterMap, verification, commitment: null };
     }
-    const startedAt = performance.now();
-    while (performance.now() - startedAt < timeoutMs) {
-      // The site may enable its forward action asynchronously without changing
-      // the selected card itself. Recompile the current surface on every bounded
-      // probe so commitment never depends on an old agent.pageMap snapshot.
-      afterMap = buildPageMap();
-      const readiness = exactChoiceCommitReadiness(target, decision, afterMap);
-      if (readiness.ready) {
-        const commitment = rememberExactChoiceCommitment(target, decision, readiness);
-        pageStateStore.invalidate("exact_choice_commitment");
-        afterMap = (await observePageStateAfterMutation("verify_exact_choice_commitment", 700)).map;
-        verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
-        if (verification.ok) {
-          return { afterMap, verification, commitment };
-        }
-      }
-      await sleep(120);
-    }
-    if (pageStateStore.isDirty()) {
-      afterMap = (await observePageStateAfterMutation("verify_exact_choice_timeout", 500)).map;
+    let readiness = exactChoiceCommitReadiness(target, decision, afterMap);
+    const pageReadiness = afterMap.readiness || {};
+    const positivePendingEvidence = pageReadiness.documentReadyState === "loading"
+      || pageReadiness.ariaBusy === true
+      || Number(pageReadiness.loadingIndicatorCount || 0) > 0
+      || pageReadiness.loadingTextEvidence === true;
+
+    // One fresh reobservation is permitted only when the page positively says
+    // that an asynchronous commit is pending. Stable pages are evidence now;
+    // repeatedly rebuilding them cannot manufacture selection truth.
+    if (!readiness.ready && positivePendingEvidence) {
+      afterMap = (await observePageStateAfterMutation("verify_exact_choice_pending", 700)).map;
       verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
+      if (verification.ok) return { afterMap, verification, commitment: null };
+      readiness = exactChoiceCommitReadiness(target, decision, afterMap);
     }
-    return { afterMap, verification, commitment: null };
+    if (!readiness.ready) return { afterMap, verification, commitment: null };
+
+    const commitment = rememberExactChoiceCommitment(target, decision, readiness);
+    pageStateStore.invalidate("exact_choice_commitment");
+    afterMap = (await observePageStateAfterMutation("verify_exact_choice_commitment", 700)).map;
+    verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, target);
+    return { afterMap, verification, commitment };
   }
 
 
@@ -376,6 +375,32 @@ export function createExecutionOrchestrator({
       .filter(Boolean)[0] || null;
   }
 
+  function shouldHoldDispatchedStageExit({
+    advanced = false,
+    visibleBlockers = [],
+    readiness = {},
+    expectedOutcome = {},
+    decision = {}
+  } = {}) {
+    const positiveLoadingEvidence = readiness.documentReadyState === "loading"
+      || readiness.ariaBusy === true
+      || Number(readiness.loadingIndicatorCount || 0) > 0
+      || readiness.loadingTextEvidence === true;
+    const dispatchedStageExit = [
+      "checkout_stage_advanced",
+      "current_surface_advanced",
+      "stage_exit_or_feedback"
+    ].includes(expectedOutcome.type)
+      || decision.interactionRole === "navigation"
+      || /advance_(?:checkout_)?stage|navigate_stage/.test(
+        `${decision.intent || ""} ${decision.semanticIntent || ""} ${decision.mechanicalEffect || ""}`
+      );
+    return advanced !== true
+      && !(visibleBlockers || []).length
+      && (positiveLoadingEvidence || dispatchedStageExit)
+      && agent.running;
+  }
+
   async function clickAndVerifyAdvance(element, label = "Continue", delay = 1200, options = {}) {
     if (!guardedHelperAllowed("clickAndVerifyAdvance", ["click"])) return false;
     const beforeMap = options.beforeMap || pageStateStore.observe({ reason: "before_advance" }).map;
@@ -416,8 +441,23 @@ export function createExecutionOrchestrator({
     const verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, element);
     let advanced = verification.ok;
     agent.pageMap = afterMap;
-    const visibleBlockers = Array.isArray(afterMap.errors) ? afterMap.errors.filter(Boolean) : [];
-    const transitionPending = !advanced && !visibleBlockers.length && agent.running;
+    const visibleBlockers = [
+      ...(Array.isArray(afterMap.errors) ? afterMap.errors.filter(Boolean) : []),
+      ...(Array.isArray(afterMap.validationIssues) ? afterMap.validationIssues.filter(Boolean) : [])
+    ];
+    const readiness = afterMap.readiness || {};
+    const transitionPending = shouldHoldDispatchedStageExit({
+      advanced,
+      visibleBlockers,
+      readiness,
+      expectedOutcome,
+      decision: governedDecision
+      // Some checkout SPAs acknowledge the click immediately and mutate the
+      // route several seconds later without exposing a spinner or aria-busy.
+      // A dispatched stage exit therefore remains pending until a material
+      // mutation or its bounded deadline; it must not be retried or reported
+      // as NO_EFFECT after the short UI-settle sample.
+    });
     setAgentActivity(
       advanced ? `Advanced to ${afterMap.step.replace(/_/g, " ")}` : transitionPending ? "Waiting for the page to advance" : `${label} did not advance`,
       advanced ? "Reading the next page state" : transitionPending ? "The stage exit was dispatched once; waiting for a material page change." : "Looking for the remaining blocker"
@@ -502,14 +542,88 @@ export function createExecutionOrchestrator({
       source: decision.source
     });
     await pageStateStore.waitForQuiet({ maxWaitMs: 260 });
-    const currentObservation = mapObservationSnapshot(pageStateStore.observe({ reason: "pre_execution" }).map);
-    if ((decision.observationHash && decision.observationHash !== currentObservation.snapshotHash) || observationChangedSince(map)) {
+    const preExecutionObservation = pageStateStore.observe({ reason: "pre_execution" });
+    const freshMap = preExecutionObservation.map;
+    const currentObservation = mapObservationSnapshot(freshMap);
+    const snapshotChanged = Boolean(
+      (decision.observationHash && decision.observationHash !== currentObservation.snapshotHash)
+      || observationChangedSince(map)
+    );
+    if (snapshotChanged) {
+      const mechanicalAction = ["click", "type", "select", "keypress", "scroll", "click_xy"].includes(decision.action);
+      const freshTarget = mechanicalAction && decision.action !== "click_xy"
+        ? resolveDecisionTarget(decision, freshMap)
+        : null;
+      const freshValidation = freshTarget
+        ? validateResolvedTarget(decision, freshTarget, freshMap)
+        : { ok: false, code: mechanicalAction ? "CANONICAL_ACTUATOR_UNAVAILABLE" : "CONTROL_FLOW_REQUIRES_FRESH_PLAN" };
+      const controlId = decision.controlId || decision.targetSnapshot?.controlId || "";
+      const freshControl = (freshMap.controls || []).find((control) => control.controlId === controlId) || null;
+      const desiredState = decision.desiredStateDelta?.desiredState
+        || decision.pipelineContract?.requirement?.desiredStateDelta?.desiredState
+        || decision.affordance?.task?.desiredStateDelta?.desiredState
+        || "";
+      const comparable = (value = "") => String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9+]+/g, "");
+      const desiredValue = decision.expectedNormalizedValue
+        || decision.expectedCanonicalValue
+        || decision.expectedValue
+        || decision.value
+        || "";
+      const observedValue = freshControl?.state?.canonicalDateValue
+        || freshControl?.state?.selectedValue
+        || freshControl?.state?.normalizedValue
+        || freshControl?.currentCanonicalValue
+        || freshControl?.currentValue
+        || "";
+      const valueAlreadySatisfied = ["type", "select"].includes(decision.action)
+        && comparable(desiredValue)
+        && comparable(desiredValue) === comparable(observedValue);
+      const choiceAlreadySatisfied = decision.action === "click"
+        && desiredState !== "unselected"
+        && isChoiceSelected(freshTarget)
+        && /select_free|select_paid|selected|policy_allowed/.test(String(
+          decision.semanticEffect
+          || decision.desiredSemanticOutcome
+          || decision.pipelineContract?.requirement?.desiredEffect
+          || ""
+        ).toLowerCase());
+      const surfaceAlreadyRevealed = decision.operation === "open"
+        && freshControl?.state?.expanded === true;
+      const exactTargetStillNeedsAction = freshValidation.ok
+        && !valueAlreadySatisfied
+        && !choiceAlreadySatisfied
+        && !surfaceAlreadyRevealed;
+
+      if (exactTargetStillNeedsAction) {
+        // Unrelated page churn must not veto an unchanged local obligation.
+        // Rebind the governed action to the exact current control and let the
+        // normal executor revalidate operation, foreground, hit testing, and
+        // safety below.
+        map = freshMap;
+        agent.pageMap = freshMap;
+        logFlow("execute.obligation_scoped_rebind", {
+          actionId,
+          observationId: actionObservationId,
+          expectedHash: decision.observationHash || "",
+          currentHash: currentObservation.snapshotHash || "",
+          controlId,
+          targetId: elementId(freshTarget),
+          validation: freshValidation.code || "TARGET_REVALIDATED"
+        });
+      } else {
       const staleOutcome = {
         ok: false,
-        code: "OBSERVATION_HASH_MISMATCH",
-        reason: "The page materially changed before execution.",
+        code: "STALE_OBSERVATION_SUPERSEDED",
+        reason: valueAlreadySatisfied || choiceAlreadySatisfied || surfaceAlreadyRevealed
+          ? "The exact local obligation is already satisfied in the fresh observation."
+          : "The exact local target or obligation changed before execution.",
         expectedHash: decision.observationHash || "",
-        currentHash: currentObservation.snapshotHash || ""
+        currentHash: currentObservation.snapshotHash || "",
+        superseded: true,
+        freshValidation
       };
       const staleResult = rememberUnexecutedActionResult(
         actionId,
@@ -536,6 +650,7 @@ export function createExecutionOrchestrator({
       await reportActionResult(staleResult);
       await continueAfterAction(150);
       return;
+      }
     }
     const message = decision.message || "I have a next action.";
     if (!agent.messages.at(-1) || agent.messages.at(-1).text !== message) {
@@ -1240,6 +1355,7 @@ export function createExecutionOrchestrator({
     pushVerificationLedger,
     repeatGuardFor,
     settleExactChoiceOutcome,
+    shouldHoldDispatchedStageExit,
     verificationFromSurfaceFeedback,
     visibleValidationElement
   };

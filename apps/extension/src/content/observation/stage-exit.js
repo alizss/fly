@@ -1,29 +1,16 @@
 export function createStageExitCompiler({
-  meaningfulActionBox,
-  controlMemberNodeIds,
   unfilledRequiredFields,
   actionableCheckoutErrors
 }) {
-  function buildStageExit(decisionGroups, fields, buttons, errors, step, controls = []) {
+  function buildStageExit(decisionGroups, fields, _buttons, errors, _step, controls = [], _terminalEvidence = null) {
     const isUnboundSelectionCta = (control) => (
       /selection[_ -]?cta/.test(`${control?.semantic || ""} ${control?.semanticType || ""} ${control?.meaning || ""}`.toLowerCase())
       && !control?.choiceContract
     );
-    const rawContinueButtons = buttons.filter((button) => (
-      button.risk === "safe_continue"
-      && !/skip to/i.test(button.label || "")
-      && meaningfulActionBox(button.box)
-    ));
-    const buttonOwnedContinueControls = rawContinueButtons.map((button) => (
-      controls.find((control) => (
-        !isUnboundSelectionCta(control)
-        && (
-          controlMemberNodeIds(control).includes(button.id)
-          || control.preferredActivationElementId === button.id
-          || control.stateElementId === button.id
-        )
-      )) || null
-    )).filter(Boolean);
+    // Navigation is a derived view of the canonical control graph. Raw button
+    // models are intentionally excluded: allowing both representations to
+    // publish mechanics made one DOM actuator appear twice with conflicting
+    // meaning/actionability and let stale text heuristics outrank fresh proof.
     const semanticContinueControls = controls.filter((control) => (
       !isUnboundSelectionCta(control)
       && (
@@ -33,10 +20,9 @@ export function createStageExitCompiler({
         || /(?:^|\s)(?:continue|next)(?:\s|$)/i.test(control.label || "")
       )
     ));
-    const continueControls = [...new Map([
-      ...buttonOwnedContinueControls,
-      ...semanticContinueControls
-    ].filter(Boolean).map((control) => [control.controlId, control])).values()];
+    const continueControls = [...new Map(
+      semanticContinueControls.map((control) => [control.controlId, control])
+    ).values()];
     const actionabilityForControl = (control) => {
       const capabilities = Object.values(control.operations || {});
       const strategies = capabilities.flatMap((capability) => capability?.strategies || []);
@@ -101,21 +87,8 @@ export function createStageExitCompiler({
     });
     const readyCandidate = stageExitCandidates.find((candidate) => candidate.status === "ready") || null;
     const observedCandidate = readyCandidate || stageExitCandidates[0] || null;
-    const buttonOwnedContinueControl = readyCandidate
-      ? controls.find((control) => control.controlId === readyCandidate.controlId) || null
-      : buttonOwnedContinueControls[0] || null;
-    const buttonOwnedNodeIds = new Set(buttonOwnedContinueControl
-      ? [
-          ...controlMemberNodeIds(buttonOwnedContinueControl),
-          buttonOwnedContinueControl.preferredActivationElementId,
-          buttonOwnedContinueControl.stateElementId
-        ].filter(Boolean)
-      : []);
-    const rawContinueButton = rawContinueButtons.find((button) => buttonOwnedNodeIds.has(button.id))
-      || rawContinueButtons[0]
-      || null;
-    const safeContinueObserved = Boolean(readyCandidate || (!continueControls.length && rawContinueButton));
-    const continueObserved = Boolean(stageExitCandidates.length || rawContinueButton);
+    const safeContinueObserved = Boolean(readyCandidate);
+    const continueObserved = stageExitCandidates.length > 0;
     const continueDisabled = Boolean(
       stageExitCandidates.length
       && stageExitCandidates.every((candidate) => candidate.status === "disabled")
@@ -133,13 +106,14 @@ export function createStageExitCompiler({
     else if (continueDisabled) blockers.push("Continue is disabled");
     else if (!safeContinueObserved) blockers.push("Continue is not safely actionable");
     return {
+      projectionVersion: "canonical-navigation/v1",
+      authority: "canonical_control_graph",
       continueAllowed: Boolean(
         safeContinueObserved
         && !continueDisabled
         && !unresolvedGroup
         && !unresolvedField
         && !actionableErrors.length
-        && !["payment", "confirmation"].includes(step)
       ),
       candidates: Object.freeze(stageExitCandidates),
       continueObserved,
@@ -163,18 +137,10 @@ export function createStageExitCompiler({
     errors = [],
     step = "unknown",
     controls = [],
+    terminalEvidence = null,
     currentSurface = { id: "surface-page", type: "page", blocksBackground: false }
   } = {}) {
-    const stageExit = buildStageExit(decisionGroups, fields, buttons, errors, step, controls);
-    const contextualOverlayBlocker = (stageExit.blockers || []).includes("visible overlay/menu/modal");
-    const pageOwnsForeground = !currentSurface?.type
-      || currentSurface.type === "page"
-      || currentSurface.blocksBackground !== true;
-    if (pageOwnsForeground && contextualOverlayBlocker) {
-      const error = new Error("SURFACE_AUTHORITY_CONTRADICTION");
-      error.code = "SURFACE_AUTHORITY_CONTRADICTION";
-      throw error;
-    }
+    const stageExit = buildStageExit(decisionGroups, fields, buttons, errors, step, controls, terminalEvidence);
     return Object.freeze({
       ...stageExit,
       surfaceAuthority: Object.freeze({

@@ -191,7 +191,8 @@ test("production runtime contains one semantic compiler and one TaskState reduct
   assert.equal((loop.match(/compileDecisionFrame\s*\(/g) || []).length, 1);
   assert.equal((loop.match(/reduceDecisionFrame\s*\(/g) || []).length, 1);
   assert.equal(/\bselectCandidate\b|\bresolveActiveComponentSemantics\b/.test(loop), false);
-  assert.equal((ambiguityResolver.match(/require\("\.\/select-candidate"\)/g) || []).length, 1);
+  assert.equal((ambiguityResolver.match(/require\("\.\/select-candidate"\)/g) || []).length, 0);
+  assert.equal(/mechanic_selection/.test(`${loop}\n${ambiguityResolver}`), false);
   assert.equal((ambiguityResolver.match(/require\("\.\/active-component-grounding"\)/g) || []).length, 0);
   assert.equal((ambiguityResolver.match(/require\("\.\/semantic-scene-reconciliation"\)/g) || []).length, 1);
   assert.equal(/resolveSemanticOwnership|reusableSemanticOwnershipDecision/.test(`${loop}\n${candidateBinder}`), false);
@@ -449,4 +450,72 @@ test("an active unexplained checkout produces typed situation reconciliation", (
   assert.equal(decisionFrame.checkoutSituation.reconciliationRequired, true);
   assert.equal(taskState.disposition.code, "SITUATION_RECONCILIATION_REQUIRED");
   assert.equal(taskState.disposition.userActionRequired, false);
+});
+
+test("strong unknown validation survives semantic uncertainty and outranks navigation while weak required markup does not", () => {
+  const baseControl = {
+    surfaceId: "surface-page",
+    representationLifecycle: { active: true, status: "active_rendered" },
+    state: { valuePresent: false },
+    operations: { type: actionable("type", "unknown_input") }
+  };
+  const observation = {
+    observationId: "obs_unknown_validation_contract",
+    observationSnapshot: { snapshotHash: "hash_unknown_validation_contract" },
+    page: {
+      url: "https://example.test/checkout",
+      step: "misleading_stage",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [{
+        ...baseControl,
+        controlId: "unknown_input",
+        stateElementId: "unknown_input",
+        preferredActivationElementId: "unknown_input",
+        role: "textbox",
+        kind: "text",
+        label: "Passenger detail",
+        name: "opaque"
+      }, {
+        ...baseControl,
+        controlId: "promo",
+        stateElementId: "promo",
+        preferredActivationElementId: "promo",
+        label: "Promo code",
+        name: "promo",
+        required: true,
+        state: { required: true, valuePresent: false }
+      }, {
+        controlId: "continue",
+        stateElementId: "continue",
+        preferredActivationElementId: "continue",
+        surfaceId: "surface-page",
+        role: "button",
+        kind: "button",
+        label: "Continue",
+        semantic: "continue",
+        physicalEffect: "advance_checkout_stage",
+        representationLifecycle: { active: true, status: "active_rendered" },
+        state: { disabled: false },
+        operations: { activate: actionable("activate", "continue") }
+      }],
+      fields: [],
+      decisionGroups: [],
+      validationIssues: [{
+        issueId: "validation_unknown",
+        controlId: "unknown_input",
+        message: "Please complete this passenger detail",
+        status: "active_control_error"
+      }],
+      stageExit: { candidates: [{ controlId: "continue", executable: true, status: "ready" }], blockers: [] }
+    }
+  };
+  const frame = compileDecisionFrame({ observation, observationFrame: createObservationFrame(observation) });
+  const kinds = frame.checkoutSituation.obligations.map((obligation) => obligation.kind);
+  assert.equal(kinds.includes("unknown_validation"), true);
+  assert.equal(frame.checkoutSituation.obligations.some((obligation) => obligation.controlId === "promo"), false);
+
+  const taskState = reduceDecisionFrame({ observation: frame.observation, decisionFrame: frame });
+  assert.equal(taskState.currentObligation.kind, "unknown_validation");
+  assert.deepEqual(taskState.currentObligation.admittedControlIds, ["unknown_input"]);
+  assert.notEqual(taskState.currentObligation.kind, "navigation");
 });

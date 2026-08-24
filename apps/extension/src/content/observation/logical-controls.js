@@ -209,6 +209,35 @@ export function createLogicalControlCompiler(dependencies) {
     );
     return Boolean(ownedState);
   }
+
+  const CHOICE_SELECTION_STATE = Object.freeze({
+    SELECTED: "SELECTED",
+    UNSELECTED: "UNSELECTED",
+    UNKNOWN: "UNKNOWN",
+    NOT_APPLICABLE: "NOT_APPLICABLE"
+  });
+
+  function directChoiceSelectionState(element) {
+    if (!element) return CHOICE_SELECTION_STATE.NOT_APPLICABLE;
+    const explicit = explicitChoiceBooleanState(element);
+    if (explicit !== null) {
+      return explicit
+        ? CHOICE_SELECTION_STATE.SELECTED
+        : CHOICE_SELECTION_STATE.UNSELECTED;
+    }
+    const stateBearing = Boolean(
+      element.matches?.("input[type='checkbox'], input[type='radio'], option, [role='checkbox'], [role='radio'], [role='option']")
+      || element.hasAttribute?.("aria-checked")
+      || element.hasAttribute?.("aria-selected")
+      || element.hasAttribute?.("aria-pressed")
+      || element.hasAttribute?.("data-selected")
+      || element.hasAttribute?.("data-checked")
+      || element.hasAttribute?.("data-state")
+    );
+    if (!stateBearing) return CHOICE_SELECTION_STATE.NOT_APPLICABLE;
+    if (isChoiceSelected(element)) return CHOICE_SELECTION_STATE.SELECTED;
+    return CHOICE_SELECTION_STATE.UNKNOWN;
+  }
   
   function choiceLabel(input) {
     const own = directControlName(input);
@@ -373,7 +402,10 @@ export function createLogicalControlCompiler(dependencies) {
       return "selection_cta";
     }
     if (/continue|next|proceed/.test(text)) return "continue";
-    return "choice";
+    // Unknown is an explicit state, not a generic choice classification.
+    // Downstream obligation admission may still retain a required current
+    // control, but no policy or consequence is inferred from this fallback.
+    return "unknown";
   }
   
   function choiceRisk(label = "") {
@@ -389,7 +421,15 @@ export function createLogicalControlCompiler(dependencies) {
     return "uncertain";
   }
   
-  const NON_ECONOMIC_EFFECT_ROLES = new Set(["scope_toggle", "information_only", "navigation", "presentation_mode"]);
+  const ECONOMIC_EFFECT_ROLES = new Set(["commerce_option", "free_decline", "included_entitlement"]);
+  const NON_ECONOMIC_EFFECT_ROLES = new Set([
+    "scope_toggle",
+    "information_only",
+    "navigation",
+    "presentation_mode",
+    "optional_consent",
+    "unknown"
+  ]);
   
   function canonicalDecisionEffectRole(control = {}) {
     const localMeaning = normalizeMatchText([
@@ -420,6 +460,10 @@ export function createLogicalControlCompiler(dependencies) {
     ) && /radio|checkbox|switch|toggle/.test(shape)
       && !control.structuredPrice;
     if (disabledStateRepresentation) return "presentation_mode";
+    if (/checkbox|switch|toggle/.test(shape)
+      && /customer satisfaction survey|participate in (?:a )?survey|newsletter|marketing|promotional|third party offers|third-party offers|commercial communications|consent to receiving/.test(localMeaning)) {
+      return "optional_consent";
+    }
     if (/same for all|apply (?:this )?to all|both (?:flights|legs|journeys)|copy (?:to|for) all/.test(localMeaning)
       && /checkbox|switch|toggle|button/.test(shape)) return "scope_toggle";
     if (/decline paid extra|decline baggage|safe decline|select free option/.test(meaning)
@@ -430,6 +474,7 @@ export function createLogicalControlCompiler(dependencies) {
       && !/add|buy|upgrade|select paid|purchase/.test(meaning)) return "included_entitlement";
     if (/show details|learn more|more info|information|allowance|dimensions|what.s included/.test(meaning)
       && !/add|buy|upgrade|select|choose/.test(meaning)) return "information_only";
+    if (/reveal control/.test(meaning)) return "navigation";
     if (/add paid extra|select paid option|purchase|upgrade|buy|\badd\b.{0,40}\b(?:bag|baggage|luggage)\b|bring onboard/.test(meaning)
       || Number(control.structuredPrice?.amount) > 0) return "commerce_option";
     if (/continue|next|proceed|navigate stage|advance checkout|close|done|back/.test(meaning)
@@ -541,6 +586,65 @@ export function createLogicalControlCompiler(dependencies) {
     return queryAllDeep("input, select, textarea, [role='radio'], [role='checkbox'], [role='option'], [role='combobox'], [role='listbox'], button, [role='button']", element)
       .filter((candidate) => isVisible(candidate) && !candidate.closest("#atw-sidebar"))[0] || element;
   }
+
+  function presentedSelectValue(element) {
+    return compactText(
+      element?.value
+      || element?.getAttribute?.("aria-valuetext")
+      || element?.getAttribute?.("data-value")
+      || element?.innerText
+      || element?.textContent
+      || "",
+      160
+    );
+  }
+
+  function nativeSelectPresentationMatches(select, presentation) {
+    if (!select || !presentation || select === presentation || select.tagName !== "SELECT") return false;
+    const presentationRole = String(implicitRole(presentation) || presentation.getAttribute?.("role") || "").toLowerCase();
+    const presentationClass = String(presentation.getAttribute?.("class") || "").toLowerCase();
+    const popupContract = ["combobox", "listbox"].includes(presentationRole)
+      || presentation.getAttribute?.("aria-haspopup") === "listbox"
+      || presentation.getAttribute?.("aria-expanded") != null
+      || /(?:^|\s)select-dropdown(?:\s|$)/.test(presentationClass);
+    if (!popupContract || !isVisible(presentation) || isDisabledLike(presentation)) return false;
+
+    const selectedOption = select.selectedIndex >= 0 ? select.options?.[select.selectedIndex] : null;
+    const selectedValues = [
+      selectedOption?.textContent,
+      selectedOption?.label,
+      selectedOption?.value,
+      select.value
+    ].map((value) => normalizeMatchText(value || "")).filter(Boolean);
+    const presentedValues = [
+      presentedSelectValue(presentation),
+      presentation.getAttribute?.("aria-label")
+    ].map((value) => normalizeMatchText(value || "")).filter(Boolean);
+    if (!selectedValues.length || !presentedValues.length) return false;
+    return presentedValues.some((presented) => selectedValues.some((selected) => (
+      presented === selected
+      || presented.endsWith(` ${selected}`)
+    )));
+  }
+
+  // Framework selects commonly split one control into a native state owner
+  // and a generated, visible combobox. Resolve that relationship before
+  // canonical registration so the façade cannot become a competing control.
+  function splitSelectStateForPresentation(element, initial) {
+    if (!element || !initial || initial.tagName === "SELECT") return null;
+    const presentation = isDropdownLikeElement(initial) ? initial : null;
+    if (!presentation) return null;
+
+    for (let owner = presentation.parentElement, depth = 0; owner && depth < 4; owner = owner.parentElement, depth += 1) {
+      if (owner.closest?.("#atw-sidebar")) return null;
+      const matches = queryAllDeep("select", owner)
+        .filter((select) => !select.closest?.("#atw-sidebar"))
+        .filter((select) => nativeSelectPresentationMatches(select, presentation));
+      if (matches.length === 1) return matches[0];
+      if (matches.length > 1 || owner.matches?.("form, main, body, html")) break;
+    }
+    return null;
+  }
   
   function exclusiveChoicePresentationText(element) {
     return compactText(
@@ -584,6 +688,8 @@ export function createLogicalControlCompiler(dependencies) {
   // wrapper and actuator are published as two competing decisions.
   function canonicalExclusiveChoiceState(element, context = {}) {
     const initial = stateElementForControl(element);
+    const splitSelectState = splitSelectStateForPresentation(element, initial);
+    if (splitSelectState) return splitSelectState;
     if (!element || !initial || structuralDecisionChoiceKind(initial) === "radio") return initial;
     const radio = element.closest?.("[role='radio']") || null;
     if (!radio || radio === initial || !isVisible(radio)) return initial;
@@ -781,11 +887,13 @@ export function createLogicalControlCompiler(dependencies) {
     const valueText = exposesChoiceValue && value && !isPlaceholderChoiceValue(value, element)
       ? compactText(value, 180)
       : "";
+    const directSelectionState = directChoiceSelectionState(element);
     const choiceLike = Boolean(
       choiceBinding
       || element?.type === "radio"
       || element?.type === "checkbox"
       || ["radio", "checkbox", "option"].includes(implicitRole(element))
+      || directSelectionState !== CHOICE_SELECTION_STATE.NOT_APPLICABLE
     );
     const optionValue = choiceLike
       ? normalizedProfileChoiceValue(
@@ -802,9 +910,14 @@ export function createLogicalControlCompiler(dependencies) {
       : semantic === "date_of_birth"
         ? (decodedDate.canonicalDateValue || decodedDate.componentValue || "")
         : normalizedControlValue(meaningfulValue, semantic, element);
-    const choiceSelected = choiceBinding
-      ? choiceBinding.selection?.selected === true
-      : (choiceLike ? isChoiceSelected(element) : false);
+    const selectionState = choiceBinding
+      ? (choiceBinding.selection?.state || (
+          choiceBinding.selection?.selected === true
+            ? CHOICE_SELECTION_STATE.SELECTED
+            : CHOICE_SELECTION_STATE.UNKNOWN
+        ))
+      : directSelectionState;
+    const choiceSelected = selectionState === CHOICE_SELECTION_STATE.SELECTED;
     return {
       checked: Boolean(choiceBinding
         ? choiceSelected
@@ -812,7 +925,9 @@ export function createLogicalControlCompiler(dependencies) {
         ? element.checked === true
         : element?.getAttribute?.("aria-checked") === "true"),
       selected: Boolean(choiceSelected),
+      selectionState,
       selectionEvidence: choiceBinding ? {
+        state: selectionState,
         source: choiceBinding.selection?.source || "",
         probeElementId: choiceBinding.selection?.probeElementId || "",
         selectedCount: Number(choiceBinding.selection?.selectedCount || 0),
@@ -820,6 +935,17 @@ export function createLogicalControlCompiler(dependencies) {
         invariantValid: choiceBinding.selection?.valid !== false,
         decisionOwnerId: elementId(choiceBinding.decisionOwner),
         optionOwnerId: elementId(choiceBinding.optionOwner)
+      } : choiceLike ? {
+        state: selectionState,
+        source: explicitChoiceBooleanState(element) !== null
+          ? "direct_explicit_state"
+          : "direct_selection_state_unknown",
+        probeElementId: elementId(element),
+        selectedCount: choiceSelected ? 1 : 0,
+        exclusive: false,
+        invariantValid: true,
+        decisionOwnerId: "",
+        optionOwnerId: ""
       } : null,
       valuePresent: Boolean(meaningfulValue && String(meaningfulValue).trim()),
       value: meaningfulValue ? "[filled]" : "",
@@ -1172,7 +1298,12 @@ export function createLogicalControlCompiler(dependencies) {
         "control_selected",
         { disabled: false }
       );
-    } else if (!dropdownLike && (kind === "button" || role === "button")) {
+    } else if (!dropdownLike && (
+      kind === "button"
+      || role === "button"
+      || tag === "a"
+      || role === "link"
+    )) {
       operations.activate = make("activate", [activationId, stateId], "observable_change", { disabled: false });
     }
     return operations;
@@ -1413,6 +1544,9 @@ export function createLogicalControlCompiler(dependencies) {
       const selected = native.filter((element) => explicitChoiceBooleanState(element) === true);
       return {
         selected: selected.length === 1,
+        state: selected.length === 1
+          ? CHOICE_SELECTION_STATE.SELECTED
+          : CHOICE_SELECTION_STATE.UNSELECTED,
         explicit: true,
         source: selected.length === 1 ? "owned_native_state" : "owned_native_unselected",
         probeElementId: elementId(selected[0] || native[0])
@@ -1425,6 +1559,7 @@ export function createLogicalControlCompiler(dependencies) {
     if (explicitSelected.length) {
       return {
         selected: true,
+        state: CHOICE_SELECTION_STATE.SELECTED,
         explicit: true,
         source: "owned_explicit_state",
         probeElementId: elementId(explicitSelected[0].element)
@@ -1436,6 +1571,7 @@ export function createLogicalControlCompiler(dependencies) {
     if (classProbe) {
       return {
         selected: true,
+        state: CHOICE_SELECTION_STATE.SELECTED,
         explicit: true,
         source: classProbe.evidence,
         probeElementId: elementId(classProbe.element)
@@ -1444,6 +1580,7 @@ export function createLogicalControlCompiler(dependencies) {
     if (explicit.length) {
       return {
         selected: false,
+        state: CHOICE_SELECTION_STATE.UNSELECTED,
         explicit: true,
         source: "owned_explicit_unselected",
         probeElementId: elementId(explicit[0].element)
@@ -1453,6 +1590,7 @@ export function createLogicalControlCompiler(dependencies) {
     if (visualTransition) {
       return {
         selected: true,
+        state: CHOICE_SELECTION_STATE.SELECTED,
         explicit: true,
         source: visualTransition,
         probeElementId: elementId(actuator)
@@ -1460,6 +1598,7 @@ export function createLogicalControlCompiler(dependencies) {
     }
     return {
       selected: false,
+      state: CHOICE_SELECTION_STATE.UNKNOWN,
       explicit: false,
       source: "no_owned_selection_state",
       probeElementId: ""
@@ -1658,7 +1797,15 @@ export function createLogicalControlCompiler(dependencies) {
       || owner?.hasAttribute?.("data-choice-group");
     const paidDecline = paidDeclineSetEvidence(peers).valid;
     const commercial = Boolean(customButtonSelectionCtaEvidence(owner, peers));
-    return { explicit, paidDecline, commercial };
+    const explicitStateSet = peers.length >= 2 && peers.every((peer) => (
+      peer.hasAttribute?.("aria-pressed")
+      || peer.hasAttribute?.("aria-selected")
+      || peer.hasAttribute?.("aria-checked")
+      || peer.hasAttribute?.("data-selected")
+      || peer.hasAttribute?.("data-checked")
+      || peer.hasAttribute?.("data-state")
+    ));
+    return { explicit, explicitStateSet, paidDecline, commercial };
   }
   
   function containsNestedCustomDecision(owner, peers = []) {
@@ -1668,7 +1815,7 @@ export function createLogicalControlCompiler(dependencies) {
         const nestedPeers = customButtonChoicePeers(current);
         if (nestedPeers.length < 2 || nestedPeers.length >= peers.length) continue;
         const evidence = customDecisionEvidence(current, nestedPeers);
-        if (evidence.explicit || evidence.paidDecline || evidence.commercial) return true;
+        if (evidence.explicit || evidence.explicitStateSet || evidence.paidDecline || evidence.commercial) return true;
       }
     }
     return false;
@@ -1686,12 +1833,14 @@ export function createLogicalControlCompiler(dependencies) {
       || owner.hasAttribute?.("data-choice-group");
     const paidDeclineSet = paidDeclineSetEvidence(peers).valid;
     const commercialOptionSet = customButtonSelectionCtaEvidence(owner, peers);
+    const explicitStateSet = customDecisionEvidence(owner, peers).explicitStateSet;
     // Inferred custom decisions are atomic and non-overlapping. Once a
     // descendant already proves a coherent choice, a page-layout ancestor may
     // not absorb unrelated buttons from a sibling summary or utility region.
     const crossesNestedDecision = !explicitChoiceOwner && containsNestedCustomDecision(owner, peers);
     if (crossesNestedDecision) return false;
     return explicitChoiceOwner
+      || explicitStateSet
       || paidDeclineSet
       || Boolean(commercialOptionSet?.parsed.some((item) => item.peer === element));
   }
@@ -1834,12 +1983,21 @@ export function createLogicalControlCompiler(dependencies) {
       .filter((index) => index >= 0);
     const optionIndex = decisionPeers.indexOf(stateElement);
     const selectionInvariantValid = selectedIndexes.length <= 1;
+    const ownState = peerStates[optionIndex]?.state || CHOICE_SELECTION_STATE.UNKNOWN;
+    const inferredState = selectionInvariantValid && selectedIndexes.length === 1
+      ? (selectedIndexes[0] === optionIndex
+          ? CHOICE_SELECTION_STATE.SELECTED
+          : CHOICE_SELECTION_STATE.UNSELECTED)
+      : ownState;
     const selection = {
-      selected: selectionInvariantValid && selectedIndexes[0] === optionIndex,
+      selected: inferredState === CHOICE_SELECTION_STATE.SELECTED,
+      state: inferredState,
       selectedCount: selectedIndexes.length,
       exclusive: true,
       valid: selectionInvariantValid,
-      source: peerStates[optionIndex]?.source || "no_owned_selection_state",
+      source: inferredState === CHOICE_SELECTION_STATE.UNSELECTED && ownState === CHOICE_SELECTION_STATE.UNKNOWN
+        ? "exclusive_peer_selected"
+        : (peerStates[optionIndex]?.source || "no_owned_selection_state"),
       probeElementId: peerStates[optionIndex]?.probeElementId || ""
     };
     const rawOptionText = [
@@ -1945,8 +2103,12 @@ export function createLogicalControlCompiler(dependencies) {
     if (!element || element.closest?.("#atw-sidebar")) return null;
     const stateElement = canonicalExclusiveChoiceState(element, context);
     if (!stateElement || stateElement.closest?.("#atw-sidebar")) return null;
-    const labelElement = labelElementForInput(stateElement);
-    const wrapper = controlWrapperForElement(element, stateElement);
+    // A link/button nested inside a form label owns only its own command
+    // actuator. Treating the enclosing label as the command's label actuator
+    // aliases legal-information links with the checkbox that the label owns.
+    const intrinsicCommand = stateElement.matches?.("a, button, [role='link'], [role='button']");
+    const labelElement = intrinsicCommand ? null : labelElementForInput(stateElement);
+    const wrapper = intrinsicCommand ? stateElement : controlWrapperForElement(element, stateElement);
     const kind = controlKindForElement(stateElement);
     const presentationBinding = choicePresentationBinding(stateElement, context);
     const activationElement = presentationBinding?.activationElement
@@ -2023,6 +2185,28 @@ export function createLogicalControlCompiler(dependencies) {
       ? explicitChoiceSemantic || semanticChoiceType(label)
       : (fieldSemantic !== "unknown" ? fieldSemantic : semanticChoiceType(label)));
     const ownedMeaning = resolveOwnedControlMeaning(ownedEvidence, fallbackSemantic, surface.type || "page");
+    const paymentMethodShape = /radio|option|choice/.test(
+      `${kind || ""} ${ownedEvidence.role || ""} ${ownedEvidence.type || ""}`.toLowerCase()
+    );
+    const exactPaymentMethodEvidence = [
+      label,
+      stateElement.getAttribute?.("name") || "",
+      ownedEvidence.testId,
+      ownedEvidence.ariaLabel,
+      ownedEvidence.graphicName
+    ].filter(Boolean).join(" ");
+    const paymentMethodControl = Boolean(
+      !/cancel|back|close|help|privacy|terms/i.test(label)
+      && (
+        /payment[-_ ]method|pay with|credit(?: or|\/)? debit card|apple pay|google pay/i.test(exactPaymentMethodEvidence)
+        || (
+          contextualSectionType === "payment"
+          && /(?:select|choose|payment)\s+(?:a\s+)?payment method|payment method|pay with|credit card payment/i.test(sectionLabel)
+          && (paymentMethodShape || (intrinsicCommand && ownedEvidence.graphicName))
+        )
+      )
+      && (paymentMethodShape || intrinsicCommand)
+    );
     // Once an exclusive option owner has been reconstructed, broad label
     // parsing must not reintroduce prices from descriptive benefits or sibling
     // content. A missing exact option price remains unknown, not inherited.
@@ -2033,9 +2217,11 @@ export function createLogicalControlCompiler(dependencies) {
         : structuredPriceFromText(label);
     const choiceControl = Boolean(presentationBinding)
       || /radio|checkbox|option|choice/.test(`${kind || ""} ${ownedEvidence.role || ""} ${ownedEvidence.type || ""} ${fallbackSemantic || ""}`.toLowerCase());
-    let physicalEffect = presentationBinding && Number(structuredPrice?.amount) === 0
-      ? "select_free_option"
-      : presentationBinding && Number(structuredPrice?.amount) > 0
+    let physicalEffect = paymentMethodControl
+      ? "reveal_control"
+      : presentationBinding && Number(structuredPrice?.amount) === 0
+        ? "select_free_option"
+        : presentationBinding && Number(structuredPrice?.amount) > 0
         ? "select_paid_option"
         : presentationBinding?.advancesOnSelection
           ? "unknown"
@@ -2049,9 +2235,11 @@ export function createLogicalControlCompiler(dependencies) {
       && /^(continue|next|proceed|go without|continue without)\b/i.test(label)) {
       physicalEffect = "dismiss_surface";
     }
-    const semantic = explicitChoiceSemantic === "legal_acceptance"
-      ? explicitChoiceSemantic
-      : fieldType
+    const semantic = paymentMethodControl
+      ? "payment_method"
+      : explicitChoiceSemantic === "legal_acceptance"
+        ? explicitChoiceSemantic
+        : fieldType
       || (presentationBinding && Number(structuredPrice?.amount) === 0 ? "select_free_option" : "")
       || (presentationBinding && Number(structuredPrice?.amount) > 0 ? "add_paid_extra" : "")
       || ownedMeaning.semantic
@@ -2071,23 +2259,38 @@ export function createLogicalControlCompiler(dependencies) {
     const contextualDecisionSectionType = exactDecisionSectionType && exactDecisionSectionType !== "unknown"
       ? exactDecisionSectionType
       : contextualSectionType;
-    // A proven profile-choice semantic owns its logical decision. The broad
-    // visual section (for example "passenger") remains layout context only.
-    const sectionType = presentationBinding && fieldType
-      ? fieldType
-      : contextualDecisionSectionType;
+    // Exact control semantics own the logical decision. A broad checkout
+    // container can legitimately contain payment methods, billing fields,
+    // marketing consent, and legal terms; its aggregate type is layout
+    // context and must not redefine an exact payment-method action as legal.
+    const sectionType = paymentMethodControl
+      ? "payment"
+      : presentationBinding && fieldType
+        ? fieldType
+        : contextualDecisionSectionType;
     const decisionLabel = presentationBinding && fieldType
       ? fieldType
       : (presentationBinding?.ownerLabel || sectionLabel);
     const surfaceDecisionGroupId = surface?.type && surface.type !== "page"
       ? (surface.decisionGroupId || decisionGroupIdForContext({ sectionType: surface.taskHint || surface.type || "", sectionLabel: surface.parentSectionLabel || surface.label || surface.taskHint || "" }))
       : "";
-    const decisionGroupId = context.decisionGroupId || surfaceDecisionGroupId || decisionGroupIdForContext({
+    const locallyOwnedDecisionGroupId = presentationBinding ? decisionGroupIdForContext({
       sectionType,
       sectionLabel: decisionLabel,
       field: fieldType || context.field || "",
       instance: presentationBinding?.decisionInstance || ""
-    });
+    }) : "";
+    // The smallest proven exclusive-choice owner is action authority. Broad
+    // section and surface groups remain layout context and may not absorb a
+    // locally reconstructed Yes/No or option-card component.
+    const decisionGroupId = locallyOwnedDecisionGroupId
+      || context.decisionGroupId
+      || surfaceDecisionGroupId
+      || decisionGroupIdForContext({
+        sectionType,
+        sectionLabel: decisionLabel,
+        field: fieldType || context.field || ""
+      });
     const members = [
       { element: stateElement, relation: "state" },
       { element: labelElement, relation: "label" },
@@ -2229,6 +2432,11 @@ export function createLogicalControlCompiler(dependencies) {
               ? ["native_click"]
               : operation === "activate" && physicalEffect === "advance_checkout_stage"
               ? ["browser_trusted_input", "native_click"]
+              : choiceControl || ["choose", "select"].includes(operation)
+                // A stateful choice has one semantic mutation. Dispatching the
+                // same mutation through another synthetic click method after
+                // NO_EFFECT is repetition, not recovery.
+                ? ["native_click"]
                 : ["native_click", "pointer_sequence"];
       capability.strategies = (capability.actuatorIds || []).flatMap((actuatorId) => methods.map((method) => ({
         operation,
@@ -2500,7 +2708,10 @@ export function createLogicalControlCompiler(dependencies) {
       )),
       state
     });
-    const economicStructuredPrice = NON_ECONOMIC_EFFECT_ROLES.has(effectRole) ? null : structuredPrice;
+    // Economic consequence is positive evidence, never the inverse of a
+    // non-economic allow-list. Unknown controls cannot inherit a booking
+    // total merely because their exact purpose has not been classified yet.
+    const economicStructuredPrice = ECONOMIC_EFFECT_ROLES.has(effectRole) ? structuredPrice : null;
     const hasActionableActuator = Boolean(
       Object.values(operations).some((capability) => (
         capability?.actionability?.executable === true
@@ -2577,13 +2788,15 @@ export function createLogicalControlCompiler(dependencies) {
       semanticIntent: semantic,
       physicalEffect: physicalEffect || "unknown",
       effectRole,
-      economicEffect: NON_ECONOMIC_EFFECT_ROLES.has(effectRole) ? "none" : "decision_outcome",
+      economicEffect: ECONOMIC_EFFECT_ROLES.has(effectRole) ? "decision_outcome" : "none",
       semanticConflict: ownedMeaning.conflict === true,
       risk: Number(economicStructuredPrice?.amount) > 0
         ? "money"
         : Number(economicStructuredPrice?.amount) === 0
           ? "safe"
-          : effectRole === "scope_toggle"
+          : paymentMethodControl
+            ? "safe"
+            : effectRole === "scope_toggle"
             ? "safe"
             : choiceRisk(label),
       structuredPrice: economicStructuredPrice,
@@ -2613,6 +2826,7 @@ export function createLogicalControlCompiler(dependencies) {
         priceEvidenceSource: presentationBinding.priceEvidenceSource || "",
         exclusive: true,
         selectionInvariant: {
+          state: presentationBinding.selection?.state || CHOICE_SELECTION_STATE.UNKNOWN,
           selectedCount: Number(presentationBinding.selection?.selectedCount || 0),
           valid: presentationBinding.selection?.valid !== false
         }
@@ -2660,6 +2874,7 @@ export function createLogicalControlCompiler(dependencies) {
   
   return Object.freeze({
     NON_ECONOMIC_EFFECT_ROLES,
+    ECONOMIC_EFFECT_ROLES,
     canonicalControlForElement,
     canonicalDecisionEffectRole,
     choiceLabel,

@@ -1,7 +1,6 @@
 const { diffObservations } = require("./observation-diff");
 const { currentSurface } = require("./surface-contract");
 const { normalizedActionSemantics, outcomeContractForGoal } = require("./action-semantics");
-const { decideStage } = require("./task-state-reducer");
 const { resolveLogicalFields, verifyLogicalField } = require("./logical-field");
 const { decodeDateFromField } = require("./date-field-codec");
 const agentContract = require("../../extension/src/shared/agent-contract");
@@ -235,7 +234,6 @@ function meaningfulDiff(diff = {}) {
     || diff.errorsAppeared?.length
     || diff.errorsCleared?.length
     || diff.priceChanged
-    || diff.stageChanged
     || diff.urlChanged
     || diff.progressChanged
     || diff.surfaceChanged
@@ -266,7 +264,6 @@ function materialStateChanged(diff = {}) {
     || diff.errorsAppeared?.length
     || diff.errorsCleared?.length
     || diff.priceChanged
-    || diff.stageChanged
     || diff.urlChanged
     || diff.progressChanged
     || diff.surfaceChanged
@@ -404,8 +401,7 @@ function policySafeChoiceTransition(expected = {}, action = {}, beforePage = {},
     && agentContract.decisionAvailability(group, afterPage.controls || []) === agentContract.DECISION_AVAILABILITY.ACTIVE
   ));
   const advanced = Boolean(
-    diff.stageChanged
-    || diff.urlChanged
+    diff.urlChanged
     || diff.progressChanged
     || (sourceRetired && activeSuccessorDecision && meaningfulDiff(diff))
   );
@@ -565,13 +561,11 @@ function destinationProgressFromOrigin(afterObservation = {}, navigationContext 
   }
   const origin = navigationContext.origin;
   const afterPage = pageOf(afterObservation);
-  const afterStage = decideStage(afterObservation).stage;
   const afterUrl = afterPage.url || afterObservation.url || "";
   const afterSurfaceId = surfaceOf(afterPage).id || "";
   const afterProgress = observationProgressFingerprint(afterObservation);
   const progressed = Boolean(
-    (origin.stage && afterStage && origin.stage !== "unknown" && afterStage !== origin.stage)
-    || (origin.url && afterUrl && afterUrl !== origin.url)
+    (origin.url && afterUrl && afterUrl !== origin.url)
     || (origin.surfaceId && afterSurfaceId && afterSurfaceId !== origin.surfaceId)
     || (
       origin.progressFingerprint
@@ -583,8 +577,6 @@ function destinationProgressFromOrigin(afterObservation = {}, navigationContext 
   return {
     ready: true,
     progressed,
-    originStage: origin.stage || "unknown",
-    afterStage,
     originUrl: origin.url || "",
     afterUrl,
     originSurfaceId: origin.surfaceId || "",
@@ -663,6 +655,19 @@ function evaluatePostcondition(
   if (type === "policy_conflict_resolved") {
     const resolved = policyConflictResolution(expected, action, beforePage, afterPage);
     return { type, ...resolved };
+  }
+  if (type === "control_unselected") {
+    const wasSelected = Boolean(beforeControl && (
+      beforeControl.selected || beforeControl.state?.checked || beforeControl.state?.selected
+    ));
+    const isSelected = Boolean(afterControl && (
+      afterControl.selected || afterControl.state?.checked || afterControl.state?.selected
+    ));
+    return {
+      type,
+      satisfied: Boolean(wasSelected && !isSelected && !priceIncreased(beforePage, afterPage)),
+      evidence: { wasSelected, isSelected, controlId }
+    };
   }
   if (type === "exact_free_option_selected") {
     const exact = exactFreeSelection(expected, action, beforePage, afterPage);
@@ -825,7 +830,7 @@ function evaluatePostcondition(
     const expectedSurfaceId = expected.surfaceId || action.targetSnapshot?.surfaceId || surfaceOf(beforePage).id || "";
     const afterSurface = surfaceOf(afterPage);
     const gone = Boolean(diff.modalClosed || (expectedSurfaceId && afterSurface.id !== expectedSurfaceId));
-    const advancedInPlace = Boolean(diff.progressChanged || diff.stageChanged || diff.urlChanged);
+    const advancedInPlace = Boolean(diff.progressChanged || diff.urlChanged);
     return {
       type,
       satisfied: gone || advancedInPlace,
@@ -845,20 +850,49 @@ function evaluatePostcondition(
     const group = groupById(afterPage, groupId);
     return { type, satisfied: Boolean(group && group.status === (expected.status || "satisfied")), evidence: { groupId, status: group?.status || "" } };
   }
+  if (type === "validation_or_requirement_resolved") {
+    const controlId = expected.controlId || action.controlId || action.targetSnapshot?.controlId || "";
+    const beforeIssues = blockingValidationIssues(beforePage).filter((issue) => (
+      !controlId || issue.controlId === controlId || issue.stageWide === true
+    ));
+    const afterIssues = blockingValidationIssues(afterPage).filter((issue) => (
+      !controlId || issue.controlId === controlId || issue.stageWide === true
+    ));
+    const afterControl = controlById(afterPage, controlId);
+    const state = afterControl?.state || {};
+    const settled = Boolean(
+      afterControl
+      && (state.valuePresent === true || state.checked === true || state.selected === true || afterControl.selected === true)
+    );
+    const satisfied = beforeIssues.length > 0
+      && afterIssues.length === 0
+      && settled
+      && !priceIncreased(beforePage, afterPage);
+    return {
+      type,
+      satisfied,
+      evidence: {
+        controlId,
+        beforeValidationCount: beforeIssues.length,
+        afterValidationCount: afterIssues.length,
+        settled,
+        priceIncreased: priceIncreased(beforePage, afterPage)
+      }
+    };
+  }
   if (type === "target_in_view") {
     const target = controlById(afterPage, expected.controlId || action.controlId || "");
     return { type, satisfied: Boolean(target && target.visualRegion?.inViewport === true), evidence: { controlId: target?.controlId || "", inViewport: target?.visualRegion?.inViewport === true } };
   }
   if (type === "stage_exit_or_feedback") {
     const satisfied = !currentSurfaceIsSiteFailure(afterPage)
-      && Boolean(diff.stageChanged || diff.urlChanged || diff.progressChanged || diff.modalOpened || diff.modalClosed || diff.errorsAppeared?.length || diff.surfaceChanged);
+      && Boolean(diff.urlChanged || diff.progressChanged || diff.modalOpened || diff.modalClosed || diff.errorsAppeared?.length || diff.surfaceChanged);
     return { type, satisfied, evidence: { stageChanged: diff.stageChanged, progressChanged: diff.progressChanged, modalOpened: diff.modalOpened, errorsAppeared: diff.errorsAppeared } };
   }
   if (type === "current_surface_advanced") {
     const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
     const advanced = !currentSurfaceIsSiteFailure(afterPage) && Boolean(
       diff.progressChanged
-      || diff.stageChanged
       || diff.urlChanged
       || (diff.surfaceChanged && !diff.modalOpened && !diff.modalClosed)
       || (destination.ready && destination.progressed)
@@ -880,8 +914,7 @@ function evaluatePostcondition(
   if (type === "checkout_stage_advanced") {
     const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
     const advanced = !currentSurfaceIsSiteFailure(afterPage) && Boolean(
-      diff.stageChanged
-      || diff.urlChanged
+      diff.urlChanged
       || diff.progressChanged
       || (destination.ready && destination.progressed)
     );
@@ -931,7 +964,7 @@ function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}) {
   if (postcondition.satisfied && postcondition.type === "current_surface_advanced") {
     return { effect: "advance_surface", verified: true, evidence: postcondition.evidence };
   }
-  if (diff.modalClosed && !diff.stageChanged && !diff.urlChanged && !diff.progressChanged) {
+  if (diff.modalClosed && !diff.urlChanged && !diff.progressChanged) {
     return { effect: "dismiss_surface", verified: true, evidence: { modalClosed: true } };
   }
   if (postcondition.satisfied) {
@@ -978,11 +1011,11 @@ function parentProgressFor(action = {}, afterObservation = {}, localEffect = {},
   const contract = task.parentOutcomeContract || task.outcomeContract || {};
   const outcomeId = task.stageOutcomeId || contract.outcomeId || task.transactionOutcomeId || "";
   const taskOutcome = contract.taskOutcome || "";
-  const observedStage = decideStage(afterObservation).stage;
-  const completed = taskOutcome === "payment_review_reached"
-    ? observedStage === "payment"
+  const terminalEvidence = agentContract.compileTerminalEvidence(afterObservation);
+  const completed = taskOutcome === "card_credential_entry_reached"
+    ? terminalEvidence.boundaryObserved === true
     : taskOutcome === "booking_confirmed"
-      ? observedStage === "confirmation"
+      ? afterObservation?.page?.bookingConfirmation?.verified === true
       : false;
   const usefulLocalProgress = localEffect.verified === true;
   const usefulObservedProgress = meaningfulDiff(diff);
@@ -991,7 +1024,13 @@ function parentProgressFor(action = {}, afterObservation = {}, localEffect = {},
     taskOutcome,
     status: completed ? "completed" : (usefulLocalProgress || usefulObservedProgress ? "progress" : "no_progress"),
     completed,
-    evidence: Object.freeze({ observedStage, stageChanged: diff.stageChanged, urlChanged: diff.urlChanged, progressChanged: diff.progressChanged })
+    evidence: Object.freeze({
+      terminalBoundaryObserved: terminalEvidence.boundaryObserved === true,
+      paymentCredentialKinds: terminalEvidence.paymentCredentialKinds || [],
+      stageChanged: diff.stageChanged,
+      urlChanged: diff.urlChanged,
+      progressChanged: diff.progressChanged
+    })
   });
 }
 
@@ -1047,8 +1086,11 @@ function evaluateTransition({
     status = "unsafe";
     nextDirective = "stop_or_request_approval";
   } else if (!beforeObservation?.observationId || !afterObservation?.observationId || !dispatched) {
-    status = "uncertain";
-    nextDirective = "reobserve_rebind";
+    // A stable observation with incomplete causal identity cannot justify a
+    // timer wait. Close this action as no-effect and let bounded recovery use
+    // a distinct proven method or stop.
+    status = "no_effect";
+    nextDirective = "try_distinct_capability";
   } else if (
     durableObjectiveProgress.completed
     || (
@@ -1083,18 +1125,55 @@ function evaluateTransition({
     status = "no_effect";
     nextDirective = "try_distinct_capability";
   } else {
-    status = "uncertain";
-    nextDirective = "reobserve_rebind";
+    status = "no_effect";
+    nextDirective = "try_distinct_capability";
   }
 
+  const provenDestinationAdvance = Boolean(
+    navigationContext?.destinationReady === true
+    && postcondition.satisfied === true
+    && ["current_surface_advanced", "checkout_stage_advanced", "stage_exit_or_feedback"].includes(postcondition.type)
+  );
+  const revealedBlocker = Boolean(
+    causality
+    || (diff.modalOpened && !provenDestinationAdvance)
+    || (diff.errorsAppeared || []).length
+  );
+  const blocker = revealedBlocker
+    ? (causality || blockerFrom(afterObservation, diff))
+    : null;
+  const actionOutcome = agentContract.compileActionOutcome({
+    legacyStatus: status,
+    causedByActionId: browserResult.actionId || governedAction.id || "",
+    originalSuccessContract: expected,
+    introducedValidation: diff.errorsAppeared || [],
+    candidateOwnerControlIds: (diff.errorsAppeared || []).map((issue) => issue.controlId),
+    revealedBlocker,
+    // A causal mismatch or newly revealed paid selection is a blocker to
+    // reconcile from the fresh TaskState, not automatically an irreversible
+    // safety event. Reserve UNSAFE_CHANGE for genuinely unsafe/site-failure
+    // transitions; otherwise REVEALED_BLOCKER wins and exact corrections can
+    // be scheduled immediately.
+    unsafe: status === "unsafe" || currentSurfaceIsSiteFailure(afterPage),
+    satisfied: currentObligationResult.completed === true || status === "achieved",
+    progressed: status === "progressed" && currentObligationResult.completed !== true,
+    surfaceChanged: diff.modalOpened || diff.modalClosed,
+    urlChanged: diff.urlChanged,
+    progressChanged: diff.progressChanged,
+    priceChanged: diff.priceChanged,
+    transactionChanged: Boolean(causality || recoverableChange)
+  });
+  if (actionOutcome.status === agentContract.ACTION_OUTCOME.REVEALED_BLOCKER) {
+    nextDirective = "rebuild_task_state";
+  } else if (actionOutcome.status === agentContract.ACTION_OUTCOME.UNSAFE_CHANGE) {
+    nextDirective = causality ? "rebuild_task_state" : "stop_or_request_approval";
+  }
   return {
-    status,
+    actionOutcome,
     diff,
     postcondition,
     nextDirective,
-    blocker: status === "blocked"
-      ? (causality || blockerFrom(afterObservation, diff))
-      : null,
+    blocker: status === "blocked" ? blocker : null,
     causality,
     authoritative: "browser_observation",
     beforeObservationId: beforeObservation?.observationId || "",

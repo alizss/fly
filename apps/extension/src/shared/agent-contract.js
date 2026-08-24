@@ -6,7 +6,7 @@
   "use strict";
 
   const CONTRACT_VERSION = "agent-contract/v1";
-  const TERMINAL_EVIDENCE_VERSION = "terminal-evidence/v1";
+  const TERMINAL_EVIDENCE_VERSION = "terminal-evidence/v2";
   const CAPABILITY_STATUS = Object.freeze({
     PROVEN_EXECUTABLE: "proven_executable",
     RECOVERABLE: "recoverable",
@@ -42,6 +42,94 @@
     UNRESOLVED: "unresolved",
     READY: "ready",
     TERMINAL: "terminal"
+  });
+  // One cross-runtime result vocabulary for an attempted action. Browser
+  // mechanics may expose richer local evidence, but all recovery and TaskState
+  // consumers must reason from one of these six outcomes.
+  const ACTION_OUTCOME = Object.freeze({
+    SATISFIED: "SATISFIED",
+    PROGRESSED: "PROGRESSED",
+    REVEALED_BLOCKER: "REVEALED_BLOCKER",
+    NO_EFFECT: "NO_EFFECT",
+    UNSAFE_CHANGE: "UNSAFE_CHANGE",
+    DESTINATION_LOADING: "DESTINATION_LOADING"
+  });
+  const COMPONENT_PATTERN = Object.freeze({
+    NATIVE_INPUT_SELECT: "native_input_select",
+    CUSTOM_COMBOBOX_LISTBOX: "custom_combobox_listbox",
+    RADIO_CHECKBOX_CHOICE: "radio_checkbox_choice",
+    QUANTITY_STEPPER: "quantity_stepper",
+    DATE_INPUT: "date_input",
+    MODAL_SURFACE: "modal_surface",
+    REPEATED_INSTANCE: "repeated_instance",
+    ANCILLARY_PRODUCT_CARD: "ancillary_product_card",
+    LEGAL_ATTESTATION: "legal_attestation",
+    PAYMENT_ENTRY: "payment_entry"
+  });
+  // Component families are behavior contracts, not workflow classifications.
+  // The same registry is serialized with observations and consulted by
+  // mechanics regardless of airline wording or page/stage guesses.
+  const COMPONENT_BEHAVIOR_REGISTRY = Object.freeze({
+    [COMPONENT_PATTERN.NATIVE_INPUT_SELECT]: Object.freeze({
+      allowedOperations: Object.freeze(["type", "select", "open", "choose", "activate", "keyboard"]),
+      successEvidence: Object.freeze(["canonical_value", "exact_option", "validation_clear"]),
+      failureEvidence: Object.freeze(["validation_appeared", "value_unchanged", "control_disabled"]),
+      authorization: "profile_or_policy_for_value"
+    }),
+    [COMPONENT_PATTERN.CUSTOM_COMBOBOX_LISTBOX]: Object.freeze({
+      allowedOperations: Object.freeze(["open", "choose", "keyboard", "type"]),
+      successEvidence: Object.freeze(["popup_opened", "exact_option", "canonical_value"]),
+      failureEvidence: Object.freeze(["popup_missing", "option_missing", "validation_appeared"]),
+      authorization: "profile_or_policy_for_choice"
+    }),
+    [COMPONENT_PATTERN.RADIO_CHECKBOX_CHOICE]: Object.freeze({
+      allowedOperations: Object.freeze(["choose", "activate", "keyboard"]),
+      successEvidence: Object.freeze(["exact_selection", "group_settled", "validation_clear"]),
+      failureEvidence: Object.freeze(["selection_unchanged", "conflicting_selection", "validation_appeared"]),
+      authorization: "typed_choice_policy"
+    }),
+    [COMPONENT_PATTERN.QUANTITY_STEPPER]: Object.freeze({
+      allowedOperations: Object.freeze(["increment", "decrement", "activate"]),
+      successEvidence: Object.freeze(["exact_quantity", "price_reconciled"]),
+      failureEvidence: Object.freeze(["quantity_unchanged", "limit_reached", "price_changed"]),
+      authorization: "quantity_and_price_policy"
+    }),
+    [COMPONENT_PATTERN.DATE_INPUT]: Object.freeze({
+      allowedOperations: Object.freeze(["type", "select", "open", "choose"]),
+      successEvidence: Object.freeze(["canonical_date", "all_components_committed", "validation_clear"]),
+      failureEvidence: Object.freeze(["date_parse_failed", "component_incomplete", "validation_appeared"]),
+      authorization: "profile_fact"
+    }),
+    [COMPONENT_PATTERN.MODAL_SURFACE]: Object.freeze({
+      allowedOperations: Object.freeze(["open", "choose", "activate", "dismiss"]),
+      successEvidence: Object.freeze(["surface_opened", "surface_dismissed", "owned_child_progress"]),
+      failureEvidence: Object.freeze(["surface_unchanged", "ownership_lost"]),
+      authorization: "child_action_policy"
+    }),
+    [COMPONENT_PATTERN.REPEATED_INSTANCE]: Object.freeze({
+      allowedOperations: Object.freeze(["type", "select", "open", "choose", "activate"]),
+      successEvidence: Object.freeze(["instance_owned_value", "instance_requirement_settled"]),
+      failureEvidence: Object.freeze(["wrong_instance_changed", "validation_appeared"]),
+      authorization: "profile_fact_for_exact_instance"
+    }),
+    [COMPONENT_PATTERN.ANCILLARY_PRODUCT_CARD]: Object.freeze({
+      allowedOperations: Object.freeze(["open", "choose", "activate", "dismiss"]),
+      successEvidence: Object.freeze(["exact_disposition", "price_reconciled", "selection_owned"]),
+      failureEvidence: Object.freeze(["unrequested_paid_selection", "price_changed", "selection_unchanged"]),
+      authorization: "commerce_policy"
+    }),
+    [COMPONENT_PATTERN.LEGAL_ATTESTATION]: Object.freeze({
+      allowedOperations: Object.freeze(["choose", "activate", "keyboard"]),
+      successEvidence: Object.freeze(["exact_selection", "validation_clear"]),
+      failureEvidence: Object.freeze(["selection_unchanged", "validation_appeared"]),
+      authorization: "typed_legal_policy"
+    }),
+    [COMPONENT_PATTERN.PAYMENT_ENTRY]: Object.freeze({
+      allowedOperations: Object.freeze(["open", "choose"]),
+      successEvidence: Object.freeze(["hosted_widget_ready", "card_credential_set_visible"]),
+      failureEvidence: Object.freeze(["widget_loading", "widget_unavailable"]),
+      authorization: "terminal_detection_only"
+    })
   });
   const SEMANTIC_EFFECT = Object.freeze({
     SET_FIELD_VALUE: "set_field_value",
@@ -84,6 +172,128 @@
       [SEMANTIC_EFFECT.RANDOM_ASSIGNMENT]: [SEMANTIC_EFFECT.SELECT_FREE_OPTION]
     };
     return (compatible[desired] || []).includes(observed);
+  }
+
+  function compileActionOutcome(input = {}) {
+    const introducedValidation = Array.isArray(input.introducedValidation)
+      ? input.introducedValidation.map((issue) => cloneSerializable(issue))
+      : [];
+    const candidateOwnerControlIds = [...new Set([
+      ...(Array.isArray(input.candidateOwnerControlIds) ? input.candidateOwnerControlIds : []),
+      ...introducedValidation.map((issue) => issue?.controlId)
+    ].map((value) => String(value || "").trim()).filter(Boolean))];
+    const directStatus = Object.values(ACTION_OUTCOME).includes(input.status) ? input.status : "";
+    const legacy = String(input.legacyStatus || (!directStatus ? input.status : "") || "").toLowerCase();
+    let status = ACTION_OUTCOME.NO_EFFECT;
+    if (directStatus) {
+      status = directStatus;
+    } else if (input.destinationLoading === true || ["destination_loading", "waiting_for_destination"].includes(legacy)) {
+      status = ACTION_OUTCOME.DESTINATION_LOADING;
+    } else if (input.unsafe === true || ["unsafe", "blocked"].includes(legacy) && input.revealedBlocker !== true) {
+      status = ACTION_OUTCOME.UNSAFE_CHANGE;
+    } else if (input.revealedBlocker === true || introducedValidation.length > 0) {
+      status = ACTION_OUTCOME.REVEALED_BLOCKER;
+    } else if (input.satisfied === true && introducedValidation.length === 0) {
+      status = ACTION_OUTCOME.SATISFIED;
+    } else if (input.satisfied === true || legacy === "achieved") {
+      status = ACTION_OUTCOME.SATISFIED;
+    } else if (input.progressed === true || legacy === "progressed") {
+      status = ACTION_OUTCOME.PROGRESSED;
+    }
+    return Object.freeze({
+      contractVersion: "action-outcome/v1",
+      status,
+      causedByActionId: String(input.causedByActionId || input.actionId || "").trim(),
+      originalSuccessContract: cloneSerializable(input.originalSuccessContract || null),
+      introducedValidation: Object.freeze(introducedValidation),
+      candidateOwnerControlIds: Object.freeze(candidateOwnerControlIds),
+      changes: Object.freeze({
+        surfaceChanged: input.surfaceChanged === true,
+        urlChanged: input.urlChanged === true,
+        progressChanged: input.progressChanged === true,
+        priceChanged: input.priceChanged === true,
+        transactionChanged: input.transactionChanged === true
+      }),
+      // An action instance is single-use. PROGRESSED/SATISFIED rebuild from
+      // fresh state; blocker/no-effect/unsafe outcomes must choose a distinct
+      // resolution. Loading is the only state that can await the destination.
+      repeatProhibited: status !== ACTION_OUTCOME.DESTINATION_LOADING
+    });
+  }
+
+  function componentPatternFor(control = {}, context = {}) {
+    const evidence = normalizedText([
+      control.semantic,
+      control.fieldType,
+      control.physicalEffect,
+      control.role,
+      control.kind,
+      control.inputType,
+      control.label,
+      control.autocomplete
+    ].filter(Boolean).join(" ")).toLowerCase();
+    const nativeSelect = String(control.kind || control.tagName || control.inputType || "").toLowerCase() === "select"
+      && Boolean(control.operations?.select || control.capabilities?.includes?.("select"));
+    if (/card_number|card_expiry|card_security_code|cardholder|cc-number|cc-exp|cc-csc|payment_entry/.test(evidence)) {
+      return COMPONENT_PATTERN.PAYMENT_ENTRY;
+    }
+    if (/legal_acceptance|accept_legal|terms_accept|attestation|accept_terms/.test(evidence)
+      || (/checkbox/.test(evidence) && isLegalAcceptanceText(evidence))) {
+      return COMPONENT_PATTERN.LEGAL_ATTESTATION;
+    }
+    if (/date|birth|expiry|\bday\b|\bmonth\b|\byear\b/.test(evidence)) return COMPONENT_PATTERN.DATE_INPUT;
+    if (/stepper|quantity|increment|decrement|counter/.test(evidence)) return COMPONENT_PATTERN.QUANTITY_STEPPER;
+    if (nativeSelect) return COMPONENT_PATTERN.NATIVE_INPUT_SELECT;
+    if (/combobox|listbox|editable_combobox|autocomplete/.test(evidence)) return COMPONENT_PATTERN.CUSTOM_COMBOBOX_LISTBOX;
+    if (/radio|checkbox|switch|choice/.test(evidence)) return COMPONENT_PATTERN.RADIO_CHECKBOX_CHOICE;
+    if (/select_paid|paid_extra|ancillary|insurance|baggage|seat|bundle|fare_family/.test(evidence)) {
+      return COMPONENT_PATTERN.ANCILLARY_PRODUCT_CARD;
+    }
+    if (control.passengerId || control.travelerId || control.segmentId || control.repeatedInstance) {
+      return COMPONENT_PATTERN.REPEATED_INSTANCE;
+    }
+    if ([control.surfaceType, context.surfaceType].some((value) => /modal|dialog|drawer|sheet/.test(String(value || "").toLowerCase()))) {
+      return COMPONENT_PATTERN.MODAL_SURFACE;
+    }
+    return COMPONENT_PATTERN.NATIVE_INPUT_SELECT;
+  }
+
+  function componentBehaviorFor(controlOrPattern = {}, context = {}) {
+    const pattern = typeof controlOrPattern === "string"
+      ? controlOrPattern
+      : componentPatternFor(controlOrPattern, context);
+    return Object.freeze({
+      pattern,
+      ...(COMPONENT_BEHAVIOR_REGISTRY[pattern]
+        || COMPONENT_BEHAVIOR_REGISTRY[COMPONENT_PATTERN.NATIVE_INPUT_SELECT])
+    });
+  }
+
+  function rawEvidenceChannels(control = {}) {
+    const state = control.state || control.controlState || {};
+    return Object.freeze({
+      name: String(control.name || ""),
+      label: String(control.label || control.accessibleName || ""),
+      heading: String(control.heading || control.sectionHeading || ""),
+      section: Object.freeze({
+        id: String(control.sectionId || ""),
+        type: String(control.sectionType || ""),
+        label: String(control.sectionLabel || "")
+      }),
+      validity: Object.freeze({
+        required: control.required === true || state.required === true,
+        invalid: control.invalid === true || state.invalid === true,
+        validationMessage: String(control.validationMessage || state.validationMessage || "")
+      }),
+      relationships: cloneSerializable({
+        decisionGroupId: control.decisionGroupId || "",
+        logicalFieldId: control.logicalFieldId || "",
+        stateElementId: control.stateElementId || "",
+        preferredActivationElementId: control.preferredActivationElementId || "",
+        semanticOwnership: control.semanticOwnership || null,
+        validationOwnership: control.validationOwnership || null
+      })
+    });
   }
 
   const NON_COMMERCE_EFFECT_ROLES = Object.freeze(new Set([
@@ -203,7 +413,15 @@
     email: ["email", "email_address", "e_mail"],
     confirm_email: ["confirm_email", "email_confirmation", "repeat_email", "confirm_email_address"],
     phone: ["phone", "phone_number", "mobile", "mobile_number", "telephone", "tel"],
-    phone_country_code: ["phone_country_code", "country_dial_code", "dial_code", "calling_code", "country_calling_code"],
+    phone_country_code: [
+      "phone_country_code",
+      "phone_country",
+      "phonecountry",
+      "country_dial_code",
+      "dial_code",
+      "calling_code",
+      "country_calling_code"
+    ],
     date_of_birth: ["date_of_birth", "birth_date", "birthdate", "dob", "bday"],
     age_at_departure: ["age_at_departure", "travel_age", "departure_age", "age_on_departure", "age_at_time_of_travel"],
     place_of_birth: ["place_of_birth", "birth_place", "birth_city"],
@@ -214,7 +432,7 @@
     document_number: ["document_number", "travel_document_number", "identity_document_number"],
     issuing_country: ["issuing_country", "document_issuing_country", "passport_issuing_country"],
     document_issue_date: ["document_issue_date", "passport_issue_date", "date_of_issue", "issue_date"],
-    address_line1: ["address_line1", "address1", "street_address", "billing_address", "billing_address_line1"],
+    address_line1: ["address_line1", "address1", "address", "street_address", "billing_address", "billing_address_line1"],
     address_line2: ["address_line2", "address2", "billing_address_line2"],
     city: ["city", "address_city", "billing_city", "locality"],
     state: ["state", "province", "region", "address_state", "billing_state"],
@@ -293,7 +511,7 @@
     if (PROFILE_FIELD_ALIASES.has(normalized)) return PROFILE_FIELD_ALIASES.get(normalized);
     const withoutSubject = normalized
       .replace(/^(?:passengers?|travell?ers?|adults?)_\d+_/, "")
-      .replace(/^(?:contact|profile)_/, "");
+      .replace(/^(?:contact|profile|customer)_/, "");
     if (PROFILE_FIELD_ALIASES.has(withoutSubject)) return PROFILE_FIELD_ALIASES.get(withoutSubject);
     if (/(?:^|_)(?:birth|dob|bday)_(?:day|month|year)(?:_|$)/.test(normalized)) return "date_of_birth";
     if (/(?:passport|document|id)_(?:expiry|expiration)_(?:day|month|year)/.test(normalized)) {
@@ -322,6 +540,15 @@
   function isLegalAcceptanceText(value = "") {
     const visible = normalizedText(value).toLowerCase();
     if (!visible) return false;
+    const key = normalizedKey(value);
+    // Raw owner names are an independent evidence channel. Checkout systems
+    // frequently expose names such as `termsAndCondition` while the associated
+    // human-readable label is long enough to be compacted before the words
+    // "terms" or "conditions" are retained. Do not make the legal consequence
+    // depend on that lossy display projection.
+    if (/(?:^|_)(?:legal_acceptance|terms?_?and_?conditions?|terms?_?conditions?|termsandconditions?|termsconditionsform)(?:_|$)/.test(key)) {
+      return true;
+    }
     return /\b(?:accept|agree|confirm|acknowledge|read and accepted|aged?\s+18)\b/.test(visible)
       && /\b(?:terms|conditions|fare rules|booking terms|cancellation terms|privacy|dangerous goods|legal)\b/.test(visible);
   }
@@ -334,7 +561,7 @@
 
   function isPaymentCommitText(value = "") {
     const visible = normalizedText(value).toLowerCase();
-    return /\b(?:pay(?:\s+now|\s+securely|\s+by\s+(?:card|bank|wallet)|\s+[\d.,])|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase|place\s+order)\b/.test(visible);
+    return /\b(?:pay(?:\s+now|\s+securely|\s+by\s+(?:card|bank|wallet)|\s+[\d.,]+)|confirm\s+and\s+pay|submit\s+payment|complete\s+purchase|place\s+order)\b/.test(visible);
   }
 
   function terminalSignalState(present, negativeEvidence = false) {
@@ -342,24 +569,38 @@
     return negativeEvidence === true ? "absent" : "unknown";
   }
 
-  // Payment controls are terminal evidence, never executable capabilities.
-  // This compiler is shared by browser perception, readiness and TaskState so
-  // those layers cannot independently reinterpret payment-looking page copy.
+  function completeCardCredentialSet(kinds = []) {
+    const observed = new Set(kinds || []);
+    return ["card_number", "card_expiry", "card_security_code"]
+      .every((kind) => observed.has(kind));
+  }
+
+  // The active milestone ends at an actual card-credential entry capability,
+  // never at a payment label, progress step, method selector, review page or
+  // Pay-looking control. This compiler is shared by browser perception and
+  // TaskState so prose can remain diagnostic without becoming stop authority.
   function compileTerminalEvidence(input = {}) {
     const page = input?.page && typeof input.page === "object" ? input.page : input;
     const supplied = page?.terminalEvidence;
     if (supplied?.contractVersion === TERMINAL_EVIDENCE_VERSION) {
       const signals = supplied.signals || {};
       const signalCount = Object.values(signals).filter(Boolean).length;
-      const boundaryObserved = supplied.boundaryObserved === true || supplied.verified === true;
+      const paymentCredentialKinds = [...(supplied.paymentCredentialKinds || [])];
+      const hostedCardEntryPresent = supplied.hostedCardEntryPresent === true;
+      const cardCredentialEntryObserved = completeCardCredentialSet(paymentCredentialKinds)
+        || hostedCardEntryPresent;
+      const boundaryObserved = cardCredentialEntryObserved;
       return Object.freeze({
         ...cloneSerializable(supplied),
         contractVersion: TERMINAL_EVIDENCE_VERSION,
-        stage: boundaryObserved ? "payment_review" : "unknown",
+        stage: boundaryObserved ? "card_credential_entry" : "unknown",
         signals: Object.freeze({ ...signals }),
         signalCount,
         boundaryObserved,
         verified: boundaryObserved,
+        cardCredentialEntryObserved,
+        hostedCardEntryPresent,
+        paymentCredentialKinds: Object.freeze(paymentCredentialKinds),
         capabilities: Object.freeze({ paymentActionsAllowed: false })
       });
     }
@@ -378,7 +619,7 @@
     const activeProgress = normalizedText(
       structural.activeProgressText || input?.activeProgressText || ""
     ).toLowerCase();
-    const route = /(?:^|[\/#?&_-])payments?(?:[\/#?&=_-]|$)/.test(url);
+    const route = /(?:^|[\/#?&_-])payments?(?:form|methods?|options?)?(?:[\/#?&=_-]|$)/.test(url);
     const progress = structural.activePaymentProgress === true || /\bpayment\b|\bpay\b/.test(activeProgress);
     const nativeCredentialKinds = structural.paymentCredentialKinds || [];
     const ownedCredentialKinds = [
@@ -399,11 +640,9 @@
     if (visibleFallbackAllowed) {
       paymentCredentialKindsFromText(visible).forEach((kind) => credentialKinds.add(kind));
     }
-    const form = structural.paymentFormPresent === true
-      || structural.paymentOwnerPresent === true
-      || structural.hostedPaymentWidgetPresent === true
-      || Number(structural.paymentCredentialCount || 0) >= 2
-      || credentialKinds.size >= 2;
+    const completeCredentials = completeCardCredentialSet(credentialKinds);
+    const hostedCardEntryPresent = structural.hostedCardEntryPresent === true;
+    const form = completeCredentials || hostedCardEntryPresent;
     const method = structural.paymentMethodPresent === true
       || /\bpayment\s+(?:method|option)\b|\bdebit\s*card\b|\bcredit\s*card\b/.test(visible);
     const commit = structural.payControlPresent === true || isPaymentCommitText(visible);
@@ -414,10 +653,9 @@
         && /\b(?:departure|return|itinerary|travel\s+details|your\s+order)\b/.test(visible));
     const heading = structural.paymentHeadingPresent === true
       || /\b(?:payment\s+details|choose\s+payment\s+method|pay\s+securely|overview\s*(?:&|and)\s*payment)\b/.test(visible);
-    // Some payment pages hydrate methods/credentials only after the traveler
-    // chooses a currency. A visible, owned itinerary + exact total + explicit
-    // payment/currency prompt is already the irreversible boundary we promise
-    // to stop at. URL or generic payment prose alone can never create it.
+    // Progressive entry and method selection are useful navigation evidence,
+    // but remain unfinished until card-number, expiry and security-code entry
+    // is actually available on the current owned surface.
     const entry = structural.progressivePaymentEntryPresent === true;
     const signals = Object.freeze({ route, progress, form, method, commit, reviewConfirm, legal, review, heading, entry });
     const signalStates = Object.freeze({
@@ -433,36 +671,17 @@
       entry: terminalSignalState(entry)
     });
     const signalCount = Object.values(signals).filter(Boolean).length;
-    const stageAnchor = route || progress || heading;
-    const boundaryObserved = Boolean(
-      (form && (stageAnchor || method || commit))
-      || (stageAnchor && method && commit)
-      || (route && progress && (method || commit || review))
-      || ((route || progress) && entry)
-      // Some review/payment pages reveal credential controls progressively.
-      // A payment heading plus owned order review plus at least one exact
-      // credential kind is a typed terminal boundary; generic payment copy or
-      // a lone card field without review ownership still cannot qualify.
-      || (heading && review && credentialKinds.size >= 1)
-      // A final review can intentionally keep payment credentials hidden
-      // until the user accepts terms. Review ownership + legal acceptance +
-      // an exact payment commit control is already the boundary at which Fly
-      // must stop; requiring hydrated card fields here caused the agent to
-      // reinterpret final checkout as an earlier traveler/seat page.
-      || (review && legal && commit)
-      // A review page can label the irreversible boundary "Confirm" instead
-      // of "Pay". Only admit that otherwise ambiguous control when the page
-      // also proves active payment progress, exact review ownership and legal
-      // acceptance. The control remains evidence-only and is never executed.
-      || (progress && review && legal && reviewConfirm)
-    );
+    const cardCredentialEntryObserved = completeCredentials || hostedCardEntryPresent;
+    const boundaryObserved = cardCredentialEntryObserved;
     return Object.freeze({
       contractVersion: TERMINAL_EVIDENCE_VERSION,
-      stage: boundaryObserved ? "payment_review" : "unknown",
+      stage: boundaryObserved ? "card_credential_entry" : "unknown",
       signals,
       signalCount,
       boundaryObserved,
       verified: boundaryObserved,
+      cardCredentialEntryObserved,
+      hostedCardEntryPresent,
       evidenceOnly: true,
       paymentCredentialKinds: Object.freeze([...credentialKinds]),
       signalStates,
@@ -1521,6 +1740,9 @@
     );
     return {
       contractVersion: CONTRACT_VERSION,
+      componentPattern: componentPatternFor(control, context),
+      componentBehavior: componentBehaviorFor(control, context),
+      rawEvidenceChannels: rawEvidenceChannels(control),
       logicalIdentity,
       componentIdentity: text(
         control.componentIdentity
@@ -1649,6 +1871,8 @@
       // same proof graph a second and third time.
       componentContract: {
         contractVersion: componentIdentityContract.contractVersion,
+        componentPattern: componentIdentityContract.componentPattern,
+        componentBehavior: componentIdentityContract.componentBehavior,
         logicalIdentity: componentIdentityContract.logicalIdentity,
         componentIdentity: componentIdentityContract.componentIdentity,
         componentRole: componentIdentityContract.componentRole,
@@ -1656,6 +1880,7 @@
         currentCanonicalValue: componentIdentityContract.currentCanonicalValue,
         desiredCanonicalValue: componentIdentityContract.desiredCanonicalValue
       },
+      rawEvidenceChannels: componentContract.rawEvidenceChannels,
       operations: compactOperations,
       observedOptions,
       currentCanonicalValue: componentContract.currentCanonicalValue,
@@ -1683,6 +1908,8 @@
       policyRequirementId: text(requirement.policyRequirementId || "", 320)
     };
     const normalizedComponent = {
+      componentPattern: text(component.componentPattern, 100),
+      componentBehavior: cloneSerializable(component.componentBehavior || null),
       logicalFieldId: text(component.logicalFieldId, 320),
       componentIdentity: text(
         component.componentIdentity || component.stableIdentity || component.id,
@@ -2143,6 +2370,9 @@
     EXECUTION_LANE,
     DECISION_KIND,
     SEMANTIC_READINESS,
+    ACTION_OUTCOME,
+    COMPONENT_PATTERN,
+    COMPONENT_BEHAVIOR_REGISTRY,
     SEMANTIC_EFFECT,
     DECISION_AVAILABILITY,
     PROFILE_FIELD_ALIAS_GROUPS,
@@ -2150,6 +2380,10 @@
     PROFILE_FIELD_TYPES,
     canonicalSemanticEffect,
     semanticEffectSatisfies,
+    compileActionOutcome,
+    componentPatternFor,
+    componentBehaviorFor,
+    rawEvidenceChannels,
     isPaidCommerceOption,
     classifySelectedCommerceTruth,
     isGenuineSelectedPaidItem,
