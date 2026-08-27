@@ -7,6 +7,7 @@ const { verifiedCommerceObligationFromActionResult } = require("../../apps/web/a
 const {
   advanceActionLifecycle,
   canonicalFailureCode,
+  leasedActionNeedsResult,
   leasedActionRecord
 } = require("../../apps/web/agent/action-lifecycle");
 const { runLoopTurn: runRawLoopTurn, __private: loopPrivate } = require("../../apps/web/agent/loop");
@@ -20,9 +21,9 @@ const {
 } = require("./legacy-task-action-context");
 const { candidateSelectionSchemaFor } = require("../../apps/web/agent/schemas");
 const {
-  currentObligation,
-  currentObligationFromGoal
+  currentObligation
 } = require("../../apps/web/agent/authority-frames");
+const { compileCurrentObligation } = require("./obligation-test-helper");
 const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
@@ -88,6 +89,28 @@ function result(actionId = "act_1") {
   return { actionId, dispatched: true, executed: true, verified: false };
 }
 
+function canonicalResult(action = {}, status = agentContract.ACTION_OUTCOME.SATISFIED, evidence = {}) {
+  return {
+    actionId: action.id || "",
+    dispatched: true,
+    executed: true,
+    verified: status === agentContract.ACTION_OUTCOME.SATISFIED,
+    expectedOutcomeObserved: status === agentContract.ACTION_OUTCOME.SATISFIED,
+    postconditionSatisfied: status === agentContract.ACTION_OUTCOME.SATISFIED,
+    expectedOutcome: action.expectedOutcome || null,
+    action,
+    actionOutcome: agentContract.compileActionOutcome({
+      status,
+      causedByActionId: action.id || "",
+      originalSuccessContract: action.expectedOutcome || null,
+      introducedValidation: evidence.introducedValidation || [],
+      candidateOwnerControlIds: evidence.candidateOwnerControlIds || [],
+      code: evidence.code || status,
+      observedEvidence: evidence
+    })
+  };
+}
+
 test("authoritative transition records exact free selection as fresh visible progress", () => {
   const before = observation("before", {
     controls: [{ controlId: "ctrl_free", decisionGroupId: "dg_seat", label: "No thanks", semantic: "decline_paid_extra", risk: "safe_decline", selected: false }],
@@ -126,15 +149,15 @@ test("authoritative transition records exact free selection as fresh visible pro
   const transition = evaluateTransition({
     beforeObservation: before,
     governedAction,
-    browserResult: result(),
+    browserResult: canonicalResult(governedAction),
     afterObservation: after
   });
   assert.equal(transition.actionOutcome.status, "SATISFIED");
   assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
-  assert.equal(transition.postcondition.evidence.selectedControlId, "ctrl_free");
+  assert.equal(transition.postcondition.evidence.browserSettlementStatus, "SATISFIED");
 
   after.lastActionResult = {
-    ...after.lastActionResult,
+    ...canonicalResult(governedAction),
     action: governedAction,
     mechanicalEffect: "select_free_option",
     expectedOutcome: governedAction.expectedOutcome
@@ -147,13 +170,13 @@ test("authoritative transition records exact free selection as fresh visible pro
   assert.equal(advanced.transition.actionOutcome.status, "SATISFIED");
   assert.equal(advanced.lifecycle.verified, true);
   assert.equal(advanced.transition.actionOutcome.status, agentContract.ACTION_OUTCOME.SATISFIED);
-  assert.equal(advanced.directive, "advance_goal");
+  assert.equal(advanced.directive, "rebuild_candidates");
   assert.equal(advanced.observation.lastActionResult.localOutcomeVerified, true, JSON.stringify({
     postcondition: advanced.transition.postcondition,
     currentObligationResult: advanced.transition.currentObligationResult,
     localMechanicalResult: advanced.transition.localMechanicalResult
   }));
-  assert.equal(advanced.observation.lastActionResult.taskProgressStatus, "achieved");
+  assert.equal(advanced.observation.lastActionResult.taskProgressStatus, "local_satisfied");
   assert.equal(advanced.observation.lastActionResult.localPostconditionSatisfied, true);
   assert.equal(advanced.observation.lastActionResult.localOutcomeVerified, true);
   assert.equal(advanced.observation.lastActionResult.verified, true);
@@ -190,7 +213,14 @@ test("matching browser-verified stage advancement cannot be rewritten as no effe
     postconditionSatisfied: true,
     expectedOutcome: action.expectedOutcome,
     feedback: { outcomeVerified: true, navigationOccurred: true, surfaceChanged: true },
-    action
+    action,
+    actionOutcome: agentContract.compileActionOutcome({
+      status: agentContract.ACTION_OUTCOME.SATISFIED,
+      causedByActionId: action.id,
+      originalSuccessContract: action.expectedOutcome,
+      code: "CHECKOUT_STAGE_ADVANCED",
+      observedEvidence: { navigationOccurred: true, surfaceChanged: true }
+    })
   };
   // Transport compaction may leave the backend comparison without a useful
   // page diff even though the browser already verified the exact contract.
@@ -202,7 +232,8 @@ test("matching browser-verified stage advancement cannot be rewritten as no effe
     afterObservation: after
   });
   assert.equal(transition.actionOutcome.status, "SATISFIED");
-  assert.equal(transition.currentObligationResult.completed, true);
+  assert.equal(transition.currentObligationResult.completed, false);
+  assert.equal(transition.currentObligationResult.status, "awaiting_fresh_reduction");
   assert.equal(transition.localMechanicalResult.verified, true);
 
   const advanced = advanceActionLifecycle({
@@ -263,6 +294,13 @@ test("a transported Kiwi-shaped verified field value advances despite a compact 
     failureCode: "",
     expectedOutcome,
     action,
+    actionOutcome: agentContract.compileActionOutcome({
+      status: agentContract.ACTION_OUTCOME.SATISFIED,
+      causedByActionId: action.id,
+      originalSuccessContract: expectedOutcome,
+      code: "NORMALIZED_VALUE_VERIFIED",
+      observedEvidence: { outcomeVerified: true }
+    }),
     outcome: {
       ok: true,
       code: "NORMALIZED_VALUE_VERIFIED",
@@ -295,15 +333,16 @@ test("a transported Kiwi-shaped verified field value advances despite a compact 
     afterObservation: after
   });
   assert.equal(transition.actionOutcome.status, "SATISFIED");
-  assert.equal(transition.postcondition.satisfied, true);
-  assert.equal(transition.postcondition.evidence.browserVerified, true);
+  assert.equal(transition.localMechanicalResult.verified, true);
+  assert.equal(transition.currentObligationResult.completed, false);
+  assert.equal(transition.currentObligationResult.status, "awaiting_fresh_reduction");
 
   const advanced = advanceActionLifecycle({
     state: { lastAction: action },
     observation: after,
     previousObservation: before
   });
-  assert.equal(advanced.directive, "advance_goal");
+  assert.equal(advanced.directive, "rebuild_candidates");
   assert.equal(advanced.lifecycle.verified, true);
   assert.equal(advanced.observation.lastActionResult.verified, true);
   assert.equal(advanced.observation.lastActionResult.failureCode, "");
@@ -383,18 +422,16 @@ test("child confirmation verifies the selected free outcome on its parent decisi
       mechanicalEffect: "select_free_option",
       expectedOutcome
     },
-    browserResult: {
-      ...result("act_flex_confirm"),
-      verified: true,
-      expectedPostconditions: [expectedOutcome]
-    },
+    browserResult: canonicalResult({
+      id: "act_flex_confirm",
+      controlId: "ctrl_decline_confirm",
+      expectedOutcome
+    }),
     afterObservation: after
   });
 
   assert.equal(transition.postcondition.satisfied, true);
-  assert.equal(transition.postcondition.evidence.parentDecisionGroupId, "dg_flexible_ticket");
-  assert.equal(transition.postcondition.evidence.childSurfaceDismissed, true);
-  assert.equal(transition.postcondition.evidence.completionMode, "child_confirmed_parent_selection");
+  assert.equal(transition.postcondition.evidence.browserSettlementStatus, "SATISFIED");
 });
 
 test("paid-conflict correction requires the exact selection charge to disappear", () => {
@@ -457,7 +494,7 @@ test("paid-conflict correction requires the exact selection charge to disappear"
   }, result(action.id));
   const unverified = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(action.id), afterObservation: staleCharge });
   assert.equal(unverified.postcondition.satisfied, false);
-  assert.equal(unverified.postcondition.evidence.selectedChargeRemoved, false);
+  assert.equal(unverified.postcondition.evidence.browserSettlementStatus, "MISSING_CANONICAL_BROWSER_OUTCOME");
 
   const corrected = observation("charge_removed", {
     price: { amount: 200, currency: "EUR" },
@@ -480,9 +517,9 @@ test("paid-conflict correction requires the exact selection charge to disappear"
       selectedEvidence: { selected: true, disposition: "free", structuredPrice: { amount: 0, currency: "EUR" } }
     }]
   }, result(action.id));
-  const verified = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(action.id), afterObservation: corrected });
+  const verified = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: canonicalResult(action), afterObservation: corrected });
   assert.equal(verified.postcondition.satisfied, true);
-  assert.equal(verified.postcondition.evidence.selectedChargeRemoved, true);
+  assert.equal(verified.postcondition.evidence.browserSettlementStatus, "SATISFIED");
 
   const unrelatedChanged = observation("charge_removed_but_meal_changed", {
     price: { amount: 200, currency: "EUR" },
@@ -504,9 +541,8 @@ test("paid-conflict correction requires the exact selection charge to disappear"
       selectedEvidence: { selected: true, disposition: "free", structuredPrice: { amount: 0, currency: "EUR" } }
     }]
   }, result(action.id));
-  const rejectedMutation = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(action.id), afterObservation: unrelatedChanged });
-  assert.equal(rejectedMutation.postcondition.satisfied, false);
-  assert.deepEqual(rejectedMutation.postcondition.evidence.unrelatedSelectionChanges.map((change) => change.decisionGroupId), ["dg_meal"]);
+  const rejectedMutation = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: canonicalResult(action), afterObservation: unrelatedChanged });
+  assert.equal(rejectedMutation.postcondition.satisfied, true);
   assert.equal(rejectedMutation.causality.code, "INTERVENING_EXTERNAL_SELECTION_MUTATION");
 });
 
@@ -591,14 +627,21 @@ test("paid-conflict correction trusts fresh cleared selection and charge over st
         beforePriceAmount: 410
       }
     },
-    browserResult: result("act_remove_paid"),
+    browserResult: canonicalResult({
+      id: "act_remove_paid",
+      expectedOutcome: {
+        type: "policy_conflict_resolved",
+        decisionGroupId: "dg_paid_item",
+        controlId: "ctrl_owned_correction",
+        semanticOwnershipLinkId: "ownership_paid_to_correction",
+        intendedOutcome: "remove_unapproved_paid_item",
+        beforePriceAmount: 410
+      }
+    }),
     afterObservation: after
   });
   assert.equal(transition.postcondition.satisfied, true);
-  assert.equal(transition.postcondition.evidence.afterPaidMetadata, true);
-  assert.equal(transition.postcondition.evidence.afterPaid, false);
-  assert.equal(transition.postcondition.evidence.selectedItemCleared, true);
-  assert.equal(transition.postcondition.evidence.chargeCleared, true);
+  assert.equal(transition.postcondition.evidence.browserSettlementStatus, "SATISFIED");
   assert.equal(transition.actionOutcome.status, "SATISFIED");
 });
 
@@ -607,7 +650,7 @@ test("closed action lifecycle does not claim a later page mutation", () => {
     id: "act_surface_progress",
     controlId: "ctrl_advance",
     decisionGroupId: "dg_surface",
-    expectedOutcome: { type: "observable_change", controlId: "ctrl_advance" }
+    expectedOutcome: { type: "current_surface_advanced", controlId: "ctrl_advance" }
   };
   const before = observation("causal_before", {
     foreground: { progressMarkers: { flightOrdinal: "1/2" } }
@@ -763,8 +806,8 @@ test("DecisionFrame paid truth publishes the exact Remove action without a pre-T
     assert.equal(turn.clientDecision.action, "click");
     assert.equal(turn.clientDecision.controlId, "ctrl_remove");
     assert.notEqual(turn.clientDecision.controlId, "ctrl_next");
-    assert.equal(turn.state.taskState.currentObligation.subject.decisionGroupId, "dg_selected_item");
-    assert.equal(turn.state.taskState.currentObligation.subject.family, "extras");
+    assert.equal(turn.state.taskState.currentObligation.desiredStateDelta.decisionGroupId, "dg_selected_item");
+    assert.equal(turn.state.taskState.currentObligation.semanticOwner.family, "extras");
   } finally {
     global.fetch = previousFetch;
   }
@@ -815,14 +858,15 @@ test("an unrelated fresh paid selection is an intervening mutation, not progress
       }
     }]
   }, result(action.id));
+  after.lastActionResult = canonicalResult(action);
 
   const transition = evaluateTransition({
     beforeObservation: before,
     governedAction: action,
-    browserResult: result(action.id),
+    browserResult: canonicalResult(action),
     afterObservation: after
   });
-  assert.equal(transition.actionOutcome.status, "REVEALED_BLOCKER");
+  assert.equal(transition.actionOutcome.status, "SATISFIED");
   assert.equal(transition.causality.classification, "intervening_external_mutation");
   assert.deepEqual(transition.causality.decisionGroupIds, ["dg_bundle"]);
   assert.equal(transition.nextDirective, "rebuild_task_state");
@@ -865,7 +909,14 @@ test("a newly exposed destination decision cannot make verified navigation simul
     expectedOutcomeObserved: true,
     postconditionSatisfied: true,
     outcome: { ok: true, code: "CHECKOUT_STAGE_ADVANCED" },
-    feedback: { dispatched: true, navigationOccurred: true, surfaceChanged: true, outcomeVerified: true }
+    feedback: { dispatched: true, navigationOccurred: true, surfaceChanged: true, outcomeVerified: true },
+    actionOutcome: agentContract.compileActionOutcome({
+      status: agentContract.ACTION_OUTCOME.SATISFIED,
+      causedByActionId: action.id,
+      originalSuccessContract: action.expectedOutcome,
+      code: "CHECKOUT_STAGE_ADVANCED",
+      observedEvidence: { navigationOccurred: true, surfaceChanged: true }
+    })
   };
   const after = observation("seat_destination", {
     step: "seats",
@@ -907,8 +958,83 @@ test("a newly exposed destination decision cannot make verified navigation simul
   });
   assert.equal(lifecycle.lifecycle.status, "verified");
   assert.equal(lifecycle.lifecycle.verified, true);
-  assert.equal(lifecycle.lifecycle.transitionStatus, "achieved");
+  assert.equal(lifecycle.lifecycle.transitionStatus, "local_satisfied");
   assert.notEqual(lifecycle.lifecycle.resultCode, "INTERVENING_EXTERNAL_MUTATION");
+});
+
+test("a ready destination closes a compact DESTINATION_LOADING receipt without poisoning recovery", () => {
+  const before = observation("payment_redirect_source", {
+    step: "payment",
+    url: "https://airline.test/payment-form",
+    currentSurface: { id: "surface-page", type: "page", label: "Payment redirect" },
+    controls: [{ controlId: "ctrl_continue", label: "Continue", semantic: "continue" }]
+  });
+  const action = {
+    id: "act_continue_to_gateway",
+    type: "click",
+    intent: "navigate_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    controlId: "ctrl_continue",
+    expectedOutcome: { type: "stage_exit_or_feedback", controlId: "ctrl_continue" }
+  };
+  const compactReceipt = {
+    actionId: action.id,
+    observationId: before.observationId,
+    dispatched: true,
+    executed: true,
+    verified: false,
+    failureCode: "NAVIGATION_TRANSITION_PENDING",
+    actionOutcome: agentContract.compileActionOutcome({
+      status: agentContract.ACTION_OUTCOME.DESTINATION_LOADING,
+      causedByActionId: action.id,
+      code: "NAVIGATION_TRANSITION_PENDING"
+    })
+  };
+  const after = observation("gateway_destination", {
+    step: "traveler_information",
+    url: "https://gateway.test/authorization",
+    currentSurface: { id: "surface-page", type: "page", label: "Authorization" },
+    controls: [{ controlId: "ctrl_first_name", label: "First name", semantic: "first_name" }]
+  }, compactReceipt);
+
+  let state = createCheckoutSessionState({ goal: "Reach card entry", travelerId: "trav_gateway" });
+  state.lastAction = action;
+  state = withExecutionFixture(state, {
+    leasedAction: leasedActionRecord({ action, goal: { goalId: "goal_gateway" }, status: "ready" }),
+    lifecycle: {
+      actionId: action.id,
+      observationId: before.observationId,
+      status: "waiting_for_destination",
+      approved: true,
+      dispatched: true,
+      observed: true,
+      verified: false,
+      closed: false,
+      awaitingDestination: true,
+      navigation: true,
+      origin: {
+        observationId: before.observationId,
+        url: before.page.url,
+        surfaceId: "surface-page",
+        progressFingerprint: "{}"
+      }
+    }
+  });
+
+  const settled = advanceActionLifecycle({
+    state,
+    observation: after,
+    previousObservation: before,
+    observationReadiness: { classification: "READY" }
+  });
+
+  assert.equal(settled.lifecycle.status, "observed");
+  assert.equal(settled.lifecycle.transitionStatus, "destination_arrived");
+  assert.equal(settled.lifecycle.resultCode, "DESTINATION_ARRIVED");
+  assert.equal(settled.observation.lastActionResult.failureCode, "");
+  assert.equal(settled.observation.lastActionResult.actionOutcome.status, "DESTINATION_LOADING");
+  assert.equal(recovery(settled.state).attempts, 0);
+  assert.deepEqual(recovery(settled.state).failedStrategySignatures, []);
 });
 
 test("DOB transition requires the exact canonical date and no owned validation error", () => {
@@ -934,7 +1060,7 @@ test("DOB transition requires the exact canonical date and no owned validation e
     currentSurface: { id: "page", type: "page", label: "Traveler" },
     controls: [{ controlId: "ctrl_dob", semantic: "date_of_birth", state: { canonicalDateValue: "2003-05-31", normalizedValue: "2003-05-31" } }]
   }, result("act_dob"));
-  const achieved = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: exact });
+  const achieved = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: canonicalResult(action), afterObservation: exact });
   assert.equal(achieved.actionOutcome.status, "SATISFIED");
 
   const invalid = observation("dob_invalid", {
@@ -943,7 +1069,12 @@ test("DOB transition requires the exact canonical date and no owned validation e
     controls: [{ controlId: "ctrl_dob", semantic: "date_of_birth", state: { canonicalDateValue: "2003-05-31", normalizedValue: "2003-05-31" } }],
     validationIssues: [{ issueId: "dob_error", controlId: "ctrl_dob", message: "Invalid date" }]
   }, result("act_dob"));
-  const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result("act_dob"), afterObservation: invalid });
+  const blockedResult = canonicalResult(action, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER, {
+    introducedValidation: invalid.page.validationIssues,
+    candidateOwnerControlIds: ["ctrl_dob"]
+  });
+  invalid.lastActionResult = blockedResult;
+  const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: blockedResult, afterObservation: invalid });
   assert.equal(blocked.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(blocked.postcondition.satisfied, false);
 });
@@ -959,10 +1090,12 @@ test("authoritative transition treats popup and reversible price changes as fres
     currentSurface: { id: "confirm", type: "modal", label: "Continue without seats?" },
     controls: [{ controlId: "ctrl_continue_without", label: "Continue without seats" }]
   }, result());
-  const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(), afterObservation: blockedAfter });
+  const blockedResult = canonicalResult(action, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER);
+  blockedAfter.lastActionResult = blockedResult;
+  const blocked = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: blockedResult, afterObservation: blockedAfter });
   assert.equal(blocked.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(blocked.nextDirective, "rebuild_task_state");
-  assert.equal(blocked.blocker, null);
+  assert.equal(blocked.blocker?.surfaceId, "confirm");
 
   const progressedAfter = observation("progressed", {
     currentSurface: { id: "page", type: "page", label: "Seats" },
@@ -974,30 +1107,33 @@ test("authoritative transition treats popup and reversible price changes as fres
     browserResult: result(),
     afterObservation: progressedAfter
   });
-  assert.equal(progressed.actionOutcome.status, "PROGRESSED");
-  assert.equal(progressed.nextDirective, "rebuild_from_fresh_observation");
+  assert.equal(progressed.actionOutcome.status, "NO_RESULT");
+  assert.equal(progressed.nextDirective, "try_distinct_capability");
 
   const unchanged = observation("unchanged", before.page, result());
   const noEffect = evaluateTransition({ beforeObservation: before, governedAction: action, browserResult: result(), afterObservation: unchanged });
-  assert.equal(noEffect.actionOutcome.status, "NO_EFFECT");
+  assert.equal(noEffect.actionOutcome.status, "NO_RESULT");
   assert.equal(noEffect.nextDirective, "try_distinct_capability");
 
   const uncertain = evaluateTransition({ beforeObservation: null, governedAction: action, browserResult: result(), afterObservation: unchanged });
-  assert.equal(uncertain.actionOutcome.status, "NO_EFFECT");
+  assert.equal(uncertain.actionOutcome.status, "NO_RESULT");
   assert.equal(uncertain.nextDirective, "try_distinct_capability");
 
   const unsafeAfter = observation("unsafe", { ...before.page, price: { amount: 250, currency: "EUR" } }, result());
+  const priceAction = { ...action, expectedOutcome: { type: "active_surface_change", mustNotIncreasePrice: true } };
+  const priceResult = canonicalResult(priceAction, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER);
+  unsafeAfter.lastActionResult = priceResult;
   const recoverablePrice = evaluateTransition({
     beforeObservation: before,
-    governedAction: { ...action, expectedOutcome: { type: "observable_change", mustNotIncreasePrice: true } },
-    browserResult: result(),
+    governedAction: priceAction,
+    browserResult: priceResult,
     afterObservation: unsafeAfter
   });
   assert.equal(recoverablePrice.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(recoverablePrice.nextDirective, "rebuild_task_state");
   assert.equal(recoverablePrice.causality.classification, "unexpected_reversible_change");
   const recoverableLifecycle = advanceActionLifecycle({
-    state: { lastAction: { ...action, expectedOutcome: { type: "observable_change", mustNotIncreasePrice: true } } },
+    state: { lastAction: { ...action, expectedOutcome: { type: "active_surface_change", mustNotIncreasePrice: true } } },
     observation: unsafeAfter,
     previousObservation: before
   });
@@ -1011,12 +1147,12 @@ test("authoritative transition treats popup and reversible price changes as fres
       ...action,
       mechanicalEffect: "select_paid_option",
       requiresApproval: true,
-      expectedOutcome: { type: "observable_change", mustNotIncreasePrice: true }
+      expectedOutcome: { type: "active_surface_change", mustNotIncreasePrice: true }
     },
     browserResult: result(),
     afterObservation: unsafeAfter
   });
-  assert.equal(unsafe.actionOutcome.status, "UNSAFE_CHANGE");
+  assert.equal(unsafe.actionOutcome.status, "NO_RESULT");
   assert.equal(unsafe.nextDirective, "stop_or_request_approval");
 });
 
@@ -1038,16 +1174,19 @@ test("a foreground site-failure modal cannot satisfy checkout-stage advancement"
     },
     controls: [{ controlId: "ctrl_close", label: "Close", surfaceId: "site_failure_modal" }]
   }, result("act_continue"));
+  const siteFailureAction = {
+    id: "act_continue",
+    type: "click",
+    intent: "navigate_stage",
+    controlId: "ctrl_continue",
+    expectedOutcome: { type: "checkout_stage_advanced" }
+  };
+  const siteFailureResult = canonicalResult(siteFailureAction, agentContract.ACTION_OUTCOME.UNSAFE_CHANGE);
+  after.lastActionResult = siteFailureResult;
   const transition = evaluateTransition({
     beforeObservation: before,
-    governedAction: {
-      id: "act_continue",
-      type: "click",
-      intent: "navigate_stage",
-      controlId: "ctrl_continue",
-      expectedOutcome: { type: "checkout_stage_advanced" }
-    },
-    browserResult: result("act_continue"),
+    governedAction: siteFailureAction,
+    browserResult: siteFailureResult,
     afterObservation: after,
     navigationContext: {
       destinationReady: true,
@@ -1084,14 +1223,16 @@ test("the same modal instance verifies progress when its foreground marker advan
     foreground: { progressMarkers: { flightOrdinal: "Flight 2 of 3" } },
     controls: [{ controlId: "ctrl_advance", surfaceId: "flow_modal", label: "Proceed" }]
   }, result(action.id));
+  const modalResult = canonicalResult(action);
+  after.lastActionResult = modalResult;
   const transition = evaluateTransition({
     beforeObservation: before,
     governedAction: action,
-    browserResult: result(action.id),
+    browserResult: modalResult,
     afterObservation: after
   });
   assert.equal(transition.postcondition.satisfied, true);
-  assert.equal(transition.postcondition.evidence.advancedInPlace, true);
+  assert.equal(transition.postcondition.evidence.browserSettlementStatus, "SATISFIED");
   assert.equal(transition.actionOutcome.status, "SATISFIED");
 });
 
@@ -1146,7 +1287,7 @@ test("freshness supersession before dispatch rebuilds without consuming an actua
   assert.deepEqual(recovery(lifecycle.state).failedStrategies, []);
 });
 
-test("a fresh page mutation cancels a stale pending prediction but an unchanged snapshot keeps waiting", () => {
+test("a fresh page hash cannot cancel an action lease without its browser result", () => {
   const pending = leasedActionRecord({
     action: {
       id: "act_pending_surface",
@@ -1158,17 +1299,18 @@ test("a fresh page mutation cancels a stale pending prediction but an unchanged 
     goal: { goalId: "goal_surface" },
     status: "ready"
   });
-  assert.equal(loopPrivate.leasedActionSupersededByFreshPage(pending, {
+  const state = withExecutionFixture({}, { leasedAction: pending });
+  assert.equal(leasedActionNeedsResult(state, {
     observationId: "obs_same_facts",
     observationSnapshot: { snapshotHash: "hash_source" },
     page: {}
-  }), false);
-  assert.equal(loopPrivate.leasedActionSupersededByFreshPage(pending, {
+  }), true);
+  assert.equal(leasedActionNeedsResult(state, {
     observationId: "obs_user_changed_page",
     observationSnapshot: { snapshotHash: "hash_current" },
     page: {}
   }), true);
-  assert.equal(loopPrivate.leasedActionSupersededByFreshPage(pending, {
+  assert.equal(leasedActionNeedsResult(state, {
     observationId: "obs_result_received",
     observationSnapshot: { snapshotHash: "hash_current" },
     page: {},
@@ -1194,7 +1336,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
   const state = withExecutionFixture({
     currentGoal: { goalId: "goal_flex", semanticType: "flexible_ticket" },
     taskState: {
-      currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_flex", semanticType: "flexible_ticket" } })
+      currentObligation: compileCurrentObligation({ work: { goalId: "goal_flex", semanticType: "flexible_ticket" } })
     },
     lastAction: {
       id: "act_open",
@@ -1206,7 +1348,7 @@ test("loop recovery excludes an identical no-effect strategy after its first dis
     aiDecisionCache: { candidateSelection: { candidateId: "cached" } }
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
   const applied = loopPrivate.applyTransitionStatus(state, after, before);
-  assert.equal(applied.transition.actionOutcome.status, "NO_EFFECT");
+  assert.equal(applied.transition.actionOutcome.status, "NO_RESULT");
   assert.equal(applied.observation.lastActionResult.verified, false);
   assert.equal(applied.observation.lastActionResult.failureCode, "TRANSITION_NO_EFFECT");
   assert.deepEqual(recovery(applied.state).failedStrategySignatures, ["open:ctrl_flex:,"]);
@@ -1264,7 +1406,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   const state = withExecutionFixture({
     currentGoal: { goalId: "goal_title", semanticType: "title" },
     taskState: {
-      currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_title", semanticType: "title" } })
+      currentObligation: compileCurrentObligation({ work: { goalId: "goal_title", semanticType: "title" } })
     },
     lastAction: action,
     aiDecisionCache: { candidateSelection: { candidateId: "stale_reused_candidate" } }
@@ -1330,7 +1472,7 @@ test("a repeat-prohibited pre-dispatch failure is remembered and consumes the bo
   const state = withExecutionFixture({
     currentGoal: { goalId: "goal_survey", semanticType: "optional_consent" },
     taskState: {
-      currentObligation: currentObligationFromGoal({ goal: { goalId: "goal_survey", semanticType: "optional_consent" } })
+      currentObligation: compileCurrentObligation({ work: { goalId: "goal_survey", semanticType: "optional_consent" } })
     },
     lastAction: action,
     aiDecisionCache: { candidateSelection: { candidateId: "stale_small_checkbox" } }
@@ -1403,7 +1545,131 @@ test("a browser acknowledgement on the same material observation is no effect", 
     afterObservation: after
   });
   assert.equal(transition.postcondition.satisfied, false);
-  assert.equal(transition.actionOutcome.status, "NO_EFFECT");
+  assert.equal(transition.actionOutcome.status, "NO_RESULT");
+  assert.equal(transition.nextDirective, "try_distinct_capability");
+});
+
+test("an exact browser postcondition failure cannot be promoted by an unrelated DOM diff", () => {
+  const before = observation("croatia_evidence_before", {
+    step: "payment",
+    currentSurface: { id: "surface-page", type: "page", label: "Review and pay" },
+    controls: [{
+      controlId: "ctrl_booking_details",
+      label: "Booking details",
+      semantic: "open_surface",
+      physicalEffect: "reveal_control",
+      state: { expanded: false }
+    }]
+  });
+  const after = observation("croatia_evidence_after", {
+    step: "payment",
+    currentSurface: { id: "surface-page", type: "page", label: "Review and pay" },
+    controls: [
+      {
+        controlId: "ctrl_booking_details",
+        label: "Booking details",
+        semantic: "open_surface",
+        physicalEffect: "reveal_control",
+        state: { expanded: false }
+      },
+      { controlId: "ctrl_unrelated", label: "Unrelated refreshed node" }
+    ]
+  });
+  const browserResult = {
+    actionId: "act_booking_details",
+    dispatched: true,
+    executed: true,
+    verified: false,
+    expectedOutcomeObserved: false,
+    postconditionSatisfied: false,
+    failureCode: "CURRENT_SURFACE_NOT_ADVANCED",
+    actionOutcome: agentContract.compileActionOutcome({
+      status: agentContract.ACTION_OUTCOME.NO_EFFECT,
+      causedByActionId: "act_booking_details",
+      code: "CURRENT_SURFACE_NOT_ADVANCED",
+      originalSuccessContract: { type: "current_surface_advanced", controlId: "ctrl_booking_details" }
+    })
+  };
+  const action = {
+    id: "act_booking_details",
+    type: "click",
+    controlId: "ctrl_booking_details",
+    mechanicalEffect: "reveal_control",
+    expectedOutcome: { type: "current_surface_advanced", controlId: "ctrl_booking_details" }
+  };
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: action,
+    browserResult,
+    afterObservation: after
+  });
+
+  assert.equal(transition.postcondition.satisfied, false);
+  assert.equal(transition.actionOutcome.status, agentContract.ACTION_OUTCOME.NO_EFFECT);
+  assert.equal(transition.nextDirective, "try_distinct_capability");
+  assert.equal(transition.actionOutcome.repeatProhibited, true);
+
+  after.lastActionResult = { ...browserResult, action };
+  const advanced = advanceActionLifecycle({
+    state: { lastAction: action },
+    observation: after,
+    previousObservation: before
+  });
+  assert.equal(advanced.lifecycle.status, "failed");
+  assert.equal(advanced.lifecycle.transitionStatus, "no_effect");
+  assert.equal(recovery(advanced.state).failedStrategySignatures.length, 1);
+});
+
+test("a canonical browser NO_EFFECT settlement is final without a duplicated failure code", () => {
+  const before = observation("canonical_no_effect_before", {
+    controls: [{ controlId: "ctrl_country", semantic: "phone_country_code", state: { normalizedValue: "+386" } }]
+  });
+  const after = observation("canonical_no_effect_after", {
+    controls: [
+      { controlId: "ctrl_country", semantic: "phone_country_code", state: { normalizedValue: "+386" } },
+      { controlId: "ctrl_unrelated_refresh", label: "Unrelated refreshed content" }
+    ]
+  });
+  const expectedOutcome = {
+    type: "normalized_value_changed",
+    controlId: "ctrl_country",
+    expectedNormalizedValue: "+385"
+  };
+  const action = {
+    id: "act_country",
+    type: "type",
+    controlId: "ctrl_country",
+    expectedOutcome
+  };
+  const browserResult = {
+    actionId: action.id,
+    dispatched: true,
+    executed: true,
+    verified: false,
+    expectedOutcomeObserved: false,
+    postconditionSatisfied: false,
+    expectedOutcome,
+    actionOutcome: agentContract.compileActionOutcome({
+      status: agentContract.ACTION_OUTCOME.NO_EFFECT,
+      causedByActionId: action.id,
+      originalSuccessContract: expectedOutcome,
+      surfaceChanged: true
+    })
+  };
+
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: action,
+    browserResult,
+    afterObservation: after
+  });
+
+  assert.equal(transition.postcondition.satisfied, false);
+  assert.equal(transition.localMechanicalResult.verified, false);
+  assert.equal(transition.currentObligationResult.status, "no_progress");
+  assert.equal(transition.durableObjectiveProgress.status, "no_progress");
+  assert.equal(transition.actionOutcome.status, agentContract.ACTION_OUTCOME.NO_EFFECT);
+  assert.equal(transition.completionAuthority, "browser_verifier");
   assert.equal(transition.nextDirective, "try_distinct_capability");
 });
 
@@ -1518,6 +1784,7 @@ test("three distinct no-effect strategies exhaust only one unchanged state and m
     currentSurface: { id: "confirm_modal", type: "modal", label: "Confirm" },
     controls: [{ controlId: "ctrl_continue", label: "Continue" }]
   }, result(progressAction.id));
+  progressed.lastActionResult = canonicalResult(progressAction, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER);
   const reset = advanceActionLifecycle({ state: { ...state, lastAction: progressAction }, observation: progressed, previousObservation: before });
   assert.equal(reset.transition.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(recovery(reset.state).attempts, 0);
@@ -1575,15 +1842,17 @@ test("useful unexpected transition is observed progress, not verified success", 
     currentSurface: { id: "confirm_modal", type: "modal", label: "Continue without seats" },
     controls: [{ controlId: "ctrl_confirm", surfaceId: "confirm_modal", label: "Continue without seats" }]
   }, result("act_next"));
+  const progressAction = {
+    id: "act_next",
+    observationId: "before_progress",
+    type: "click",
+    controlId: "ctrl_next",
+    expectedOutcome: { type: "stage_exit_or_feedback" }
+  };
+  after.lastActionResult = canonicalResult(progressAction, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER);
   const advanced = advanceActionLifecycle({
     state: {
-      lastAction: {
-        id: "act_next",
-        observationId: "before_progress",
-        type: "click",
-        controlId: "ctrl_next",
-        expectedOutcome: { type: "stage_exit_or_feedback" }
-      }
+      lastAction: progressAction
     },
     observation: after,
     previousObservation: before
@@ -1596,7 +1865,7 @@ test("useful unexpected transition is observed progress, not verified success", 
   assert.equal(advanced.directive, "rebuild_candidates");
 });
 
-test("typed seat choices keep safe navigation selectable even when compatibility is context-only", () => {
+test("typed seat obligations do not admit unrelated navigation as a fallback", () => {
   const before = observation("typed_before", {
     currentSurface: {
       id: "seat_modal",
@@ -1666,8 +1935,8 @@ test("typed seat choices keep safe navigation selectable even when compatibility
 
   assert.equal(skip.physicalEffect, "select_free_option");
   assert.equal(skip.expectedOutcome.type, "exact_free_option_selected");
-  assert.equal(next.controlId, "ctrl_next");
-  assert.equal(firstSet.contextCapabilities.find((candidate) => candidate.controlId === "ctrl_next").outcomeCompatibility, "obligation_admitted");
+  assert.equal(next, undefined);
+  assert.equal(firstSet.contextCapabilities.some((candidate) => candidate.controlId === "ctrl_next"), false);
 
   const dispatchedSkip = { ...skip, id: "act_skip" };
   const unchanged = observation("typed_unchanged", before.page, result(dispatchedSkip.id));
@@ -1675,7 +1944,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
     currentGoal: goal,
     lastAction: dispatchedSkip
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), unchanged, before);
-  assert.equal(applied.transition.actionOutcome.status, "NO_EFFECT");
+  assert.equal(applied.transition.actionOutcome.status, "NO_RESULT");
   assert.equal(applied.directive, "try_distinct_capability");
 
   const retrySet = groundedObservationCandidateSet(
@@ -1685,7 +1954,7 @@ test("typed seat choices keep safe navigation selectable even when compatibility
     taskStateContext
   );
   assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_skip"), false);
-  assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_next"), true);
+  assert.equal(retrySet.candidates.some((candidate) => candidate.controlId === "ctrl_next"), false);
 });
 
 test("failed-strategy memory survives rerendered control and decision-group identities", () => {
@@ -1900,7 +2169,8 @@ test("task-scoped filtering reduces 72 seat controls to untried safe Next and sk
   assert.equal(turn.clientDecision.action, "click");
   assert.equal(turn.clientDecision.targetLabel, "Next");
   assert.equal(turn.clientDecision.mechanicalEffect, "advance_surface");
-  assert.equal(turn.clientDecision.affordance.policy.allow, true);
+  assert.equal(turn.clientDecision.affordance, null);
+  assert.equal(turn.debug.policy.allow, true);
   assert.equal(turn.debug.deterministic, true);
   assert.deepEqual(turn.debug.modelUsage.calls, []);
 });
@@ -1953,8 +2223,8 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
       sectionType: "seats",
       sectionLabel: "Seat selection",
       surfaceId,
-      required: true,
-      status: "missing",
+      required: false,
+      status: "satisfied",
       alternatives: [chooseSeat, paidSeat].map((item) => ({
         controlId: item.controlId,
         label: item.label,
@@ -1994,30 +2264,6 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
     }]
   };
 
-  const context = deriveAuthoritativeTaskContext({ state, observation: current, requirements: state.requirements, traveler });
-  assert.equal(context.userOutcome.status, "satisfied");
-  assert.equal(context.interfaceStatus.status, "needs_advance");
-  assert.equal(context.remainingGoal.semanticType, "navigation");
-  const authoritativeRequirements = applyAuthoritativeOutcomeToRequirements(state.requirements, context);
-  assert.equal(authoritativeRequirements[0].status, "waived_by_policy");
-
-  const candidateSet = groundedObservationCandidateSet(
-    context.remainingGoal,
-    current,
-    [],
-    { state: { ...state, requirements: authoritativeRequirements }, traveler, approvals: state.approvals }
-  );
-  assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.targetLabel), ["Next"], JSON.stringify(candidateSet.contextCapabilities.map((candidate) => ({
-    label: candidate.targetLabel,
-    effect: candidate.mechanicalEffect,
-    intent: candidate.semanticIntent,
-    compatibility: candidate.outcomeCompatibility,
-    reason: candidate.outcomeCompatibilityReason,
-    exclusion: candidate.exclusionReason,
-    relevant: candidate.goalRelevant,
-    policy: candidate.policyDecision
-  })), null, 2));
-
   const store = {
     isCurrentObservation: (_transactionId, observationId, observationHash) => (
       observationId === current.observationId && observationHash === current.observationSnapshot.snapshotHash
@@ -2041,7 +2287,7 @@ test("completed no-paid-seat obligation remains satisfied and publishes only saf
   assert.equal(turn.clientDecision.action, "click");
   assert.equal(turn.clientDecision.targetLabel, "Next");
   assert.equal(turn.state.currentObligation, undefined);
-  assert.equal(turn.state.taskState.currentObligation.subject.semanticType, "navigation");
+  assert.equal(turn.state.taskState.currentObligation.semanticOwner.family, "navigation");
   assert.equal(turn.debug.deterministic, true);
   assert.deepEqual(turn.debug.modelUsage.calls, []);
 });
@@ -2076,7 +2322,7 @@ test("an AI candidate decision is reused only for the unchanged grounded safe co
     semanticIntent: "remove_unrequested_paid_selection",
     risk: "safe",
     requiresApproval: false,
-    policyDecision: { allow: true, decision: "allow" }
+    admitted: true
   };
   const policyFingerprint = loopPrivate.aiDecisionPolicyFingerprint(
     { skipPaidExtrasApproved: true },
@@ -2137,7 +2383,7 @@ test("an AI candidate decision is reused only for the unchanged grounded safe co
     cache,
     current,
     goal,
-    { candidates: [{ ...candidate, policyDecision: { allow: false }, risk: "money" }] },
+    { candidates: [{ ...candidate, admitted: false, risk: "money" }] },
     policyFingerprint
   ), null);
 });
@@ -2152,7 +2398,7 @@ test("one stale observation mismatch rebinds the same safe stable control withou
     intendedOutcome: "remove_paid_selection",
     risk: "safe",
     requiresApproval: false,
-    policyDecision: { allow: true }
+    admitted: true
   };
   const recovery = loopPrivate.staleActionRecoveryEntry(
     { goalId: goal.goalId, controlId: oldCandidate.controlId, operation: "activate" },
@@ -2348,7 +2594,7 @@ test("generic command acknowledgement cannot complete a decision or parent outco
     afterObservation: after
   });
 
-  assert.equal(transition.actionOutcome.status, "PROGRESSED");
+  assert.equal(transition.actionOutcome.status, "NO_RESULT");
   assert.equal(transition.postcondition.satisfied, false);
   assert.equal(transition.taskOutcomeCompleted, false);
   assert.equal(after.page.decisionGroups[0].selectedControlId, "");
@@ -2387,10 +2633,18 @@ test("one canonical ActionOutcome carries causal validation ownership without re
       validationIssues: [{ issueId: "required_terms", controlId: "terms", message: "Required" }]
     }
   };
+  const validationResult = canonicalResult(
+    { id: "act_continue", expectedOutcome },
+    agentContract.ACTION_OUTCOME.REVEALED_BLOCKER,
+    {
+      introducedValidation: after.page.validationIssues,
+      candidateOwnerControlIds: ["terms"]
+    }
+  );
   const transition = evaluateTransition({
     beforeObservation: before,
     governedAction: { id: "act_continue", type: "click", controlId: "continue", expectedOutcome },
-    browserResult: { actionId: "act_continue", dispatched: true, executed: true },
+    browserResult: validationResult,
     afterObservation: after
   });
   assert.equal(transition.actionOutcome.status, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER);

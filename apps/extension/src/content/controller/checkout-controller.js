@@ -1,5 +1,4 @@
 export function createCheckoutController({
-  DESTINATION_MUTATION_SETTLE_MS,
   addAgentMessage,
   agent,
   announceSectionQueue,
@@ -22,7 +21,6 @@ export function createCheckoutController({
   resetFieldProgress,
   runRiskChecks,
   saveResumeMarker,
-  scheduleDestinationObservation,
   setAgentActivity,
   setWarnings,
   shouldAutoDeclinePaidExtras,
@@ -64,6 +62,22 @@ export function createCheckoutController({
   }
 
   async function takeOverCheckout() {
+    if (agent.engineReconciliationPending && agent.sessionId) {
+      const existingSessionId = agent.sessionId;
+      const session = await startAgentSession(existingSessionId, { validateBeforeObservation: true });
+      if (!session || agent.sessionId !== existingSessionId) return false;
+      agent.engineReconciliationPending = false;
+      agent.running = true;
+      agent.awaiting = "";
+      startWatchingCheckoutChanges();
+      await saveResumeMarker();
+      setAgentActivity(
+        "Continuing the existing checkout session",
+        "Re-observing the current page without creating a replacement transaction."
+      );
+      processCheckoutAgent();
+      return true;
+    }
     if (agent.running || agent.loopBusy) {
       logFlow("loop.start_duplicate_suppressed", {
         activeLoopRunId: agent.activeLoopRunId,
@@ -121,6 +135,7 @@ export function createCheckoutController({
   async function resumeCheckoutAfterNavigation(marker) {
     resetAgentLoopLifecycle("resume_after_navigation");
     agent.running = true;
+    agent.engineReconciliationPending = false;
     agent.sessionId = "";
     agent.awaiting = "";
     agent.messages = [];
@@ -138,46 +153,46 @@ export function createCheckoutController({
     agent.processDiagnostics = null;
     resetFieldProgress();
     setAgentActivity("Continuing checkout agent after page change", travelerRules() || "Using saved traveler profile");
-    // A newly loaded checkout document is still hydrating when the content
-    // script starts. Building the entire page map immediately and then again
-    // after the old 650 ms delay caused two multi-second DOM scans on large
-    // airline pages. Let initial framework work land first, then create one
-    // atomic fresh observation which the first planning turn can reuse.
-    await sleep(650);
-    const resumedObservation = await pageStateStore.observeFresh({
-      reason: "navigation_resume",
-      maxWaitMs: 650,
-      maxAttempts: 2,
-      postBuildGraceMs: 100
-    });
-    agent.pageMap = rememberPagePlan(resumedObservation.map);
     const resumeSessionId = String(marker.sessionId || "");
-    const session = resumeSessionId ? await startAgentSession(resumeSessionId) : null;
+    // Session authority comes before page perception. A stale marker must not
+    // earn a multi-second main-thread scan merely because the local server is
+    // reachable.
+    const session = resumeSessionId
+      ? await startAgentSession(resumeSessionId, { validateBeforeObservation: true })
+      : null;
     if (!session || agent.sessionId !== resumeSessionId) {
       stopWatchingCheckoutChanges();
       agent.running = false;
       agent.awaiting = "manual";
       await clearResumeMarker();
-      addAgentMessage("assistant", "The prior checkout session could not be resumed, so I stopped instead of starting a replacement transaction.");
-      renderSidebar("agent");
+      addAgentMessage("assistant", "The prior checkout session could not be resumed, so I left this page dormant.");
+      renderSidebar("ready");
       return;
     }
     if (session.status === "awaiting_user") {
       stopWatchingCheckoutChanges();
       agent.running = false;
       agent.awaiting = "manual";
+      await clearResumeMarker();
       addAgentMessage(
         "assistant",
         session.lastAction?.reason || "This checkout is still waiting for your previous answer."
       );
-      renderSidebar("agent");
+      renderSidebar("ready");
       return;
     }
+    // Let initial framework work land before the first planning observation.
+    // processCheckoutAgent owns that one observation; doing a separate resume
+    // scan here made every cross-document advance scan the same large airline
+    // page twice before it could plan.
+    await sleep(650);
     startWatchingCheckoutChanges();
     await saveResumeMarker();
     addAgentMessage("assistant", "Picking back up where I left off after the page changed.");
     renderSidebar("agent");
-    await announceSectionQueue();
+    // Yield once so the passive sidebar can paint before the observation loop
+    // performs its one intentional semantic scan on a large checkout page.
+    await sleep(0);
     processCheckoutAgent();
   }
 
@@ -268,28 +283,7 @@ export function createCheckoutController({
       await executeAgentDecision(decision, stableMap);
     } finally {
       shouldRerun = finishAgentLoop(loopToken);
-      if (agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
-        const remaining = Math.max(0, agent.destinationWait.deadlineAt - Date.now());
-        const oneShotReobservePending = agent.destinationWait.kind === "one_shot_reobserve"
-          && agent.destinationWait.attempts === 0;
-        const materialWakePending = agent.destinationWait.wakeRequested === true
-          && agent.destinationWait.lastWakeReason === "dom_mutation";
-        // Strategy exhaustion needs one immediate reducer pass carrying its
-        // mechanical evidence. Other readiness waits wake on a material DOM
-        // mutation or send exactly one observation at the bounded deadline.
-        scheduleDestinationObservation(
-          oneShotReobservePending
-            ? "one_shot_reobserve"
-            : materialWakePending
-              ? "dom_mutation"
-              : "readiness_deadline",
-          oneShotReobservePending
-            ? 0
-            : materialWakePending
-              ? DESTINATION_MUTATION_SETTLE_MS
-              : remaining
-        );
-      } else if (shouldRerun) {
+      if (shouldRerun) {
         setTimeout(() => processCheckoutAgent(), 0);
       }
     }

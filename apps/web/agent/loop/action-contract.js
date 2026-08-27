@@ -143,16 +143,8 @@ function expectedOutcomeForAction(action = {}, page = {}) {
       intent: action.intent || ""
     };
   }
-  if (["click", "click_xy", "keypress"].includes(action.type)) {
-    return {
-      type: "observable_change",
-      targetId: action.actuatorId || target.id || "",
-      controlId: action.controlId || target.controlId || "",
-      decisionGroupId: action.decisionGroupId || target.decisionGroupId || "",
-      surfaceId: target.surfaceId || "",
-      intent: action.intent || ""
-    };
-  }
+  // A generic command has no success semantics. Every typed action must arrive
+  // with a typed expected outcome from its owning obligation.
   return null;
 }
 

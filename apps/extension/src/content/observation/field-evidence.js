@@ -225,6 +225,28 @@ export function createFieldEvidence({
       );
       if (resolvedChoice) return resolvedChoice;
     }
+    // Custom select triggers are frequently plain buttons with no ARIA popup
+    // metadata until after they have been opened.  Their compact, exact label
+    // is still first-party control identity; discarding it solely because the
+    // framework rendered a <button> made required facts such as a phone
+    // country code disappear from the profile graph.  Keep this admission
+    // deliberately narrow so legal prose containing words like "name" or
+    // "information" cannot become a profile field.
+    if (activationOnly && explicitLabel && explicitLabel.length <= 160) {
+      const compactChoiceLabel = explicitLabel.toLowerCase();
+      const describesChoiceControl = /\b(?:select|choose|pick)\b/.test(compactChoiceLabel)
+        || /\b(?:country|calling|dial|phone)\s*(?:phone\s*)?code\b/.test(compactChoiceLabel);
+      const consequenceBearingProse = /\b(?:accept|agree|confirm|declare|accurate|correct|terms?|conditions?|privacy|consent)\b/.test(compactChoiceLabel);
+      if (describesChoiceControl && !consequenceBearingProse) {
+        const resolvedButtonChoice = resolveTier(
+          profileFieldTypesFromText(explicitLabel, { editable: false }),
+          "profile_choice_explicit_button_label",
+          0.97,
+          explicitLabel
+        );
+        if (resolvedButtonChoice) return resolvedButtonChoice;
+      }
+    }
     if (activationOnly || type === "checkbox" || role === "checkbox") {
       return result(
         "",

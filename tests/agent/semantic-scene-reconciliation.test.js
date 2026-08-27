@@ -9,6 +9,7 @@ const {
   reconcileSemanticScene
 } = require("../../apps/web/agent/semantic-scene-reconciliation");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
+const { compileDecisionFrame } = require("../../apps/web/agent/authority-frames");
 
 function control(overrides = {}) {
   return {
@@ -43,13 +44,15 @@ function observation(controls, validationIssues = []) {
 
 function admittedObligation(controlIds = ["ctrl_unknown"], decisionGroupId = "") {
   return {
-    obligationId: "unknown-required:ctrl_unknown",
-    kind: "unknown_required",
+    contractVersion: "current-obligation/v3",
+    id: "unknown-required:ctrl_unknown",
     objective: "resolve the current unknown required control",
-    authority: "task_state",
     admittedControlIds: controlIds,
-    policyDecision: { status: "admitted" },
-    subject: { decisionGroupId }
+    delta: {
+      kind: "unknown_required",
+      subject: { family: "profile", decisionGroupId },
+      authorization: { status: "admitted" }
+    }
   };
 }
 
@@ -108,8 +111,8 @@ test("an unfamiliar decision receives only a closed descriptive type and determi
     ]
   }];
   source.page.controls = [
-    control({ controlId: "ctrl_accept", role: "radio", kind: "radio", required: false, label: "Add protection", operations: { select: { actuatorId: "accept" } } }),
-    control({ controlId: "ctrl_decline", role: "radio", kind: "radio", required: false, label: "Continue without", operations: { select: { actuatorId: "decline" } } })
+    control({ controlId: "ctrl_accept", role: "radio", kind: "radio", required: false, state: { required: false, valuePresent: true }, label: "Add protection", operations: { select: { actuatorId: "accept" } } }),
+    control({ controlId: "ctrl_decline", role: "radio", kind: "radio", required: false, state: { required: false, valuePresent: true }, label: "Continue without", operations: { select: { actuatorId: "decline" } } })
   ];
   source.page.fields = [];
   const uncertainty = semanticSceneUncertainty({
@@ -136,11 +139,86 @@ test("an unfamiliar decision receives only a closed descriptive type and determi
   assert.equal(Object.hasOwn(reconciled.page.semanticDecisionHints[0], "required"), false);
   assert.equal(Object.hasOwn(reconciled.page.semanticDecisionHints[0], "action"), false);
 
-  const compiled = agentContract.compileSemanticCheckout(reconciled.page);
-  const decision = compiled.decisionGroups.find((group) => group.decisionGroupId === "dg_opaque_offer");
+  const decisionFrame = compileDecisionFrame({
+    observation: {
+      ...reconciled,
+      page: {
+        ...reconciled.page,
+        observationContract: "structural-observation/v1"
+      }
+    }
+  });
+  const decision = decisionFrame.semanticCompilation.decisionGroups.find((group) => group.decisionGroupId === "dg_opaque_offer");
   assert.equal(decision.semanticOwnership.family, "insurance");
   assert.equal(decision.required, false);
   assert.equal(decision.status, "optional");
+});
+
+test("a grounded control hypothesis cannot add an unrelated control to an existing decision", () => {
+  const source = observation([]);
+  source.page.step = "payment";
+  source.page.controls = [
+    control({
+      controlId: "ctrl_card",
+      role: "button",
+      kind: "button",
+      label: "Credit card / Debit card",
+      semantic: "open_surface",
+      fieldType: "",
+      required: false,
+      state: { valuePresent: true },
+      operations: { activate: { actuatorId: "act_card" } }
+    }),
+    control({
+      controlId: "ctrl_wallet",
+      role: "button",
+      kind: "button",
+      label: "Apple Pay",
+      semantic: "payment_method",
+      fieldType: "",
+      required: false,
+      state: { valuePresent: true },
+      operations: { activate: { actuatorId: "act_wallet" } }
+    })
+  ];
+  source.page.fields = [];
+  source.page.decisionGroups = [{
+    decisionGroupId: "dg_payment_method",
+    requirementId: "payment:payment-method",
+    sectionType: "payment_method",
+    subject: "payment_method",
+    required: true,
+    material: true,
+    status: "missing",
+    alternativeControlIds: ["ctrl_wallet"],
+    alternatives: [{ controlId: "ctrl_wallet", label: "Apple Pay", semantic: "payment_method" }]
+  }];
+
+  const uncertainty = semanticSceneUncertainty({ observation: source, traveler: { payment_preference: "manual payment" } });
+  assert.equal(uncertainty.needed, true);
+  assert.equal(uncertainty.allowedControlIds.includes("ctrl_card"), true);
+  assert.equal(uncertainty.allowedDecisionGroupIds.includes("dg_payment_method"), true);
+
+  const reconciled = applySemanticSceneHypotheses(source, {
+    status: "grounded",
+    hypotheses: [],
+    decisionHypotheses: [],
+    controlHypotheses: [{
+      controlId: "ctrl_card",
+      semanticRole: "payment_method",
+      decisionGroupId: "dg_payment_method",
+      decisionType: "payment_method",
+      consequenceClass: "payment_route",
+      prerequisiteOf: "",
+      expectedReversibleEffect: "reveal_control",
+      confidence: "high",
+      evidence: "The local control explicitly offers credit or debit card payment beside Apple Pay."
+    }]
+  }, uncertainty);
+
+  assert.equal(reconciled.page.semanticSceneReconciliation.controlHypotheses.length, 0);
+  assert.equal(reconciled.page.controls.find((item) => item.controlId === "ctrl_card").semantic, "open_surface");
+  assert.deepEqual(reconciled.page.decisionGroups[0].alternativeControlIds, ["ctrl_wallet"]);
 });
 
 test("scene hypotheses may refine supplied evidence but cannot invent owners or facts", () => {
@@ -174,11 +252,20 @@ test("scene hypotheses may refine supplied evidence but cannot invent owners or 
     }]
   }, uncertainty);
 
-  assert.equal(reconciled.page.controls[0].fieldType, "first_name");
-  assert.equal(reconciled.page.controls[0].fieldClassification.source, "grounded_semantic_scene");
-  assert.equal(reconciled.page.validationIssues[0].controlId, "ctrl_unknown");
+  assert.equal(reconciled.page.controls[0].fieldType, "");
+  assert.equal(reconciled.page.validationIssues[0].controlId, "");
+  assert.equal(reconciled.page.semanticFieldHints[0].semanticType, "first_name");
+  assert.equal(reconciled.page.semanticValidationHints[0].controlId, "ctrl_unknown");
   assert.equal(reconciled.page.semanticSceneReconciliation.hypotheses.length, 1);
   assert.equal(reconciled.page.semanticSceneReconciliation.authority, "hypothesis_only");
+  const frame = compileDecisionFrame({
+    observation: {
+      ...reconciled,
+      page: { ...reconciled.page, observationContract: "structural-observation/v1" }
+    }
+  });
+  assert.equal(frame.observation.page.controls[0].fieldType, "first_name");
+  assert.equal(frame.observation.page.validationIssues[0].controlId, "ctrl_unknown");
 });
 
 test("an evidence-identical grounded binding is reused without another model request", () => {
@@ -213,9 +300,17 @@ test("an evidence-identical grounded binding is reused without another model req
   });
 
   assert.equal(memory.length, 1);
-  assert.equal(next.page.controls[0].fieldType, "first_name");
-  assert.equal(next.page.controls[0].fieldClassification.source, "remembered_grounded_semantic_scene");
-  assert.equal(semanticSceneUncertainty({ observation: next, traveler: { first_name: "Ali" } }).needed, false);
+  assert.equal(next.page.controls[0].fieldType, "");
+  assert.equal(next.page.semanticFieldHints[0].semanticType, "first_name");
+  const frame = compileDecisionFrame({
+    observation: {
+      ...next,
+      page: { ...next.page, observationContract: "structural-observation/v1" }
+    },
+    traveler: { first_name: "Ali" }
+  });
+  assert.equal(frame.observation.page.controls[0].fieldType, "first_name");
+  assert.equal(frame.semanticCompilation.semanticReadiness, "ready");
 });
 
 test("a grounded binding is invalidated when its local semantic evidence changes", () => {
@@ -303,20 +398,97 @@ test("an ambiguous scene uses one closed-ID hypothesis call and returns no actio
     assert.equal(calls, 1);
     assert.equal(payload.outputAuthority, "grounded_hypothesis_only");
     assert.equal(Object.hasOwn(payload.scene, "stage"), false);
-    assert.equal(payload.scene.currentObligation.obligationId, obligation.obligationId);
+    assert.equal(payload.scene.currentObligation.id, obligation.id);
     assert.equal(payload.scene.components[0].rawEvidenceChannels.name, "opaque_1");
     assert.equal(payload.policyConstraints.declinePaidExtras, true);
     assert.deepEqual(payload.failedMethods, [{ operation: "open", method: "native_click", result: "NO_EFFECT" }]);
     assert.equal(payload.forbiddenConsequences.includes("grant_permission"), true);
-    assert.equal(payload.allowedSemanticBindings.some((binding) => (
-      binding.controlId === "ctrl_unknown"
-      && binding.semanticType === "first_name"
-      && binding.factSource === "profile.first_name"
-    )), true);
-    assert.equal(result.observation.page.controls[0].fieldType, "first_name");
+    assert.deepEqual(payload.allowedSemanticBindings.controlIds, ["ctrl_unknown"]);
+    assert.equal(payload.allowedSemanticBindings.semanticTypes.includes("first_name"), true);
+    assert.equal(payload.allowedSemanticBindings.factSources.includes("profile.first_name"), true);
+    assert.equal(result.observation.page.controls[0].fieldType, "");
+    assert.equal(result.observation.page.semanticFieldHints[0].semanticType, "first_name");
     assert.equal(Object.hasOwn(result.reconciliation, "action"), false);
     assert.equal(Object.hasOwn(result.reconciliation, "permission"), false);
     assert.equal(Object.hasOwn(result.reconciliation, "completed"), false);
+  } finally {
+    global.fetch = previousFetch;
+  }
+});
+
+test("a maximal unfamiliar scene sends closed enums without a Cartesian packet explosion", async () => {
+  const previousFetch = global.fetch;
+  let request = null;
+  global.fetch = async (_url, options) => {
+    request = JSON.parse(options.body);
+    return {
+      ok: true,
+      json: async () => ({
+        status: "completed",
+        model: "test-model",
+        output_text: JSON.stringify({ status: "grounded", hypotheses: [], decisionHypotheses: [] }),
+        usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 }
+      })
+    };
+  };
+  try {
+    const controls = Array.from({ length: 12 }, (_, index) => control({
+      controlId: `ctrl_opaque_${index + 1}`,
+      label: `Required passenger checkout value ${index + 1} ${"opaque ".repeat(10)}`,
+      name: `checkout.deeply.nested.opaque_${index + 1}`,
+      semantic: "unknown",
+      operations: { type: { actuatorId: `act_opaque_${index + 1}` } }
+    }));
+    const source = observation(controls);
+    source.page.decisionGroups = Array.from({ length: 8 }, (_, index) => ({
+      decisionGroupId: `dg_opaque_${index + 1}`,
+      sectionType: "unknown",
+      sectionLabel: `Unfamiliar required choice ${index + 1}`,
+      subject: "unknown",
+      required: true,
+      material: true,
+      alternatives: [{ controlId: controls[index].controlId, label: controls[index].label }]
+    }));
+    const traveler = {
+      first_name: "Ali",
+      last_name: "Sifrar",
+      email: "ali@example.test",
+      phone: "+38670111222",
+      title: "MR",
+      gender: "male",
+      date_of_birth: "1990-01-01",
+      nationality: "SI",
+      country_of_residence: "SI",
+      address_line1: "Test Street 1",
+      postal_code: "1000",
+      city: "Ljubljana"
+    };
+    const obligation = admittedObligation(controls.map((item) => item.controlId));
+    const uncertainty = semanticSceneUncertainty({
+      observation: source,
+      traveler,
+      currentObligation: obligation
+    });
+
+    assert.equal(uncertainty.allowedBindings.length > uncertainty.components.length, true);
+    await reconcileSemanticScene({
+      apiKey: "test-key",
+      model: "test-model",
+      observation: source,
+      traveler,
+      currentObligation: obligation,
+      policyConstraints: { bookingRules: "no paid extras", declinePaidExtras: true },
+      uncertainty
+    });
+
+    const prompt = request.input[0].content[0].text;
+    const payload = JSON.parse(prompt);
+    assert.equal(prompt.length < 24_000, true, `semantic scene prompt was ${prompt.length} characters`);
+    assert.equal(payload.allowedSemanticBindings.controlIds.length, 12);
+    assert.equal(Array.isArray(payload.allowedSemanticBindings.semanticTypes), true);
+    assert.equal(Array.isArray(payload.allowedSemanticBindings.factSources), true);
+    assert.equal(Array.isArray(payload.allowedDecisionBindings.decisionGroupIds), true);
+    assert.equal(Array.isArray(payload.allowedDecisionBindings.decisionTypes), true);
   } finally {
     global.fetch = previousFetch;
   }

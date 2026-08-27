@@ -10,12 +10,13 @@ const {
   verifyLogicalField
 } = require("../../apps/web/agent/logical-field");
 const {
-  selectNextProfileRequirement,
+  selectNextProfileRequirement
+} = require("../../apps/web/agent/profile-mechanics");
+const {
   candidatesForProfileGoal,
   profileGoalSatisfied
-} = require("../../apps/web/agent/profile-mechanics");
+} = require("./legacy-mechanics-binding-adapter");
 const { fieldDescriptors } = require("../../apps/web/agent/profile-requirements");
-const { evaluatePostcondition } = require("../../apps/web/agent/transition-evaluator");
 const { semanticGoalKey, decisionInstanceKey } = require("../../packages/shared/agent-actions");
 
 test("raw and compiled global goals share one semantic recovery key", () => {
@@ -25,10 +26,10 @@ test("raw and compiled global goals share one semantic recovery key", () => {
     desiredValue: "next_stage"
   };
   const compiled = {
-    contractVersion: "current-obligation/v2",
-    subject: { semanticType: "navigation", subjectId: "global" },
-    desiredValue: "next_stage",
-    binding: { component: {} }
+    contractVersion: "current-obligation/v3",
+    semanticType: "navigation",
+    subjectId: "global",
+    desiredStateDelta: { desiredValue: "next_stage" }
   };
   assert.equal(semanticGoalKey(raw), semanticGoalKey(compiled));
 });
@@ -999,6 +1000,52 @@ test("shared placeholder and combined-phone contracts preserve site semantics", 
   assert.equal(logicalFieldSatisfied(phone), false);
 });
 
+test("semantic phone projections sharing one scalar actuator compile as one atomic value", () => {
+  const shared = {
+    stateElementId: "phone_scalar_state",
+    sectionId: "contact",
+    sectionType: "contact",
+    role: "textbox",
+    kind: "tel",
+    state: { normalizedValue: "", valuePresent: false },
+    operations: {
+      type: {
+        operation: "type",
+        actuatorId: "phone_scalar_state",
+        actuatorIds: ["phone_scalar_state"]
+      }
+    }
+  };
+  const country = {
+    ...shared,
+    controlId: "ctrl_phone_country_projection",
+    semantic: "phone_country_code",
+    fieldType: "phone_country_code",
+    label: "Country code"
+  };
+  const local = {
+    ...shared,
+    controlId: "ctrl_phone_local_projection",
+    semantic: "phone",
+    fieldType: "phone",
+    label: "Phone number",
+    phoneField: { representation: "local_number" }
+  };
+  const [phone] = resolveLogicalFields({
+    controls: [country, local],
+    fields: [fieldFor(country), fieldFor(local)],
+    validationIssues: []
+  }, { phone_country_code: "+386", phone: "70328922" });
+
+  assert.equal(phone.structure, "scalar");
+  assert.equal(phone.components.length, 1);
+  assert.equal(phone.components[0].role, "international_number");
+  assert.equal(phone.components[0].inputValue, "+38670328922");
+  assert.equal(phone.desiredCanonicalValue, "+38670328922");
+  assert.equal(phone.ambiguity, null);
+  assert.equal(logicalFieldSatisfied(phone), false);
+});
+
 test("native invalid phone state reopens the exact primary phone component", () => {
   const phoneControl = {
     controlId: "ctrl_phone_invalid",
@@ -1221,45 +1268,6 @@ test("completed component progress advances with a fresh strategy budget", () =>
   assert.equal(monthCandidates[0].value, "05");
   assert.notEqual(monthCandidates[0].candidateId, dayCandidate.candidateId);
   assert.equal(fieldDescriptors(after, traveler).find((descriptor) => descriptor.componentRole === "day").hasValue, true);
-});
-
-test("transition verification reports local component success without inventing logical completion", () => {
-  const before = observation([
-    dateControl("day", ""),
-    dateControl("month", ""),
-    dateControl("year", "")
-  ], [], "obs_before_transition");
-  const goal = deriveProfileGoal(before, traveler);
-  const after = observation([
-    dateControl("day", "31", { controlId: "fresh_day" }),
-    dateControl("month", "", { controlId: "fresh_month" }),
-    dateControl("year", "", { controlId: "fresh_year" })
-  ], [{
-    logicalFieldId: goal.logicalFieldId,
-    message: "Enter complete date"
-  }], "obs_after_transition");
-  const result = evaluatePostcondition({
-    type: "date_value_committed",
-    controlId: goal.controlId,
-    logicalFieldId: goal.logicalFieldId,
-    subjectId: goal.subjectId,
-    semanticType: goal.semanticType,
-    componentRole: "day",
-    expectedNormalizedValue: "31",
-    expectedCanonicalValue: "2003-05-31",
-    dateCodec: { ok: true, kind: "component", component: "day" }
-  }, {
-    controlId: goal.controlId,
-    value: "31"
-  }, before, after, {
-    changed: [{ controlId: "fresh_day" }]
-  }, {
-    dispatched: true
-  });
-
-  assert.equal(result.satisfied, true);
-  assert.equal(result.evidence.componentResult.satisfied, true);
-  assert.equal(result.evidence.logicalFieldResult.satisfied, false);
 });
 
 test("recovery memory is scoped to the stable logical field component", () => {

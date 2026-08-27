@@ -98,12 +98,7 @@ export function createOutcomeVerification({
       targetLabel: String(label || "").replace(/\s+/g, " ").trim().slice(0, 180),
       beforeSignature: structuralPageSignature(map),
       beforeUrl: map.url || currentNavigationUrl(),
-      beforeVisualState: visualPageState(map),
-      policyAuthorized: Boolean(
-        decision.policy?.allow === true
-        || decision.policyDecision?.allow === true
-        || decision.affordance?.policy?.allow === true
-      )
+      beforeVisualState: visualPageState(map)
     };
     const activeForegroundSurface = activeSurface?.type && activeSurface.type !== "page" ? activeSurface : null;
     const foregroundDecline = activeForegroundSurface && (
@@ -184,7 +179,7 @@ export function createOutcomeVerification({
     }
     return {
       ...base,
-      type: "observable_change"
+      type: "exact_outcome_missing"
     };
   }
 
@@ -647,32 +642,38 @@ export function createOutcomeVerification({
         || afterControlState?.valuePresent
       )
     );
-    if (expected.type === "semantic_progress") {
-      const currentSurface = afterMap.currentSurface || {};
-      const actualNormalizedValue = String(afterControlState?.normalizedValue || "");
-      const wantedNormalizedValue = String(expected.expectedNormalizedValue || "");
-      const valueChanged = actualNormalizedValue !== String(expected.previousValue || "");
-      const goalSatisfied = Boolean(wantedNormalizedValue && actualNormalizedValue === wantedNormalizedValue);
-      const optionsAppeared = Boolean(
-        afterControlState?.expanded === true
-        || (currentSurface.type && currentSurface.type !== "page" && currentSurface.id !== String(expected.previousSurfaceId || ""))
+    if (expected.type === "information_surface_revealed") {
+      const controlledElementIds = [...new Set(expected.controlledElementIds || [])].filter(Boolean);
+      const visibleControlledElementIds = controlledElementIds.filter((nodeId) => {
+        const node = elementById(nodeId);
+        return Boolean(node && isVisible(node));
+      });
+      const expanded = afterControlState?.expanded === true
+        || String(afterControl?.ariaExpanded || "").toLowerCase() === "true";
+      const exactOwnerRetained = Boolean(
+        afterControl
+        && afterControl.controlId === expected.controlId
+        && controlledElementIds.length
+        && (afterControl.controlledElementIds || []).some((nodeId) => controlledElementIds.includes(nodeId))
       );
-      const ok = goalSatisfied || optionsAppeared || valueChanged || foregroundChanged || progressMarkerChanged;
+      const ok = Boolean(
+        expected.previousExpanded !== true
+        && exactOwnerRetained
+        && (expanded || visibleControlledElementIds.length)
+      );
       return {
         ok,
-        code: ok ? "SEMANTIC_PROGRESS_OBSERVED" : "SEMANTIC_PROGRESS_NOT_OBSERVED",
+        code: ok ? "INFORMATION_SURFACE_REVEALED" : "INFORMATION_SURFACE_NOT_REVEALED",
         message: ok
-          ? "The interaction produced fresh semantic progress for the unresolved control."
-          : "The interaction did not change the value, options surface, or foreground state.",
+          ? "The exact owned information disclosure revealed its controlled content."
+          : "The admitted information disclosure did not reveal its exact controlled content.",
         evidence: {
           ...evidence,
-          goalSatisfied,
-          optionsAppeared,
-          valueChanged,
-          actualNormalizedValue,
-          wantedNormalizedValue,
           control: afterControl || null,
-          currentSurface
+          controlledElementIds,
+          visibleControlledElementIds,
+          expanded,
+          exactOwnerRetained
         }
       };
     }
@@ -1100,7 +1101,7 @@ export function createOutcomeVerification({
         if (exactReversalVerified) return true;
         if (!intendedOutcome || intendedOutcome === "declined or free") return true;
         if (intendedOutcome === "random assignment") {
-          return /random seating|random (?:seat )?assignment|automatic seat assignment|skip seat|continue without (?:a )?seat|go without (?:a )?seat|no seat selection/.test(selectedText);
+          return /random seating|random (?:seat )?assignment|automatic seat assignment|skip seat|continue without (?:a )?seat|go without (?:a )?seat|no seat selection|no thanks/.test(selectedText);
         }
         if (intendedOutcome === "included base fare") {
           return /included|base fare|basic(?: fare)?|saver(?: fare)?|economy light|light fare/.test(selectedText);
@@ -1219,9 +1220,8 @@ export function createOutcomeVerification({
           || (beforeExpectedControl.surfaceType === "page" && checkoutStageAdvanced)
         )
       );
-      const policySafeTransitionCandidate = Boolean(
+      const exactFreeTransitionCandidate = Boolean(
         beforeExpectedControl
-        && expected.policyAuthorized === true
         && (
           Number(beforeExpectedControl.structuredPrice?.amount) === 0
           || /decline|safe decline|free|included|without|skip|no thanks|no extra/.test(
@@ -1231,7 +1231,7 @@ export function createOutcomeVerification({
         && sourceRetired
         && checkoutStageAdvanced
       );
-      const priceDidNotIncrease = (exactReversalVerified || advancingFreeOptionDisappeared || freeCommandDismissed || policySafeTransitionCandidate)
+      const priceDidNotIncrease = (exactReversalVerified || advancingFreeOptionDisappeared || freeCommandDismissed || exactFreeTransitionCandidate)
         && Number.isFinite(beforePriceAmount)
         && !Number.isFinite(afterPriceAmount)
         ? true
@@ -1270,8 +1270,8 @@ export function createOutcomeVerification({
         && ownedValidationErrors.length === 0
         && actionableCheckoutErrors(afterMap.errors || []).length === 0
       );
-      const policySafeChoiceAdvanced = Boolean(
-        policySafeTransitionCandidate
+      const exactFreeChoiceAdvanced = Boolean(
+        exactFreeTransitionCandidate
         && semanticPolicyOutcomeVerified
         && priceDidNotIncrease
         && unrelatedSelectionChanges.length === 0
@@ -1279,11 +1279,11 @@ export function createOutcomeVerification({
         && ownedValidationErrors.length === 0
         && actionableCheckoutErrors(afterMap.errors || []).length === 0
       );
-      const exactPolicySafeAdvance = contractPolicySafeAdvance || policySafeChoiceAdvanced;
+      const exactFreeAdvance = contractPolicySafeAdvance || exactFreeChoiceAdvanced;
       const ok = Boolean(
-        (group?.status === "satisfied" || exactReversalVerified || exactPolicySafeAdvance || freeCommandDismissed)
-        && (exactControlSelected || exactPolicySafeAdvance || freeCommandDismissed)
-        && (semanticDispositionVerified || exactPolicySafeAdvance || freeCommandDismissed)
+        (group?.status === "satisfied" || exactReversalVerified || exactFreeAdvance || freeCommandDismissed)
+        && (exactControlSelected || exactFreeAdvance || freeCommandDismissed)
+        && (semanticDispositionVerified || exactFreeAdvance || freeCommandDismissed)
         && semanticPolicyOutcomeVerified
         && selectedChargeRemoved
         && unrelatedSelectionChanges.length === 0
@@ -1294,12 +1294,12 @@ export function createOutcomeVerification({
       );
       return {
         ok,
-        code: policySafeChoiceAdvanced
-          ? "POLICY_SAFE_CHOICE_ADVANCED"
+        code: exactFreeChoiceAdvanced
+          ? "EXACT_FREE_CHOICE_ADVANCED"
           : (ok ? "EXACT_FREE_OPTION_VERIFIED" : "EXACT_FREE_OPTION_NOT_VERIFIED"),
         message: ok
-          ? (policySafeChoiceAdvanced
-              ? "The profile-authorized free/no-extra choice safely advanced checkout to a fresh stage."
+          ? (exactFreeChoiceAdvanced
+              ? "The exact free/no-extra choice advanced checkout to a fresh stage."
               : "The exact canonical free/no-extra option is selected without a price increase or validation error.")
           : "The decision is not proven to be the exact canonical free/no-extra selection.",
         evidence: {
@@ -1323,11 +1323,11 @@ export function createOutcomeVerification({
           afterDecisionAvailability,
           sourceRetired,
           activeSuccessorDecision,
-          exactPolicySafeAdvance,
+          exactFreeAdvance,
           contractPolicySafeAdvance,
-          policySafeChoiceAdvanced,
+          exactFreeChoiceAdvanced,
           checkoutStageAdvanced,
-          completionMode: policySafeChoiceAdvanced ? "safe_stage_transition" : "same_surface_selection",
+          completionMode: exactFreeChoiceAdvanced ? "exact_free_stage_transition" : "same_surface_selection",
           freeCommandDismissed,
           intendedOutcome: expected.intendedOutcome || "",
           semanticPolicyOutcomeVerified,
@@ -1452,6 +1452,26 @@ export function createOutcomeVerification({
     if (expected.type === "stage_exit_or_feedback") {
       const errors = actionableCheckoutErrors(afterMap.errors || []);
       const blockers = stageExitBlockers(afterMap, expected);
+      const blockersBefore = Array.isArray(expected.blockersBefore) ? expected.blockersBefore : [];
+      const newDestinationBlockers = blockers.filter((blocker) => !blockersBefore.some((before) => (
+        before?.code === blocker?.code && before?.message === blocker?.message
+      )));
+      const targetRetiredFromActiveSurface = Boolean(
+        beforeExpectedControl
+        && (
+          !directlyMatchedControl
+          || directlyMatchedControl.representationLifecycle?.status === "dormant_hidden"
+          || directlyMatchedControl.representationLifecycle?.active === false
+        )
+      );
+      if (expectedBeforeNavigationUrl !== verifiedAfterNavigationUrl) {
+        return {
+          ok: true,
+          code: "NAVIGATION_URL_CHANGED",
+          message: "Navigation advanced to a fresh URL.",
+          evidence
+        };
+      }
       if (progressMarkerChanged) {
         return { ok: true, code: "NAVIGATION_PROGRESS_CHANGED", message: "Navigation advanced the current progress marker.", evidence };
       }
@@ -1463,6 +1483,20 @@ export function createOutcomeVerification({
           evidence
         };
       }
+      // A successful same-document Continue commonly retires its source
+      // actuator and reveals the next stage's required fields before a route,
+      // progress marker, or stable stage label updates. Those fresh required
+      // fields are the destination work; they cannot retroactively make the
+      // source navigation fail. Require both source-target retirement and a
+      // newly owned blocker so arbitrary DOM churn still cannot prove success.
+      if (targetRetiredFromActiveSurface && newDestinationBlockers.length && (changed || visualChanged)) {
+        return {
+          ok: true,
+          code: "NAVIGATION_DESTINATION_REQUIREMENT_REVEALED",
+          message: "Navigation retired the source actuator and revealed a fresh destination requirement.",
+          evidence: { ...evidence, blockers, blockersBefore, newDestinationBlockers }
+        };
+      }
       if (validationAppeared) {
         return {
           ok: false,
@@ -1470,9 +1504,6 @@ export function createOutcomeVerification({
           message: "Navigation revealed fresh validation that now owns the next obligation.",
           evidence: { ...evidence, errors, blockers, validationIssues: afterMap.validationIssues || [] }
         };
-      }
-      if ((changed || visualChanged) && !blockers.length) {
-        return { ok: true, code: "PAGE_CHANGED", message: "Page structure changed after navigation action.", evidence };
       }
       if (errors.length || blockers.length) {
         return {
@@ -1482,17 +1513,24 @@ export function createOutcomeVerification({
           evidence: { ...evidence, blockers }
         };
       }
+      // Source-page churn is not destination evidence. Checkout SPAs often
+      // rerender the clicked section before the next stage hydrates. Keep the
+      // dispatched navigation lifecycle open until a destination fact settles it.
       return {
-        ok: changed || visualChanged,
-        code: changed || visualChanged ? "PAGE_CHANGED" : "NO_OBSERVABLE_STAGE_CHANGE",
-        message: changed || visualChanged ? "Page changed after navigation action." : "Navigation action did not produce an observable page change.",
+        ok: false,
+        code: changed || visualChanged ? "NAVIGATION_TRANSITION_PENDING" : "NO_OBSERVABLE_STAGE_CHANGE",
+        message: changed || visualChanged
+          ? "The source surface changed, but no destination fact proves checkout advancement yet."
+          : "Navigation action did not produce an observable page change.",
         evidence
       };
     }
     return {
-      ok: changed || visualChanged,
-      code: changed || visualChanged ? "OBSERVABLE_CHANGE" : "NO_OBSERVABLE_CHANGE",
-      message: changed || visualChanged ? "Page changed after the action." : "No observable page change after the action.",
+      ok: false,
+      code: expected.type === "exact_outcome_missing" ? "EXACT_OUTCOME_MISSING" : "OUTCOME_TYPE_UNSUPPORTED",
+      message: expected.type === "exact_outcome_missing"
+        ? "The governed action did not carry a typed success contract."
+        : `The browser verifier does not own the outcome type ${expected.type || "unknown"}.`,
       evidence
     };
   }

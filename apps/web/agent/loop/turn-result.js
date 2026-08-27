@@ -5,10 +5,9 @@ const {
 } = require("../../../../packages/shared/agent-actions");
 const { withUpdate } = require("../../../../packages/shared/agent-state");
 const { currentObligation } = require("../authority-frames");
-const { obligationField } = require("../current-obligation");
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  return currentObligation(taskState);
 }
 
 function finalHandoffAction(reason, observation = {}, overrides = {}) {
@@ -95,7 +94,8 @@ function summarizeTurn({ pageState, requirements, plannedAction, finalAction, po
 }
 
 function toClientDecision(action) {
-  const actionLease = createActionLease(action);
+  const mechanicalAction = ["click", "type", "select", "keypress", "scroll", "click_xy"].includes(action.type);
+  const actionLease = mechanicalAction ? createActionLease(action) : null;
   const decision = {
     source: "agent-loop",
     actionId: action.id || "",
@@ -114,9 +114,15 @@ function toClientDecision(action) {
     reobserveRetryToken: action.reobserveRetryToken || "",
     message: action.reason || "Working on the next step.",
     needsApproval: action.requiresApproval,
+    userActionRequired: action.userActionRequired === true,
     risk: action.risk,
     reason: action.reason
   };
+  if (!mechanicalAction) {
+    decision.observationId = action.observationId || "";
+    decision.observationHash = action.observationHash || "";
+    decision.intent = action.intent || action.type || "";
+  }
   return decision;
 }
 

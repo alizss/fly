@@ -61,7 +61,8 @@ export function createPageMapCompiler(dependencies) {
   } = dependencies;
 
   function buildPageMap() {
-    beginObservationCompilation();
+    const finishObservationCompilation = beginObservationCompilation();
+    try {
     const text = primaryPageText();
     const fullText = visiblePageText();
     const sourceActionElements = queryAllDeep("button, a, input[type='button'], input[type='submit'], [role='button'], [role='option'], [role='menuitem'], [role='checkbox'], [role='radio']")
@@ -310,6 +311,9 @@ export function createPageMapCompiler(dependencies) {
     map.foreground = foregroundSurfaceState(map.currentSurface || {});
     map.visualState = visualPageState(map);
     return map;
+    } finally {
+      finishObservationCompilation?.();
+    }
   }
 
   return Object.freeze({ buildPageMap });

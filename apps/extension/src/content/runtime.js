@@ -1,7 +1,7 @@
 import {
-  approvedSelectedBookingAcquisitionFromMap,
   authoritativeSelectedBookingFacts,
   composeSelectedBookingContract,
+  selectedBookingMissingFacts,
   validStoredSelectedBookingContract
 } from "./selected-booking.js";
 import { createAgentRuntimeContext } from "./runtime-context.js";
@@ -17,7 +17,7 @@ import { createControlRegistryTools } from "./observation/control-registry.js";
 import { createElementRegistry } from "./observation/element-registry.js";
 import { createControlGraphCompiler } from "./observation/control-graph.js";
 import { createDecisionGroupCompiler } from "./observation/decision-groups.js";
-import { implicitRole, isVisible, queryAllDeep, textFromIds } from "./observation/dom.js";
+import { beginDeepQueryPass, implicitRole, isVisible, queryAllDeep, textFromIds } from "./observation/dom.js";
 import { createPageStateStore } from "./observation/page-state-store.js";
 import { createPageStateSupport } from "./observation/page-state-support.js";
 import { createPageMapCompiler } from "./observation/page-map.js";
@@ -130,6 +130,7 @@ import {
     agent.lastActionResult = null;
     agent.activeExecutionActionId = "";
     agent.activeExecutionObservationId = "";
+    agent.engineReconciliationPending = false;
   }
 
   function rememberChoiceActuatorBinding(controlId = "", actuator = null, decision = {}) {
@@ -401,7 +402,7 @@ import {
   const DESTINATION_MUTATION_SETTLE_MS = 450;
   async function saveResumeMarker() {
     try {
-      if (!agent.running || !agent.sessionId) {
+      if ((!agent.running && !agent.engineReconciliationPending) || !agent.sessionId) {
         await clearResumeMarker();
         return;
       }
@@ -629,11 +630,8 @@ import {
 
   function inferCheckoutSite() {
     const host = location.hostname.toLowerCase();
-    if (host.includes("gotogate")) return "gotogate";
-    if (host.includes("croatiaairlines")) return "croatia-airlines";
-    if (host.includes("skyscanner")) return "skyscanner";
     if (host.includes("localhost")) return "demo";
-    return "generic";
+    return "external-checkout";
   }
 
   function isPaymentField(input) {
@@ -839,6 +837,7 @@ import {
     resetAgentLoopLifecycle,
     scheduleDestinationObservation
   } = createAgentLifecycle({
+    DESTINATION_MUTATION_SETTLE_MS,
     DESTINATION_RETRY_INTERVAL_MS,
     DESTINATION_WAIT_TIMEOUT_MS,
     addAgentMessage,
@@ -937,25 +936,46 @@ import {
     // progress is evaluated by TaskState after the fresh observation, so the
     // result can never claim verified=true while postconditionSatisfied=false.
     const postconditionSatisfied = Boolean(verification.ok);
-    const validationDetails = [
+    const observedValidationDetails = [
       ...(verification.evidence?.validationIssues || []),
       ...(verification.evidence?.errors || []),
       ...(verification.evidence?.blockers || [])
     ].map((issue, index) => typeof issue === "string"
       ? { issueId: `browser-validation-${index + 1}`, message: issue }
       : issue).filter(Boolean);
+    // Verifier evidence can describe validation that already existed before
+    // dispatch. Only the verifier's exact before/after delta may call it an
+    // introduced blocker; carrying every diagnostic issue into settlement
+    // would let context overwrite the action result.
+    const introducedValidation = feedback.validationAppeared === true
+      ? observedValidationDetails
+      : [];
+    const destinationLoading = [
+      "NAVIGATION_TRANSITION_PENDING",
+      "DESTINATION_LOADING",
+      "WAITING_FOR_DESTINATION"
+    ].includes(String(verification.code || "").trim().toUpperCase());
     const browserActionOutcome = AGENT_CONTRACT?.compileActionOutcome?.({
-      status: feedback.validationAppeared === true || validationDetails.length
-        ? AGENT_CONTRACT.ACTION_OUTCOME.REVEALED_BLOCKER
-        : verification.ok
-          ? AGENT_CONTRACT.ACTION_OUTCOME.SATISFIED
-          : pageChanged
-            ? AGENT_CONTRACT.ACTION_OUTCOME.PROGRESSED
+      // The verifier owns the leased local postcondition. An overlay that is
+      // the expected result of opening a control is success, not a blocker.
+      // Only an unexpected overlay accompanying an unsatisfied postcondition
+      // may be published as a newly revealed obstruction.
+      status: verification.ok
+        ? AGENT_CONTRACT.ACTION_OUTCOME.SATISFIED
+        : feedback.validationAppeared === true || feedback.overlayAppeared === true
+          ? AGENT_CONTRACT.ACTION_OUTCOME.REVEALED_BLOCKER
+          : destinationLoading
+            ? AGENT_CONTRACT.ACTION_OUTCOME.DESTINATION_LOADING
             : AGENT_CONTRACT.ACTION_OUTCOME.NO_EFFECT,
       causedByActionId: actionId,
+      code: verification.code || "",
+      observedEvidence: {
+        ...(verification.evidence || {}),
+        mechanicalEffect: decision.mechanicalEffect || decision.physicalEffect || "unknown"
+      },
       originalSuccessContract: expectedOutcome,
-      introducedValidation: validationDetails,
-      candidateOwnerControlIds: validationDetails.map((issue) => issue?.controlId),
+      introducedValidation,
+      candidateOwnerControlIds: introducedValidation.map((issue) => issue?.controlId),
       surfaceChanged: feedback.surfaceChanged === true,
       urlChanged: feedback.navigationOccurred === true,
       progressChanged: feedback.progressChanged === true,
@@ -1020,7 +1040,7 @@ import {
       expectedOutcome,
       outcome: verification
     };
-    if (!verification.ok) {
+    if (!verification.ok && !destinationLoading) {
       rememberFailedLocalStrategy(decision, agent.pageMap || buildPageMap(), verification.code || "OUTCOME_NOT_VERIFIED");
     }
     agent.lastActionResult = result;
@@ -1080,6 +1100,8 @@ import {
         : AGENT_CONTRACT?.compileActionOutcome?.({
             status: AGENT_CONTRACT.ACTION_OUTCOME.NO_EFFECT,
             causedByActionId: actionId,
+            code: String(outcome.code || "ACTION_NOT_DISPATCHED"),
+            observedEvidence: outcome.feedback || {},
             originalSuccessContract: decision.expectedOutcome || null
           }) || null,
       action: {
@@ -1146,6 +1168,7 @@ import {
     return reportActionResult({
       at: new Date().toISOString(),
       type: decision.action || "stop",
+      userActionRequired: decision.userActionRequired === true,
       actionId: actionId || decision.actionId || decision.id || nextFlowId("act"),
       observationId: observationId || decision.observationId || agent.activeObservationId || "",
       executed: true,
@@ -1357,10 +1380,48 @@ import {
     };
   }
 
-  function resolveOwnedControlMeaning(evidence = {}, fallbackSemantic = "", surfaceType = "page") {
+  function collapseRepeatedOwnedText(value = "") {
+    let tokens = compactText(value, 500).toLowerCase().split(/\s+/).filter(Boolean);
+    while (tokens.length > 1 && tokens.length % 2 === 0) {
+      const midpoint = tokens.length / 2;
+      const left = tokens.slice(0, midpoint);
+      const right = tokens.slice(midpoint);
+      if (left.some((token, index) => token !== right[index])) break;
+      tokens = left;
+    }
+    return tokens.join(" ");
+  }
+
+  function paymentMethodKindForEvidence(evidence = {}, context = {}) {
+    const commandLike = /^(?:a|button)$/.test(String(evidence.tagName || ""))
+      || /^(?:button|link|radio|option)$/.test(String(evidence.role || ""))
+      || /^(?:button|radio|submit)$/.test(String(evidence.type || ""));
+    if (!commandLike) return "";
+    const meanings = [
+      evidence.label,
+      evidence.ownText,
+      evidence.title,
+      evidence.ariaLabel,
+      evidence.graphicName,
+      evidence.name,
+      evidence.testId
+    ].map(collapseRepeatedOwnedText).filter(Boolean);
+    const directCardRoute = /^(?:continue to payment\s+)?(?:pay (?:by|with|via) )?(?:card|credit card|debit card|credit\s*(?:\/|or)\s*debit card|credit card\s*(?:\/|or)\s*debit card|debit card\s*(?:\/|or)\s*credit card)$/i;
+    if (meanings.some((meaning) => directCardRoute.test(meaning))) return "card";
+    if (meanings.some((meaning) => /^(?:apple pay|google pay|paypal|klarna|tkpay(?: wallet)?|keks pay)$/i.test(meaning))) return "wallet";
+    const paymentContext = String(context.sectionType || "").toLowerCase() === "payment"
+      || /(?:select|choose|payment)\s+(?:a\s+)?payment method|payment method|pay with|credit card payment/i.test(String(context.sectionLabel || ""));
+    if (paymentContext && meanings.some((meaning) => /^(?:visa|mastercard|master card|american express|amex|maestro|diners club(?: international)?|discover)$/i.test(meaning))) {
+      return "card";
+    }
+    if (paymentContext && meanings.some((meaning) => /\b(?:card|payment|wallet|pay)\b/i.test(meaning))) return "alternative";
+    return "";
+  }
+
+  function resolveOwnedControlMeaning(evidence = {}, fallbackSemantic = "", surfaceType = "page", context = {}) {
     const ownIdentity = `${evidence.testId || ""} ${evidence.id || ""} ${evidence.name || ""}`.trim().toLowerCase();
     const identity = `${ownIdentity} ${evidence.formId || ""} ${evidence.formAction || ""}`.trim().toLowerCase();
-    const ownMeaning = `${evidence.ownText || ""} ${evidence.title || ""}`.trim().toLowerCase();
+    const ownMeaning = collapseRepeatedOwnedText(`${evidence.ownText || ""} ${evidence.title || ""}`);
     const accessibleHint = String(evidence.ariaLabel || "").trim().toLowerCase();
     const commandLike = /^(?:a|button)$/.test(String(evidence.tagName || ""))
       || /^(?:button|link)$/.test(String(evidence.role || ""))
@@ -1369,9 +1430,12 @@ import {
     const semanticBlocksAdvance = /(?:selection_cta|add_paid_extra|select_paid_option|decline_paid_extra|decline_baggage|safe_decline|select_free_option)/.test(
       String(fallbackSemantic || "")
     );
-    const purchaseCommit = commandLike && (
+    const paymentMethodKind = paymentMethodKindForEvidence(evidence, context);
+    const explicitPaymentMethodRoute = Boolean(paymentMethodKind);
+    const explicitForwardCommand = /^(?:continue|next|proceed|submit)(?: to payment)?$/.test(ownMeaning);
+    const purchaseCommit = commandLike && !explicitPaymentMethodRoute && !explicitForwardCommand && (
       /(?:^|[-_])(?:paynow|booknow|purchase|placeorder|submitpayment|completebooking)(?:$|[-_])/.test(ownIdentity)
-      || /^(?:pay(?: now| securely)?|book now|purchase|place order|submit (?:payment|purchase)|complete (?:booking|purchase)|confirm (?:and pay|booking|payment))(?:\s|$)/.test(ownMeaning)
+      || /^(?:pay(?: now| securely)?(?:\s+(?:[0-9]+(?:[.,][0-9]+)?|[a-z]{3}))?|book now|purchase|place order|submit (?:payment|purchase)|complete (?:booking|purchase)|confirm (?:and pay|booking|payment))$/.test(ownMeaning)
     );
     const strongDismiss = /(?:^|[-_])(dialog|modal|seatmap)?[-_]?close(?:$|[-_])|dismiss|close-button/.test(ownIdentity)
       || /^(close|dismiss)( window| dialog| modal)?$/.test(ownMeaning)
@@ -1379,15 +1443,21 @@ import {
     // A form action belongs to the form submission command, not to every
     // textbox, radio and checkbox contained by the form. Inheriting a URL
     // such as /PaymentForm made every child look like checkout navigation.
-    const strongAdvance = commandLike && !purchaseCommit && !semanticBlocksAdvance && (
+    // Payment routes are classified here once from their owned evidence. The
+    // logical-control compiler consumes this result and must not run a second
+    // label interpretation authority.
+    const strongAdvance = commandLike && !purchaseCommit && !explicitPaymentMethodRoute
+      && (!semanticBlocksAdvance || explicitForwardCommand)
+      && (
       /submit|continue|proceed|next|saveandcontinue/.test(commandIdentity)
       || /^(continue|next|proceed|submit)( to payment)?$/.test(ownMeaning)
       || /^(confirm|review and confirm)$/.test(ownMeaning)
       || /^(?:finish|complete) (?:configuration|selection|choices?|options?)$/.test(ownMeaning)
-    );
+      );
     const strongOpen = /edit|change|open/.test(ownIdentity)
       || /^(edit|change|open)\b/.test(ownMeaning);
-    const choiceControl = /radio|checkbox|option/.test(`${evidence.role || ""} ${evidence.type || ""}`);
+    const choiceControl = context.choiceBound === true
+      || /radio|checkbox|option/.test(`${evidence.role || ""} ${evidence.type || ""}`);
     const informationDisclosure = evidence.controlsInformationOnly === true
       && Boolean(evidence.ariaControls)
       && evidence.ariaExpanded !== ""
@@ -1406,6 +1476,12 @@ import {
     }
     if (strongDismiss) return { semantic: "dismiss_surface", physicalEffect: "dismiss_surface", conflict: false };
     if (purchaseCommit) return { semantic: "submit_purchase", physicalEffect: "submit_purchase", conflict: false };
+    if (explicitPaymentMethodRoute) return {
+      semantic: "payment_method",
+      physicalEffect: "reveal_control",
+      paymentMethodKind,
+      conflict: false
+    };
     if (informationDisclosure) return { semantic: "reveal_information", physicalEffect: "open_surface", conflict: false };
     if (strongOpen) return { semantic: "open_surface", physicalEffect: "open_surface", conflict: false };
     if (strongAdvance) {
@@ -1416,10 +1492,20 @@ import {
         conflict: false
       };
     }
+    if (commandLike && !choiceControl && explicitDeclineCommand) {
+      // A command-shaped decline owns a transition, not option state. On a
+      // child surface it dismisses that surface; on the page it advances the
+      // checkout after declining the offer. This structural contract covers
+      // unfamiliar wording without a product/site vocabulary.
+      return {
+        semantic: fallbackSemantic && fallbackSemantic !== "unknown"
+          ? fallbackSemantic
+          : "safe_decline",
+        physicalEffect: surfaceType === "page" ? "advance_checkout_stage" : "dismiss_surface",
+        conflict: false
+      };
+    }
     if (/decline_paid_extra|decline_baggage|safe_decline|select_free_option/.test(fallbackSemantic)) {
-      if (!choiceControl && surfaceType !== "page" && explicitDeclineCommand) {
-        return { semantic: fallbackSemantic, physicalEffect: "dismiss_surface", conflict: false };
-      }
       return { semantic: fallbackSemantic, physicalEffect: "select_free_option", conflict: false };
     }
     if (/add_paid_extra|select_paid_option/.test(fallbackSemantic)) {
@@ -2470,8 +2556,15 @@ import {
   }
 
   function beginObservationCompilation() {
-    elementRegistry.begin();
-    activeObservationControlRegistry = null;
+    const finishDeepQueryPass = beginDeepQueryPass();
+    try {
+      elementRegistry.begin();
+      activeObservationControlRegistry = null;
+      return finishDeepQueryPass;
+    } catch (error) {
+      finishDeepQueryPass();
+      throw error;
+    }
   }
 
   function currentObservationCompilation() {
@@ -2576,11 +2669,10 @@ import {
 
   const {
     admitForStart: admitSelectedBookingForStart,
-    acquireForStart: acquireSelectedBookingForStart,
-    approveVisibleSummary: approveVisibleSelectedBookingSummary,
     armSelectionCapture: armSelectedBookingCapture,
     cancel: cancelSelectedBookingCapture,
     capture: captureSelectedBookingFromMap,
+    discard: discardSelectedBookingAcquisition,
     disarmSelectionCapture: disarmSelectedBookingCapture,
     hydrate: hydrateSelectedBookingAcquisition,
     read: readSelectedBookingAcquisition,
@@ -3343,10 +3435,182 @@ import {
       surfaceClass: surface.surfaceClass || "unknown",
       blocksBackground: Boolean(surface.blocksBackground),
       parentSurfaceId: surface.parentSurfaceId || "",
+      parentSectionId: surface.parentSectionId || "",
+      parentSectionType: surface.parentSectionType || "",
+      parentSectionLabel: surface.parentSectionLabel || "",
+      expectedResolution: surface.expectedResolution || "",
       observationId: surface.observationId || "",
       memberControlIds: uniqueControlIds(surface.memberControlIds || surface.controlIds || surface.options || []),
       memberActuatorIds: [...new Set(surface.memberActuatorIds || [])].filter(Boolean),
       foreground: surface.foreground || surface.visualState?.foreground || null
+    };
+  }
+
+  function structuralControlForTransport(control = {}, observationId = "") {
+    const machineIdentity = [
+      control.testId,
+      control.stableKey,
+      control.formId,
+      control.id
+    ].filter(Boolean).join(" ").toLowerCase();
+    // Page chrome (for example itinerary edit actions) is still checkout
+    // evidence. Only Fly's own injected controls are excluded.
+    const nonPageUi = /split-notch-(?:chat-button|agent-trigger)|agent-management-(?:settings|close)|assistant-controls/.test(machineIdentity);
+    return {
+      controlId: control.controlId || "",
+      stableKey: control.stableKey || "",
+      label: control.label || "",
+      ownText: control.ownText || "",
+      accessibleName: control.accessibleName || "",
+      accessibleDescription: control.accessibleDescription || "",
+      ariaLabel: control.ariaLabel || "",
+      title: control.title || "",
+      name: control.name || "",
+      id: control.id || "",
+      testId: control.testId || "",
+      placeholder: control.placeholder || "",
+      autocomplete: control.autocomplete || "",
+      inputMode: control.inputMode || "",
+      inputType: control.inputType || "",
+      pattern: control.pattern || "",
+      kind: control.kind || control.controlKind || "",
+      role: control.role || "",
+      domRole: control.domRole || "",
+      formAction: control.formAction || "",
+      formMethod: control.formMethod || "",
+      formId: control.formId || "",
+      controlledElementIds: [...new Set(control.controlledElementIds || [])].filter(Boolean),
+      ariaExpanded: control.ariaExpanded ?? "",
+      iconOnly: control.iconOnly === true,
+      options: (control.options || []).map((option) => ({
+        value: option?.value ?? "",
+        label: option?.label ?? "",
+        disabled: option?.disabled === true,
+        selected: option?.selected === true
+      })),
+      optionCount: Number(control.optionCount || 0),
+      optionsTruncated: control.optionsTruncated === true,
+      state: control.state || control.controlState || {},
+      currentValue: control.currentValue ?? control.state?.normalizedValue ?? "",
+      selected: control.selected === true,
+      // Native/current-state facts are structural evidence. They do not say
+      // what the control means, but DecisionFrame and exact mechanics must be
+      // able to distinguish an optional empty control from a required one.
+      required: control.state?.required === true,
+      invalid: control.state?.invalid === true,
+      disabled: control.disabled === true || control.logicalDisabled === true,
+      structuredPrice: control.structuredPrice || null,
+      representationLifecycle: control.representationLifecycle || null,
+      surfaceId: control.surfaceId || "surface-page",
+      surfaceType: control.surfaceType || "page",
+      surfaceLabel: control.surfaceLabel || "",
+      surfaceMembershipEvidence: control.surfaceMembershipEvidence || "",
+      sectionId: control.sectionId || "",
+      sectionLabel: control.sectionLabel || "",
+      globalChrome: control.globalChrome === true,
+      tightOwnerId: control.tightOwnerId || control.fieldClassification?.tightOwnerId || "",
+      tightOwnerKey: control.tightOwnerKey || control.fieldClassification?.tightOwnerKey || "",
+      ownershipIntegrity: control.ownershipIntegrity || null,
+      // Membership is topology, not business meaning. The browser owns the
+      // exact state/actuator graph; DecisionFrame alone owns the group's
+      // subject, policy consequence, and required work.
+      decisionGroupId: control.decisionGroupId || "",
+      stateElementId: control.stateElementId || "",
+      visibleWidgetElementId: control.visibleWidgetElementId || "",
+      preferredActivationElementId: control.preferredActivationElementId || "",
+      actuators: control.actuators || [],
+      operations: control.operations || {},
+      recovery: Object.fromEntries(Object.entries(control.recovery || {}).map(([operation, recovery]) => [
+        operation,
+        recovery
+          ? {
+              ...recovery,
+              regions: (recovery.regions || []).map((region) => normalizeVisualRegionContract(region, {
+                observationId,
+                controlId: control.controlId,
+                operation,
+                source: `control.recovery.${operation}`,
+                surfaceId: control.surfaceId || ""
+              }))
+            }
+          : null
+      ])),
+      visualRegions: (control.visualRegions || []).map((region) => normalizeVisualRegionContract(region, {
+        observationId,
+        controlId: control.controlId,
+        operation: region.operation || "",
+        source: region.source || "control.visual_region",
+        surfaceId: control.surfaceId || ""
+      })),
+      visualRegion: control.visualRegion
+        ? normalizeVisualRegionContract(control.visualRegion, {
+            observationId,
+            controlId: control.controlId,
+            source: control.visualRegion.source || "control.visual_region",
+            surfaceId: control.surfaceId || ""
+          })
+        : null,
+      sourceProvenance: {
+        kind: nonPageUi ? "non_page_ui" : "page_dom",
+        evidence: nonPageUi
+          ? (control.globalChrome === true ? "global_chrome" : "injected_assistant_machine_identity")
+          : "document_control_graph"
+      }
+    };
+  }
+
+  function structuralDecisionGroupForTransport(group = {}, controlsById = new Map()) {
+    const memberIds = uniqueControlIds(group.alternativeControlIds || group.alternatives || [])
+      .filter((controlId) => controlsById.has(controlId));
+    const memberControls = memberIds.map((controlId) => controlsById.get(controlId)).filter(Boolean);
+    const exactChoiceOwnerRequired = memberControls.some((control) => {
+      const ownerId = control.choiceContract?.decisionOwnerId || "";
+      const owner = ownerId ? elementById(ownerId) : null;
+      return Boolean(
+        owner
+        && (
+          owner.required === true
+          || owner.getAttribute?.("required") !== null
+          || owner.getAttribute?.("aria-required") === "true"
+        )
+      );
+    });
+    const requiredStateObserved = memberControls.some((control) => (
+      control.state?.required === true
+    )) || exactChoiceOwnerRequired;
+    return {
+      decisionGroupId: group.decisionGroupId || group.decisionId || group.requirementId || "",
+      surfaceId: group.surfaceId || "surface-page",
+      surfaceType: group.surfaceType || "page",
+      sectionId: group.sectionId || "",
+      sectionLabel: group.sectionLabel || group.label || "",
+      // This is locally owned state of the exact bounded choice owner, not a
+      // business requirement or scheduler status. DecisionFrame remains the
+      // sole layer that decides what the state means and whether it creates
+      // work.
+      requiredStateObserved,
+      selectedControlId: memberIds.includes(group.selectedControlId) ? group.selectedControlId : "",
+      selectedLabel: group.selectedLabel || "",
+      // Selected-item ownership and price are objective current-state facts.
+      // Preserve them across the compact boundary so DecisionFrame can be the
+      // one layer that interprets paid/free meaning and schedules correction.
+      selectedEvidence: group.selectedEvidence ? {
+        selected: group.selectedEvidence.selected === true,
+        selectedControlId: group.selectedEvidence.selectedControlId || "",
+        ownerElementId: group.selectedEvidence.ownerElementId || "",
+        source: group.selectedEvidence.source || "",
+        structuredPrice: group.selectedEvidence.structuredPrice || null
+      } : null,
+      selectionInvariant: group.selectionInvariant || null,
+      alternativeControlIds: memberIds,
+      alternatives: (group.alternatives || []).filter((option) => memberIds.includes(option.controlId)).map((option) => ({
+        controlId: option.controlId || "",
+        targetId: option.targetId || option.exactActuator?.targetId || "",
+        label: option.label || "",
+        selected: option.selected === true,
+        structuredPrice: option.structuredPrice || null,
+        state: option.state || null
+      }))
     };
   }
 
@@ -3361,7 +3625,19 @@ import {
       aliasConflictCount: aliasIndex.conflicts.length,
       aliasConflicts: aliasIndex.conflicts.slice(0, 12)
     };
+    const structuralControls = (map.controls || [])
+      .map((control) => structuralControlForTransport(control, observationId))
+      .filter((control) => control.sourceProvenance?.kind === "page_dom");
+    const structuralControlIds = new Set(structuralControls.map((control) => control.controlId));
+    const sourceControlsById = new Map((map.controls || [])
+      .filter((control) => structuralControlIds.has(control.controlId))
+      .map((control) => [control.controlId, control]));
+    const structuralDecisionGroups = (map.decisionGroups || [])
+      .filter((group) => group.projectionKind !== "synthetic_global_payment")
+      .map((group) => structuralDecisionGroupForTransport(group, sourceControlsById))
+      .filter((group) => group.alternativeControlIds.length > 0);
     return {
+      observationContract: "structural-observation/v1",
       site: map.site,
       url: currentNavigationUrl(),
       step: map.step || "unknown",
@@ -3380,7 +3656,7 @@ import {
       coverage: map.coverage || null,
       readiness: map.readiness || null,
       terminalEvidence: map.terminalEvidence || null,
-      stageExit: map.stageExit || null,
+      stageExit: null,
       text: map.text || map.fullText,
       snapshotHash: observationHashForMap(map),
       graphIntegrity,
@@ -3395,70 +3671,57 @@ import {
         landmarkCount: map.accessibility.landmarkCount,
         controlIds: uniqueControlIds(map.accessibility.controls || [])
       } : null,
-      // This is intentionally lossless. Meaning is resolved once by the
-      // backend Logical Field Adapter; transport only refreshes observation
-      // binding (not semantic ownership) and preserves the complete control.
-      controls: (map.controls || []).map((control) => {
-        const outgoing = {
-          ...control,
-          recovery: Object.fromEntries(Object.entries(control.recovery || {}).map(([operation, recovery]) => [
-            operation,
-            recovery
-              ? {
-                  ...recovery,
-                  regions: (recovery.regions || []).map((region) => normalizeVisualRegionContract(region, {
-                    observationId,
-                    controlId: control.controlId,
-                    operation,
-                    source: `control.recovery.${operation}`,
-                    surfaceId: control.surfaceId || ""
-                  }))
-                }
-              : null
-          ])),
-          visualRegions: (control.visualRegions || []).map((region) => normalizeVisualRegionContract(region, {
-            observationId,
-            controlId: control.controlId,
-            operation: region.operation || "",
-            source: region.source || "control.visual_region",
-            surfaceId: control.surfaceId || ""
-          })),
-          visualRegion: control.visualRegion
-            ? normalizeVisualRegionContract(control.visualRegion, {
-                observationId,
-                controlId: control.controlId,
-                source: control.visualRegion.source || "control.visual_region",
-                surfaceId: control.surfaceId || ""
-              })
-            : null
-        };
+      controls: structuralControls.map((outgoing) => {
         return AGENT_CONTRACT?.serializeObservedControl
           ? AGENT_CONTRACT.serializeObservedControl(outgoing, { observationId })
           : JSON.parse(JSON.stringify(outgoing));
       }),
       controlCollections: (map.controlCollections || []).map((collection) => ({
-        ...(AGENT_CONTRACT?.cloneSerializable?.(collection) || JSON.parse(JSON.stringify(collection)))
+        collectionId: collection.collectionId || "",
+        type: collection.type || "",
+        decisionGroupId: structuralDecisionGroups.some((group) => group.decisionGroupId === collection.decisionGroupId)
+          ? collection.decisionGroupId
+          : "",
+        sectionId: collection.sectionId || "",
+        surfaceId: collection.surfaceId || "surface-page",
+        totalCount: Math.max(0, Number(collection.totalCount || 0)),
+        retainedCount: Math.max(0, Number(collection.retainedCount || 0)),
+        omittedCount: Math.max(0, Number(collection.omittedCount || 0)),
+        availableCount: Math.max(0, Number(collection.availableCount || 0)),
+        disabledCount: Math.max(0, Number(collection.disabledCount || 0)),
+        selectedCount: Math.max(0, Number(collection.selectedCount || 0)),
+        requiresExpansion: collection.requiresExpansion === true
       })),
       transportCompleteness: (map.controlCollections || []).some((collection) => Number(collection.omittedCount || 0) > 0)
         ? "task_complete"
         : "full",
-      decisionGroups: (map.decisionGroups || []).map((group) => ({
-        ...(AGENT_CONTRACT?.cloneSerializable?.(group) || JSON.parse(JSON.stringify(group))),
-        alternativeControlIds: uniqueControlIds(group.alternativeControlIds || group.alternatives || [])
-      })),
+      // Synthetic business groups (notably the browser's global payment
+      // projection) are local diagnostics. DecisionFrame rebuilds them from
+      // structural control evidence so browser classification cannot decide
+      // which checkout work exists. Bounded DOM-owned groups cross only as
+      // neutral membership and selected-state evidence.
+      decisionGroups: structuralDecisionGroups,
       errors: actionableCheckoutErrors(map.errors),
-      validationIssues: (map.validationIssues || []).map((issue) => (
-        AGENT_CONTRACT?.cloneSerializable?.(issue) || JSON.parse(JSON.stringify(issue))
-      )).slice(0, 12),
-      paidChoices: map.paidChoices,
+      validationIssues: (map.validationIssues || []).map((issue) => ({
+        issueId: issue.issueId || "",
+        message: issue.message || issue.text || "",
+        controlId: structuralControlIds.has(issue.controlId) ? issue.controlId : "",
+        surfaceId: issue.surfaceId || "surface-page",
+        stageWide: issue.stageWide === true,
+        status: issue.status || "",
+        visible: issue.visible !== false,
+        active: issue.active === true,
+        errorCount: Number.isFinite(Number(issue.errorCount)) ? Number(issue.errorCount) : null,
+        introducedAfterAction: issue.introducedAfterAction === true,
+        invalidControlIds: uniqueControlIds(issue.invalidControlIds || []).filter((controlId) => structuralControlIds.has(controlId))
+      })).slice(0, 12),
+      paidChoices: [],
       completedFields: agent.completedFields || {},
       sections: (map.sections || []).map((section) => ({
         id: section.id,
         label: section.label,
-        type: section.type,
+        type: "",
         order: section.order,
-        required: Boolean(section.required),
-        paidChoice: Boolean(section.paidChoice),
         controlIds: uniqueControlIds([
           ...(section.fields || []),
           ...(section.choices || []),
@@ -3594,6 +3857,7 @@ import {
     beginDestinationWait,
     buildPageMap,
     buttonText,
+    clearResumeMarker,
     clearExecutionContext,
     clickResolvedViewportTarget,
     clickableAncestor,
@@ -3630,6 +3894,7 @@ import {
     queryAllDeep,
     recordAction,
     rejectMechanicalAction,
+    resetAgentLoopLifecycle,
     rememberActionExecutionResult,
     rememberCanonicalSelectionCommitment,
     rememberChoiceVisualStateBeforeDispatch,
@@ -3638,6 +3903,7 @@ import {
     renderSidebar: (...args) => renderSidebar(...args),
     reportActionResult,
     resolveDecisionTarget,
+    saveResumeMarker,
     scrollElementWithinNearestContainer,
     setAgentActivity,
     setFieldValue,
@@ -3646,6 +3912,7 @@ import {
     showAgentThought,
     sleep,
     stableHash,
+    stopWatchingCheckoutChanges: () => stopWatchingCheckoutChanges(),
     targetFingerprint,
     targetLocalDispatchIdentity,
     traveler,
@@ -3696,7 +3963,6 @@ import {
     setObserverTab,
     takeOverCheckout
   } = createCheckoutController({
-    DESTINATION_MUTATION_SETTLE_MS,
     addAgentMessage,
     agent: runtimeScopes.checkout,
     announceSectionQueue,
@@ -3719,7 +3985,6 @@ import {
     resetFieldProgress,
     runRiskChecks,
     saveResumeMarker,
-    scheduleDestinationObservation,
     setAgentActivity,
     setWarnings: (nextWarnings) => {
       warnings = nextWarnings;
@@ -3781,10 +4046,32 @@ import {
     travelerRules
   });
 
+  function continueOnMaterialPageChange() {
+    if (!agent.sessionId) return false;
+    if (!agent.running && !agent.engineReconciliationPending) return false;
+    if (agent.engineReconciliationPending) {
+      agent.engineReconciliationPending = false;
+      agent.running = true;
+      agent.awaiting = "";
+      setAgentActivity(
+        "Page changed; continuing checkout",
+        "The dormant engine session observed fresh structural evidence and is resuming automatically."
+      );
+      void saveResumeMarker();
+    }
+    if (agent.loopBusy || agent.activePlannerRequest) {
+      agent.loopRerunQueued = true;
+      return true;
+    }
+    processCheckoutAgent();
+    return true;
+  }
+
   ({ watch: watchForCheckoutChanges, stop: stopWatchingCheckoutChanges } = createCheckoutWatcher({
     destinationMutationSettleMs: DESTINATION_MUTATION_SETTLE_MS,
     getDestinationWait: () => agent.destinationWait,
     hasFilledFields: () => Boolean(filledFields.length),
+    onMaterialPageChange: continueOnMaterialPageChange,
     pageStateStore,
     refreshSidebarWarnings: () => {
       warnings = runRiskChecks();
@@ -3836,6 +4123,9 @@ import {
         awaiting: agent.awaiting
       }),
       agentLoopState: () => ({
+        running: agent.running,
+        sessionId: agent.sessionId,
+        engineReconciliationPending: agent.engineReconciliationPending,
         lifecycleId: agent.lifecycleId,
         loopBusy: agent.loopBusy,
         loopRerunQueued: agent.loopRerunQueued,
@@ -3850,6 +4140,7 @@ import {
           lifecycleId: agent.activePlannerRequest.lifecycleId
         } : null
       }),
+      continueOnMaterialPageChange,
       processCheckoutAgent,
       watchForCheckoutChanges,
       beginDestinationWait,
@@ -3860,19 +4151,19 @@ import {
       narrowerExactControlOwner,
       compactPageMap,
       authoritativeSelectedBookingFacts,
-      approvedSelectedBookingAcquisitionFromMap,
+      selectedBookingMissingFacts,
       admitSelectedBookingForStart,
       composeSelectedBookingContract,
       validStoredSelectedBookingContract,
       captureSelectedBookingFromMap,
-      approveVisibleSelectedBookingSummary,
+      discardSelectedBookingAcquisition,
       armSelectedBookingCapture,
-      acquireSelectedBookingForStart,
       disarmSelectedBookingCapture,
       hydrateSelectedBookingAcquisition,
       readSelectedBookingAcquisition,
       scheduleSelectedBookingCapture,
       startAgentSession,
+      reportActionResult,
       compactSurfaceReference,
       observationTransportBytes,
       observationNeedsScreenshot,
@@ -3927,6 +4218,7 @@ import {
       trustedBrowserKey,
       settleTrustedChoiceInteraction,
       settleExactChoiceOutcome,
+      finalizeGovernedAction,
       holdDispatchedStageExit,
       shouldHoldDispatchedStageExit,
       choiceEpisodeEvidence,
@@ -3939,6 +4231,7 @@ import {
       dispatchKey,
       setFieldValue,
       expectedOutcomeForDecision,
+      executeAgentDecision,
       verifyExpectedOutcome,
       transitionFeedbackForMaps,
       rememberActionExecutionResult,

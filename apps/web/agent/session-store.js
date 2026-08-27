@@ -190,15 +190,12 @@ function compactTaskState(taskState = null) {
   const verificationDecisionMemory = taskState.verificationDecisionMemory || taskState.canonicalDecisions;
   return {
     contractVersion: String(taskState.contractVersion || "task-state/v2"),
-    goal: eventSummary(taskState.goal || null),
+    milestone: eventSummary(taskState.milestone || null),
     userPreferences: eventSummary(taskState.userPreferences || {}),
     safetyRestrictions: eventSummary(taskState.safetyRestrictions || {}),
     terminalGoalLatch: eventSummary(taskState.terminalGoalLatch || null),
     checkoutBoundary: eventSummary(taskState.checkoutBoundary || null),
     stage: String(taskState.stage || "unknown"),
-    transactionOutcome: eventSummary(taskState.transactionOutcome || null),
-    stageOutcome: eventSummary(taskState.stageOutcome || null),
-    surfaceSubgoal: eventSummary(taskState.surfaceSubgoal || null),
     decisionEpisode: eventSummary(taskState.decisionEpisode || null),
     verifiedCommerceObligations: eventSummary(taskState.verifiedCommerceObligations || []),
     verifiedProfileComponents: eventSummary(taskState.verifiedProfileComponents || []),
@@ -292,6 +289,8 @@ function compactTransactionInvariants(envelope = null) {
     current: compactInvariantFacts(envelope.current || null),
     outcomeLedger: eventSummary(envelope.outcomeLedger || []),
     reviewFacts: compactInvariantFacts(envelope.reviewFacts || null),
+    baselineAuthority: String(envelope.baselineAuthority || ""),
+    baselineLocked: envelope.baselineLocked === true,
     baselineStatus: String(envelope.baselineStatus || ""),
     baselineObservationId: String(envelope.baselineObservationId || ""),
     approvedAt: String(envelope.approvedAt || ""),
@@ -405,7 +404,7 @@ function compactExecutionEpisode(state = {}) {
   return {
     ...eventSummary(current),
     contractVersion: "execution-episode/v2",
-    obligationId: String(obligation?.obligationId || current.obligationId || pending?.obligationId || ""),
+    obligationId: String(obligation?.id || current.obligationId || pending?.obligationId || ""),
     leasedAction: pending,
     status: String(current.status || recovery?.phase || (pending ? "leased" : "idle")),
     failedStrategies: eventSummary(recovery?.failedStrategies || []),
@@ -752,24 +751,40 @@ function createStore({ dbPath = DEFAULT_DB_PATH } = {}) {
     return { ok: true, actionId: action.id, signature };
   }
 
-  function updateGovernedAction(actionId, status, result = null) {
+  function updateGovernedAction(actionId, status, result) {
     if (!actionId) return false;
-    const outcome = db.prepare(`
-      UPDATE governed_actions SET status = ?, result_json = ?, updated_at = ?
-      WHERE action_id = ?
-    `).run(String(status || "reported"), result == null ? null : json(result, {}), nowIso(), actionId);
+    const preserveBrowserResult = result === undefined;
+    const outcome = preserveBrowserResult
+      ? db.prepare(`
+          UPDATE governed_actions SET status = ?, updated_at = ?
+          WHERE action_id = ?
+        `).run(String(status || "reported"), nowIso(), actionId)
+      : db.prepare(`
+          UPDATE governed_actions SET status = ?, result_json = ?, updated_at = ?
+          WHERE action_id = ?
+        `).run(String(status || "reported"), result == null ? null : json(result, {}), nowIso(), actionId);
     return outcome.changes > 0;
   }
 
-  function advanceGovernedAction(actionId, fromStatuses, status, result = null) {
+  function advanceGovernedAction(actionId, fromStatuses, status, result) {
     if (!actionId) return false;
     const allowed = [...new Set((Array.isArray(fromStatuses) ? fromStatuses : [fromStatuses]).filter(Boolean).map(String))];
     if (!allowed.length) return false;
     const placeholders = allowed.map(() => "?").join(", ");
-    const outcome = db.prepare(`
-      UPDATE governed_actions SET status = ?, result_json = ?, updated_at = ?
-      WHERE action_id = ? AND status IN (${placeholders})
-    `).run(String(status || "reported"), result == null ? null : json(result, {}), nowIso(), actionId, ...allowed);
+    // The browser action result is immutable evidence. Lifecycle settlement
+    // already lives in executionEpisode and action_events; a status-only
+    // transition must not replace the exact browser result with a backend
+    // projection or a later document will be unable to resume the lease.
+    const preserveBrowserResult = result === undefined;
+    const outcome = preserveBrowserResult
+      ? db.prepare(`
+          UPDATE governed_actions SET status = ?, updated_at = ?
+          WHERE action_id = ? AND status IN (${placeholders})
+        `).run(String(status || "reported"), nowIso(), actionId, ...allowed)
+      : db.prepare(`
+          UPDATE governed_actions SET status = ?, result_json = ?, updated_at = ?
+          WHERE action_id = ? AND status IN (${placeholders})
+        `).run(String(status || "reported"), result == null ? null : json(result, {}), nowIso(), actionId, ...allowed);
     return outcome.changes > 0;
   }
 

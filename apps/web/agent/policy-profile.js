@@ -36,17 +36,24 @@ function normalizedOptions(decision = {}) {
     || [];
   const mapped = source.map((option) => {
     const meaning = lower(`${option.label || ""} ${option.semantic || ""} ${option.risk || ""}`);
-    const declinesPaid = /decline|no thanks|without|skip|remove|not now|random|automatic|\bno (?:bundle|insurance|protection|ticket|baggage|bag|seat)\b/.test(meaning);
+    const price = optionPrice(option);
+    const exactPaidPrice = Number.isFinite(price) && price > 0;
+    const declinesPaid = !exactPaidPrice
+      && /decline|no thanks|without|skip|remove|not now|random|automatic|\bno (?:bundle|insurance|protection|ticket|baggage|bag|seat)\b/.test(meaning);
     return ({
     optionId: clean(option.optionId || option.controlId),
     controlId: clean(option.controlId),
     label: clean(option.label || option.canonicalValue),
-    price: optionPrice(option),
+    price,
     currency: clean(option.currency || option.structuredPrice?.currency || option.price?.currency).toUpperCase(),
-    included: option.included === true
-      || optionPrice(option) === 0
-      || /decline|no thanks|without|skip|remove|not now|random|automatic|\bno (?:bundle|insurance|protection|ticket|baggage|bag|seat)\b/.test(lower(`${option.label || ""} ${option.semantic || ""} ${option.risk || ""}`)),
-    paid: !declinesPaid && (option.paid === true || Number(optionPrice(option)) > 0 || /money|paid|purchase|upgrade|add_paid/.test(meaning)),
+    // Exact option-local price outranks a bad inherited semantic. A 2 EUR
+    // option cannot become "included" because a sibling-section parser
+    // happened to label both buttons as decline controls.
+    included: price === 0 || (!exactPaidPrice && (
+      option.included === true
+      || /decline|no thanks|without|skip|remove|not now|random|automatic|\bno (?:bundle|insurance|protection|ticket|baggage|bag|seat)\b/.test(meaning)
+    )),
+    paid: exactPaidPrice || (!declinesPaid && (option.paid === true || /money|paid|purchase|upgrade|add_paid/.test(meaning))),
     selected: option.selected === true,
     executable: option.executable !== false,
     canonicalAttributes: option.canonicalAttributes || {},
@@ -280,15 +287,16 @@ function resolveProfileDecision(decision = {}, { userPolicy = {}, traveler = {},
           && !/gift card|loyalty card/.test(label);
     });
     if (eligible.length) {
-      const equivalentCardEntryRoutes = !wantsWallet && eligible.every((option) => (
-        option.paid !== true
-        && option.raw?.physicalEffect === "reveal_control"
-      ));
       return resolutionResult({
         match: "exact",
         source: "saved_profile",
         options: eligible,
-        preferred: eligible.length === 1 || equivalentCardEntryRoutes ? eligible[0] : null,
+        // Choosing the route into card entry is milestone navigation, not a
+        // payment authorization. Every option here already matches the saved
+        // payment preference and excludes gift/loyalty cards, so resolve the
+        // first executable route deterministically instead of asking the user
+        // because sites expose equivalent routes with different mechanics.
+        preferred: eligible[0],
         reason: `Payment-method choice follows the saved profile preference: ${preference}.`,
         evidence: [preference]
       });

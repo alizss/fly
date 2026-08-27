@@ -19,6 +19,8 @@ const { actionForCurrentCandidate, buildCurrentCandidateSet } = require("./legac
 const { evaluateTransition } = require("../../apps/web/agent/transition-evaluator");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { plannerFailureReason } = require("../../apps/web/agent/loop/turn-result");
+const agentContract = require("../../apps/extension/src/shared/agent-contract");
+const { compileCurrentObligation } = require("./obligation-test-helper");
 
 test("planner authentication failures identify configuration instead of generic page uncertainty", () => {
   const reason = plannerFailureReason(new Error("OpenAI checkout_candidate_selection request failed: 401 Incorrect API key provided"));
@@ -103,17 +105,9 @@ test("unknown grounding can block only its exact admitted profile obligation", (
     observation: groundedObservation,
     traveler: { date_of_birth: "2003-05-31" }
   });
-  const candidateSet = buildCurrentCandidateSet({
-    goal: finalState.currentGoal,
-    observation: groundedObservation,
-    traveler: { date_of_birth: "2003-05-31" },
-    state: { taskState: finalState, approvals: {} }
-  });
-
-  assert.equal(finalState.currentObligation.policyDecision.status, "blocked");
-  assert.equal(finalState.currentObligation.policyDecision.ambiguity.code, "ACTIVE_REQUIREMENT_UNRESOLVED");
+  assert.equal(finalState.currentObligation, null);
+  assert.equal(finalState.disposition.code, "ACTIVE_REQUIREMENT_UNRESOLVED");
   assert.equal(finalState.profileReadiness.ready, true);
-  assert.deepEqual(candidateSet.candidates, []);
 });
 
 test("an unblocked executable stage exit suppresses unknown-component grounding authority", () => {
@@ -324,7 +318,7 @@ test("a GoToGate paid bundle cannot enter profile grounding ahead of its admitte
     paid.map((control) => control.controlId)
   );
   assert.deepEqual(taskState.currentObligation.admittedControlIds, [decline.controlId]);
-  assert.equal(taskState.currentObligation.subject.family, "extras");
+  assert.equal(taskState.currentObligation.semanticOwner.family, "extras");
   assert.deepEqual(unknownComponentsForObligation(observation, taskState.currentObligation), []);
 });
 
@@ -558,7 +552,7 @@ test("candidate AI receives at most twenty related DOM controls and no screensho
   }
 });
 
-test("adaptive candidate AI compacts verbose surfaces before the hard packet boundary", async () => {
+test("candidate AI compacts verbose surfaces before the hard packet boundary", async () => {
   const previousFetch = global.fetch;
   let request = null;
   global.fetch = async (_url, options) => {
@@ -591,29 +585,23 @@ test("adaptive candidate AI compacts verbose surfaces before the hard packet bou
     policyDecision: { allow: true, decision: "allow" }
   };
   try {
+    const obligation = compileCurrentObligation({ work: {
+      kind: "profile_field",
+      goalId: "goal_profile_verbose",
+      semanticType: "phone_country_code",
+      desiredValue: "+386",
+      actionableControlIds: [candidate.controlId],
+      successCondition: {
+        type: "normalized_value_changed",
+        semanticType: "phone_country_code",
+        controlId: candidate.controlId,
+        expectedCanonicalValue: "+386"
+      }
+    } });
     const result = await selectCandidate({
       apiKey: "test-key",
       model: "test-model",
-      goal: {
-        kind: "adaptive_surface",
-        goalId: "goal_adaptive_verbose",
-        semanticType: "phone_country_code",
-        semanticGoal: `Choose +386 from ${verboseCountryList}`,
-        desiredValue: "+386",
-        adaptiveEnvelope: {
-          kind: "bounded_adaptive_surface",
-          episodeId: "episode_verbose",
-          objective: `Choose +386 from ${verboseCountryList}`,
-          desiredValue: "+386",
-          surfaceId: "surface_country_list",
-          surfaceType: "dropdown",
-          allowedOperations: ["choose", "keyboard"],
-          forbiddenRisks: ["money", "payment", "legal"],
-          forbiddenEffects: ["select_paid_option", "submit_payment"],
-          remainingSteps: 5,
-          deadlineAt: Date.now() + 20_000
-        }
-      },
+      goal: obligation,
       taskState: {
         stage: "traveler_information",
         foregroundSurface: {
@@ -640,7 +628,7 @@ test("adaptive candidate AI compacts verbose surfaces before the hard packet bou
     assert.ok(Buffer.byteLength(JSON.stringify(payload), "utf8") < 24_000);
     assert.equal(payload.interactionView.currentObligation.semanticType, "phone_country_code");
     assert.ok(payload.interactionView.foregroundSurface.label.length <= 240);
-    assert.ok(payload.interactionView.currentObligation.adaptiveEnvelope.objective.length <= 240);
+    assert.equal(payload.interactionView.currentObligation.adaptiveEnvelope, undefined);
   } finally {
     global.fetch = previousFetch;
   }
@@ -1166,13 +1154,22 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
     const failedTransition = evaluateTransition({
       beforeObservation: resolved.observation,
       governedAction: correctionAction,
-      browserResult: { actionId: correctionAction.id, dispatched: true, verified: false },
+      browserResult: {
+        actionId: correctionAction.id,
+        dispatched: true,
+        verified: false,
+        actionOutcome: agentContract.compileActionOutcome({
+          status: agentContract.ACTION_OUTCOME.NO_EFFECT,
+          causedByActionId: correctionAction.id,
+          originalSuccessContract: correctionAction.expectedOutcome
+        })
+      },
       afterObservation: failedCorrection
     });
-    assert.equal(failedTransition.actionOutcome.status, "REVEALED_BLOCKER");
+    assert.equal(failedTransition.actionOutcome.status, "NO_EFFECT");
     assert.equal(failedTransition.postcondition.satisfied, false);
     assert.equal(failedTransition.currentObligationResult.completed, false);
-    assert.equal(failedTransition.nextDirective, "rebuild_task_state");
+    assert.equal(failedTransition.nextDirective, "try_distinct_capability");
 
     const afterCorrection = {
       observationId: "obs_cross_surface_after_correction",
@@ -1192,13 +1189,26 @@ test("cross-surface ownership maps a background paid fact to the exact foregroun
     const transition = evaluateTransition({
       beforeObservation: resolved.observation,
       governedAction: correctionAction,
-      browserResult: { actionId: correctionAction.id, dispatched: true, verified: true },
+      browserResult: {
+        actionId: correctionAction.id,
+        dispatched: true,
+        verified: true,
+        expectedOutcome: correctionAction.expectedOutcome,
+        actionOutcome: agentContract.compileActionOutcome({
+          status: agentContract.ACTION_OUTCOME.SATISFIED,
+          causedByActionId: correctionAction.id,
+          originalSuccessContract: correctionAction.expectedOutcome,
+          code: "POLICY_CONFLICT_RESOLVED",
+          observedEvidence: { mechanicalEffect: "select_free_option" }
+        })
+      },
       afterObservation: afterCorrection
     });
     assert.equal(transition.localMechanicalResult.effect, "select_free_option");
     assert.equal(transition.localMechanicalResult.verified, true);
-    assert.equal(transition.currentObligationResult.completed, true);
-    assert.equal(transition.postcondition.evidence.selectedChargeRemoved, true);
+    assert.equal(transition.currentObligationResult.completed, false);
+    assert.equal(transition.currentObligationResult.status, "awaiting_fresh_reduction");
+    assert.equal(transition.postcondition.satisfied, true);
     assert.equal(transition.diff.priceChanged.to.amount, 100);
 
     const afterState = reduceTaskState({

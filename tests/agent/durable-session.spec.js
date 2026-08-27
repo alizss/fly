@@ -137,7 +137,7 @@ test("a final booking contract without a selected request traveler creates no tr
   });
 });
 
-test("the session boundary rejects raw airline acquisition instead of creating a provisional transaction", async ({ request }) => {
+test("raw airline acquisition cannot create a transaction without a final selected booking", async ({ request }) => {
   const travelerId = `trav_raw_acquisition_${Date.now()}`;
   const response = await request.post(`${API}/agent/session`, {
     data: {
@@ -149,12 +149,11 @@ test("the session boundary rejects raw airline acquisition instead of creating a
   });
   expect(response.status()).toBe(422);
   expect(await response.json()).toMatchObject({
-    code: "SELECTED_BOOKING_REQUIRED",
-    error: "A complete approved flight selection is required before starting checkout."
+    code: "SELECTED_BOOKING_REQUIRED"
   });
 });
 
-test("missing itinerary and total cannot create a durable transaction", async ({ request }) => {
+test("a traveler checkout with hidden itinerary creates no provisional session", async ({ request }) => {
   const travelerId = `trav_no_booking_${Date.now()}`;
   const response = await request.post(`${API}/agent/session`, {
     data: {
@@ -165,9 +164,48 @@ test("missing itinerary and total cannot create a durable transaction", async ({
   });
   expect(response.status()).toBe(422);
   expect(await response.json()).toMatchObject({
-    code: "SELECTED_BOOKING_REQUIRED",
-    error: "A complete approved flight selection is required before starting checkout."
+    code: "SELECTED_BOOKING_REQUIRED"
   });
+});
+
+test("an engine-only stop remains the same resumable durable transaction", async ({ request }) => {
+  const travelerId = `trav_engine_pause_${Date.now()}`;
+  const startedResponse = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Continue checkout safely.",
+      traveler: { id: travelerId },
+      selectedBookingContract: selectedBookingContract(`obs_engine_pause_${Date.now()}`, travelerId),
+      page: { site: "example.test", url: "https://example.test/checkout", step: "payment" }
+    }
+  });
+  expect(startedResponse.status()).toBe(201);
+  const started = await startedResponse.json();
+
+  const reported = await request.post(`${API}/agent/report`, {
+    data: {
+      sessionId: started.id,
+      result: {
+        type: "stop",
+        actionId: "act_engine_reconciliation",
+        userActionRequired: false,
+        outcome: { code: "MISSING_DECISION_FACT" }
+      },
+      page: { site: "example.test", url: "https://example.test/checkout", step: "payment" }
+    }
+  });
+  expect(reported.status()).toBe(200);
+  expect((await reported.json()).status).toBe("stopped");
+
+  const resumed = await request.post(`${API}/agent/session`, {
+    data: {
+      sessionId: started.id,
+      resumeOnly: true,
+      traveler: { id: travelerId },
+      page: { site: "example.test", url: "https://example.test/checkout", step: "payment" }
+    }
+  });
+  expect(resumed.status()).toBe(201);
+  expect(await resumed.json()).toMatchObject({ id: started.id, status: "running" });
 });
 
 test("P0.2 one session handshake resumes the exact transaction and rejects replacement", async ({ request }) => {

@@ -271,7 +271,7 @@ function updateExecutionRecovery(state = {}, event = {}) {
   const code = String(event.code || "");
   let classification = "none";
 
-  if (["verified", "meaningful_progress"].includes(kind)) {
+  if (["verified", "local_success"].includes(kind)) {
     next.attempts = 0;
     next.phase = kind;
     next.stateHash = "";
@@ -407,10 +407,14 @@ function baseLifecycle(state = {}, observation = {}, action = {}, result = {}) {
 }
 
 function authoritativeTransitionStatus(transition = {}) {
+  if (transition.nextDirective === "stop_or_request_approval") return "unsafe";
+  if (transition.nextDirective === "rebuild_task_state"
+    && (transition.causality || transition.blocker)) return "blocked";
   const status = transition.actionOutcome?.status || "";
   const outcome = agentContract.ACTION_OUTCOME;
-  if (status === outcome.SATISFIED) return "achieved";
-  if (status === outcome.PROGRESSED) return "progressed";
+  if (status === outcome.DESTINATION_LOADING
+    && transition.destinationArrival?.arrived === true) return "destination_arrived";
+  if (status === outcome.SATISFIED) return "local_satisfied";
   if (status === outcome.REVEALED_BLOCKER) return "blocked";
   if (status === outcome.UNSAFE_CHANGE) return transition.causality ? "blocked" : "unsafe";
   if (status === outcome.DESTINATION_LOADING) return "destination_loading";
@@ -422,34 +426,22 @@ function transitionResult(result = {}, transition = null) {
   if (!transition) return { ...result, failureCode: canonicalFailureCode(result) };
   const transitionStatus = authoritativeTransitionStatus(transition);
   const interveningMutation = transition.causality?.classification === "intervening_external_mutation";
-  const browserCanonicalComponentCommit = Boolean(
-    result.verified === true
-    && result.expectedOutcomeObserved === true
-    && result.postconditionSatisfied === true
-    && result.expectedOutcome?.type === "logical_component_committed"
-    && result.outcome?.ok === true
-    && String(result.outcome?.code || result.failureCode || "") === "LOGICAL_COMPONENT_COMMITTED"
-  );
-  // One action can finish its exact local obligation while the durable parent
-  // objective merely progresses to another decision. Keep those facts
-  // separate: parent progress must never erase a browser-proven local outcome
-  // before the journal/ledger consumes it.
-  const localPostconditionSatisfied = browserCanonicalComponentCommit
-    || transition.postcondition?.satisfied === true
-    || transition.currentObligationResult?.completed === true;
-  const localOutcomeVerified = browserCanonicalComponentCommit
-    || (localPostconditionSatisfied && (
-      transition.localMechanicalResult?.verified === true
-      || transition.localEffect?.verified === true
-      || transition.physicalResult?.verified === true
-    ));
+  // The transported browser ActionOutcome is the sole authority for the
+  // leased local postcondition. Backend observation analysis may report
+  // durable/safety consequences, but it cannot turn that local proof on or
+  // off by rerunning a compact-DOM verifier.
+  const localOutcomeVerified = transition.actionOutcome?.status
+    === agentContract.ACTION_OUTCOME.SATISFIED;
+  const localPostconditionSatisfied = localOutcomeVerified;
   return {
     ...result,
     failureCode: interveningMutation
       ? "INTERVENING_EXTERNAL_MUTATION"
+      : transitionStatus === "destination_arrived"
+      ? ""
       : transitionStatus === "no_effect"
-      ? "TRANSITION_NO_EFFECT"
-      : canonicalFailureCode(result),
+        ? "TRANSITION_NO_EFFECT"
+        : canonicalFailureCode(result),
     transitionStatus,
     transitionDirective: transition.nextDirective,
     transition,
@@ -468,7 +460,7 @@ function transitionResult(result = {}, transition = null) {
     localExpectedOutcomeObserved: localPostconditionSatisfied,
     localOutcomeVerified,
     browserReportedVerified: result.verified === true,
-    completionAuthority: "transition_evaluator",
+    completionAuthority: transition.completionAuthority || "missing_browser_settlement",
     postconditionSatisfied: localPostconditionSatisfied,
     expectedOutcomeObserved: localPostconditionSatisfied,
     verified: localOutcomeVerified
@@ -696,31 +688,20 @@ function advanceActionLifecycle({
     });
     const transitionStatus = authoritativeTransitionStatus(transition);
     const observed = true;
-    if (transitionStatus === "achieved") {
-      recovery = updateExecutionRecovery(state, { kind: "verified", code });
-      lifecycle = { ...lifecycle, status: "verified", dispatched: true, observed, verified: true, closed: true, awaitingClarification: false, awaitingDestination: false, destinationReadiness: observationReadiness, transitionStatus: "achieved", resultCode: code };
-      directive = "advance_goal";
-    } else if (transitionStatus === "progressed") {
-      recovery = updateExecutionRecovery(state, { kind: "meaningful_progress", code });
+    if (transitionStatus === "local_satisfied") {
+      recovery = updateExecutionRecovery(state, { kind: "local_success", code });
       lifecycle = {
         ...lifecycle,
-        status: "observed",
+        status: "verified",
         dispatched: true,
         observed,
-        verified: false,
-        localOutcomeVerified: (
-          transition.postcondition?.satisfied === true
-          || transition.currentObligationResult?.completed === true
-        ) && (
-          transition.localMechanicalResult?.verified === true
-          || transition.localEffect?.verified === true
-          || transition.physicalResult?.verified === true
-        ),
+        verified: true,
+        localOutcomeVerified: true,
         closed: true,
         awaitingClarification: false,
         awaitingDestination: false,
         destinationReadiness: observationReadiness,
-        transitionStatus: "progressed",
+        transitionStatus: "local_satisfied",
         resultCode: code
       };
       directive = "rebuild_candidates";
@@ -730,7 +711,7 @@ function advanceActionLifecycle({
         ? (transition.causality?.code || "FRESH_STATE_RECONCILIATION_REQUIRED")
         : code;
       recovery = updateExecutionRecovery(state, {
-        kind: "meaningful_progress",
+        kind: "local_success",
         code: reconciliationCode
       });
       lifecycle = {
@@ -745,6 +726,30 @@ function advanceActionLifecycle({
         resultCode: reconciliationCode
       };
       directive = rebuildFromCurrentState ? "rebuild_candidates" : "resolve_blocker";
+    } else if (transitionStatus === "destination_arrived") {
+      // Cross-document navigation has two non-competing authorities: the
+      // browser proves dispatch and the fresh ready observation proves arrival.
+      // Arrival closes the lease as observed progress without rewriting the
+      // browser's DESTINATION_LOADING receipt into local click success.
+      recovery = updateExecutionRecovery(state, {
+        kind: "local_success",
+        code: "DESTINATION_ARRIVED"
+      });
+      lifecycle = {
+        ...lifecycle,
+        status: "observed",
+        dispatched: true,
+        observed,
+        verified: false,
+        localOutcomeVerified: false,
+        closed: true,
+        awaitingClarification: false,
+        awaitingDestination: false,
+        destinationReadiness: observationReadiness,
+        transitionStatus: "destination_arrived",
+        resultCode: "DESTINATION_ARRIVED"
+      };
+      directive = "rebuild_candidates";
     } else if (transitionStatus === "no_effect") {
       const revealAction = action.type === "scroll" || action.intent === "recover_target_viewport";
       if (revealAction) {

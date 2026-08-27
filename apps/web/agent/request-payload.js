@@ -211,12 +211,25 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       inCurrentSurface: evidence.inCurrentSurface === true,
       hitTested: evidence.hitTested === true,
       notOccluded: evidence.notOccluded === true,
+      selfOccluded: evidence.selfOccluded === true,
+      targetable: evidence.targetable === true,
       operationAuthorized: evidence.operationAuthorized === true,
+      operationProven: evidence.operationProven === true,
+      operationProof: clampText(evidence.operationProof, 160),
       executable: evidence.executable === true,
       revealable: evidence.revealable === true,
       code: clampText(evidence.code, 80),
       surfaceId: clampText(evidence.surfaceId, 80),
-      operation: clampText(evidence.operation, 40)
+      operation: clampText(evidence.operation, 40),
+      visualRegion: evidence.visualRegion && typeof evidence.visualRegion === "object"
+        ? agentContract.cloneSerializable(evidence.visualRegion)
+        : null,
+      hitTestEvidence: evidence.hitTestEvidence && typeof evidence.hitTestEvidence === "object"
+        ? agentContract.cloneSerializable(evidence.hitTestEvidence)
+        : null,
+      box: evidence.box && typeof evidence.box === "object"
+        ? agentContract.cloneSerializable(evidence.box)
+        : null
     };
   }
   
@@ -258,6 +271,92 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
     // semantic/capability property and normalize the shared contract in place;
     // do not reconstruct a second, lossy control schema here.
     return agentContract.serializeObservedControl(control);
+  }
+
+  function compactStructuralControl(control = {}) {
+    // Enforce the structural allow-list again at the server boundary. A
+    // malformed or stale extension cannot smuggle browser-authored business
+    // meaning into DecisionFrame merely by declaring the structural contract.
+    return agentContract.serializeObservedControl({
+      controlId: clampText(control.controlId, 140),
+      stableKey: clampText(control.stableKey, 500),
+      label: clampText(control.label, 300),
+      ownText: clampText(control.ownText, 300),
+      accessibleName: clampText(control.accessibleName, 300),
+      accessibleDescription: clampText(control.accessibleDescription, 400),
+      ariaLabel: clampText(control.ariaLabel, 300),
+      title: clampText(control.title, 300),
+      name: clampText(control.name, 240),
+      id: clampText(control.id, 160),
+      testId: clampText(control.testId, 160),
+      placeholder: clampText(control.placeholder, 300),
+      autocomplete: clampText(control.autocomplete, 120),
+      inputMode: clampText(control.inputMode, 80),
+      inputType: clampText(control.inputType, 80),
+      pattern: clampText(control.pattern, 240),
+      kind: clampText(control.kind, 80),
+      role: clampText(control.role, 80),
+      domRole: clampText(control.domRole, 80),
+      formAction: clampText(control.formAction, 500),
+      formMethod: clampText(control.formMethod, 40),
+      formId: clampText(control.formId, 160),
+      controlledElementIds: Array.isArray(control.controlledElementIds)
+        ? control.controlledElementIds.map((id) => clampText(id, 160)).filter(Boolean).slice(0, 16)
+        : [],
+      ariaExpanded: control.ariaExpanded === true || control.ariaExpanded === "true"
+        ? "true"
+        : control.ariaExpanded === false || control.ariaExpanded === "false"
+          ? "false"
+          : "",
+      iconOnly: control.iconOnly === true,
+      options: Array.isArray(control.options) ? control.options.map((option) => ({
+        value: clampText(option?.value, 180),
+        label: clampText(option?.label, 220),
+        disabled: option?.disabled === true,
+        selected: option?.selected === true
+      })).slice(0, 80) : [],
+      optionCount: Math.max(0, Number(control.optionCount || 0)),
+      optionsTruncated: control.optionsTruncated === true,
+      state: control.state && typeof control.state === "object"
+        ? agentContract.cloneSerializable(control.state)
+        : {},
+      currentValue: clampText(control.currentValue, 600),
+      selected: control.selected === true,
+      required: control.state?.required === true,
+      invalid: control.state?.invalid === true,
+      disabled: control.disabled === true,
+      structuredPrice: compactStructuredPrice(control.structuredPrice),
+      representationLifecycle: control.representationLifecycle && typeof control.representationLifecycle === "object"
+        ? agentContract.cloneSerializable(control.representationLifecycle)
+        : null,
+      surfaceId: clampText(control.surfaceId || "surface-page", 80),
+      surfaceType: clampText(control.surfaceType || "page", 80),
+      surfaceLabel: clampText(control.surfaceLabel, 300),
+      surfaceMembershipEvidence: clampText(control.surfaceMembershipEvidence, 100),
+      sectionId: clampText(control.sectionId, 100),
+      sectionLabel: clampText(control.sectionLabel, 300),
+      globalChrome: control.globalChrome === true,
+      tightOwnerId: clampText(control.tightOwnerId, 160),
+      tightOwnerKey: clampText(control.tightOwnerKey, 320),
+      ownershipIntegrity: control.ownershipIntegrity && typeof control.ownershipIntegrity === "object"
+        ? agentContract.cloneSerializable(control.ownershipIntegrity)
+        : null,
+      decisionGroupId: clampText(control.decisionGroupId, 140),
+      stateElementId: clampText(control.stateElementId, 160),
+      visibleWidgetElementId: clampText(control.visibleWidgetElementId, 160),
+      preferredActivationElementId: clampText(control.preferredActivationElementId, 160),
+      actuators: compactActuators(control.actuators),
+      operations: compactControlOperations(control.operations),
+      recovery: compactControlRecovery(control.recovery),
+      visualRegion: control.visualRegion || null,
+      visualRegions: Array.isArray(control.visualRegions) ? control.visualRegions.slice(0, 8) : [],
+      sourceProvenance: control.sourceProvenance && typeof control.sourceProvenance === "object"
+        ? {
+            kind: clampText(control.sourceProvenance.kind, 40),
+            evidence: clampText(control.sourceProvenance.evidence, 120)
+          }
+        : null
+    });
   }
   
   function compactStructuredPrice(price = null) {
@@ -360,6 +459,54 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         }];
       }),
       evidence: Array.isArray(group.evidence) ? group.evidence.map((item) => clampText(item, 180)).slice(0, 5) : []
+    };
+  }
+
+  function compactStructuralDecisionGroup(group = {}, controlsById = new Map()) {
+    const ids = [...new Set([
+      ...(group.alternativeControlIds || []),
+      ...(group.alternatives || []).map((option) => option.controlId)
+    ].map((id) => clampText(id, 140)).filter((id) => id && controlsById.has(id)))];
+    const observedAlternativeById = new Map((group.alternatives || []).map((option) => [option.controlId, option]));
+    return {
+      decisionGroupId: clampText(group.decisionGroupId, 140),
+      surfaceId: clampText(group.surfaceId, 80),
+      surfaceType: clampText(group.surfaceType, 80),
+      sectionId: clampText(group.sectionId, 80),
+      sectionLabel: clampText(group.sectionLabel, 160),
+      requiredStateObserved: group.requiredStateObserved === true,
+      selectedControlId: ids.includes(group.selectedControlId) ? clampText(group.selectedControlId, 140) : "",
+      selectedLabel: clampText(group.selectedLabel, 220),
+      selectedEvidence: group.selectedEvidence && typeof group.selectedEvidence === "object" ? {
+        selected: group.selectedEvidence.selected === true,
+        selectedControlId: ids.includes(group.selectedEvidence.selectedControlId)
+          ? clampText(group.selectedEvidence.selectedControlId, 140)
+          : "",
+        ownerElementId: clampText(group.selectedEvidence.ownerElementId, 140),
+        source: clampText(group.selectedEvidence.source, 80),
+        structuredPrice: compactStructuredPrice(group.selectedEvidence.structuredPrice)
+      } : null,
+      selectionInvariant: group.selectionInvariant && typeof group.selectionInvariant === "object"
+        ? agentContract.cloneSerializable(group.selectionInvariant)
+        : null,
+      alternativeControlIds: ids,
+      alternatives: ids.map((controlId) => {
+        const observed = observedAlternativeById.get(controlId) || {};
+        const control = controlsById.get(controlId) || {};
+        return {
+          controlId,
+          targetId: clampText(observed.targetId, 140),
+          label: clampText(observed.label || control.label, 220),
+          selected: observed.selected === true
+            || control.selected === true
+            || control.state?.selected === true
+            || control.state?.checked === true,
+          structuredPrice: compactStructuredPrice(observed.structuredPrice || control.structuredPrice),
+          state: observed.state && typeof observed.state === "object"
+            ? agentContract.cloneSerializable(observed.state)
+            : null
+        };
+      })
     };
   }
   
@@ -602,7 +749,11 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       ...normalizeSurface(observedCurrentSurface, clampText(body.observationId || "", 120))
     };
     const canonicalControls = Array.isArray(page.controls)
-      ? page.controls.map(compactLogicalControl).filter((control) => control.controlId).map((control) => {
+      ? page.controls.map((control) => (
+          page.observationContract === "structural-observation/v1"
+            ? compactStructuralControl(control)
+            : compactLogicalControl(control)
+        )).filter((control) => control.controlId).map((control) => {
           const surfaceId = control.surfaceId || (currentSurface.type === "page" ? PAGE_SURFACE_ID : "");
           const belongsToCurrent = Boolean(surfaceId && surfaceId === currentSurface.id);
           return {
@@ -708,6 +859,9 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         } : null
       },
       page: {
+        observationContract: page.observationContract === "structural-observation/v1"
+          ? "structural-observation/v1"
+          : "",
         site: clampText(page.site, 80),
         url: clampText(page.url, 500),
         step: clampText(page.step, 80),
@@ -826,11 +980,15 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
             })).filter((entry) => entry.aliasId && entry.controlId)
           : [],
         decisionGroups: Array.isArray(page.decisionGroups)
-          ? page.decisionGroups.map((group) => compactDecisionGroup(
-              group,
-              canonicalControlsById,
-              page.transactionFacts?.selectedExtras || []
-            )).filter((group) => group.decisionGroupId)
+          ? page.decisionGroups.map((group) => (
+              page.observationContract === "structural-observation/v1"
+                ? compactStructuralDecisionGroup(group, canonicalControlsById)
+                : compactDecisionGroup(
+                    group,
+                    canonicalControlsById,
+                    page.transactionFacts?.selectedExtras || []
+                  )
+            )).filter((group) => group.decisionGroupId && group.alternativeControlIds.length > 0)
           : [],
         stageExit: page.stageExit || {},
         reconciliation: page.reconciliation || {},

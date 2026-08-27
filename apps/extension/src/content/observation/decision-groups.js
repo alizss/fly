@@ -635,6 +635,9 @@ export function createDecisionGroupCompiler(dependencies) {
       if (control.fieldType && control.operations?.open && !control.choiceContract?.decisionInstance) return false;
       const role = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
       const semantic = String(control.semantic || "").toLowerCase();
+      // Payment methods have one observation-wide owner below; visual
+      // sections and local choice contracts must not form competing groups.
+      if (semantic === "payment_method") return false;
       const optionalCommand = /button/.test(role) && (
         /decline_paid_extra|decline_baggage|add_paid_extra/.test(semantic)
         || /safe_decline|money|paid/.test(String(control.risk || "").toLowerCase())
@@ -642,7 +645,6 @@ export function createDecisionGroupCompiler(dependencies) {
       );
       return /combobox|listbox|select/.test(role)
         || /required_dropdown_choice/.test(semantic)
-        || semantic === "payment_method"
         || optionalCommand
         || Boolean(control.choiceContract?.decisionInstance)
         || Boolean(control.operations?.open);
@@ -652,16 +654,6 @@ export function createDecisionGroupCompiler(dependencies) {
   function decisionControlContext(control = {}, section = {}, controls = []) {
     const role = `${control.role || ""} ${control.domRole || ""} ${control.kind || ""}`.toLowerCase();
     const semantic = String(control.semantic || "").toLowerCase();
-    if (semantic === "payment_method") {
-      return {
-        instance: control.choiceContract?.decisionInstance
-          || `payment-method:${section.id || normalizeMatchText(section.label || "payment method")}`,
-        label: control.choiceContract?.decisionLabel || section.label || "Payment method",
-        // A payment-method selector is a required gateway to card entry even
-        // when the native radio or image tile omits required/aria-required.
-        required: true
-      };
-    }
     if (control.choiceContract?.decisionInstance) {
       const owner = elementById(control.choiceContract.decisionOwnerId || "");
       return {
@@ -779,13 +771,13 @@ export function createDecisionGroupCompiler(dependencies) {
             decisionLabel: choice.decisionLabel || "",
             decisionRequired: Boolean(choice.decisionRequired)
           };
-        });
+        }).filter((choice) => String(choice.semantic || "").toLowerCase() !== "payment_method");
         const fieldModels = sectionDecisionFields(section).map((field) => ({
           ...choiceLikeModelFromDecisionField(field, byControlId.get(field.controlId) || {}),
           decisionInstance: `field:${field.controlId || field.id || field.field || field.label}`,
           decisionLabel: field.label || "",
           decisionRequired: Boolean(field.required)
-        }));
+        })).filter((choice) => String(choice.semantic || "").toLowerCase() !== "payment_method");
         const controlModels = decisionControls.flatMap((control) => {
           const decision = decisionControlContext(control, section, controls);
           if (!decision) return [];
@@ -943,6 +935,73 @@ export function createDecisionGroupCompiler(dependencies) {
         return groups;
       })
       .slice(0, 80);
+    // Payment methods are one logical decision on the current observation,
+    // regardless of whether a site places card, wallet and brand controls in
+    // different visual sections. Compile that decision exactly once from the
+    // canonical control registry; section geometry is context, not authority.
+    const paymentMethodControls = (controls || []).filter((control) => (
+      control.controlId
+      && control.semantic === "payment_method"
+      && control.physicalEffect === "reveal_control"
+      && control.representationLifecycle?.active !== false
+    ));
+    const paymentMethodGroups = paymentMethodControls.length ? [(() => {
+      const decisionGroupId = decisionGroupIdForContext({
+        sectionType: "payment",
+        sectionLabel: "Payment method",
+        instance: "payment-method:current-observation"
+      });
+      for (const control of paymentMethodControls) control.decisionGroupId = decisionGroupId;
+      const selectedControls = paymentMethodControls.filter((control) => (
+        control.selected || control.state?.checked || control.state?.selected
+      ));
+      const selectionInvariantValid = selectedControls.length <= 1;
+      const selected = selectionInvariantValid && selectedControls.length === 1
+        ? selectedControls[0]
+        : null;
+      const surfaceIds = [...new Set(paymentMethodControls.map((control) => control.surfaceId).filter(Boolean))];
+      const sectionIds = [...new Set(paymentMethodControls.map((control) => control.sectionId).filter(Boolean))];
+      return {
+        decisionGroupId,
+        // This group is a browser-local convenience projection over every
+        // control that currently looks like a payment method. It is not a DOM
+        // ownership relationship and must never be used to decide which
+        // structural groups cross the browser/backend boundary.
+        projectionKind: "synthetic_global_payment",
+        surfaceId: surfaceIds.length === 1 ? surfaceIds[0] : "surface-page",
+        sectionId: sectionIds.length === 1 ? sectionIds[0] : "",
+        sectionType: "payment",
+        sectionLabel: "Payment method",
+        requirementId: "payment:payment-method",
+        required: true,
+        status: selected ? "satisfied" : "missing",
+        selectedControlId: selected?.controlId || "",
+        selectedLabel: selected?.label || "",
+        selectedSemantic: selected?.semantic || "",
+        selectionInvariant: {
+          exclusive: true,
+          valid: selectionInvariantValid,
+          selectedCount: selectedControls.length
+        },
+        alternatives: paymentMethodControls.map((control) => ({
+          controlId: control.controlId,
+          targetId: control.preferredActivationElementId || control.stateElementId || "",
+          label: control.label || "",
+          semantic: control.semantic,
+          physicalEffect: control.physicalEffect,
+          risk: control.risk || "uncertain",
+          effectRole: control.effectRole || "unknown",
+          selected: Boolean(control.selected || control.state?.checked || control.state?.selected),
+          structuredPrice: control.structuredPrice || null,
+          priceText: control.structuredPrice
+            ? `${control.structuredPrice.amount} ${control.structuredPrice.currency || ""}`.trim()
+            : ""
+        })),
+        evidence: selected
+          ? [`Selected: ${selected.label}`]
+          : ["No selected option for Payment method"]
+      };
+    })()] : [];
     const sectionOwnedControlIds = new Set(sectionGroups
       .flatMap((group) => group.alternatives || [])
       .map((choice) => choice.controlId)
@@ -951,7 +1010,7 @@ export function createDecisionGroupCompiler(dependencies) {
     for (const control of controls || []) {
       const contract = control.choiceContract || null;
       const instance = String(contract?.decisionInstance || "");
-      if (!instance || !control.controlId) continue;
+      if (!instance || !control.controlId || control.semantic === "payment_method") continue;
       if (!contractBuckets.has(instance)) contractBuckets.set(instance, []);
       contractBuckets.get(instance).push(control);
     }
@@ -975,11 +1034,7 @@ export function createDecisionGroupCompiler(dependencies) {
         ? selectedChoices[0]
         : null;
       const decisionLabel = first.choiceContract?.decisionLabel || first.sectionLabel || "choice";
-      const paymentMethodGateway = choices.every((control) => (
-        control.semantic === "payment_method"
-        && control.physicalEffect === "reveal_control"
-      ));
-      const required = paymentMethodGateway || choices.some((control) => (
+      const required = choices.some((control) => (
         control.choiceContract?.advancesOnSelection === true
         || control.choiceContract?.required === true
         || control.required
@@ -1023,6 +1078,7 @@ export function createDecisionGroupCompiler(dependencies) {
     });
     const representedControlIds = new Set([
       ...sectionGroups,
+      ...paymentMethodGroups,
       ...controlOwnedChoiceGroups
     ].flatMap((group) => group.alternatives || []).map((choice) => choice.controlId).filter(Boolean));
     // A current required checkbox/radio is a unary attestation obligation,
@@ -1154,6 +1210,7 @@ export function createDecisionGroupCompiler(dependencies) {
         })()]
       : [];
     const ownedControlIds = new Set(sectionGroups
+      .concat(paymentMethodGroups)
       .flatMap((group) => group.alternatives || [])
       .map((choice) => choice.controlId)
       .filter(Boolean));
@@ -1166,6 +1223,7 @@ export function createDecisionGroupCompiler(dependencies) {
       .filter(Boolean));
     const representedGroups = [
       ...sectionGroups,
+      ...paymentMethodGroups,
       ...controlOwnedChoiceGroups,
       ...unrepresentedSurfaceGroups
     ].filter((group) => !(group.alternatives || []).some((choice) => requiredCheckboxIds.has(choice.controlId)));
@@ -1236,11 +1294,14 @@ export function createDecisionGroupCompiler(dependencies) {
     representedGroups.push(...standaloneOptionalToggleGroups);
     const collapsedSelectorGroups = ownedCollapsedSelectorDecisionGroups(sections, controls, representedGroups);
     const removalGroups = ownedRemovalDecisionGroups(sections, controls, [...representedGroups, ...collapsedSelectorGroups], activeSurface);
+    const canonicalPaymentGroupIds = new Set(paymentMethodGroups.map((group) => group.decisionGroupId));
+    const genericEffectGroups = [...representedGroups, ...collapsedSelectorGroups, ...removalGroups]
+      .filter((group) => !canonicalPaymentGroupIds.has(group.decisionGroupId));
     return reconcileExclusiveDecisionControlOwnership(
-      reconcileDecisionEffectGroups(
-        [...representedGroups, ...collapsedSelectorGroups, ...removalGroups],
-        controls
-      ),
+      [
+        ...reconcileDecisionEffectGroups(genericEffectGroups, controls),
+        ...paymentMethodGroups
+      ],
       byControlId
     ).slice(0, 80);
   }
@@ -1268,23 +1329,6 @@ export function createDecisionGroupCompiler(dependencies) {
       const requiredAttestation = group.required === true
         && (group.alternatives || []).some((choice) => /legal_acceptance|unknown_attestation/.test(choice.semantic || ""));
       if (requiredAttestation) return true;
-      const exactAlternativeControls = (group.alternatives || [])
-        .map((choice) => byControlId.get(choice.controlId))
-        .filter(Boolean);
-      const paymentMethodGateway = exactAlternativeControls.length > 0
-        && exactAlternativeControls.length === (group.alternatives || []).length
-        && exactAlternativeControls.every((control) => (
-          control.semantic === "payment_method"
-          && control.physicalEffect === "reveal_control"
-        ));
-      if (paymentMethodGateway) {
-        // The observer already owns the payment semantic identity. This layer
-        // preserves the required gateway but never repairs or reclassifies
-        // group meaning after its identity and requirement were compiled.
-        group.required = true;
-        if (!group.selectedControlId) group.status = "missing";
-        return true;
-      }
       const roles = (group.alternatives || []).map(roleFor).filter((role) => role && role !== "unknown");
       if (roles.includes("optional_consent")) {
         // Requiredness for an optional consent can come only from its own

@@ -113,12 +113,8 @@ function activeUnknownComponents(observation = {}, { admittedControlIds = [] } =
 
 function unknownComponentsForObligation(observation = {}, obligation = null) {
   if (!obligation || typeof obligation !== "object") return [];
-  if (obligation.authority !== "task_state"
-    || obligation.policyDecision?.status !== "admitted") return [];
-  const family = clean(
-    obligation.subject?.family
-  ).toLowerCase();
-  if (family !== "profile") return [];
+  const kind = clean(obligation.desiredStateDelta?.kind).toLowerCase();
+  if (!["profile_field", "profile_fact", "unknown_required", "unknown_validation"].includes(kind)) return [];
   return activeUnknownComponents(observation, {
     admittedControlIds: obligation.admittedControlIds || []
   });

@@ -1,6 +1,5 @@
 import {
   SELECTED_BOOKING_MAX_AGE_MS,
-  approvedSelectedBookingAcquisitionFromMap,
   authoritativeSelectedBookingFacts,
   selectedBookingAdmissionState,
   selectedBookingCompatibilityWithMap
@@ -9,8 +8,6 @@ import { currentNavigationUrl } from "./navigation-identity.js";
 
 const SELECTED_BOOKING_KEY = "atwSelectedBookingAcquisitionV1";
 const UNCHANGED_RETRY_MS = 30_000;
-const START_ACQUISITION_TIMEOUT_MS = 10_000;
-const START_MUTATION_SETTLE_MS = 180;
 
 export function createSelectedBookingAcquisition({
   checkoutContextRead = async () => null,
@@ -25,7 +22,6 @@ export function createSelectedBookingAcquisition({
   unchangedRetryMs = UNCHANGED_RETRY_MS
 }) {
   let captureTimer = null;
-  let pendingStartAcquisition = null;
   let durableAcquisition = null;
   let durableHydrated = false;
   let durableMutation = Promise.resolve();
@@ -197,24 +193,6 @@ export function createSelectedBookingAcquisition({
     return persist(acquisition);
   }
 
-  function approveVisibleSummary(map = null, approvalSource = "explicit_agent_start", { checkoutLineageId = "" } = {}) {
-    const observationHash = String(observationHashForMap(map) || "");
-    const acquisition = approvedSelectedBookingAcquisitionFromMap(map, {
-      approvalSource,
-      observationHash,
-      sourceUrl: currentNavigationUrl()
-    });
-    if (!acquisition) return null;
-    return persist({
-      ...acquisition,
-      checkoutLineageId: String(
-        checkoutLineageId
-        || checkoutContext?.checkoutLineageId
-        || acquisition.checkoutLineageId
-      )
-    });
-  }
-
   function acquisitionFromMap(map = null) {
     const existing = read();
     if (existing) {
@@ -226,10 +204,10 @@ export function createSelectedBookingAcquisition({
       // fresh acquisition and uses the backend's durable baseline.
       discard();
     }
-    return capture(map) || approveVisibleSummary(map);
+    return capture(map);
   }
 
-  async function admitForStart(options = {}) {
+  async function admitForStart({ initialMap = null } = {}) {
     await hydrate();
     await refreshCheckoutContext();
     if (checkoutContext?.source === "app_launch" && checkoutContext.selectedBookingContract) {
@@ -243,8 +221,12 @@ export function createSelectedBookingAcquisition({
         checkoutLineageId: String(checkoutContext.checkoutLineageId || "")
       });
     }
-    const acquisition = await acquireForStart(options);
-    const map = options.initialMap || pageStateStore.current();
+    if (!checkoutContext?.checkoutLineageId) await beginCheckoutLineage({ rotate: false });
+    // Admission is a single snapshot read. Existing/app-supplied evidence may
+    // strengthen the baseline, but DOM hydration can never delay or authorize
+    // durable session creation.
+    const map = initialMap || pageStateStore.current();
+    const acquisition = acquisitionFromMap(map);
     const admission = selectedBookingAdmissionState(acquisition, map, {
       ...lineageAdmissionOptions()
     });
@@ -256,98 +238,6 @@ export function createSelectedBookingAcquisition({
       selectedBookingContract: null,
       checkoutLineageId: authoritativeAdmission.status === "confirmed" ? String(acquisition?.checkoutLineageId || "") : ""
     });
-  }
-
-  async function acquireForStart({
-    initialMap = null,
-    timeoutMs = START_ACQUISITION_TIMEOUT_MS,
-    mutationSettleMs = START_MUTATION_SETTLE_MS
-  } = {}) {
-    await hydrate();
-    await refreshCheckoutContext();
-    if (!checkoutContext?.checkoutLineageId) await beginCheckoutLineage({ rotate: false });
-    const immediate = acquisitionFromMap(initialMap || pageStateStore.current());
-    if (immediate) return immediate;
-    if (pendingStartAcquisition) return pendingStartAcquisition.promise;
-
-    let observer = null;
-    let settleTimer = null;
-    let deadlineTimer = null;
-    let scanBusy = false;
-    let scanQueued = false;
-    let resolvePending = null;
-
-    function cleanup() {
-      observer?.disconnect();
-      observer = null;
-      if (settleTimer) clearTimeout(settleTimer);
-      if (deadlineTimer) clearTimeout(deadlineTimer);
-      settleTimer = null;
-      deadlineTimer = null;
-      pendingStartAcquisition = null;
-    }
-
-    function finish(value = null) {
-      const resolve = resolvePending;
-      cleanup();
-      resolve?.(value);
-    }
-
-    async function scan(reason = "mutation") {
-      if (scanBusy) {
-        scanQueued = true;
-        return;
-      }
-      scanBusy = true;
-      try {
-        const observed = await pageStateStore.observeFresh({
-          reason: `selected_booking_start_${reason}`,
-          maxWaitMs: 500,
-          maxAttempts: 2,
-          postBuildGraceMs: 80
-        });
-        const acquisition = acquisitionFromMap(observed.map);
-        if (acquisition) {
-          finish(acquisition);
-          return;
-        }
-      } finally {
-        scanBusy = false;
-      }
-      if (scanQueued && pendingStartAcquisition) {
-        scanQueued = false;
-        scan("queued");
-      }
-    }
-
-    function scheduleScan(reason = "mutation") {
-      if (!pendingStartAcquisition || settleTimer) return;
-      settleTimer = setTimeout(() => {
-        settleTimer = null;
-        scan(reason);
-      }, Math.max(0, mutationSettleMs));
-    }
-
-    const promise = new Promise((resolve) => {
-      resolvePending = resolve;
-      const boundedTimeout = Math.max(0, Number(timeoutMs) || 0);
-      observer = new MutationObserver((mutations) => {
-        pageStateStore.noteMutations(mutations);
-        scheduleScan("mutation");
-      });
-      observer.observe(document.documentElement || document.body, {
-        attributes: true,
-        childList: true,
-        characterData: true,
-        subtree: true
-      });
-      deadlineTimer = setTimeout(async () => {
-        await scan("deadline");
-        if (pendingStartAcquisition) finish(null);
-      }, boundedTimeout);
-    });
-    pendingStartAcquisition = { promise, finish };
-    return promise;
   }
 
   function bookingCommitCopy(owner = null) {
@@ -362,41 +252,68 @@ export function createSelectedBookingAcquisition({
     ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 600);
   }
 
-  function potentialBookingCommitTarget(target = null) {
+  function bookingSelectionContext(owner = null) {
+    const contexts = [];
+    let cursor = owner?.parentElement || null;
+    while (cursor && contexts.length < 8) {
+      if (cursor.matches?.("article, section, form, [role='group'], [role='radiogroup'], main")) contexts.push(cursor);
+      if (cursor.matches?.("main")) break;
+      cursor = cursor.parentElement;
+    }
+    if (!contexts.length || contexts.some((context) => context.closest?.("#atw-sidebar"))) {
+      return { copy: "", structuredItinerary: false };
+    }
+    const copy = contexts.flatMap((context) => {
+      const heading = context.querySelector?.("h1, h2, h3, legend, [role='heading']");
+      return [
+        context.getAttribute?.("aria-label"),
+        context.getAttribute?.("data-testid"),
+        context.id,
+        typeof context.className === "string" ? context.className : "",
+        heading?.innerText,
+        heading?.textContent
+      ];
+    }).filter(Boolean).join(" ").replace(/\s+/g, " ").trim().slice(0, 1_200);
+    const structuredItinerary = contexts.some((context) => (
+      context.matches?.("[data-origin][data-destination]")
+      || context.querySelector?.("[data-origin][data-destination]")
+    ));
+    return { copy, structuredItinerary };
+  }
+
+  function explicitBookingSelectionTarget(target = null) {
     const owner = target?.closest?.("a, button, [role='button'], [role='radio'], [role='option']");
     if (!owner || owner.closest?.("#atw-sidebar")) return null;
-    const copy = bookingCommitCopy(owner);
-    return /\b(?:select|choose|continue|proceed|confirm|book|fare|flight|next)\b/i.test(copy)
+    const ownerCopy = bookingCommitCopy(owner);
+    const context = bookingSelectionContext(owner);
+    const explicitCopy = `${ownerCopy} ${context.copy}`;
+    const explicitFlightSelection = /\b(?:select|choose|book)\b.*\b(?:flight|fare)\b|\b(?:flight|fare)\b.*\b(?:select|choose|book)\b/i.test(explicitCopy);
+    const contextualCommit = /\b(?:continue|proceed|next|confirm|select|choose|book)\b/i.test(ownerCopy)
+      && (context.structuredItinerary || /\b(?:flight|fare)[\s_-]+(?:selection|options?|choice|family)\b/i.test(context.copy));
+    return explicitFlightSelection || contextualCommit
       ? owner
       : null;
   }
 
   function onPotentialBookingCommit(event) {
-    const commitTarget = potentialBookingCommitTarget(event.target);
+    const commitTarget = explicitBookingSelectionTarget(event.target);
     if (isSessionActive() || !commitTarget) return;
-    const beforeCommit = pageStateStore.observe({
+    // One explicit flight/fare selection may establish the immutable booking
+    // baseline. Generic Continue/Next/Confirm controls are not booking
+    // authority and must leave the idle extension inert.
+    const selectionObservation = pageStateStore.observe({
       forceFull: true,
       reason: "selected_booking_user_commit"
     });
-    const explicitSelection = /\b(?:select|choose|book)\b.*\b(?:flight|fare)\b|\b(?:flight|fare)\b.*\b(?:select|choose|book)\b/i
-      .test(bookingCommitCopy(commitTarget));
-    const beginsNewSelection = beforeCommit.map?.step === "flight_selection" || explicitSelection;
-    const lineagePromise = beginCheckoutLineage({ rotate: beginsNewSelection });
+    const lineagePromise = beginCheckoutLineage({ rotate: true });
     queueMicrotask(async () => {
       if (isSessionActive()) return;
       const activeContext = await lineagePromise;
-      const observed = pageStateStore.observe({
-        forceFull: true,
-        reason: "selected_booking_user_commit"
-      });
       const lineageOptions = {
         checkoutLineageId: activeContext?.checkoutLineageId || "",
-        replaceExisting: beginsNewSelection
+        replaceExisting: true
       };
-      const captured = capture(observed.map, lineageOptions);
-      if (!captured && (observed.map?.step === "flight_selection" || explicitSelection)) {
-        approveVisibleSummary(observed.map, "explicit_flight_selection", lineageOptions);
-      }
+      capture(selectionObservation.map, lineageOptions);
     });
   }
 
@@ -449,20 +366,15 @@ export function createSelectedBookingAcquisition({
       captureTimer = null;
       cancelled = true;
     }
-    if (pendingStartAcquisition) {
-      pendingStartAcquisition.finish(null);
-      cancelled = true;
-    }
     return cancelled;
   }
 
   return Object.freeze({
     admitForStart,
-    acquireForStart,
-    approveVisibleSummary,
     armSelectionCapture,
     cancel,
     capture,
+    discard,
     disarmSelectionCapture,
     hydrate,
     read,

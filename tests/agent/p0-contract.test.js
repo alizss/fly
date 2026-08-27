@@ -36,7 +36,7 @@ const {
   canonicalizeUserPolicy,
   seatPolicyFrom
 } = require("../../apps/web/agent/policy-profile");
-const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { compileCurrentObligation } = require("./obligation-test-helper");
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 test("seat preference aliases normalize once into canonical seatPolicy", () => {
@@ -187,7 +187,7 @@ test("viewport recovery never rebinds a stale fare action to the sole control on
   };
   const state = {
     taskState: {
-      currentObligation: currentObligationFromGoal({ goal: staleFareGoal })
+      currentObligation: compileCurrentObligation({ work: staleFareGoal })
     },
     approvals: {}
   };
@@ -208,8 +208,7 @@ test("fresh TaskState ownership cancels a viewport recovery whose obligation is 
       expectedOutcome: { decisionGroupId: "dg_insurance" }
     }
   };
-  const current = currentObligationFromGoal({
-    goal: {
+  const current = compileCurrentObligation({ work: {
       goalId: "navigation:continue",
       kind: "navigation",
       semanticType: "navigation",
@@ -217,13 +216,11 @@ test("fresh TaskState ownership cancels a viewport recovery whose obligation is 
       successCondition: { type: "checkout_stage_advanced" }
     }
   });
-  const same = currentObligationFromGoal({
-    goal: {
+  const same = compileCurrentObligation({ work: {
       goalId: "decision:dg_insurance",
       kind: "checkout_decision",
       decisionGroupId: "dg_insurance",
       eligibleAlternativeControlIds: ["insurance_none"],
-      desiredStateDelta: { actionRequired: true },
       successCondition: {
         type: "decision_group_resolved",
         decisionGroupId: "dg_insurance",
@@ -469,9 +466,9 @@ test("governor rejects an expired candidate-set envelope before target execution
     candidateSet: { ...candidateSet, observationHash: "expired_hash" },
     candidates: candidateSet.candidates
   };
-  const failure = governorPrivate.currentGoalCandidateFailure(action, {
+  const failure = governorPrivate.currentWorkCandidateFailure(action, {
     taskState: {
-      currentObligation: currentObligationFromGoal({ goal: expiredGoal })
+      currentObligation: compileCurrentObligation({ work: expiredGoal })
     }
   }, observation, [], { ...candidateSet, observationHash: "expired_hash" });
 
@@ -568,6 +565,7 @@ test("the server-owned semantic affordance is unchanged from candidate through a
     observationId: "obs_affordance",
     observationSnapshot: { snapshotHash: "hash_affordance" },
     page: {
+      observationContract: "structural-observation/v1",
       currentSurface: { id: "surface_seats", type: "modal", memberControlIds: ["ctrl_random"] },
       controls: [{
         controlId: "ctrl_random",
@@ -601,9 +599,10 @@ test("the server-owned semantic affordance is unchanged from candidate through a
   const action = actionForCurrentCandidate(goal, candidate, observation);
 
   assert.deepEqual(action.affordance, candidate.affordance);
-  assert.equal(candidate.affordance.mechanicalEffect, "select_option");
+  assert.equal(candidate.affordance.mechanicalEffect, "select_free_option");
   assert.equal(candidate.affordance.semanticIntent, "resolve_current_decision");
-  assert.equal(candidate.affordance.policy.decision, "obligation_admitted");
+  assert.equal(candidate.admitted, true);
+  assert.equal(candidate.affordance.policy, undefined);
   assert.deepEqual(candidate.obligationSuccessCondition, candidate.outcomeContract);
 });
 
@@ -927,6 +926,48 @@ test("currentSurface is the sole candidate and envelope ownership authority", ()
   assert.equal(currentSurface(page).id, "surface_current_popover");
   assert.equal(surfaceBinding(observation).surfaceId, "surface_current_popover");
   assert.deepEqual(candidates.map((candidate) => candidate.controlId), ["ctrl_no_thanks"]);
+});
+
+test("structured legal risk cannot be promoted to payment by a payment-page label", () => {
+  const legalControl = {
+    controlId: "ctrl_easyjet_terms",
+    decisionGroupId: "dg_easyjet_terms",
+    stateElementId: "el_easyjet_terms",
+    preferredActivationElementId: "el_easyjet_terms",
+    label: "payment-page-terms-checkbox I confirm that I accept the terms and conditions",
+    semantic: "legal_acceptance",
+    physicalEffect: "accept_legal_terms",
+    risk: "legal",
+    kind: "checkbox",
+    role: "checkbox",
+    required: true,
+    selected: false,
+    surfaceId: "surface-page",
+    visualRegion: { inViewport: true },
+    operations: { choose: actionableCapability("choose", "el_easyjet_terms") }
+  };
+  const observation = {
+    observationId: "obs_easyjet_terms",
+    observationSnapshot: { snapshotHash: "hash_easyjet_terms" },
+    page: {
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [legalControl],
+      decisionGroups: [{
+        decisionGroupId: "dg_easyjet_terms",
+        sectionType: "legal_acceptance",
+        required: true,
+        status: "missing",
+        alternatives: [{ controlId: legalControl.controlId }]
+      }]
+    }
+  };
+  const goal = deriveObservationGoal(observation, []);
+  const candidate = rawObservationCandidates(observation, goal)
+    .find((item) => item.controlId === legalControl.controlId);
+
+  assert.ok(candidate);
+  assert.equal(candidate.physicalEffect, "accept_legal_terms");
+  assert.equal(candidate.risk, "legal");
 });
 
 test("P0.10 derives one canonical requirement per decision group and drops duplicate choice requirements", () => {
@@ -1327,7 +1368,7 @@ test("policy cannot reinterpret a directly priced actuator as a free option", ()
   assert.equal(contradictoryCandidates.some((candidate) => (
     candidate.controlId === lockPriceMisclassifiedAsFree.controlId
   )), false);
-  assert.deepEqual(contradictoryCandidates.map((candidate) => candidate.type), ["ask_user"]);
+  assert.deepEqual(contradictoryCandidates, []);
 
   const unprovenFreeGoal = {
     ...goal,
@@ -1337,7 +1378,7 @@ test("policy cannot reinterpret a directly priced actuator as a free option", ()
   assert.equal(unprovenCandidates.some((candidate) => (
     candidate.controlId === lockPriceMisclassifiedAsFree.controlId
   )), false);
-  assert.deepEqual(unprovenCandidates.map((candidate) => candidate.type), ["ask_user"]);
+  assert.deepEqual(unprovenCandidates, []);
 });
 
 test("P0.6 typed policy trusts canonical semantic risk instead of button wording", () => {
@@ -1776,7 +1817,17 @@ test("legal acceptance uses a closed five-scope contract and verifies factual at
     approvals: { standardBookingTermsApproved: true },
     transactionInvariants: { review: { ready: true, missingFacts: [], contradictions: [] } }
   });
-  assert.equal(afterReview.allow, true);
+  assert.equal(afterReview.allow, false);
+  const exactTravelerEvidence = evaluateActionPolicy(factual, {
+    approvals: { standardBookingTermsApproved: true },
+    transactionInvariants: {
+      current: {
+        travelers: [{ name: "Ali SIFRAR" }],
+        factEvidence: { travelers: { authoritative: true } }
+      }
+    }
+  });
+  assert.equal(exactTravelerEvidence.allow, true);
 
   const exceptional = {
     ...legalAction("I declare that I am a resident of Slovenia"),
@@ -1839,11 +1890,22 @@ test("factual attestation uses selected-booking, traveler-profile, and current-t
     }
   };
 
-  assert.deepEqual(factualAccuracyEvidence(state), { verified: true, missingFacts: [], contradictions: [] });
+  assert.deepEqual(factualAccuracyEvidence(state, action), {
+    verified: true,
+    missingFacts: [],
+    contradictions: [],
+    scope: ["travelers", "itinerary"]
+  });
   assert.equal(evaluateActionPolicy(action, state, {}, state.approvals).allow, true);
 
   const changed = structuredClone(state);
   changed.transactionInvariants.current.totalPrice.amount = 162.62;
-  assert.equal(factualAccuracyEvidence(changed).verified, false);
-  assert.equal(evaluateActionPolicy(action, changed, {}, changed.approvals).decision, "ask_user");
+  assert.equal(factualAccuracyEvidence(changed, action).verified, true);
+  assert.equal(evaluateActionPolicy(action, changed, {}, changed.approvals).allow, true);
+  const priceAction = {
+    ...action,
+    targetLabel: "I confirm the passenger names, itinerary, and total price are accurate"
+  };
+  assert.equal(factualAccuracyEvidence(changed, priceAction).verified, false);
+  assert.equal(evaluateActionPolicy(priceAction, changed, {}, changed.approvals).decision, "ask_user");
 });

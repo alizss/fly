@@ -128,6 +128,27 @@ function executable(control = {}) {
   ));
 }
 
+function boundedChoiceDiscoveryStrategy(control = {}) {
+  const shape = lower(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`);
+  const recovery = control.recovery?.open || null;
+  if (!/select|combobox|listbox/.test(shape) || recovery?.requiresVisualConfirmation !== true) return null;
+  return (recovery.strategies || []).find((strategy) => {
+    const actuatorId = clean(strategy.actuatorId);
+    const proof = strategy.proof
+      || strategy.actionability
+      || recovery.targetabilityByActuator?.[actuatorId]
+      || {};
+    return Boolean(
+      actuatorId
+      && proof.rendered === true
+      && proof.visible === true
+      && proof.enabled === true
+      && proof.inCurrentSurface === true
+      && proof.targetable === true
+    );
+  }) || null;
+}
+
 function isPlaceholderValue(value = "") {
   return agentContract.isPlaceholderChoiceValue(clean(value));
 }
@@ -205,6 +226,17 @@ function exactSubject(group = {}, controls = []) {
     ? lower(ownership.family)
     : "";
 
+  const typedLegalEvidence = lower([
+    authoritative,
+    localLabel,
+    group.sectionType,
+    group.semanticType,
+    ...controls.map((control) => `${control.semantic || ""} ${control.physicalEffect || ""}`)
+  ].filter(Boolean).join(" "));
+  if (/legal_acceptance|accept_legal|accept_terms|terms_accept|booking terms|purchase conditions|conditions of carriage/.test(typedLegalEvidence)) {
+    return { key: `legal_${slug(localLabel || groupId(group))}`, label: authoritative || localLabel || "Legal acceptance", family: "legal" };
+  }
+
   // The order is deliberate. Protection and quantity are different subjects,
   // even when their smallest local owners share a broader baggage section.
   if (/fare (?:package|option|family)|base fare|basic fare|basic (?:saver|standard|flexi)|saver fare|continue with (?:saver|standard|flexi)|economy light|light fare/.test(ownerEvidence)) {
@@ -250,16 +282,6 @@ function exactSubject(group = {}, controls = []) {
   if (/bundle|support|sms|extra|add.?on/.test(evidence)) {
     return { key: `extras_${slug(localLabel || groupId(group))}`, label: authoritative || localLabel || "Optional extra", family: "extras" };
   }
-  const typedLegalEvidence = lower([
-    authoritative,
-    localLabel,
-    group.sectionType,
-    group.semanticType,
-    ...controls.map((control) => `${control.semantic || ""} ${control.physicalEffect || ""}`)
-  ].filter(Boolean).join(" "));
-  if (/legal_acceptance|unknown_attestation|accept_legal|accept_terms|terms_accept|booking terms|purchase conditions|conditions of carriage/.test(typedLegalEvidence)) {
-    return { key: `legal_${slug(localLabel || groupId(group))}`, label: authoritative || localLabel || "Legal acceptance", family: "legal" };
-  }
   if (/payment|card|pay/.test(evidence)) {
     return { key: `payment_${slug(localLabel || groupId(group))}`, label: authoritative || localLabel || "Payment", family: "payment" };
   }
@@ -296,6 +318,25 @@ function optionCount(option = {}) {
 }
 
 function exactUserIntent(subject = {}, group = {}, transitions = [], userPolicy = {}, traveler = {}) {
+  if (subject.family === "legal") {
+    const executable = transitions.filter((transition) => transition.executable);
+    const authorized = userPolicy.standardBookingTermsApproved === true;
+    return {
+      match: authorized ? "exact" : "unavailable",
+      source: authorized ? "transaction_mandate" : "",
+      desiredOutcome: authorized ? "selected" : "",
+      desiredSelected: authorized ? true : null,
+      desiredCanonicalValue: null,
+      desiredControlIds: authorized ? executable.map((transition) => transition.controlId) : [],
+      eligibleOptionIds: executable.map((transition) => transition.controlId),
+      preferredOptionId: authorized && executable.length === 1 ? executable[0].controlId : "",
+      authorization: authorized ? { kind: "standard_booking_terms", approved: true } : null,
+      reason: authorized
+        ? "The transaction mandate authorizes this required standard booking attestation."
+        : "Required legal acceptance has no transaction authorization.",
+      evidence: authorized ? ["standardBookingTermsApproved"] : []
+    };
+  }
   if (subject.key === "optional_consent") {
     const policyText = lower([
       userPolicy.bookingInstruction,
@@ -424,9 +465,14 @@ function transitionFor(control = {}, alternative = {}) {
   const opensChoice = /open_choice_control|open_surface/.test(lower(
     `${alternative.semantic || ""} ${alternative.physicalEffect || ""}`
   ));
+  const boundedDiscovery = boundedChoiceDiscoveryStrategy(control);
+  const selectLike = /select|combobox|listbox/.test(lower(
+    `${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`
+  ));
   const operation = (opensChoice
     ? executableOperations.find(([name]) => ["open", "activate", "keyboard"].includes(name))
-    : executableOperations[0])?.[0] || "";
+    : executableOperations[0])?.[0]
+    || ((opensChoice || selectLike) && boundedDiscovery ? "open" : "");
   const controlEffectRole = clean(control.effectRole);
   const effectRole = clean(
     controlEffectRole && controlEffectRole !== "unknown"
@@ -447,12 +493,16 @@ function transitionFor(control = {}, alternative = {}) {
   return Object.freeze({
     transitionId: `${clean(control.controlId || alternative.controlId)}:${operation || "unavailable"}`,
     controlId: clean(control.controlId || alternative.controlId),
-    targetId: clean(control.preferredActivationElementId || control.stateElementId || alternative.targetId),
+    targetId: clean(
+      operation === "open" && boundedDiscovery?.actuatorId
+        ? boundedDiscovery.actuatorId
+        : control.preferredActivationElementId || control.stateElementId || alternative.targetId
+    ),
     operation,
     label: clean(alternative.label || control.label),
     canonicalValue: alternative.canonicalValue ?? control.canonicalValue ?? alternative.value ?? control.currentValue ?? clean(alternative.label || control.label),
     selected: Boolean(control.selected || control.state?.checked || control.state?.selected || alternative.selected),
-    executable: executable(control),
+    executable: executable(control) || Boolean(operation === "open" && boundedDiscovery),
     paid: economic && paid(merged),
     price,
     effectRole,
@@ -517,9 +567,8 @@ function deferredChoiceCommitment({
   decisionEpisode = null
 } = {}) {
   const surface = page.currentSurface || {};
-  const presentationPaidState = selectedTransition?.effectRole === "presentation_mode"
-    && paid({ ...selected, semantic: selectedTransition.semantic });
-  if (!selected || (!selectedTransition?.paid && !presentationPaidState) || !surface.type || surface.type === "page") return false;
+  const presentationSelection = selectedTransition?.effectRole === "presentation_mode";
+  if (!selected || (!selectedTransition?.paid && !presentationSelection) || !surface.type || surface.type === "page") return false;
   const sourceSurfaceId = clean(selected.surfaceId || group.surfaceId || "surface-page");
   if (sourceSurfaceId === clean(surface.id)) return false;
 
@@ -608,14 +657,17 @@ function canonicalDecisionForGroup({
       || ["resolved", "hypothesis"].includes(clean(group.semanticOwnership?.status))
     )
   );
-  const selectedIsEconomic = ["commerce_option", "free_decline", "included_entitlement"].includes(selectedEffectRole)
-    || selectedEvidence?.source === "selected_control"
-    || Boolean(transactionSelection)
-    || selectedSummaryEconomic
-    || Boolean(selectedTransition?.price)
-    || /select_paid|add_paid|purchase|upgrade|money|paid_extra/.test(lower(
-      `${selectedTransition?.semantic || ""} ${selectedTransition?.risk || ""}`
-    ));
+  const selectedIsScopeControl = ["scope_toggle", "surface_opener", "presentation_mode"].includes(selectedEffectRole);
+  const selectedIsEconomic = !selectedIsScopeControl && (
+    ["commerce_option", "free_decline", "included_entitlement"].includes(selectedEffectRole)
+      || selectedEvidence?.source === "selected_control"
+      || Boolean(transactionSelection)
+      || selectedSummaryEconomic
+      || Boolean(selectedTransition?.price)
+      || /select_paid|add_paid|purchase|upgrade|money|paid_extra/.test(lower(
+        `${selectedTransition?.semantic || ""} ${selectedTransition?.risk || ""}`
+      ))
+  );
   const paidTruth = agentContract.classifySelectedCommerceTruth({
     decisionGroupId: id,
     selectedControlId: selectedId,
@@ -634,7 +686,7 @@ function canonicalDecisionForGroup({
   const evidencePaid = Boolean(selectedIsEconomic && paidTruth.selectedPaid);
   let intent = exactUserIntent(subject, group, transitions, userPolicy, traveler);
   const discoveryControlIds = new Set(controls.filter((control) => (
-    executable(control)
+    (executable(control) || Boolean(boundedChoiceDiscoveryStrategy(control)))
     && (
       Object.keys(control.operations || {}).includes("open")
       || /open_choice_control|open_surface/.test(lower(`${control.semantic || ""} ${control.physicalEffect || ""}`))
@@ -717,10 +769,23 @@ function canonicalDecisionForGroup({
     && intent.match === "constraint"
     && intent.eligibleOptionIds.includes(selectedId)
   );
+  const selectedConstraintMismatch = Boolean(
+    selected
+    && intent.match === "constraint"
+    && !policyCompatibleSelected
+    && (intent.desiredControlIds.length > 0 || intent.eligibleOptionIds.length > 0)
+    // A selected scope/opening toggle says which child surface is visible;
+    // it is not itself the transaction choice.  Treating it as the paid
+    // selection makes policy fight navigation (for example, a seat-map mode
+    // that can be exited safely with Next).
+    && !["scope_toggle", "surface_opener", "presentation_mode"].includes(clean(
+      selectedTransition?.effectRole || selectedEvidence?.effectRole
+    ))
+  );
   const paidAuthorization = intent.authorization || (userPolicy.paidExtraAuthorizations || []).find((authorization) => (
     authorization?.authorizationId && authorization.decisionGroupId === id
   )) || null;
-  const paidConflict = currentOutcome === "paid_affirmative" && (
+  const paidConflict = evidencePaid && currentOutcome === "paid_affirmative" && (
     intent.match === "constraint"
     || intent.match === "ambiguous"
     || (!paidAuthorization && intent.match !== "exact")
@@ -751,17 +816,9 @@ function canonicalDecisionForGroup({
   ));
   const enabledStageExitAvailable = page.stageExit?.continueAllowed === true
     && page.stageExit?.continueDisabled !== true;
-  const nonBlockingPageConstraint = !selected
-    && intent.match === "constraint"
-    && enabledStageExitAvailable
-    && clean(group.surfaceType || "page") === "page"
-    && clean(group.surfaceId || "surface-page") === "surface-page"
-    && !validation
-    && !evidencePaid;
   const constraintNeedsResolution = !selected
     && intent.match === "constraint"
     && (intent.desiredControlIds.length > 0 || intent.eligibleOptionIds.length > 0)
-    && !nonBlockingPageConstraint
     && (
       (required && !enabledStageExitAvailable)
       || (controlType === CONTROL_TYPES.EXCLUSIVE_CHOICE
@@ -821,6 +878,15 @@ function canonicalDecisionForGroup({
       risk: selectedTransition?.risk || "",
       ...(paidAuthorization ? { authorizationId: clean(paidAuthorization.authorizationId) } : {})
     };
+  } else if (selectedConstraintMismatch) {
+    status = "conflicted";
+    needsAction = true;
+    actionReason = "selected_option_conflicts_with_profile_constraint";
+    reopenEvidence = {
+      code: "EXACT_SELECTION_CONTRADICTS_PROFILE_CONSTRAINT",
+      decisionGroupId: id,
+      controlId: selectedId
+    };
   } else if (!required && intent.desiredSelected === false && !selected) {
     status = "waived";
     needsAction = false;
@@ -875,15 +941,6 @@ function canonicalDecisionForGroup({
     status = "satisfied";
     actionReason = "optional_paid_affirmative_already_declined";
     completionReason = "policy_constraint_already_satisfied";
-  } else if (nonBlockingPageConstraint) {
-    // A no-paid constraint is a set of acceptable states, not an instruction
-    // to click a particular decline representation. An enabled canonical
-    // stage exit proves the page accepts its current state, so an inferred
-    // `required` option group cannot manufacture a redundant selection.
-    status = "waived";
-    needsAction = false;
-    actionReason = "enabled_stage_exit_proves_constraint_non_blocking";
-    completionReason = "policy_constraint_satisfied_without_selection";
   } else if (paidOnlyWithSafeForward) {
     status = "waived";
     actionReason = "constraint_does_not_require_paid_selection";

@@ -67,10 +67,11 @@ function looksLikeLegalAcceptance(action) {
   const target = action.targetSnapshot || {};
   // High-risk policy requires a typed consequence. A label-derived risk or a
   // noun such as "legal person" is not evidence that the action accepts
-  // terms, makes a declaration, or changes legal state.
+  // terms, makes a declaration, or changes legal state. Section membership
+  // is context, not consequence: a Continue/Confirm button beside a terms
+  // checkbox does not itself accept those terms.
   return action.intent === "accept_legal_terms"
     || ["accept_legal_terms", "legal_acceptance", "unknown_attestation"].includes(target.semantic)
-    || ["legal_acceptance", "unknown_attestation"].includes(target.sectionType)
     || ["accept_legal_terms", "legal_acceptance"].includes(action.semanticEffect)
     || ["accept_legal_terms", "legal_acceptance"].includes(action.affordance?.physicalEffect);
 }
@@ -150,60 +151,85 @@ function normalizedFact(value) {
   return String(value == null ? "" : value).trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function factualAccuracyEvidence(state = {}) {
+function attestedFactScope(action = {}) {
+  const target = action.targetSnapshot || {};
+  const statement = normalizedFact([
+    action.targetLabel,
+    action.label,
+    target.label,
+    target.accessibleName,
+    target.description,
+    target.legalText,
+    action.legalText
+  ].filter(Boolean).join(" "));
+  const scope = new Set();
+  if (/passenger|travell?er|guest|name|personal (?:data|details)|contact details/.test(statement)) scope.add("travelers");
+  if (/flight|itinerary|journey|route|departure|arrival|date|time|destination|origin/.test(statement)) scope.add("itinerary");
+  if (/price|total|amount|fare|currency|cost|charge/.test(statement)) scope.add("total_price");
+  return { statement, scope };
+}
+
+function factualAccuracyEvidence(state = {}, action = {}) {
   const invariants = state?.transactionInvariants || {};
   const baseline = invariants.baseline || null;
   const current = invariants.current || null;
+  const attestation = attestedFactScope(action);
   const missingFacts = [];
   const contradictions = [];
-  if (invariants.baselineStatus !== "approved") missingFacts.push("approved_booking_baseline");
-  if (!baseline) missingFacts.push("booking_baseline");
+  if (!attestation.scope.size) {
+    return { verified: false, missingFacts: ["attestation_scope"], contradictions, scope: [] };
+  }
   if (!current) missingFacts.push("current_booking_facts");
-  if (!baseline || !current) {
-    return { verified: false, missingFacts, contradictions };
+  if (!current) return { verified: false, missingFacts, contradictions, scope: [...attestation.scope] };
+
+  if (attestation.scope.has("itinerary")) {
+    const baselineSegments = Array.isArray(baseline?.itinerary?.segments) ? baseline.itinerary.segments : [];
+    const currentSegments = Array.isArray(current.itinerary?.segments) ? current.itinerary.segments : [];
+    if (baseline?.itinerary?.completeness !== "complete" || !baselineSegments.length) {
+      missingFacts.push("authoritative_itinerary");
+    } else if (currentSegments.length !== baselineSegments.length) {
+      contradictions.push("itinerary_segment_count_changed");
+    } else {
+      const itineraryFields = ["origin", "destination", "departureDate", "departureTime", "arrivalTime", "flightNumber"];
+      baselineSegments.forEach((segment, index) => {
+        const observed = currentSegments[index] || {};
+        for (const field of itineraryFields) {
+          const expected = normalizedFact(segment?.[field]);
+          const actual = normalizedFact(observed?.[field]);
+          if (expected && actual && expected !== actual) contradictions.push(`itinerary_${index}_${field}_changed`);
+          if (expected && !actual) missingFacts.push(`itinerary_${index}_${field}`);
+        }
+      });
+    }
   }
 
-  const baselineSegments = Array.isArray(baseline.itinerary?.segments) ? baseline.itinerary.segments : [];
-  const currentSegments = Array.isArray(current.itinerary?.segments) ? current.itinerary.segments : [];
-  if (baseline.itinerary?.completeness !== "complete" || !baselineSegments.length) {
-    missingFacts.push("authoritative_itinerary");
-  } else if (currentSegments.length !== baselineSegments.length) {
-    contradictions.push("itinerary_segment_count_changed");
-  } else {
-    const itineraryFields = ["origin", "destination", "departureDate", "departureTime", "arrivalTime", "flightNumber"];
-    baselineSegments.forEach((segment, index) => {
-      const observed = currentSegments[index] || {};
-      for (const field of itineraryFields) {
-        const expected = normalizedFact(segment?.[field]);
-        const actual = normalizedFact(observed?.[field]);
-        if (expected && actual && expected !== actual) contradictions.push(`itinerary_${index}_${field}_changed`);
-        if (expected && !actual) missingFacts.push(`itinerary_${index}_${field}`);
-      }
-    });
+  if (attestation.scope.has("travelers")) {
+    const travelers = Array.isArray(current.travelers) ? current.travelers : [];
+    const travelerEvidence = current.factEvidence?.travelers || null;
+    if (!travelers.length || travelers.some((traveler) => !normalizedFact(traveler?.name))) {
+      missingFacts.push("traveler_names");
+    }
+    if (travelerEvidence?.authoritative !== true) missingFacts.push("authoritative_traveler_profile");
   }
 
-  const travelers = Array.isArray(current.travelers) ? current.travelers : [];
-  const travelerEvidence = current.factEvidence?.travelers || null;
-  if (!travelers.length || travelers.some((traveler) => !normalizedFact(traveler?.name))) {
-    missingFacts.push("traveler_names");
+  if (attestation.scope.has("total_price")) {
+    const baselineTotal = Number(baseline?.totalPrice?.amount);
+    const currentTotal = Number(current.totalPrice?.amount);
+    const baselineCurrency = normalizedFact(baseline?.totalPrice?.currency || baseline?.currency).toUpperCase();
+    const currentCurrency = normalizedFact(current.totalPrice?.currency || current.currency).toUpperCase();
+    if (!Number.isFinite(baselineTotal) || !baselineCurrency) missingFacts.push("approved_total_price");
+    if (!Number.isFinite(currentTotal) || !currentCurrency) missingFacts.push("current_total_price");
+    if (Number.isFinite(baselineTotal) && Number.isFinite(currentTotal) && Math.abs(baselineTotal - currentTotal) > 0.001) {
+      contradictions.push("total_price_changed");
+    }
+    if (baselineCurrency && currentCurrency && baselineCurrency !== currentCurrency) contradictions.push("currency_changed");
   }
-  if (travelerEvidence?.authoritative !== true) missingFacts.push("authoritative_traveler_profile");
-
-  const baselineTotal = Number(baseline.totalPrice?.amount);
-  const currentTotal = Number(current.totalPrice?.amount);
-  const baselineCurrency = normalizedFact(baseline.totalPrice?.currency || baseline.currency).toUpperCase();
-  const currentCurrency = normalizedFact(current.totalPrice?.currency || current.currency).toUpperCase();
-  if (!Number.isFinite(baselineTotal) || !baselineCurrency) missingFacts.push("approved_total_price");
-  if (!Number.isFinite(currentTotal) || !currentCurrency) missingFacts.push("current_total_price");
-  if (Number.isFinite(baselineTotal) && Number.isFinite(currentTotal) && Math.abs(baselineTotal - currentTotal) > 0.001) {
-    contradictions.push("total_price_changed");
-  }
-  if (baselineCurrency && currentCurrency && baselineCurrency !== currentCurrency) contradictions.push("currency_changed");
 
   return {
     verified: missingFacts.length === 0 && contradictions.length === 0,
     missingFacts: [...new Set(missingFacts)],
-    contradictions: [...new Set(contradictions)]
+    contradictions: [...new Set(contradictions)],
+    scope: [...attestation.scope]
   };
 }
 
@@ -300,15 +326,8 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
   }
   if (looksLikeLegalAcceptance(action)) {
     const scope = legalAcceptanceScope(action);
-    const transactionReview = state?.transactionInvariants?.review
-      || state?.taskState?.readModel?.transactionReview
-      || state?.readModel?.transactionReview
-      || null;
-    const attestedFacts = factualAccuracyEvidence(state);
+    const attestedFacts = factualAccuracyEvidence(state, action);
     const factualAccuracyVerified = merged.factualAccuracyVerified === true
-      || (transactionReview?.ready === true
-        && !(transactionReview?.missingFacts || []).length
-        && !(transactionReview?.contradictions || []).length)
       || attestedFacts.verified === true;
     if (merged.legalApproved) {
       return { allow: true, decision: "allow", reason: "The exact legal action has explicit approval." };
@@ -319,7 +338,7 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
     if (scope === LEGAL_ACCEPTANCE_SCOPE.FACTUAL_ACCURACY_ATTESTATION
       && merged.standardBookingTermsApproved === true
       && factualAccuracyVerified) {
-      return { allow: true, decision: "allow", reason: "The attested traveler, itinerary, and total facts were reconciled against the selected-booking baseline." };
+      return { allow: true, decision: "allow", reason: `The exact attested fact scope (${attestedFacts.scope.join(", ")}) is reconciled.` };
     }
     if (scope === LEGAL_ACCEPTANCE_SCOPE.EXCEPTIONAL_PERSONAL_DECLARATION
       && exceptionalDeclarationProfileMatch(action, profile)) {
@@ -339,7 +358,7 @@ function evaluateActionPolicy(action, state, profile = {}, approvals = {}) {
         : scope === LEGAL_ACCEPTANCE_SCOPE.EXCEPTIONAL_PERSONAL_DECLARATION
           ? "This is a personal declaration outside the standard booking mandate."
           : scope === LEGAL_ACCEPTANCE_SCOPE.FACTUAL_ACCURACY_ATTESTATION
-            ? "The booking facts must be reconciled before the agent can attest to their accuracy."
+            ? `The exact attested facts are not reconciled: ${[...attestedFacts.missingFacts, ...attestedFacts.contradictions].join(", ") || "unknown scope"}.`
             : "This legal control is not proven to be standard terms covered by the transaction-bound mandate."
     };
   }

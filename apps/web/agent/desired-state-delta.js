@@ -27,7 +27,18 @@ function typedLegalEvidence(decision = {}) {
       `${transition.semantic || ""} ${transition.effectRole || ""}`
     ))
   ].filter(Boolean).join(" "));
-  return /legal_acceptance|unknown_attestation|accept_legal|accept_terms|terms_accept/.test(typed);
+  return /legal_acceptance|accept_legal|accept_terms|terms_accept/.test(typed);
+}
+
+function unknownAttestationEvidence(decision = {}) {
+  const observed = decision.observed || {};
+  return /unknown_attestation/.test(lower([
+    observed.sectionType,
+    observed.semanticType,
+    decision.semanticType,
+    decision.subject?.key,
+    ...(decision.availableTransitions || []).map((transition) => transition.semantic)
+  ].filter(Boolean).join(" ")));
 }
 
 function exactIncrementalCostProof(decision = {}) {
@@ -54,12 +65,14 @@ function exactIncrementalCostProof(decision = {}) {
   const explicitPaidSemantic = /select_paid|add_paid|purchase|upgrade|money/.test(lower(
     `${transition.semantic || ""} ${transition.risk || ""} ${evidence.semantic || ""} ${evidence.risk || ""}`
   ));
-  const typedCommerce = clean(transition.effectRole || evidence.effectRole) === "commerce_option"
+  const effectRole = clean(evidence.effectRole || transition.effectRole);
+  const scopeControl = ["scope_toggle", "surface_opener", "presentation_mode"].includes(effectRole);
+  const typedCommerce = !scopeControl && (effectRole === "commerce_option"
     || evidence.source === "selected_control"
     || boundedSelectedSummary
     || transition.price != null
     || decision.priceRisk?.transactionOwned === true
-    || explicitPaidSemantic;
+    || explicitPaidSemantic);
   return Object.freeze({
     proven: typedCommerce && (
       Number.isFinite(amount) && amount > 0
@@ -69,12 +82,17 @@ function exactIncrementalCostProof(decision = {}) {
     amount: Number.isFinite(amount) ? amount : null,
     currency: clean(transition.price?.currency || evidence.structuredPrice?.currency),
     evidenceSource: clean(evidence.source),
-    effectRole: clean(transition.effectRole || evidence.effectRole)
+    effectRole
   });
 }
 
 function exactProfileMismatch(decision = {}) {
   const intent = decision.userIntent || {};
+  // The transaction-bound mandate authorizes required standard terms; it is
+  // not a command to opt into every legal-looking checkbox on the page.
+  // Optional legal state remains page state unless a separate explicit user
+  // preference owns it.
+  if (typedLegalEvidence(decision) && decision.required !== true) return false;
   // A constraint describes a set of acceptable states, not a command to
   // activate one representative control. In particular, "no paid extras" is
   // already satisfied when no paid option is selected. Only exact profile
@@ -102,7 +120,22 @@ function deltaForDecision(decision = {}) {
   const decisionGroupId = clean(decision.decisionGroupId || decision.decisionId);
   if (!decisionGroupId) return null;
   const selectedId = clean(decision.selectedControlId || decision.currentState?.selectedControlId);
-  const requiredMissing = decision.required === true && !selectedId;
+  const safeUnselectedPolicyOutcomes = new Set([
+    "random_assignment",
+    "declined_or_free",
+    "no_insurance",
+    "included_base_fare"
+  ]);
+  const transitions = decision.availableTransitions || [];
+  const paidOnlyUnselectedConstraint = !selectedId
+    && clean(decision.userIntent?.match) === "constraint"
+    && safeUnselectedPolicyOutcomes.has(clean(decision.userIntent?.desiredOutcome))
+    && transitions.length > 0
+    && transitions.every((transition) => (
+      transition.paid === true
+      || Number.isFinite(Number(transition.price?.amount)) && Number(transition.price.amount) > 0
+    ));
+  const requiredMissing = decision.required === true && !selectedId && !paidOnlyUnselectedConstraint;
   const profileMismatch = exactProfileMismatch(decision);
   const validation = ownedValidationProof(decision);
   const incrementalCost = exactIncrementalCostProof(decision);
@@ -110,11 +143,32 @@ function deltaForDecision(decision = {}) {
     && incrementalCost.proven;
   const requiredSemanticResolution = decision.required === true
     && ["ambiguous", "unavailable"].includes(clean(decision.userIntent?.match));
+  const exactDiscoveryControlIds = (decision.userIntent?.desiredControlIds || []).map(clean).filter((controlId) => (
+    (decision.availableTransitions || []).some((transition) => (
+      clean(transition.controlId) === controlId
+      && transition.executable === true
+      && clean(transition.operation) === "open"
+    ))
+  ));
+  const ownedChoiceDiscovery = decision.actionReason === "open_owned_choice_to_observe_options"
+    && exactDiscoveryControlIds.length === 1;
+  const unavailablePolicyConstraint = clean(decision.userIntent?.match) === "constraint"
+    && decision.needsAction === true
+    && !paidOnlyUnselectedConstraint
+    && !(decision.userIntent?.desiredControlIds || []).length
+    && !(decision.userIntent?.eligibleOptionIds || []).length;
   const typedProfileRequirement = clean(decision.family || decision.subject?.family) === "profile"
     && decision.needsAction === true;
   const typedLegalRequirement = !selectedId
     && typedLegalEvidence(decision)
-    && (decision.required === true || decision.needsAction === true);
+    && decision.required === true;
+  const unknownAttestation = !selectedId
+    && unknownAttestationEvidence(decision)
+    && decision.required === true;
+  const hasOwnedActuator = [
+    ...(decision.userIntent?.desiredControlIds || []),
+    ...(decision.physicalControlIds || [])
+  ].some((controlId) => clean(controlId));
   const blockedExternal = clean(decision.status) === "blocked"
     && /AUTHORIZATION|LOGIN|AUTHENTICATION|OTP|CAPTCHA|3DS|BANK_APPROVAL/.test(
       clean(decision.reopenEvidence?.code)
@@ -123,7 +177,15 @@ function deltaForDecision(decision = {}) {
   let reason = "";
   let desiredState = "";
   let evidenceKind = "";
-  if (validation) {
+  if (unknownAttestation) {
+    // Requiredness proves that the site demands a choice; it does not prove
+    // what an unfamiliar declaration means or that the user's checkout
+    // mandate authorizes it. Keep it as missing semantic authority instead
+    // of converting the visible checkbox into an executable legal action.
+    reason = "required_semantic_resolution";
+    desiredState = "required_state_satisfied";
+    evidenceKind = "structural_required";
+  } else if (validation) {
     reason = "owned_validation";
     desiredState = "validation_cleared";
     evidenceKind = "owned_validation";
@@ -137,6 +199,18 @@ function deltaForDecision(decision = {}) {
       ? "unselected"
       : "profile_selected_state";
     evidenceKind = "profile_policy";
+  } else if (ownedChoiceDiscovery) {
+    // The semantic choice is not missing: TaskState knows exactly which owned
+    // control can reveal its alternatives. Publish that single reversible
+    // state change instead of turning a grounded mechanical discovery into a
+    // user-facing MISSING_FACT blocker.
+    reason = "owned_choice_options_not_observed";
+    desiredState = "options_surface_visible";
+    evidenceKind = "owned_choice_discovery";
+  } else if (unavailablePolicyConstraint || (requiredSemanticResolution && !hasOwnedActuator)) {
+    reason = "required_semantic_resolution";
+    desiredState = "required_state_satisfied";
+    evidenceKind = "structural_required";
   } else if (typedLegalRequirement || requiredMissing) {
     reason = typedLegalRequirement ? "typed_required_legal_attestation" : "required_state_missing";
     desiredState = "required_state_satisfied";
@@ -156,13 +230,43 @@ function deltaForDecision(decision = {}) {
     return null;
   }
 
+  const status = blockedExternal
+    ? "BLOCKED_EXTERNAL"
+    : reason === "required_semantic_resolution"
+      ? "MISSING_FACT"
+      : "EXACT_DELTA";
+  const actionRequired = status === "EXACT_DELTA";
+  const exactDesiredControlIds = [
+    ...(ownedChoiceDiscovery ? exactDiscoveryControlIds : (decision.userIntent?.desiredControlIds || [])),
+    ...(!(decision.userIntent?.desiredControlIds || []).length
+      ? (decision.userIntent?.eligibleOptionIds || [])
+      : [])
+  ].map(clean).filter((value, index, values) => value && values.indexOf(value) === index);
+  const policyCompatibleControlIds = (decision.availableTransitions || []).filter((transition) => (
+    transition.paid !== true
+    && !(Number.isFinite(Number(transition.price?.amount)) && Number(transition.price.amount) > 0)
+    && /select_free|decline|remove|delete|undo|skip|without|none|random/.test(lower(
+      `${transition.semantic || ""} ${transition.physicalEffect || ""} ${transition.risk || ""} ${transition.label || ""}`
+    ))
+  )).map((transition) => clean(transition.controlId)).filter(Boolean);
+  const exactCorrectionControlIds = exactDesiredControlIds.length
+    ? exactDesiredControlIds
+    : paidConflict
+      ? policyCompatibleControlIds
+      : [];
+  const candidateControlIds = exactCorrectionControlIds.length
+    ? exactCorrectionControlIds
+    : [
+        ...exactDesiredControlIds,
+        ...(decision.physicalControlIds || [])
+      ];
+  const admittedControlIds = actionRequired
+    ? candidateControlIds.map(clean).filter((value, index, values) => value && values.indexOf(value) === index)
+    : [];
+
   return Object.freeze({
     contractVersion: DESIRED_STATE_DELTA_VERSION,
-    status: blockedExternal
-      ? "BLOCKED_EXTERNAL"
-      : requiredSemanticResolution
-        ? "MISSING_FACT"
-        : "EXACT_DELTA",
+    status,
     deltaId: `delta:${decisionGroupId}`,
     decisionGroupId,
     surfaceId: clean(decision.surfaceId || "surface-page"),
@@ -176,19 +280,92 @@ function deltaForDecision(decision = {}) {
       required: decision.required === true
     }),
     desiredState,
-    actionRequired: true,
-    admittedControlIds: Object.freeze([
-      ...(decision.userIntent?.desiredControlIds || []),
-      ...(decision.physicalControlIds || [])
-    ].map(clean).filter((value, index, values) => value && values.indexOf(value) === index)),
+    desiredEffect: ownedChoiceDiscovery ? "open" : "",
+    actionRequired,
+    admittedControlIds: Object.freeze(admittedControlIds),
+    authorization: decision.userIntent?.authorization
+      ? Object.freeze({ ...decision.userIntent.authorization })
+      : decision.authorization
+        ? Object.freeze({ ...decision.authorization })
+        : null,
     proof: Object.freeze({
       requiredMissing,
       profileMismatch,
       ownedValidation: validation,
       typedLegalRequirement,
+      unknownAttestation,
       typedProfileRequirement,
       incrementalCost
     })
+  });
+}
+
+function deltaForWork({ work = null, admittedControlIds = [] } = {}) {
+  if (!work) return null;
+  if (work.desiredStateDelta) {
+    const supplied = work.desiredStateDelta;
+    const status = clean(supplied.status || "EXACT_DELTA");
+    const actionRequired = status === "EXACT_DELTA" && supplied.actionRequired !== false;
+    return Object.freeze({
+      ...supplied,
+      contractVersion: DESIRED_STATE_DELTA_VERSION,
+      status,
+      actionRequired,
+      admittedControlIds: Object.freeze(actionRequired
+        ? (supplied.admittedControlIds || admittedControlIds).map(clean).filter(Boolean)
+        : []),
+      authorization: supplied.authorization
+        ? Object.freeze({ ...supplied.authorization })
+        : work.authorization
+          ? Object.freeze({ ...work.authorization })
+          : null
+    });
+  }
+
+  const kind = clean(work.kind || work.semanticType || "unknown");
+  const ambiguityCode = clean(work.ambiguity?.code);
+  const semanticFactMissing = /ACTIVE_REQUIREMENT_UNRESOLVED|SEMANTIC_AMBIGUITY|NO_POLICY_ALLOWED_CANDIDATE|UNKNOWN_REQUIRED/.test(ambiguityCode);
+  const status = semanticFactMissing ? "MISSING_FACT" : "EXACT_DELTA";
+  const actionRequired = status === "EXACT_DELTA";
+  // A CurrentObligation changes one component. Its delta must carry that
+  // component's requested value (for example +386), not the aggregate
+  // logical-field normalization (+38670328922) used by final verification.
+  const desiredValue = work.desiredValue
+    ?? work.expectedComponentValue
+    ?? work.expectedCanonicalValue
+    ?? work.canonicalValue
+    ?? work.expectedNormalizedValue
+    ?? "";
+  const desiredState = kind === "profile_field"
+    ? "profile_value_satisfied"
+    : work.semanticType === "navigation"
+      ? "next_checkout_surface_observed"
+      : work.semanticType === "completed_choice_surface"
+        ? "current_surface_dismissed"
+        : "required_state_satisfied";
+
+  return Object.freeze({
+    contractVersion: DESIRED_STATE_DELTA_VERSION,
+    status,
+    deltaId: `delta:${clean(work.goalId || work.requirementId || work.decisionGroupId || kind)}`,
+    decisionGroupId: clean(work.decisionGroupId),
+    surfaceId: clean(work.surfaceId || "surface-page"),
+    family: clean(work.canonicalSubject?.family || work.subject?.family || work.family || work.sectionType || kind),
+    reason: clean(work.ambiguity?.code || `${kind}_desired_state`),
+    evidenceKind: kind === "profile_field" ? "profile_policy" : "canonical_obligation",
+    observedState: Object.freeze({
+      value: work.currentValue ?? "",
+      selectedControlId: clean(work.selectedControlId),
+      status: clean(work.decisionStatus || "unresolved")
+    }),
+    desiredState,
+    desiredValue,
+    actionRequired,
+    admittedControlIds: Object.freeze(actionRequired
+      ? admittedControlIds.map(clean).filter(Boolean)
+      : []),
+    authorization: work.authorization ? Object.freeze({ ...work.authorization }) : null,
+    proof: Object.freeze({ source: "decision_frame" })
   });
 }
 
@@ -226,9 +403,14 @@ function compileDesiredStateEvaluations({ decisions = [] } = {}) {
     .filter(Boolean));
 }
 
-function compileDesiredStateDeltas({ decisions = [] } = {}) {
-  return Object.freeze(compileDesiredStateEvaluations({ decisions })
-    .filter((evaluation) => evaluation.actionRequired === true));
+function compileDesiredStateDeltas({ decisions = [], work = null, admittedControlIds = [] } = {}) {
+  const decisionDeltas = compileDesiredStateEvaluations({ decisions })
+    .filter((evaluation) => evaluation.status === "EXACT_DELTA" && evaluation.actionRequired === true);
+  const workDelta = work ? deltaForWork({ work, admittedControlIds }) : null;
+  return Object.freeze([
+    ...decisionDeltas,
+    ...(workDelta?.status === "EXACT_DELTA" && workDelta.actionRequired === true ? [workDelta] : [])
+  ]);
 }
 
 module.exports = {

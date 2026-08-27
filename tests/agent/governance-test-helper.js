@@ -2,7 +2,7 @@ const { governAction } = require("../../apps/web/agent/action-governor");
 const { prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
 const { currentSurfaceId } = require("../../apps/web/agent/surface-contract");
 const { visualRegionsMatch } = require("../../packages/shared/agent-actions");
-const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { compileCurrentObligation } = require("./obligation-test-helper");
 
 function replayCandidateSet(state = {}, observation = {}, action = null) {
   let candidates = state.taskState?.currentGoal?.candidates || state.currentGoal?.candidates || [];
@@ -32,12 +32,12 @@ function replayCandidateSet(state = {}, observation = {}, action = null) {
 // that production prepares before calling the pure governor.
 function governObservedAction(args = {}) {
   const legacyGoal = args.state?.taskState?.currentGoal || null;
-  const state = legacyGoal && !args.state.taskState.currentObligation
+  const state = legacyGoal
     ? {
         ...args.state,
         taskState: {
           ...args.state.taskState,
-          currentObligation: currentObligationFromGoal({ goal: legacyGoal })
+          currentObligation: compileCurrentObligation({ work: legacyGoal })
         }
       }
     : args.state;

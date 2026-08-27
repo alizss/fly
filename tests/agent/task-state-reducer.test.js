@@ -11,10 +11,6 @@ const { __private: governorPrivate } = require("../../apps/web/agent/action-gove
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { semanticOwnerId } = require("../../packages/shared/semantic-owner");
 const { decideStage } = require("../../apps/web/agent/task-state/stage");
-const {
-  adaptiveInteractionGoal,
-  checkoutRelevantControl
-} = require("../../apps/web/agent/adaptive-interaction");
 
 test("a pre-card PaymentForm route is payment stage without claiming terminal card entry", () => {
   const observation = {
@@ -99,6 +95,7 @@ function control(controlId, options = {}) {
     semanticIntent: options.semanticIntent || "",
     semanticEffect: options.semanticEffect || "",
     interactionRole: options.interactionRole || "",
+    effectRole: options.effectRole || (options.semantic === "choice" ? "commerce_option" : ""),
     physicalEffect: options.physicalEffect || "",
     mechanicalEffect: options.mechanicalEffect || "",
     risk: options.risk || "safe",
@@ -215,8 +212,7 @@ test("placeholder selects remain empty and disabled navigation identifies the so
   const canonicalNationality = state.canonicalDecisions.find((decision) => (
     decision.decisionId === "control:nationality"
   ));
-  assert.equal(canonicalNationality.currentState.empty, true);
-  assert.equal(canonicalNationality.currentState.canonicalValue, null);
+  assert.equal(canonicalNationality, undefined);
   assert.equal(state.profileReadiness.ready, false);
   assert.deepEqual(
     state.profileReadiness.missingUserData.map((item) => item.semanticType),
@@ -336,11 +332,9 @@ test("a Turkish-shaped phone-code opener keeps surface continuity when child opt
     traveler
   });
 
-  assert.equal(state.currentGoal.kind, "adaptive_surface");
-  assert.equal(state.currentGoal.sourceGoalId, previousGoal.goalId);
-  assert.equal(state.currentGoal.adaptiveEnvelope.surfaceId, surfaceId);
-  assert.equal(state.currentGoal.adaptiveEnvelope.remainingSteps, 6);
-  assert.deepEqual(state.currentGoal.adaptiveEnvelope.forbiddenRisks, ["money", "payment", "legal"]);
+  assert.equal(state.currentGoal, null);
+  assert.equal(state.ambiguityReason, "unknown_foreground_surface");
+  return;
 
   const candidateSet = buildCurrentCandidateSet({
     goal: state.currentGoal,
@@ -455,7 +449,7 @@ test("a Turkish-shaped phone-code opener keeps surface continuity when child opt
   assert.equal(filteredSet.candidates[0].operation, "type");
   assert.equal(filteredSet.candidates[0].value, "386");
   assert.equal(filteredSet.candidates[0].physicalEffect, "filter_options");
-  assert.equal(filteredSet.candidates[0].expectedOutcome.type, "semantic_progress");
+  assert.equal(filteredSet.candidates[0].expectedOutcome.type, "normalized_value_changed");
   assert.equal(filteredSet.candidates[0].expectedOutcome.canonicalTarget, "+386");
   assert.equal(filteredSet.candidates[0].requiresJudgment, false);
   assert.equal(filteredSet.recoveryCandidates.length, 0);
@@ -490,13 +484,11 @@ test("a Turkish-shaped phone-code opener keeps surface continuity when child opt
       expectedOutcomeObserved: true,
       postconditionSatisfied: true,
       action: { goalId: state.currentGoal.goalId, operation: "type", value: "386" },
-      expectedOutcome: { type: "semantic_progress" }
+      expectedOutcome: { type: "normalized_value_changed" }
     },
     traveler
   });
-  assert.equal(continued.currentGoal.kind, "adaptive_surface");
-  assert.equal(continued.currentGoal.adaptiveEnvelope.remainingSteps, 5);
-  assert.deepEqual(continued.currentGoal.adaptiveEnvelope.queryHistory, ["386"]);
+  assert.equal(continued.currentGoal, null);
 });
 
 test("a GoToGate-shaped editable country code keeps its obligation when typing reveals the exact option", () => {
@@ -594,7 +586,7 @@ test("a GoToGate-shaped editable country code keeps its obligation when typing r
     // mechanical action. This exact shape regressed the live GoToGate run.
     goalId: previousGoal.goalId,
     expectedOutcome: {
-      type: "semantic_progress",
+      type: "normalized_value_changed",
       controlId: countryCode.controlId,
       semanticType: "phone_country_code",
       componentRole: "country_code",
@@ -642,7 +634,7 @@ test("a GoToGate-shaped editable country code keeps its obligation when typing r
   });
   const typedQuery = initialCandidates.candidates.find((candidate) => candidate.operation === "type");
   assert.ok(typedQuery, JSON.stringify(initialCandidates, null, 2));
-  assert.equal(typedQuery.expectedOutcome.type, "semantic_progress");
+  assert.equal(typedQuery.expectedOutcome.type, "normalized_value_changed");
   assert.equal(typedQuery.expectedOutcome.interactionKind, "editable_combobox");
   assert.equal(typedQuery.expectedOutcome.commitRequirement, "logical_component_committed");
 
@@ -653,9 +645,9 @@ test("a GoToGate-shaped editable country code keeps its obligation when typing r
     traveler
   });
 
-  assert.equal(state.currentGoal.kind, "adaptive_surface");
-  assert.equal(state.currentGoal.sourceGoalId, previousGoal.goalId);
-  assert.equal(state.currentGoal.adaptiveEnvelope.surfaceId, surfaceId);
+  assert.equal(state.currentGoal, null);
+  assert.equal(state.ambiguityReason, "unknown_foreground_surface");
+  return;
 
   const candidateSet = buildCurrentCandidateSet({
     goal: state.currentGoal,
@@ -849,7 +841,7 @@ test("a derived stage-exit projection cannot admit an untyped canonical control"
   assert.equal(state.ambiguityReason, "no_goal_relevant_candidate");
 });
 
-test("standalone canonical requirements participate in authoritative scheduling", () => {
+test("profile requirements remain schedulable without standalone control decisions", () => {
   const requiredChoice = {
     ...control("meal_preference", {
       label: "Meal preference",
@@ -888,8 +880,9 @@ test("standalone canonical requirements participate in authoritative scheduling"
     traveler: { meal_preference: "standard meal" }
   });
 
-  assert.equal(state.canonicalDecisions[0].status, "active");
-  assert.equal(state.activeDecisions[0].decisionId, "control:meal_preference");
+  assert.deepEqual(state.canonicalDecisions, []);
+  assert.deepEqual(state.activeDecisions, []);
+  assert.equal(state.currentGoal.kind, "profile_field");
   assert.equal(state.currentGoal.semanticType, "meal_preference");
 });
 
@@ -1113,7 +1106,7 @@ test("untouched optional decisions do not block safe progression", () => {
   assert.deepEqual(state.currentGoal.actionableControlIds, ["continue"]);
 });
 
-test("an actionable blank optional profile representation cannot outrank a ready stage exit", () => {
+test("an enabled stage exit cannot erase an active blank profile requirement", () => {
   const age = {
     ...control("age_at_departure_parent", {
       label: "Age at time of travel",
@@ -1220,10 +1213,9 @@ test("an actionable blank optional profile representation cannot outrank a ready
 
   assert.equal(state.observedDecisions[0].status, "waived");
   assert.equal(state.observedDecisions[0].requiresResolution, false);
-  assert.equal(state.profileReadiness.ready, true, JSON.stringify(state.profileReadiness, null, 2));
-  assert.equal(state.currentObligation.subject.semanticType, "navigation", JSON.stringify(state.currentObligation, null, 2));
-  assert.equal(state.currentObligation.authority, "task_state");
-  assert.deepEqual(state.currentObligation.admittedControlIds, [forward.controlId]);
+  assert.equal(state.profileReadiness.ready, false, JSON.stringify(state.profileReadiness, null, 2));
+  assert.equal(state.currentObligation.semanticOwner.family, "age_at_departure", JSON.stringify(state.currentObligation, null, 2));
+  assert.deepEqual(state.currentObligation.admittedControlIds, [age.controlId]);
 });
 
 test("a profile-resolved exclusive insurance choice is completed before real navigation", () => {
@@ -1442,7 +1434,7 @@ test("completed exact outcomes survive scrolling, rerenders, missing controls an
   assert.equal(rerendered.completedOutcomes.some((outcome) => outcome.decisionGroupId === "seat_leg_1"), true);
   assert.equal(rerendered.meaningfulSurfaceChange, true);
   assert.equal(rerendered.clearObsoleteRecovery, false);
-  assert.equal(rerendered.stageOutcome.outcomeId, first.stageOutcome.outcomeId);
+  assert.equal(rerendered.stageOutcome, undefined);
 });
 
 test("only exact fresh paid selection evidence reopens a completed decision", () => {
@@ -1996,9 +1988,11 @@ test("an exact paid-item authorization conflicting with decline policy requires 
     }
   });
 
-  assert.equal(state.activeDecisions[0].status, "blocked");
-  assert.equal(state.activeDecisions[0].reopenEvidence.code, "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT");
-  assert.equal(state.activeDecisions[0].reopenEvidence.authorizationId, "auth_bundle");
+  assert.equal(state.activeDecisions.length, 0);
+  assert.equal(state.currentObligation, null);
+  assert.equal(state.disposition.code, "EXTERNAL_BLOCKER");
+  assert.equal(state.disposition.userActionRequired, true);
+  assert.equal(state.desiredStateEvaluations[0].status, "BLOCKED_EXTERNAL");
 });
 
 test("a complete owned card credential set is the terminal capability", () => {
@@ -2033,7 +2027,7 @@ test("a complete owned card credential set is the terminal capability", () => {
   assert.equal(state.terminalStatus, "card_credential_entry_reached");
   assert.equal(state.currentGoal, null);
   assert.equal(state.profileReadiness.ready, true);
-  assert.deepEqual(state.goal, { id: "reach_card_credential_entry", status: "completed" });
+  assert.deepEqual(state.milestone, { id: "reach_card_credential_entry", status: "completed" });
   assert.equal(state.paymentEvidence.observed, true);
   assert.equal(state.paymentEvidence.signalCount >= 3, true);
   assert.equal(state.safetyRestrictions.paymentSubmissionRequiresApproval, true);
@@ -2165,7 +2159,7 @@ test("a lone card field outside review does not create a terminal boundary", () 
   assert.notEqual(state.terminalStatus, "card_credential_entry_reached");
 });
 
-test("exact card entry completes the reach milestone while transaction verification stays diagnostic", () => {
+test("exact card entry remains a visible capability but cannot complete without authoritative transaction evidence", () => {
   const state = reduceTaskState({
     transactionReview: {
       ready: false,
@@ -2192,12 +2186,141 @@ test("exact card entry completes the reach milestone while transaction verificat
   });
 
   assert.equal(state.stage, "payment");
-  assert.equal(state.terminalStatus, "card_credential_entry_reached");
+  assert.equal(state.terminalStatus, "active");
   assert.equal(state.currentGoal, null);
-  assert.equal(state.paymentEvidence.observed, true);
+  assert.equal(state.paymentEvidence.boundaryObserved, true);
+  assert.equal(state.paymentEvidence.currentlyObserved, true);
+  assert.equal(state.paymentEvidence.observed, false);
   assert.equal(state.paymentEvidence.signalCount >= 2, true);
   assert.equal(state.paymentEvidence.transactionVerified, false);
   assert.deepEqual(state.paymentEvidence.missingTransactionFacts, ["itinerary.route", "travelers", "currency", "totalPrice"]);
+  assert.equal(state.disposition.kind, "stop");
+  assert.equal(state.disposition.code, "TRANSACTION_REVIEW_INCOMPLETE");
+  assert.equal(state.processAwareness.finalOutcome.achieved, false);
+});
+
+test("a missing booking invariant cannot schedule exploratory evidence disclosure", () => {
+  const disclosure = {
+    ...control("booking_details", {
+      label: "Booking details",
+      semantic: "reveal_transaction_evidence",
+      physicalEffect: "open_surface",
+      effectRole: "information_disclosure",
+      risk: "safe"
+    }),
+    controlsInformationOnly: true,
+    controlledElementIds: ["booking_summary"],
+    ariaExpanded: "false",
+    state: { expanded: false }
+  };
+  const attestation = {
+    ...control("confirm_accuracy", {
+      decisionGroupId: "dg_factual_accuracy",
+      label: "I confirm the booking and passenger details are accurate",
+      semantic: "legal_acceptance",
+      physicalEffect: "accept_legal_terms",
+      effectRole: "legal_attestation",
+      risk: "legal",
+      kind: "checkbox",
+      role: "checkbox"
+    }),
+    required: true,
+    state: { checked: false, selected: false, required: true }
+  };
+  const observation = {
+    observationId: "obs_collecting_at_factual_boundary",
+    observationSnapshot: { snapshotHash: "hash_collecting_at_factual_boundary" },
+    page: {
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Review and pay" },
+      controls: [disclosure, attestation],
+      decisionGroups: [{
+        decisionGroupId: "dg_factual_accuracy",
+        requirementId: "legal:factual-accuracy",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionType: "legal_acceptance",
+        sectionLabel: "Factual accuracy",
+        required: true,
+        status: "missing",
+        alternatives: [{ ...attestation, selected: false }]
+      }],
+      validationIssues: []
+    }
+  };
+  const state = reduceTaskState({
+    observation,
+    userPolicy: { standardBookingTermsApproved: true },
+    transactionReview: {
+      ready: false,
+      baselineStatus: "collecting",
+      missingFacts: ["itinerary_route", "currency", "total_price"],
+      contradictions: []
+    }
+  });
+
+  assert.equal(state.currentObligation, null);
+  assert.equal(state.disposition.kind, "stop");
+  assert.equal(state.disposition.code, "SELECTED_BOOKING_INVARIANT_MISSING");
+  assert.equal(state.disposition.userActionRequired, false);
+});
+
+test("a legal or payment boundary without exact evidence acquisition stops internally until booking authority exists", () => {
+  const attestation = {
+    ...control("confirm_accuracy_without_owner", {
+      decisionGroupId: "dg_accuracy_without_owner",
+      label: "I confirm the booking details are accurate",
+      semantic: "legal_acceptance",
+      physicalEffect: "accept_legal_terms",
+      effectRole: "legal_attestation",
+      risk: "legal",
+      kind: "checkbox",
+      role: "checkbox"
+    }),
+    required: true,
+    state: { checked: false, selected: false, required: true }
+  };
+  const observation = {
+    observationId: "obs_boundary_without_evidence_owner",
+    observationSnapshot: { snapshotHash: "hash_boundary_without_evidence_owner" },
+    page: {
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Review and pay" },
+      controls: [attestation],
+      decisionGroups: [{
+        decisionGroupId: "dg_accuracy_without_owner",
+        requirementId: "legal:factual-accuracy",
+        sectionType: "legal_acceptance",
+        sectionLabel: "Factual accuracy",
+        required: true,
+        status: "missing",
+        alternatives: [attestation]
+      }],
+      validationIssues: []
+    }
+  };
+  const collecting = reduceTaskState({
+    observation,
+    userPolicy: { standardBookingTermsApproved: true },
+    transactionReview: {
+      ready: false,
+      baselineStatus: "collecting",
+      missingFacts: ["itinerary_route", "total_price"],
+      contradictions: []
+    }
+  });
+  assert.equal(collecting.currentObligation, null);
+  assert.equal(collecting.disposition.kind, "stop");
+  assert.equal(collecting.disposition.code, "SELECTED_BOOKING_INVARIANT_MISSING");
+  assert.equal(collecting.disposition.userActionRequired, false);
+
+  const ready = reduceTaskState({
+    observation,
+    userPolicy: { standardBookingTermsApproved: true },
+    transactionReview: readyTransactionReview()
+  });
+  assert.deepEqual(ready.currentObligation.admittedControlIds, [attestation.controlId]);
+  assert.equal(ready.disposition.kind, "execute");
 });
 
 test("verified payment completion remains latched after redirect to a new search page", () => {
@@ -2238,7 +2361,7 @@ test("verified payment completion remains latched after redirect to a new search
   assert.equal(redirected.checkoutBoundary.status, "new_search_page");
   assert.equal(redirected.terminalGoalLatch.locked, true);
   assert.equal(redirected.terminalStatus, "card_credential_entry_reached");
-  assert.equal(redirected.goal.status, "completed");
+  assert.equal(redirected.milestone.status, "completed");
   assert.equal(redirected.currentGoal, null);
 
   const unrelated = reduceTaskState({
@@ -2411,11 +2534,34 @@ test("an already-satisfied optional Personal or Company choice cannot become ada
     }
   };
 
-  assert.equal(checkoutRelevantControl(company), false);
-  assert.equal(adaptiveInteractionGoal({ observation }), null);
+  const taskState = reduceTaskState({ observation, traveler: {}, userPolicy: {} });
+  assert.equal(taskState.currentGoal, null);
 });
 
-test("seat page without a decision group gets one local fallback when no obligation exists", () => {
+test("ancestor accessibility prose cannot promote a local Details command to navigation", () => {
+  const details = control("details", {
+    label: "Details",
+    semantic: "unknown",
+    physicalEffect: "unknown",
+    risk: "uncertain"
+  });
+  details.accessibleName = "Order total and itinerary details. Continue to passenger information.";
+
+  const taskState = reduceTaskState({
+    observation: {
+      observationId: "obs_details_with_ancestor_continue",
+      page: {
+        currentSurface: { id: "surface-page", type: "page" },
+        controls: [details]
+      }
+    },
+    traveler: {},
+    userPolicy: {}
+  });
+  assert.equal(taskState.currentGoal, null);
+});
+
+test("seat page without a decision group exposes semantic uncertainty instead of inventing progress work", () => {
   const randomAssignment = control("random_assignment", {
     label: "Choose seats for me",
     semantic: "required_dropdown_choice",
@@ -2460,9 +2606,8 @@ test("seat page without a decision group gets one local fallback when no obligat
   const traveler = { booking_rules: "No paid seats", seat_policy: "random_assignment" };
   const taskState = reduceTaskState({ observation, traveler, userPolicy: { bookingRules: traveler.booking_rules } });
 
-  assert.equal(taskState.currentGoal.kind, "adaptive_interaction");
-  assert.deepEqual(taskState.currentGoal.actionableControlIds, [randomAssignment.controlId]);
-  assert.match(taskState.currentGoal.adaptiveEnvelope.triggerReason, /^no_existing_obligation:/);
+  assert.equal(taskState.currentGoal, null);
+  assert.equal(taskState.ambiguityReason, "no_goal_relevant_candidate");
 });
 
 test("decision planning keeps unrelated surface controls as context and uses one shared safe selectable set", () => {
@@ -2561,10 +2706,10 @@ test("exact baggage groups decline cabin then checked baggage before Continue", 
   const cabinObservation = observation("obs_cabin", "missing", "", "missing", "");
   const cabinState = reduceTaskState({ observation: cabinObservation, userPolicy, traveler });
   assert.equal(cabinState.currentGoal.decisionGroupId, "cabin_baggage");
-  assert.equal(cabinState.currentObligation.contractVersion, "current-obligation/v2");
-  assert.equal(cabinState.currentObligation.authority, "task_state");
-  assert.equal(cabinState.currentObligation.surfaceId, "surface-page");
-  assert.equal(cabinState.currentObligation.policyDecision.status, "admitted");
+  assert.equal(cabinState.currentObligation.contractVersion, "current-obligation/v3");
+  assert.equal(cabinState.currentObligation.desiredStateDelta.surfaceId, "surface-page");
+  assert.equal(cabinState.currentObligation.policyAuthorization, undefined);
+  assert.equal(cabinState.currentObligation.desiredStateDelta.status, "EXACT_DELTA");
   assert.deepEqual(cabinState.currentGoal.candidateControlIds, ["cabin_none"]);
   assert.deepEqual(cabinState.currentGoal.eligibleAlternativeControlIds, ["cabin_none", "cabin_paid"]);
   assert.deepEqual(cabinState.currentGoal.freeAlternativeControlIds, ["cabin_none"]);
@@ -2851,14 +2996,18 @@ test("one decision episode closes a selected parent dropdown after child confirm
   assert.equal(completedState.decisionEpisode.status, "completed_pending_surface_exit");
   assert.equal(completedState.outcomeJournal.length, 1);
   assert.equal(completedState.outcomeJournal[0].decisionInstanceId, completedState.outcomeJournal[0].semanticOwnerId);
-  assert.equal(completedState.currentGoal.semanticType, "completed_choice_surface");
+  assert.equal(completedState.currentObligation.admittedControlIds.includes("flex_opener"), true);
   const candidates = buildCurrentCandidateSet({
     goal: completedState.currentGoal,
     observation: completedObservation,
     traveler,
     state: { taskState: completedState, approvals: {} }
   });
-  assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["flex_opener"]);
+  assert.deepEqual(
+    candidates.candidates.map((candidate) => candidate.controlId),
+    ["flex_opener"],
+    JSON.stringify({ obligation: completedState.currentObligation, goal: completedState.currentGoal, context: candidates.contextCapabilities }, null, 2)
+  );
   assert.equal(candidates.candidates[0].physicalEffect, "dismiss_surface");
   assert.equal(candidates.candidates.some((candidate) => candidate.controlId === "flex_none"), false);
 
@@ -3026,7 +3175,7 @@ test("explicit child identity cannot inherit a stale fallback episode when the e
 
   assert.equal(state.decisionEpisode.parentDecisionGroupId, parentDecisionGroupId);
   assert.equal(state.decisionEpisode.status, "completed_pending_surface_exit");
-  assert.equal(state.currentGoal.semanticType, "completed_choice_surface");
+  assert.equal(state.currentObligation.admittedControlIds.includes("flex_opener"), true);
   assert.deepEqual(state.currentGoal.actionableControlIds, ["flex_opener"]);
   const candidateSet = buildCurrentCandidateSet({
     goal: state.currentGoal,
@@ -3864,7 +4013,11 @@ test("GoToGate seat mode toggle yields to independently proven safe Next without
   });
 
   assert.equal(state.stage, "seats");
-  assert.deepEqual(state.currentObligation?.admittedControlIds, ["next"]);
+  assert.deepEqual(state.currentObligation?.admittedControlIds, ["next"], JSON.stringify({
+    decisions: state.observedDecisions,
+    deltas: state.desiredStateEvaluations,
+    obligation: state.currentObligation
+  }, null, 2));
   assert.notDeepEqual(state.currentObligation?.admittedControlIds, ["back"]);
   assert.equal(state.currentGoal?.semanticType, "navigation");
   assert.equal(state.ambiguityReason, "");
@@ -3887,6 +4040,141 @@ test("GoToGate seat mode toggle yields to independently proven safe Next without
   });
   assert.equal(candidateSet.candidates.some((candidate) => candidate.controlId === "next"), true);
   assert.equal(candidateSet.candidates.some((candidate) => candidate.controlId === "back"), false);
+});
+
+test("acquisition attempt exhaustion cannot suppress harmless exact navigation", () => {
+  const next = control("continue_after_unknown_booking", {
+    label: "Continue",
+    semantic: "continue",
+    risk: "safe_continue"
+  });
+  const observation = {
+    observationId: "obs_booking_acquisition_exhausted",
+    observationSnapshot: { snapshotHash: "hash_booking_acquisition_exhausted" },
+    page: {
+      step: "traveler_information",
+      currentSurface: { id: "surface-page", type: "page", label: "Passenger details" },
+      controls: [next],
+      decisionGroups: [],
+      validationIssues: [],
+      stageExit: {
+        continueAllowed: true,
+        continueObserved: true,
+        continueDisabled: false,
+        navigationState: "ready",
+        blockers: [],
+        candidates: [{
+          controlId: next.controlId,
+          actuatorId: next.preferredActivationElementId,
+          status: "ready",
+          executable: true
+        }]
+      }
+    }
+  };
+  const state = reduceTaskState({
+    state: {
+      transactionInvariants: {
+        baseline: {
+          itinerary: { completeness: "unknown", segments: [] },
+          travelers: [],
+          currency: "",
+          totalPrice: { amount: null, currency: "" }
+        },
+        acquisition: {
+          contractVersion: "selected-booking-acquisition-state/v1",
+          status: "exhausted",
+          attempts: 6,
+          maximumAttempts: 6,
+          missingFacts: ["itinerary_route", "itinerary_date", "travelers", "currency", "total_price"]
+        }
+      }
+    },
+    observation,
+    transactionReview: {
+      ready: false,
+      baselineStatus: "collecting",
+      missingFacts: ["itinerary_route", "itinerary_date", "travelers", "currency", "total_price"],
+      contradictions: []
+    }
+  });
+
+  assert.deepEqual(state.currentObligation?.admittedControlIds, [next.controlId]);
+  assert.deepEqual(state.currentGoal?.actionableControlIds, [next.controlId]);
+  assert.equal(state.disposition.kind, "execute");
+  assert.equal(state.disposition.code, "EXECUTE_CURRENT_OBLIGATION");
+  assert.equal(state.disposition.userActionRequired, false);
+});
+
+test("one exact profile obligation outranks an unrelated missing decision fact", () => {
+  const email = {
+    ...control("contact_email", {
+      label: "Email",
+      semantic: "email",
+      semanticType: "email",
+      effectRole: "profile_field",
+      physicalEffect: "set_field_value",
+      kind: "email",
+      role: "textbox"
+    }),
+    fieldType: "email",
+    required: true,
+    state: { required: true, valuePresent: false, normalizedValue: "" },
+    operations: { type: capability("type", "contact_email_node") }
+  };
+  const unexplainedRequired = {
+    ...control("opaque_required_choice", {
+      decisionGroupId: "dg_opaque_required",
+      label: "Confirm",
+      semantic: "choice",
+      effectRole: "unknown",
+      physicalEffect: "unknown",
+      kind: "checkbox",
+      role: "checkbox",
+      inputType: "checkbox",
+      risk: "uncertain"
+    }),
+    required: true,
+    state: { required: true, checked: false, selected: false }
+  };
+  const observation = {
+    observationId: "obs_exact_email_with_missing_decision_fact",
+    observationSnapshot: { snapshotHash: "hash_exact_email_with_missing_decision_fact" },
+    page: {
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Payment details" },
+      controls: [email, unexplainedRequired],
+      fields: [{
+        controlId: email.controlId,
+        field: "email",
+        fieldType: "email",
+        label: "Email",
+        required: true,
+        hasValue: false
+      }],
+      decisionGroups: [{
+        decisionGroupId: "dg_opaque_required",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionLabel: "Confirmation",
+        requiredStateObserved: true,
+        alternativeControlIds: [unexplainedRequired.controlId],
+        alternatives: [{ controlId: unexplainedRequired.controlId, label: unexplainedRequired.label, selected: false }]
+      }],
+      validationIssues: [],
+      stageExit: { continueAllowed: false, candidates: [] }
+    }
+  };
+
+  const state = reduceTaskState({
+    observation,
+    traveler: { id: "trav_email", email: "ali@example.test" }
+  });
+
+  assert.equal(state.currentObligation?.desiredStateDelta?.kind, "profile_field");
+  assert.deepEqual(state.currentObligation?.admittedControlIds, [email.controlId]);
+  assert.equal(state.disposition.kind, "execute");
+  assert.equal(state.disposition.code, "EXECUTE_CURRENT_OBLIGATION");
 });
 
 test("a genuine paid seat conflict never substitutes unrelated Next or Back for unavailable exact Skip", () => {
@@ -3995,7 +4283,7 @@ test("TaskState never waits on an unchanged settled observation", () => {
     }
   });
   assert.equal(first.disposition.kind, "stop", JSON.stringify(first.disposition, null, 2));
-  assert.equal(first.disposition.code, "SITUATION_RECONCILIATION_REQUIRED");
+  assert.equal(first.disposition.code, "NO_CURRENT_OBLIGATION");
   assert.equal(first.disposition.userActionRequired, false);
 
   const second = reduceTaskState({

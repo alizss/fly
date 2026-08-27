@@ -17,6 +17,12 @@
 // which is a real cost for a product whose whole point is being fast.
 
 const agentContract = require("../../../extension/src/shared/agent-contract");
+const STALE_IDENTITY_CODES = new Set([
+  "CANDIDATE_SET_OBSERVATION_MISMATCH",
+  "CURRENT_GOAL_CANDIDATE_MISMATCH",
+  "ACTION_OBSERVATION_MISMATCH",
+  "ACTION_DESIRED_STATE_DELTA_MISMATCH"
+]);
 
 const {
   resolveAmbiguity,
@@ -78,7 +84,7 @@ const {
   createObservationFrame,
   currentObligation
 } = require("../authority-frames");
-const { obligationField, semanticOwner } = require("../current-obligation");
+const { semanticOwner } = require("../current-obligation");
 const {
   executionEpisodeFor,
   leasedActionFor,
@@ -101,7 +107,6 @@ const {
 const { applyTransitionStatus, deterministicTransitionVerification } = require("./transition");
 const {
   browserDispatched,
-  leasedActionSupersededByFreshPage,
   rawVerifiedCommerceReceipt,
   recordPreviousActionFacts,
   staleIdentityRejection
@@ -134,7 +139,7 @@ const {
 } = require("./turn-result");
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  return currentObligation(taskState);
 }
 
 function bufferedDiagnosticStore(store = null) {
@@ -206,6 +211,26 @@ async function runLoopTurn({
       status: "running"
     });
   }
+  if (
+    state.status === "awaiting_user"
+    && !consumedProfileResponse
+    && !String(userMessage || "").trim()
+    && !userResponse
+    && state.lastAction?.type === "ask_user"
+  ) {
+    // A question is a durable latch. Page mutation, reinjection, duplicate
+    // transport, or a queued turn returns the same request without reducing,
+    // replanning, or emitting a second ask.
+    return {
+      state,
+      clientDecision: toClientDecision(state.lastAction),
+      debug: withLatencyDebug({
+        askUserLatched: true,
+        candidateGenerationSuppressed: true,
+        finalAction: state.lastAction
+      }, latency, modelUsageFromMetas(model, []))
+    };
+  }
   traveler = applySessionProfileOverrides(traveler, state.sessionProfileOverrides || {});
   // Capture evidence/mechanics once. Semantic task authority is compiled once
   // immediately before TaskState reduces the exact DecisionFrame once.
@@ -220,8 +245,8 @@ async function runLoopTurn({
       type: "final_review",
       intent: "card_credential_entry_reached",
       reason: "Card credential entry was already verified for this booking request. The completed checkout goal remains closed.",
-      risk: "payment",
-      requiresApproval: true
+      risk: "safe",
+      requiresApproval: false
     });
     const terminalState = withUpdate(state, {
       executionEpisode: updatedExecutionEpisode(state, { leasedAction: null }),
@@ -289,9 +314,8 @@ async function runLoopTurn({
     });
     transactionStore?.advanceGovernedAction?.(
       lifecycle.actionId,
-      ["allowed", "approved", "dispatched", "observed"],
-      lifecycle.status,
-      { lifecycle, transition }
+      ["allowed", "approved", "dispatched", "observed", "waiting_for_destination"],
+      lifecycle.status
     );
     state = withUpdate(state, {
       executionEpisode: updatedExecutionEpisode(state, {
@@ -322,7 +346,7 @@ async function runLoopTurn({
     state = withUpdate(state, {
       currentBlocker: outcomeStatus === actionOutcome.REVEALED_BLOCKER ? transition.blocker : null,
       executionEpisode: updatedExecutionEpisode(state, {
-        leasedAction: [actionOutcome.SATISFIED, actionOutcome.PROGRESSED, actionOutcome.REVEALED_BLOCKER].includes(outcomeStatus) && !preserveViewportRecovery
+        leasedAction: [actionOutcome.SATISFIED, actionOutcome.REVEALED_BLOCKER].includes(outcomeStatus) && !preserveViewportRecovery
           ? null
           : leasedActionFor(state)
       })
@@ -476,27 +500,41 @@ async function runLoopTurn({
     ambiguityModelCalls += 1;
     return resolveAmbiguity(request);
   };
-  // Deterministic semantics and TaskState run first. A model may enrich only
-  // the exact CurrentObligation that TaskState already admitted; it never
-  // scans the page first and cannot create work.
+  // Deterministic semantics are the fast path, not an admission gate. The
+  // first reduction is provisional: when it cannot explain the active
+  // surface, one grounded semantic pass may enrich the DecisionFrame before
+  // the authoritative TaskState obligation is published.
   const semanticCompileStartedAt = Date.now();
   observation = applyRememberedSemanticBindings(observation, state.semanticBindingMemory, {
     traveler,
     transactionReview: state.transactionInvariants?.review || null
   });
-  const compileCurrentDecisionFrame = (semanticCompilation = null) => {
-    observationFrame = createObservationFrame(observation);
+  // Preserve the immutable structural source across an optional grounded
+  // reconciliation. The published semantic observation is for consumers; it
+  // must never become the input to a second interpretation pass.
+  let decisionFrameSourceObservation = observation;
+  // Acquire objective transaction structure before publishing semantics for
+  // this observation. Otherwise the observation that consumes the final
+  // bounded acquisition attempt can compile a DecisionFrame from the stale
+  // "collecting" state and publish one stage-changing action after durable
+  // acquisition has already become exhausted.
+  const structuralTransactionContext = prepareTransactionInvariants(state, observation, traveler, {
+    authoritativeTransactionFacts: observation.page?.transactionFacts || {}
+  });
+  state = structuralTransactionContext.state;
+  const compileCurrentDecisionFrame = () => {
+    observationFrame = createObservationFrame(decisionFrameSourceObservation);
     decisionFrame = compileDecisionFrame({
-      observation,
+      observation: decisionFrameSourceObservation,
       observationFrame,
-      ...(semanticCompilation ? { semanticCompilation } : {}),
       state,
       traveler
     });
     observation = decisionFrame.observation;
   };
-  const deterministicSemanticCompilation = agentContract.compileSemanticCheckout(observation.page || {});
-  compileCurrentDecisionFrame(deterministicSemanticCompilation);
+  // DecisionFrame is the sole semantic compiler. The orchestrator must not
+  // precompile the same page and inject a competing semantic result.
+  compileCurrentDecisionFrame();
   latency.semantic_compile_ms += Date.now() - semanticCompileStartedAt;
   let transactionContext = prepareTransactionInvariants(state, observation, traveler, {
     authoritativeTransactionFacts: decisionFrame.transactionFacts
@@ -508,7 +546,6 @@ async function runLoopTurn({
     bookingRules: traveler.booking_rules || state.userPolicy?.bookingRules || "",
     paymentPreference: traveler.payment_preference || state.userPolicy?.paymentPreference || ""
   };
-  const taskStateStartedAt = Date.now();
   const runTaskStateReduction = (previousTaskState, mechanicalEvidence) => reduceDecisionFrame({
     previousTaskState,
     observation,
@@ -521,20 +558,24 @@ async function runLoopTurn({
     decisionFrame,
     mechanicalEvidence
   });
-  let taskState = runTaskStateReduction(
-    initialTaskState,
-    executionEpisodeFor(state).mechanicalEvidence || null
-  );
-  const reconcileMechanicalExhaustion = runTaskStateReduction;
-  const preliminaryObligation = currentObligation(taskState);
-  const sceneUncertainty = semanticSceneUncertainty({
-    observation,
-    semanticCompilation: decisionFrame.semanticCompilation,
-    traveler,
-    transactionReview: transactionContext.review,
-    currentObligation: preliminaryObligation
-  });
-  if (preliminaryObligation && sceneUncertainty.needed) {
+  const taskStateStartedAt = Date.now();
+  const mechanicalEvidence = executionEpisodeFor(state).mechanicalEvidence || null;
+  // Semantic sufficiency belongs before TaskState. A provisional TaskState
+  // used to decide whether the scene was understood, which let a plausible
+  // but wrong obligation suppress unfamiliarity reasoning. DecisionFrame now
+  // declares its own incompleteness; TaskState is reduced exactly once from
+  // the final frame.
+  const semanticFallbackEligible = decisionFrame.semanticCompilation?.semanticReadiness === "unresolved"
+    || (decisionFrame.unresolvedEvidence || []).length > 0;
+  const sceneUncertainty = semanticFallbackEligible
+    ? semanticSceneUncertainty({
+        observation,
+        semanticCompilation: decisionFrame.semanticCompilation,
+        traveler,
+        transactionReview: transactionContext.review
+      })
+    : { needed: false, reason: "DECISION_FRAME_SEMANTICALLY_SUFFICIENT" };
+  if (sceneUncertainty.needed) {
     try {
       const reconciled = await resolveTurnAmbiguity({
         kind: "semantic_scene",
@@ -545,7 +586,6 @@ async function runLoopTurn({
           semanticCompilation: decisionFrame.semanticCompilation,
           traveler,
           transactionReview: transactionContext.review,
-          currentObligation: preliminaryObligation,
           policyConstraints: effectiveUserPolicy,
           failedMethods: (recoveryFacts(state).failedStrategies || []).map((strategy) => ({
             operation: strategy.operation || strategy.type || "",
@@ -556,6 +596,18 @@ async function runLoopTurn({
           uncertainty: sceneUncertainty
         }
       });
+      const reconciledPage = reconciled.observation.page || {};
+      decisionFrameSourceObservation = {
+        ...decisionFrameSourceObservation,
+        page: {
+          ...(decisionFrameSourceObservation.page || {}),
+          semanticFieldHints: reconciledPage.semanticFieldHints || [],
+          semanticValidationHints: reconciledPage.semanticValidationHints || [],
+          semanticControlHints: reconciledPage.semanticControlHints || [],
+          semanticDecisionHints: reconciledPage.semanticDecisionHints || [],
+          semanticSceneReconciliation: reconciledPage.semanticSceneReconciliation || null
+        }
+      };
       observation = reconciled.observation;
       activeComponentGrounding = reconciled.reconciliation;
       activeComponentGroundingMeta = reconciled.meta;
@@ -583,11 +635,9 @@ async function runLoopTurn({
       authoritativeTransactionFacts: decisionFrame.transactionFacts
     });
     state = transactionContext.state;
-    taskState = runTaskStateReduction(
-      initialTaskState,
-      executionEpisodeFor(state).mechanicalEvidence || null
-    );
   }
+  let taskState = runTaskStateReduction(initialTaskState, mechanicalEvidence);
+  const reconcileMechanicalExhaustion = runTaskStateReduction;
   const taskReadModel = taskStateReadModel(taskState) || {};
   const authoritativeGoal = taskMechanics(taskState);
   latency.task_state_ms = Date.now() - taskStateStartedAt;
@@ -608,8 +658,8 @@ async function runLoopTurn({
       })
     });
   }
-  const resolvedPaidAuthorization = taskState.currentObligation?.policyDecision?.authorization;
-  const authorizedDecisionGroupId = taskState.currentObligation?.subject?.decisionGroupId;
+  const resolvedPaidAuthorization = taskState.currentObligation?.desiredStateDelta?.authorization;
+  const authorizedDecisionGroupId = taskState.currentObligation?.desiredStateDelta?.decisionGroupId;
   if (resolvedPaidAuthorization?.authorizationId && authorizedDecisionGroupId) {
     const existingAuthorizations = Array.isArray(state.approvals?.paidExtraAuthorizations)
       ? state.approvals.paidExtraAuthorizations
@@ -648,41 +698,15 @@ async function runLoopTurn({
     state = withUpdate(state, { pendingUserInput: null });
   }
 
-  // The current browser state wins over an undispatched/stale prediction. If
-  // the page changed without a matching result for the pending action, cancel
-  // that binding and plan from the fresh surface instead of waiting for an
-  // obsolete DOM outcome.
-  const stalePending = normalizeLeasedAction(leasedActionFor(state));
-  if (leasedActionSupersededByFreshPage(stalePending, observation)) {
-    transactionStore?.recordActionEvent?.(state.id, {
-      actionId: stalePending.originalAction.id || "",
-      observationId: observation.observationId || "",
-      turnId: clientTurnId || turnId,
-      stage: "pending_action_cancelled_by_fresh_page",
-      sourceObservationHash: stalePending.sourceObservationHash || "",
-      currentObservationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      dispatched: false
-    });
-    state = withUpdate(state, {
-      executionEpisode: updatedExecutionEpisode(state, {
-        leasedAction: null,
-        attemptedCandidateIds: [],
-        failedStrategySignatures: [],
-        failedStrategies: []
-      }),
-      status: "running"
-    });
-  }
-
   // A pending advance is never stronger than newer exact selection truth.
   // Manual changes, rerenders, and late selector hydration can reveal a paid
   // conflict after navigation was planned. Cancel that stale plan and let the
   // freshly reduced decision own this turn.
   const pendingBeforeConflictReconciliation = normalizeLeasedAction(leasedActionFor(state));
   const authoritativeEffect = String(
-    obligationField(authoritativeGoal, "semanticEffect")
-    || obligationField(authoritativeGoal, "desiredSemanticOutcome")
-    || obligationField(authoritativeGoal, "desiredPolicyOutcome")
+    (authoritativeGoal?.desiredStateDelta?.desiredEffect)
+    || (authoritativeGoal?.desiredSemanticOutcome)
+    || (authoritativeGoal?.desiredPolicyOutcome)
     || ""
   );
   const authoritativeCorrection = agentContract.canonicalSemanticEffect(authoritativeEffect)
@@ -695,8 +719,8 @@ async function runLoopTurn({
       observationId: observation.observationId || "",
       turnId: clientTurnId || turnId,
       stage: "pending_navigation_preempted_by_policy_conflict",
-      decisionGroupId: obligationField(authoritativeGoal, "decisionGroupId") || "",
-      obligationId: obligationField(authoritativeGoal, "goalId") || "",
+      decisionGroupId: (authoritativeGoal?.decisionGroupId) || "",
+      obligationId: (authoritativeGoal?.id) || "",
       dispatched: false
     });
     state = withUpdate(state, {
@@ -720,7 +744,7 @@ async function runLoopTurn({
       turnId: clientTurnId || turnId,
       stage: "pending_recovery_cancelled_by_fresh_obligation",
       obligationId: normalizedPending.actionLease?.obligationId || "",
-      currentObligationId: authoritativeGoal?.obligationId || "",
+      currentObligationId: authoritativeGoal?.id || "",
       dispatched: false
     });
     state = withUpdate(state, {
@@ -903,7 +927,7 @@ async function runLoopTurn({
       const exhaustedGoal = authoritativeGoal || {};
       const mechanicalEvidence = {
         kind: "goal_strategies_exhausted",
-        goalId: obligationField(exhaustedGoal, "goalId") || pending.actionLease?.obligationId || pending.obligationId || "",
+        goalId: (exhaustedGoal?.id) || pending.actionLease?.obligationId || pending.obligationId || "",
         semanticGoalKey: semanticGoalKey(exhaustedGoal),
         decisionGroupId: exhaustedGoal.decisionGroupId || exhaustedGoal.subject?.decisionGroupId || "",
         subjectKey: exhaustedGoal.canonicalSubject?.key || exhaustedGoal.subject?.key || exhaustedGoal.semanticType || "",
@@ -1055,8 +1079,8 @@ async function runLoopTurn({
           mechanicalEffect: "none",
           expectedPostconditions: [],
           reason,
-          risk: taskDisposition.code === "CARD_CREDENTIAL_ENTRY_REACHED" ? "payment" : "safe",
-          requiresApproval: true
+          risk: "safe",
+          requiresApproval: false
         })
       : taskDisposition.kind === "request_input"
       ? finalHandoffAction(reason, observation, {
@@ -1084,7 +1108,8 @@ async function runLoopTurn({
             expectedPostconditions: [],
             reason,
             risk: "safe",
-            requiresApproval: false
+            requiresApproval: false,
+            userActionRequired: taskDisposition.userActionRequired === true
           });
     const status = taskDisposition.kind === "terminal"
       ? "ready_for_payment"
@@ -1234,7 +1259,7 @@ async function runLoopTurn({
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
         type: "stop",
         intent: boundButIncomplete ? "candidate_contract_incomplete" : "mechanic_unavailable",
-        obligationId: obligationField(canonicalGoal, "goalId") || "",
+        obligationId: (canonicalGoal?.id) || "",
         reason,
         risk: "safe",
         requiresApproval: false
@@ -1245,7 +1270,7 @@ async function runLoopTurn({
           kind: "stop",
           code,
           reason,
-          obligationId: obligationField(canonicalGoal, "goalId") || "",
+          obligationId: (canonicalGoal?.id) || "",
           userActionRequired: false
         })
       });
@@ -1290,11 +1315,11 @@ async function runLoopTurn({
       .filter(Boolean))];
     const mechanicalEvidence = {
         kind: "goal_strategies_exhausted",
-        goalId: obligationField(canonicalGoal, "goalId"),
+        goalId: (canonicalGoal?.id),
         semanticGoalKey: semanticGoalKey(canonicalGoal),
-        decisionGroupId: obligationField(canonicalGoal, "decisionGroupId") || obligationField(canonicalGoal, "subject")?.decisionGroupId || "",
-        subjectKey: obligationField(canonicalGoal, "canonicalSubject")?.key || obligationField(canonicalGoal, "subject")?.key || obligationField(canonicalGoal, "semanticType") || "",
-        surfaceId: obligationField(canonicalGoal, "surfaceId") || observation.page?.currentSurface?.id || "surface-page",
+        decisionGroupId: (canonicalGoal?.decisionGroupId) || (canonicalGoal?.subject)?.decisionGroupId || "",
+        subjectKey: (canonicalGoal?.canonicalSubject)?.key || (canonicalGoal?.subject)?.key || (canonicalGoal?.semanticType) || "",
+        surfaceId: (canonicalGoal?.surfaceId) || observation.page?.currentSurface?.id || "surface-page",
         observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
         excludedControlIds: failedControlIds
       };
@@ -1430,7 +1455,7 @@ async function runLoopTurn({
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
       type: "stop",
       intent: "candidate_compilation_failed",
-      obligationId: obligationField(observationGoal, "goalId") || "",
+      obligationId: (observationGoal?.id) || "",
       reason: "No executable action could be compiled from the settled surface and bounded candidate set.",
       risk: "safe",
       requiresApproval: false
@@ -1539,7 +1564,7 @@ async function runLoopTurn({
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
       type: "stop",
       intent: "stale_binding_rejected",
-      obligationId: obligationField(observationGoal, "goalId"),
+      obligationId: (observationGoal?.id),
       candidateId: modelSelection?.candidateId || "",
       reason: `The fresh stable surface rejected ${governance.code}; stop without scheduling a mutation wait or repeating the binding.`,
       risk: "safe",
@@ -1581,6 +1606,12 @@ async function runLoopTurn({
   } else if (!governance.allow) {
     finalAction = policyBlockedAction(governance, executablePlannedAction);
   }
+  if (governance.allow === true) {
+    finalAction = normalizeAction({
+      ...finalAction,
+      governorDecisionId: governance.governorDecisionId
+    });
+  }
   finalAction = bindTargetSnapshot(finalAction, observation);
 
   const pendingExecutableAction = governance.allow === true
@@ -1598,7 +1629,11 @@ async function runLoopTurn({
   nextState = withUpdate(nextState, {
     executionEpisode: updatedExecutionEpisode(nextState, { leasedAction: authoritativePendingAction }),
     lastAction: finalAction,
-    status: finalAction.type === "ask_user" || finalAction.type === "final_review" ? "awaiting_user" : "running"
+    status: finalAction.type === "final_review"
+      ? "ready_for_payment"
+      : finalAction.type === "ask_user"
+        ? "awaiting_user"
+        : "running"
   });
 
   const debug = withLatencyDebug(
@@ -1649,7 +1684,6 @@ module.exports = {
     rebindPendingRecoveryAction,
     updateExecutionRecovery,
     applyTransitionStatus,
-    leasedActionSupersededByFreshPage,
     candidateStrategySignature,
     candidateSelectionCacheEntry,
     reusableCandidateSelection,

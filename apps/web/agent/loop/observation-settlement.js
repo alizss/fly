@@ -14,7 +14,7 @@ const {
 const { verifiedCommerceObligationFromActionResult } = require("../task-state-reducer");
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  return currentObligation(taskState);
 }
 
 function browserDispatched(result = {}) {
@@ -49,15 +49,6 @@ function compactCurrentObservation(observation = {}) {
     url: observation.page?.url || "",
     capturedAt: new Date().toISOString()
   };
-}
-
-function leasedActionSupersededByFreshPage(pending = null, observation = {}) {
-  const normalized = normalizeLeasedAction(pending);
-  if (!normalized?.originalAction?.id || normalized.status === "needs_reveal") return false;
-  if (observation.lastActionResult?.actionId === normalized.originalAction.id) return false;
-  const sourceHash = String(normalized.sourceObservationHash || normalized.originalAction.observationHash || "");
-  const currentHash = String(observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "");
-  return Boolean(sourceHash && currentHash && sourceHash !== currentHash);
 }
 
 function recordPreviousActionFacts(state = {}, observation = {}, traveler = {}) {
@@ -103,16 +94,14 @@ function rawVerifiedCommerceReceipt(state = {}, observation = {}) {
     {
       taskState: state.taskState || {},
       decisionEpisode: state.taskState?.decisionEpisode || null,
-      currentGoal: taskMechanics(state.taskState || {})
+      currentWork: taskMechanics(state.taskState || {})
     }
   );
 }
 
 module.exports = {
   browserDispatched,
-  leasedActionSupersededByFreshPage,
   rawVerifiedCommerceReceipt,
   recordPreviousActionFacts,
   staleIdentityRejection
 };
-

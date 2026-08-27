@@ -234,7 +234,7 @@ test("a prior transient state cannot perpetuate waiting after the action closes"
   assert.equal(readiness.attempts, 0);
 });
 
-test("navigation lifecycle closes on the first mechanically usable destination frame", () => {
+test("navigation lifecycle closes on a usable frame without inventing destination progress", () => {
   const action = {
     id: "act_advance",
     observationId: "obs_before",
@@ -265,6 +265,6 @@ test("navigation lifecycle closes on the first mechanically usable destination f
     observationReadiness: ready
   });
   assert.equal(ready.classification, READINESS.READY);
-  assert.equal(closed.transition.actionOutcome.status, "PROGRESSED");
+  assert.equal(closed.transition.actionOutcome.status, "NO_RESULT");
   assert.equal(closed.lifecycle.closed, true);
 });

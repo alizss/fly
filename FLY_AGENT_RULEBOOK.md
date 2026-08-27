@@ -2,7 +2,10 @@
 
 ## Goal
 
-Build one reusable checkout agent that works across unfamiliar airline sites. Do not build airline-specific workflows.
+Build one reusable checkout agent solution that works across unfamiliar airline sites, OTEs, and so on.
+Do not build airline-specific workflows.
+Goal is this for future long term to work on web/extension/ios app and so on aka engine.
+It has to complete checkouts airline and based on user context profile and reach the payment stage dealing with all unfamilirites and obstacles, reason and figure it out to reach the goal.
 
 Current milestone: complete all authorized pre-payment checkout work, verify that real card-entry controls have been reached, and stop before entering payment credentials, paying, or purchasing.
 
@@ -48,7 +51,26 @@ Trace the failure upstream until you find the earliest incorrect or missing trut
 
 Do not assume the root cause is large. Choose the smallest cause that fully explains the evidence.
 
-### 3. Add only the highest-leverage component
+### 3. Only if still necessary, challenge any addition
+
+Here, a component means any module, service, planner, compiler, store, verifier, adapter, abstraction, state, fallback, or code path that owns system behavior.
+
+Before adding one, challenge whether it should exist at all. First search the codebase for who already owns the same fact, decision, lifecycle, or capability.
+
+Ask:
+
+- Does this responsibility already exist somewhere?
+- If it exists but is failing, why are we not fixing, simplifying, or replacing its current owner?
+- Can an existing owner handle this responsibility?
+- Can removing or simplifying something make the addition unnecessary?
+- Does it own one necessary responsibility that nothing else should own?
+- Would the system be clearer and still correct without it?
+
+Never create a second component to compensate for an existing component that is incomplete, constrained, or broken. That creates conflicting authorities, duplicated state, and inconsistent behavior. Fix, simplify, reconnect, replace, or remove the existing owner instead.
+
+If the addition cannot prove a new, necessary, non-overlapping responsibility, do not add it.
+
+Never force an addition, component, layer, abstraction, state, fallback, or code path into the solution. Adding nothing is the preferred outcome when removal, simplification, correction, reconnection, or reuse fully solves the root bottleneck.
 
 Add something only when removal, simplification, or correction cannot solve the problem.
 
@@ -57,6 +79,18 @@ Choose the smallest universal component that creates an order-of-magnitude impro
 Use the simplest design that fully removes the bottleneck. More code, more layers, and more generality are costs—not signs of a better solution.
 
 Complexity must earn its existence. Every new layer, state, abstraction, or fallback must solve a demonstrated problem that a simpler correction cannot solve.
+
+### Universal unfamiliarity test
+
+Always think universally. Fly's goal is to handle unfamiliar sites, encounter obstacles, reason from fresh evidence, and figure out a safe path to the goal.
+
+Before accepting a solution, ask:
+
+- What unfamiliar site structure or obstacle would break this assumption?
+- Does the solution teach a reusable capability, or only encode the discovering site and trace?
+- Can the engine infer what to do from evidence when labels, layout, order, controls, or navigation differ?
+
+Use adversarial counterexamples to test the abstraction. Never solve unfamiliarity with an airline-specific condition or a memorized workflow.
 
 Priority:
 
@@ -70,10 +104,13 @@ remove unnecessary complexity
 ## Engineering rules
 
 - One authority per fact, decision, obligation, action, and result. Everything else is derived or diagnostic.
+- A replacement is incomplete while the old component, fallback, state, or decision path can still compete with it. Remove the superseded authority.
+- Prefer fewer authorities, states, transitions, and recovery paths. Make invalid or contradictory states impossible where practical.
 - Follow the last verified fact in the trace. Never treat an intended effect as observed success.
 - Repair the universal owning layer, not the discovering airline.
 - Do not reopen completed or optional work without fresh evidence.
 - Keep recovery bounded and remember failed strategies.
+- Never repeat the same failed strategy without new information. Every retry must use changed evidence, conditions, or mechanics.
 - One exact canonical actuator has one feasibility authority. Execution may revalidate current identity, visibility, enabled state, hit testing, surface ownership, and operation compatibility, but it must not contradict the observer with a generic CTA-size heuristic; native radios and checkboxes are valid small targets.
 - A repeat-prohibited failure before dispatch is still a failed strategy. Persist it at the target-local semantic scope, clear stale selection, consume the finite budget, and choose a distinct actuator instead of repeating the same plan.
 - Verify the exact fix and its downstream effect with a trace-derived replay, focused tests, the full relevant suite, and a retained canary.

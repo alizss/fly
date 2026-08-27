@@ -18,14 +18,14 @@ const {
 } = require("./mechanics");
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  return currentObligation(taskState);
 }
 
 function deterministicTransitionVerification(transition = null) {
   const status = transition?.actionOutcome?.status || "";
   const outcome = agentContract.ACTION_OUTCOME;
   const achieved = status === outcome.SATISFIED;
-  const changed = [outcome.SATISFIED, outcome.PROGRESSED, outcome.REVEALED_BLOCKER].includes(status);
+  const changed = [outcome.SATISFIED, outcome.REVEALED_BLOCKER].includes(status);
   return {
     ok: achieved,
     changed,
@@ -91,7 +91,10 @@ function applyTransitionStatus(
   const rejectedBeforeDispatch = advanced.lifecycle.status === "rejected_before_dispatch";
   const failedWithoutDispatch = rejectedBeforeDispatch && repeatProhibited;
   if (
-    ((repeatProhibited && transition?.actionOutcome?.status === agentContract.ACTION_OUTCOME.NO_EFFECT)
+    ((repeatProhibited && [
+      agentContract.ACTION_OUTCOME.NO_EFFECT,
+      agentContract.ACTION_OUTCOME.NO_RESULT
+    ].includes(transition?.actionOutcome?.status))
       || failedWithoutDispatch
       || failedStrategyReuse)
     && governedAction.type !== "scroll"
@@ -102,7 +105,7 @@ function applyTransitionStatus(
     const entry = {
       goalKey,
       decisionInstanceId,
-      semanticGoalKey: semanticGoalKey(authoritativeGoal),
+      semanticGoalKey: authoritativeGoal ? semanticGoalKey(authoritativeGoal) : "",
       strategySignature: signature,
       controlId: governedAction.controlId || "",
       stableControlKey: affordance.stableKey || governedAction.controlId || "",
@@ -137,7 +140,7 @@ function applyTransitionStatus(
       return entry.goalKey === goalKey && entry.pageStateHash === pageStateHash;
     }
     const scope = targetLocalRecoveryScope(authoritativeGoal, observation, entry);
-    return entry.semanticGoalKey === semanticGoalKey(authoritativeGoal)
+    return entry.semanticGoalKey === (authoritativeGoal ? semanticGoalKey(authoritativeGoal) : "")
       && entry.surfaceInstanceKey === scope.surfaceInstanceKey
       && entry.targetLocalStateKey === scope.targetLocalStateKey;
   });
@@ -153,7 +156,8 @@ function applyTransitionStatus(
         failedStrategies: failedStrategies.slice(-80),
         failedStrategySignatures: attemptedStrategySignatures
       }),
-      ...(transition?.actionOutcome?.status === agentContract.ACTION_OUTCOME.NO_EFFECT
+      ...([agentContract.ACTION_OUTCOME.NO_EFFECT, agentContract.ACTION_OUTCOME.NO_RESULT]
+        .includes(transition?.actionOutcome?.status)
         || failedWithoutDispatch
         || failedStrategyReuse
         ? { aiDecisionCache: null }

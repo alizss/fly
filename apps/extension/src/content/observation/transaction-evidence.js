@@ -14,7 +14,19 @@ export function createTransactionEvidenceCompiler(dependencies) {
   } = dependencies;
 
   function transactionFactsEvidence({ step = "unknown", price = null, decisionGroups = [], activeSurface = {}, terminalEvidence = null } = {}) {
-    const text = String(primaryPageText() || visiblePageText() || "")
+    // Transaction identity is often split between the main form and a sticky
+    // order-summary aside. Never let the first non-empty region suppress the
+    // rest of the visible booking evidence.
+    const transactionTexts = [primaryPageText(), visiblePageText()];
+    queryAllDeep("main, [role='main'], form, section, article, aside, dialog, [role='dialog'], [aria-label*='booking' i], [aria-label*='itinerary' i], [aria-label*='route' i], [data-testid*='booking' i], [data-testid*='itinerary' i], [data-testid*='route' i]")
+      .filter((element) => isVisible(element))
+      .filter((element) => !element.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]"))
+      .forEach((element) => transactionTexts.push(
+        String(element.innerText || element.textContent || element.getAttribute?.("aria-label") || "").slice(0, 12000)
+      ));
+    const text = [...new Set(transactionTexts.map((value) => String(value || "").trim()).filter(Boolean))]
+      .join(" \n ")
+      .slice(0, 50000)
       .replace(/[\u200e\u200f\u202a-\u202e]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
@@ -228,6 +240,28 @@ export function createTransactionEvidenceCompiler(dependencies) {
         authoritative: true
       }
     }));
+    // Generic repeated flight/leg rows are a structural transaction contract:
+    // ordinal + full date + departure time/IATA + arrival time/IATA. This
+    // covers ordinary visual rows even when the site supplies no semantic
+    // itinerary attributes and without naming an airline or page layout.
+    const flightSequenceSegments = [...text.matchAll(
+      /\b(?:flight|leg)\s*(\d{1,2})\s*(?:[\p{L}]{3,9})?\s*(\d{1,2}\s+[\p{L}.'’-]+\s+20\d{2}).{0,180}?(\d{1,2}:\d{2})\s+[\p{L} .,'’()-]{1,80}?\(([A-Z]{3})\).{0,140}?(\d{1,2}:\d{2})\s+[\p{L} .,'’()-]{1,80}?\(([A-Z]{3})\)/giu
+    )].map((match) => ({
+      segmentId: `flight_sequence_${match[1]}_${stableHash(`${match[4]}:${match[6]}:${match[2]}`)}`,
+      origin: match[4],
+      destination: match[6],
+      departureDate: match[2],
+      departureTime: match[3],
+      arrivalTime: match[5],
+      flightNumber: "",
+      confidence: 0.97,
+      evidence: {
+        source: "owned_flight_segment_sequence",
+        ownerKey: stableHash(`flight-sequence:${match[0].slice(0, 320)}`),
+        qualification: "ordinal_full_date_departure_arrival_iata",
+        authoritative: true
+      }
+    }));
     // Checkout sites frequently render the persistent selected route as an
     // ordinary styled div/span rather than a semantic heading. Read only a
     // small, exact route-shaped owner; never infer a route from page-wide text.
@@ -344,24 +378,92 @@ export function createTransactionEvidenceCompiler(dependencies) {
     const flights = [...text.matchAll(/\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\s*([0-9]{2,4})\b/g)]
       .map((match) => `${match[1]}${match[2]}`)
       .filter((value) => !/^20\d{2}$/.test(value));
-    const segments = canonicalRouteSegments(attributeSegments.length
-      ? attributeSegments.map((segment) => ({
-          ...segment,
-          evidence: { source: "structured_itinerary_attributes", ownerKey: segment.segmentId, authoritative: true }
-        }))
-      : itineraryActionSegments.length
-        ? itineraryActionSegments
-      : itinerarySummarySegments.length
-        ? itinerarySummarySegments
-        : persistentSummarySegments.length
-          ? persistentSummarySegments
-        : progressiveItinerarySegments.length
-          ? progressiveItinerarySegments
-        : ownedRouteSegments.length
-        ? ownedRouteSegments
-        : boundedRouteSegments.length
-          ? boundedRouteSegments
-          : [])
+    const structuredAttributeSegments = attributeSegments.map((segment) => ({
+      ...segment,
+      evidence: { source: "structured_itinerary_attributes", ownerKey: segment.segmentId, authoritative: true }
+    }));
+    const candidateSegmentSets = [
+      structuredAttributeSegments,
+      flightSequenceSegments,
+      itineraryActionSegments,
+      itinerarySummarySegments,
+      persistentSummarySegments,
+      progressiveItinerarySegments,
+      ownedRouteSegments,
+      boundedRouteSegments
+    ].filter((candidate) => candidate.length);
+    const segmentSetScore = (candidate = []) => candidate.reduce((score, segment) => (
+      score
+      + (segment.origin && segment.destination ? 40 : 0)
+      + (segment.departureDate ? 35 : 0)
+      + (segment.departureTime && segment.arrivalTime ? 20 : 0)
+      + (/^[A-Z]{3}$/.test(segment.origin) && /^[A-Z]{3}$/.test(segment.destination) ? 15 : 0)
+      + Number(segment.confidence || 0)
+    ), candidate.length * 8);
+    const strongestSegmentSet = candidateSegmentSets
+      .slice()
+      .sort((left, right) => segmentSetScore(right) - segmentSetScore(left))[0] || [];
+    const segmentDetailScore = (segment = {}) => (
+      (segment.evidence?.authoritative === true ? 1000 : 0)
+      + Number(segment.confidence || 0) * 100
+      + [segment.origin, segment.destination, segment.departureDate, segment.departureTime, segment.arrivalTime, segment.flightNumber]
+        .filter(Boolean).length * 10
+    );
+    const compatibleSegmentClaim = (backbone = {}, claim = {}) => (
+      backbone.origin === claim.origin
+      && backbone.destination === claim.destination
+      && (
+        !backbone.departureDate
+        || !claim.departureDate
+        || backbone.departureDate === claim.departureDate
+      )
+    );
+    const allSegmentClaims = candidateSegmentSets.flat().sort((left, right) => (
+      segmentDetailScore(right) - segmentDetailScore(left)
+    ));
+    const segments = canonicalRouteSegments(strongestSegmentSet)
+      .map((backbone, index) => {
+        const compatibleClaims = allSegmentClaims.filter((claim) => compatibleSegmentClaim(backbone, claim));
+        const claims = compatibleClaims.length ? compatibleClaims : [backbone];
+        const chosenProofByField = {};
+        const valueFor = (field) => {
+          const chosen = claims.find((claim) => String(claim[field] || "").trim()) || null;
+          if (chosen) chosenProofByField[field] = chosen.evidence || null;
+          return chosen?.[field] || "";
+        };
+        const origin = valueFor("origin");
+        const destination = valueFor("destination");
+        const departureDate = valueFor("departureDate");
+        const departureTime = valueFor("departureTime");
+        const arrivalTime = valueFor("arrivalTime");
+        const flightNumber = valueFor("flightNumber");
+        const proofs = Object.values(chosenProofByField).filter(Boolean);
+        const sources = [...new Set(proofs.map((proof) => proof.source).filter(Boolean))];
+        const ownerKeys = [...new Set(proofs.map((proof) => proof.ownerKey).filter(Boolean))];
+        const criticalProofs = ["origin", "destination", "departureDate"]
+          .map((field) => chosenProofByField[field])
+          .filter(Boolean);
+        return {
+          ...backbone,
+          segmentId: backbone.segmentId || `merged_segment_${index + 1}`,
+          origin,
+          destination,
+          departureDate,
+          departureTime,
+          arrivalTime,
+          flightNumber,
+          evidence: {
+            source: sources.length === 1 ? sources[0] : "merged_structural_itinerary_evidence",
+            ownerKey: ownerKeys.length === 1
+              ? ownerKeys[0]
+              : stableHash(`merged-itinerary:${ownerKeys.sort().join(":")}`),
+            qualification: sources.length > 1 ? "compatible_multi_region_claims" : proofs[0]?.qualification || "",
+            authoritative: criticalProofs.length === 3
+              && criticalProofs.every((proof) => proof.authoritative === true),
+            fields: chosenProofByField
+          }
+        };
+      })
       .map(({ confidence, ...segment }) => segment)
       .slice(0, 12);
     const completeness = !segments.length
@@ -591,7 +693,8 @@ export function createTransactionEvidenceCompiler(dependencies) {
           ownerKey: segment.evidence?.ownerKey || segment.segmentId,
           observationId: agent.activeObservationId || "",
           confidence: segment.evidence?.source === "structured_itinerary_attributes" ? 0.95 : 0.88,
-          authoritative: segment.evidence?.authoritative === true
+          authoritative: segment.evidence?.authoritative === true,
+          fields: segment.evidence?.fields || null
         })),
         fareBrand: fareBrand ? {
           source: ownedFareRows[0] ? "review_summary_row" : "owned_fare_summary_line",

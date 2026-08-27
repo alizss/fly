@@ -123,7 +123,7 @@ function hasExactSafeAlternative(group = {}, page = {}, userPolicy = {}, travele
   const selectedControlId = clean(group.selectedControlId || group.selectedEvidence?.selectedControlId);
   const removalControlId = clean(group.removalControlId);
   const textSummaryOwnership = !selectedControlId
-    && Boolean(removalControlId && clean(group.selectedEvidence?.ownerElementId));
+    && Boolean(removalControlId && group.selectedEvidence?.selected === true);
   if (!selectedControlId && !textSummaryOwnership) return false;
   const ownedIds = new Set(ownedControlIds(group, page));
   const safeOwnedReversals = (page.controls || []).filter((control) => (
@@ -132,8 +132,8 @@ function hasExactSafeAlternative(group = {}, page = {}, userPolicy = {}, travele
     && (!selectedControlId || clean(control.controlId) !== selectedControlId)
     && controlHasExecutableCapability(control)
     && !controlIsForbiddenCorrectionCandidate(control)
-    && /remove|decline|free|skip|without|none|deselect|clear|safe_decline|select_free/.test(
-      clean(`${control.semantic || ""} ${control.physicalEffect || ""} ${control.risk || ""}`).toLowerCase()
+    && /remove|decline|free|skip|without|none|deselect|undo|clear|safe_decline|select_free/.test(
+      clean(`${control.label || ""} ${control.ariaLabel || ""} ${control.semantic || ""} ${control.physicalEffect || ""} ${control.risk || ""}`).toLowerCase()
     )
   ));
   // A paid selection can be rendered as summary text with no actionable

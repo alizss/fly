@@ -33,6 +33,7 @@
  * @property {string} [targetLabel]
  * @property {Object} [targetSnapshot]
  * @property {Object} [expectedOutcome]
+ * @property {Object} [desiredStateDelta]
  * @property {Object} [affordance]
  * @property {Object} [pipelineContract]
  * @property {"proven_executable"|"recoverable"|"unproven_experiment"|"unavailable"} [capabilityStatus]
@@ -200,6 +201,7 @@ function normalizeAction(raw = {}) {
     semanticOwnershipLinkId: raw.semanticOwnershipLinkId ? String(raw.semanticOwnershipLinkId).slice(0, 260) : "",
     policyCorrectionForDecisionGroupId: raw.policyCorrectionForDecisionGroupId ? String(raw.policyCorrectionForDecisionGroupId).slice(0, 140) : "",
     obligationId: (raw.obligationId || raw.goalId) ? String(raw.obligationId || raw.goalId).slice(0, 200) : "",
+    governorDecisionId: raw.governorDecisionId ? String(raw.governorDecisionId).slice(0, 240) : "",
     semanticOwner: owner,
     semanticOwnerId: String(raw.semanticOwnerId || (owner ? semanticOwnerId(owner) : "")).slice(0, 300),
     decisionInstanceId: raw.decisionInstanceId ? String(raw.decisionInstanceId).slice(0, 900) : "",
@@ -220,6 +222,9 @@ function normalizeAction(raw = {}) {
     targetLabel: raw.targetLabel ? String(raw.targetLabel).slice(0, 300) : "",
     targetSnapshot: raw.targetSnapshot && typeof raw.targetSnapshot === "object" ? raw.targetSnapshot : null,
     expectedOutcome: raw.expectedOutcome && typeof raw.expectedOutcome === "object" ? raw.expectedOutcome : null,
+    desiredStateDelta: raw.desiredStateDelta && typeof raw.desiredStateDelta === "object"
+      ? { ...raw.desiredStateDelta }
+      : null,
     affordance: raw.affordance && typeof raw.affordance === "object" ? raw.affordance : null,
     pipelineContract: raw.pipelineContract && typeof raw.pipelineContract === "object" ? raw.pipelineContract : null,
     capabilityStatus: raw.capabilityStatus ? String(raw.capabilityStatus).slice(0, 60) : "",
@@ -262,7 +267,8 @@ function normalizeAction(raw = {}) {
     reason: String(raw.reason || "").slice(0, 500),
     requirementId: raw.requirementId ? String(raw.requirementId) : "",
     risk: RISK_LEVELS.has(raw.risk) ? raw.risk : "uncertain",
-    requiresApproval: Boolean(raw.requiresApproval)
+    requiresApproval: Boolean(raw.requiresApproval),
+    userActionRequired: raw.userActionRequired === true
   };
 }
 
@@ -285,6 +291,7 @@ function createActionLease(action = {}) {
       hash: action.observationHash || ""
     }),
     obligationId: action.obligationId || "",
+    governorDecisionId: action.governorDecisionId || "",
     semanticOwner: semanticOwner ? Object.freeze(semanticOwner) : null,
     semanticOwnerId: action.semanticOwnerId || (semanticOwner ? semanticOwnerId(semanticOwner) : ""),
     candidateId: action.candidateId || "",
@@ -313,10 +320,7 @@ function createActionLease(action = {}) {
     expected: Object.freeze({
       objective: action.intent || "",
       semanticEffect: action.semanticEffect || "",
-      policyAuthorization: Object.freeze({
-        allow: action.affordance?.policy?.allow === true,
-        decision: String(action.affordance?.policy?.decision || "")
-      }),
+      desiredStateDelta: action.desiredStateDelta ? Object.freeze({ ...action.desiredStateDelta }) : null,
       successCondition
     }),
     capabilityProof: action.pipelineContract || null,
@@ -337,6 +341,7 @@ function actionFromLease(lease = null) {
     observationId: lease.observation?.id || "",
     observationHash: lease.observation?.hash || "",
     obligationId: lease.obligationId || "",
+    governorDecisionId: lease.governorDecisionId || "",
     semanticOwner: lease.semanticOwner || null,
     semanticOwnerId: lease.semanticOwnerId || "",
     candidateId: lease.candidateId || "",
@@ -358,13 +363,8 @@ function actionFromLease(lease = null) {
     intent: expected.objective || expected.semanticEffect || "",
     semanticEffect: expected.semanticEffect || "",
     expectedOutcome: expected.successCondition || null,
+    desiredStateDelta: expected.desiredStateDelta || null,
     expectedPostconditions: expected.successCondition ? [expected.successCondition] : [],
-    affordance: {
-      policy: {
-        allow: expected.policyAuthorization?.allow === true,
-        decision: expected.policyAuthorization?.decision || ""
-      }
-    },
     pipelineContract: lease.capabilityProof || null,
     risk: lease.risk || "uncertain",
     requiresApproval: false
@@ -406,13 +406,11 @@ function actuatorSignature(action = {}) {
 }
 
 function semanticGoalKey(source = {}) {
-  const goal = source.affordance?.task || source.currentGoal || source;
-  const obligation = goal.contractVersion === "current-obligation/v2" ? goal : null;
-  const component = obligation?.binding?.component || {};
-  const subject = obligation?.subject || {};
-  const stableScope = subject.semanticType
-    || component.semanticType
-    || subject.family
+  if (!source) return "";
+  const goal = source.affordance?.task || source;
+  const obligation = goal.contractVersion === "current-obligation/v3" ? goal : null;
+  const stableScope = obligation?.semanticType
+    || obligation?.semanticOwner?.family
     || goal.semanticType
     || goal.sectionType
     || goal.semanticGoal
@@ -422,14 +420,13 @@ function semanticGoalKey(source = {}) {
   const normalize = (value) => String(value || "").toLowerCase().replace(/\s+/g, " ").trim();
   return [
     stableScope,
-    component.logicalFieldId || subject.logicalFieldId || goal.logicalFieldId || "",
+    obligation?.successCondition?.logicalFieldId || goal.logicalFieldId || "",
     // Raw navigation goals historically omitted a subject while their
     // compiled CurrentObligation used the explicit global subject. Those two
     // representations must share recovery memory for the same obligation.
-    subject.subjectId || goal.subjectId || "global",
-    component.role || goal.componentRole || "",
-    obligation?.desiredValue || goal.desiredValue || "",
-    Number.isFinite(Number(component.ordinal ?? goal.ordinal)) ? `ordinal:${Number(component.ordinal ?? goal.ordinal)}` : ""
+    obligation?.semanticOwner?.subjectId || goal.subjectId || "global",
+    obligation?.successCondition?.componentRole || goal.componentRole || "",
+    obligation?.desiredStateDelta?.desiredValue || goal.desiredValue || ""
   ]
     .map(normalize)
     .join("|");
@@ -445,15 +442,13 @@ function normalizedInstanceFact(value = "") {
  */
 function decisionInstanceKey(source = {}, observation = {}) {
   const page = observation.page || {};
-  const goal = source.affordance?.task || source.currentGoal || source;
-  const obligation = goal.contractVersion === "current-obligation/v2" ? goal : null;
-  const obligationSubject = obligation?.subject || {};
-  const obligationComponent = obligation?.binding?.component || {};
+  const goal = source.affordance?.task || source;
+  const obligation = goal.contractVersion === "current-obligation/v3" ? goal : null;
   const target = source.targetSnapshot || {};
   const decisionGroupId = String(
     source.policyCorrectionForDecisionGroupId
     || source.decisionGroupId
-    || obligationSubject.decisionGroupId
+    || obligation?.desiredStateDelta?.decisionGroupId
     || goal.decisionGroupId
     || target.policyCorrectionForDecisionGroupId
     || target.decisionGroupId
@@ -472,7 +467,7 @@ function decisionInstanceKey(source = {}, observation = {}) {
     || group.travelerId
     || group.passengerOrdinal
     || group.travelerOrdinal
-    || obligationSubject.passengerId
+    || obligation?.semanticOwner?.passengerId
     || goal.passengerId
     || goal.travelerId
     || progress.passengerOrdinal
@@ -501,9 +496,9 @@ function decisionInstanceKey(source = {}, observation = {}) {
       progress.segment
     ].filter(Boolean).join("|")),
     passenger: normalizedInstanceFact(passenger),
-    decisionGroup: normalizedInstanceFact(decisionGroupId || group.requirementId || obligationSubject.requirementId || goal.requirementId),
-    logicalField: normalizedInstanceFact(obligationComponent.logicalFieldId || obligationSubject.logicalFieldId || goal.logicalFieldId || ""),
-    componentRole: normalizedInstanceFact(obligationComponent.role || goal.componentRole || ""),
+    decisionGroup: normalizedInstanceFact(decisionGroupId || group.requirementId || obligation?.successCondition?.requirementId || goal.requirementId),
+    logicalField: normalizedInstanceFact(obligation?.successCondition?.logicalFieldId || goal.logicalFieldId || ""),
+    componentRole: normalizedInstanceFact(obligation?.successCondition?.componentRole || goal.componentRole || ""),
     selectedItem: normalizedInstanceFact(selected)
   });
 }

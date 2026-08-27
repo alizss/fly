@@ -1,5 +1,4 @@
 const { currentObligation } = require("../authority-frames");
-const { obligationField } = require("../current-obligation");
 const { controlBelongsToCurrentSurface } = require("../surface-contract");
 const { actionPostconditions } = require("./action-result");
 const {
@@ -12,7 +11,7 @@ const GOAL_CREATING = new Set(["active", "conflicted", "blocked"]);
 const DECISION_EPISODE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  return currentObligation(taskState);
 }
 
 function clean(value = "") {
@@ -151,18 +150,18 @@ function actionDecisionLineage(result = null, fallbackGoal = {}, fallbackEpisode
     requirementId: explicitRequirementId
   });
   const fallbackInstanceId = clean(
-    obligationField(fallbackGoal, "decisionInstanceId")
-    || obligationField(fallbackGoal, "canonicalOwnerId")
+    (fallbackGoal?.successCondition?.decisionInstanceId)
+    || (fallbackGoal?.semanticOwner?.repeatedInstance)
     || fallbackEpisode.decisionInstanceId
     || fallbackEpisode.canonicalOwnerId
   );
   const fallbackLineage = Object.freeze({
-    decisionEpisodeId: clean(obligationField(fallbackGoal, "decisionEpisodeId") || fallbackEpisode.episodeId),
+    decisionEpisodeId: clean((fallbackGoal?.successCondition?.decisionEpisodeId) || fallbackEpisode.episodeId),
     decisionInstanceId: fallbackInstanceId,
     canonicalOwnerId: fallbackInstanceId,
-    parentDecisionGroupId: clean(obligationField(fallbackGoal, "parentDecisionGroupId") || fallbackEpisode.parentDecisionGroupId),
-    decisionGroupId: clean(obligationField(fallbackGoal, "decisionGroupId") || fallbackEpisode.parentDecisionGroupId),
-    requirementId: clean(obligationField(fallbackGoal, "requirementId") || fallbackEpisode.requirementId)
+    parentDecisionGroupId: clean((fallbackGoal?.successCondition?.parentDecisionGroupId) || fallbackEpisode.parentDecisionGroupId),
+    decisionGroupId: clean((fallbackGoal?.desiredStateDelta?.decisionGroupId) || fallbackEpisode.parentDecisionGroupId),
+    requirementId: clean((fallbackGoal?.successCondition?.requirementId) || fallbackEpisode.requirementId)
   });
   const decisionInstanceId = clean(
     explicitInstanceId
@@ -209,19 +208,36 @@ function episodeOwnsDecision(episode = {}, decision = {}) {
 }
 
 function episodeOwnsGoal(episode = {}, goal = {}) {
-  return episodeOwnsDecision(episode, goal)
-    || clean(goal.parentDecisionGroupId) === clean(episode.parentDecisionGroupId)
-    || clean(goal.completedDecisionGroupId) === clean(episode.parentDecisionGroupId)
-    // A child confirmation is permitted only after the episode itself proved
-    // that this foreground surface belongs to its exact parent decision.
-    || (
-      clean(episode.childSurfaceId)
-      && clean(goal.surfaceId) === clean(episode.childSurfaceId)
-    );
+  if (episodeOwnsDecision(episode, goal)) return true;
+  const ownsProvenChildSurface = Boolean(
+    clean(episode.childSurfaceId)
+    && clean(episode.parentSurfaceId)
+    && clean(episode.childSurfaceId) !== clean(episode.parentSurfaceId)
+    && clean(goal.surfaceId) === clean(episode.childSurfaceId)
+    && (
+      !clean(goal.parentDecisionGroupId)
+      || clean(goal.parentDecisionGroupId) === clean(episode.parentDecisionGroupId)
+    )
+  );
+  const directGoalDecisionGroupId = clean(goal.decisionGroupId || goal.completedDecisionGroupId);
+  if (
+    directGoalDecisionGroupId
+    && directGoalDecisionGroupId !== clean(episode.parentDecisionGroupId)
+  ) return ownsProvenChildSurface;
+  // Parent annotations can be carried forward in TaskState, so they are not
+  // ownership proof. A different direct decision group is a sibling even when
+  // it reuses the same control or modal (for example the next flight segment).
+  // Only an exact child-surface proof may extend an episode beyond its owner.
+  return ownsProvenChildSurface;
 }
 
 function verifiedActionSucceeded(result = null) {
   if (!result || result.dispatched === false) return false;
+  // The browser's canonical local outcome is the sole mechanical-result
+  // authority. Compact transports may omit the legacy boolean aliases;
+  // TaskState must not discard an exact SATISFIED result when they are absent.
+  const canonicalStatus = result.actionOutcome?.status || result.outcome?.status || "";
+  if (canonicalStatus) return canonicalStatus === "SATISFIED";
   const hasLocalOutcomeContract = [
     "localOutcomeVerified",
     "localExpectedOutcomeObserved",
@@ -565,6 +581,7 @@ function choiceDecisionEpisode({
     family,
     subjectKey,
     parentDecisionGroupId,
+    parentSurfaceId: clean(parent?.surfaceId || previous?.parentSurfaceId),
     decisionInstanceId,
     canonicalOwnerId: decisionInstanceId,
     commitmentPhase,
@@ -595,6 +612,7 @@ function choiceDecisionEpisode({
     family,
     subjectKey,
     parentDecisionGroupId,
+    parentSurfaceId: clean(parent?.surfaceId || previous?.parentSurfaceId),
     requirementId: clean(parent?.requirementId || previous?.requirementId),
     intendedOutcome: clean(previous?.intendedOutcome || "selected_policy_allowed_option"),
     selectedControlId,

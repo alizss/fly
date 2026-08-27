@@ -5,7 +5,7 @@ const path = require("node:path");
 
 const { toClientDecision } = require("../../apps/web/agent/loop");
 const { actionFromLease, normalizeAction } = require("../../packages/shared/agent-actions");
-const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { compileCurrentObligation } = require("./obligation-test-helper");
 const { leasedActionRecord } = require("../../apps/web/agent/action-lifecycle");
 const { normalizeExecutionEpisode } = require("../../apps/web/agent/execution-episode");
 const {
@@ -16,6 +16,198 @@ const {
   normalizeSelectedBooking,
   transactionFactsFromSelectedBooking
 } = require("../../packages/shared/selected-booking");
+const {
+  compileDecisionFrame,
+  createObservationFrame,
+  compileCurrentObligation: compileProductionCurrentObligation
+} = require("../../apps/web/agent/authority-frames");
+const { desiredStateEvaluationForDecision } = require("../../apps/web/agent/desired-state-delta");
+const { bindMechanics } = require("../../apps/web/agent/mechanics-binder");
+const { createRequestPayloadAdapter } = require("../../apps/web/agent/request-payload");
+
+test("request compaction preserves the structural observation authority marker", () => {
+  const { compactAgentPayload } = createRequestPayloadAdapter({
+    agentSessionStore: { getCurrentObservation: () => null },
+    screenshotForObservation: () => ({ screenshotId: "", screenshotDataUrl: "" })
+  });
+  const compact = compactAgentPayload({
+    observationId: "obs_transport_authority",
+    traveler: {},
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://example.test/checkout",
+      controls: [{
+        controlId: "ctrl_continue",
+        label: "Continue",
+        kind: "button",
+        semantic: "continue",
+        physicalEffect: "advance_checkout_stage",
+        operations: { activate: { actuatorId: "continue_node" } }
+      }],
+      decisionGroups: [{
+        decisionGroupId: "dg_choice",
+        sectionLabel: "Choice",
+        requiredStateObserved: false,
+        required: true,
+        status: "missing",
+        alternativeControlIds: ["ctrl_continue"],
+        alternatives: [{ controlId: "ctrl_continue", label: "Continue" }]
+      }],
+      currentSurface: { id: "surface-page", type: "page" }
+    }
+  });
+
+  assert.equal(compact.page.observationContract, "structural-observation/v1");
+  assert.equal(compact.page.stageExit?.continueAllowed, undefined);
+  assert.equal(compact.page.decisionGroups[0].required, undefined);
+  assert.equal(compact.page.decisionGroups[0].status, undefined);
+  assert.equal(compact.page.controls[0].semantic, undefined);
+  assert.equal(compact.page.controls[0].physicalEffect, undefined);
+});
+
+test("MISSING_FACT cannot become an obligation, mechanics candidate, or lease", () => {
+  const missing = desiredStateEvaluationForDecision({
+    decisionId: "dg_unknown_required",
+    decisionGroupId: "dg_unknown_required",
+    family: "legal",
+    status: "active",
+    required: true,
+    needsAction: true,
+    userIntent: { match: "unavailable", desiredControlIds: [] },
+    physicalControlIds: [],
+    availableTransitions: [],
+    observed: {}
+  });
+  const obligation = compileProductionCurrentObligation({
+    work: {
+      goalId: "decision:dg_unknown_required",
+      semanticType: "unknown_attestation",
+      desiredStateDelta: missing,
+      successCondition: { type: "decision_group_resolved", decisionGroupId: "dg_unknown_required" }
+    }
+  });
+
+  assert.equal(missing.status, "MISSING_FACT");
+  assert.equal(missing.actionRequired, false);
+  assert.equal(obligation, null);
+  assert.throws(() => bindMechanics({ obligation, observation: {} }), /CURRENT_OBLIGATION_REQUIRED/);
+  assert.equal(toClientDecision({ type: "ask_user", reason: "Missing fact" }).actionLease, null);
+});
+
+test("raw structural observation carries no business decision and DecisionFrame publishes meaning once", () => {
+  const observation = {
+    observationId: "obs_structural_authority",
+    observationSnapshot: { snapshotHash: "hash_structural_authority" },
+    page: {
+      observationContract: "structural-observation/v1",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [{
+        controlId: "ctrl_no_insurance",
+        label: "No thanks, continue without insurance",
+        role: "radio",
+        kind: "radio",
+        state: { checked: false, selected: false },
+        operations: {}
+      }],
+      decisionGroups: [{
+        decisionGroupId: "dg_insurance",
+        required: true,
+        status: "missing",
+        alternatives: [{ controlId: "ctrl_no_insurance", label: "No thanks" }]
+      }]
+    }
+  };
+  const raw = createObservationFrame(observation);
+  const decided = compileDecisionFrame({ observation, observationFrame: raw });
+
+  assert.equal(raw.mechanics.controls[0].semantic, undefined);
+  assert.equal(raw.mechanics.controls[0].risk, undefined);
+  assert.equal(raw.mechanics.controls[0].physicalEffect, undefined);
+  assert.equal(decided.observation.page.controls[0].semanticAuthority, "decision-frame/v2");
+  assert.equal(decided.observation.page.controls[0].semantic, "decline_paid_extra");
+  assert.equal(decided.observation.page.controls[0].physicalEffect, "select_free_option");
+
+  const runtime = fs.readFileSync(path.resolve(__dirname, "../../apps/extension/src/content/runtime.js"), "utf8");
+  const start = runtime.indexOf("function structuralControlForTransport");
+  const end = runtime.indexOf("function structuralDecisionGroupForTransport", start);
+  const transport = runtime.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.doesNotMatch(transport, /browserSemanticHint\s*:/);
+  assert.doesNotMatch(transport, /const outgoing = \{ \.\.\.control \}/);
+  assert.match(transport, /sourceProvenance:/);
+  assert.match(transport, /kind: nonPageUi \? "non_page_ui" : "page_dom"/);
+
+  const groupStart = runtime.indexOf("function structuralDecisionGroupForTransport");
+  const groupEnd = runtime.indexOf("function compactPageMap", groupStart);
+  const groupTransport = runtime.slice(groupStart, groupEnd);
+  assert.ok(groupStart >= 0 && groupEnd > groupStart);
+  assert.doesNotMatch(groupTransport, /requirementId:\s*group\.requirementId/);
+  assert.doesNotMatch(groupTransport, /required:\s*group\.required/);
+  assert.doesNotMatch(groupTransport, /status:\s*group\.status/);
+  assert.doesNotMatch(groupTransport, /semanticOwnership:\s*group\.semanticOwnership/);
+  assert.match(groupTransport, /requiredStateObserved = memberControls\.some/);
+  assert.doesNotMatch(groupTransport, /requiredStateObserved:\s*group\.required === true/);
+  assert.match(runtime, /group\.projectionKind !== "synthetic_global_payment"/);
+  assert.doesNotMatch(runtime, /group\.requirementId !== "payment:payment-method"/);
+  assert.doesNotMatch(runtime, /structuralProgressCandidates/);
+});
+
+test("DecisionFrame ignores browser-authored group requiredness and status", () => {
+  const observation = {
+    observationId: "obs_group_authority",
+    observationSnapshot: { snapshotHash: "hash_group_authority" },
+    page: {
+      observationContract: "structural-observation/v1",
+      currentSurface: { id: "surface-page", type: "page" },
+      controls: [{
+        controlId: "ctrl_optional_choice",
+        label: "Receive product updates",
+        role: "checkbox",
+        kind: "checkbox",
+        required: false,
+        state: { checked: false, selected: false, required: false },
+        operations: {}
+      }],
+      decisionGroups: [{
+        decisionGroupId: "dg_browser_claimed_required",
+        sectionLabel: "Product updates",
+        required: true,
+        status: "missing",
+        alternatives: [{ controlId: "ctrl_optional_choice", label: "Receive product updates" }]
+      }],
+      validationIssues: []
+    }
+  };
+  const frame = compileDecisionFrame({ observation });
+  const group = frame.observation.page.decisionGroups.find((entry) => (
+    entry.decisionGroupId === "dg_browser_claimed_required"
+  ));
+
+  assert.equal(group.required, false);
+  assert.equal(group.status, "optional");
+});
+
+test("production exposes one delta creator and mechanics never authorizes", () => {
+  const root = path.resolve(__dirname, "../../apps");
+  const files = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(target);
+      else if (entry.isFile() && entry.name.endsWith(".js")) files.push(target);
+    }
+  };
+  visit(root);
+  const creators = files.filter((file) => (
+    fs.readFileSync(file, "utf8").includes('const DESIRED_STATE_DELTA_VERSION = "desired-state-delta/v1"')
+  ));
+  const binder = fs.readFileSync(path.join(root, "web/agent/mechanics-binder.js"), "utf8");
+  const governor = fs.readFileSync(path.join(root, "web/agent/action-governor.js"), "utf8");
+
+  assert.deepEqual(creators.map((file) => path.basename(file)), ["desired-state-delta.js"]);
+  assert.doesNotMatch(binder, /policyDecision|affordance\.policy|\ballow:\s*(?:true|false)/);
+  assert.match(governor, /function governAction/);
+});
 
 test("ActionLease is the sole enumerable execution contract at the HTTP boundary", () => {
   const decision = toClientDecision({
@@ -54,8 +246,8 @@ test("ActionLease is the sole enumerable execution contract at the HTTP boundary
   assert.equal(transported.actionLease.expected.postconditions, undefined);
   assert.deepEqual(Object.keys(transported.actionLease.target).sort(), ["actuatorId", "controlId", "surfaceId"]);
   assert.deepEqual(Object.keys(transported.actionLease.expected).sort(), [
+    "desiredStateDelta",
     "objective",
-    "policyAuthorization",
     "semanticEffect",
     "successCondition"
   ]);
@@ -90,6 +282,21 @@ test("ActionLease hydration does not recreate a transported target snapshot or s
   assert.equal(hydrated.intent, "advance_surface");
   assert.equal(hydrated.mechanicalEffect, "advance_surface");
   assert.equal(hydrated.semanticEffect, "advance_checkout_stage");
+});
+
+test("control-flow outcomes never receive a DOM ActionLease", () => {
+  for (const type of ["ask_user", "wait", "stop", "final_review", "save_trip"]) {
+    const decision = toClientDecision({
+      id: `flow_${type}`,
+      type,
+      observationId: "obs_flow",
+      observationHash: "hash_flow",
+      reason: type,
+      risk: "safe"
+    });
+    assert.equal(decision.action, type);
+    assert.equal(decision.actionLease, null);
+  }
 });
 
 test("durable leased action stores one ActionLease plus mechanical recovery identity", () => {
@@ -184,8 +391,7 @@ test("semantic owner identity is structured and stable across fresh actuator ide
 });
 
 test("CurrentObligation and ActionLease carry the same semantic owner identity", () => {
-  const obligation = currentObligationFromGoal({
-    goal: {
+  const obligation = compileCurrentObligation({ work: {
       goalId: "profile:phone_country_code:0",
       kind: "profile_field",
       stage: "traveler_information",
@@ -206,9 +412,9 @@ test("CurrentObligation and ActionLease carry the same semantic owner identity",
     type: "select",
     observationId: "obs_country_code",
     observationHash: "hash_country_code",
-    obligationId: obligation.obligationId,
+    obligationId: obligation.id,
     semanticOwner: obligation.semanticOwner,
-    semanticOwnerId: obligation.semanticOwnerId,
+    semanticOwnerId: semanticOwnerId(obligation.semanticOwner),
     candidateId: "candidate_country_code",
     controlId: "country_code",
     actuatorId: "option_slovenia",
@@ -218,7 +424,7 @@ test("CurrentObligation and ActionLease carry the same semantic owner identity",
     risk: "safe"
   });
 
-  assert.equal(decision.actionLease.semanticOwnerId, obligation.semanticOwnerId);
+  assert.equal(decision.actionLease.semanticOwnerId, semanticOwnerId(obligation.semanticOwner));
   assert.deepEqual(decision.actionLease.semanticOwner, obligation.semanticOwner);
 });
 
@@ -300,6 +506,24 @@ test("non-boundary internal contract versions are absent", () => {
   assert.doesNotMatch(lifecycle, /next\.decisionInstanceId|previous\.decisionInstanceId/);
 });
 
+test("production has one flat CurrentObligation contract and no compatibility reader", () => {
+  const root = path.resolve(__dirname, "../../apps");
+  const sources = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(target);
+      else if (entry.isFile() && entry.name.endsWith(".js")) sources.push(fs.readFileSync(target, "utf8"));
+    }
+  };
+  visit(root);
+  const production = sources.join("\n");
+
+  assert.doesNotMatch(production, /current-obligation\/v2/);
+  assert.doesNotMatch(production, /\bobligationField\b|\bcurrentObligationValue\b/);
+  assert.doesNotMatch(production, /\.delta\??\.(?:subject|component|choice|surface|lineage|authorization)/);
+});
+
 test("observation transport sends one latest result and loop failures stay typed", () => {
   const root = path.resolve(__dirname, "../..");
   const server = fs.readFileSync(path.join(root, "apps/web/server.js"), "utf8");
@@ -338,6 +562,18 @@ test("extension page-map and observation transport have one modular implementati
   assert.match(pageMap, /function buildPageMap\s*\(/);
   assert.match(transport, /function boundedObservationTransport\s*\(/);
   assert.match(transport, /function postObservationWithSizeRecovery\s*\(/);
+});
+
+test("one page-map compilation reuses deep-root discovery", () => {
+  const root = path.resolve(__dirname, "../..");
+  const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
+  const dom = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/dom.js"), "utf8");
+  const pageMap = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/page-map.js"), "utf8");
+
+  assert.match(runtime, /beginDeepQueryPass\s*\(\)/);
+  assert.match(dom, /function beginDeepQueryPass\s*\(/);
+  assert.match(dom, /pass\.roots\.get\s*\(root\)/);
+  assert.match(pageMap, /finishObservationCompilation\?\.\(\)/);
 });
 
 test("extension logical controls and canonical graph compile outside the runtime orchestrator", () => {
@@ -447,6 +683,8 @@ test("extension execution orchestrator owns one governed action lifecycle", () =
   assert.match(orchestrator, /function clickAndVerifyAdvance\s*\(/);
   assert.match(orchestrator, /function pushVerificationLedger\s*\(/);
   assert.match(orchestrator, /function verificationFromSurfaceFeedback\s*\(/);
+  assert.match(orchestrator, /function isGovernedStageExit\s*\(/);
+  assert.doesNotMatch(orchestrator, /button\?\.risk\s*===\s*["']safe_continue["']/);
 });
 
 test("extension controller owns single-flight turns and bounded destination waiting", () => {
@@ -493,6 +731,9 @@ test("extension sidebar module owns rendering and diagnostic presentation", () =
   assert.match(sidebar, /function renderSidebar\s*\(/);
   assert.match(sidebar, /function observerPanelHtml\s*\(/);
   assert.match(sidebar, /function agentProcessDiagnosticsHtml\s*\(/);
+  assert.doesNotMatch(sidebar, /pageStateStore\.observe\s*\(/);
+  assert.match(sidebar, /function sidebarPageMap\s*\(/);
+  assert.match(sidebar, /pageStateStore\.current\s*\(\)/);
 });
 
 test("extension diagnostics and screenshot projection are modular boundaries", () => {

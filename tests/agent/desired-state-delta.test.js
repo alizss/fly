@@ -116,6 +116,30 @@ test("Desired State Delta treats typed legal evidence narrowly", () => {
   assert.equal(deltaForDecision(attestation).evidenceKind, "typed_legal_requirement");
 });
 
+test("transaction terms authority does not activate an optional legal checkbox", () => {
+  const optionalTerms = decision({
+    family: "legal",
+    subject: { key: "legal_terms", family: "legal" },
+    required: false,
+    status: "optional",
+    // A downstream policy resolver may describe a compatible option, but it
+    // cannot turn an optional legal control into a required obligation.
+    needsAction: true,
+    selectedControlId: "",
+    currentState: { selectedControlId: "" },
+    availableTransitions: [{ controlId: "terms", semantic: "legal_acceptance", executable: true }],
+    userIntent: {
+      match: "exact",
+      desiredSelected: true,
+      desiredControlIds: ["terms"]
+    },
+    observed: { semanticType: "legal_acceptance" }
+  });
+
+  assert.equal(deltaForDecision(optionalTerms), null);
+  assert.equal(desiredStateEvaluationForDecision(optionalTerms).status, "SATISFIED");
+});
+
 test("Desired State Delta admits selected optional consent only for an explicit profile mismatch", () => {
   const consent = decision({
     family: "contact",
@@ -236,5 +260,9 @@ test("Desired State Delta distinguishes missing facts and external authorization
   });
 
   assert.equal(desiredStateEvaluationForDecision(missingFact).status, "MISSING_FACT");
+  assert.equal(desiredStateEvaluationForDecision(missingFact).actionRequired, false);
+  assert.deepEqual(desiredStateEvaluationForDecision(missingFact).admittedControlIds, []);
   assert.equal(desiredStateEvaluationForDecision(external).status, "BLOCKED_EXTERNAL");
+  assert.equal(desiredStateEvaluationForDecision(external).actionRequired, false);
+  assert.deepEqual(compileDesiredStateDeltas({ decisions: [missingFact, external] }), []);
 });

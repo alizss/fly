@@ -11,7 +11,6 @@ const {
   semanticGoalKey
 } = require("../../../../packages/shared/agent-actions");
 const { currentSurface, currentSurfaceId, surfaceBinding } = require("../surface-contract");
-const { obligationField } = require("../current-obligation");
 const { recoveryFacts } = require("../execution-episode");
 const { withActionContract } = require("./action-contract");
 
@@ -195,9 +194,13 @@ function bindTargetSnapshot(action = {}, observation = {}) {
     observationId: canonicalAction.observationId || observation.observationId || "",
     observationHash: canonicalAction.observationHash || observation.observationSnapshot?.snapshotHash || "",
     controlId: targetSnapshot?.controlId || canonicalAction.controlId || "",
-    decisionGroupId: targetSnapshot?.policyCorrectionForDecisionGroupId
+    // The action belongs to TaskState's semantic obligation. A correction
+    // control may physically live in another group; preserve that truthful
+    // physical group only inside targetSnapshot instead of allowing target
+    // binding to rewrite the leased action's semantic owner.
+    decisionGroupId: canonicalAction.decisionGroupId
+      || targetSnapshot?.policyCorrectionForDecisionGroupId
       || targetSnapshot?.decisionGroupId
-      || canonicalAction.decisionGroupId
       || "",
     actuatorId: targetSnapshot?.actuatorId || targetSnapshot?.id || canonicalAction.actuatorId || "",
     logicalControlId: targetSnapshot?.logicalControlId || canonicalAction.logicalControlId || canonicalAction.controlId || "",
@@ -218,6 +221,7 @@ function candidateStrategySignature(goal = {}, candidate = {}) {
 }
 
 function semanticGoalRecoveryKey(goal = {}, observation = {}) {
+  if (!goal) return "";
   return `${semanticGoalKey(goal)}::${decisionInstanceKey(goal, observation)}`;
 }
 
@@ -234,8 +238,8 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
   const controls = page.controls || [];
   const expectedControlId = String(
     identity.controlId
-    || obligationField(goal, "controlId")
-    || obligationField(goal, "componentBinding")?.controlId
+    || (goal?.controlId)
+    || (goal?.componentBinding)?.controlId
     || ""
   );
   const expectedStableControlKey = String(
@@ -272,8 +276,8 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
     surfaceId: surface.id || "surface-page",
     surfaceType: surface.type || "page",
     surfaceInstanceId: surface.instanceId || "",
-    decisionGroupId: obligationField(goal, "decisionGroupId") || control?.decisionGroupId || "",
-    requirementId: obligationField(goal, "requirementId") || ""
+    decisionGroupId: (goal?.decisionGroupId) || control?.decisionGroupId || "",
+    requirementId: (goal?.requirementId) || ""
   });
   const targetLocalStateKey = JSON.stringify({
     stableControlKey,
@@ -425,11 +429,11 @@ function deterministicTaskCandidate(candidateSet = {}, goal = {}) {
   // mechanic for every obligation kind; failed-strategy memory removes it on
   // the next observation if verification fails.
   const exactControlIds = new Set([
-    obligationField(goal, "controlId"),
-    obligationField(goal, "componentBinding")?.controlId,
-    ...(obligationField(goal, "actionableControlIds") || [])
+    (goal?.controlId),
+    (goal?.componentBinding)?.controlId,
+    ...((goal?.admittedControlIds) || [])
   ].filter(Boolean));
-  const goalKind = String(obligationField(goal, "kind") || "");
+  const goalKind = String((goal?.kind) || "");
   const rank = (candidate) => {
     const operation = String(candidate.operation || "");
     const exactChoice = Boolean(candidate.exactOption?.canonicalValue);

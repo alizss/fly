@@ -6,6 +6,24 @@ const { reduceTaskState } = require("./task-state-replay-adapter");
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const { __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { compileTypedExpectedOutcome } = require("../../apps/web/agent/action-semantics");
+const agentContract = require("../../apps/extension/src/shared/agent-contract");
+
+function canonicalResult(action = {}, status, evidence = {}) {
+  return {
+    actionId: action.id || "",
+    dispatched: true,
+    executed: true,
+    verified: status === agentContract.ACTION_OUTCOME.SATISFIED,
+    expectedOutcome: action.expectedOutcome || null,
+    actionOutcome: agentContract.compileActionOutcome({
+      status,
+      causedByActionId: action.id || "",
+      originalSuccessContract: action.expectedOutcome || null,
+      code: evidence.code || status,
+      observedEvidence: evidence
+    })
+  };
+}
 
 function capability(operation, actuatorId) {
   const actionability = {
@@ -70,6 +88,7 @@ function paymentGoal(id = "obs_modal") {
     semanticGoal: "reach card credential entry",
     semanticType: "card_credential_entry",
     desiredValue: "card_credential_entry_reached",
+    actionableControlIds: ["close", "submit"],
     observationId: id,
     surfaceId: "review_modal",
     outcomeContract: {
@@ -99,7 +118,7 @@ test("checkout advance preserves the stage-exit-or-feedback contract", () => {
   assert.equal(compiled.beforePageHash, "hash_before");
 });
 
-test("same-label modal close and checkout submit remain safe selectable foreground actions", () => {
+test("same-label modal close and checkout submit remain exact admitted foreground actions", () => {
   const current = observation("obs_modal", {
     currentSurface: { id: "review_modal", type: "modal", label: "Review", memberControlIds: ["close", "submit"] },
     controls: [
@@ -216,24 +235,25 @@ test("opening a warning modal is verified intermediate progress, never checkout 
     currentSurface: { id: "warning", type: "modal", label: "Continue without extras?" },
     controls: [{ controlId: "confirm", label: "Continue", surfaceId: "warning" }]
   }, { actionId: "act_continue", dispatched: true, executed: true });
+  const action = {
+    id: "act_continue",
+    controlId: "continue",
+    physicalEffect: "advance_checkout_stage",
+    expectedOutcome: { type: "checkout_stage_advanced", controlId: "continue" },
+    affordance: { physicalEffect: "advance_checkout_stage", effect: "advance_checkout_stage", task: { outcomeContract: paymentGoal().outcomeContract } }
+  };
   const transition = evaluateTransition({
     beforeObservation: before,
-    governedAction: {
-      id: "act_continue",
-      controlId: "continue",
-      physicalEffect: "advance_checkout_stage",
-      expectedOutcome: { type: "checkout_stage_advanced", controlId: "continue" },
-      affordance: { physicalEffect: "advance_checkout_stage", effect: "advance_checkout_stage", task: { outcomeContract: paymentGoal().outcomeContract } }
-    },
-    browserResult: { actionId: "act_continue", dispatched: true, executed: true },
+    governedAction: action,
+    browserResult: canonicalResult(action, agentContract.ACTION_OUTCOME.REVEALED_BLOCKER, { overlayAppeared: true }),
     afterObservation: after
   });
 
   assert.equal(transition.actionOutcome.status, "REVEALED_BLOCKER");
   assert.equal(transition.postcondition.satisfied, false);
-  assert.deepEqual(transition.physicalResult.effect, "open_surface");
+  assert.equal(transition.physicalResult.verified, false);
   assert.equal(transition.taskOutcomeCompleted, false);
-  assert.equal(transition.completionAuthority, "transition_evaluator");
+  assert.equal(transition.completionAuthority, "browser_verifier");
 });
 
 test("closing a review modal cannot prove payment review was reached", () => {
@@ -247,22 +267,23 @@ test("closing a review modal cannot prove payment review was reached", () => {
     currentSurface: { id: "surface-page", type: "page", label: "Extras" },
     controls: [{ controlId: "base_continue", label: "Continue", surfaceId: "surface-page" }]
   }, { actionId: "act_close", dispatched: true, executed: true });
+  const action = {
+    id: "act_close",
+    controlId: "close",
+    physicalEffect: "advance_checkout_stage",
+    expectedOutcome: { type: "checkout_stage_advanced", controlId: "close" },
+    affordance: { physicalEffect: "advance_checkout_stage", effect: "advance_checkout_stage", task: { outcomeContract: paymentGoal().outcomeContract } }
+  };
   const transition = evaluateTransition({
     beforeObservation: before,
-    governedAction: {
-      id: "act_close",
-      controlId: "close",
-      physicalEffect: "advance_checkout_stage",
-      expectedOutcome: { type: "checkout_stage_advanced", controlId: "close" },
-      affordance: { physicalEffect: "advance_checkout_stage", effect: "advance_checkout_stage", task: { outcomeContract: paymentGoal().outcomeContract } }
-    },
-    browserResult: { actionId: "act_close", dispatched: true, executed: true },
+    governedAction: action,
+    browserResult: canonicalResult(action, agentContract.ACTION_OUTCOME.NO_EFFECT),
     afterObservation: after
   });
 
-  assert.equal(transition.actionOutcome.status, "PROGRESSED");
+  assert.equal(transition.actionOutcome.status, "NO_EFFECT");
   assert.equal(transition.postcondition.satisfied, false);
-  assert.equal(transition.physicalResult.effect, "dismiss_surface");
+  assert.equal(transition.physicalResult.verified, false);
   assert.equal(transition.taskOutcomeCompleted, false);
 });
 
@@ -285,16 +306,17 @@ test("a verified free choice resolves its decision but TaskState still publishes
     ],
     decisionGroups: [{ decisionGroupId: "bag", requirementId: "bag", sectionType: "baggage", required: true, status: "satisfied", selectedControlId: "free", surfaceId: "surface-page", alternatives: [{ controlId: "free" }] }]
   }, { actionId: "act_free", dispatched: true, executed: true });
+  const action = {
+    id: "act_free",
+    controlId: "free",
+    decisionGroupId: "bag",
+    expectedOutcome: { type: "exact_free_option_selected", controlId: "free", expectedSelectedControlId: "free", decisionGroupId: "bag" },
+    affordance: { physicalEffect: "select_free_option", effect: "select_free_option", task: { outcomeContract: { taskOutcome: "optional_extra_declined", acceptablePhysicalEffects: ["select_free_option"], completionEvidence: ["exact_option_selected"] } } }
+  };
   const transition = evaluateTransition({
     beforeObservation: before,
-    governedAction: {
-      id: "act_free",
-      controlId: "free",
-      decisionGroupId: "bag",
-      expectedOutcome: { type: "exact_free_option_selected", controlId: "free", expectedSelectedControlId: "free", decisionGroupId: "bag" },
-      affordance: { physicalEffect: "select_free_option", effect: "select_free_option", task: { outcomeContract: { taskOutcome: "optional_extra_declined", acceptablePhysicalEffects: ["select_free_option"], completionEvidence: ["exact_option_selected"] } } }
-    },
-    browserResult: { actionId: "act_free", dispatched: true, executed: true },
+    governedAction: action,
+    browserResult: canonicalResult(action, agentContract.ACTION_OUTCOME.SATISFIED),
     afterObservation: after
   });
   const taskState = reduceTaskState({
@@ -313,7 +335,7 @@ test("a verified free choice resolves its decision but TaskState still publishes
   assert.equal(taskState.terminalStatus, "active");
 });
 
-test("a profile-authorized free choice may complete by safely advancing to the next stage", () => {
+test("a failed exact free-choice postcondition cannot be promoted by a stage change", () => {
   const before = observation("before_auto_advance", {
     step: "extras",
     price: { amount: 120, currency: "EUR" },
@@ -350,52 +372,47 @@ test("a profile-authorized free choice may complete by safely advancing to the n
     }],
     decisionGroups: []
   }, { actionId: "act_no_insurance", dispatched: true, executed: true });
-  const transition = evaluateTransition({
-    beforeObservation: before,
-    governedAction: {
-      id: "act_no_insurance",
+  const action = {
+    id: "act_no_insurance",
+    controlId: "no_insurance",
+    decisionGroupId: "insurance",
+    semanticIntent: "select_policy_safe_option",
+    mechanicalEffect: "select_free_option",
+    expectedOutcome: {
+      type: "exact_free_option_selected",
       controlId: "no_insurance",
+      expectedSelectedControlId: "no_insurance",
       decisionGroupId: "insurance",
-      semanticIntent: "select_policy_safe_option",
-      mechanicalEffect: "select_free_option",
-      expectedOutcome: {
-        type: "exact_free_option_selected",
-        controlId: "no_insurance",
-        expectedSelectedControlId: "no_insurance",
-        decisionGroupId: "insurance",
-        expectedDisposition: "decline_free_no_extra",
-        mustNotIncreasePrice: true
-      },
-      affordance: {
-        policy: { allow: true },
-        physicalEffect: "select_free_option",
-        task: {
-          outcomeContract: {
-            taskOutcome: "optional_extra_declined",
-            acceptablePhysicalEffects: ["select_free_option", "advance_checkout_stage"],
-            completionEvidence: ["exact_option_selected", "fresh_stage"]
-          }
+      expectedDisposition: "decline_free_no_extra",
+      mustNotIncreasePrice: true
+    },
+    affordance: {
+      policy: { allow: true },
+      physicalEffect: "select_free_option",
+      task: {
+        outcomeContract: {
+          taskOutcome: "optional_extra_declined",
+          acceptablePhysicalEffects: ["select_free_option", "advance_checkout_stage"],
+          completionEvidence: ["exact_option_selected", "fresh_stage"]
         }
       }
-    },
-    browserResult: {
-      actionId: "act_no_insurance",
-      dispatched: true,
-      executed: true,
-      verified: false,
-      outcome: { code: "EXACT_FREE_OPTION_NOT_VERIFIED" }
-    },
+    }
+  };
+  const transition = evaluateTransition({
+    beforeObservation: before,
+    governedAction: action,
+    browserResult: canonicalResult(action, agentContract.ACTION_OUTCOME.NO_EFFECT, { code: "EXACT_FREE_OPTION_NOT_VERIFIED" }),
     afterObservation: after
   });
 
-  assert.equal(transition.actionOutcome.status, "SATISFIED");
-  assert.equal(transition.postcondition.satisfied, true);
-  assert.equal(transition.postcondition.evidence.completionMode, "safe_stage_transition");
-  assert.equal(transition.physicalResult.effect, "select_free_option");
-  assert.equal(transition.nextDirective, "rebuild_from_fresh_observation");
+  assert.equal(transition.actionOutcome.status, "NO_EFFECT");
+  assert.equal(transition.postcondition.satisfied, false);
+  assert.equal(transition.postcondition.evidence.browserSettlementStatus, "NO_EFFECT");
+  assert.equal(transition.physicalResult.verified, false);
+  assert.equal(transition.nextDirective, "try_distinct_capability");
 });
 
-test("durable payment outcome survives base page and review-modal subgoals", () => {
+test("one terminal latch replaces the stage and surface outcome hierarchy", () => {
   const base = observation("hierarchy_base", {
     step: "extras",
     currentSurface: { id: "surface-page", type: "page", label: "Extras", surfaceClass: "navigation" },
@@ -423,11 +440,9 @@ test("durable payment outcome survives base page and review-modal subgoals", () 
     state: { taskState: second, approvals: {} }
   });
 
-  assert.equal(second.transactionOutcome.outcomeId, first.transactionOutcome.outcomeId);
-  assert.equal(second.stageOutcome.outcomeId, first.stageOutcome.outcomeId);
-  assert.equal(second.stageOutcome.status, "active");
-  assert.equal(second.surfaceSubgoal.parentOutcomeId, second.stageOutcome.outcomeId);
-  assert.equal(second.surfaceSubgoal.surfaceClass, "review_confirmation");
+  assert.equal(second.transactionOutcome, undefined);
+  assert.equal(second.stageOutcome, undefined);
+  assert.equal(second.surfaceSubgoal, undefined);
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), ["close", "submit"]);
   assert.equal(candidates.contextCapabilities.find((candidate) => candidate.controlId === "close").selectable, true);
 
@@ -447,9 +462,8 @@ test("durable payment outcome survives base page and review-modal subgoals", () 
     observation: payment,
     transactionReview: readyTransactionReview()
   });
-  assert.equal(completed.stageOutcome.outcomeId, second.stageOutcome.outcomeId);
-  assert.equal(completed.stageOutcome.status, "completed");
   assert.equal(completed.terminalStatus, "card_credential_entry_reached");
+  assert.equal(completed.terminalGoalLatch.locked, true);
 });
 
 test("no-paid-seat policy with only paid seats creates navigation, not a fake free-seat obligation", () => {
@@ -550,12 +564,13 @@ test("seat-warning Continue carries separate mechanical, semantic, and postcondi
   const transition = evaluateTransition({
     beforeObservation: warning,
     governedAction: action,
-    browserResult: { actionId: action.id, dispatched: true, executed: true },
+    browserResult: canonicalResult(action, agentContract.ACTION_OUTCOME.SATISFIED),
     afterObservation: after
   });
   assert.deepEqual(transition.localMechanicalResult, transition.localEffect);
   assert.equal(transition.localMechanicalResult.effect, "dismiss_surface");
-  assert.equal(transition.currentObligationResult.completed, true);
+  assert.equal(transition.currentObligationResult.completed, false);
+  assert.equal(transition.currentObligationResult.status, "awaiting_fresh_reduction");
   assert.equal(transition.durableObjectiveProgress.completed, false);
-  assert.equal(transition.durableObjectiveProgress.status, "progress");
+  assert.equal(transition.durableObjectiveProgress.status, "no_progress");
 });

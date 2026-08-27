@@ -5,12 +5,11 @@ const {
 const { leasedActionRecord } = require("../action-lifecycle");
 const { normalizeAction } = require("../../../../packages/shared/agent-actions");
 const { currentObligation } = require("../authority-frames");
-const { obligationField } = require("../current-obligation");
 const { canonicalizeUserPolicy, seatPolicyFrom } = require("../policy-profile");
 const { bindTargetSnapshot } = require("./mechanics");
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  return currentObligation(taskState);
 }
 
 function recoveryScrollAmount(action = {}, observation = {}) {
@@ -115,7 +114,7 @@ function rebindPendingRecoveryAction(pending = {}, observation = {}, state = {},
     expectedOutcome: null,
     reason: `Rebound pending governed action after viewport recovery: ${original.reason || original.intent || original.type || "action"}.`
   }), observation);
-  if (!obligationField(authoritativeGoal, "goalId")) {
+  if (!(authoritativeGoal?.id)) {
     return { action: direct, candidateSet: null, candidate: pending.candidateIdentity || null };
   }
 
@@ -135,22 +134,22 @@ function rebindPendingRecoveryAction(pending = {}, observation = {}, state = {},
       && (candidate.affordance?.stableKey || candidate.stableKey || "") === previousStableKey
       && candidate.operation === previous.operation
   )) || null;
-  const profileSemantic = String(
-    obligationField(authoritativeGoal, "kind") === "profile_field"
-      ? (obligationField(authoritativeGoal, "field") || obligationField(authoritativeGoal, "semanticType") || "")
-      : obligationField(authoritativeGoal, "semanticType") || ""
-  ).toLowerCase();
-  const profileRecovery = obligationField(authoritativeGoal, "kind") === "profile_field"
-    || /^(?:email|confirm_email|phone|phone_country_code|first_name|given_names|middle_name|last_name|second_last_name|full_name|title|gender|date_of_birth|place_of_birth|nationality|country_of_residence|document_type|passport_number|document_number|issuing_country|document_issue_date|passport_expiry|document_expiry|address_line1|address_line2|city|state|postal_code|country)$/.test(profileSemantic);
-  const semanticProfileCandidate = profileRecovery
-    ? (reboundSet.candidates || []).find((candidate) => (
-        candidate.operation === (previous.operation || original.operation)
-        && String(candidate.semanticGoal || obligationField(authoritativeGoal, "semanticGoal") || "").toLowerCase()
-          === String(previous.semanticGoal || obligationField(authoritativeGoal, "semanticGoal") || "").toLowerCase()
-        && String(candidate.decisionGroupId || "") === String(previous.decisionGroupId || original.decisionGroupId || "")
-      )) || null
-    : null;
-  const reboundCandidate = exactStableCandidate || semanticProfileCandidate;
+  const admittedIds = new Set(
+    (authoritativeGoal.admittedControlIds || authoritativeGoal.desiredStateDelta?.admittedControlIds || [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  );
+  const operation = previous.operation || original.operation || original.type || "";
+  const mechanicallyCompatible = (reboundSet.candidates || []).filter((candidate) => {
+    const controlId = String(candidate.controlId || candidate.affordance?.controlId || "").trim();
+    return candidate.operation === operation
+      && (!admittedIds.size || admittedIds.has(controlId));
+  });
+  // Recovery has no semantic authority. DecisionFrame + CurrentObligation have
+  // already admitted the controls that can satisfy the exact delta. A stale
+  // binding may therefore move only to the unique compatible fresh actuator.
+  const reboundCandidate = exactStableCandidate
+    || (mechanicallyCompatible.length === 1 ? mechanicallyCompatible[0] : null);
   if (!reboundCandidate) return { action: direct, candidateSet: reboundSet, candidate: null };
   const action = bindTargetSnapshot(normalizeAction({
     ...actionForCurrentCandidate(authoritativeGoal, reboundCandidate, observation),
@@ -167,7 +166,7 @@ function pendingRecoveryOwnedByCurrentObligation(pending = {}, taskState = {}) {
   if (!obligation) return false;
 
   const leasedObligationId = String(lease.obligationId || original.obligationId || "").trim();
-  const currentObligationId = String(obligation.obligationId || "").trim();
+  const currentObligationId = String(obligation.id || "").trim();
   if (leasedObligationId && currentObligationId && leasedObligationId !== currentObligationId) return false;
 
   const leasedDecisionGroupId = String(
@@ -176,10 +175,10 @@ function pendingRecoveryOwnedByCurrentObligation(pending = {}, taskState = {}) {
       || original.expectedPostconditions?.[0]?.decisionGroupId
       || ""
   ).trim();
-  const currentDecisionGroupId = String(obligation.subject?.decisionGroupId || "").trim();
+  const currentDecisionGroupId = String(obligation.desiredStateDelta?.decisionGroupId || "").trim();
   if (leasedDecisionGroupId && currentDecisionGroupId && leasedDecisionGroupId !== currentDecisionGroupId) return false;
 
-  const delta = obligation.desiredStateDelta || obligation.binding?.component?.desiredStateDelta || null;
+  const delta = obligation.desiredStateDelta || null;
   if (delta && delta.actionRequired === false) return false;
   return true;
 }
@@ -229,7 +228,7 @@ function observationDecisionHash(observation = {}) {
 }
 
 function decisionConflictId(goal = {}) {
-  return String(obligationField(goal, "decisionGroupId") || obligationField(goal, "requirementId") || obligationField(goal, "goalId") || "");
+  return String((goal?.decisionGroupId) || (goal?.requirementId) || (goal?.id) || "");
 }
 
 function candidateIntendedOutcome(candidate = {}, selection = {}) {
@@ -243,7 +242,7 @@ function candidateSelectionCacheEntry({ observation = {}, goal = {}, candidate =
     observationHash: observationDecisionHash(observation),
     policyFingerprint,
     conflictId: decisionConflictId(goal),
-    obligationId: String(obligationField(goal, "goalId") || ""),
+    obligationId: String((goal?.id) || ""),
     candidateId: String(candidate.candidateId),
     controlId: String(candidate.controlId),
     stableControlIdentity: String(candidate.affordance?.stableKey || candidate.stableKey || candidate.controlId),
@@ -258,12 +257,12 @@ function reusableCandidateSelection(cache = null, observation = {}, goal = {}, c
   const entry = cache?.candidateSelection;
   if (!entry || entry.observationHash !== observationDecisionHash(observation)) return null;
   if (entry.policyFingerprint !== policyFingerprint) return null;
-  if (entry.conflictId !== decisionConflictId(goal) || entry.obligationId !== String(obligationField(goal, "goalId") || "")) return null;
+  if (entry.conflictId !== decisionConflictId(goal) || entry.obligationId !== String((goal?.id) || "")) return null;
   const candidate = (candidateSet.candidates || []).find((item) => (
     String(item.affordance?.stableKey || item.stableKey || item.controlId) === entry.stableControlIdentity
     && String(item.operation || item.type || "") === entry.operation
     && candidateIntendedOutcome(item, entry) === entry.intendedOutcome
-    && item.policyDecision?.allow === true
+    && item.admitted === true
     && item.risk === "safe"
     && item.requiresApproval !== true
   ));
@@ -285,7 +284,7 @@ function staleActionRecoveryEntry(action = {}, candidate = {}, goal = {}, policy
   return Object.freeze({
     code,
     conflictId: decisionConflictId(goal),
-    obligationId: String(obligationField(goal, "goalId") || action.obligationId || ""),
+    obligationId: String((goal?.id) || action.obligationId || ""),
     stableControlIdentity,
     operation: String(candidate.operation || action.operation || action.type || ""),
     intendedOutcome: candidateIntendedOutcome(candidate, action),
@@ -296,12 +295,12 @@ function staleActionRecoveryEntry(action = {}, candidate = {}, goal = {}, policy
 
 function reusableStaleActionCandidate(entry = null, goal = {}, candidateSet = {}, policyFingerprint = "") {
   if (!entry || entry.attempts !== 1 || entry.policyFingerprint !== policyFingerprint) return null;
-  if (entry.conflictId !== decisionConflictId(goal) || entry.obligationId !== String(obligationField(goal, "goalId") || "")) return null;
+  if (entry.conflictId !== decisionConflictId(goal) || entry.obligationId !== String((goal?.id) || "")) return null;
   return (candidateSet.candidates || []).find((candidate) => (
     String(candidate.affordance?.stableKey || candidate.stableKey || candidate.controlId) === entry.stableControlIdentity
     && String(candidate.operation || candidate.type || "") === entry.operation
     && candidateIntendedOutcome(candidate, entry) === entry.intendedOutcome
-    && candidate.policyDecision?.allow === true
+    && candidate.admitted === true
     && candidate.risk === "safe"
     && candidate.requiresApproval !== true
   )) || null;

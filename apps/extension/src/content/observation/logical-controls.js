@@ -1275,7 +1275,7 @@ export function createLogicalControlCompiler(dependencies) {
       operations.type = make(
         "type",
         [stateId],
-        dropdownLike ? "semantic_progress" : "normalized_value_changed",
+        "normalized_value_changed",
         { disabled: false }
       );
     }
@@ -1288,7 +1288,7 @@ export function createLogicalControlCompiler(dependencies) {
         operations.open = make("open", openCandidates, "options_surface_appeared", { expanded: false });
       }
       if (tag !== "select") {
-        operations.keyboard = make("keyboard", [stateId], "semantic_progress", { disabled: false });
+        operations.keyboard = make("keyboard", [stateId], "options_surface_appeared", { disabled: false });
       }
     }
     if (["option", "radio", "checkbox"].includes(kind) || ["option", "radio", "checkbox"].includes(role)) {
@@ -1304,7 +1304,9 @@ export function createLogicalControlCompiler(dependencies) {
       || tag === "a"
       || role === "link"
     )) {
-      operations.activate = make("activate", [activationId, stateId], "observable_change", { disabled: false });
+      // A generic pressable has no success semantics by itself. The canonical
+      // obligation must supply an exact typed outcome before execution.
+      operations.activate = make("activate", [activationId, stateId], "exact_outcome_missing", { disabled: false });
     }
     return operations;
   }
@@ -2184,27 +2186,23 @@ export function createLogicalControlCompiler(dependencies) {
       : fieldType || (/radio|checkbox|option/.test(kind) || presentationBinding
       ? explicitChoiceSemantic || semanticChoiceType(label)
       : (fieldSemantic !== "unknown" ? fieldSemantic : semanticChoiceType(label)));
-    const ownedMeaning = resolveOwnedControlMeaning(ownedEvidence, fallbackSemantic, surface.type || "page");
+    const ownedMeaning = resolveOwnedControlMeaning(
+      ownedEvidence,
+      fallbackSemantic,
+      surface.type || "page",
+      {
+        choiceBound: Boolean(presentationBinding),
+        sectionType: contextualSectionType,
+        sectionLabel
+      }
+    );
     const paymentMethodShape = /radio|option|choice/.test(
       `${kind || ""} ${ownedEvidence.role || ""} ${ownedEvidence.type || ""}`.toLowerCase()
     );
-    const exactPaymentMethodEvidence = [
-      label,
-      stateElement.getAttribute?.("name") || "",
-      ownedEvidence.testId,
-      ownedEvidence.ariaLabel,
-      ownedEvidence.graphicName
-    ].filter(Boolean).join(" ");
+    const paymentMethodKind = ownedMeaning.paymentMethodKind || "";
     const paymentMethodControl = Boolean(
       !/cancel|back|close|help|privacy|terms/i.test(label)
-      && (
-        /payment[-_ ]method|pay with|credit(?: or|\/)? debit card|apple pay|google pay/i.test(exactPaymentMethodEvidence)
-        || (
-          contextualSectionType === "payment"
-          && /(?:select|choose|payment)\s+(?:a\s+)?payment method|payment method|pay with|credit card payment/i.test(sectionLabel)
-          && (paymentMethodShape || (intrinsicCommand && ownedEvidence.graphicName))
-        )
-      )
+      && paymentMethodKind
       && (paymentMethodShape || intrinsicCommand)
     );
     // Once an exclusive option owner has been reconstructed, broad label
@@ -2770,6 +2768,12 @@ export function createLogicalControlCompiler(dependencies) {
       ownText: ownedEvidence.ownText,
       ariaLabel: ownedEvidence.ariaLabel,
       title: ownedEvidence.title,
+      // These are objective element relationships, not browser-authored
+      // checkout meaning. DecisionFrame may use them to distinguish an exact
+      // information disclosure from an unrelated utility/plus button.
+      controlledElementIds: String(ownedEvidence.ariaControls || "").split(/\s+/).filter(Boolean),
+      ariaExpanded: ownedEvidence.ariaExpanded,
+      controlsInformationOnly: ownedEvidence.controlsInformationOnly === true,
       iconOnly: ownedEvidence.iconOnly,
       kind,
       name: stateElement.getAttribute?.("name") || "",
@@ -2786,7 +2790,19 @@ export function createLogicalControlCompiler(dependencies) {
       domRole,
       semantic,
       semanticIntent: semantic,
+      semanticAuthority: "browser_semantic_hint/v1",
       physicalEffect: physicalEffect || "unknown",
+      componentPattern: AGENT_CONTRACT?.componentPatternFor?.({
+        semantic,
+        fieldType,
+        physicalEffect: physicalEffect || "unknown",
+        role: perceptionRole,
+        kind,
+        inputType: String(stateElement.getAttribute?.("type") || "").toLowerCase(),
+        autocomplete: stateElement.getAttribute?.("autocomplete") || "",
+        surfaceType: surface.type || "page"
+      }, { surfaceType: surface.type || "page" }) || "",
+      paymentMethodKind,
       effectRole,
       economicEffect: ECONOMIC_EFFECT_ROLES.has(effectRole) ? "decision_outcome" : "none",
       semanticConflict: ownedMeaning.conflict === true,
@@ -2796,6 +2812,8 @@ export function createLogicalControlCompiler(dependencies) {
           ? "safe"
           : paymentMethodControl
             ? "safe"
+            : physicalEffect === "reveal_control"
+              ? "safe"
             : effectRole === "scope_toggle"
             ? "safe"
             : choiceRisk(label),

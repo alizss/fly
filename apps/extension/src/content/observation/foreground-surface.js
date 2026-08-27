@@ -536,6 +536,7 @@ export function createForegroundSurfaceCompiler(dependencies) {
         id: elementId(option),
         label,
         semantic: meaning.semantic,
+        semanticAuthority: "browser_semantic_hint/v1",
         physicalEffect: meaning.physicalEffect,
         semanticConflict: meaning.conflict === true,
         testId: ownedEvidence.testId,

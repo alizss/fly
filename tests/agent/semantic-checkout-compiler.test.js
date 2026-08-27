@@ -3,9 +3,47 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
+const { predictPhysicalEffect } = require("../../apps/web/agent/action-semantics");
 const { resolveProfileDecision } = require("../../apps/web/agent/policy-profile");
 const { reduceTaskState } = require("./task-state-replay-adapter");
 const { buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
+const { compileDecisionFrame } = require("../../apps/web/agent/authority-frames");
+
+test("published canonical control meaning cannot be reinterpreted from its label", () => {
+  const rawControl = {
+    controlId: "ctrl_opaque",
+    label: "Pay now",
+    semantic: "unknown",
+    physicalEffect: "unknown",
+    semanticAuthority: "browser_semantic_hint/v1",
+    role: "button",
+    kind: "button"
+  };
+  const canonicalUnknown = compileDecisionFrame({
+    observation: {
+      observationId: "obs_canonical_unknown",
+      page: { controls: [rawControl], decisionGroups: [], validationIssues: [] }
+    },
+    semanticScene: {
+      status: "accepted",
+      controls: [{ controlId: "ctrl_opaque", semanticRole: "unknown", confidence: 1, evidence: ["opaque"] }]
+    }
+  }).observation.page.controls[0];
+  assert.equal(canonicalUnknown.semanticAuthority, "decision-frame/v2");
+  assert.equal(predictPhysicalEffect({
+    semantics: { interactionRole: "command", expectedEvidence: "dismissed" },
+    control: canonicalUnknown,
+    candidate: {},
+    goal: {}
+  }), "unknown");
+
+  assert.equal(predictPhysicalEffect({
+    semantics: { interactionRole: "command", expectedEvidence: "dismissed" },
+    control: { ...canonicalUnknown, semanticAuthority: "browser_semantic_hint/v1" },
+    candidate: {},
+    goal: {}
+  }), "submit_purchase");
+});
 
 function executableControl({ controlId, targetId, label, x, testId = "", price = null, semantic = "selection_cta" }) {
   const box = { x, y: 723, width: 200, height: 44, centerX: x + 100, centerY: 745, inViewport: true };
@@ -83,6 +121,73 @@ function kiwiAbsoluteFareTotalsPage() {
   };
 }
 
+function boundedFarePage(page, prices, currency, displayedTotals = []) {
+  const controls = page.controls.map((control, index) => ({
+    ...control,
+    structuredPrice: { amount: prices[index], currency }
+  }));
+  const alternatives = controls.map((control, index) => ({
+    controlId: control.controlId,
+    label: control.label.replace(/^Continue with\s+/i, ""),
+    structuredPrice: control.structuredPrice,
+    included: prices[index] === 0,
+    canonicalAttributes: {
+      ...(index === 0 ? { flexibility: "none" } : { flexibility: "changes_allowed" }),
+      ...(index === 2 ? { refundPercent: 80 } : {}),
+      ...(displayedTotals[index] != null ? {
+        displayedTotal: displayedTotals[index],
+        displayedTotalCurrency: currency,
+        priceBasis: "absolute_total"
+      } : {})
+    }
+  }));
+  return {
+    ...page,
+    controls,
+    decisionGroups: [{
+      decisionGroupId: "dg_fare_package",
+      requirementId: "fare_package:current",
+      subject: "fare_package",
+      sectionType: "fare_package",
+      sectionLabel: "Fare package",
+      kind: "exclusive_choice",
+      exclusive: true,
+      required: true,
+      status: "missing",
+      alternativeControlIds: controls.map((control) => control.controlId),
+      alternatives
+    }]
+  };
+}
+
+function boundedSeatPage(page) {
+  const alternatives = page.controls.filter((control) => ["skip", "continue"].includes(control.controlId)).map((control) => ({
+    controlId: control.controlId,
+    label: control.label,
+    semantic: control.semantic,
+    physicalEffect: control.physicalEffect,
+    risk: control.risk,
+    included: control.controlId === "skip"
+  }));
+  return {
+    ...page,
+    decisionGroups: [{
+      decisionGroupId: "dg_kiwi_seat_confirmation",
+      requirementId: "seat:confirmation",
+      subject: "seat",
+      sectionType: "seat",
+      sectionLabel: page.currentSurface.label,
+      surfaceId: page.currentSurface.id,
+      kind: "exclusive_choice",
+      exclusive: true,
+      required: true,
+      status: "missing",
+      alternativeControlIds: alternatives.map((alternative) => alternative.controlId),
+      alternatives
+    }]
+  };
+}
+
 function kiwiSeatConfirmationPage() {
   const surfaceId = "seat-confirmation";
   const onSurface = (control, overrides = {}) => ({
@@ -118,8 +223,15 @@ function kiwiSeatConfirmationPage() {
   };
 }
 
-test("exact sanitized Kiwi observation reconstructs one fare decision with three owned actuators", () => {
-  const compiled = agentContract.compileSemanticCheckout(kiwiFailurePage());
+test("bounded compiler preserves one DecisionFrame fare group and never reconstructs a missing group", () => {
+  const incomplete = agentContract.compileSemanticCheckout(kiwiFailurePage());
+  assert.equal(incomplete.decisionContracts.length, 0);
+  assert.equal(incomplete.semanticReadiness, "unresolved");
+  const compiled = agentContract.compileSemanticCheckout(boundedFarePage(
+    kiwiFailurePage(),
+    [0, 685.74, 1396.64],
+    "TRY"
+  ));
   const fares = compiled.decisionContracts.filter((decision) => decision.subject === "fare_package");
   assert.equal(fares.length, 1);
   assert.equal(fares[0].kind, "exclusive_choice");
@@ -132,11 +244,14 @@ test("exact sanitized Kiwi observation reconstructs one fare decision with three
   assert.equal(fares[0].options[2].canonicalAttributes.refundPercent, 80);
   assert.equal(compiled.unownedMaterialControls.length, 0);
   assert.equal(compiled.semanticReadiness, "ready");
-  compiled.controls.forEach((control) => assert.equal(control.choiceContract?.decisionInstance, fares[0].decisionGroupId));
 });
 
 test("the same fare decision resolves differently from profile criteria and never invents paid authority", () => {
-  const compiled = agentContract.compileSemanticCheckout(kiwiFailurePage());
+  const compiled = agentContract.compileSemanticCheckout(boundedFarePage(
+    kiwiFailurePage(),
+    [0, 685.74, 1396.64],
+    "TRY"
+  ));
   const decision = compiled.decisionContracts.find((item) => item.subject === "fare_package");
   const cheapest = resolveProfileDecision(decision, { userPolicy: { bookingRules: "Cheapest included fare" } });
   const standard = resolveProfileDecision(decision, { userPolicy: { bookingRules: "Flexible changes, maximum 700 TL" } });
@@ -156,8 +271,8 @@ test("the same fare decision resolves differently from profile criteria and neve
   assert.equal(unbounded.authorization, null);
 });
 
-test("absolute fare totals compile into one zero-increment base fare and exact profile candidate", () => {
-  const page = kiwiAbsoluteFareTotalsPage();
+test("DecisionFrame-derived fare deltas remain exact through bounded compilation", () => {
+  const page = boundedFarePage(kiwiAbsoluteFareTotalsPage(), [0, 12, 25], "EUR", [33, 45, 58]);
   const compiled = agentContract.compileSemanticCheckout(page);
   const decision = compiled.decisionContracts.find((item) => item.subject === "fare_package");
   assert.ok(decision);
@@ -175,18 +290,15 @@ test("absolute fare totals compile into one zero-increment base fare and exact p
     observationId: "obs_absolute_fares",
     page: {
       ...page,
-      controls: compiled.controls,
-      decisionGroups: compiled.decisionGroups,
-      decisionContracts: compiled.decisionContracts
+      observationContract: "structural-observation/v1"
     }
   };
   const state = reduceTaskState({ observation, traveler });
-  assert.equal(state.currentGoal.semanticType, "fare_package");
-  assert.equal(state.currentGoal.desiredPolicyOutcome, "included_base_fare");
-  assert.equal(state.currentGoal.desiredSemanticOutcome, "included_base_fare");
-  assert.deepEqual(state.currentGoal.policyAllowedControlIds, ["fare_saver"]);
+  assert.equal(state.currentObligation.semanticOwner.family, "fare");
+  assert.equal(state.currentObligation.desiredStateDelta.desiredEffect, "included_base_fare");
+  assert.deepEqual(state.currentObligation.admittedControlIds, ["fare_saver"]);
   const candidateSet = buildCurrentCandidateSet({
-    goal: state.currentGoal,
+    obligation: state.currentObligation,
     observation,
     traveler,
     state: { taskState: state, approvals: {} }
@@ -218,7 +330,7 @@ test("Continue labels never manufacture an included fare when price effects are 
 });
 
 test("a selected paid fare does not satisfy a no-paid constraint merely because something is selected", () => {
-  const page = kiwiAbsoluteFareTotalsPage();
+  const page = boundedFarePage(kiwiAbsoluteFareTotalsPage(), [0, 12, 25], "EUR", [33, 45, 58]);
   page.controls[1].selected = true;
   page.controls[1].state = { ...page.controls[1].state, selected: true };
   const state = reduceTaskState({
@@ -233,20 +345,47 @@ test("a selected paid fare does not satisfy a no-paid constraint merely because 
 });
 
 test("TaskState consumes the compiled contract and schedules only the profile-resolved exact option", () => {
-  const page = kiwiFailurePage();
+  const page = boundedFarePage(kiwiFailurePage(), [0, 685.74, 1396.64], "TRY");
   const state = reduceTaskState({
     observation: { observationId: "obs_ms8m7xbb_379", page },
     userPolicy: { bookingRules: "Flexible changes, maximum 700 TL" },
-    traveler: {}
+    traveler: {},
+    transactionReview: {
+      ready: true,
+      baselineStatus: "approved",
+      missingFacts: [],
+      contradictions: [],
+      baseline: {
+        itinerary: {
+          completeness: "complete",
+          segments: [{ origin: "SAW", destination: "LJU", departureDate: "2026-09-01" }]
+        },
+        travelers: [{ travelerId: "trav_fare", name: "Fare Traveler" }],
+        currency: "TRY",
+        totalPrice: { amount: 600, currency: "TRY" },
+        selectedExtras: []
+      },
+      current: {
+        itinerary: {
+          completeness: "complete",
+          segments: [{ origin: "SAW", destination: "LJU", departureDate: "2026-09-01" }]
+        },
+        travelers: [{ travelerId: "trav_fare", name: "Fare Traveler" }],
+        currency: "TRY",
+        totalPrice: { amount: 600, currency: "TRY" },
+        selectedExtras: []
+      }
+    }
   });
   assert.equal(state.semanticReadiness, "ready");
-  assert.equal(state.currentObligation.subject.semanticType, "fare_package");
+  assert.equal(state.currentObligation.semanticOwner.family, "fare");
   assert.deepEqual(state.currentObligation.admittedControlIds, ["ctrl_button_hco73sm"]);
-  assert.equal(state.currentObligation.policyDecision.authorization.maximumAmount, 700);
+  assert.equal(state.currentObligation.policyAuthorization, undefined);
+  assert.equal(state.currentObligation.desiredStateDelta.authorization.maximumAmount, 700);
 });
 
 test("blocking seat confirmation is reconstructed as a profile-resolved foreground choice", () => {
-  const page = kiwiSeatConfirmationPage();
+  const page = boundedSeatPage(kiwiSeatConfirmationPage());
   const compiled = agentContract.compileSemanticCheckout(page);
   assert.equal(compiled.semanticReadiness, "ready");
   assert.equal(compiled.decisionContracts.length, 1);
@@ -266,8 +405,8 @@ test("blocking seat confirmation is reconstructed as a profile-resolved foregrou
     userPolicy: { seatPolicy: "random_assignment" },
     traveler: { booking_rules: "No paid seats" }
   });
-  assert.equal(state.currentGoal.semanticType, "seat_selection");
-  assert.deepEqual(state.currentGoal.policyAllowedControlIds, ["skip"]);
+  assert.equal(state.currentObligation.semanticOwner.family, "seat");
+  assert.deepEqual(state.currentObligation.admittedControlIds, ["skip"]);
 });
 
 test("unowned selection CTAs fail semantic readiness instead of becoming navigation", () => {
@@ -314,7 +453,7 @@ test("payment-method choice follows the selected profile and is not completion",
   assert.equal(wallet.preferredControlId, "wallet");
 });
 
-test("equivalent card-network reveal tiles resolve to one bounded card-entry route", () => {
+test("card-compatible routes with different mechanics resolve without asking the user", () => {
   const decision = {
     decisionGroupId: "payment-method-tiles",
     subject: { key: "payment_method" },
@@ -322,7 +461,7 @@ test("equivalent card-network reveal tiles resolve to one bounded card-entry rou
     material: true,
     alternatives: [
       { controlId: "amex", label: "American Express", semantic: "payment_method", physicalEffect: "reveal_control", executable: true },
-      { controlId: "visa", label: "Visa", semantic: "payment_method", physicalEffect: "reveal_control", executable: true },
+      { controlId: "visa", label: "Visa", semantic: "payment_method", physicalEffect: "advance_checkout_stage", executable: true },
       { controlId: "mastercard", label: "Mastercard", semantic: "payment_method", physicalEffect: "reveal_control", executable: true },
       { controlId: "wallet", label: "KEKS Pay", semantic: "payment_method", physicalEffect: "reveal_control", executable: true }
     ]

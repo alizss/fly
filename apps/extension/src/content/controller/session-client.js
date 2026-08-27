@@ -30,6 +30,17 @@ export function createSessionClient({
     logFlow("booking.admission", { event: type, ...payload });
   }
 
+  function resumePageIdentity() {
+    return {
+      site: location.host,
+      url: currentNavigationUrl(),
+      step: "unknown",
+      currentSurface: null,
+      summary: null,
+      errors: []
+    };
+  }
+
   async function startAgentSession(resumeSessionId = "", options = {}) {
     const startAttemptId = String(options.startAttemptId || `start_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`);
     try {
@@ -51,10 +62,9 @@ export function createSessionClient({
       if (!resumeSessionId) {
         const currentMap = agent.pageMap || pageStateStore.current() || pageStateStore.observe({ reason: "session_start_booking" }).map;
         recordStartEvent("BOOKING_CAPTURE_STARTED", { startAttemptId });
-        const admission = await admitSelectedBookingForStart({
-          initialMap: currentMap,
-          timeoutMs: options.bookingAcquisitionTimeoutMs
-        });
+        // Consume already-available proof without waiting for this document to
+        // repeat itinerary copy. Explicit Start owns durable admission.
+        const admission = await admitSelectedBookingForStart({ initialMap: currentMap });
         if (admission.status === "candidate") {
           recordStartEvent("BOOKING_CANDIDATE_FOUND", {
             startAttemptId,
@@ -70,13 +80,11 @@ export function createSessionClient({
           selectedTraveler
         ) || composeSelectedBookingContract(admission.acquisition, selectedTraveler);
         if (suppliedSelectedBooking && !selectedBookingContract) {
-          const error = new Error("The app-selected booking is expired, incomplete, or does not include the selected wallet traveler.");
-          error.code = "APP_SELECTED_BOOKING_INVALID";
-          error.details = {
+          recordStartEvent("APP_SELECTED_BOOKING_INVALID", {
+            startAttemptId,
             checkoutLineageId: admission.checkoutLineageId || "",
             selectionId: String(suppliedSelectedBooking.selectionId || "")
-          };
-          throw error;
+          });
         }
         if (selectedBookingContract) {
           recordStartEvent("BOOKING_CONFIRMED", {
@@ -86,25 +94,16 @@ export function createSessionClient({
           });
         }
         if (!selectedBookingContract) {
-          const missingFacts = admission.missingFacts || [];
-          recordStartEvent("BOOKING_CONFIRMATION_REQUIRED", {
+          recordStartEvent("BOOKING_EVIDENCE_REQUIRED", {
             startAttemptId,
             status: admission.status || "absent",
             reason: admission.reason || "",
-            missingFacts
+            missingFacts: admission.missingFacts || []
           });
-          setAgentActivity(
-            "Confirming the selected booking",
-            missingFacts.length
-              ? `The current tab is missing: ${missingFacts.join(", ")}.`
-              : "The current tab must expose the selected itinerary and displayed starting total."
-          );
-          renderSidebar("agent");
           const error = new Error(
-            "The selected itinerary and starting total are not available yet. Return to the approved flight selection or make its booking summary visible, then start again."
+            "The selected booking could not be verified. Return to the selected itinerary and start checkout again."
           );
           error.code = "SELECTED_BOOKING_REQUIRED";
-          error.details = { admissionStatus: admission.status || "absent", missingFacts };
           throw error;
         }
       }
@@ -118,7 +117,13 @@ export function createSessionClient({
           userIntent: userIntentText(),
           traveler: traveler(),
           selectedBookingContract,
-          page: compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
+          // A durable resume handshake proves that the transaction still
+          // exists before this document is allowed to perform an expensive
+          // semantic observation. The next controller step supplies the full
+          // page after the server has accepted the exact session id.
+          page: resumeSessionId && options.validateBeforeObservation === true
+            ? resumePageIdentity()
+            : compactPageMap(agent.pageMap || pageStateStore.observe({ reason: "session_start" }).map)
         })
       });
       const session = await response.json().catch(() => ({}));
@@ -155,7 +160,7 @@ export function createSessionClient({
     }
   }
 
-  async function reportActionResult(result = {}) {
+  async function reportActionResult(result = {}, options = {}) {
     if (!agent.sessionId) {
       if (!agent.running) return false;
       throw new Error("Cannot report an action result without the durable checkout session.");
@@ -174,7 +179,10 @@ export function createSessionClient({
     });
     try {
       const settings = await storageGet(["apiBase"]);
-      const map = pageStateStore.observe({ reason: "action_report" }).map;
+      // A dispatched navigation receipt must be emitted before any fresh DOM
+      // work: the old document can disappear immediately after the click.
+      // Its already-owned source map is sufficient identity for persistence.
+      const map = options.pageMap || pageStateStore.observe({ reason: "action_report" }).map;
       const authoritativeResult = compactActionResultForTransport({
         ...(agent.lastActionResult || {}),
         ...result,
@@ -213,6 +221,10 @@ export function createSessionClient({
             method: "POST",
             headers: { "content-type": "application/json" },
             body: reportBody,
+            // Only the pre-navigation dispatch receipt may outlive its source
+            // document. Ordinary field/choice results use an acknowledged
+            // request and must not consume the browser's keepalive quota.
+            ...(options.keepalive === true ? { keepalive: true } : {}),
             signal: controller.signal
           });
           if (!response.ok) {

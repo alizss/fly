@@ -32,7 +32,7 @@ test("raw required value fields request grounding without manufacturing a profil
   assert.equal(decisions[0].actionReason, "semantic_grounding_required");
 });
 
-test("an enabled page exit satisfies a no-paid constraint without clicking an unselected decline representation", () => {
+test("an enabled page exit cannot waive an exact unresolved required choice", () => {
   const actionable = (actuatorId) => ({
     actuatorId,
     actionability: { executable: true, revealable: false }
@@ -92,7 +92,8 @@ test("an enabled page exit satisfies a no-paid constraint without clicking an un
   });
 
   assert.equal(decisions.length, 1);
-  assert.equal(decisions[0].status, "waived");
-  assert.equal(decisions[0].needsAction, false);
-  assert.equal(decisions[0].actionReason, "enabled_stage_exit_proves_constraint_non_blocking");
+  assert.equal(decisions[0].status, "active");
+  assert.equal(decisions[0].needsAction, true);
+  assert.equal(decisions[0].actionReason, "required_unresolved");
+  assert.deepEqual(decisions[0].userIntent.desiredControlIds, ["insurance_none"]);
 });

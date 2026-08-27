@@ -83,7 +83,6 @@ const PROFILE_FIELD_ORDER = [
   "special_assistance"
 ];
 
-const { obligationField } = require("./current-obligation");
 
 function meaningfulObservedFieldValue(field = {}, control = {}) {
   const state = control.state || field.controlState || {};
@@ -384,20 +383,6 @@ function decisionGroupForDescriptor(descriptor = {}, page = {}) {
   }) || null;
 }
 
-function unblockedStageExitReady(page = {}) {
-  const exit = page.stageExit || {};
-  if (exit.continueDisabled === true || exit.navigationState === "disabled") return false;
-  const readyCandidate = (exit.candidates || []).some((candidate) => (
-    candidate.executable === true
-    || candidate.status === "ready"
-  ));
-  return Boolean(
-    (exit.continueAllowed === true || exit.continueObserved === true || readyCandidate)
-    && readyCandidate
-    && !(exit.blockers || []).length
-  );
-}
-
 function descriptorOwnsActiveRequirement(descriptor = {}, page = {}) {
   const control = descriptor.control || {};
   const field = descriptor.field || {};
@@ -426,17 +411,11 @@ function descriptorOwnsActiveRequirement(descriptor = {}, page = {}) {
   }
   if (required || ownsValidation || decisionRequiresResolution) return true;
 
-  // Actionability describes how a control can be operated; it is never proof
-  // that the control represents work. A fresh, unblocked stage exit is an
-  // explicit statement that no optional blank profile representation owns
-  // the current task. This is the live EasyJet boundary where a blank
-  // framework parent survived after the exact age choice was already settled.
-  if (unblockedStageExitReady(page)) return false;
-
   // Some checkout forms omit HTML `required` and canonical decision metadata.
-  // While their stage exit is absent or blocked, an exact active logical field
-  // remains admissible from current-owner evidence. This fallback depends on
-  // semantic ownership and form state, never on executable/revealable mechanics.
+  // An exact active logical field remains admissible from current-owner
+  // evidence. A Continue button's enabledness is mechanical state, not proof
+  // that blank traveler facts are optional. Durable verified-component memory
+  // is the sole authority allowed to suppress a stale blank representation.
   const lifecycle = descriptor.representationLifecycle || mergedRepresentationLifecycle(field, control);
   const surface = authoritativeCurrentSurface(page);
   const renderingEvidence = Object.values(control.operations || {}).flatMap((capability) => (

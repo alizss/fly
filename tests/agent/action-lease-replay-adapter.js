@@ -46,9 +46,7 @@ function executableDecisionFromActionLease(rawDecision = {}) {
       || ""
     ),
     expectedOutcome: successCondition,
-    affordance: lease.expected?.policyAuthorization ? {
-      policy: lease.expected.policyAuthorization
-    } : null,
+    affordance: null,
     pipelineContract: lease.capabilityProof || null,
     interactionMethod: lease.mechanic?.method || "",
     boundedRecovery: lease.mechanic?.boundedRecovery === true,

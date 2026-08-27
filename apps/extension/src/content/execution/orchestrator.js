@@ -8,6 +8,7 @@ export function createExecutionOrchestrator({
   beginDestinationWait,
   buildPageMap,
   buttonText,
+  clearResumeMarker,
   clearExecutionContext,
   clickResolvedViewportTarget,
   clickableAncestor,
@@ -44,6 +45,7 @@ export function createExecutionOrchestrator({
   queryAllDeep,
   recordAction,
   rejectMechanicalAction,
+  resetAgentLoopLifecycle,
   rememberActionExecutionResult,
   rememberCanonicalSelectionCommitment,
   rememberChoiceVisualStateBeforeDispatch,
@@ -52,6 +54,7 @@ export function createExecutionOrchestrator({
   renderSidebar,
   reportActionResult,
   resolveDecisionTarget,
+  saveResumeMarker,
   scrollElementWithinNearestContainer,
   setAgentActivity,
   setFieldValue,
@@ -60,6 +63,7 @@ export function createExecutionOrchestrator({
   showAgentThought,
   sleep,
   stableHash,
+  stopWatchingCheckoutChanges,
   targetFingerprint,
   targetLocalDispatchIdentity,
   traveler,
@@ -73,6 +77,26 @@ export function createExecutionOrchestrator({
   withChoiceCommitEvidence,
   withOverlayProgressEvidence
 }) {
+  const dispatchedStageExitReceipts = new Map();
+
+  async function settleStopDecision(decision, actionId, observationId) {
+    await persistControlFlowDecision(decision, actionId, observationId);
+    agent.running = false;
+    if (decision.userActionRequired === false) {
+      // Engine-only settlement is dormant, not terminal. Preserve this exact
+      // durable transaction and wake it only from fresh structural evidence.
+      agent.engineReconciliationPending = true;
+      agent.awaiting = "engine";
+      await saveResumeMarker();
+    } else {
+      agent.engineReconciliationPending = false;
+      agent.awaiting = "";
+      stopWatchingCheckoutChanges();
+      await clearResumeMarker();
+    }
+    renderSidebar("agent");
+  }
+
   async function pushVerificationLedger(actionId, observationId, decision, expectedOutcome, verification) {
     const executionResult = rememberActionExecutionResult(actionId, observationId, decision, expectedOutcome, verification);
     pushActionLedger({
@@ -108,6 +132,8 @@ export function createExecutionOrchestrator({
       expectedOutcome,
       verification
     );
+    const destinationLoading = executionResult.actionOutcome?.status
+      === AGENT_CONTRACT?.ACTION_OUTCOME?.DESTINATION_LOADING;
     logFlow("action.lifecycle.finalized", {
       actionId,
       observationId,
@@ -115,28 +141,85 @@ export function createExecutionOrchestrator({
       verified: executionResult.verified === true,
       outcomeCode: executionResult.outcome?.code || executionResult.failureCode || "",
       resultObservationHash: executionResult.resultObservationHash || "",
-      next: "fresh_observation"
+      next: destinationLoading ? "mutation_or_deadline" : "fresh_observation"
     });
+    // The canonical action outcome owns post-dispatch lifecycle. Once a
+    // dispatched stage exit is known to be awaiting its destination, the
+    // unchanged source page cannot be sent back to the planner as a new
+    // situation: doing so lets a later generic stop contradict the in-flight
+    // navigation. Wake only on a material mutation or the bounded deadline.
+    if (destinationLoading) {
+      beginDestinationWait({
+        action: "wait",
+        intent: "wait_for_dispatched_stage_exit",
+        semanticIntent: "wait_for_dispatched_stage_exit",
+        observationId,
+        actionId,
+        expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
+        reobserveRetryToken: `stage_exit:${actionId}`
+      });
+      clearExecutionContext();
+      renderSidebar("agent");
+      return executionResult;
+    }
     await continueAfterAction(delay);
     return executionResult;
   }
 
-  async function holdDispatchedStageExit(actionId, observationId, decision, expectedOutcome, afterMap = {}) {
-    const pendingResult = rememberUnexecutedActionResult(
+  async function persistDispatchedStageExitReceipt(actionId, observationId, decision, expectedOutcome, afterMap = {}) {
+    const existing = dispatchedStageExitReceipts.get(actionId);
+    if (existing) return existing;
+    const pendingResult = rememberActionExecutionResult(
       actionId,
       observationId,
       decision,
+      expectedOutcome,
       {
         ok: false,
         code: "NAVIGATION_TRANSITION_PENDING",
         message: "The governed stage exit was dispatched once; verification is waiting for a material page change or the bounded deadline.",
-        dispatched: true,
-        executed: true,
-        targetResolved: true,
-        clickReachedPage: true,
-        pageChanged: false,
-        resultObservationHash: observationHashForMap(afterMap)
+        feedback: {
+          dispatched: true,
+          dispatchSucceeded: true,
+          targetFound: true,
+          targetReacted: true,
+          domChanged: false,
+          visualChanged: false,
+          surfaceChanged: false,
+          progressChanged: false,
+          navigationOccurred: false
+        },
+        evidence: {
+          afterObservationHash: observationHashForMap(afterMap)
+        }
       }
+    );
+    pushActionLedger({
+      actionId,
+      observationId,
+      stage: "dispatched_receipt",
+      action: decision,
+      expectedOutcome,
+      executionResult: pendingResult
+    });
+    // Persist the exact dispatch before an expensive post-click scan. A full
+    // navigation may destroy this document during that scan; the destination
+    // must still inherit the same leased action from the durable ledger.
+    await reportActionResult(pendingResult, { pageMap: afterMap, keepalive: true });
+    dispatchedStageExitReceipts.set(actionId, pendingResult);
+    if (dispatchedStageExitReceipts.size > 8) {
+      dispatchedStageExitReceipts.delete(dispatchedStageExitReceipts.keys().next().value);
+    }
+    return pendingResult;
+  }
+
+  async function holdDispatchedStageExit(actionId, observationId, decision, expectedOutcome, afterMap = {}) {
+    const pendingResult = await persistDispatchedStageExitReceipt(
+      actionId,
+      observationId,
+      decision,
+      expectedOutcome,
+      afterMap
     );
     pushActionLedger({
       actionId,
@@ -155,7 +238,6 @@ export function createExecutionOrchestrator({
       expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
       reobserveRetryToken: `stage_exit:${actionId}`
     });
-    await reportActionResult(pendingResult);
     logFlow("action.lifecycle.stage_exit_pending", {
       actionId,
       observationId,
@@ -231,8 +313,7 @@ export function createExecutionOrchestrator({
     const allowed = new Set([
       "options_surface_appeared",
       "active_surface_dismissed",
-      "active_surface_change",
-      "observable_change"
+      "active_surface_change"
     ]);
     if (!allowed.has(String(expected.type || ""))) return null;
 
@@ -257,7 +338,6 @@ export function createExecutionOrchestrator({
     if (expected.type === "options_surface_appeared") ok = overlayAppeared;
     else if (expected.type === "active_surface_dismissed") ok = overlayDismissed || progress?.ok === true;
     else if (expected.type === "active_surface_change") ok = overlayChanged || overlayDismissed || progress?.ok === true;
-    else if (expected.type === "observable_change") ok = overlayAppeared || overlayChanged || overlayDismissed || urlChanged;
     if (!ok) return null;
 
     return {
@@ -315,10 +395,9 @@ export function createExecutionOrchestrator({
       ? `${signature}::action:${actionLeaseId}`
       : signature;
     const now = Date.now();
-    const navigationLike = Boolean(decision && (
-      decision.interactionRole === "navigation"
-      || decision.semanticEffect === "advance"
-      || /navigate|advance|continue|next_stage/.test(String(decision.intent || decision.physicalEffect || "").toLowerCase())
+    const navigationLike = Boolean(decision && isGovernedStageExit(
+      decision,
+      decision.expectedOutcome || {}
     ));
     const sameSignature = dispatchSignature === agent.lastClickSignature;
     if (sameSignature) {
@@ -363,16 +442,68 @@ export function createExecutionOrchestrator({
   }
 
   function visibleValidationElement() {
-    return queryAllDeep("body *")
+    return queryAllDeep([
+      "input:invalid",
+      "select:invalid",
+      "textarea:invalid",
+      "[aria-invalid='true']",
+      "[role='alert']",
+      "[aria-live='assertive']",
+      ".validation-error",
+      ".field-error",
+      ".error-message"
+    ].join(", "))
       .filter((element) => isVisible(element) && !element.closest("#atw-sidebar"))
       .map((element) => {
-        const text = (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+        const text = (
+          element.validationMessage
+          || element.innerText
+          || element.textContent
+          || element.getAttribute?.("aria-label")
+          || ""
+        ).replace(/\s+/g, " ").trim();
+        if (element.matches?.(":invalid, [aria-invalid='true']")) {
+          return { element, text: text || "invalid control" };
+        }
         if (!text || text.length > 220) return null;
-        return /select one option|select an option|choose one option|please select|required|must enter|invalid|not valid|too long|too short/i.test(text)
+        return /select one option|select an option|choose one option|please select|required|must enter|invalid|not valid|too long|too short|error/i.test(text)
           ? { element, text }
           : null;
       })
       .filter(Boolean)[0] || null;
+  }
+
+  function lightweightStageExitPendingEvidence(element, beforeMap = {}) {
+    const busy = queryAllDeep(
+      "[aria-busy='true'], [role='progressbar'], progress, [data-loading='true'], .loading, .loader, .spinner"
+    ).some((candidate) => isVisible(candidate));
+    const documentLoading = document.readyState === "loading";
+    const urlChanged = Boolean(
+      beforeMap.url
+      && currentNavigationUrl() !== sanitizedNavigationUrl(beforeMap.url)
+    );
+    const targetDisabled = Boolean(
+      element?.disabled
+      || element?.getAttribute?.("aria-disabled") === "true"
+    );
+    const targetHiddenOrReplaced = Boolean(element && (!element.isConnected || !isVisible(element)));
+    const materialMutation = pageStateStore.isDirty();
+    const validation = visibleValidationElement();
+    const pending = !validation && (
+      documentLoading
+      || busy
+      || (materialMutation && (targetDisabled || targetHiddenOrReplaced))
+    );
+    return {
+      pending,
+      documentLoading,
+      busy,
+      urlChanged,
+      targetDisabled,
+      targetHiddenOrReplaced,
+      materialMutation,
+      validationText: validation?.text || ""
+    };
   }
 
   function shouldHoldDispatchedStageExit({
@@ -386,19 +517,27 @@ export function createExecutionOrchestrator({
       || readiness.ariaBusy === true
       || Number(readiness.loadingIndicatorCount || 0) > 0
       || readiness.loadingTextEvidence === true;
-    const dispatchedStageExit = [
-      "checkout_stage_advanced",
-      "current_surface_advanced",
-      "stage_exit_or_feedback"
-    ].includes(expectedOutcome.type)
-      || decision.interactionRole === "navigation"
-      || /advance_(?:checkout_)?stage|navigate_stage/.test(
-        `${decision.intent || ""} ${decision.semanticIntent || ""} ${decision.mechanicalEffect || ""}`
-      );
+    const dispatchedStageExit = isGovernedStageExit(decision, expectedOutcome);
     return advanced !== true
       && !(visibleBlockers || []).length
       && (positiveLoadingEvidence || dispatchedStageExit)
       && agent.running;
+  }
+
+  function isGovernedStageExit(decision = {}, expectedOutcome = {}) {
+    if (decision.interactionRole === "navigation") return true;
+    const exactMechanicalEffect = `${decision.mechanicalEffect || ""} ${decision.physicalEffect || ""}`.trim();
+    // An explicit local mechanical effect outranks a broad legacy intent or
+    // inferred postcondition. Revealing card fields is not page navigation.
+    if (exactMechanicalEffect) {
+      return /advance_(?:checkout_)?stage/.test(exactMechanicalEffect);
+    }
+    return [
+      "checkout_stage_advanced",
+      "current_surface_advanced",
+      "stage_exit_or_feedback"
+    ].includes(expectedOutcome.type)
+      || /advance_(?:checkout_)?stage/.test(String(decision.semanticIntent || ""));
   }
 
   async function clickAndVerifyAdvance(element, label = "Continue", delay = 1200, options = {}) {
@@ -435,7 +574,36 @@ export function createExecutionOrchestrator({
       action: governedDecision,
       targetFingerprint: targetFingerprint(element, governedDecision)
     });
+    const actionId = options.actionId || agent.activeExecutionActionId || nextFlowId("act");
+    const observationId = options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "";
+    await persistDispatchedStageExitReceipt(
+      actionId,
+      observationId,
+      governedDecision,
+      expectedOutcome,
+      beforeMap
+    );
     await waitForUiSettle(700);
+    const pendingEvidence = lightweightStageExitPendingEvidence(element, beforeMap);
+    if (pendingEvidence.pending) {
+      // A governed navigation was dispatched and the browser already exposes
+      // positive transition evidence. Do not deep-scan the disappearing
+      // source document and then rebuild the destination a second time. The
+      // durable destination lifecycle owns the next canonical observation.
+      logFlow("navigation.source_rescan_skipped", {
+        actionId,
+        observationId,
+        evidence: pendingEvidence
+      });
+      await holdDispatchedStageExit(
+        actionId,
+        observationId,
+        governedDecision,
+        expectedOutcome,
+        beforeMap
+      );
+      return false;
+    }
     const postActionObservation = await observePageStateAfterMutation("verify_advance", 900);
     let afterMap = postActionObservation.map;
     const verification = verifyExpectedOutcome(expectedOutcome, beforeMap, afterMap, element);
@@ -470,8 +638,6 @@ export function createExecutionOrchestrator({
       url: currentNavigationUrl(),
       verification
     });
-    const actionId = options.actionId || agent.activeExecutionActionId || nextFlowId("act");
-    const observationId = options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "";
     if (transitionPending && inferCheckoutSite() !== "demo") {
       await holdDispatchedStageExit(actionId, observationId, governedDecision, expectedOutcome, afterMap);
       return false;
@@ -541,6 +707,64 @@ export function createExecutionOrchestrator({
       risk: decision.risk,
       source: decision.source
     });
+    const mechanicalDecision = ["click", "type", "select", "keypress", "scroll", "click_xy"].includes(decision.action);
+    // Control-flow decisions are durable reducer outcomes, not DOM actions.
+    // Page churn cannot stale, rebind, or execute them through mechanics.
+    if (!mechanicalDecision) {
+      const message = decision.message || "I have a next action.";
+      if (!agent.messages.at(-1) || agent.messages.at(-1).text !== message) {
+        addAgentMessage("assistant", message);
+      }
+      if (decision.reason) setAgentActivity(message, decision.reason);
+      if (decision.fatalBackendFailure === true) {
+        agent.running = false;
+        agent.awaiting = "";
+        renderSidebar("agent");
+        return;
+      }
+      if (decision.action === "final_review") {
+        await persistControlFlowDecision(decision, actionId, actionObservationId);
+        agent.awaiting = "final";
+        agent.running = false;
+        resetAgentLoopLifecycle("card_entry_reached");
+        stopWatchingCheckoutChanges();
+        await clearResumeMarker();
+        clearExecutionContext();
+        renderSidebar("review");
+        return;
+      }
+      if (decision.risk !== "safe" && decision.needsApproval || decision.action === "ask_user") {
+        agent.running = false;
+        stopWatchingCheckoutChanges();
+        resetAgentLoopLifecycle("awaiting_user");
+        await persistControlFlowDecision(
+          decision.action === "ask_user" ? decision : { ...decision, action: "ask_user" },
+          actionId,
+          actionObservationId
+        );
+        agent.pendingInputRequest = decision.inputRequest || null;
+        agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "payment" ? "final" : "manual";
+        renderSidebar("agent");
+        return;
+      }
+      if (decision.action === "save_trip") {
+        await persistControlFlowDecision(decision, actionId, actionObservationId);
+        agent.awaiting = "";
+        agent.running = false;
+        renderSidebar("saved");
+        return;
+      }
+      if (decision.action === "stop") {
+        await settleStopDecision(decision, actionId, actionObservationId);
+        return;
+      }
+      if (decision.action === "wait") {
+        if (isDestinationReadinessDecision(decision)) beginDestinationWait(decision);
+        else await continueAfterAction(900);
+        return;
+      }
+    }
+
     await pageStateStore.waitForQuiet({ maxWaitMs: 260 });
     const preExecutionObservation = pageStateStore.observe({ reason: "pre_execution" });
     const freshMap = preExecutionObservation.map;
@@ -670,31 +894,48 @@ export function createExecutionOrchestrator({
       return;
     }
 
+    // final_review is an inert terminal notification. Its type already means
+    // the card-entry boundary was verified; the generic risk gate must never
+    // reinterpret that completed outcome as a payment approval request.
+    if (decision.action === "final_review") {
+      await persistControlFlowDecision(decision, actionId, actionObservationId);
+      agent.awaiting = "final";
+      agent.running = false;
+      resetAgentLoopLifecycle("card_entry_reached");
+      stopWatchingCheckoutChanges();
+      await clearResumeMarker();
+      clearExecutionContext();
+      renderSidebar("review");
+      return;
+    }
+
     if (decision.risk !== "safe" && decision.needsApproval) {
+      // Close the local executor before the durable write. A mutation watcher
+      // or queued turn must never observe the old `running` flag and schedule
+      // a second copy of the same question while this request is in flight.
+      agent.running = false;
+      stopWatchingCheckoutChanges();
+      resetAgentLoopLifecycle("awaiting_user");
       await persistControlFlowDecision({ ...decision, action: "ask_user" }, actionId, actionObservationId);
       agent.awaiting = decision.risk === "money" ? "extras" : decision.risk === "payment" ? "final" : "manual";
-      agent.running = false;
       renderSidebar("agent");
       return;
     }
 
     if (decision.action === "ask_user") {
+      // `ask_user` is a latched control-flow state, not an action that may be
+      // replanned on page churn. Stop every local producer before persisting
+      // it so one missing fact produces one question.
+      agent.running = false;
+      stopWatchingCheckoutChanges();
+      resetAgentLoopLifecycle("awaiting_user");
       await persistControlFlowDecision(decision, actionId, actionObservationId);
       agent.pendingInputRequest = decision.inputRequest || null;
       agent.awaiting = decision.risk === "money" ? "extras" : "manual";
-      agent.running = false;
       renderSidebar("agent");
       return;
     }
     agent.pendingInputRequest = null;
-
-    if (decision.action === "final_review") {
-      await persistControlFlowDecision(decision, actionId, actionObservationId);
-      agent.awaiting = "final";
-      agent.running = false;
-      renderSidebar("review");
-      return;
-    }
 
     if (decision.action === "save_trip") {
       await persistControlFlowDecision(decision, actionId, actionObservationId);
@@ -705,10 +946,7 @@ export function createExecutionOrchestrator({
     }
 
     if (decision.action === "stop") {
-      await persistControlFlowDecision(decision, actionId, actionObservationId);
-      agent.running = false;
-      agent.awaiting = "";
-      renderSidebar("agent");
+      await settleStopDecision(decision, actionId, actionObservationId);
       return;
     }
 
@@ -1056,6 +1294,10 @@ export function createExecutionOrchestrator({
       });
       const resolvedTargetId = elementId(target);
       const button = map.buttons.find((item) => item.id === decision.targetId || item.id === resolvedTargetId);
+      const canonicalControl = (map.controls || []).find((item) => (
+        item.controlId === decision.controlId
+        || item.controlId === decision.targetSnapshot?.controlId
+      )) || null;
       const surfaceEntry = currentSurfaceEntryForElement(map, target);
       const targetText = labelText(target) || target.innerText || button?.label || "";
       if (surfaceEntry?.risk === "paid") {
@@ -1065,10 +1307,20 @@ export function createExecutionOrchestrator({
         renderSidebar("agent");
         return;
       }
-      if (button?.risk === "payment" || isDangerousActionLabel(button?.label || "")) {
+      const canonicalEffect = String([
+        decision.mechanicalEffect,
+        decision.physicalEffect,
+        decision.targetSnapshot?.physicalEffect,
+        canonicalControl?.physicalEffect,
+        canonicalControl?.semantic
+      ].filter(Boolean).join(" ")).toLowerCase();
+      const canonicalPurchaseCommit = decision.risk === "payment"
+        || canonicalControl?.risk === "payment"
+        || /submit_purchase|enter_payment_credentials|confirm_purchase|complete_purchase|book_now|pay_now/.test(canonicalEffect);
+      if (canonicalPurchaseCommit) {
         agent.awaiting = "final";
         agent.running = false;
-        addAgentMessage("assistant", "I will not click payment or final booking buttons automatically on a real site.");
+        addAgentMessage("assistant", "I will not enter payment credentials or submit a purchase automatically.");
         renderSidebar("review");
         return;
       }
@@ -1098,13 +1350,18 @@ export function createExecutionOrchestrator({
         await continueAfterAction(500);
         return;
       }
-      if (button?.risk === "safe_continue") {
+      const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
+      // The canonical action contract owns lifecycle routing. A presentation
+      // button model may be missing or stale after framework rerenders, but it
+      // cannot demote a governed stage exit into an ordinary click whose
+      // dispatch receipt would be lost during cross-document navigation.
+      if (isGovernedStageExit(decision, expectedOutcome)) {
         await clickAndVerifyAdvance(target, button.label || "Continue", 1200, {
           actionId,
           observationId: actionObservationId,
           beforeMap: map,
           decision,
-          expectedOutcome: expectedOutcomeForDecision(decision, map, target)
+          expectedOutcome
         });
         return;
       }
@@ -1114,7 +1371,6 @@ export function createExecutionOrchestrator({
       // bounded live probe can prove that a new modal/listbox appeared.
       const beforeOverlay = surfaceWasActive ? activeOverlayElements()[0] : null;
       const beforeOverlaySignature = beforeOverlay ? overlaySignature(beforeOverlay) : "";
-      const expectedOutcome = expectedOutcomeForDecision(decision, map, target);
       showAgentCursor(target, button?.label || "clicking");
       flashElement(target);
       rememberChoiceVisualStateBeforeDispatch(target, decision);

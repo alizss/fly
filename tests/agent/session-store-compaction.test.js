@@ -189,13 +189,74 @@ test("the ledger returns only the durable result for the currently leased action
   store.close();
 });
 
+test("lifecycle status cannot overwrite the canonical browser result across a document restart", () => {
+  const store = createStore({ dbPath: ":memory:" });
+  const browserResult = {
+    actionId: "action_cross_document_confirm",
+    observationId: "observation_payment_review",
+    dispatched: true,
+    executed: true,
+    verified: false,
+    failureCode: "NAVIGATION_TRANSITION_PENDING",
+    actionOutcome: {
+      contractVersion: "action-outcome/v1",
+      status: "DESTINATION_LOADING",
+      causedByActionId: "action_cross_document_confirm",
+      exactPostconditionSatisfied: false,
+      code: "NAVIGATION_TRANSITION_PENDING"
+    }
+  };
+  const state = withExecutionFixture(createCheckoutSessionState({ goal: "Reach card entry" }), {
+    leasedAction: leasedActionRecord({
+      action: {
+        id: browserResult.actionId,
+        type: "click",
+        observationId: browserResult.observationId,
+        observationHash: "hash_payment_review",
+        intent: "navigate_stage",
+        mechanicalEffect: "advance_checkout_stage",
+        controlId: "confirm"
+      }
+    })
+  });
+  store.saveSession(state);
+  store.recordObservation(state.id, {
+    observationId: browserResult.observationId,
+    observationSnapshot: { snapshotHash: "hash_payment_review" },
+    page: { url: "https://example.test/payment-review", step: "payment" }
+  }, { updateSession: false });
+  store.reserveGovernedAction({
+    transactionId: state.id,
+    observationId: browserResult.observationId,
+    observationHash: "hash_payment_review",
+    action: { id: browserResult.actionId, type: "click", controlId: "confirm" }
+  });
+  store.recordActionResult(state.id, browserResult);
+
+  assert.equal(store.advanceGovernedAction(
+    browserResult.actionId,
+    ["dispatched"],
+    "waiting_for_destination"
+  ), true);
+  assert.equal(store.getGovernedAction(browserResult.actionId).status, "waiting_for_destination");
+  assert.deepEqual(store.getPendingActionResult(store.getSession(state.id)), browserResult);
+  assert.equal(store.advanceGovernedAction(
+    browserResult.actionId,
+    ["waiting_for_destination"],
+    "verified"
+  ), true);
+  assert.equal(store.getGovernedAction(browserResult.actionId).status, "verified");
+  assert.deepEqual(store.getGovernedAction(browserResult.actionId).result, browserResult);
+  store.close();
+});
+
 test("one durable execution episode replaces parallel lifecycle and recovery copies", () => {
   const state = withExecutionFixture(withUpdate(createCheckoutSessionState({ goal: "Reach payment review" }), {
     taskState: {
       stage: "extras",
       currentObligation: {
-        contractVersion: "current-obligation/v2",
-        obligationId: "obligation_skip_bags",
+        contractVersion: "current-obligation/v3",
+        id: "obligation_skip_bags",
         mechanics: { candidateControlIds: ["skip_bags"], legacyGoalGraph: { large: true } }
       }
     }

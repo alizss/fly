@@ -1,4 +1,5 @@
 export function createAgentLifecycle({
+  DESTINATION_MUTATION_SETTLE_MS,
   DESTINATION_RETRY_INTERVAL_MS,
   DESTINATION_WAIT_TIMEOUT_MS,
   addAgentMessage,
@@ -26,6 +27,7 @@ export function createAgentLifecycle({
     if (decision.action !== "wait") return false;
     const intent = `${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase();
     return /wait_for_ready_observation|wait_for_dispatched_stage_exit|reobserve_after_transient_observation|reobserve_degraded_loading_destination/.test(intent)
+      || /await_pending_action_result/.test(intent)
       || (decision.expectedPostconditions || []).some((postcondition) => (
         postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
       ));
@@ -69,7 +71,7 @@ export function createAgentLifecycle({
     const existing = agent.destinationWait;
     const backendStartedAt = Number(decision.readinessStartedAt || 0);
     const backendDeadlineAt = Number(decision.readinessDeadlineAt || 0);
-    const dispatchedStageExitWait = /wait_for_dispatched_stage_exit/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
+    const dispatchedStageExitWait = /wait_for_dispatched_stage_exit|await_pending_action_result/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
     const retryToken = String(decision.reobserveRetryToken || "");
     agent.destinationWait = {
       status: "WAITING_FOR_DESTINATION",
@@ -102,6 +104,13 @@ export function createAgentLifecycle({
       backendWaits: agent.destinationWait.backendWaits,
       deadlineAt: new Date(agent.destinationWait.deadlineAt).toISOString()
     });
+    // The wait object owns its deadline wake.  If this is entered during an
+    // active loop, finishAgentLoop consumes the durable wake request; if it is
+    // entered outside a loop, the deadline is armed immediately.
+    scheduleDestinationObservation(
+      "readiness_deadline",
+      Math.max(0, agent.destinationWait.deadlineAt - now)
+    );
     return agent.destinationWait;
   }
 
@@ -151,6 +160,11 @@ export function createAgentLifecycle({
       });
       processCheckoutAgent();
     }, boundedDelay);
+    logFlow("destination_wait.scheduled", {
+      reason,
+      delayMs: boundedDelay,
+      deadlineAt: new Date(wait.deadlineAt).toISOString()
+    });
     return true;
   }
 
@@ -189,6 +203,18 @@ export function createAgentLifecycle({
     agent.loopBusy = false;
     agent.activeLoopRunId = 0;
     agent.loopRerunQueued = false;
+    if (agent.destinationWait?.status === "WAITING_FOR_DESTINATION") {
+      const wait = agent.destinationWait;
+      const materialWakePending = wait.wakeRequested === true
+        && wait.lastWakeReason === "dom_mutation";
+      scheduleDestinationObservation(
+        materialWakePending ? "dom_mutation" : "readiness_deadline",
+        materialWakePending
+          ? DESTINATION_MUTATION_SETTLE_MS
+          : Math.max(0, wait.deadlineAt - Date.now())
+      );
+      return false;
+    }
     return shouldRerun;
   }
 

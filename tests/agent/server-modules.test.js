@@ -11,6 +11,7 @@ const { createStaticHandler } = require("../../apps/web/http/static");
 const { createAgentRoutes } = require("../../apps/web/routes/agent");
 const { createScreenshotStore } = require("../../apps/web/agent/screenshot-store");
 const { createRequestPayloadAdapter } = require("../../apps/web/agent/request-payload");
+const { createNextActionService } = require("../../apps/web/agent/next-action-service");
 const {
   summarizeActionLedgerRow,
   summarizeClientFlowLog
@@ -107,6 +108,98 @@ test("agent route rejects planning without replacing the durable session", async
   assert.equal(res.status, 409);
   assert.equal(JSON.parse(res.body).code, "DURABLE_SESSION_REQUIRED");
   assert.equal(timings.at(-1).outcome, "durable_session_required");
+});
+
+test("next-action joins a compact browser receipt to its durable governed action", async () => {
+  const governedAction = {
+    id: "act_compact_country",
+    type: "click",
+    operation: "select",
+    controlId: "ctrl_country",
+    targetLabel: "Turkey",
+    pipelineContract: {
+      expectedOutcome: {
+        type: "logical_component_committed",
+        controlId: "ctrl_country",
+        expectedCanonicalValue: "tr"
+      }
+    }
+  };
+  const compactReceipt = {
+    actionId: governedAction.id,
+    observationId: "obs_country_before",
+    resultObservationHash: "hash_country_after",
+    dispatched: true,
+    executed: true,
+    verified: true,
+    expectedOutcomeObserved: true,
+    postconditionSatisfied: true,
+    failureCode: "",
+    actionOutcome: {
+      contractVersion: "action-outcome/v1",
+      status: "SATISFIED",
+      causedByActionId: governedAction.id,
+      exactPostconditionSatisfied: true,
+      code: "LOGICAL_COMPONENT_COMMITTED"
+    }
+  };
+  let loopObservation = null;
+  const state = {
+    id: "chk_compact_receipt",
+    goal: "Reach card entry",
+    travelerId: "trav_compact_receipt",
+    userPolicy: {},
+    approvals: {},
+    site: {},
+    stallCount: 0
+  };
+  const service = createNextActionService({
+    agentLoop: {
+      runLoopTurn: async ({ observation }) => {
+        loopObservation = observation;
+        return {
+          state,
+          clientDecision: { action: "wait", actionId: "", reason: "test complete" },
+          debug: { deterministic: true, latency: {}, modelUsage: {} }
+        };
+      }
+    },
+    agentSessionStore: {
+      getSession: () => state,
+      getObservation: () => null,
+      getPendingActionResult: () => null,
+      getGovernedAction: (actionId) => actionId === governedAction.id
+        ? { action: governedAction }
+        : null,
+      recordObservation: () => null
+    },
+    compactAgentPayload: (body) => body,
+    createAgentLoopFailure: (error) => error,
+    dataDir: "",
+    logAgent: () => {},
+    model: "test-model",
+    openAiApiKey: "",
+    recoveryModel: "test-model"
+  });
+
+  await service.decideAgentNextActionViaLoop({
+    sessionId: state.id,
+    clientTurnId: "turn_compact_receipt",
+    observationId: "obs_country_after",
+    observationSnapshot: { snapshotHash: "hash_country_after" },
+    page: { site: "gateway.test", url: "https://gateway.test/pay", step: "traveler_information" },
+    traveler: { id: state.travelerId },
+    approvalState: {},
+    lastActionResult: compactReceipt
+  });
+
+  assert.deepEqual(loopObservation.lastActionResult.action, governedAction);
+  assert.deepEqual(
+    loopObservation.lastActionResult.expectedOutcome,
+    governedAction.pipelineContract.expectedOutcome
+  );
+  assert.equal(loopObservation.lastActionResult.actionOutcome, compactReceipt.actionOutcome);
+  assert.equal(compactReceipt.action, undefined);
 });
 
 test("screenshot references remain bounded to their durable session and observation", () => {

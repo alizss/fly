@@ -21,7 +21,6 @@ const {
 } = require("./action-semantics");
 const agentContract = require("../../extension/src/shared/agent-contract");
 const { currentObligation } = require("./authority-frames");
-const { obligationField } = require("./current-obligation");
 
 const DOM_MUTATIONS = new Set(["click", "type", "select", "keypress"]);
 const COMPOUND_MUTATIONS = new Set(["fill_known_fields", "fill_visible_profile_fields"]);
@@ -54,7 +53,7 @@ const RECOVERABLE_GROUNDING_CODES = new Set([
 ]);
 
 function taskMechanics(taskState = {}) {
-  return currentObligation(taskState) || {};
+  return currentObligation(taskState);
 }
 
 function fail(code, reason, checks = [], decision = "blocked_by_safety") {
@@ -133,9 +132,9 @@ function canonicalActionSurfaceId(action = {}) {
   return String(action.targetSnapshot?.surfaceId || "");
 }
 
-function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, checks = [], preparedCandidateSet = null) {
+function currentWorkCandidateFailure(action = {}, state = {}, observation = {}, checks = [], preparedCandidateSet = null) {
   const goal = taskMechanics(state.taskState || {});
-  if (!obligationField(goal, "goalId") || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
+  if (!(goal?.id) || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
   // An action with no candidate claim is an ownership violation. Let the
   // ownership check below report that precise prerequisite error; candidate
   // exactness applies once a candidateId is actually presented.
@@ -173,7 +172,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
       && actionAffordance.actuator?.proven === true
       && isDeepStrictEqual(candidateAffordance, actionAffordance);
   const exact = Boolean(candidate)
-    && action.obligationId === obligationField(goal, "goalId")
+    && action.obligationId === (goal?.id)
     && candidate.type === action.type
     && candidate.operation === action.operation
     && candidate.controlId === action.controlId
@@ -190,7 +189,7 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
     && isDeepStrictEqual(action.pipelineContract || null, candidate.pipelineContract || null);
   if (!exact) {
     const mismatchFields = !candidate ? ["candidate"] : [
-      ["obligationId", action.obligationId, obligationField(goal, "goalId")],
+      ["obligationId", action.obligationId, (goal?.id)],
       ["type", action.type, candidate.type],
       ["operation", action.operation, candidate.operation],
       ["controlId", action.controlId, candidate.controlId],
@@ -209,78 +208,28 @@ function currentGoalCandidateFailure(action = {}, state = {}, observation = {}, 
       checks
     );
   }
+  const requiredDelta = goal.desiredStateDelta || goal.delta || null;
+  if (!requiredDelta?.deltaId || action.desiredStateDelta?.deltaId !== requiredDelta.deltaId) {
+    return recoverable(
+      "ACTION_DESIRED_STATE_DELTA_MISMATCH",
+      "Every mutation must carry the exact DesiredStateDelta published by the current obligation.",
+      checks
+    );
+  }
   pass(checks, "CURRENT_GOAL_CANDIDATE_EXACT", candidate.candidateId);
   return null;
 }
 
-function currentGoalOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
+function currentWorkOwnershipFailure(action = {}, state = {}, page = {}, checks = []) {
   const goal = taskMechanics(state.taskState || {});
-  if (!obligationField(goal, "goalId") || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
-  if (action.candidateId && action.obligationId === obligationField(goal, "goalId")) return null;
+  if (!(goal?.id) || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
+  if (action.candidateId && action.obligationId === (goal?.id)) return null;
   const control = canonicalControlForAction(action, page) || {};
   return fail(
     "CURRENT_GOAL_UNRESOLVED",
-    `The current semantic goal ${obligationField(goal, "label") || obligationField(goal, "semanticType")}=${obligationField(goal, "desiredValue")} must complete or exhaust its finite recovery budget before ${control.label || action.targetLabel || action.intent || action.type}.`,
+    `The current semantic goal ${String(goal?.semanticOwner?.family || goal?.desiredStateDelta?.kind || "unknown").replace(/_/g, " ")}=${goal?.desiredStateDelta?.desiredValue} must complete or exhaust its finite recovery budget before ${control.label || action.targetLabel || action.intent || action.type}.`,
     checks
   );
-}
-
-function adaptiveEnvelopeFailure(action = {}, state = {}, observation = {}, checks = []) {
-  const goal = taskMechanics(state.taskState || {});
-  if (!["adaptive_surface", "adaptive_interaction"].includes(obligationField(goal, "kind"))
-    || (!DOM_MUTATIONS.has(action.type) && action.type !== "click_xy")) return null;
-  const envelope = obligationField(goal, "adaptiveEnvelope") || {};
-  const observationSurfaceId = currentObservationSurfaceId(observation);
-  const targetSurfaceId = canonicalActionSurfaceId(action);
-  if (!observationSurfaceId
-    || envelope.surfaceId !== observationSurfaceId
-    || targetSurfaceId !== observationSurfaceId) {
-    return recoverable(
-      "ADAPTIVE_SURFACE_CHANGED",
-      "The bounded adaptive episode may act only on the exact foreground surface that created it.",
-      checks
-    );
-  }
-  if (Number(envelope.remainingSteps || 0) <= 0 || Number(envelope.deadlineAt || 0) <= Date.now()) {
-    return fail(
-      "ADAPTIVE_EPISODE_EXHAUSTED",
-      "The bounded adaptive episode exhausted its step or time budget before a verified result.",
-      checks
-    );
-  }
-  if (!(envelope.allowedOperations || []).includes(action.operation)) {
-    return fail(
-      "ADAPTIVE_OPERATION_FORBIDDEN",
-      `The adaptive envelope does not authorize ${action.operation || action.type}.`,
-      checks
-    );
-  }
-  const risk = String(action.risk || action.targetSnapshot?.risk || "uncertain").toLowerCase();
-  if ((envelope.forbiddenRisks || []).some((item) => risk === String(item).toLowerCase())) {
-    return fail("ADAPTIVE_RISK_FORBIDDEN", `The adaptive envelope forbids ${risk} actions.`, checks);
-  }
-  const effect = [
-    action.mechanicalEffect,
-    action.mechanicalEffect,
-    action.intent,
-    action.intent,
-    action.targetSnapshot?.semantic
-  ].filter(Boolean).join(" ").toLowerCase();
-  const profileChildSurface = obligationField(goal, "kind") === "adaptive_surface";
-  if ((envelope.forbiddenEffects || []).some((item) => effect.includes(String(item).toLowerCase()))
-    || (profileChildSurface && action.intent === "navigate_stage")
-    || (profileChildSurface && action.interactionRole === "navigation")
-    || /payment|purchase|card|accept[_ ]legal|legal[_ ]consent|select[_ ]paid|add[_ ]paid/.test(effect)) {
-    return fail(
-      "ADAPTIVE_EFFECT_FORBIDDEN",
-      profileChildSurface
-        ? "The profile-surface episode cannot navigate checkout, add money, accept legal terms, or touch payment."
-        : "The adaptive interaction cannot add money, accept legal terms, alter the itinerary, or touch payment.",
-      checks
-    );
-  }
-  pass(checks, "ADAPTIVE_ENVELOPE_VALID", `${envelope.episodeId}:${envelope.remainingSteps}`);
-  return null;
 }
 
 function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, checks = []) {
@@ -295,8 +244,13 @@ function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, c
     action.intent,
     action.targetSnapshot?.semantic
   ].filter(Boolean).join(" ").toLowerCase();
+  const profileDiscovery = goal?.desiredStateDelta?.kind === "profile_field";
+  const ownedChoiceDiscovery = goal?.desiredStateDelta?.status === "EXACT_DELTA"
+    && goal?.desiredStateDelta?.desiredState === "options_surface_visible"
+    && goal?.desiredStateDelta?.desiredEffect === "open"
+    && (goal?.admittedControlIds || []).includes(action.controlId);
   if (
-    obligationField(goal, "kind") !== "profile_field"
+    (!profileDiscovery && !ownedChoiceDiscovery)
     || envelope.kind !== "pre_surface_discovery"
     || action.candidateClass !== "mechanical_hypothesis"
     || action.boundedRecovery !== true
@@ -304,7 +258,7 @@ function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, c
   ) {
     return fail(
       "DISCOVERY_CONTRACT_INVALID",
-      "A pre-surface hypothesis requires the exact profile goal and bounded discovery contract that created it.",
+      "A pre-surface hypothesis requires the exact owned choice goal and bounded discovery contract that created it.",
       checks
     );
   }
@@ -340,11 +294,11 @@ function preSurfaceDiscoveryFailure(action = {}, state = {}, observation = {}, c
     risk !== "safe"
     || (envelope.forbiddenRisks || []).includes(risk)
     || (envelope.forbiddenEffects || []).some((item) => effect.includes(String(item).toLowerCase()))
-    || /payment|purchase|booking|paid|price|legal|terms|consent|subscribe|navigate|advance/.test(effect)
+    || /purchase|booking|submit[_ ]?payment|pay[_ ]?now|paid|price|legal|terms|consent|subscribe|navigate|advance/.test(effect)
   ) {
     return fail(
       "DISCOVERY_EFFECT_FORBIDDEN",
-      "Pre-surface discovery cannot navigate, add money, accept consent, or touch payment.",
+      "Pre-surface discovery cannot navigate, add money, accept consent, or submit payment.",
       checks
     );
   }
@@ -624,7 +578,7 @@ function governAction({
     `${graphConflicts.actionable.length} unrelated actionable conflict(s); ${graphConflicts.diagnostic.length} diagnostic conflict(s) preserved`
   );
 
-  const goalCandidateFailure = currentGoalCandidateFailure(
+  const goalCandidateFailure = currentWorkCandidateFailure(
     action,
     state,
     observation,
@@ -638,18 +592,10 @@ function governAction({
       state
     });
   }
-  const goalOwnershipFailure = currentGoalOwnershipFailure(action, state, observation.page || {}, checks);
+  const goalOwnershipFailure = currentWorkOwnershipFailure(action, state, observation.page || {}, checks);
   if (goalOwnershipFailure) {
     return denied({
       ...goalOwnershipFailure,
-      action,
-      state
-    });
-  }
-  const adaptiveFailure = adaptiveEnvelopeFailure(action, state, observation, checks);
-  if (adaptiveFailure) {
-    return denied({
-      ...adaptiveFailure,
       action,
       state
     });
@@ -717,8 +663,8 @@ function governAction({
 
   if (DOM_MUTATIONS.has(action.type) || action.type === "click_xy") {
     const goal = taskMechanics(state.taskState || {});
-    const contract = obligationField(goal, "outcomeContract") || outcomeContractForGoal(goal, observation);
-    const parentContract = state.taskState?.stageOutcome?.outcomeContract || obligationField(goal, "parentOutcomeContract") || contract;
+    const contract = (goal?.successCondition) || outcomeContractForGoal(goal, observation);
+    const parentContract = contract;
     const explicitMechanicalEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || "";
     const mechanicalEffect = explicitMechanicalEffect || predictPhysicalEffect({
       semantics: normalizedActionSemantics(action, { control: action.targetSnapshot || {}, goal, expectedOutcome: action.expectedOutcome }),
@@ -831,7 +777,17 @@ function governAction({
     approveActionLifecycle(executionEpisodeFor(state))
   );
   record("governed", { result: { ok: true, code: "ALLOWED", checks } });
-  return { allow: true, decision: "allowed", code: "ALLOWED", reason: policy.reason, checks, action, state, policy };
+  return {
+    allow: true,
+    decision: "allowed",
+    code: "ALLOWED",
+    reason: policy.reason,
+    checks,
+    action,
+    state,
+    policy,
+    governorDecisionId: `governor:${action.id}:${observation.observationId}:${policy.authorization?.authorizationId || "routine"}`
+  };
 }
 
 module.exports = {
@@ -839,10 +795,9 @@ module.exports = {
   __private: {
     canonicalControlForAction,
     canonicalActionSurfaceId,
-    currentGoalCandidateFailure,
+    currentWorkCandidateFailure,
     currentObservationSurfaceId,
-    currentGoalOwnershipFailure,
-    adaptiveEnvelopeFailure,
+    currentWorkOwnershipFailure,
     preSurfaceDiscoveryFailure,
     validateCanonicalTarget,
     validateVisualFallback

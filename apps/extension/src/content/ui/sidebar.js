@@ -25,6 +25,12 @@ export function createSidebarUi({
   function warningHtml(dormant = false) {
     if (dormant) return "<p class='atw-muted'>Risk checks begin after Start.</p>";
     const currentWarnings = getWarnings();
+    // Rendering is presentation-only. During an active checkout, the
+    // observation loop owns page reads and publishes warnings; the sidebar
+    // must not crawl a still-hydrating document merely to paint itself.
+    if (!currentWarnings.length && agent.running) {
+      return "<p class='atw-muted'>Risk checks update after the current page observation.</p>";
+    }
     const list = currentWarnings.length ? currentWarnings : runRiskChecks();
     if (!list.length) return "<p class='atw-muted'>No booking risks detected.</p>";
     return list.map((warning) => `
@@ -155,7 +161,7 @@ export function createSidebarUi({
     const captured = segments.length > 0 && segments.every((segment) => (
       segment.origin && segment.destination && segment.departureDate
     ));
-    const route = captured ? diagnosticRoute(facts) : "missing";
+    const route = captured ? diagnosticRoute(facts) : "collecting";
     const dates = captured
       ? segments.map((segment) => segment.departureDate).filter(Boolean).join(" · ")
       : "departure date unavailable";
@@ -163,13 +169,27 @@ export function createSidebarUi({
       ? "captured before session"
       : captured
         ? "durable baseline"
-        : "not acquired";
-    return `<div class="atw-map-line">Selected booking: <strong>${captured ? "captured" : "missing"}</strong> · ${escapeHtml(route)} · ${escapeHtml(dates)} · ${escapeHtml(source)}</div>`;
+        : "current checkout";
+    return `<div class="atw-map-line">Checkout baseline: <strong>${captured ? "captured" : "collecting"}</strong> · ${escapeHtml(route)} · ${escapeHtml(dates)} · ${escapeHtml(source)}</div>`;
   }
 
   // Sidebar is logs-only by design: it starts the agent and shows what it's doing
   // (section checklist, reasoning log). Anything that needs the user's input is
   // asked on the page itself, next to the AI cursor — see cursorPromptHtml().
+  function sidebarPageMap() {
+    return agent.pageMap || pageStateStore.current() || {
+      site: location.host,
+      step: "loading_checkout",
+      sections: [],
+      summary: {
+        fields: 0,
+        knownFields: 0,
+        buttons: 0,
+        paidChoices: 0
+      }
+    };
+  }
+
   function agentChatHtml(dormant = false) {
     if (dormant) {
       return `
@@ -180,7 +200,7 @@ export function createSidebarUi({
         ${selectedBookingAcquisitionHtml()}
       `;
     }
-    const map = agent.pageMap || pageStateStore.observe({ reason: "sidebar_render" }).map;
+    const map = sidebarPageMap();
     return `
       ${agentStatusHtml(map)}
       <div class="atw-map-line">Reading ${map.site}: ${map.step.replace(/_/g, " ")} · ${map.summary.knownFields}/${map.summary.fields} fields · ${map.summary.paidChoices} paid areas</div>
@@ -401,7 +421,12 @@ export function createSidebarUi({
   function renderSidebar(mode = "ready") {
     const t = traveler();
     const dormant = mode === "ready" && !agent.running && !agent.pageMap;
-    const detected = dormant || bookingDetected();
+    // Cached/running state is sufficient to render. Booking detection is an
+    // expensive page scan and is only needed before the first checkout start.
+    const detected = agent.running
+      || Boolean(agent.pageMap || pageStateStore.current())
+      || dormant
+      || bookingDetected();
     const root = document.getElementById("atw-sidebar") || document.createElement("aside");
     root.id = "atw-sidebar";
     root.innerHTML = `
@@ -428,7 +453,7 @@ export function createSidebarUi({
           <button class="atw-primary" id="atw-takeover" ${detected && !agent.running ? "" : "disabled"}>Start agent</button>
           <button id="atw-observe-only" ${detected ? "" : "disabled"}>Observe page (no actions) [TEMP]</button>
         </div>
-        ${!agent.running ? `<div class="atw-mini-note">Start confirms the selected itinerary and currently displayed total as Fly's checkout baseline. Fly will stop before purchase.</div>` : ""}
+        ${!agent.running ? `<div class="atw-mini-note">Start binds Fly to this checkout and traveler. Visible trip facts are preserved as they appear. Fly stops at card entry.</div>` : ""}
         ${mode === "observer" ? `
           <div class="atw-observer">
             ${observerTabsHtml()}

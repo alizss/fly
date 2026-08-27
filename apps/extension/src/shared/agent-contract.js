@@ -45,12 +45,12 @@
   });
   // One cross-runtime result vocabulary for an attempted action. Browser
   // mechanics may expose richer local evidence, but all recovery and TaskState
-  // consumers must reason from one of these six outcomes.
+  // consumers must reason from one of these five exact local outcomes.
   const ACTION_OUTCOME = Object.freeze({
     SATISFIED: "SATISFIED",
-    PROGRESSED: "PROGRESSED",
     REVEALED_BLOCKER: "REVEALED_BLOCKER",
     NO_EFFECT: "NO_EFFECT",
+    NO_RESULT: "NO_RESULT",
     UNSAFE_CHANGE: "UNSAFE_CHANGE",
     DESTINATION_LOADING: "DESTINATION_LOADING"
   });
@@ -182,28 +182,20 @@
       ...(Array.isArray(input.candidateOwnerControlIds) ? input.candidateOwnerControlIds : []),
       ...introducedValidation.map((issue) => issue?.controlId)
     ].map((value) => String(value || "").trim()).filter(Boolean))];
-    const directStatus = Object.values(ACTION_OUTCOME).includes(input.status) ? input.status : "";
-    const legacy = String(input.legacyStatus || (!directStatus ? input.status : "") || "").toLowerCase();
-    let status = ACTION_OUTCOME.NO_EFFECT;
-    if (directStatus) {
-      status = directStatus;
-    } else if (input.destinationLoading === true || ["destination_loading", "waiting_for_destination"].includes(legacy)) {
-      status = ACTION_OUTCOME.DESTINATION_LOADING;
-    } else if (input.unsafe === true || ["unsafe", "blocked"].includes(legacy) && input.revealedBlocker !== true) {
-      status = ACTION_OUTCOME.UNSAFE_CHANGE;
-    } else if (input.revealedBlocker === true || introducedValidation.length > 0) {
-      status = ACTION_OUTCOME.REVEALED_BLOCKER;
-    } else if (input.satisfied === true && introducedValidation.length === 0) {
-      status = ACTION_OUTCOME.SATISFIED;
-    } else if (input.satisfied === true || legacy === "achieved") {
-      status = ACTION_OUTCOME.SATISFIED;
-    } else if (input.progressed === true || legacy === "progressed") {
-      status = ACTION_OUTCOME.PROGRESSED;
-    }
+    // Producers must publish one explicit vocabulary value. This compiler is
+    // a serializer, not another outcome interpreter; legacy flags such as
+    // `satisfied`, `progressed`, generic diffs, or backend status names may
+    // never manufacture a browser result.
+    const status = Object.values(ACTION_OUTCOME).includes(input.status)
+      ? input.status
+      : ACTION_OUTCOME.NO_RESULT;
     return Object.freeze({
       contractVersion: "action-outcome/v1",
       status,
       causedByActionId: String(input.causedByActionId || input.actionId || "").trim(),
+      exactPostconditionSatisfied: status === ACTION_OUTCOME.SATISFIED,
+      code: String(input.code || input.outcomeCode || status).trim().slice(0, 160),
+      observedEvidence: Object.freeze(cloneSerializable(input.observedEvidence || {})),
       originalSuccessContract: cloneSerializable(input.originalSuccessContract || null),
       introducedValidation: Object.freeze(introducedValidation),
       candidateOwnerControlIds: Object.freeze(candidateOwnerControlIds),
@@ -214,7 +206,7 @@
         priceChanged: input.priceChanged === true,
         transactionChanged: input.transactionChanged === true
       }),
-      // An action instance is single-use. PROGRESSED/SATISFIED rebuild from
+      // An action instance is single-use. SATISFIED rebuilds from
       // fresh state; blocker/no-effect/unsafe outcomes must choose a distinct
       // resolution. Loading is the only state that can await the destination.
       repeatProhibited: status !== ACTION_OUTCOME.DESTINATION_LOADING
@@ -273,8 +265,18 @@
     const state = control.state || control.controlState || {};
     return Object.freeze({
       name: String(control.name || ""),
-      label: String(control.label || control.accessibleName || ""),
+      label: String(control.label || ""),
+      accessibleName: String(control.accessibleName || control.ariaLabel || ""),
+      autocomplete: String(control.autocomplete || ""),
+      placeholder: String(control.placeholder || ""),
+      accessibleDescription: String(control.accessibleDescription || ""),
+      helper: String(control.helperText || control.description || ""),
       heading: String(control.heading || control.sectionHeading || ""),
+      constraints: Object.freeze({
+        inputType: String(control.inputType || control.type || ""),
+        inputMode: String(control.inputMode || ""),
+        pattern: String(control.pattern || "")
+      }),
       section: Object.freeze({
         id: String(control.sectionId || ""),
         type: String(control.sectionType || ""),
@@ -287,11 +289,8 @@
       }),
       relationships: cloneSerializable({
         decisionGroupId: control.decisionGroupId || "",
-        logicalFieldId: control.logicalFieldId || "",
         stateElementId: control.stateElementId || "",
-        preferredActivationElementId: control.preferredActivationElementId || "",
-        semanticOwnership: control.semanticOwnership || null,
-        validationOwnership: control.validationOwnership || null
+        preferredActivationElementId: control.preferredActivationElementId || ""
       })
     });
   }
@@ -859,6 +858,65 @@
     };
   }
 
+  function boundedDecisionPriceEvidence(page = {}, alternatives = [], controlsById = new Map()) {
+    const descriptors = alternatives.map((alternative) => {
+      const control = controlsById.get(alternative.controlId) || {};
+      return selectionCtaDescriptor(control) || {
+        command: "select",
+        optionName: normalizedText(alternative.label || control.label),
+        label: normalizedText(control.label || alternative.label)
+      };
+    });
+    let evidence = alternatives.map((alternative, index) => {
+      const control = controlsById.get(alternative.controlId) || {};
+      const localText = optionEvidenceFromPage(page, descriptors[index], descriptors, index);
+      const explicitlyIncluded = /\b(?:included|no extra (?:cost|charge)|at no extra (?:cost|charge))\b/i.test(localText)
+        || /\b0(?:[.,]0{1,2})?\s*(?:eur|usd|gbp|try|tl|€|\$|£|₺)\b/i.test(localText);
+      const incremental = priceFrom(alternative.structuredPrice || control.structuredPrice)
+        || signedPriceFromText(localText)
+        || (explicitlyIncluded ? { amount: 0, currency: "" } : null);
+      const absolute = !incremental && !explicitlyIncluded
+        ? absolutePriceNearOption(localText, descriptors[index].optionName)
+        : null;
+      return {
+        controlId: alternative.controlId,
+        structuredPrice: incremental,
+        absolute,
+        included: explicitlyIncluded || incremental?.amount === 0,
+        canonicalAttributes: {
+          ...canonicalAttributesFromEvidence(localText),
+          ...(absolute ? {
+            displayedTotal: absolute.amount,
+            displayedTotalCurrency: absolute.currency,
+            priceBasis: "absolute_total"
+          } : {})
+        }
+      };
+    });
+    const absoluteTotals = evidence.map((entry) => entry.absolute);
+    const currencies = new Set(absoluteTotals.map((price) => price?.currency).filter(Boolean));
+    if (absoluteTotals.length >= 2 && absoluteTotals.every(Boolean) && currencies.size === 1) {
+      const baseline = Math.min(...absoluteTotals.map((price) => price.amount));
+      if (absoluteTotals.filter((price) => price.amount === baseline).length === 1) {
+        evidence = evidence.map((entry) => ({
+          ...entry,
+          structuredPrice: {
+            amount: Math.round((entry.absolute.amount - baseline) * 100) / 100,
+            currency: entry.absolute.currency
+          },
+          included: entry.absolute.amount === baseline
+        }));
+      }
+    }
+    const knownCurrencies = [...new Set(evidence.map((entry) => entry.structuredPrice?.currency).filter(Boolean))];
+    if (knownCurrencies.length === 1) {
+      evidence = evidence.map((entry) => entry.structuredPrice && !entry.structuredPrice.currency
+        ? { ...entry, structuredPrice: { ...entry.structuredPrice, currency: knownCurrencies[0] } }
+        : entry);
+    }
+    return evidence;
+  }
+
   function subjectFromEvidence(value = "") {
     const evidence = normalizedText(value).toLowerCase();
     // Exact product nouns outrank generic commercial tier words. A seat
@@ -956,7 +1014,7 @@
     };
   }
 
-  function reconstructSelectionCtaGroups(page = {}, controls = []) {
+  function boundedRepeatedChoiceGroups(page = {}, controls = []) {
     const candidates = controls
       .map((control) => ({ control, descriptor: selectionCtaDescriptor(control) }))
       .filter((item) => item.descriptor && operationExecutable(item.control));
@@ -1116,7 +1174,7 @@
     });
   }
 
-  function reconstructForegroundChoiceGroups(page = {}, controls = []) {
+  function boundedForegroundChoiceGroups(page = {}, controls = []) {
     const surface = page.currentSurface || page.activeSurface || {};
     const surfaceType = normalizedText(surface.type || "page").toLowerCase();
     const surfaceId = text(surface.id || surface.surfaceId, 160);
@@ -1230,149 +1288,70 @@
   }
 
   function compileSemanticCheckout(page = {}) {
+    // DecisionFrame has already interpreted each structural control and
+    // bounded group. This compiler owns only group normalization, actuator
+    // binding and contract validation; it may not rediscover control meaning
+    // from text, reconstruct a new semantic group, or rewrite semantic/risk.
     const controls = (page.controls || []).map((control) => ({ ...control }));
     const controlsById = new Map(controls.map((control) => [control.controlId, control]));
-    const existingGroups = (page.decisionGroups || []).map((group) => {
-      const declared = group.decisionContract || group;
-      const referencedControlIds = [
+    const groups = (page.decisionGroups || []).map((group) => {
+      const controlIds = [...new Set([
         ...(group.alternativeControlIds || []),
-        ...(group.semanticCorrectionControlIds || []),
-        group.removalControlId
-      ].filter(Boolean);
-      const inferredOptions = referencedControlIds.map((controlId) => {
+        ...(group.alternatives || []).map((alternative) => alternative.controlId)
+      ].filter(Boolean))];
+      const alternatives = controlIds.map((controlId) => {
+        const interpreted = (group.alternatives || []).find((alternative) => alternative.controlId === controlId) || {};
         const control = controlsById.get(controlId) || {};
+        const exactActuator = interpreted.exactActuator?.targetId
+          ? interpreted.exactActuator
+          : exactActuatorFor(control);
         return {
+          ...interpreted,
           controlId,
-          label: control.label || controlId,
-          structuredPrice: control.structuredPrice || null,
-          selected: control.selected === true || control.state?.checked === true || control.state?.selected === true
+          label: interpreted.label || control.label || controlId,
+          selected: interpreted.selected === true
+            || control.selected === true
+            || control.state?.checked === true
+            || control.state?.selected === true,
+          exactActuator,
+          stateProbe: interpreted.stateProbe || {
+            controlId,
+            stateElementId: control.stateElementId || "",
+            selectionEvidence: control.state?.selectionEvidence || null
+          }
         };
       });
       const decisionContract = normalizeDecisionContract({
-        ...declared,
-        options: declared.options || declared.alternatives || group.alternatives || inferredOptions
+        ...group,
+        options: alternatives
       }, controlsById);
-      return { ...group, decisionContract };
-    });
-    const existingOwned = new Set(existingGroups.flatMap((group) => (group.alternatives || []).map((option) => option.controlId)).filter(Boolean));
-    const reconstructedChoices = reconstructSelectionCtaGroups(page, controls).filter((group) => (
-      !(group.alternatives || []).some((option) => existingOwned.has(option.controlId))
-    ));
-    const reconstructedChoiceControlIds = new Set(reconstructedChoices.flatMap((group) => (
-      (group.alternatives || []).map((option) => option.controlId)
-    )));
-    const reconstructedForegroundChoices = reconstructForegroundChoiceGroups(page, controls).filter((group) => (
-      !(group.alternatives || []).some((option) => (
-        existingOwned.has(option.controlId) || reconstructedChoiceControlIds.has(option.controlId)
-      ))
-    ));
-    const reconstructed = [...reconstructedChoices, ...reconstructedForegroundChoices];
-    const groups = [...existingGroups, ...reconstructed];
-    const decisionHintFamily = Object.freeze({
-      baggage: "baggage",
-      seat: "seat",
-      insurance: "insurance",
-      bundle: "extras",
-      flexible_ticket: "extras",
-      check_in_method: "extras",
-      optional_support: "extras",
-      loyalty_enrollment: "extras",
-      legal_acceptance: "legal",
-      stage_exit: "navigation"
-    });
-    const semanticDecisionHints = new Map((page.semanticDecisionHints || []).flatMap((hint) => {
-      const decisionGroupId = text(hint?.decisionGroupId, 240);
-      const decisionType = text(hint?.decisionType, 120);
-      const family = decisionHintFamily[decisionType] || "";
-      if (!decisionGroupId || !family || hint?.authority !== "grounded_hypothesis_only") return [];
-      return [[decisionGroupId, { ...hint, decisionGroupId, decisionType, family }]];
-    }));
-    for (const group of groups) {
-      const hint = semanticDecisionHints.get(text(group.decisionGroupId || group.requirementId, 240));
-      if (!hint) continue;
-      group.subject = hint.decisionType;
-      group.sectionType = hint.decisionType;
-      group.semanticOwnership = {
-        status: "resolved",
-        family: hint.family,
-        subject: hint.decisionType,
-        source: "grounded_semantic_scene",
-        authority: "hypothesis_only",
-        confidence: hint.confidence === "high" ? 0.95 : 0.82,
-        evidence: normalizedText(hint.evidence)
+      return {
+        ...group,
+        alternatives,
+        alternativeControlIds: alternatives.map((alternative) => alternative.controlId),
+        decisionContract
       };
-      group.decisionContract = {
-        ...(group.decisionContract || {}),
-        subject: hint.decisionType
-      };
-    }
-    const reconstructedIds = new Set(reconstructed.map((group) => group.decisionGroupId));
-    for (const group of groups) {
-      if (!reconstructedIds.has(group.decisionGroupId)) continue;
-      for (const option of group.decisionContract?.options || []) {
-        const control = controlsById.get(option.controlId);
-        if (!control) continue;
-        const alternative = (group.alternatives || []).find((item) => item.controlId === option.controlId) || {};
-        const controlShape = normalizedText(
-          `${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`
-        ).toLowerCase();
-        const ownsLogicalField = Boolean(
-          control.fieldType
-          || control.field
-          || control.logicalFieldId
-          || (
-            control.componentContract?.logicalIdentity
-            && /textbox|input|textarea|combobox|select|spinbutton|date/.test(controlShape)
-          )
-        );
-        Object.assign(control, {
-          decisionGroupId: group.decisionGroupId,
-          choiceContract: {
-            ...(control.choiceContract || {}),
-            decisionInstance: group.decisionGroupId,
-            decisionLabel: group.sectionLabel || group.decisionContract.subjectLabel,
-            optionId: option.optionId,
-            optionName: option.label,
-            optionCount: group.decisionContract.options.length,
-            required: group.required === true,
-            advancesOnSelection: control.choiceContract?.advancesOnSelection === true || /^continue\b/i.test(control.label || ""),
-            ownershipComplete: Boolean(option.exactActuator?.targetId && option.exactActuator?.executable),
-            structuredPrice: option.structuredPrice || null,
-            priceDelta: option.priceDelta,
-            optionPhysicalEffect: option.included
-              ? "select_free_option"
-              : (Number(option.priceDelta) > 0 ? "select_paid_option" : "unknown"),
-            exactActuator: option.exactActuator,
-            stateProbe: option.stateProbe,
-            canonicalAttributes: option.canonicalAttributes
-          },
-          structuredPrice: option.structuredPrice || control.structuredPrice || null
-        });
-        if (!ownsLogicalField) {
-          Object.assign(control, {
-            semantic: alternative.semantic || (option.included ? "select_free_option" : (Number(option.priceDelta) > 0 ? "add_paid_extra" : control.semantic)),
-            semanticIntent: alternative.semantic || control.semanticIntent,
-            physicalEffect: option.included ? "select_free_option" : (Number(option.priceDelta) > 0 ? "select_paid_option" : control.physicalEffect),
-            risk: option.included ? "safe" : (Number(option.priceDelta) > 0 ? "money" : control.risk)
-          });
-        }
-      }
-    }
-    const groupIds = new Set(groups.map((group) => text(group.decisionGroupId || group.requirementId, 240)).filter(Boolean));
-    const ownedControlIds = new Set([
-      ...groups.flatMap((group) => (group.decisionContract?.options || []).map((option) => option.controlId)),
-      ...controls.filter((control) => groupIds.has(text(control.decisionGroupId, 240))).map((control) => control.controlId)
-    ].filter(Boolean));
+    });
+    const ownedControlIds = new Set(groups.flatMap((group) => group.alternativeControlIds || []));
     const unownedMaterialControls = controls.filter((control) => (
-      materialControl(control)
+      operationExecutable(control)
       && !ownedControlIds.has(control.controlId)
-      && !control.fieldType
-      && !control.componentContract?.logicalIdentity
+      && (
+        control.semantic === "choice"
+        || control.semantic === "selection_cta"
+        || control.semantic === "unknown_attestation"
+        || (
+          (control.required === true || control.state?.required === true)
+          && control.state?.valuePresent !== true
+          && control.state?.selected !== true
+          && control.state?.checked !== true
+        )
+      )
     )).map((control) => ({
       controlId: text(control.controlId, 160),
       label: normalizedText(control.label),
       semantic: text(control.semantic, 120),
-      reason: /selection[_ -]?cta/i.test(`${control.semantic || ""} ${control.meaning || ""}`)
+      reason: control.semantic === "selection_cta"
         ? "UNOWNED_SELECTION_CTA"
         : "UNOWNED_MATERIAL_CONTROL"
     }));
@@ -1401,21 +1380,32 @@
         : (unownedMaterialControls.length || unresolvedDecisions.length)
           ? SEMANTIC_READINESS.UNRESOLVED
           : SEMANTIC_READINESS.READY;
-    const currentExecutableObligations = groups.filter((group) => (
-      group.required === true && !["satisfied", "waived", "waived_by_policy"].includes(group.status)
-    )).map((group) => group.decisionGroupId);
+    const canonicalControls = controls.map((control) => ({
+      ...control,
+      semanticAuthority: "semantic-checkout-compiler/v1"
+    }));
+    const canonicalGroups = groups.map((group) => ({
+      ...group,
+      semanticAuthority: "semantic-checkout-compiler/v1",
+      alternatives: (group.alternatives || []).map((alternative) => ({
+        ...alternative,
+        semanticAuthority: "semantic-checkout-compiler/v1"
+      }))
+    }));
     return {
       contractVersion: CONTRACT_VERSION,
       semanticReadiness,
-      controls,
-      decisionGroups: groups,
-      decisionContracts: groups.map((group) => group.decisionContract).filter(Boolean),
+      controls: canonicalControls,
+      decisionGroups: canonicalGroups,
+      decisionContracts: canonicalGroups.map((group) => group.decisionContract).filter(Boolean),
       unownedMaterialControls,
       unresolvedDecisions,
-      currentExecutableObligations,
+      currentExecutableObligations: canonicalGroups.filter((group) => (
+        group.required === true && !["satisfied", "waived", "waived_by_policy"].includes(group.status)
+      )).map((group) => group.decisionGroupId),
       evidence: {
-        reconstructedDecisionCount: reconstructed.length,
-        existingDecisionCount: existingGroups.length,
+        reconstructedDecisionCount: 0,
+        existingDecisionCount: canonicalGroups.length,
         materialControlCount: ownedControlIds.size + unownedMaterialControls.length
       }
     };
@@ -2122,7 +2112,11 @@
       action.semanticIntent || action.intent || action.targetSnapshot?.semantic,
       240
     ).toLowerCase();
-    if (risk === "payment" || /payment|purchase|book_now|confirm_booking/.test(semantic)) return false;
+    const exactChoiceReveal = text(action.operation, 60) === "open"
+      && (action.expectedOutcome?.type || action.pipelineContract?.expectedOutcome?.type) === "options_surface_appeared";
+    if (risk === "payment" && !exactChoiceReveal) return false;
+    if (/purchase|book_now|confirm_booking|submit_payment|pay_now/.test(semantic)) return false;
+    if (/payment/.test(semantic) && !exactChoiceReveal) return false;
     if (risk === "legal" || /legal|terms_accept|accept_terms|consent/.test(semantic)) return false;
     if (["money", "paid"].includes(risk)) {
       return action.approvedPaidAction === true
@@ -2403,6 +2397,9 @@
     serializeObservedControl,
     canonicalPipelineContract,
     normalizeDecisionContract,
+    boundedDecisionPriceEvidence,
+    boundedRepeatedChoiceGroups,
+    boundedForegroundChoiceGroups,
     compileTerminalEvidence,
     isLegalAcceptanceText,
     isInsuranceOfferText,

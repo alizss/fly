@@ -54,17 +54,30 @@ function semanticBindingSchemaFor(componentIds = [], semanticTypes = [], factSou
   };
 }
 
-function semanticSceneSchemaFor(controlIds = [], semanticTypes = [], factSources = [], validationIssueIds = [], decisionGroupIds = [], decisionTypes = []) {
+function semanticSceneSchemaFor(
+  controlIds = [],
+  semanticTypes = [],
+  factSources = [],
+  validationIssueIds = [],
+  decisionGroupIds = [],
+  decisionTypes = [],
+  controlRoles = [],
+  consequenceClasses = [],
+  expectedEffects = []
+) {
   const controls = [...new Set(controlIds.map(String).filter(Boolean))];
   const semantics = [...new Set(semanticTypes.map(String).filter(Boolean))];
   const sources = [...new Set(factSources.map(String).filter(Boolean))];
   const issues = [...new Set(validationIssueIds.map(String).filter(Boolean))];
   const groups = [...new Set(decisionGroupIds.map(String).filter(Boolean))];
   const decisions = [...new Set(decisionTypes.map(String).filter(Boolean))];
+  const roles = [...new Set(controlRoles.map(String).filter(Boolean))];
+  const consequences = [...new Set(consequenceClasses.map(String).filter(Boolean))];
+  const effects = [...new Set(expectedEffects.map(String).filter(Boolean))];
   return {
     type: "object",
     additionalProperties: false,
-    required: ["status", "hypotheses", "decisionHypotheses"],
+    required: ["status", "hypotheses", "decisionHypotheses", "controlHypotheses"],
     properties: {
       status: { type: "string", enum: ["grounded", "unknown"] },
       hypotheses: {
@@ -94,6 +107,36 @@ function semanticSceneSchemaFor(controlIds = [], semanticTypes = [], factSources
           properties: {
             decisionGroupId: { type: "string", enum: ["", ...groups] },
             decisionType: { type: "string", enum: ["unknown", ...decisions] },
+            confidence: { type: "string", enum: ["high", "medium", "low"] },
+            evidence: { type: "string" }
+          }
+        }
+      },
+      controlHypotheses: {
+        type: "array",
+        maxItems: 6,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "controlId",
+            "semanticRole",
+            "decisionGroupId",
+            "decisionType",
+            "prerequisiteOf",
+            "consequenceClass",
+            "expectedReversibleEffect",
+            "confidence",
+            "evidence"
+          ],
+          properties: {
+            controlId: { type: "string", enum: ["", ...controls] },
+            semanticRole: { type: "string", enum: ["unknown", ...roles] },
+            decisionGroupId: { type: "string", enum: ["", ...groups] },
+            decisionType: { type: "string", enum: ["unknown", ...decisions] },
+            prerequisiteOf: { type: "string", enum: ["", ...controls, ...groups] },
+            consequenceClass: { type: "string", enum: ["unknown", ...consequences] },
+            expectedReversibleEffect: { type: "string", enum: ["unknown", ...effects] },
             confidence: { type: "string", enum: ["high", "medium", "low"] },
             evidence: { type: "string" }
           }

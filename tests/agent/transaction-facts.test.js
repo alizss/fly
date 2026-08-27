@@ -5,7 +5,7 @@ const { createCheckoutSessionState } = require("../../packages/shared/agent-stat
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const { factsFromObservation, mergeCommerceSelections, normalizeFacts } = require("../../apps/web/agent/transaction-facts");
 const { explicitItineraryConflict, invariantDecision, prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
-const { currentObligationFromGoal } = require("../../apps/web/agent/authority-frames");
+const { compileCurrentObligation } = require("./obligation-test-helper");
 
 function facts({
   completeness = "complete",
@@ -582,7 +582,7 @@ test("the final transaction review compares fresh identity instead of a retained
   assert.deepEqual(changed.review.contradictions, ["ITINERARY_ROUTE_CHANGED"]);
 });
 
-test("P0.5 progressively promotes an unknown baseline once complete transaction facts arrive", () => {
+test("a partial collecting baseline promotes only after monotonic evidence completes it", () => {
   let state = createCheckoutSessionState({ travelerId: "trav_1" });
   state.id = "txn_unknown_baseline";
   const unknown = prepareTransactionInvariants(state, observation("obs_unknown", null), { id: "trav_1" });
@@ -594,6 +594,61 @@ test("P0.5 progressively promotes an unknown baseline once complete transaction 
   assert.equal(completed.envelope.baseline.itinerary.segments[0].origin, "LHR");
   assert.equal(completed.envelope.evidence.at(-1).facts.itinerary.completeness, "complete");
   assert.equal(completed.envelope.evidence.at(-1).facts.itinerary.segments[0].origin, "LHR");
+});
+
+test("authoritative partial facts fill baseline blanks and later contradictions never overwrite it", () => {
+  const typed = (raw, { total = null } = {}) => {
+    const value = facts(raw);
+    value.contractVersion = "transaction-facts/v2";
+    value.evidenceMode = "typed";
+    value.totalPrice = total == null
+      ? { amount: null, currency: "" }
+      : { amount: total, currency: "EUR" };
+    value.factEvidence = {
+      itinerary: value.itinerary.segments.map((segment) => ({
+        segmentId: segment.segmentId,
+        source: "owned_itinerary_region",
+        ownerKey: "itinerary_region_1",
+        authoritative: true
+      })),
+      travelers: {
+        source: "selected_traveler_profile",
+        ownerKey: "trav_1",
+        authoritative: true
+      },
+      totalPrice: total == null ? null : {
+        source: "owned_price_summary",
+        ownerKey: "booking_total_1",
+        role: "booking_total",
+        authoritative: true
+      }
+    };
+    return value;
+  };
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_monotonic_partial";
+  const partial = prepareTransactionInvariants(state, observation("obs_partial_route", typed({
+    completeness: "partial",
+    departureDate: "",
+    totalPrice: null
+  })), { id: "trav_1" });
+  const complete = prepareTransactionInvariants(partial.state, observation("obs_complete_route", typed({
+    completeness: "complete",
+    departureDate: "2026-08-10"
+  }, { total: 208 })), { id: "trav_1" });
+  const contradictory = prepareTransactionInvariants(complete.state, observation("obs_conflicting_date", typed({
+    completeness: "complete",
+    departureDate: "2026-08-11"
+  }, { total: 208 })), { id: "trav_1" });
+
+  assert.equal(partial.envelope.baselineStatus, "collecting");
+  assert.equal(partial.envelope.baseline.itinerary.segments[0].origin, "LHR");
+  assert.equal(partial.envelope.baseline.itinerary.segments[0].departureDate, "");
+  assert.equal(complete.envelope.baselineStatus, "approved");
+  assert.equal(complete.envelope.acquisition.status, "locked");
+  assert.equal(complete.envelope.baseline.itinerary.segments[0].departureDate, "2026-08-10");
+  assert.equal(contradictory.envelope.baseline.itinerary.segments[0].departureDate, "2026-08-10");
+  assert.ok(contradictory.review.contradictions.includes("ITINERARY_DATE_CHANGED"));
 });
 
 test("a zero loading placeholder cannot become the immutable transaction baseline", () => {
@@ -707,7 +762,8 @@ test("an ancillary offer price cannot become the selected-booking baseline", () 
     { id: "trav_1" }
   );
   assert.equal(increased.review.ready, false);
-  assert.ok(increased.review.contradictions.includes("UNAPPROVED_PRICE_CHANGE"));
+  assert.equal(increased.review.contradictions.includes("UNAPPROVED_PRICE_CHANGE"), true);
+  assert.equal(increased.review.baselineStatus, "approved");
 });
 
 test("a final payment review cannot establish its own missing itinerary baseline", () => {
@@ -723,6 +779,21 @@ test("a final payment review cannot establish its own missing itinerary baseline
   assert.equal(reviewed.envelope.reviewFacts.itinerary.segments[0].origin, "LHR");
   assert.equal(reviewed.review.ready, false);
   assert.ok(reviewed.review.missingFacts.includes("itinerary_route"));
+});
+
+test("fresh final-review facts remain diagnostic when the transaction baseline is unknown", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state.id = "txn_review_revealed_unknown_facts";
+  const unknown = prepareTransactionInvariants(state, observation("obs_unknown_before_reveal", null), { id: "trav_1" });
+  const reviewFacts = facts();
+  reviewFacts.provenance = [{ source: "payment_summary", observationId: "obs_revealed_review", confidence: 0.95 }];
+  const revealedObservation = observation("obs_revealed_review", reviewFacts);
+  const reviewed = prepareTransactionInvariants(unknown.state, revealedObservation, { id: "trav_1" });
+
+  assert.equal(reviewed.envelope.baselineStatus, "collecting");
+  assert.equal(reviewed.envelope.baseline.itinerary.segments.length, 0);
+  assert.equal(reviewed.envelope.reviewFacts.itinerary.segments[0].origin, "LHR");
+  assert.equal(reviewed.review.ready, false);
 });
 
 test("typed card-entry evidence is the sole final-boundary authority when provenance wording is absent", () => {
@@ -1023,8 +1094,7 @@ test("price evidence allows reconciliation while selected-extra policy still blo
     approvals: {},
     paymentState: {},
     taskState: {
-      currentObligation: currentObligationFromGoal({
-        goal: { goalId: "goal_bundle", decisionGroupId: "dg_bundle", desiredPolicyOutcome: "selected_free_option" }
+      currentObligation: compileCurrentObligation({ work: { goalId: "goal_bundle", decisionGroupId: "dg_bundle", desiredPolicyOutcome: "selected_free_option" }
       })
     }
   };

@@ -114,6 +114,7 @@ function initialAgentRuntimeState(defaultApi = "") {
     activePlannerRequest: null,
     destinationWait: null,
     destinationWaitTimer: null,
+    engineReconciliationPending: false,
     honoredReobserveRetryTokens: new Set(),
     lastSentMaterialHash: "",
     lastSentFeedbackKey: "",
@@ -126,7 +127,7 @@ const RUNTIME_SCOPES = Object.freeze({
   lifecycle: {
     write: [
       "activeLoopRunId", "activePlannerRequest", "awaiting", "destinationWait", "destinationWaitTimer",
-      "honoredReobserveRetryTokens", "lifecycleId", "loopBusy", "loopRerunQueued", "loopRunSerial", "running"
+      "engineReconciliationPending", "honoredReobserveRetryTokens", "lifecycleId", "loopBusy", "loopRerunQueued", "loopRunSerial", "running"
     ]
   },
   transactionEvidence: { read: ["activeObservationId"] },
@@ -159,13 +160,13 @@ const RUNTIME_SCOPES = Object.freeze({
     write: [
       "actionHistory", "activeExecutionActionId", "activeExecutionDecisionAction", "activeExecutionObservationId",
       "activeObservationId", "awaiting", "lastBackendDebug", "lastClickAt", "lastClickSignature", "messages",
-      "pageMap", "pendingInputRequest", "repeatClickCount", "running", "sessionProfileOverrides"
+      "engineReconciliationPending", "pageMap", "pendingInputRequest", "repeatClickCount", "running", "sessionProfileOverrides"
     ]
   },
   checkout: {
     write: [
       "actionHistory", "activeLoopRunId", "autopilotMode", "awaiting", "destinationWait", "lastClickAt",
-      "lastClickSignature", "lifecycleId", "loopBusy", "loopRerunQueued", "messages", "observerTab", "pageMap",
+      "engineReconciliationPending", "lastClickSignature", "lifecycleId", "loopBusy", "loopRerunQueued", "messages", "observerTab", "pageMap",
       "pageUnderstanding", "pendingInputRequest", "pendingUserMessage", "pendingUserResponse", "processDiagnostics",
       "reasoningLog", "repeatClickCount", "running", "sessionId", "sessionProfileOverrides", "sessionStartFailure",
       "skipPaidExtrasApproved"

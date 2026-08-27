@@ -8,7 +8,6 @@ const {
 } = require("./transaction-facts");
 const { controlBelongsToCurrentSurface } = require("./surface-contract");
 const { currentObligation } = require("./authority-frames");
-const { obligationField } = require("./current-obligation");
 const agentContract = require("../../extension/src/shared/agent-contract");
 
 function text(value, limit = 180) {
@@ -77,6 +76,71 @@ function comparableBookingTotals(left = {}, right = {}) {
 
 function isFinalReviewFacts(facts = {}) {
   return (facts.provenance || []).some((entry) => entry.source === "payment_summary");
+}
+
+function authoritativeItinerary(facts = {}, { requireComplete = true } = {}) {
+  const segments = facts.itinerary?.segments || [];
+  const evidence = facts.factEvidence?.itinerary || [];
+  return (!requireComplete || facts.itinerary?.completeness === "complete")
+    && segments.length > 0
+    && (!requireComplete || segments.every((segment) => segment.origin && segment.destination && segment.departureDate))
+    && segments.every((segment) => segment.origin || segment.destination || segment.departureDate)
+    && segments.every((segment) => evidence.some((entry) => (
+      entry.segmentId === segment.segmentId
+      && entry.authoritative === true
+      && Boolean(entry.ownerKey)
+    )));
+}
+
+function baselineEligibleFacts(observed = {}, existingBaseline = {}, { state = {}, traveler = {}, finalReview = false } = {}) {
+  const legacyOwnedObservation = observed.evidenceMode !== "typed" && !finalReview;
+  // Independently owned partial itinerary facts may enter the collecting
+  // baseline. They can fill blanks monotonically across later observations,
+  // but cannot authorize a material boundary until the complete contract is
+  // coherent.
+  const itineraryEligible = legacyOwnedObservation || authoritativeItinerary(observed, { requireComplete: false });
+  const travelersEligible = (observed.travelers || []).length > 0
+    && (
+      legacyOwnedObservation
+      || observed.factEvidence?.travelers?.authoritative === true
+      || Boolean(traveler?.id) && observed.travelers.some((entry) => entry.travelerId === traveler.id)
+    );
+  const fareEligible = legacyOwnedObservation || observed.factEvidence?.fareBrand?.authoritative === true;
+  const candidate = normalizeFacts({
+    itinerary: itineraryEligible ? observed.itinerary : existingBaseline.itinerary,
+    travelers: travelersEligible ? observed.travelers : existingBaseline.travelers,
+    currency: observed.currency || existingBaseline.currency,
+    basePrice: observed.basePrice,
+    totalPrice: observed.totalPrice,
+    fareBrand: fareEligible ? observed.fareBrand : existingBaseline.fareBrand,
+    factEvidence: {
+      itinerary: itineraryEligible ? observed.factEvidence?.itinerary : existingBaseline.factEvidence?.itinerary,
+      travelers: travelersEligible ? observed.factEvidence?.travelers : existingBaseline.factEvidence?.travelers,
+      totalPrice: observed.factEvidence?.totalPrice,
+      fareBrand: fareEligible
+        ? observed.factEvidence?.fareBrand
+        : existingBaseline.factEvidence?.fareBrand
+    },
+    provenance: observed.provenance
+  }, { state, traveler });
+  const totalEligible = legacyOwnedObservation || coherentBookingEnvelope(candidate);
+  return normalizeFacts({
+    itinerary: itineraryEligible ? observed.itinerary : existingBaseline.itinerary,
+    travelers: travelersEligible ? observed.travelers : existingBaseline.travelers,
+    currency: totalEligible ? candidate.currency : existingBaseline.currency,
+    basePrice: totalEligible ? candidate.basePrice : existingBaseline.basePrice,
+    totalPrice: totalEligible ? candidate.totalPrice : existingBaseline.totalPrice,
+    fareBrand: fareEligible ? observed.fareBrand : existingBaseline.fareBrand,
+    factEvidence: {
+      itinerary: itineraryEligible ? observed.factEvidence?.itinerary : existingBaseline.factEvidence?.itinerary,
+      travelers: travelersEligible ? observed.factEvidence?.travelers : existingBaseline.factEvidence?.travelers,
+      totalPrice: totalEligible ? observed.factEvidence?.totalPrice : existingBaseline.factEvidence?.totalPrice,
+      fareBrand: fareEligible
+        ? observed.factEvidence?.fareBrand
+        : existingBaseline.factEvidence?.fareBrand
+    },
+    provenance: observed.provenance
+  }, { state, traveler });
 }
 
 function outcomeClass(extra = {}) {
@@ -164,8 +228,33 @@ function mergeSegmentIdentity(existing = {}, observed = {}, index = 0) {
 function enrichBaseline(existing = {}, observed = {}) {
   const previousSegments = existing.itinerary?.segments || [];
   const observedSegments = observed.itinerary?.segments || [];
+  const usedObserved = new Set();
+  const observedForExisting = (segment = {}, index = 0) => {
+    const matchingIndex = observedSegments.findIndex((candidate, candidateIndex) => (
+      !usedObserved.has(candidateIndex)
+      && segment.origin
+      && segment.destination
+      && segment.origin === candidate.origin
+      && segment.destination === candidate.destination
+      && (!segment.departureDate || !candidate.departureDate || segment.departureDate === candidate.departureDate)
+    ));
+    const selectedIndex = matchingIndex >= 0
+      ? matchingIndex
+      : (!segment.origin && !segment.destination && observedSegments[index] ? index : -1);
+    if (selectedIndex >= 0) usedObserved.add(selectedIndex);
+    return selectedIndex >= 0 ? observedSegments[selectedIndex] : {};
+  };
+  const retained = previousSegments.map((segment, index) => (
+    mergeSegmentIdentity(segment, observedForExisting(segment, index), index)
+  ));
+  const mayExtendCollectingBaseline = existing.itinerary?.completeness !== "complete";
+  const additions = mayExtendCollectingBaseline
+    ? observedSegments
+      .filter((_segment, index) => !usedObserved.has(index))
+      .map((segment, index) => mergeSegmentIdentity({}, segment, retained.length + index))
+    : [];
   const segments = previousSegments.length
-    ? previousSegments.map((segment, index) => mergeSegmentIdentity(segment, observedSegments[index] || {}, index))
+    ? [...retained, ...additions]
     : observedSegments.map((segment, index) => mergeSegmentIdentity({}, segment, index));
   const completeness = segments.length
     ? segments.every((segment) => segment.origin && segment.destination && segment.departureDate)
@@ -190,9 +279,17 @@ function enrichBaseline(existing = {}, observed = {}) {
     fareBrand: existing.fareBrand || observed.fareBrand,
     selectedExtras: existing.selectedExtras || [],
     factEvidence: {
-      itinerary: previousSegments.length && existing.factEvidence?.itinerary?.length
-        ? existing.factEvidence.itinerary
-        : observed.factEvidence?.itinerary,
+      itinerary: segments.map((segment, index) => {
+        const existingEvidence = (existing.factEvidence?.itinerary || []).find((entry) => (
+          entry.segmentId === previousSegments[index]?.segmentId
+        )) || null;
+        const observedEvidence = (observed.factEvidence?.itinerary || []).find((entry) => (
+          entry.segmentId === segment.segmentId
+          || entry.segmentId === observedSegments[index]?.segmentId
+        )) || null;
+        const preferred = existingEvidence?.authoritative === true ? existingEvidence : observedEvidence || existingEvidence;
+        return preferred ? { ...preferred, segmentId: segment.segmentId } : null;
+      }).filter(Boolean),
       fareBrand: existing.factEvidence?.fareBrand || observed.factEvidence?.fareBrand || null,
       totalPrice: existingTotalAmount == null
         ? observed.factEvidence?.totalPrice || null
@@ -245,6 +342,7 @@ function transactionFactGaps(facts = {}) {
   const gaps = [];
   const segments = facts.itinerary?.segments || [];
   if (!segments.length || segments.some((segment) => !segment.origin || !segment.destination)) gaps.push("itinerary_route");
+  if (!segments.length || segments.some((segment) => !segment.departureDate)) gaps.push("itinerary_date");
   if (!(facts.travelers || []).length) gaps.push("travelers");
   if (!facts.currency) gaps.push("currency");
   if (baselineTotalAmount(facts) == null) gaps.push("total_price");
@@ -311,13 +409,24 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
 function prepareTransactionInvariants(state = {}, observation = {}, traveler = {}, {
   authoritativeTransactionFacts = null
 } = {}) {
-  const observed = authoritativeTransactionFacts
+  let observed = authoritativeTransactionFacts
     ? normalizeFacts(authoritativeTransactionFacts, {
         observationId: observation.observationId || "",
         state,
         traveler
       })
     : factsFromObservation(state, observation, traveler);
+  const terminalReviewObserved = observation.page?.terminalEvidence?.boundaryObserved === true
+    && observation.page?.terminalEvidence?.cardCredentialEntryObserved !== false;
+  if (terminalReviewObserved && !isFinalReviewFacts(observed)) {
+    observed = normalizeFacts({
+      ...observed,
+      provenance: [
+        ...(observed.provenance || []),
+        { source: "payment_summary", observationId: observation.observationId || "", confidence: 1 }
+      ]
+    }, { observationId: observation.observationId || "", state, traveler });
+  }
   const admittedOutcomes = durableCommerceSelections(observed.selectedExtras);
   // Final-review UI may not seed transaction meaning, but a verified governed
   // browser receipt remains authoritative even when its action lands directly
@@ -329,30 +438,38 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
   const existing = state.transactionInvariants;
   const at = new Date().toISOString();
   const finalReviewObservation = isFinalReviewFacts(observed);
+  const selectedBookingAuthority = [
+    ...(observed.factEvidence?.itinerary || []),
+    observed.factEvidence?.totalPrice,
+    observed.factEvidence?.fareBrand,
+    observed.factEvidence?.travelers
+  ].some((evidence) => evidence?.source === "product_selected_booking");
   let envelope;
   if (!existing) {
-    const baseline = finalReviewObservation
-      ? enrichBaseline(normalizeFacts({}, { state, traveler }), normalizeFacts({}, { state, traveler }))
-      : enrichBaseline(normalizeFacts({}, { state, traveler }), observed);
+    const emptyBaseline = normalizeFacts({}, { state, traveler });
+    const eligibleObserved = baselineEligibleFacts(observed, emptyBaseline, { state, traveler, finalReview: finalReviewObservation });
+    const baseline = enrichBaseline(emptyBaseline, eligibleObserved);
+    const baselineComplete = transactionFactGaps(baseline).length === 0;
     envelope = {
       version: 4,
       baseline,
       current: mergeCurrentFacts({}, observed, baseline),
       outcomeLedger: finalReviewObservation ? mergeCommerceSelections(verifiedActionOutcomes) : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
-      baselineStatus: transactionFactGaps(baseline).length ? "collecting" : "approved",
+      baselineAuthority: selectedBookingAuthority ? "selected_booking" : "observed_checkout",
+      baselineLocked: selectedBookingAuthority || baselineComplete,
+      baselineStatus: baselineComplete ? "approved" : "collecting",
       baselineObservationId: observation.observationId || "",
-      approvedAt: transactionFactGaps(baseline).length ? "" : at,
+      approvedAt: baselineComplete ? at : "",
       evidence: []
     };
   } else if ((existing.version === 4 || existing.version === 3) && existing.baseline) {
-    // Approved identity is immutable, but facts that were genuinely unknown
-    // (for example a fare chosen later in checkout) may still be filled from
-    // authoritative non-review evidence. Final review can never seed them.
-    const baseline = finalReviewObservation
-      ? existing.baseline
-      : enrichBaseline(existing.baseline, observed);
-    const approved = !transactionFactGaps(baseline).length;
+    // Baseline identity is monotonic: existing values win, while independently
+    // owned missing facts may be added. A payment/review page is not rejected
+    // wholesale; only its facts that fail the typed ownership contract are.
+    const eligibleObserved = baselineEligibleFacts(observed, existing.baseline, { state, traveler, finalReview: finalReviewObservation });
+    const baseline = enrichBaseline(existing.baseline, eligibleObserved);
+    const baselineComplete = transactionFactGaps(baseline).length === 0;
     envelope = {
       ...existing,
       version: 4,
@@ -362,35 +479,39 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
         ? mergeCommerceSelections(existing.outcomeLedger, verifiedActionOutcomes)
         : mergeCommerceSelections(existing.outcomeLedger, admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : (existing.reviewFacts || null),
-      baselineStatus: existing.baselineStatus === "approved" || approved ? "approved" : "collecting",
-      approvedAt: existing.approvedAt || (approved ? at : "")
+      baselineAuthority: existing.baselineAuthority || (selectedBookingAuthority ? "selected_booking" : "observed_checkout"),
+      baselineLocked: existing.baselineLocked === true || selectedBookingAuthority || baselineComplete,
+      baselineStatus: existing.baselineStatus === "approved" || baselineComplete ? "approved" : "collecting",
+      approvedAt: existing.baselineStatus === "approved" ? existing.approvedAt : baselineComplete ? at : ""
     };
   } else if (existing.version === 2 && existing.baseline) {
     const baseline = enrichBaseline(existing.baseline, observed);
-    const approved = !transactionFactGaps(baseline).length;
     envelope = {
       version: 4,
       baseline,
       current: mergeCurrentFacts(existing.baseline, observed, baseline),
       outcomeLedger: finalReviewObservation ? mergeCommerceSelections(verifiedActionOutcomes) : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
-      baselineStatus: approved ? "approved" : "collecting",
+      baselineAuthority: "legacy_observation",
+      baselineLocked: false,
+      baselineStatus: "collecting",
       baselineObservationId: existing.baselineObservationId || observation.observationId || "",
-      approvedAt: approved ? (existing.approvedAt || at) : "",
+      approvedAt: "",
       evidence: Array.isArray(existing.evidence) ? existing.evidence : []
     };
   } else {
     const baseline = enrichBaseline(legacyBaseline(existing, state), observed);
-    const approved = !transactionFactGaps(baseline).length;
     envelope = {
       version: 4,
       baseline,
       current: mergeCurrentFacts({}, observed, baseline),
       outcomeLedger: finalReviewObservation ? mergeCommerceSelections(verifiedActionOutcomes) : mergeCommerceSelections(admittedOutcomes),
       reviewFacts: finalReviewObservation ? observed : null,
-      baselineStatus: approved ? "approved" : "collecting",
+      baselineAuthority: "legacy_observation",
+      baselineLocked: false,
+      baselineStatus: "collecting",
       baselineObservationId: existing.baselineObservationId || "",
-      approvedAt: approved ? (existing.approvedAt || state.createdAt || at) : "",
+      approvedAt: "",
       evidence: Array.isArray(existing.evidence) ? existing.evidence : []
     };
   }
@@ -404,6 +525,27 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
     evidence: nextEvidence,
     review: null
   };
+  const acquisitionObservationIds = [...new Set([
+    ...(existing?.acquisition?.observationIds || []),
+    ...(observationId ? [observationId] : [])
+  ])].slice(-12);
+  const baselineComplete = transactionFactGaps(nextEnvelope.baseline).length === 0;
+  const acquisitionAttempts = baselineComplete ? acquisitionObservationIds.length : acquisitionObservationIds.length;
+  nextEnvelope.acquisition = Object.freeze({
+    contractVersion: "selected-booking-acquisition-state/v1",
+    status: baselineComplete
+      ? "locked"
+      : acquisitionAttempts >= 6
+        ? "exhausted"
+        : "collecting",
+    attempts: acquisitionAttempts,
+    maximumAttempts: 6,
+    observationIds: Object.freeze(acquisitionObservationIds),
+    missingFacts: Object.freeze(transactionFactGaps(nextEnvelope.baseline)),
+    lockedObservationId: baselineComplete
+      ? (existing?.acquisition?.lockedObservationId || observationId || nextEnvelope.baselineObservationId || "")
+      : ""
+  });
   nextEnvelope.review = reviewTransactionEnvelope(nextEnvelope, state);
   return {
     state: withUpdate(state, { transactionInvariants: nextEnvelope }),
@@ -484,18 +626,20 @@ function exactPolicyCorrectionStep(action = {}, state = {}, observed = {}) {
     || action.affordance?.physicalEffect
     || action.affordance?.effect
     || "";
-  const currentGoal = currentObligation(state.taskState || {}) || {};
+  const currentWork = currentObligation(state.taskState || {}) || {};
   const obligation = state.taskState?.currentObligation || {};
+  const obligationDecisionGroupId = obligation.desiredStateDelta?.decisionGroupId || "";
   const obligationOwnsCorrection = Boolean(
-    obligation.subject?.decisionGroupId === decisionGroupId
-    && obligation.policyDecision?.status === "admitted"
-    && agentContract.canonicalSemanticEffect(obligation.desiredEffect)
+    obligationDecisionGroupId === decisionGroupId
+    && obligation.desiredStateDelta?.status === "EXACT_DELTA"
+    && obligation.desiredStateDelta?.actionRequired === true
+    && agentContract.canonicalSemanticEffect(obligation.desiredStateDelta?.desiredEffect)
       === agentContract.SEMANTIC_EFFECT.SELECT_FREE_OPTION
   );
   const paidSelection = observedPaidExtraForDecision(observed, decisionGroupId);
   const exactGoal = Boolean(
-    obligationField(currentGoal, "decisionGroupId")
-    && obligationField(currentGoal, "decisionGroupId") === decisionGroupId
+    currentWork?.desiredStateDelta?.decisionGroupId
+    && currentWork.desiredStateDelta.decisionGroupId === decisionGroupId
   );
   const exactTarget = Boolean(
     decisionGroupId
@@ -602,7 +746,18 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
     || action.affordance?.physicalEffect
     || action.affordance?.effect
     || "";
-  const actionMeaning = normalizedText(`${action.intent || ""} ${action.risk || ""} ${action.targetSnapshot?.semantic || ""}`);
+  const actionMeaning = normalizedText([
+    action.intent,
+    action.risk,
+    actionEffect,
+    action.targetLabel,
+    action.targetSnapshot?.label,
+    action.targetSnapshot?.semantic,
+    action.targetSnapshot?.effectRole,
+    action.targetSnapshot?.risk,
+    action.expectedOutcome?.legalScope,
+    action.affordance?.legalScope
+  ].filter(Boolean).join(" "));
   const exactCostReducingCorrection = exactPolicyCorrectionStep(action, state, observed);
   // A grounded observation-scoped correction may still have an unknown
   // browser semantic. Its safety comes from the exact conflict/control link
@@ -646,6 +801,32 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
     ["advance_surface", "advance_checkout_stage"].includes(actionEffect)
     || action.intent === "navigate_stage"
   );
+  const factualAttestation = /factual_accuracy|verify.*(?:itinerary|traveler|booking)|attestation/.test(actionMeaning)
+    || /factual_accuracy/.test(normalizedText(action.expectedOutcome?.legalScope || action.affordance?.legalScope || ""));
+  const legalAttestation = actionEffect === "accept_legal_terms"
+    || action.risk === "legal"
+    || action.targetSnapshot?.risk === "legal"
+    || /legal_acceptance|accept legal|accept terms|conditions of carriage/.test(actionMeaning);
+  const paymentRoute = /payment_method|payment route|pay by card|continue to payment|go to payment/.test(actionMeaning);
+  const authoritativeTransactionReady = baselineApproved && transactionFactGaps(baseline).length === 0;
+  if (!authoritativeTransactionReady && (
+    factualAttestation
+    || legalAttestation
+    || paymentRoute
+    || actionAddsCost
+    || finalTransactionBoundary
+  )) {
+    return deny(
+      "SELECTED_BOOKING_INVARIANT_MISSING",
+      "The durable session is missing its authoritative selected-booking baseline.",
+      {
+        acquisitionStatus: prepared.envelope?.acquisition?.status || "collecting",
+        attempts: prepared.envelope?.acquisition?.attempts || 0,
+        missingFacts: transactionFactGaps(baseline)
+      }
+    );
+  }
+  pass("SELECTED_BOOKING_TRANSACTION_BOUNDARY_AUTHORIZED");
   if (advancesCheckout) {
     const paidSelections = (observed.selectedExtras || []).filter((extra) => (
       number(extra.priceAmount) > 0

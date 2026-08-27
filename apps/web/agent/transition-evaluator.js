@@ -4,11 +4,6 @@ const { normalizedActionSemantics, outcomeContractForGoal } = require("./action-
 const { resolveLogicalFields, verifyLogicalField } = require("./logical-field");
 const { decodeDateFromField } = require("./date-field-codec");
 const agentContract = require("../../extension/src/shared/agent-contract");
-const { activeValidationIssues } = require("./validation-evidence");
-
-function blockingValidationIssues(page = {}) {
-  return activeValidationIssues(page.validationIssues || []);
-}
 
 const UNSAFE_CODES = new Set([
   "ITINERARY_ROUTE_CHANGED",
@@ -38,15 +33,6 @@ function controlById(page = {}, controlId = "") {
   return (page.controls || []).find((control) => control.controlId === controlId) || null;
 }
 
-function groupById(page = {}, groupId = "") {
-  return (page.decisionGroups || []).find((group) => group.decisionGroupId === groupId || group.requirementId === groupId) || null;
-}
-
-function controlValue(control = {}) {
-  const state = control.state || control.controlState || {};
-  return text(state.normalizedValue || state.value || control.currentValue || "").replace(/\s+/g, "");
-}
-
 function selected(control = {}) {
   const state = control.state || control.controlState || {};
   return Boolean(control.selected || state.selected || state.checked);
@@ -54,12 +40,6 @@ function selected(control = {}) {
 
 function surfaceOf(page = {}) {
   return currentSurface(page);
-}
-
-function currentSurfaceIsSiteFailure(page = {}) {
-  const surface = surfaceOf(page);
-  return surface.type !== "page"
-    && [surface.surfaceClass, page.surfaceClass].some((value) => text(value) === "site_failure");
 }
 
 function priceAmount(page = {}) {
@@ -221,26 +201,6 @@ function interveningPaidMutation(beforePage = {}, afterPage = {}, action = {}) {
   });
 }
 
-function meaningfulDiff(diff = {}) {
-  return Boolean(
-    diff.appeared?.length
-    || diff.disappeared?.length
-    || diff.changed?.length
-    || diff.decisionChanges?.length
-    || diff.becameEnabled?.length
-    || diff.becameDisabled?.length
-    || diff.modalOpened
-    || diff.modalClosed
-    || diff.errorsAppeared?.length
-    || diff.errorsCleared?.length
-    || diff.priceChanged
-    || diff.urlChanged
-    || diff.progressChanged
-    || diff.surfaceChanged
-    || diff.targetReacted
-  );
-}
-
 function materialObservationHash(observation = {}) {
   return String(
     observation.observationSnapshot?.materialHash
@@ -270,6 +230,73 @@ function materialStateChanged(diff = {}) {
   );
 }
 
+function navigationDestinationArrival(beforeObservation = {}, afterObservation = {}, diff = {}, navigationContext = {}) {
+  if (navigationContext?.destinationReady !== true) {
+    return Object.freeze({ arrived: false, evidence: [] });
+  }
+  const afterPage = pageOf(afterObservation);
+  const afterSurface = surfaceOf(afterPage);
+  const surfaceClass = text(afterSurface.surfaceClass || afterSurface.classification || "");
+  const destinationBlocked = Boolean(
+    (diff.errorsAppeared || []).length
+    || /site.failure|fatal|unavailable|error/.test(surfaceClass)
+  );
+  if (destinationBlocked) {
+    return Object.freeze({ arrived: false, blocked: true, evidence: [] });
+  }
+  const origin = navigationContext.origin || {};
+  const originUrlChanged = Boolean(origin.url && afterPage.url && origin.url !== afterPage.url);
+  const originSurfaceChanged = Boolean(
+    origin.surfaceId
+    && afterSurface.id
+    && origin.surfaceId !== afterSurface.id
+  );
+  const currentProgressFingerprint = JSON.stringify(
+    afterPage.foreground?.progressMarkers
+      || afterPage.visualState?.foreground?.progressMarkers
+      || afterPage.progressMarkers
+      || {}
+  );
+  const originProgressChanged = Boolean(
+    origin.progressFingerprint
+    && origin.progressFingerprint !== currentProgressFingerprint
+  );
+  const evidence = [
+    diff.urlChanged ? "url_changed" : "",
+    diff.stageChanged ? "stage_changed" : "",
+    diff.progressChanged ? "progress_changed" : "",
+    diff.surfaceChanged ? "surface_changed" : "",
+    originUrlChanged ? "origin_url_changed" : "",
+    originSurfaceChanged ? "origin_surface_changed" : "",
+    originProgressChanged ? "origin_progress_changed" : ""
+  ].filter(Boolean);
+  return Object.freeze({ arrived: evidence.length > 0, blocked: false, evidence: Object.freeze(evidence) });
+}
+
+function matchingBrowserActionOutcome(browserResult = {}, expected = {}, action = {}) {
+  const outcome = browserResult.actionOutcome || browserResult.canonicalOutcome || null;
+  if (!outcome || outcome.contractVersion !== "action-outcome/v1") return null;
+  if (!Object.values(agentContract.ACTION_OUTCOME).includes(outcome.status)) return null;
+  const browserContract = outcome.originalSuccessContract || browserResult.expectedOutcome || null;
+  const expectedType = String(expected.type || "");
+  // The governed action is the expected-contract authority. A compact browser
+  // receipt may omit that already-durable contract; compare it only when an
+  // older producer still supplies a copy.
+  if (browserContract && expectedType && String(browserContract.type || "") !== expectedType) return null;
+  const expectedControlId = String(expected.controlId || action.controlId || action.targetSnapshot?.controlId || "");
+  const browserControlId = String(
+    browserContract?.controlId
+    || browserResult.action?.controlId
+    || browserResult.targetSnapshot?.controlId
+    || ""
+  );
+  if (expectedControlId && browserControlId && expectedControlId !== browserControlId) return null;
+  const expectedActionId = String(action.id || "");
+  const browserActionId = String(outcome.causedByActionId || browserResult.actionId || "");
+  if (expectedActionId && browserActionId && expectedActionId !== browserActionId) return null;
+  return outcome;
+}
+
 function expectedFor(governedAction = {}, browserResult = {}) {
   // The adapter-owned contract is authoritative. Browser acknowledgements
   // are evidence only and cannot replace the semantic outcome definition.
@@ -279,717 +306,46 @@ function expectedFor(governedAction = {}, browserResult = {}) {
     || {};
 }
 
-function exactFreeSelection(expected = {}, action = {}, beforePage = {}, afterPage = {}) {
-  const parentDecisionGroupId = expected.parentDecisionGroupId || action.affordance?.task?.parentDecisionGroupId || "";
-  const groupId = parentDecisionGroupId
-    || expected.decisionGroupId
-    || action.decisionGroupId
-    || action.targetSnapshot?.decisionGroupId
-    || "";
-  const group = groupById(afterPage, groupId);
-  const expectedControlId = parentDecisionGroupId
-    ? (expected.parentExpectedSelectedControlId || action.affordance?.task?.parentExpectedSelectedControlId || "")
-    : (expected.expectedSelectedControlId || expected.controlId || action.controlId || "");
-  const chosen = controlById(afterPage, group?.selectedControlId || expectedControlId);
-  const semantic = text(`${group?.selectedSemantic || ""} ${chosen?.semantic || ""} ${chosen?.risk || ""} ${chosen?.label || group?.selectedLabel || ""}`);
-  const exact = Boolean(group && expectedControlId && group.selectedControlId === expectedControlId && selected(chosen || {}));
-  const freeDisposition = /decline|free|no[_ -]?extra|no thanks|without|skip|none/.test(semantic)
-    && !/purchase|premium|upgrade/.test(semantic);
-  const paidSelected = (afterPage.controls || []).some((control) => (
-    control.decisionGroupId === groupId
-    && selected(control)
-    && control.controlId !== expectedControlId
-    && /paid|money|purchase|premium|upgrade/.test(text(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`))
-  ));
-  const validation = blockingValidationIssues(afterPage).some((issue) => (
-    issue.stageWide === true
-    || issue.controlId === expectedControlId
-    || (group?.sectionId && issue.sectionId === group.sectionId)
-  ));
-  const selectedEvidence = group?.selectedEvidence || {};
-  const selectedChargeAmount = Number(selectedEvidence.structuredPrice?.amount ?? chosen?.structuredPrice?.amount);
-  const paidTransactionForGroup = (page = {}) => (page.transactionFacts?.selectedExtras || []).find((extra) => (
-    String(extra.decisionGroupId || "") === groupId
-    && (
-      Number(extra.priceAmount) > 0
-      || /paid|money|selected_paid/.test(text(extra.disposition || ""))
-    )
-    && !/decline|free|remove|skip|without|none|no extra/.test(text(extra.disposition || ""))
-  )) || null;
-  const beforePaidTransaction = paidTransactionForGroup(beforePage);
-  const afterPaidTransaction = paidTransactionForGroup(afterPage);
-  const semanticOwnershipLink = (beforePage.semanticOwnershipLinks || []).find((link) => (
-    link.linkId === expected.semanticOwnershipLinkId
-    && link.sourceDecisionGroupId === groupId
-    && link.correctionControlId === expectedControlId
-    && link.status === "resolved"
-  )) || null;
-  const linkedPaidSelectionCleared = Boolean(
-    semanticOwnershipLink
-    && beforePaidTransaction
-    && !afterPaidTransaction
-  );
-  const selectedChargeRemoved = expected.requireChargeRemoved !== true || Boolean(
-    linkedPaidSelectionCleared
-    ||
-    !group
-    || (
-      selectedEvidence.disposition === "free"
-      && (!Number.isFinite(selectedChargeAmount) || selectedChargeAmount <= 0)
-    )
-    || (Number.isFinite(selectedChargeAmount) && selectedChargeAmount === 0)
-  );
-  const unrelatedSelectionChangesObserved = unrelatedSelectionChanges(beforePage, afterPage, groupId)
-    .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
-  const exactOrLinkedCorrection = (exact && freeDisposition) || linkedPaidSelectionCleared;
-  const childSurfaceId = expected.childSurfaceId || "";
-  const childSurfaceDismissed = expected.requireChildSurfaceDismissed !== true
-    || !childSurfaceId
-    || String(afterPage.currentSurface?.id || "surface-page") !== childSurfaceId;
-  return {
-    satisfied: exactOrLinkedCorrection
-      && childSurfaceDismissed
-      && selectedChargeRemoved
-      && unrelatedSelectionChangesObserved.length === 0
-      && !paidSelected
-      && !priceIncreased(beforePage, afterPage)
-      && !validation,
-    evidence: {
-      groupId,
-      parentDecisionGroupId,
-      expectedControlId,
-      selectedControlId: group?.selectedControlId || "",
-      freeDisposition,
-      semanticOwnershipLinkId: semanticOwnershipLink?.linkId || "",
-      linkedPaidSelectionCleared,
-      childSurfaceDismissed,
-      selectedChargeRemoved,
-      selectedChargeAmount: Number.isFinite(selectedChargeAmount) ? selectedChargeAmount : null,
-      unrelatedSelectionChanges: unrelatedSelectionChangesObserved,
-      paidSelected,
-      validation
-    }
-  };
-}
 
-function policyAuthorized(action = {}, expected = {}) {
-  return expected.policyAuthorized === true
-    || action.policy?.allow === true
-    || action.policyDecision?.allow === true
-    || action.affordance?.policy?.allow === true;
-}
-
-function policySafeChoiceTransition(expected = {}, action = {}, beforePage = {}, afterPage = {}, diff = {}) {
-  const groupId = expected.decisionGroupId || action.decisionGroupId || action.targetSnapshot?.decisionGroupId || "";
-  const controlId = expected.expectedSelectedControlId || expected.controlId || action.controlId || "";
-  const beforeControl = controlById(beforePage, controlId) || action.targetSnapshot || {};
-  const afterControl = controlById(afterPage, controlId);
-  const afterGroup = groupById(afterPage, groupId);
-  const afterControlAvailability = afterControl
-    ? agentContract.controlAvailability(afterControl)
-    : agentContract.DECISION_AVAILABILITY.INACTIVE;
-  const afterGroupAvailability = afterGroup
-    ? agentContract.decisionAvailability(afterGroup, afterPage.controls || [])
-    : agentContract.DECISION_AVAILABILITY.INACTIVE;
-  const sourceRetired = Boolean(
-    controlId
-    && afterControlAvailability === agentContract.DECISION_AVAILABILITY.INACTIVE
-    && afterGroupAvailability === agentContract.DECISION_AVAILABILITY.INACTIVE
-  );
-  const activeSuccessorDecision = (afterPage.decisionGroups || []).some((group) => (
-    (group.decisionGroupId || group.requirementId) !== groupId
-    && agentContract.decisionAvailability(group, afterPage.controls || []) === agentContract.DECISION_AVAILABILITY.ACTIVE
-  ));
-  const advanced = Boolean(
-    diff.urlChanged
-    || diff.progressChanged
-    || (sourceRetired && activeSuccessorDecision && meaningfulDiff(diff))
-  );
-  const meaning = text([
-    expected.expectedDisposition,
-    action.intent,
-    action.mechanicalEffect,
-    beforeControl.physicalEffect,
-    beforeControl.semantic,
-    beforeControl.risk,
-    beforeControl.label
-  ].filter(Boolean).join(" "));
-  const amount = Number(beforeControl.structuredPrice?.amount);
-  const explicitlySafe = (Number.isFinite(amount) && amount === 0)
-    || /decline|safe decline|free|included|without|skip|no thanks|no extra|none/.test(meaning);
-  const ownedValidation = blockingValidationIssues(afterPage).some((issue) => (
-    issue.stageWide === true
-    || (controlId && issue.controlId === controlId)
-  ));
-  const unrelated = unrelatedSelectionChanges(beforePage, afterPage, groupId)
-    .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
-  const paidMutation = interveningPaidMutation(beforePage, afterPage, action);
-  const satisfied = Boolean(
-    policyAuthorized(action, expected)
-    && explicitlySafe
-    && sourceRetired
-    && advanced
-    && !priceIncreased(beforePage, afterPage)
-    && !ownedValidation
-    && unrelated.length === 0
-    && !paidMutation
-  );
-  return {
-    satisfied,
-    evidence: {
-      completionMode: satisfied ? "safe_stage_transition" : "unproven_transition",
-      groupId,
-      controlId,
-      policyAuthorized: policyAuthorized(action, expected),
-      explicitlySafe,
-      sourceDisappeared: sourceRetired,
-      sourceRetired,
-      afterControlAvailability,
-      afterGroupAvailability,
-      activeSuccessorDecision,
-      advanced,
-      stageChanged: Boolean(diff.stageChanged),
-      urlChanged: Boolean(diff.urlChanged),
-      progressChanged: Boolean(diff.progressChanged),
-      priceIncreased: priceIncreased(beforePage, afterPage),
-      ownedValidation,
-      unrelatedSelectionChanges: unrelated,
-      paidMutation
-    }
-  };
-}
-
-function policyConflictResolution(expected = {}, action = {}, beforePage = {}, afterPage = {}) {
-  const groupId = expected.decisionGroupId || action.decisionGroupId || "";
-  const paidTransaction = (page = {}) => (page.transactionFacts?.selectedExtras || []).find((extra) => (
-    String(extra.decisionGroupId || "") === groupId
-    && (
-      Number(extra.priceAmount) > 0
-      || /paid|money|selected_paid/.test(text(extra.disposition || ""))
-    )
-    && !/decline|free|remove|skip|without|none|no extra/.test(text(extra.disposition || ""))
-  )) || null;
-  const paidGroup = (page = {}) => {
-    const group = groupById(page, groupId);
-    const evidence = group?.selectedEvidence || {};
-    const amount = Number(evidence.structuredPrice?.amount);
-    return Boolean(group && evidence.selected === true && (
-      evidence.disposition === "paid"
-      || (Number.isFinite(amount) && amount > 0)
-      || /selected_paid|add_paid|money|purchase/.test(text(`${group.selectedSemantic || ""} ${evidence.semantic || ""} ${evidence.risk || ""}`))
-    ));
-  };
-  const beforeTransaction = paidTransaction(beforePage);
-  const afterTransaction = paidTransaction(afterPage);
-  const beforeGroup = groupById(beforePage, groupId);
-  const afterGroup = groupById(afterPage, groupId);
-  const selectedControlId = String(
-    beforeGroup?.selectedEvidence?.selectedControlId
-    || beforeGroup?.selectedControlId
-    || ""
-  );
-  const afterSelectedControl = controlById(afterPage, selectedControlId);
-  const afterSelectedText = text(
-    afterPage.foreground?.progressMarkers?.selectedText
-    || afterPage.visualState?.foreground?.progressMarkers?.selectedText
-    || ""
-  );
-  const exactControlUnselected = Boolean(
-    selectedControlId && (!afterSelectedControl || !selected(afterSelectedControl))
-  );
-  const explicitUnselectedState = /not selected|unselected|no selection|none selected/.test(afterSelectedText);
-  const groupSelectionCleared = Boolean(
-    !afterGroup
-    || (afterGroup.selectedEvidence?.selected !== true && !afterGroup.selectedControlId)
-  );
-  const beforePaid = Boolean(beforeTransaction || paidGroup(beforePage));
-  const selectedItemCleared = Boolean(
-    beforePaid && (exactControlUnselected || explicitUnselectedState || groupSelectionCleared)
-  );
-  const afterPaidMetadata = Boolean(afterTransaction || paidGroup(afterPage));
-  const afterPaid = Boolean(afterTransaction || (paidGroup(afterPage) && !selectedItemCleared));
-  const chargeCleared = beforeTransaction ? !afterTransaction : !afterPaid;
-  const unrelated = unrelatedSelectionChanges(beforePage, afterPage, groupId)
-    .filter((change) => change.decisionGroupId !== expected.correctionDecisionGroupId);
-  const validation = blockingValidationIssues(afterPage).some((issue) => (
-    issue.stageWide === true
-    || issue.controlId === (expected.controlId || action.controlId)
-  ));
-  return {
-    satisfied: Boolean(
-      expected.semanticOwnershipLinkId
-      && beforePaid
-      && selectedItemCleared
-      && !afterPaid
-      && chargeCleared
-      && unrelated.length === 0
-      && !priceIncreased(beforePage, afterPage)
-      && !validation
-    ),
-    evidence: {
-      groupId,
-      semanticOwnershipLinkId: expected.semanticOwnershipLinkId || "",
-      intendedOutcome: expected.intendedOutcome || "unknown",
-      beforePaid,
-      afterPaid,
-      afterPaidMetadata,
-      selectedItemCleared,
-      exactControlUnselected,
-      explicitUnselectedState,
-      groupSelectionCleared,
-      chargeCleared,
-      selectedChargeRemoved: chargeCleared,
-      unrelatedSelectionChanges: unrelated,
-      validation
-    }
-  };
-}
-
-function observationProgressFingerprint(observation = {}) {
-  const page = observation.page || {};
-  return JSON.stringify(
-    page.foreground?.progressMarkers
-      || page.visualState?.foreground?.progressMarkers
-      || page.progressMarkers
-      || {}
-  );
-}
-
-function destinationProgressFromOrigin(afterObservation = {}, navigationContext = null) {
-  if (!navigationContext?.destinationReady || !navigationContext.origin) {
-    return { ready: false, progressed: false };
-  }
-  const origin = navigationContext.origin;
-  const afterPage = pageOf(afterObservation);
-  const afterUrl = afterPage.url || afterObservation.url || "";
-  const afterSurfaceId = surfaceOf(afterPage).id || "";
-  const afterProgress = observationProgressFingerprint(afterObservation);
-  const progressed = Boolean(
-    (origin.url && afterUrl && afterUrl !== origin.url)
-    || (origin.surfaceId && afterSurfaceId && afterSurfaceId !== origin.surfaceId)
-    || (
-      origin.progressFingerprint
-      && afterProgress
-      && afterProgress !== "{}"
-      && afterProgress !== origin.progressFingerprint
-    )
-  );
-  return {
-    ready: true,
-    progressed,
-    originUrl: origin.url || "",
-    afterUrl,
-    originSurfaceId: origin.surfaceId || "",
-    afterSurfaceId
-  };
-}
-
-function exactBrowserVerification(browserResult = {}, expected = {}, action = {}) {
-  const browserExpected = browserResult.expectedOutcome
-    || (browserResult.expectedPostconditions || []).find((condition) => condition?.type === expected.type)
-    || null;
-  const expectedControlId = String(expected.controlId || action.controlId || action.targetSnapshot?.controlId || "");
-  const browserControlId = String(
-    browserExpected?.controlId
-    || browserResult.action?.controlId
-    || browserResult.targetSnapshot?.controlId
-    || ""
-  );
-  const actionMatches = !browserResult.actionId
-    || !action.id
-    || String(browserResult.actionId) === String(action.id);
-  const typeMatches = Boolean(browserExpected?.type && browserExpected.type === expected.type);
-  const controlMatches = !expectedControlId || !browserControlId || expectedControlId === browserControlId;
-  const failed = Boolean(
-    browserResult.failureCode
-    || browserResult.outcome?.ok === false
-    || browserResult.feedback?.outcomeVerified === false
-  );
-  return Boolean(
-    actionMatches
-    && typeMatches
-    && controlMatches
-    && !failed
-    && browserResult.dispatched === true
-    && browserResult.verified === true
-    && browserResult.expectedOutcomeObserved === true
-    && browserResult.postconditionSatisfied === true
-  );
-}
-
-function evaluatePostcondition(
-  expected = {},
-  action = {},
-  beforeObservation = {},
-  afterObservation = {},
-  diff = {},
-  browserResult = {},
-  navigationContext = null
-) {
-  const beforePage = pageOf(beforeObservation);
-  const afterPage = pageOf(afterObservation);
-  const controlId = expected.controlId || action.controlId || action.targetSnapshot?.controlId || "";
-  const beforeControl = controlById(beforePage, controlId);
-  let afterControl = controlById(afterPage, controlId);
-  const type = expected.type || "observable_change";
-  const semantics = normalizedActionSemantics(action, { expectedOutcome: expected });
-
-  // The browser owns exact post-action verification because it observes the
-  // real DOM before and after dispatch. Backend transition analysis adds
-  // parent-stage/transaction consequences; it must not redefine the same
-  // matching local proof as failure merely because transport compaction or a
-  // destination frame changed the later diff.
-  if (exactBrowserVerification(browserResult, { ...expected, type }, action)) {
-    return {
-      type,
-      satisfied: true,
-      evidence: {
-        browserVerified: true,
-        actionId: browserResult.actionId || action.id || "",
-        controlId,
-        feedback: browserResult.feedback || null
-      }
-    };
-  }
-
-  if (type === "policy_conflict_resolved") {
-    const resolved = policyConflictResolution(expected, action, beforePage, afterPage);
-    return { type, ...resolved };
-  }
-  if (type === "control_unselected") {
-    const wasSelected = Boolean(beforeControl && (
-      beforeControl.selected || beforeControl.state?.checked || beforeControl.state?.selected
-    ));
-    const isSelected = Boolean(afterControl && (
-      afterControl.selected || afterControl.state?.checked || afterControl.state?.selected
-    ));
-    return {
-      type,
-      satisfied: Boolean(wasSelected && !isSelected && !priceIncreased(beforePage, afterPage)),
-      evidence: { wasSelected, isSelected, controlId }
-    };
-  }
-  if (type === "exact_free_option_selected") {
-    const exact = exactFreeSelection(expected, action, beforePage, afterPage);
-    const safeTransition = policySafeChoiceTransition(expected, action, beforePage, afterPage, diff);
-    const browserExpected = browserResult.expectedOutcome
-      || browserResult.expectedPostconditions?.find((condition) => condition?.type === "exact_free_option_selected")
-      || expected;
-    const browserVerifiedBeforeDismissal = Boolean(
-      !exact.satisfied
-      && !safeTransition.satisfied
-      && browserResult.verified === true
-      && browserExpected?.type === "exact_free_option_selected"
-      && (diff.modalClosed || (diff.disappeared || []).some((item) => item.controlId === (expected.controlId || action.controlId)))
-      && !priceIncreased(beforePage, afterPage)
-      && !(diff.errorsAppeared || []).length
-    );
-    return {
-      type,
-      satisfied: exact.satisfied || safeTransition.satisfied || browserVerifiedBeforeDismissal,
-      evidence: {
-        ...exact.evidence,
-        ...safeTransition.evidence,
-        completionMode: exact.satisfied
-          ? (expected.parentDecisionGroupId ? "child_confirmed_parent_selection" : "same_surface_selection")
-          : (safeTransition.satisfied
-            ? "safe_stage_transition"
-            : (browserVerifiedBeforeDismissal ? "browser_verified_dismissal" : "unproven")),
-        browserVerifiedBeforeDismissal
-      }
-    };
-  }
-  if (type === "date_value_committed") {
-    const hierarchical = expected.logicalFieldId
-      ? verifyLogicalField(afterPage, { ...expected, controlId }, {})
-      : null;
-    if (!afterControl && expected.logicalFieldId) {
-      const reboundField = resolveLogicalFields(afterPage, {}).find((field) => (
-        field.logicalFieldId === expected.logicalFieldId
-      ));
-      const reboundComponent = reboundField?.components.find((component) => (
-        component.role === (expected.componentRole || "value")
-      ));
-      afterControl = reboundComponent?.control || null;
-    }
-    const codec = expected.dateCodec || afterControl?.dateField || {};
-    const wantedCanonicalValue = String(expected.expectedCanonicalValue || "");
-    const wantedComponentValue = String(expected.expectedNormalizedValue || "");
-    const rawDateValue = String(
-      afterControl?.state?.rawValue
-      || afterControl?.state?.normalizedValue
-      || afterControl?.currentValue
-      || ""
-    );
-    const decodedWithExpectedCodec = codec?.kind === "full" && rawDateValue
-      ? decodeDateFromField(rawDateValue, codec)
-      : null;
-    const actualCanonicalValue = String(
-      afterControl?.state?.canonicalDateValue
-      || decodedWithExpectedCodec?.canonicalValue
-      || ""
-    );
-    const actualComponentValue = String(afterControl?.state?.dateComponentValue || "");
-    const verifiedControlId = afterControl?.controlId || controlId;
-    const validation = blockingValidationIssues(afterPage).some((issue) => (
-      Boolean(verifiedControlId && issue.controlId === verifiedControlId)
-      || Boolean(
-        expected.logicalFieldId
-        && issue.logicalFieldId === expected.logicalFieldId
-        && issue.componentRole === (expected.componentRole || "value")
-      )
-    ));
-    const exact = codec.kind === "component"
-      ? Boolean(
-          hierarchical?.componentResult?.satisfied
-          || (wantedComponentValue && actualComponentValue === wantedComponentValue)
-        )
-      : Boolean(wantedCanonicalValue && actualCanonicalValue === wantedCanonicalValue);
-    return {
-      type,
-      satisfied: exact && !validation,
-      evidence: {
-        controlId: verifiedControlId,
-        codec,
-        wantedCanonicalValue,
-        actualCanonicalValue,
-        wantedComponentValue,
-        actualComponentValue,
-        validation,
-        componentResult: hierarchical?.componentResult || null,
-        logicalFieldResult: hierarchical?.logicalFieldResult || null
-      }
-    };
-  }
-  if (["normalized_value_changed", "logical_component_committed", "field_value_changed"].includes(type)) {
-    if (expected.logicalFieldId) {
-      const hierarchical = verifyLogicalField(afterPage, { ...expected, controlId }, {});
-      return {
-        type,
-        satisfied: hierarchical.componentResult.satisfied,
-        evidence: {
-          controlId: hierarchical.component?.controlId || controlId,
-          componentResult: hierarchical.componentResult,
-          logicalFieldResult: hierarchical.logicalFieldResult
-        }
-      };
-    }
-    const wanted = text(expected.expectedNormalizedValue || expected.expectedValue || action.value || "").replace(/\s+/g, "");
-    const actual = controlValue(afterControl || {});
-    return { type, satisfied: Boolean(afterControl && wanted && actual === wanted), evidence: { controlId, wanted, actual } };
-  }
-  if (type === "control_selected") {
-    const hierarchical = expected.logicalFieldId
-      ? verifyLogicalField(afterPage, { ...expected, controlId }, {})
-      : null;
-    const groupId = expected.decisionGroupId || action.decisionGroupId || afterControl?.decisionGroupId || "";
-    const group = groupById(afterPage, groupId);
-    const wanted = expected.expectedSelectedControlId || expected.controlId || action.controlId || "";
-    const actual = group?.selectedControlId || (selected(afterControl || {}) ? afterControl?.controlId : "");
-    const conflictingSelected = (expected.conflictingControlIds || []).filter((controlId) => {
-      const control = controlById(afterPage, controlId);
-      return selected(control || {});
-    });
-    const validation = blockingValidationIssues(afterPage).filter((issue) => (
-      issue.stageWide === true || issue.controlId === wanted
-    ));
-    return {
-      type,
-      satisfied: Boolean(
-        (
-          hierarchical?.componentResult?.satisfied
-          || (wanted && actual === wanted)
-        )
-        && !conflictingSelected.length
-        && !validation.length
-      ),
-      evidence: {
-        groupId,
-        wanted,
-        actual,
-        conflictingSelected,
-        validation,
-        componentResult: hierarchical?.componentResult || null,
-        logicalFieldResult: hierarchical?.logicalFieldResult || null
-      }
-    };
-  }
-  if (["options_surface_appeared", "active_surface_change", "semantic_progress"].includes(type)) {
-    const expanded = afterControl?.state?.expanded === true && beforeControl?.state?.expanded !== true;
-    const optionAppeared = (diff.appeared || []).some((item) => /option|choice|radio|menuitem/.test(text(item.role)));
-    const beforeValue = controlValue(beforeControl || {});
-    const afterValue = controlValue(afterControl || {});
-    const valueChanged = type === "semantic_progress" && Boolean(afterControl && beforeValue !== afterValue);
-    return {
-      type,
-      satisfied: Boolean(expanded || diff.modalOpened || optionAppeared || diff.surfaceChanged || valueChanged),
-      evidence: { expanded, optionAppeared, modalOpened: diff.modalOpened, beforeValue, afterValue, valueChanged }
-    };
-  }
-  if (type === "active_surface_dismissed") {
-    const expectedSurfaceId = expected.surfaceId || action.targetSnapshot?.surfaceId || surfaceOf(beforePage).id || "";
-    const afterSurface = surfaceOf(afterPage);
-    const gone = Boolean(diff.modalClosed || (expectedSurfaceId && afterSurface.id !== expectedSurfaceId));
-    const advancedInPlace = Boolean(diff.progressChanged || diff.urlChanged);
-    return {
-      type,
-      satisfied: gone || advancedInPlace,
-      evidence: {
-        expectedSurfaceId,
-        currentSurfaceId: afterSurface.id || "",
-        modalClosed: diff.modalClosed,
-        advancedInPlace,
-        progressChanged: diff.progressChanged,
-        stageChanged: diff.stageChanged,
-        urlChanged: diff.urlChanged
-      }
-    };
-  }
-  if (type === "requirement_status") {
-    const groupId = expected.requirementId || expected.decisionGroupId || action.decisionGroupId || "";
-    const group = groupById(afterPage, groupId);
-    return { type, satisfied: Boolean(group && group.status === (expected.status || "satisfied")), evidence: { groupId, status: group?.status || "" } };
-  }
-  if (type === "validation_or_requirement_resolved") {
-    const controlId = expected.controlId || action.controlId || action.targetSnapshot?.controlId || "";
-    const beforeIssues = blockingValidationIssues(beforePage).filter((issue) => (
-      !controlId || issue.controlId === controlId || issue.stageWide === true
-    ));
-    const afterIssues = blockingValidationIssues(afterPage).filter((issue) => (
-      !controlId || issue.controlId === controlId || issue.stageWide === true
-    ));
-    const afterControl = controlById(afterPage, controlId);
-    const state = afterControl?.state || {};
-    const settled = Boolean(
-      afterControl
-      && (state.valuePresent === true || state.checked === true || state.selected === true || afterControl.selected === true)
-    );
-    const satisfied = beforeIssues.length > 0
-      && afterIssues.length === 0
-      && settled
-      && !priceIncreased(beforePage, afterPage);
-    return {
-      type,
-      satisfied,
-      evidence: {
-        controlId,
-        beforeValidationCount: beforeIssues.length,
-        afterValidationCount: afterIssues.length,
-        settled,
-        priceIncreased: priceIncreased(beforePage, afterPage)
-      }
-    };
-  }
-  if (type === "target_in_view") {
-    const target = controlById(afterPage, expected.controlId || action.controlId || "");
-    return { type, satisfied: Boolean(target && target.visualRegion?.inViewport === true), evidence: { controlId: target?.controlId || "", inViewport: target?.visualRegion?.inViewport === true } };
-  }
-  if (type === "stage_exit_or_feedback") {
-    const satisfied = !currentSurfaceIsSiteFailure(afterPage)
-      && Boolean(diff.urlChanged || diff.progressChanged || diff.modalOpened || diff.modalClosed || diff.errorsAppeared?.length || diff.surfaceChanged);
-    return { type, satisfied, evidence: { stageChanged: diff.stageChanged, progressChanged: diff.progressChanged, modalOpened: diff.modalOpened, errorsAppeared: diff.errorsAppeared } };
-  }
-  if (type === "current_surface_advanced") {
-    const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
-    const advanced = !currentSurfaceIsSiteFailure(afterPage) && Boolean(
-      diff.progressChanged
-      || diff.urlChanged
-      || (diff.surfaceChanged && !diff.modalOpened && !diff.modalClosed)
-      || (destination.ready && destination.progressed)
-    );
-    return {
-      type,
-      satisfied: advanced,
-      evidence: {
-        stageChanged: diff.stageChanged,
-        urlChanged: diff.urlChanged,
-        progressChanged: diff.progressChanged,
-        surfaceChanged: diff.surfaceChanged,
-        modalOpened: diff.modalOpened,
-        modalClosed: diff.modalClosed,
-        destination
-      }
-    };
-  }
-  if (type === "checkout_stage_advanced") {
-    const destination = destinationProgressFromOrigin(afterObservation, navigationContext);
-    const advanced = !currentSurfaceIsSiteFailure(afterPage) && Boolean(
-      diff.urlChanged
-      || diff.progressChanged
-      || (destination.ready && destination.progressed)
-    );
-    return {
-      type,
-      satisfied: advanced,
-      evidence: {
-        stageChanged: diff.stageChanged,
-        urlChanged: diff.urlChanged,
-        progressChanged: diff.progressChanged,
-        modalOpened: diff.modalOpened,
-        modalClosed: diff.modalClosed,
-        destination
-      }
-    };
-  }
-  if (["section_choice_verified", "observable_change"].includes(type)) {
-    return { type, satisfied: meaningfulDiff(diff) && browserResult.dispatched === true, evidence: { targetReacted: diff.targetReacted } };
-  }
-  return {
-    type,
-    satisfied: Boolean(browserResult.verified === true && meaningfulDiff(diff)),
-    evidence: { browserVerified: browserResult.verified === true, targetReacted: diff.targetReacted }
-  };
-}
-
-function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}) {
+function verifiedPhysicalResult(action = {}, postcondition = {}, diff = {}, browserSettlement = null) {
   const predictedEffect = action.mechanicalEffect || action.affordance?.mechanicalEffect || action.affordance?.physicalEffect || action.affordance?.effect || "unknown";
-  if (diff.modalOpened) {
-    return { effect: "open_surface", verified: true, evidence: { modalOpened: true } };
+  if (!browserSettlement) {
+    return {
+      effect: predictedEffect,
+      verified: false,
+      evidence: {
+        browserSettlementStatus: "MISSING_CANONICAL_BROWSER_OUTCOME"
+      }
+    };
   }
-  if (postcondition.satisfied && postcondition.type === "exact_free_option_selected") {
-    return { effect: "select_free_option", verified: true, evidence: postcondition.evidence };
-  }
-  if (postcondition.satisfied && postcondition.type === "policy_conflict_resolved") {
-    return { effect: "select_free_option", verified: true, evidence: postcondition.evidence };
-  }
-  if (postcondition.satisfied && postcondition.type === "control_selected") {
-    return { effect: predictedEffect === "select_paid_option" ? "select_paid_option" : predictedEffect, verified: true, evidence: postcondition.evidence };
-  }
-  if (postcondition.satisfied && ["normalized_value_changed", "logical_component_committed", "field_value_changed", "date_value_committed"].includes(postcondition.type)) {
-    return { effect: predictedEffect === "enter_payment_credentials" ? "enter_payment_credentials" : "set_field_value", verified: true, evidence: postcondition.evidence };
-  }
-  if (postcondition.satisfied && postcondition.type === "checkout_stage_advanced") {
-    return { effect: "advance_checkout_stage", verified: true, evidence: postcondition.evidence };
-  }
-  if (postcondition.satisfied && postcondition.type === "current_surface_advanced") {
-    return { effect: "advance_surface", verified: true, evidence: postcondition.evidence };
-  }
-  if (diff.modalClosed && !diff.urlChanged && !diff.progressChanged) {
-    return { effect: "dismiss_surface", verified: true, evidence: { modalClosed: true } };
-  }
-  if (postcondition.satisfied) {
-    return { effect: predictedEffect, verified: true, evidence: postcondition.evidence };
-  }
-  return { effect: meaningfulDiff(diff) ? "unknown" : predictedEffect, verified: false, evidence: postcondition.evidence || {} };
+  return {
+    effect: browserSettlement.observedEvidence?.mechanicalEffect || predictedEffect,
+    verified: browserSettlement.status === agentContract.ACTION_OUTCOME.SATISFIED,
+    evidence: {
+      browserSettlementStatus: browserSettlement.status,
+      causedByActionId: browserSettlement.causedByActionId || "",
+      originalSuccessContract: browserSettlement.originalSuccessContract || null
+    }
+  };
 }
 
-function currentObligationResultFor(action = {}, postcondition = {}, localMechanicalResult = {}, diff = {}) {
+function currentObligationResultFor(action = {}, postcondition = {}, localMechanicalResult = {}, diff = {}, browserSettlement = null) {
   const taskOutcome = action.affordance?.task?.outcomeContract?.taskOutcome || "";
   const compatibility = action.outcomeCompatibility || "unknown";
-  const completed = postcondition.satisfied === true;
-  const progress = !completed && (
-    localMechanicalResult.verified === true
-    || meaningfulDiff(diff)
-  );
   return Object.freeze({
-    outcomeId: action.affordance?.task?.surfaceSubgoalId || action.obligationId || "",
+    outcomeId: action.obligationId || action.affordance?.task?.goalId || "",
     taskOutcome,
-    status: completed ? "completed" : (progress ? "progress" : "no_progress"),
-    completed,
+    // Browser settlement closes only the leased local operation. The next
+    // DecisionFrame/TaskState reduction is the sole obligation authority.
+    status: browserSettlement?.status === agentContract.ACTION_OUTCOME.SATISFIED
+      ? "awaiting_fresh_reduction"
+      : "no_progress",
+    completed: false,
     compatibility,
     evidence: Object.freeze({
       postconditionType: postcondition.type || "",
       postconditionSatisfied: postcondition.satisfied === true,
+      browserSettlementStatus: browserSettlement?.status || "MISSING_CANONICAL_BROWSER_OUTCOME",
       mechanicalEffect: localMechanicalResult.effect || "unknown"
     })
   });
@@ -1006,10 +362,10 @@ function blockerFrom(afterObservation = {}, diff = {}) {
   return null;
 }
 
-function parentProgressFor(action = {}, afterObservation = {}, localEffect = {}, diff = {}) {
+function parentProgressFor(action = {}, afterObservation = {}, localEffect = {}, diff = {}, browserSettlement = null) {
   const task = action.affordance?.task || {};
   const contract = task.parentOutcomeContract || task.outcomeContract || {};
-  const outcomeId = task.stageOutcomeId || contract.outcomeId || task.transactionOutcomeId || "";
+  const outcomeId = contract.outcomeId || task.goalId || action.obligationId || "";
   const taskOutcome = contract.taskOutcome || "";
   const terminalEvidence = agentContract.compileTerminalEvidence(afterObservation);
   const completed = taskOutcome === "card_credential_entry_reached"
@@ -1017,12 +373,10 @@ function parentProgressFor(action = {}, afterObservation = {}, localEffect = {},
     : taskOutcome === "booking_confirmed"
       ? afterObservation?.page?.bookingConfirmation?.verified === true
       : false;
-  const usefulLocalProgress = localEffect.verified === true;
-  const usefulObservedProgress = meaningfulDiff(diff);
   return Object.freeze({
     outcomeId,
     taskOutcome,
-    status: completed ? "completed" : (usefulLocalProgress || usefulObservedProgress ? "progress" : "no_progress"),
+    status: completed ? "completed" : "no_progress",
     completed,
     evidence: Object.freeze({
       terminalBoundaryObserved: terminalEvidence.boundaryObserved === true,
@@ -1043,24 +397,28 @@ function evaluateTransition({
 } = {}) {
   const diff = diffObservations(beforeObservation, afterObservation);
   const expected = expectedFor(governedAction, browserResult);
+  const browserSettlement = matchingBrowserActionOutcome(browserResult, expected, governedAction);
   const code = String(browserResult.outcome?.code || browserResult.failureCode || browserResult.code || "");
   const beforePage = pageOf(beforeObservation || {});
   const afterPage = pageOf(afterObservation);
-  const postcondition = evaluatePostcondition(
-    expected,
-    governedAction,
-    beforeObservation || {},
-    afterObservation,
-    diff,
-    browserResult,
-    navigationContext
-  );
+  // Backend transition analysis does not run a second local verifier. It
+  // transports the browser settlement and separately evaluates durable
+  // safety/terminal consequences from the fresh observation.
+  const postcondition = Object.freeze({
+    type: expected.type || "exact_outcome_missing",
+    satisfied: browserSettlement?.status === agentContract.ACTION_OUTCOME.SATISFIED,
+    evidence: Object.freeze({
+      browserSettlementStatus: browserSettlement?.status || "MISSING_CANONICAL_BROWSER_OUTCOME",
+      causedByActionId: browserSettlement?.causedByActionId || "",
+      observedEvidence: browserSettlement?.observedEvidence || null
+    })
+  });
   const actionSemantics = normalizedActionSemantics(governedAction, { expectedOutcome: expected });
   const outcomeContract = governedAction.affordance?.task?.outcomeContract
     || outcomeContractForGoal(governedAction.goal || {}, beforeObservation || {});
-  const localMechanicalResult = verifiedPhysicalResult(governedAction, postcondition, diff);
-  const currentObligationResult = currentObligationResultFor(governedAction, postcondition, localMechanicalResult, diff);
-  const durableObjectiveProgress = parentProgressFor(governedAction, afterObservation, localMechanicalResult, diff);
+  const localMechanicalResult = verifiedPhysicalResult(governedAction, postcondition, diff, browserSettlement);
+  const currentObligationResult = currentObligationResultFor(governedAction, postcondition, localMechanicalResult, diff, browserSettlement);
+  const durableObjectiveProgress = parentProgressFor(governedAction, afterObservation, localMechanicalResult, diff, browserSettlement);
   const dispatched = browserResult.dispatched === true || browserResult.executed === true;
   const beforeMaterialHash = materialObservationHash(beforeObservation || {});
   const afterMaterialHash = materialObservationHash(afterObservation);
@@ -1070,6 +428,12 @@ function evaluateTransition({
     && beforeMaterialHash === afterMaterialHash
   );
   const unchangedMaterialState = sameMaterialObservation || !materialStateChanged(diff);
+  const destinationArrival = navigationDestinationArrival(
+    beforeObservation || {},
+    afterObservation,
+    diff,
+    navigationContext || {}
+  );
   let causality = interveningPaidMutation(beforePage, afterPage, governedAction);
   const recoverableChange = reversibleUnexpectedChange(governedAction, code, beforePage, afterPage);
   let status;
@@ -1091,21 +455,34 @@ function evaluateTransition({
     // a distinct proven method or stop.
     status = "no_effect";
     nextDirective = "try_distinct_capability";
+  } else if (browserSettlement?.status === agentContract.ACTION_OUTCOME.UNSAFE_CHANGE) {
+    status = "unsafe";
+    nextDirective = "stop_or_request_approval";
+  } else if (browserSettlement?.status === agentContract.ACTION_OUTCOME.REVEALED_BLOCKER) {
+    status = "blocked";
+    nextDirective = "rebuild_task_state";
+  } else if (browserSettlement?.status === agentContract.ACTION_OUTCOME.NO_EFFECT) {
+    status = "no_effect";
+    nextDirective = "try_distinct_capability";
+  } else if (browserSettlement?.status === agentContract.ACTION_OUTCOME.NO_RESULT) {
+    status = "no_result";
+    nextDirective = "try_distinct_capability";
   } else if (
     durableObjectiveProgress.completed
-    || (
-      navigationContext?.destinationReady === true
-      && postcondition.satisfied === true
-      && ["current_surface_advanced", "checkout_stage_advanced", "stage_exit_or_feedback"].includes(postcondition.type)
-    )
   ) {
     status = "achieved";
     nextDirective = "advance_goal";
-  } else if (currentObligationResult.completed) {
-    // Exact local completion is final for the current obligation even when
-    // the durable parent checkout has only progressed. Keep the two facts
-    // separate while ensuring recovery never records the actuator as failed.
-    status = "progressed";
+  } else if (
+    browserSettlement?.status === agentContract.ACTION_OUTCOME.DESTINATION_LOADING
+    && destinationArrival.arrived
+  ) {
+    status = "destination_arrived";
+    nextDirective = "rebuild_from_fresh_observation";
+  } else if (browserSettlement?.status === agentContract.ACTION_OUTCOME.DESTINATION_LOADING) {
+    status = "destination_loading";
+    nextDirective = "wait_for_destination";
+  } else if (browserSettlement?.status === agentContract.ACTION_OUTCOME.SATISFIED) {
+    status = "local_satisfied";
     nextDirective = "rebuild_from_fresh_observation";
   } else if (dispatched && postcondition.satisfied !== true && unchangedMaterialState) {
     // A new observation id or browser acknowledgement is not progress. The
@@ -1118,9 +495,6 @@ function evaluateTransition({
     // action strategy even when some unrelated visible change occurred.
     status = "no_effect";
     nextDirective = "try_distinct_capability";
-  } else if (meaningfulDiff(diff)) {
-    status = "progressed";
-    nextDirective = "rebuild_from_fresh_observation";
   } else if (dispatched) {
     status = "no_effect";
     nextDirective = "try_distinct_capability";
@@ -1136,32 +510,24 @@ function evaluateTransition({
   );
   const revealedBlocker = Boolean(
     causality
-    || (diff.modalOpened && !provenDestinationAdvance)
-    || (diff.errorsAppeared || []).length
+    || browserSettlement?.status === agentContract.ACTION_OUTCOME.REVEALED_BLOCKER
+    || (!browserSettlement && (
+      (diff.modalOpened && !provenDestinationAdvance)
+      || (diff.errorsAppeared || []).length
+    ))
   );
   const blocker = revealedBlocker
     ? (causality || blockerFrom(afterObservation, diff))
     : null;
-  const actionOutcome = agentContract.compileActionOutcome({
-    legacyStatus: status,
+  // The backend never recompiles local success from its own diff. It either
+  // transports the exact matching browser settlement or records that the
+  // local result lacked canonical browser authority. Safety and durable
+  // checkout consequences remain separate transition fields below.
+  const actionOutcome = browserSettlement || agentContract.compileActionOutcome({
+    status: agentContract.ACTION_OUTCOME.NO_RESULT,
     causedByActionId: browserResult.actionId || governedAction.id || "",
-    originalSuccessContract: expected,
-    introducedValidation: diff.errorsAppeared || [],
-    candidateOwnerControlIds: (diff.errorsAppeared || []).map((issue) => issue.controlId),
-    revealedBlocker,
-    // A causal mismatch or newly revealed paid selection is a blocker to
-    // reconcile from the fresh TaskState, not automatically an irreversible
-    // safety event. Reserve UNSAFE_CHANGE for genuinely unsafe/site-failure
-    // transitions; otherwise REVEALED_BLOCKER wins and exact corrections can
-    // be scheduled immediately.
-    unsafe: status === "unsafe" || currentSurfaceIsSiteFailure(afterPage),
-    satisfied: currentObligationResult.completed === true || status === "achieved",
-    progressed: status === "progressed" && currentObligationResult.completed !== true,
-    surfaceChanged: diff.modalOpened || diff.modalClosed,
-    urlChanged: diff.urlChanged,
-    progressChanged: diff.progressChanged,
-    priceChanged: diff.priceChanged,
-    transactionChanged: Boolean(causality || recoverableChange)
+    code: "MISSING_CANONICAL_BROWSER_OUTCOME",
+    originalSuccessContract: expected
   });
   if (actionOutcome.status === agentContract.ACTION_OUTCOME.REVEALED_BLOCKER) {
     nextDirective = "rebuild_task_state";
@@ -1187,27 +553,28 @@ function evaluateTransition({
     localMechanicalResult,
     currentObligationResult,
     durableObjectiveProgress,
+    destinationArrival,
     localEffect: localMechanicalResult,
     physicalResult: localMechanicalResult,
     parentProgress: durableObjectiveProgress,
     surfaceTaskOutcome: outcomeContract.taskOutcome,
     taskOutcome: durableObjectiveProgress.taskOutcome || outcomeContract.taskOutcome,
     taskOutcomeCompleted: durableObjectiveProgress.completed,
-    // Browser verification is local execution evidence. This evaluator is
-    // the single authority that decides whether the exact CurrentObligation
-    // postcondition completed; TaskState only consumes that verified fact on
-    // the next reduction.
-    completionAuthority: "transition_evaluator"
+    // A matching browser settlement is the local action-result authority.
+    // This evaluator derives only safety, blocker, and durable checkout
+    // consequences from the fresh observation. Legacy/synthetic results that
+    // predate the canonical settlement retain deterministic compatibility.
+    completionAuthority: browserSettlement ? "browser_verifier" : "missing_browser_settlement"
   };
 }
 
 module.exports = {
   crossesIrreversibleBoundary,
   currentObligationResultFor,
-  evaluatePostcondition,
   evaluateTransition,
-  meaningfulDiff,
+  matchingBrowserActionOutcome,
   materialStateChanged,
+  navigationDestinationArrival,
   parentProgressFor,
   reversibleUnexpectedChange,
   verifiedPhysicalResult

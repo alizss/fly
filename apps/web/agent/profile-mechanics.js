@@ -20,7 +20,6 @@ const {
 } = require("./logical-field");
 const { profileFieldLabel } = require("./profile-context");
 
-const { obligationField } = require("./current-obligation");
 
 const {
   descriptorOwnsActiveRequirement,
@@ -33,33 +32,38 @@ const {
 } = require("./profile-requirements");
 
 function descriptorFromPublishedProfileGoal(atom, observation = {}) {
-  if (atom.kind !== "profile_field") return null;
+  if ((atom?.kind) !== "profile_field") return null;
   const page = observation.page || {};
-  const publishedControlId = atom.controlId || atom.componentBinding?.controlId || "";
+  const publishedControlId = (atom?.controlId)
+    || (atom?.componentBinding)?.controlId
+    || "";
   const control = (page.controls || []).find((candidate) => candidate.controlId === publishedControlId) || null;
   if (!control || !ownsActiveRepresentation({}, control)) return null;
 
   const field = (page.fields || []).find((candidate) => candidate.controlId === control.controlId) || {};
-  const desiredValue = atom.expectedNormalizedValue
-    || atom.semanticGoal?.desiredValue
-    || atom.expectedValue
+  const desiredValue = (atom?.expectedNormalizedValue)
+    || (atom?.desiredStateDelta?.desiredValue)
+    || (atom?.expectedValue)
     || "";
   // The admitted logical-field postcondition is the semantic success fact.
   // An observed actuator may expose a narrower mechanical outcome (for
   // example `control_selected`), but it must not replace that fact. Split
   // state/actuator widgets often retain the canonical value on the logical
   // component rather than the clicked presentation node.
-  const expectedOutcome = atom.postcondition || atom.expectedOutcome || null;
+  const expectedOutcome = (atom?.successCondition)
+    || (atom?.expectedOutcome)
+    || null;
   const freshCapabilityContracts = (agentContract.observedComponentContract(control, {
     surfaceId: control.surfaceId || "surface-page"
   }).capabilities || []).map((capability) => ({
     ...capability,
     expectedOutcome: expectedOutcome || {}
   }));
-  const componentBinding = atom.componentBinding || {
-    logicalFieldId: atom.logicalFieldId || "",
-    componentIdentity: atom.descriptorKey || `${atom.logicalFieldId || control.stableKey || control.controlId}:${atom.componentRole || "value"}`,
-    componentRole: atom.componentRole || "value",
+  const componentBinding = (atom?.componentBinding) || {
+    logicalFieldId: (atom?.logicalFieldId) || "",
+    componentIdentity: (atom?.descriptorKey)
+      || `${(atom?.logicalFieldId) || control.stableKey || control.controlId}:${(atom?.componentRole) || "value"}`,
+    componentRole: (atom?.componentRole) || "value",
     controlId: control.controlId,
     controlRole: control.role || field.role || "",
     currentCanonicalValue: control.state?.normalizedValue || "",
@@ -68,22 +72,22 @@ function descriptorFromPublishedProfileGoal(atom, observation = {}) {
     observedOptions: control.options || []
   };
   return {
-    key: atom.descriptorKey || componentBinding.componentIdentity,
+    key: (atom?.descriptorKey) || componentBinding.componentIdentity,
     domOrder: Number(control.order || 0),
-    semanticType: atom.semanticType || atom.requirementContract?.semanticType || "",
-    ordinal: Number(atom.ordinal || 0),
-    label: control.label || field.label || atom.label || atom.semanticType || "",
+    semanticType: (atom?.semanticType) || (atom?.requirementContract)?.semanticType || "",
+    ordinal: Number((atom?.ordinal) || 0),
+    label: control.label || field.label || (atom?.label) || (atom?.semanticType) || "",
     field,
     control,
-    value: atom.expectedValue || desiredValue,
+    value: (atom?.expectedValue) || desiredValue,
     observedRole: control.role || field.role || componentBinding.controlRole || "",
     observedCapabilities: control.capabilities || [],
     // Capabilities are mechanics from the immutable current observation. They
     // are rebuilt here and never persisted in CurrentObligation.
     capabilityContracts: freshCapabilityContracts,
-    requirementContract: atom.requirementContract || null,
+    requirementContract: (atom?.requirementContract) || null,
     bindingContract: agentContract.canonicalPipelineContract({
-      requirement: atom.requirementContract || {},
+      requirement: (atom?.requirementContract) || {},
       component: {
         ...componentBinding,
         controlId: control.controlId,
@@ -91,36 +95,36 @@ function descriptorFromPublishedProfileGoal(atom, observation = {}) {
       },
       capability: {},
       expectedOutcome: expectedOutcome || {},
-      validationOwnership: atom.validationOwnership || {}
+      validationOwnership: (atom?.validationOwnership) || {}
     }),
     expectedOutcome,
     validationOwnership: atom.validationOwnership || null,
     choiceLike: Boolean(
-      atom.choiceLike
+      (atom?.choiceLike)
       || control.choiceContract
       || ["radio", "checkbox", "option"].includes(control.role || control.kind)
     ),
-    choiceTerms: [...(atom.choiceTerms || [])],
+    choiceTerms: [...((atom?.choiceTerms) || [])],
     currentNormalizedValue: control.state?.normalizedValue || "",
     desiredNormalizedValue: desiredValue,
     exactOption: componentBinding.exactOption || null,
-    canonicalValue: atom.expectedCanonicalValue || desiredValue,
-    dateCodec: atom.dateCodec || null,
-    codecError: atom.codecError || null,
+    canonicalValue: (atom?.expectedCanonicalValue) || desiredValue,
+    dateCodec: (atom?.dateCodec) || null,
+    codecError: (atom?.codecError) || null,
     hasValue: false,
     validationIssues: [],
     conflictingSelectedControlIds: [],
-    logicalFieldId: atom.logicalFieldId || componentBinding.logicalFieldId || "",
-    subjectId: atom.subjectId || atom.requirementContract?.subjectId || "traveler_1",
-    componentRole: atom.componentRole || componentBinding.componentRole || "value",
-    logicalStructure: atom.logicalStructure || "scalar",
+    logicalFieldId: (atom?.logicalFieldId) || componentBinding.logicalFieldId || "",
+    subjectId: (atom?.subjectId) || (atom?.requirementContract)?.subjectId || "traveler_1",
+    componentRole: (atom?.componentRole) || componentBinding.componentRole || "value",
+    logicalStructure: (atom?.logicalStructure) || "scalar",
     logicalCurrentCanonicalValue: "",
-    logicalDesiredCanonicalValue: atom.expectedCanonicalValue || desiredValue,
+    logicalDesiredCanonicalValue: (atom?.expectedCanonicalValue) || desiredValue,
     logicalFieldSatisfied: false,
     logicalFieldValidationIssues: [],
-    instructions: [...(atom.instructions || [])],
-    options: [...(atom.options || [])],
-    ambiguity: atom.ambiguity || null,
+    instructions: [...((atom?.instructions) || [])],
+    options: [...((atom?.options) || [])],
+    ambiguity: atom?.ambiguity || null,
     representationLifecycle: mergedRepresentationLifecycle(field, control)
   };
 }
@@ -246,7 +250,7 @@ function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}
   }
   if (strategy.operation === "type" && targetControl.role === "editable_combobox") {
     return {
-      type: "semantic_progress",
+      type: "normalized_value_changed",
       controlId: goalControl.controlId,
       expectedNormalizedValue: atom.expectedNormalizedValue || "",
       previousSurfaceId: surface?.id || "",
@@ -256,7 +260,7 @@ function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}
   }
   if (strategy.operation === "keyboard") {
     return {
-      type: "semantic_progress",
+      type: "options_surface_appeared",
       controlId: goalControl.controlId,
       expectedNormalizedValue: atom.expectedNormalizedValue || "",
       previousSurfaceId: surface?.id || "",
@@ -308,7 +312,7 @@ function expectedOutcomeForStrategy(atom, descriptor, strategy, observation = {}
     };
   }
   return {
-    type: "semantic_progress",
+    type: strategy.operation === "type" ? "normalized_value_changed" : "options_surface_appeared",
     controlId: goalControl.controlId,
     expectedNormalizedValue: atom.expectedNormalizedValue || "",
     previousSurfaceId: surface?.id || "",
@@ -684,42 +688,42 @@ function strategyCandidatesForAtom(atom = {}, descriptor = null, observation = {
 
 function semanticGoalAtom(goal = {}, attemptedCandidateIds = []) {
   return {
-    atomId: obligationField(goal, "goalId") || "",
-    kind: obligationField(goal, "kind") || "profile_field",
-    descriptorKey: obligationField(goal, "descriptorKey") || "",
-    semanticType: obligationField(goal, "semanticType") || "",
-    ordinal: Number(obligationField(goal, "ordinal") || 0),
-    logicalFieldId: obligationField(goal, "logicalFieldId") || "",
-    subjectId: obligationField(goal, "subjectId") || "traveler_1",
-    componentRole: obligationField(goal, "componentRole") || "value",
-    label: obligationField(goal, "label") || obligationField(goal, "semanticType") || "",
+    atomId: (goal?.id) || "",
+    kind: (goal?.kind) || "profile_field",
+    descriptorKey: (goal?.descriptorKey) || "",
+    semanticType: (goal?.semanticType) || "",
+    ordinal: Number((goal?.ordinal) || 0),
+    logicalFieldId: (goal?.logicalFieldId) || "",
+    subjectId: (goal?.subjectId) || "traveler_1",
+    componentRole: (goal?.componentRole) || "value",
+    label: (goal?.label) || (goal?.semanticType) || "",
     semanticGoal: {
-      semanticType: obligationField(goal, "semanticType") || "",
-      desiredValue: obligationField(goal, "desiredValue") || ""
+      semanticType: (goal?.semanticType) || "",
+      desiredValue: (goal?.desiredStateDelta?.desiredValue) || ""
     },
     postcondition: {
-      type: obligationField(goal, "postcondition")?.type || "normalized_value_changed",
-      expectedValue: obligationField(goal, "postcondition")?.expectedValue || obligationField(goal, "desiredValue") || "",
-      expectedCanonicalValue: obligationField(goal, "postcondition")?.expectedCanonicalValue || obligationField(goal, "canonicalValue") || "",
-      dateCodec: obligationField(goal, "postcondition")?.dateCodec || obligationField(goal, "dateCodec") || null
+      type: (goal?.successCondition)?.type || "normalized_value_changed",
+      expectedValue: (goal?.successCondition)?.expectedValue || (goal?.desiredStateDelta?.desiredValue) || "",
+      expectedCanonicalValue: (goal?.successCondition)?.expectedCanonicalValue || (goal?.canonicalValue) || "",
+      dateCodec: (goal?.successCondition)?.dateCodec || (goal?.dateCodec) || null
     },
-    expectedValue: obligationField(goal, "inputValue") || obligationField(goal, "desiredValue") || "",
-    expectedNormalizedValue: obligationField(goal, "desiredValue") || "",
-    expectedCanonicalValue: obligationField(goal, "canonicalValue") || "",
-    dateCodec: obligationField(goal, "dateCodec") || null,
-    codecError: obligationField(goal, "codecError") || null,
-    ambiguity: obligationField(goal, "ambiguity") || null,
-    logicalStructure: obligationField(goal, "logicalStructure") || "scalar",
-    label: obligationField(goal, "label") || obligationField(goal, "semanticType") || "",
-    instructions: [...(obligationField(goal, "instructions") || [])],
-    options: [...(obligationField(goal, "options") || [])],
-    controlId: obligationField(goal, "controlId") || obligationField(goal, "componentBinding")?.controlId || "",
-    requirementContract: obligationField(goal, "requirementContract") || null,
-    componentBinding: obligationField(goal, "componentBinding") || null,
-    capabilityContracts: [...(obligationField(goal, "capabilityContracts") || [])],
-    validationOwnership: obligationField(goal, "validationOwnership") || null,
-    expectedOutcome: obligationField(goal, "expectedOutcome") || obligationField(goal, "postcondition") || null,
-    choiceTerms: [...(obligationField(goal, "choiceTerms") || [])],
+    expectedValue: (goal?.inputValue) || (goal?.desiredStateDelta?.desiredValue) || "",
+    expectedNormalizedValue: (goal?.desiredStateDelta?.desiredValue) || "",
+    expectedCanonicalValue: (goal?.canonicalValue) || "",
+    dateCodec: (goal?.dateCodec) || null,
+    codecError: (goal?.codecError) || null,
+    ambiguity: goal?.ambiguity || null,
+    logicalStructure: (goal?.logicalStructure) || "scalar",
+    label: (goal?.label) || (goal?.semanticType) || "",
+    instructions: [...((goal?.instructions) || [])],
+    options: [...((goal?.options) || [])],
+    controlId: (goal?.controlId) || (goal?.componentBinding)?.controlId || "",
+    requirementContract: (goal?.requirementContract) || null,
+    componentBinding: (goal?.componentBinding) || null,
+    capabilityContracts: [...((goal?.capabilityContracts) || [])],
+    validationOwnership: (goal?.validationOwnership) || null,
+    expectedOutcome: (goal?.expectedOutcome) || (goal?.successCondition) || null,
+    choiceTerms: [...((goal?.choiceTerms) || [])],
     strategyHistory: (attemptedCandidateIds || []).map((strategyId) => ({
       strategyId,
       status: "attempted"
@@ -736,7 +740,6 @@ function profileGoalForDescriptor(descriptor = {}, observation = {}, previousGoa
   const {
     semanticGoal: _discardedAdaptiveSemanticGoal,
     selectionMode: _discardedSelectionMode,
-    adaptiveEnvelope: _discardedAdaptiveEnvelope,
     sourceGoal: _discardedSourceGoal,
     sourceGoalId: _discardedSourceGoalId,
     surfaceId: _discardedAdaptiveSurfaceId,
@@ -791,7 +794,7 @@ function profileGoalForDescriptor(descriptor = {}, observation = {}, previousGoa
   };
 }
 
-function selectNextProfileRequirement(observation = {}, traveler = {}, currentGoal = null, verifiedProfileComponents = [], options = {}) {
+function selectNextProfileRequirement(observation = {}, traveler = {}, currentWork = null, verifiedProfileComponents = [], options = {}) {
   const page = observation.page || {};
   const descriptors = (Array.isArray(options.descriptors)
     ? options.descriptors
@@ -804,8 +807,8 @@ function selectNextProfileRequirement(observation = {}, traveler = {}, currentGo
 
   // Requirement ordering is semantic authority only. Current DOM mechanics
   // must not decide which traveler fact Fly works on next.
-  if (currentGoal?.goalId) {
-    const rebound = descriptorForSemanticGoal(currentGoal, observation, traveler);
+  if (currentWork?.id) {
+    const rebound = descriptorForSemanticGoal(currentWork, observation, traveler);
     if (
       rebound
       && descriptorOwnsActiveRequirement(rebound, page)
@@ -815,7 +818,7 @@ function selectNextProfileRequirement(observation = {}, traveler = {}, currentGo
       ))
     ) {
       return {
-        goal: profileGoalForDescriptor(rebound, observation, currentGoal),
+        goal: profileGoalForDescriptor(rebound, observation, currentWork),
         candidates: [],
         blockedFields: [],
         failureCode: ""
@@ -832,32 +835,32 @@ function selectNextProfileRequirement(observation = {}, traveler = {}, currentGo
 }
 
 function profileGoalSatisfied(goal = {}, observation = {}, traveler = {}) {
-  if (!obligationField(goal, "goalId")) return false;
+  if (!(goal?.id)) return false;
   const verification = verifyLogicalField(observation.page || {}, {
-    logicalFieldId: obligationField(goal, "logicalFieldId") || "",
-    subjectId: obligationField(goal, "subjectId") || "traveler_1",
-    semanticType: obligationField(goal, "semanticType") || "",
-    componentRole: obligationField(goal, "componentRole") || "value",
-    controlId: obligationField(goal, "controlId") || "",
-    expectedComponentValue: obligationField(goal, "desiredValue") || "",
-    expectedCanonicalValue: obligationField(goal, "canonicalValue") || ""
+    logicalFieldId: (goal?.logicalFieldId) || "",
+    subjectId: (goal?.subjectId) || "traveler_1",
+    semanticType: (goal?.semanticType) || "",
+    componentRole: (goal?.componentRole) || "value",
+    controlId: (goal?.controlId) || "",
+    expectedComponentValue: (goal?.desiredStateDelta?.desiredValue) || "",
+    expectedCanonicalValue: (goal?.canonicalValue) || ""
   });
   if (!verification.logicalField) return false;
-  if (obligationField(goal, "reconciliation")) {
+  if ((goal?.reconciliation)) {
     const commit = verification.component?.control?.commitState || {};
     return Boolean(
       commit.status === "settled"
       && commit.popupClosed === true
-      && Number(commit.attempts || 0) > Number(obligationField(goal, "reconciliation").priorCommitAttempts || 0)
+      && Number(commit.attempts || 0) > Number((goal?.reconciliation).priorCommitAttempts || 0)
     );
   }
-  return obligationField(goal, "logicalStructure") === "composite"
+  return (goal?.logicalStructure) === "composite"
     ? verification.componentResult.satisfied
     : verification.componentResult.satisfied && verification.logicalFieldResult.satisfied;
 }
 
 function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, attemptedCandidateIds = [], options = {}) {
-  if (!obligationField(goal, "goalId")) return [];
+  if (!(goal?.id)) return [];
   const descriptor = descriptorForSemanticGoal(goal, observation, traveler, {
     // TaskState already compiled the semantic type and desired value. This
     // layer only rebinds that contract to the current exact actuator.
@@ -886,7 +889,7 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
   const atom = semanticGoalAtom(goal, attemptedCandidateIds);
   const mapped = strategyCandidatesForAtom(atom, descriptor, observation).map((strategy) => ({
     candidateId: strategy.strategyId,
-    obligationId: obligationField(goal, "goalId"),
+    obligationId: (goal?.id),
     type: strategy.actionType,
     operation: strategy.operation,
     ...deriveActionSemantics({
@@ -938,5 +941,6 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
 module.exports = {
   selectNextProfileRequirement,
   profileGoalSatisfied,
+  profileGoalForDescriptor,
   candidatesForProfileGoal
 };

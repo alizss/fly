@@ -6,12 +6,11 @@ const path = require("node:path");
 const {
   compileDecisionFrame,
   createObservationFrame,
-  currentObligationFromGoal,
-  CHECKOUT_SITUATION_VERSION,
   CURRENT_OBLIGATION_VERSION,
   DECISION_FRAME_VERSION,
   OBSERVATION_FRAME_VERSION
 } = require("../../apps/web/agent/authority-frames");
+const { compileCurrentObligation } = require("./obligation-test-helper");
 const { reduceTaskState } = require("./task-state-replay-adapter");
 const { reduceDecisionFrame, taskStateReadModel } = require("../../apps/web/agent/task-state-reducer");
 const { bindMechanics, buildCurrentCandidateSet } = require("./legacy-mechanics-binding-adapter");
@@ -60,7 +59,7 @@ function option(controlId, label, price = null) {
   };
 }
 
-test("V2 frames compile once and publish one small mechanics-binding obligation", () => {
+test("V3 frames compile once and publish one flat mechanics-binding obligation", () => {
   const free = option("bag_none", "No checked baggage");
   const paid = option("bag_paid", "Add 20 kg — 35 EUR", { amount: 35, currency: "EUR" });
   const observation = {
@@ -107,13 +106,21 @@ test("V2 frames compile once and publish one small mechanics-binding obligation"
 
   assert.equal(observationFrame.contractVersion, OBSERVATION_FRAME_VERSION);
   assert.equal(decisionFrame.contractVersion, DECISION_FRAME_VERSION);
+  assert.equal(free.semanticAuthority, undefined);
+  assert.equal(decisionFrame.semanticCompilation.controls[0].semanticAuthority, DECISION_FRAME_VERSION);
+  assert.equal(decisionFrame.semanticCompilation.controls[0].browserSemanticHint, undefined);
+  assert.equal(decisionFrame.semanticCompilation.controls[0].semanticHint, undefined);
+  assert.equal(decisionFrame.semanticCompilation.controls[0].semantic, free.semantic);
   assert.equal(taskState.decisionFrameId, decisionFrame.frameId);
   assert.equal(taskState.currentObligation.contractVersion, CURRENT_OBLIGATION_VERSION);
-  assert.equal(taskState.currentObligation.authority, "task_state");
   assert.equal(taskState.currentObligation.bindingContract, undefined);
   assert.equal(taskState.currentObligation.mechanics, undefined);
-  assert.ok(taskState.currentObligation.binding);
-  assert.equal(taskState.currentObligation.subject.decisionGroupId, "dg_baggage");
+  assert.equal(taskState.currentObligation.binding, undefined);
+  assert.equal(taskState.currentObligation.delta, undefined);
+  assert.ok(taskState.currentObligation.desiredStateDelta);
+  assert.equal(taskState.currentObligation.policyAuthorization, undefined);
+  assert.equal(taskState.currentObligation.desiredStateDelta.status, "EXACT_DELTA");
+  assert.equal(taskState.currentObligation.desiredStateDelta.decisionGroupId, "dg_baggage");
   assert.deepEqual(taskState.currentObligation.admittedControlIds, ["bag_none"]);
   assert.equal(taskState.currentGoal.candidateSet, undefined);
   assert.equal(taskState.currentGoal.candidates, undefined);
@@ -131,18 +138,325 @@ test("V2 frames compile once and publish one small mechanics-binding obligation"
     state: { taskState, approvals: {} },
     traveler: { booking_rules: "No paid baggage or extras" }
   });
-  assert.equal(candidateSet.obligationId, taskState.currentObligation.obligationId);
+  assert.equal(candidateSet.obligationId, taskState.currentObligation.id);
   assert.deepEqual(candidateSet.candidates.map((candidate) => candidate.controlId), ["bag_none"]);
   assert.throws(() => bindMechanics({
     obligation: taskState.currentObligation,
-    decisionFrame: { ...decisionFrame, observationHash: "stale_hash" },
+    decisionFrame: { ...decisionFrame, frameId: "stale_frame" },
     observation: decisionFrame.observation
   }), /BIND_MECHANICS_DECISION_FRAME_MISMATCH/);
 });
 
+test("DecisionFrame preserves an exact native-select group selection instead of reopening it", () => {
+  const titleControlId = "ctrl_title";
+  const titleGroupId = "dg_title";
+  const title = {
+    controlId: titleControlId,
+    stateElementId: "title_node",
+    preferredActivationElementId: "title_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: titleGroupId,
+    label: "Title: *",
+    name: "IDEN_TitleCode",
+    kind: "select",
+    role: "select",
+    domRole: "combobox",
+    required: true,
+    state: {
+      checked: false,
+      selected: false,
+      disabled: false,
+      required: true,
+      valuePresent: true,
+      normalizedValue: "mr"
+    },
+    operations: { select: actionable("select", "title_node") }
+  };
+  const observation = {
+    observationId: "obs_selected_native_title",
+    observationSnapshot: { snapshotHash: "hash_selected_native_title" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://example.test/checkout/travelers",
+      step: "traveler_information",
+      currentSurface: {
+        id: "surface-page",
+        type: "page",
+        surfaceClass: "checkout",
+        label: "Traveler information"
+      },
+      controls: [title],
+      decisionGroups: [{
+        decisionGroupId: titleGroupId,
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionLabel: "Title: *",
+        requiredStateObserved: true,
+        selectedControlId: titleControlId,
+        selectedLabel: "mr",
+        selectedEvidence: {
+          selected: true,
+          selectedControlId: titleControlId,
+          selectedLabel: "mr",
+          source: "selected_control_state"
+        },
+        selectionInvariant: { exclusive: false, valid: true, selectedCount: 1 },
+        alternativeControlIds: [titleControlId],
+        alternatives: [{
+          controlId: titleControlId,
+          label: "Title: *",
+          selected: false
+        }]
+      }],
+      validationIssues: [],
+      stageExit: { continueAllowed: false, candidates: [] }
+    }
+  };
+
+  const decisionFrame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation),
+    traveler: { title: "MR" }
+  });
+  const group = decisionFrame.semanticCompilation.decisionGroups.find((entry) => (
+    entry.decisionGroupId === titleGroupId
+  ));
+
+  assert.ok(group);
+  assert.equal(group.status, "satisfied");
+  assert.equal(group.selectedControlId, titleControlId);
+  assert.equal(group.selectedLabel, "mr");
+  assert.equal(group.alternatives.find((entry) => entry.controlId === titleControlId)?.selected, true);
+});
+
+test("a payment section cannot turn local optional marketing consent into a required payment method", () => {
+  const marketing = {
+    controlId: "third_party_offers",
+    stateElementId: "third_party_offers_node",
+    preferredActivationElementId: "third_party_offers_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_third_party_offers",
+    label: "I would like to receive third-party special offers",
+    kind: "checkbox",
+    role: "checkbox",
+    inputType: "checkbox",
+    state: { checked: false, selected: false, required: false },
+    operations: { choose: actionable("choose", "third_party_offers_node") }
+  };
+  const observation = {
+    observationId: "obs_payment_marketing",
+    observationSnapshot: { snapshotHash: "hash_payment_marketing" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://example.test/checkout/payment",
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", surfaceClass: "checkout", label: "Payment" },
+      controls: [marketing],
+      decisionGroups: [{
+        decisionGroupId: "dg_third_party_offers",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionLabel: "Payment method",
+        requiredStateObserved: false,
+        alternativeControlIds: [marketing.controlId],
+        alternatives: [{ controlId: marketing.controlId, label: marketing.label, selected: false }]
+      }],
+      validationIssues: [],
+      stageExit: { continueAllowed: false, candidates: [] }
+    }
+  };
+
+  const frame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation)
+  });
+  const control = frame.semanticCompilation.controls.find((entry) => entry.controlId === marketing.controlId);
+  const group = frame.semanticCompilation.decisionGroups.find((entry) => entry.decisionGroupId === "dg_third_party_offers");
+
+  assert.equal(control.semantic, "optional_consent");
+  assert.equal(control.effectRole, "optional_consent");
+  assert.equal(group.subject, "optional_consent");
+  assert.equal(group.required, false);
+  assert.equal(group.status, "optional");
+});
+
+test("an unfamiliar hidden payment select compiles one exact bounded reveal obligation", () => {
+  const controlId = "ctrl_payment_method_selector";
+  const actuatorId = "visible_payment_method_widget";
+  const unavailableSelect = {
+    operation: "select",
+    actuatorId: "hidden_payment_select",
+    actuatorIds: ["hidden_payment_select"],
+    actionability: {
+      rendered: true,
+      visible: false,
+      enabled: false,
+      inViewport: false,
+      inCurrentSurface: true,
+      hitTested: false,
+      notOccluded: false,
+      targetable: false,
+      operationAuthorized: true,
+      operationProven: true,
+      executable: false,
+      revealable: false,
+      code: "CANONICAL_ACTUATOR_UNAVAILABLE",
+      operation: "select"
+    }
+  };
+  const recoveryProof = {
+    rendered: true,
+    visible: true,
+    enabled: true,
+    inViewport: true,
+    inCurrentSurface: true,
+    hitTested: true,
+    notOccluded: true,
+    targetable: true,
+    operationAuthorized: true,
+    operationProven: false,
+    executable: false,
+    revealable: false,
+    code: "UNPROVEN_TARGETABLE_ACTUATOR",
+    operation: "open"
+  };
+  const selector = {
+    controlId,
+    stateElementId: "hidden_payment_select",
+    preferredActivationElementId: actuatorId,
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_payment_method_selector",
+    label: "Payment method selector",
+    semantic: "",
+    kind: "select",
+    role: "combobox",
+    domRole: "combobox",
+    state: { disabled: true, available: false, selected: false, valuePresent: false },
+    operations: { select: unavailableSelect },
+    recovery: {
+      open: {
+        operation: "open",
+        status: "unproven",
+        requiresVisualConfirmation: true,
+        actuatorIds: [actuatorId],
+        targetabilityByActuator: { [actuatorId]: recoveryProof },
+        strategies: [{
+          operation: "open",
+          actuatorId,
+          method: "native_click",
+          actionType: "click",
+          status: "unproven_experiment",
+          operationProven: false,
+          actionability: recoveryProof
+        }],
+        regions: []
+      }
+    }
+  };
+  const unrelatedVisibleControl = {
+    controlId: "ctrl_cancel_payment",
+    stateElementId: "visible_cancel_payment",
+    preferredActivationElementId: "visible_cancel_payment",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    label: "Cancel",
+    kind: "button",
+    role: "button",
+    domRole: "button",
+    state: { disabled: false, valuePresent: false },
+    operations: { activate: actionable("activate", "visible_cancel_payment") }
+  };
+  const observation = {
+    observationId: "obs_unfamiliar_payment_select",
+    observationSnapshot: { snapshotHash: "hash_unfamiliar_payment_select" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://gateway.example.test/payment",
+      step: "payment",
+      currentSurface: { id: "surface-page", type: "page", surfaceClass: "checkout", label: "Payment" },
+      // A real hosted gateway contains many other executable controls. Their
+      // presence must not erase the active payment selector and convert a
+      // bounded local recovery into no_goal_relevant_candidate.
+      controls: [selector, unrelatedVisibleControl],
+      decisionGroups: [{
+        decisionGroupId: selector.decisionGroupId,
+        requirementId: "decision:payment-method-selector",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionLabel: "Payment method selector",
+        requiredStateObserved: false,
+        alternativeControlIds: [controlId],
+        alternatives: [{ controlId, label: selector.label, selected: false }]
+      }],
+      validationIssues: [],
+      stageExit: { continueAllowed: false, candidates: [] }
+    }
+  };
+
+  const frame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation)
+  });
+  const group = frame.semanticCompilation.decisionGroups.find((entry) => (
+    entry.decisionGroupId === selector.decisionGroupId
+  ));
+  const taskState = reduceTaskState({
+    observation,
+    decisionFrame: frame,
+    traveler: { payment: "browser saved card" },
+    userPolicy: { preferences: { payment: "browser saved card" } },
+    transactionReview: {
+      baselineStatus: "approved",
+      ready: false,
+      missingFacts: ["payment_review"],
+      contradictions: [],
+      baseline: {
+        itinerary: { completeness: "complete", segments: [{ origin: "ZAG", destination: "SPU", departureDate: "2026-09-01" }] },
+        travelers: [{ travelerId: "traveler_1" }],
+        currency: "EUR",
+        totalPrice: { amount: 152.62, currency: "EUR" }
+      }
+    }
+  });
+
+  assert.equal(group.subject, "payment_method");
+  assert.equal(group.required, true);
+  assert.ok(taskState.currentObligation, JSON.stringify({
+    group,
+    currentGoal: taskState.currentGoal,
+    keys: Object.keys(taskState),
+    status: taskState.status,
+    blocker: taskState.blocker,
+    observedDecisions: taskState.observedDecisions,
+    desiredStateEvaluations: taskState.desiredStateEvaluations
+  }, null, 2));
+  assert.equal(taskState.currentObligation.desiredStateDelta.status, "EXACT_DELTA");
+  assert.equal(taskState.currentObligation.desiredStateDelta.reason, "owned_choice_options_not_observed");
+  assert.equal(taskState.currentObligation.desiredStateDelta.desiredState, "options_surface_visible");
+  assert.equal(taskState.currentObligation.desiredStateDelta.desiredEffect, "open");
+  assert.deepEqual(taskState.currentObligation.admittedControlIds, [controlId]);
+
+  const candidates = bindMechanics({
+    obligation: taskState.currentObligation,
+    decisionFrame: frame,
+    observation: frame.observation,
+    state: { taskState, approvals: {} },
+    traveler: { payment: "browser saved card" }
+  });
+  const reveal = candidates.candidates.find((candidate) => candidate.controlId === controlId);
+  assert.ok(reveal);
+  assert.equal(reveal.operation, "open");
+  assert.equal(reveal.targetId, actuatorId);
+  assert.equal(reveal.boundedRecovery, true);
+  assert.equal(reveal.mechanicalHypothesis, true);
+  assert.equal(reveal.expectedOutcome.type, "options_surface_appeared");
+});
+
 test("a decision obligation cannot admit navigation that its success condition cannot satisfy", () => {
-  assert.throws(() => currentObligationFromGoal({
-    goal: {
+  assert.throws(() => compileCurrentObligation({ work: {
       goalId: "seat-random-assignment",
       semanticType: "seat_selection",
       desiredSemanticOutcome: "random_assignment",
@@ -155,9 +469,7 @@ test("a decision obligation cannot admit navigation that its success condition c
         eligibleAlternativeControlIds: ["skip_seat_selection"]
       }
     }
-  }), {
-    message: "CURRENT_OBLIGATION_CONTROL_CANNOT_SATISFY_SUCCESS_CONDITION"
-  });
+  }), /CURRENT_OBLIGATION_CONTROL_CANNOT_SATISFY_SUCCESS_CONDITION/);
 });
 
 test("shared semantic effects canonicalize legacy free-choice vocabulary", () => {
@@ -281,7 +593,7 @@ test("navigation admission excludes a settled decline even when browser stage-ex
   };
   const decisionFrame = compileDecisionFrame({ observation, observationFrame: createObservationFrame(observation) });
   const taskState = reduceTaskState({ observation, decisionFrame, traveler: { booking_rules: "No paid extras" } });
-  assert.equal(taskState.currentObligation.desiredEffect, "advance_checkout_stage");
+  assert.equal(taskState.currentObligation.desiredStateDelta.desiredEffect, "advance_checkout_stage");
   assert.deepEqual(taskState.currentObligation.admittedControlIds, [continueControl.controlId]);
   const candidates = buildCurrentCandidateSet({
     obligation: taskState.currentObligation,
@@ -292,7 +604,7 @@ test("navigation admission excludes a settled decline even when browser stage-ex
   assert.deepEqual(candidates.candidates.map((candidate) => candidate.controlId), [continueControl.controlId]);
 });
 
-test("CheckoutSituation admits grounded obligations and consequences without treating stage as authority", () => {
+test("DecisionFrame publishes one unresolved-evidence stream without a second situation scheduler", () => {
   const firstName = {
     controlId: "first_name",
     stateElementId: "first_name_node",
@@ -367,23 +679,12 @@ test("CheckoutSituation admits grounded obligations and consequences without tre
     observationFrame: createObservationFrame(observation),
     traveler: { first_name: "Ali" }
   });
-  const situation = decisionFrame.checkoutSituation;
   const taskState = reduceTaskState({ observation, decisionFrame, traveler: { first_name: "Ali" } });
 
-  assert.equal(situation.contractVersion, CHECKOUT_SITUATION_VERSION);
-  assert.equal(situation.stageHint.value, "extras");
-  assert.equal(situation.obligations.some((item) => item.semanticType === "first_name"), true);
-  assert.deepEqual(situation.blockers, []);
-  assert.deepEqual(
-    situation.obligations.filter((item) => item.status === "authorization_required").map((item) => item.kind).sort(),
-    ["legal_authorization", "purchase_authorization"]
-  );
-  assert.deepEqual(
-    situation.consequentialActions.map((item) => item.consequence).sort(),
-    ["legal_attestation", "purchase_submission"]
-  );
-  assert.equal(taskState.currentObligation.kind, "profile_field");
-  assert.equal(taskState.currentObligation.subject.semanticType, "first_name");
+  assert.equal(decisionFrame.checkoutSituation, undefined);
+  assert.deepEqual(decisionFrame.unresolvedEvidence, []);
+  assert.equal(taskState.currentObligation.desiredStateDelta.evidenceKind, "profile_policy");
+  assert.equal(taskState.currentObligation.semanticOwner.family, "first_name");
 });
 
 test("stage hints do not change stable obligation ownership", () => {
@@ -430,7 +731,7 @@ test("stage hints do not change stable obligation ownership", () => {
   assert.equal(extras.surfaceFingerprint, travelerHint.surfaceFingerprint);
 });
 
-test("an active unexplained checkout produces typed situation reconciliation", () => {
+test("an active unexplained checkout does not create a second situation authority", () => {
   const observation = {
     observationId: "obs_unexplained_checkout",
     observationSnapshot: { snapshotHash: "hash_unexplained_checkout" },
@@ -447,8 +748,9 @@ test("an active unexplained checkout produces typed situation reconciliation", (
   const decisionFrame = compileDecisionFrame({ observation, observationFrame: createObservationFrame(observation) });
   const taskState = reduceDecisionFrame({ observation, decisionFrame });
 
-  assert.equal(decisionFrame.checkoutSituation.reconciliationRequired, true);
-  assert.equal(taskState.disposition.code, "SITUATION_RECONCILIATION_REQUIRED");
+  assert.equal(decisionFrame.checkoutSituation, undefined);
+  assert.deepEqual(decisionFrame.unresolvedEvidence, []);
+  assert.equal(taskState.disposition.code, "NO_CURRENT_OBLIGATION");
   assert.equal(taskState.disposition.userActionRequired, false);
 });
 
@@ -510,12 +812,12 @@ test("strong unknown validation survives semantic uncertainty and outranks navig
     }
   };
   const frame = compileDecisionFrame({ observation, observationFrame: createObservationFrame(observation) });
-  const kinds = frame.checkoutSituation.obligations.map((obligation) => obligation.kind);
+  const kinds = frame.unresolvedEvidence.map((obligation) => obligation.kind);
   assert.equal(kinds.includes("unknown_validation"), true);
-  assert.equal(frame.checkoutSituation.obligations.some((obligation) => obligation.controlId === "promo"), false);
+  assert.equal(frame.unresolvedEvidence.some((obligation) => obligation.controlId === "promo"), false);
 
   const taskState = reduceDecisionFrame({ observation: frame.observation, decisionFrame: frame });
-  assert.equal(taskState.currentObligation.kind, "unknown_validation");
+  assert.equal(taskState.currentObligation.semanticOwner.family, "unknown");
   assert.deepEqual(taskState.currentObligation.admittedControlIds, ["unknown_input"]);
-  assert.notEqual(taskState.currentObligation.kind, "navigation");
+  assert.notEqual(taskState.currentObligation.semanticOwner.family, "navigation");
 });

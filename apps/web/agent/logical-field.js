@@ -132,6 +132,16 @@ function supportsProfileLabelInference(control = {}, field = {}) {
 }
 
 function semanticTypeForControl(control = {}, field = {}) {
+  // DecisionFrame is the sole business-semantic authority. Once it has
+  // published a profile identity, logical-field compilation may derive value
+  // topology and codecs, but it must not parse labels/helper text and decide
+  // that the control means something else.
+  if (control.semanticAuthority === "decision-frame/v2") {
+    const decided = normalizeProfileFieldType(
+      control.fieldType || control.field || control.semanticType || control.semantic || ""
+    );
+    return PROFILE_FIELDS.has(decided) ? decided : "";
+  }
   if (
     control.fieldClassification?.source === "direct_non_profile_control"
     || field.fieldClassification?.source === "direct_non_profile_control"
@@ -474,6 +484,12 @@ function dateComponentRole(control = {}, field = {}) {
 }
 
 function componentRole(control = {}, field = {}, semanticType = "") {
+  // DecisionFrame owns semantic decomposition. Once published, downstream
+  // logical-field compilation must consume that role instead of deriving a
+  // competing interpretation from the same labels.
+  if (control.semanticAuthority === "decision-frame/v2" && control.componentRole) {
+    return String(control.componentRole);
+  }
   if (DATE_FIELDS.has(semanticType)) return dateComponentRole(control, field);
   if (semanticType === "phone_country_code") return "country_code";
   if (semanticType === "phone") {
@@ -1168,6 +1184,66 @@ function mergeComponentRepresentations(components = []) {
   });
 }
 
+function mutableStateOwnerId(component = {}) {
+  const control = component.control || {};
+  const stateOwner = control.stateElementId
+    || control.componentContract?.controlIdentity?.stateElementId
+    || "";
+  if (stateOwner) return String(stateOwner);
+  const stateCapability = control.operations?.type
+    || control.operations?.select
+    || control.operations?.choose
+    || null;
+  return String(stateCapability?.actuatorId || "");
+}
+
+function componentTopologyConflict(components = []) {
+  const rolesByOwner = new Map();
+  for (const component of components) {
+    if (component.componentRole === "option") continue;
+    const ownerId = mutableStateOwnerId(component);
+    if (!ownerId) continue;
+    if (!rolesByOwner.has(ownerId)) rolesByOwner.set(ownerId, new Set());
+    rolesByOwner.get(ownerId).add(component.componentRole || "value");
+  }
+  const conflict = [...rolesByOwner.entries()].find(([, roles]) => roles.size > 1);
+  return conflict ? { ownerId: conflict[0], roles: [...conflict[1]] } : null;
+}
+
+function atomicMembersByStateOwner(members = [], semanticType = "") {
+  const rolesByOwner = new Map();
+  for (const member of members) {
+    if (member.role === "option") continue;
+    const ownerId = mutableStateOwnerId({
+      control: member.control,
+      componentRole: member.role
+    });
+    if (!ownerId) continue;
+    if (!rolesByOwner.has(ownerId)) rolesByOwner.set(ownerId, new Set());
+    rolesByOwner.get(ownerId).add(member.role || "value");
+  }
+  const scalarOwners = new Set([...rolesByOwner.entries()]
+    .filter(([, roles]) => roles.size > 1)
+    .map(([ownerId]) => ownerId));
+  if (!scalarOwners.size) return members;
+  return members.map((member) => {
+    const ownerId = mutableStateOwnerId({
+      control: member.control,
+      componentRole: member.role
+    });
+    if (!scalarOwners.has(ownerId)) return member;
+    // Semantic projections cannot manufacture independent mechanics. If
+    // several projections point at the same mutable scalar state, collapse
+    // them before component compilation. A phone scalar owns one complete
+    // international value; a scalar date owns one complete canonical date.
+    return {
+      ...member,
+      directSemanticType: semanticType === "phone" ? "phone" : member.directSemanticType,
+      role: semanticType === "phone" ? "international_number" : "value"
+    };
+  });
+}
+
 function expectedOutcomeForCapability(capability = {}, componentOutcome = {}, control = {}) {
   if (capability.operation === "open") {
     return Object.freeze({
@@ -1182,7 +1258,7 @@ function expectedOutcomeForCapability(capability = {}, componentOutcome = {}, co
   )) {
     return Object.freeze({
       ...componentOutcome,
-      type: "semantic_progress",
+      type: capability.operation === "type" ? "normalized_value_changed" : "options_surface_appeared",
       previousSurfaceId: control.surfaceId || "",
       previousValue: componentOutcome.expectedComponentValue
         ? String(control.state?.normalizedValue || "")
@@ -1257,8 +1333,9 @@ function resolveLogicalFields(page = {}, profile = {}) {
   return [...groups.values()].map((group) => {
     const logicalFieldId = `lf_${normalizedAlias(`${group.subject.id}_${group.semanticType}_${group.owner}`)}`;
     const traveler = travelerForSubject(profile, group.subject);
-    const phoneTypes = new Set(group.members.map((member) => member.directSemanticType));
-    const combinedInternationalPhone = group.members.some((member) => member.role === "international_number");
+    const canonicalMembers = atomicMembersByStateOwner(group.members, group.semanticType);
+    const phoneTypes = new Set(canonicalMembers.map((member) => member.directSemanticType));
+    const combinedInternationalPhone = canonicalMembers.some((member) => member.role === "international_number");
     const fullPhoneValue = agentContract.encodePhoneForField(traveler, { representation: "combined_international" });
     const desiredCanonicalValue = group.semanticType === "phone"
       ? combinedInternationalPhone
@@ -1276,7 +1353,7 @@ function resolveLogicalFields(page = {}, profile = {}) {
       desiredCanonicalValue: desiredCanonicalValue || "",
       validationOwnerId: logicalFieldId
     });
-    const representationComponents = group.members.map(({ control, field, directSemanticType, role, order }) => {
+    const representationComponents = canonicalMembers.map(({ control, field, directSemanticType, role, order }) => {
       const componentSemanticType = directSemanticType === "phone_country_code"
         ? "phone_country_code"
         : directSemanticType === "phone"
@@ -1429,14 +1506,22 @@ function resolveLogicalFields(page = {}, profile = {}) {
     const ambiguousComponents = DATE_FIELDS.has(group.semanticType)
       && components.some((component) => component.role === "value"
         && !inferDateFieldCodec({ ...component.field, dateField: component.control.dateField || component.field.dateField }).ok);
+    const topologyConflict = componentTopologyConflict(components);
     const ambiguity = ambiguousComponents
       ? {
           code: "AMBIGUOUS_DATE_FORMAT",
           reason: "The date control does not expose a reliable day/month/year representation."
         }
+      : topologyConflict
+        ? {
+            code: "NON_INDEPENDENT_COMPONENT_TOPOLOGY",
+            reason: "Multiple semantic components claim the same mutable state actuator.",
+            ownerId: topologyConflict.ownerId,
+            componentRoles: topologyConflict.roles
+          }
       : null;
-    const instructions = instructionsForMembers(group.members);
-    const options = optionsForMembers(group.members);
+    const instructions = instructionsForMembers(canonicalMembers);
+    const options = optionsForMembers(canonicalMembers);
     const controls = components.map((component) => Object.freeze({
       controlId: component.controlId,
       semanticType: component.semanticType,

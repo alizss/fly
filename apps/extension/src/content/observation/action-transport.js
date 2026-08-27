@@ -39,6 +39,82 @@ export function createActionTransport({ compactText, compactChoiceCommitEvidence
     return compact;
   }
 
+  function compactValidationIssue(issue = {}, index = 0) {
+    if (typeof issue === "string") {
+      return {
+        issueId: `browser-validation-${index + 1}`,
+        message: compactText(issue, 240)
+      };
+    }
+    return {
+      issueId: String(issue.issueId || `browser-validation-${index + 1}`),
+      controlId: String(issue.controlId || ""),
+      ownerId: String(issue.ownerId || ""),
+      code: String(issue.code || ""),
+      message: compactText(issue.message || issue.label || "", 240)
+    };
+  }
+
+  function compactCanonicalOutcome(outcome = {}, result = {}) {
+    const evidence = outcome.observedEvidence && typeof outcome.observedEvidence === "object"
+      ? outcome.observedEvidence
+      : {};
+    return {
+      contractVersion: String(outcome.contractVersion || "action-outcome/v1"),
+      status: String(outcome.status || "NO_RESULT"),
+      causedByActionId: String(outcome.causedByActionId || result.actionId || ""),
+      exactPostconditionSatisfied: outcome.exactPostconditionSatisfied === true,
+      code: String(outcome.code || result.failureCode || ""),
+      observedEvidence: {
+        beforeObservationHash: String(evidence.beforeObservationHash || ""),
+        afterObservationHash: String(evidence.afterObservationHash || result.resultObservationHash || ""),
+        mechanicalEffect: compactText(evidence.mechanicalEffect || result.mechanicalEffect || "", 160),
+        actualNormalizedValue: compactText(evidence.actualNormalizedValue || "", 240),
+        wantedNormalizedValue: compactText(evidence.wantedNormalizedValue || "", 240),
+        actualSemanticValue: compactText(evidence.actualSemanticValue || "", 240),
+        wantedSemanticValue: compactText(evidence.wantedSemanticValue || "", 240),
+        interactionKind: String(evidence.interactionKind || ""),
+        commitRequirement: String(evidence.commitRequirement || ""),
+        exactObservedOption: evidence.exactObservedOption === true,
+        activeChoiceSurface: evidence.activeChoiceSurface === true,
+        commitSettled: evidence.commitSettled === true
+      },
+      introducedValidation: (outcome.introducedValidation || [])
+        .slice(0, 8)
+        .map(compactValidationIssue),
+      candidateOwnerControlIds: (outcome.candidateOwnerControlIds || [])
+        .map((value) => String(value || ""))
+        .filter(Boolean)
+        .slice(0, 8),
+      changes: {
+        surfaceChanged: outcome.changes?.surfaceChanged === true,
+        urlChanged: outcome.changes?.urlChanged === true,
+        progressChanged: outcome.changes?.progressChanged === true,
+        priceChanged: outcome.changes?.priceChanged === true,
+        transactionChanged: outcome.changes?.transactionChanged === true
+      },
+      repeatProhibited: outcome.repeatProhibited === true
+    };
+  }
+
+  function compactFeedback(feedback = {}) {
+    return {
+      dispatched: feedback.dispatched === true,
+      dispatchSucceeded: feedback.dispatchSucceeded === true,
+      targetFound: feedback.targetFound !== false,
+      targetReacted: feedback.targetReacted === true,
+      selectionChanged: feedback.selectionChanged === true,
+      surfaceChanged: feedback.surfaceChanged === true,
+      progressChanged: feedback.progressChanged === true,
+      domChanged: feedback.domChanged === true,
+      visualChanged: feedback.visualChanged === true,
+      navigationOccurred: feedback.navigationOccurred === true,
+      validationAppeared: feedback.validationAppeared === true,
+      priceChanged: feedback.priceChanged === true,
+      outcomeVerified: feedback.outcomeVerified === true
+    };
+  }
+
   function minimalActionResultForTransport(result = {}) {
     const outcome = result.outcome && typeof result.outcome === "object" ? result.outcome : {};
     const choiceCommit = compactChoiceCommitEvidence(outcome.evidence?.choiceCommit || null);
@@ -47,22 +123,13 @@ export function createActionTransport({ compactText, compactChoiceCommitEvidence
     );
     return {
       at: result.at || "",
+      type: String(result.type || ""),
+      userActionRequired: result.userActionRequired === true,
       actionId: String(result.actionId || ""),
       observationId: String(result.observationId || ""),
       plannedObservationId: String(result.plannedObservationId || ""),
       observationHash: String(result.observationHash || ""),
       resultObservationHash: String(result.resultObservationHash || ""),
-      requirementId: String(result.requirementId || ""),
-      intent: compactText(result.intent || "", 500),
-      semanticIntent: compactText(result.semanticIntent || "", 500),
-      mechanicalEffect: compactText(result.mechanicalEffect || "", 500),
-      operation: String(result.operation || ""),
-      goalId: String(result.goalId || ""),
-      semanticOwner: compactActionTransportValue(result.semanticOwner || null),
-      semanticOwnerId: String(result.semanticOwnerId || ""),
-      decisionInstanceId: String(result.decisionInstanceId || ""),
-      candidateId: String(result.candidateId || ""),
-      controlId: String(result.controlId || ""),
       dispatched: result.dispatched === true,
       targetResolved: result.targetResolved === true,
       clickReachedPage: result.clickReachedPage === true,
@@ -73,16 +140,13 @@ export function createActionTransport({ compactText, compactChoiceCommitEvidence
       executed: result.executed === true,
       verified: result.verified === true,
       superseded: result.superseded === true,
-      actionOutcome: compactActionTransportValue(result.actionOutcome || null),
+      actionOutcome: compactCanonicalOutcome(result.actionOutcome || {}, result),
       failureCode: String(result.failureCode || ""),
-      action: compactActionTransportValue(result.action || {}),
-      targetSnapshot: compactActionTransportValue(result.targetSnapshot || {}),
-      expectedOutcome: compactActionTransportValue(result.expectedOutcome || {}),
       outcome: {
         ok: outcome.ok === true,
         code: String(outcome.code || result.failureCode || ""),
         message: compactText(outcome.message || "", 600),
-        feedback: compactActionTransportValue(outcome.feedback || {}),
+        feedback: compactFeedback(outcome.feedback || result.feedback || {}),
         evidence: {
           ...(choiceCommit ? { choiceCommit } : {}),
           ...(exactChildSettlement ? { exactChildSettlement } : {})
@@ -93,9 +157,17 @@ export function createActionTransport({ compactText, compactChoiceCommitEvidence
 
   function compactActionResultForTransport(result = null) {
     if (!result || typeof result !== "object") return null;
-    const compact = compactActionTransportValue(result);
-    if (observationTransportBytes(compact) <= MAX_ACTION_RESULT_TRANSPORT_BYTES) return compact;
-    return minimalActionResultForTransport(result);
+    // The durable governed-action ledger already owns the complete action,
+    // actuator, expected contract, and semantic lineage.  The browser sends
+    // only its exact causal receipt and the backend joins it to that lease by
+    // actionId.  Re-sending target snapshots, pipelines, or hundreds of
+    // observed options creates a second contract copy and can exceed browser
+    // keepalive quotas on ordinary country/nationality selectors.
+    const compact = minimalActionResultForTransport(result);
+    if (observationTransportBytes(compact) > MAX_ACTION_RESULT_TRANSPORT_BYTES) {
+      throw new Error("Canonical action-result receipt exceeds its transport budget.");
+    }
+    return compact;
   }
 
   function compactObservationActionContext(payload = {}) {

@@ -14,7 +14,6 @@ const INSTRUCTIONS = [
   "Selectable candidates are grounded, actionable, and policy-safe. Choose only from selectableCandidates.",
   "A mechanical_hypothesis is one reversible, exact-actuator discovery action. Use it only to reveal the current obligation's owned child surface; never treat it as semantic completion.",
   "After one mechanical hypothesis the browser must reobserve. Do not infer or emit a second action.",
-  "When adaptiveEnvelope is present, remain inside its exact surface, operations, risk limits, step budget, and semantic objective.",
   "Do not invent targets, values, keys, geometry, or another action.",
   "Semantic intent and outcome compatibility are guidance only. You may select a grounded safe candidate whose semantic classification is unknown when it is relevant to the visible foreground surface.",
   "Prefer the simplest direct candidate likely to satisfy the semantic postcondition.",
@@ -53,7 +52,7 @@ async function selectCandidate({
     }
   }
   const allCapabilities = [...capabilityById.values()];
-  const needsScreenshot = ["adaptive_surface", "adaptive_interaction"].includes(goal.kind) || allCapabilities.some((candidate) => (
+  const needsScreenshot = allCapabilities.some((candidate) => (
     candidate.type === "click_xy"
     || candidate.mechanicalHypothesis === true
     || (!candidate.controlId && candidate.visualRegion)

@@ -34,6 +34,23 @@ function createNextActionService({
     const durablePendingActionResult = payload.lastActionResult
       ? null
       : agentSessionStore.getPendingActionResult(state);
+    const browserActionResult = payload.lastActionResult || durablePendingActionResult || null;
+    const governedResultAction = browserActionResult?.actionId
+      ? agentSessionStore.getGovernedAction(browserActionResult.actionId)?.action || null
+      : null;
+    // Browser receipts own only the local causal outcome. The durable ledger
+    // owns the leased action and its expected contract, so hydrate that
+    // metadata server-side instead of asking every page to transport another
+    // copy of targets, options, pipelines, and semantic lineage.
+    const hydratedActionResult = browserActionResult && governedResultAction
+      ? {
+          ...browserActionResult,
+          action: governedResultAction,
+          expectedOutcome: governedResultAction.pipelineContract?.expectedOutcome
+            || governedResultAction.expectedOutcome
+            || null
+        }
+      : browserActionResult;
   
     const observation = {
       observationId: payload.observationId,
@@ -42,7 +59,7 @@ function createNextActionService({
       destinationReadiness: payload.destinationReadiness,
       userIntent: payload.userIntent,
       page: payload.page,
-      lastActionResult: payload.lastActionResult || durablePendingActionResult || null
+      lastActionResult: hydratedActionResult
     };
   
     // The loop owns the single authoritative state commit for this turn. The

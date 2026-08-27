@@ -8,19 +8,35 @@ export function isVisible(element) {
     && style.display !== "none";
 }
 
-export function queryAllDeep(selector, root = document) {
-  const results = [];
+let activeDeepQueryPass = null;
+
+export function beginDeepQueryPass() {
+  const pass = { roots: new WeakMap() };
+  activeDeepQueryPass = pass;
+  return () => {
+    if (activeDeepQueryPass === pass) activeDeepQueryPass = null;
+  };
+}
+
+function deepQueryScopes(root, pass) {
+  const cached = pass.roots.get(root);
+  if (cached) return cached;
+  const records = [];
+  const visited = new Set();
   const visit = (scope) => {
+    if (!scope || visited.has(scope)) return;
+    visited.add(scope);
     try {
-      results.push(...scope.querySelectorAll(selector));
-      for (const element of scope.querySelectorAll("*")) {
+      const elements = [...scope.querySelectorAll("*")];
+      records.push({ scope, elements });
+      for (const element of elements) {
         if (element.shadowRoot) visit(element.shadowRoot);
-      }
-      for (const frame of scope.querySelectorAll("iframe")) {
-        try {
-          if (frame.contentDocument) visit(frame.contentDocument);
-        } catch (error) {
-          // Cross-origin frames are intentionally opaque to the content script.
+        if (element.tagName === "IFRAME") {
+          try {
+            if (element.contentDocument) visit(element.contentDocument);
+          } catch (error) {
+            // Cross-origin frames are intentionally opaque to the content script.
+          }
         }
       }
     } catch (error) {
@@ -28,6 +44,20 @@ export function queryAllDeep(selector, root = document) {
     }
   };
   visit(root);
+  pass.roots.set(root, records);
+  return records;
+}
+
+export function queryAllDeep(selector, root = document) {
+  const results = [];
+  const pass = activeDeepQueryPass || { roots: new WeakMap() };
+  for (const { scope, elements } of deepQueryScopes(root, pass)) {
+    try {
+      results.push(...(selector === "*" ? elements : scope.querySelectorAll(selector)));
+    } catch (error) {
+      // A root or frame may disappear while a checkout re-renders.
+    }
+  }
   return [...new Set(results)];
 }
 

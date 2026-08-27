@@ -1,6 +1,5 @@
 const { currentSurface } = require("./surface-contract");
 const { diffObservations } = require("./observation-diff");
-const { obligationField } = require("./current-obligation");
 
 const MAX_RELATED_MODEL_CONTROLS = 20;
 
@@ -41,22 +40,6 @@ function compactOutcome(contract = null) {
     taskOutcome: clean(contract.taskOutcome),
     acceptablePhysicalEffects: (contract.acceptablePhysicalEffects || []).map(clean).filter(Boolean).slice(0, 8),
     completionEvidence: (contract.completionEvidence || []).map(clean).filter(Boolean).slice(0, 8)
-  };
-}
-
-function compactAdaptiveEnvelope(envelope = null) {
-  if (!envelope || typeof envelope !== "object") return null;
-  return {
-    episodeId: clipped(envelope.episodeId, 180),
-    objective: clipped(envelope.objective, 240),
-    desiredValue: clipped(envelope.desiredValue, 120),
-    surfaceId: clean(envelope.surfaceId),
-    surfaceType: clean(envelope.surfaceType),
-    allowedOperations: (envelope.allowedOperations || []).map(clean).filter(Boolean).slice(0, 10),
-    forbiddenRisks: (envelope.forbiddenRisks || []).map(clean).filter(Boolean).slice(0, 10),
-    forbiddenEffects: (envelope.forbiddenEffects || []).map(clean).filter(Boolean).slice(0, 12),
-    remainingSteps: Number(envelope.remainingSteps || 0),
-    deadlineAt: Number(envelope.deadlineAt || 0)
   };
 }
 
@@ -175,12 +158,11 @@ function compileInteractionView({
     observationId: clean(observation.observationId),
     foregroundSurface: compactSurface(currentSurface(observation.page || {})),
     currentObligation: {
-      obligationId: clean(obligationField(goal, "goalId")),
-      semanticType: clean(obligationField(goal, "semanticType")),
-      desiredCanonicalValue: clipped(obligationField(goal, "desiredValue") || obligationField(goal, "canonicalValue"), 120),
-      successCondition: compactPostcondition(obligationField(goal, "successCondition") || obligationField(goal, "postcondition")),
-      outcomeContract: compactOutcome(obligationField(goal, "outcomeContract")),
-      adaptiveEnvelope: compactAdaptiveEnvelope(obligationField(goal, "adaptiveEnvelope"))
+      obligationId: clean((goal?.id)),
+      semanticType: clean(goal?.semanticOwner?.family || goal?.desiredStateDelta?.kind),
+      desiredCanonicalValue: clipped(goal?.desiredStateDelta?.desiredValue, 120),
+      successCondition: compactPostcondition((goal?.successCondition) || (goal?.successCondition)),
+      outcomeContract: compactOutcome((goal?.successCondition))
     },
     components: [...componentById.values()].map((component) => ({
       ...component,

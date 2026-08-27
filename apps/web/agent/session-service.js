@@ -43,12 +43,22 @@ function createSessionService(agentSessionStore) {
     const existing = requestedSessionId ? agentSessionStore.getSession(requestedSessionId) : null;
     if (body.resumeOnly && (!requestedSessionId || !existing)) return null;
     const durableBaseline = existing?.transactionInvariants?.baseline || null;
+    const durableBaselineApproved = existing?.transactionInvariants?.baselineStatus === "approved"
+      && existing?.transactionInvariants?.baselineAuthority === "selected_booking"
+      && Boolean(durableBaseline);
     const admittedSelectedBooking = existing ? null : normalizeSelectedBooking(body.selectedBookingContract);
     if (!existing && !admittedSelectedBooking) {
       throw requestBodyError(
         "SELECTED_BOOKING_REQUIRED",
-        "A complete approved flight selection is required before starting checkout.",
+        "An authoritative selected booking is required before checkout can start.",
         422
+      );
+    }
+    if (existing && !durableBaselineApproved) {
+      throw requestBodyError(
+        "DURABLE_SELECTED_BOOKING_MISSING",
+        "This checkout has no locked selected-booking baseline and cannot be resumed safely.",
+        409
       );
     }
     const selectedBooking = admittedSelectedBooking
@@ -111,18 +121,18 @@ function createSessionService(agentSessionStore) {
       approvals: {
         ...state.approvals,
         skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
-        // Starting a selected-booking checkout is the transaction-bound
-        // mandate for ordinary carriage/fare/privacy/dangerous-goods terms.
-        // The policy layer still rejects exceptional declarations and bundled
-        // optional consent unless separately authorized.
+        // Admission has already locked the selected transaction, so starting
+        // this checkout is a transaction-bound mandate for ordinary booking
+        // terms. Exceptional declarations and optional consent remain outside
+        // this authority.
         standardBookingTermsApproved: true,
         paymentApproved: false,
         paymentAuthorization: body.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
         priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
       }
     });
-    if (selectedBooking) {
-      updated = prepareTransactionInvariants(updated, {
+    if (!existing) {
+      const sessionStartObservation = {
         observationId: selectedBooking.observationId,
         page: {
           site: body.page?.site || "",
@@ -130,6 +140,9 @@ function createSessionService(agentSessionStore) {
           step: "flight_selection",
           transactionFacts: selectedBooking.facts
         }
+      };
+      updated = prepareTransactionInvariants(updated, {
+        ...sessionStartObservation
       }, traveler).state;
     }
     agentSessionStore.saveSession(updated);
@@ -144,8 +157,10 @@ function createSessionService(agentSessionStore) {
       ? "ready_for_payment"
       : result.type === "save_trip"
         ? "complete"
-        : ["ask_user", "stop"].includes(result.type)
+        : result.type === "ask_user" || (result.type === "stop" && result.userActionRequired !== false)
           ? "awaiting_user"
+          : result.type === "stop"
+            ? "stopped"
           : checkoutState.status;
     return agentSessionStore.recordActionResult(checkoutState.id, result, { status });
   }

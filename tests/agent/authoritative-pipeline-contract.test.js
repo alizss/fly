@@ -665,6 +665,19 @@ test("shared execution-lane classifier admits only fresh exact bounded recovery"
     pipelineContract,
     control,
     observation
+  }), agentContract.EXECUTION_LANE.BOUNDED_RECOVERY);
+  assert.equal(agentContract.classifyExecutionLane({
+    action: {
+      ...action,
+      intent: "submit_payment",
+      expectedOutcome: { type: "payment_submitted" }
+    },
+    pipelineContract: {
+      ...pipelineContract,
+      expectedOutcome: { type: "payment_submitted" }
+    },
+    control,
+    observation
   }), agentContract.EXECUTION_LANE.DENY);
   assert.equal(agentContract.classifyExecutionLane({
     action: { ...action, observationId: "stale_observation" },

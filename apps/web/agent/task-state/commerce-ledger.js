@@ -57,8 +57,8 @@ function createCommerceLedger({
     const task = action.affordance?.task || {};
     const postcondition = verifiedCommercePostcondition(result) || {};
     const decisionEpisode = context.decisionEpisode || context.taskState?.decisionEpisode || null;
-    const currentGoal = context.currentGoal || taskMechanics(context.taskState || {});
-    const lineage = actionDecisionLineage(result, currentGoal, decisionEpisode || {});
+    const currentWork = context.currentWork || taskMechanics(context.taskState || {});
+    const lineage = actionDecisionLineage(result, currentWork, decisionEpisode || {});
     const actionSurfaceId = clean(
       postcondition.surfaceId
       || result.targetSnapshot?.surfaceId

@@ -59,6 +59,7 @@ export function createDecisionClient({
       semanticIntent: semanticEffect,
       expectedPostconditions: successCondition ? [successCondition] : [],
       goalId: lease.obligationId || "",
+      governorDecisionId: lease.governorDecisionId || "",
       semanticOwner: lease.semanticOwner || null,
       semanticOwnerId: lease.semanticOwnerId || "",
       decisionInstanceId: lease.semanticOwner?.repeatedInstance || "",
@@ -74,9 +75,7 @@ export function createDecisionClient({
         || ""
       ),
       expectedOutcome: successCondition,
-      affordance: lease.expected?.policyAuthorization ? {
-        policy: lease.expected.policyAuthorization
-      } : null,
+      affordance: null,
       pipelineContract: lease.capabilityProof || null,
       interactionMethod: lease.mechanic?.method || "",
       boundedRecovery: lease.mechanic?.boundedRecovery === true,
