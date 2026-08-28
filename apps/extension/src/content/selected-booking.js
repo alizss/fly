@@ -1,5 +1,3 @@
-import { currentNavigationUrl } from "./navigation-identity.js";
-
 export const SELECTED_BOOKING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 function authoritativeSelectedBookingItinerary(facts = null) {
@@ -185,39 +183,6 @@ export function authoritativeSelectedBookingFacts(facts = null) {
     && totalEvidence?.role === "booking_total"
     && Boolean(String(totalEvidence.ownerKey || "").trim());
   return authoritativeTotal ? itineraryFacts : null;
-}
-
-export function composeSelectedBookingContract(acquisition = null, selectedTraveler = null, environment = {}) {
-  const facts = authoritativeSelectedBookingFacts(acquisition?.facts);
-  const travelerId = String(selectedTraveler?.id || "").trim();
-  if (!facts || !travelerId) return null;
-  const now = typeof environment.now === "function" ? environment.now() : Date.now();
-  const sourceUrl = environment.sourceUrl ?? currentNavigationUrl();
-  return {
-    contractVersion: "selected-booking/v1",
-    selectionId: String(acquisition.observationId || `selected_booking_${now.toString(36)}`),
-    selectedAt: String(acquisition.capturedAt || new Date(now).toISOString()),
-    sourceUrl: String(acquisition.sourceUrl || sourceUrl),
-    itinerary: {
-      segments: facts.itinerary.segments.map((segment) => ({
-        segmentId: segment.segmentId || "",
-        origin: segment.origin || "",
-        destination: segment.destination || "",
-        departureDate: segment.departureDate || "",
-        departureTime: segment.departureTime || "",
-        arrivalDate: segment.arrivalDate || "",
-        arrivalTime: segment.arrivalTime || "",
-        carrier: segment.carrier || "",
-        flightNumber: segment.flightNumber || ""
-      }))
-    },
-    approvedTotal: {
-      amount: Number(facts.totalPrice.amount),
-      currency: String(facts.totalPrice.currency || facts.currency || "").trim().toUpperCase()
-    },
-    fareBrand: String(facts.fareBrand || ""),
-    travelerIds: [travelerId]
-  };
 }
 
 export function validStoredSelectedBookingContract(

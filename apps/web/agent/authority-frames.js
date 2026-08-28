@@ -3,6 +3,7 @@ const { factsFromObservation } = require("./transaction-facts");
 const { fieldDescriptors } = require("./profile-requirements");
 const { activeValidationIssues } = require("./validation-evidence");
 const { inferDateFieldCodec } = require("./date-field-codec");
+const { surfaceClassFrom } = require("./task-state/surface-state");
 const {
   normalizeSemanticOwner,
   semanticOwnerId
@@ -257,8 +258,8 @@ function profileComponentRoleFromStructure(control = {}, semanticType = "", phon
 
 function paymentMethodKindFromStructure(control = {}) {
   const evidence = lower(`${control.ownText || ""} ${control.label || ""} ${control.accessibleName || ""} ${control.name || ""} ${control.id || ""}`);
-  if (/apple pay|google pay|paypal|wallet/.test(evidence)) return "wallet";
-  if (/credit card|debit card|card payment|visa|mastercard|master card|american express|amex|maestro|diners club|discover/.test(evidence)) return "card";
+  if (/apple pay|google pay|paypal|wallet|keks pay/.test(evidence)) return "wallet";
+  if (/credit card|debit card|card payment|pay by card|visa|mastercard|master card|american express|amex|maestro|diners club|discover/.test(evidence)) return "card";
   return "unknown";
 }
 
@@ -376,17 +377,10 @@ function interpretStructuralControl(control = {}, groupLabel = "", currentSurfac
     && control.state?.disabled !== true
     && /button|link|submit/.test(shape)
     && /submit|continue|next|proceed/.test(structuralProgressEvidence);
-  const controlledElementIds = unique(control.controlledElementIds || []);
-  const transactionEvidenceDisclosure = control.controlsInformationOnly === true
-    && controlledElementIds.length > 0
-    && clean(control.ariaExpanded) !== ""
-    && /booking|flight|trip|journey|itinerary|order|fare|price|total/.test(localEvidence)
-    && /detail|summary|itinerary|breakdown|information/.test(localEvidence)
-    && /button|link/.test(shape);
   const groundedField = hints.fieldHint?.authority === "grounded_hypothesis_only"
     ? clean(hints.fieldHint.semanticType).toLowerCase()
     : "";
-  const profileField = groundedField || ((localNavigationCommand || hintedStageExit || surfaceDismiss || surfaceOpen || surfaceAdvance || commercialSelectionCta || transactionEvidenceDisclosure) ? "" : profileSemanticFromStructure({
+  const profileField = groundedField || ((localNavigationCommand || hintedStageExit || surfaceDismiss || surfaceOpen || surfaceAdvance || commercialSelectionCta) ? "" : profileSemanticFromStructure({
     ...control,
     sectionLabel: clean(groupLabel || control.sectionLabel)
   }));
@@ -403,11 +397,25 @@ function interpretStructuralControl(control = {}, groupLabel = "", currentSurfac
   const optionalConsent = /checkbox|switch/.test(shape)
     && /newsletter|marketing|special offers|third[- ]party offers|offers from (?:our )?(?:partners|third parties)|promotional|notifications? via (?:sms|e-?mail)|survey|research/.test(localEvidence)
     && !legal;
+  const pressableChoiceCapability = [
+    control.operations?.activate,
+    control.operations?.choose
+  ].some((capability) => Boolean(
+    capability
+    && (
+      capability.actuatorId
+      || (capability.actuatorIds || []).length
+      || (capability.strategies || []).some((strategy) => strategy?.actuatorId)
+    )
+  ));
   const paymentMethod = !cardField
     && !optionalConsent
     && !/^(?:cancel|back|close|help)(?:\s|$)/.test(localActionText)
     && /payment method|pay by card|card payment|credit card|debit card|apple pay|google pay|paypal|visa|mastercard|master card|american express|amex|maestro|diners club|discover|keks pay/.test(localEvidence)
-    && /button|radio|option|choice|link|select|combobox|listbox/.test(shape);
+    && (
+      /button|radio|option|choice|link|select|combobox|listbox|pressable/.test(shape)
+      || pressableChoiceCapability
+    );
   const purchase = !paymentMethod && agentContract.isPaymentCommitText(localEvidence);
   const scopeToggle = /checkbox|switch|button/.test(shape)
     && /same for all flights|apply to all (?:flights|segments|travellers|travelers)|use for all/.test(localEvidence);
@@ -436,8 +444,6 @@ function interpretStructuralControl(control = {}, groupLabel = "", currentSurfac
       ? "open_surface"
       : surfaceAdvance
         ? "navigation"
-      : transactionEvidenceDisclosure
-        ? "reveal_transaction_evidence"
       : commercialSelectionCta && !ownedCommercialChoice
         ? "selection_cta"
         : cardField
@@ -471,8 +477,6 @@ function interpretStructuralControl(control = {}, groupLabel = "", currentSurfac
       ? "open_surface"
       : surfaceAdvance
         ? (surfaceClass === "review_confirmation" ? "advance_checkout_stage" : "advance_surface")
-      : transactionEvidenceDisclosure
-        ? "open_surface"
       : commercialSelectionCta && !ownedCommercialChoice
         ? "unknown"
         : profileField
@@ -502,7 +506,7 @@ function interpretStructuralControl(control = {}, groupLabel = "", currentSurfac
       ? "legal"
       : priced
         ? "money"
-        : surfaceDismiss || surfaceOpen || surfaceAdvance || transactionEvidenceDisclosure || explicitlyFree || profileField || stageExit || paymentMethod || scopeToggle || optionalConsent
+        : surfaceDismiss || surfaceOpen || surfaceAdvance || explicitlyFree || profileField || stageExit || paymentMethod || scopeToggle || optionalConsent
           ? "safe"
           : "uncertain";
   const phoneField = ["phone", "phone_country_code"].includes(profileField)
@@ -556,8 +560,6 @@ function interpretStructuralControl(control = {}, groupLabel = "", currentSurfac
       ? "presentation_mode"
       : surfaceDismiss || surfaceOpen || surfaceAdvance
       ? "surface_command"
-      : transactionEvidenceDisclosure
-      ? "information_disclosure"
       : profileField
       ? "profile_field"
       : legal
@@ -678,11 +680,10 @@ function interpretStructuralPage(page = {}) {
     // Requiredness is interpreted here from exact current evidence. The
     // browser's previous group.required/status projection is intentionally not
     // authoritative across the structural boundary.
-    let required = group.requiredStateObserved === true
+    const requiredBySite = group.ownerState?.required === true
       || requiredByControl
-      || requiredByValidation
-      || family === "payment_method"
-      || family === "fare";
+      || requiredByValidation;
+    let required = requiredBySite;
     const requiredOpaqueAttestation = required
       && groupControls.length === 1
       && /checkbox|switch/.test(clean(`${groupControls[0].kind || ""} ${groupControls[0].role || ""}`).toLowerCase())
@@ -831,7 +832,15 @@ function interpretStructuralPage(page = {}) {
       || /^(?:remove|deselect|undo|clear|none|no thanks|without)\b/i.test(clean(option.label))
     ))?.controlId || "";
     return {
-      ...group,
+      // The observer owns membership, selection and state relationships only.
+      // Do not carry its semantic family/status projections into the final
+      // DecisionFrame group and then overwrite them field-by-field.
+      decisionGroupId: clean(group.decisionGroupId),
+      surfaceId: clean(group.surfaceId || "surface-page"),
+      surfaceType: clean(group.surfaceType || "page"),
+      sectionId: clean(group.sectionId),
+      sectionLabel: clean(group.sectionLabel),
+      ownerState: group.ownerState || null,
       requirementId: structuralRequirementKey(family, group.sectionLabel),
       subject: family,
       sectionType: family,
@@ -841,6 +850,7 @@ function interpretStructuralPage(page = {}) {
       // surface, not proof that only one final alternative exists.
       exclusive,
       material: family !== "decision",
+      requiredBySite,
       required,
       status: selectionInvariantValid
         ? (selected ? "satisfied" : required ? "missing" : "optional")
@@ -941,47 +951,92 @@ function interpretStructuralPage(page = {}) {
       canonicalAttributes: alternative.canonicalAttributes || control.canonicalAttributes || null
     } : control;
   });
-  // Payment routes are semantic choices even when the browser can prove only
-  // a flat set of links/images (a common hosted-gateway shape). Group those
-  // already interpreted controls once, here in DecisionFrame, instead of
-  // teaching the structural observer or TaskState another payment classifier.
-  const ownedDecisionControlIds = new Set(decisionGroups.flatMap((group) => (
-    group.alternativeControlIds || []
-  )));
-  const unownedPaymentControls = controls.filter((control) => (
+  // Final payment ownership is compiled once from interpreted controls. The
+  // observer may report a placeholder selector group and a flat set of actual
+  // routes, but those are structural presentations of one decision—not two
+  // semantic authorities. Keep presentation selectors as owned support nodes;
+  // only card/wallet routes are final alternatives.
+  const paymentRoutesBySurface = new Map();
+  controls.filter((control) => (
     control.semantic === "payment_method"
-    && !ownedDecisionControlIds.has(control.controlId)
+    && ["card", "wallet"].includes(clean(control.paymentMethodKind))
     && activeRepresentation(control)
-  ));
-  if (unownedPaymentControls.length) {
-    const selected = unownedPaymentControls.filter((control) => (
+  )).forEach((control) => {
+    const surfaceId = clean(control.surfaceId || "surface-page");
+    if (!paymentRoutesBySurface.has(surfaceId)) paymentRoutesBySurface.set(surfaceId, []);
+    paymentRoutesBySurface.get(surfaceId).push(control);
+  });
+  for (const [surfaceId, routes] of paymentRoutesBySurface) {
+    const routeIds = new Set(routes.map((control) => control.controlId));
+    const relatedGroups = decisionGroups.filter((group) => (
+      clean(group.surfaceId || "surface-page") === surfaceId
+      && (
+        group.sectionType === "payment_method"
+        || (group.alternativeControlIds || []).some((controlId) => routeIds.has(controlId))
+      )
+    ));
+    const presentationControlIds = unique(relatedGroups.flatMap((group) => group.alternativeControlIds || []))
+      .filter((controlId) => !routeIds.has(controlId));
+    for (let index = decisionGroups.length - 1; index >= 0; index -= 1) {
+      if (relatedGroups.includes(decisionGroups[index])) decisionGroups.splice(index, 1);
+    }
+    const selected = routes.filter((control) => (
       control.selected === true || control.state?.checked === true || control.state?.selected === true
     ));
-    const surfaceId = clean(unownedPaymentControls[0].surfaceId || "surface-page");
+    const required = relatedGroups.some((group) => group.required === true);
+    const decisionGroupId = `dg_payment_method_${surfaceId.replace(/[^a-z0-9]+/gi, "_")}`;
     decisionGroups.push({
-      decisionGroupId: `dg_payment_method_${surfaceId.replace(/[^a-z0-9]+/gi, "_")}`,
+      decisionGroupId,
       requirementId: "payment:method",
       surfaceId,
-      surfaceType: clean(unownedPaymentControls[0].surfaceType || "page"),
-      sectionLabel: "Payment method",
+      surfaceType: clean(routes[0].surfaceType || "page"),
+      sectionId: clean(relatedGroups[0]?.sectionId),
+      sectionLabel: clean(relatedGroups[0]?.sectionLabel || "Payment method"),
       subject: "payment_method",
       sectionType: "payment_method",
       kind: "exclusive_choice",
       material: true,
-      required: true,
-      status: selected.length ? "satisfied" : "missing",
+      requiredBySite: required,
+      required,
+      status: selected.length ? "satisfied" : required ? "missing" : "optional",
       selectedControlId: selected[0]?.controlId || "",
       selectedLabel: selected[0]?.label || "",
-      alternatives: unownedPaymentControls.map((control) => ({
+      presentationControlIds,
+      alternatives: routes.map((control) => ({
         controlId: control.controlId,
         label: control.label || control.controlId,
         semantic: "payment_method",
+        paymentMethodKind: control.paymentMethodKind,
         physicalEffect: "reveal_control",
+        effectRole: "payment_route",
         risk: "safe",
         selected: selected.includes(control),
         structuredPrice: null
       })),
-      alternativeControlIds: unownedPaymentControls.map((control) => control.controlId)
+      alternativeControlIds: routes.map((control) => control.controlId),
+      selectionInvariant: {
+        exclusive: true,
+        valid: selected.length <= 1,
+        selectedCount: selected.length
+      }
+    });
+    const ownedIds = new Set([...routeIds, ...presentationControlIds]);
+    controls = controls.map((control) => {
+      if (!ownedIds.has(control.controlId)) return control;
+      if (routeIds.has(control.controlId)) return {
+        ...control,
+        decisionGroupId,
+        sectionType: "payment_method"
+      };
+      return {
+        ...control,
+        decisionGroupId,
+        semantic: "payment_presentation",
+        semanticType: "payment_presentation",
+        physicalEffect: control.operations?.open ? "open_surface" : "unknown",
+        effectRole: "presentation_mode",
+        risk: "safe"
+      };
     });
   }
   const navigationControls = controls.filter((control) => control.physicalEffect === "advance_checkout_stage");
@@ -1050,7 +1105,10 @@ function controlEvidenceIds(control = {}) {
   return Object.freeze(unique([
     control.controlId,
     control.stateElementId,
-    control.preferredActivationElementId
+    ...Object.values(control.operations || {}).flatMap((capability) => [
+      ...(capability?.actuatorIds || []),
+      ...(capability?.strategies || []).map((strategy) => strategy?.actuatorId)
+    ])
   ]));
 }
 
@@ -1247,6 +1305,50 @@ function canonicalSemanticCompilation(compilation = {}, interpretedPage = {}) {
   });
 }
 
+function structuralPageForDecisionFrame(rawPage = {}) {
+  const stripSurfaceMeaning = (surface = null) => {
+    if (!surface || typeof surface !== "object") return surface;
+    const {
+      taskHint: _taskHint,
+      surfaceClass: _surfaceClass,
+      parentSectionType: _parentSectionType,
+      expectedResolution: _expectedResolution,
+      ...structuralSurface
+    } = surface;
+    return structuralSurface;
+  };
+  const structuralPage = {
+    ...rawPage,
+    // Browser stage/surface classifiers remain available in the immutable raw
+    // ObservationFrame for diagnostics. They do not enter the semantic
+    // compiler as business meaning; DecisionFrame and TaskState derive meaning
+    // from labels, relationships, current state, controls, and typed evidence.
+    browserDiagnostics: {
+      ...(rawPage.browserDiagnostics || {}),
+      step: clean(rawPage.browserDiagnostics?.step || rawPage.step),
+      stepEvidence: rawPage.browserDiagnostics?.stepEvidence || rawPage.stepEvidence || null,
+      currentSurface: {
+        ...(rawPage.browserDiagnostics?.currentSurface || {}),
+        taskHint: clean(rawPage.browserDiagnostics?.currentSurface?.taskHint || rawPage.currentSurface?.taskHint),
+        surfaceClass: clean(rawPage.browserDiagnostics?.currentSurface?.surfaceClass || rawPage.currentSurface?.surfaceClass),
+        expectedResolution: clean(rawPage.browserDiagnostics?.currentSurface?.expectedResolution || rawPage.currentSurface?.expectedResolution)
+      }
+    },
+    step: "",
+    stepEvidence: null,
+    currentSurface: stripSurfaceMeaning(rawPage.currentSurface),
+    activeSurface: stripSurfaceMeaning(rawPage.activeSurface),
+    surfaceStack: (rawPage.surfaceStack || []).map(stripSurfaceMeaning)
+  };
+  if (structuralPage.currentSurface && typeof structuralPage.currentSurface === "object") {
+    structuralPage.currentSurface = {
+      ...structuralPage.currentSurface,
+      surfaceClass: surfaceClassFrom(structuralPage)
+    };
+  }
+  return structuralPage;
+}
+
 function compileDecisionFrame({
   observation = {},
   observationFrame = null,
@@ -1265,9 +1367,24 @@ function compileDecisionFrame({
     rawPage.semanticControlHints,
     rawPage.semanticDecisionHints
   ].some((hints) => Array.isArray(hints) && hints.length > 0);
-  const interpretedPage = rawPage.observationContract === "structural-observation/v1" || hasGroundedHints
-    ? interpretStructuralPage(rawPage)
+  const structuralSourcePage = rawPage.observationContract === "structural-observation/v1"
+    ? structuralPageForDecisionFrame(rawPage)
     : rawPage;
+  let interpretedPage = rawPage.observationContract === "structural-observation/v1" || hasGroundedHints
+    ? interpretStructuralPage(structuralSourcePage)
+    : rawPage;
+  if (rawPage.observationContract === "structural-observation/v1"
+    && interpretedPage.currentSurface
+    && typeof interpretedPage.currentSurface === "object"
+    && clean(interpretedPage.currentSurface.type || "page").toLowerCase() !== "page") {
+    interpretedPage = {
+      ...interpretedPage,
+      currentSurface: {
+        ...interpretedPage.currentSurface,
+        surfaceClass: surfaceClassFrom(interpretedPage)
+      }
+    };
+  }
   const deterministicCompilation = agentContract.compileSemanticCheckout(interpretedPage);
   const compilation = canonicalSemanticCompilation(deterministicCompilation, interpretedPage);
   const semanticPage = {
@@ -1290,6 +1407,14 @@ function compileDecisionFrame({
       semanticType: clean(owner.fieldType || owner.semanticType || owner.semantic || issue.semanticType)
     } : { ...issue });
   }));
+  if (semanticPage.currentSurface
+    && typeof semanticPage.currentSurface === "object"
+    && clean(semanticPage.currentSurface.type || "page").toLowerCase() !== "page") {
+    semanticPage.currentSurface = Object.freeze({
+      ...semanticPage.currentSurface,
+      surfaceClass: surfaceClassFrom(semanticPage)
+    });
+  }
   const semanticObservation = {
     ...observation,
     page: semanticPage,
@@ -1323,7 +1448,6 @@ function compileDecisionFrame({
     commerceEntities: freezeArray(compilation.decisionGroups || []),
     navigationDiagnostics: page.stageExit || null,
     transactionFacts,
-    transactionAcquisition: state.transactionInvariants?.acquisition || null,
     terminalEvidence: page.terminalEvidence || null,
     validationBlockers: arrayReference(page.validationIssues),
     unresolvedEvidence,

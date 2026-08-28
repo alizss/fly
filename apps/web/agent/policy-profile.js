@@ -93,6 +93,23 @@ function explicitNoPaid(value = "") {
   return /decline all paid|skip all paid|avoid all paid|nothing paid|\bno paid extras?\b|\bno paid upgrades?\b|\bno extras?\b|\bwithout extras?\b|\bskip extras?\b|nothing extra/.test(lower(value));
 }
 
+function standingCheckoutPolicy(userPolicy = {}, traveler = {}) {
+  // Absence of a saved preference is not authority to decline a product.
+  // The wallet migration writes the product default explicitly; synthetic or
+  // incomplete profiles remain unconfigured here.
+  const paidExtras = lower(userPolicy.paidExtras || traveler.paid_extras_policy || "ask");
+  const standardBookingTerms = lower(userPolicy.standardBookingTerms || traveler.standard_booking_terms || "ask");
+  const marketingConsent = lower(userPolicy.marketingConsent || traveler.marketing_consent || "decline");
+  const paymentMethod = clean(userPolicy.paymentMethod || userPolicy.paymentPreference || traveler.payment_preference || "browser saved card");
+  return Object.freeze({
+    paidExtras: paidExtras === "decline" ? "decline" : "ask",
+    standardBookingTerms: standardBookingTerms === "accept" ? "accept" : "ask",
+    marketingConsent: marketingConsent === "accept" ? "accept" : "decline",
+    paymentMethod,
+    paymentSubmission: "never"
+  });
+}
+
 function normalizeAuthorization(raw = {}, index = 0) {
   const maximumAmount = Number(raw.maximumAmount ?? raw.maxAmount ?? raw.priceLimit?.amount);
   return Object.freeze({
@@ -116,7 +133,10 @@ function normalizeProfilePolicy({ userPolicy = {}, traveler = {} } = {}) {
   const savedRules = clean([userPolicy.bookingRules, traveler.booking_rules].filter(Boolean).join(" "));
   const seatPolicy = seatPolicyFrom({ userPolicy, traveler });
   const policyText = lower(`${bookingSpecific} ${savedRules} ${userPolicy.baggage || ""} ${traveler.baggage_preference || ""} ${userPolicy.insurance || ""} ${userPolicy.extras || ""}`);
-  const globalNoPaid = userPolicy.skipPaidExtrasApproved === true || explicitNoPaid(policyText);
+  const standingPolicy = standingCheckoutPolicy(userPolicy, traveler);
+  const globalNoPaid = standingPolicy.paidExtras === "decline"
+    || userPolicy.skipPaidExtrasApproved === true
+    || explicitNoPaid(policyText);
   const noPaidByFamily = Object.freeze({
     seat: globalNoPaid || seatPolicy === SEAT_POLICIES.RANDOM_ASSIGNMENT,
     baggage: globalNoPaid || /no paid (?:bag|baggage)|no checked (?:bag|baggage)|no (?:bag|baggage)|personal item only|without baggage/.test(policyText),
@@ -131,6 +151,7 @@ function normalizeProfilePolicy({ userPolicy = {}, traveler = {} } = {}) {
   ].map(normalizeAuthorization);
   return Object.freeze({
     facts: Object.freeze({ travelerId: clean(traveler.id), profile: traveler }),
+    standingPolicy,
     preferences: Object.freeze({
       seatPolicy,
       baggage: clean(userPolicy.baggage || traveler.baggage_preference),
@@ -258,21 +279,23 @@ function resolveProfileDecision(decision = {}, { userPolicy = {}, traveler = {},
         description: option.raw?.description
       }
     }) === "standard_terms");
-    if (eligible.length) {
+    if (eligible.length && policy.standingPolicy?.standardBookingTerms === "accept") {
       return resolutionResult({
         match: "exact",
-        source: "checkout_mandate",
+        source: "saved_profile",
         options: eligible,
         preferred: eligible.length === 1 ? eligible[0] : null,
-        reason: "The transaction-bound Book/Pay mandate covers ordinary required booking terms.",
+        reason: "The saved profile explicitly authorizes ordinary required booking terms.",
         evidence: eligible.map((option) => option.label)
       });
     }
     return resolutionResult({
       match: "ambiguous",
-      source: "checkout_mandate",
+      source: "saved_profile",
       options: [],
-      reason: "The legal choice is exceptional, bundled, or not proven to be ordinary booking terms.",
+      reason: eligible.length
+        ? "The profile does not grant standing authority for ordinary booking terms."
+        : "The legal choice is exceptional, bundled, or not proven to be ordinary booking terms.",
       evidence: options.map((option) => option.label)
     });
   }
@@ -535,6 +558,35 @@ function seatPolicyFrom({ userPolicy = {}, traveler = {} } = {}) {
   return normalizeSeatPolicy(explicit || legacy, bookingRules);
 }
 
+function routineCheckoutAdmission({ traveler = {}, userPolicy = {} } = {}) {
+  const missingFacts = [];
+  const firstName = clean(traveler.first_name || traveler.firstName || traveler.given_name || traveler.givenName);
+  const lastName = clean(traveler.last_name || traveler.lastName || traveler.surname || traveler.family_name);
+  const dateOfBirth = clean(traveler.date_of_birth || traveler.dateOfBirth || traveler.birth_date || traveler.dob);
+  const email = clean(traveler.email || traveler.contact_email);
+  const phone = clean(traveler.phone || traveler.phone_number || traveler.mobile || traveler.mobile_phone);
+  if (!firstName) missingFacts.push("traveler.first_name");
+  if (!lastName) missingFacts.push("traveler.last_name");
+  if (!dateOfBirth) missingFacts.push("traveler.date_of_birth");
+  if (!email) missingFacts.push("traveler.email");
+  if (!phone) missingFacts.push("traveler.phone");
+
+  const paidExtras = lower(userPolicy.paidExtras || traveler.paid_extras_policy);
+  const standardTerms = lower(userPolicy.standardBookingTerms || traveler.standard_booking_terms);
+  const marketing = lower(userPolicy.marketingConsent || traveler.marketing_consent);
+  const paymentMethod = clean(userPolicy.paymentMethod || userPolicy.paymentPreference || traveler.payment_preference);
+  const paymentSubmission = lower(userPolicy.paymentSubmission || traveler.payment_submission);
+  if (paidExtras !== "decline") missingFacts.push("policy.paid_extras");
+  if (standardTerms !== "accept") missingFacts.push("policy.standard_booking_terms");
+  if (!["accept", "decline"].includes(marketing)) missingFacts.push("policy.marketing_consent");
+  if (!paymentMethod) missingFacts.push("policy.payment_method");
+  if (paymentSubmission !== "never") missingFacts.push("policy.payment_submission");
+  return Object.freeze({
+    ready: missingFacts.length === 0,
+    missingFacts: Object.freeze(missingFacts)
+  });
+}
+
 function canonicalizeUserPolicy(userPolicy = {}, traveler = {}) {
   const {
     preferredSeat: _preferredSeat,
@@ -545,6 +597,7 @@ function canonicalizeUserPolicy(userPolicy = {}, traveler = {}) {
   return Object.freeze({
     ...rest,
     seatPolicy: seatPolicyFrom({ userPolicy, traveler }),
+    standingPolicy: standingCheckoutPolicy(userPolicy, traveler),
     profilePolicy: normalizeProfilePolicy({ userPolicy, traveler })
   });
 }
@@ -556,5 +609,7 @@ module.exports = {
   normalizeSeatPolicy,
   parsePriceLimit,
   resolveProfileDecision,
-  seatPolicyFrom
+  routineCheckoutAdmission,
+  seatPolicyFrom,
+  standingCheckoutPolicy
 };

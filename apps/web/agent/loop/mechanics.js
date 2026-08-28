@@ -53,12 +53,8 @@ function targetCandidateSnapshot(candidate = {}, source = "", surface = {}) {
     box: candidate.box || null,
     visualRegion: candidate.visualRegion || candidate.box || null,
     stateElementId: String(candidate.stateElementId || ""),
-    visibleWidgetElementId: String(candidate.visibleWidgetElementId || ""),
-    preferredActivationElementId: String(candidate.preferredActivationElementId || ""),
     ownershipIntegrity: candidate.ownershipIntegrity || null,
-    actuators: Array.isArray(candidate.actuators) ? candidate.actuators.slice(0, 10) : [],
     operations: candidate.operations && typeof candidate.operations === "object" ? candidate.operations : {},
-    recovery: candidate.recovery && typeof candidate.recovery === "object" ? candidate.recovery : {},
     visualRegions: Array.isArray(candidate.visualRegions) ? candidate.visualRegions.slice(0, 12) : [],
     source,
     surfaceId: String(surface?.id || ""),
@@ -90,53 +86,30 @@ function targetSnapshotForAction(action = {}, page = {}) {
         id: control.surfaceId || "",
         label: control.surfaceLabel || control.sectionLabel || ""
       }),
-      recoveryOperation: action.operation || "",
+      operation: action.operation || "",
     };
   }
   if (resolution.ok) {
     const control = resolution.control;
     const annotation = (page.screenshotAnnotations || []).find((item) => item.controlId === control.controlId) || null;
     const capability = action.operation ? control.operations?.[action.operation] : null;
-    const recovery = action.boundedRecovery === true && action.operation
-      ? control.recovery?.[action.operation] || null
-      : null;
-    const operationIds = capability?.actuatorIds || [];
-    const recoveryIds = [
-      ...(recovery?.actuatorIds || []),
-      ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-    ].filter(Boolean);
-    const requestedMemberId = [
-      control.stateElementId,
-      control.preferredActivationElementId,
-      ...(control.actuators || []).map((item) => item.nodeId),
-      ...operationIds,
-      ...recoveryIds
-    ]
-      .includes(action.actuatorId) ? action.actuatorId : "";
-    const exactRecoveryTargetId = recovery
-      && requestedMemberId
-      && recoveryIds.includes(requestedMemberId)
-      && (recovery.strategies || []).some((strategy) => (
-        strategy.actuatorId === requestedMemberId
-        && (!action.interactionMethod || strategy.method === action.interactionMethod)
-      ))
-      ? requestedMemberId
-      : "";
-    const exactStrategy = [
-      ...(capability?.strategies || []),
-      ...(recovery?.strategies || [])
-    ].find((strategy) => (
-      strategy.actuatorId === (exactRecoveryTargetId || requestedMemberId || action.actuatorId)
+    // A leased mutation must name the exact canonical operation whose
+    // strategies own its physical actuators. State/presentation aliases are
+    // verification topology, never a fallback execution plan.
+    if (!capability) return null;
+    const operationIds = [...new Set([
+      ...(capability?.actuatorIds || []),
+      ...(capability?.strategies || []).map((strategy) => strategy.actuatorId)
+    ].filter(Boolean))];
+    const requestedMemberId = operationIds.includes(action.actuatorId) ? action.actuatorId : "";
+    const exactStrategy = (capability?.strategies || []).find((strategy) => (
+      strategy.actuatorId === (requestedMemberId || action.actuatorId)
       && (!action.interactionMethod || strategy.method === action.interactionMethod)
     )) || null;
-    const operationTargetId = exactRecoveryTargetId || (capability
-      ? (requestedMemberId && operationIds.includes(requestedMemberId) ? requestedMemberId : capability.actuatorId || operationIds[0])
-      : ["type", "select"].includes(action.type)
-        ? control.stateElementId
-        : requestedMemberId || control.preferredActivationElementId || control.stateElementId);
+    const operationTargetId = requestedMemberId || capability.actuatorId || operationIds[0];
+    if (!operationTargetId) return null;
     const exactActuatorRegion = exactStrategy?.proof?.visualRegion
       || exactStrategy?.actionability?.visualRegion
-      || recovery?.targetabilityByActuator?.[operationTargetId]?.visualRegion
       || capability?.actionabilityByActuator?.[operationTargetId]?.visualRegion
       || (capability?.exactActuators || []).find((item) => item.actuatorId === operationTargetId)?.proof?.visualRegion
       || null;
@@ -264,10 +237,8 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
     || identity.pipelineContract?.capability?.selectedStrategy?.actuatorStableKey
     || ""
   );
-  const strategies = [
-    ...Object.values(control?.operations || {}).flatMap((capability) => capability?.strategies || []),
-    ...Object.values(control?.recovery || {}).flatMap((recovery) => recovery?.strategies || [])
-  ];
+  const strategies = Object.values(control?.operations || {})
+    .flatMap((capability) => capability?.strategies || []);
   const matchingStrategies = selectedActuatorStableKey
     ? strategies.filter((strategy) => strategy.actuatorStableKey === selectedActuatorStableKey)
     : strategies;
@@ -294,8 +265,7 @@ function targetLocalRecoveryScope(goal = {}, observation = {}, identity = {}) {
         || control.currentValue
         || ""
       ),
-      optionValue: String(control.state?.optionValue || ""),
-      visibleWidgetElementId: String(control.visibleWidgetElementId || "")
+      optionValue: String(control.state?.optionValue || "")
     } : null,
     actuator: matchingStrategies.map((strategy) => ({
       actuatorStableKey: strategy.actuatorStableKey || "",

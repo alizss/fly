@@ -7,7 +7,24 @@ Do not build airline-specific workflows.
 Goal is this for future long term to work on web/extension/ios app and so on aka engine.
 It has to complete checkouts airline and based on user context profile and reach the payment stage dealing with all unfamilirites and obstacles, reason and figure it out to reach the goal.
 
-Current milestone: complete all authorized pre-payment checkout work, verify that real card-entry controls have been reached, and stop before entering payment credentials, paying, or purchasing.
+Current milestone: given an authoritative selected booking, a selected traveler,
+a complete profile, and standing checkout policy, one explicit Start must complete
+all authorized routine pre-payment work on an unfamiliar airline/OTA checkout,
+verify that real card-entry controls have been reached, and stop before entering
+payment credentials, paying, or purchasing.
+
+Routine checkout is zero-intervention. Ordinary profile fields, authorized
+free/included choices, declined paid extras, standard terms, card-route selection,
+navigation, and redirects must not ask the user or require a manual restart.
+Questions are reserved for genuine exceptions such as missing profile facts,
+CAPTCHA/login/OTP, unavailable inventory, exceptional declarations, or a material
+itinerary/traveler/currency/price conflict outside explicit profile authority.
+
+`SelectedBooking` is a startup invariant, not something checkout pages may
+manufacture later. It must be supplied by the booking-selection owner or captured
+from an explicit user flight/fare selection before Start, persisted with checkout
+lineage, and locked for the durable session. Current-page observations compare
+against it; they never promote themselves into transaction approval.
 
 ## How to think
 

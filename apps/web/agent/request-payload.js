@@ -81,8 +81,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
             name: clampText(control.name, 180),
             label: clampText(control.label, 180),
             kind: clampText(control.kind, 80),
-            semantic: clampText(control.semantic, 80),
-            risk: clampText(control.risk, 80),
             selected: Boolean(control.selected),
             required: Boolean(control.required),
             hasValue: Boolean(control.hasValue),
@@ -95,7 +93,7 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
   
   function compactSurface(surface = {}) {
     if (!surface || typeof surface !== "object") {
-      return { type: "page", id: "", label: "", role: "", taskHint: "", box: null, memberControlIds: [], memberActuatorIds: [] };
+      return { type: "page", id: "", label: "", role: "", box: null, memberControlIds: [], memberActuatorIds: [] };
     }
     const surfaceMembers = [
       ...(surface.memberControlIds || surface.controlIds || []),
@@ -104,16 +102,14 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
     ];
     const surfaceActuators = [
       ...(surface.memberActuatorIds || []),
-      ...(surface.options || []).flatMap((item) => [item.stateElementId, item.preferredActivationElementId]),
-      ...(surface.buttons || []).flatMap((item) => [item.stateElementId, item.preferredActivationElementId])
+      ...(surface.options || []).flatMap((item) => Object.values(item.operations || {}).flatMap((capability) => capability?.actuatorIds || [])),
+      ...(surface.buttons || []).flatMap((item) => Object.values(item.operations || {}).flatMap((capability) => capability?.actuatorIds || []))
     ];
     return {
       type: clampText(surface.type || "page", 40),
       id: clampText(surface.id || "", 80),
       label: clampText(surface.label || "", 1200),
       role: clampText(surface.role || "", 80),
-      taskHint: clampText(surface.taskHint || "", 120),
-      surfaceClass: clampText(surface.surfaceClass || "unknown", 40),
       blocksBackground: Boolean(surface.blocksBackground),
       parentSurfaceId: clampText(surface.parentSurfaceId, 80),
       parentControlId: clampText(surface.parentControlId, 140),
@@ -121,23 +117,10 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       observationId: clampText(surface.observationId, 120),
       memberControlIds: [...new Set(surfaceMembers.map((id) => clampText(id, 140)).filter(Boolean))],
       memberActuatorIds: [...new Set(surfaceActuators.map((id) => clampText(id, 80)).filter(Boolean))],
-      expectedResolution: clampText(surface.expectedResolution || "", 180),
       foreground: compactVisualState({ foreground: surface.foreground || surface.visualState?.foreground || null })?.foreground || null,
       visualState: compactVisualState(surface.visualState),
       box: surface.box || null
     };
-  }
-  
-  function compactActuators(actuators = []) {
-    return Array.isArray(actuators)
-      ? actuators.map((item) => ({
-          nodeId: clampText(item.nodeId, 80),
-          relation: clampText(item.relation, 40),
-          role: clampText(item.role, 80),
-          label: clampText(item.label, 180),
-          box: item.box || null
-        })).filter((item) => item.nodeId).slice(0, 10)
-      : [];
   }
   
   function compactControlFields(item = {}) {
@@ -164,7 +147,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       controlKind: clampText(item.controlKind || item.kind, 80),
       controlState: item.controlState || item.state || null,
       stateElementId: clampText(item.stateElementId, 80),
-      preferredActivationElementId: clampText(item.preferredActivationElementId, 80),
       fieldClassification: item.fieldClassification?.fieldType ? {
         fieldType: clampText(item.fieldClassification.fieldType, 80),
         source: clampText(item.fieldClassification.source, 80),
@@ -178,8 +160,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         ambiguity: item.fieldClassification.ambiguity || null
       } : null,
       operations: compactControlOperations(item.operations),
-      recovery: compactControlRecovery(item.recovery),
-      actuators: compactActuators(item.actuators),
       visualRegion: item.visualRegion || null
     };
   }
@@ -189,12 +169,44 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       clampText(name, 40),
       capability ? {
         operation: clampText(capability.operation || name, 40),
+        status: clampText(capability.status, 40),
         actuatorId: clampText(capability.actuatorId, 80),
         actuatorIds: Array.isArray(capability.actuatorIds) ? capability.actuatorIds.map((id) => clampText(id, 80)).filter(Boolean).slice(0, 8) : [],
         actionability: compactActuatorActionability(capability.actionability),
-        actionabilityByActuator: Object.fromEntries(Object.entries(capability.actionabilityByActuator || {})
-          .slice(0, 8)
-          .map(([id, evidence]) => [clampText(id, 80), compactActuatorActionability(evidence)])),
+        exactActuators: Array.isArray(capability.exactActuators)
+          ? capability.exactActuators.map((actuator) => ({
+              actuatorId: clampText(actuator.actuatorId, 80),
+              status: clampText(actuator.status, 40),
+              proof: compactActuatorActionability(actuator.proof)
+            })).filter((actuator) => actuator.actuatorId).slice(0, 8)
+          : [],
+        strategies: Array.isArray(capability.strategies)
+          ? capability.strategies.map((strategy) => ({
+              strategyId: clampText(strategy.strategyId || strategy.actuatorStableKey, 700),
+              actuatorStableKey: clampText(strategy.actuatorStableKey, 700),
+              operation: clampText(strategy.operation || name, 40),
+              actuatorId: clampText(strategy.actuatorId, 80),
+              method: clampText(strategy.method, 80),
+              actionType: clampText(strategy.actionType, 40),
+              keys: clampText(strategy.keys, 40),
+              status: clampText(strategy.status, 40),
+              operationProven: strategy.operationProven === true,
+              actionability: compactActuatorActionability(strategy.actionability || strategy.proof),
+              visualRegion: strategy.visualRegion && typeof strategy.visualRegion === "object"
+                ? agentContract.cloneSerializable(strategy.visualRegion)
+                : null,
+              expectedOutcome: typeof strategy.expectedOutcome === "string"
+                ? clampText(strategy.expectedOutcome, 120)
+                : strategy.expectedOutcome && typeof strategy.expectedOutcome === "object"
+                  ? agentContract.cloneSerializable(strategy.expectedOutcome)
+                  : null,
+              evidence: clampText(strategy.evidence, 240)
+            })).slice(0, 24)
+          : [],
+        requiresVisualConfirmation: capability.requiresVisualConfirmation === true,
+        regions: Array.isArray(capability.regions)
+          ? capability.regions.map((region) => agentContract.cloneSerializable(region)).slice(0, 4)
+          : [],
         precondition: capability.precondition || null,
         expectedOutcome: clampText(capability.expectedOutcome, 80)
       } : null
@@ -231,39 +243,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         ? agentContract.cloneSerializable(evidence.box)
         : null
     };
-  }
-  
-  function compactControlRecovery(recovery = {}) {
-    return Object.fromEntries(Object.entries(recovery || {}).map(([name, capability]) => [
-      clampText(name, 40),
-      capability ? {
-        operation: clampText(capability.operation || name, 40),
-        status: clampText(capability.status, 40),
-        strategy: clampText(capability.strategy, 120),
-        requiresFreshObservation: Boolean(capability.requiresFreshObservation),
-        requiresVisualConfirmation: Boolean(capability.requiresVisualConfirmation),
-        regions: Array.isArray(capability.regions)
-          ? capability.regions.map((region) => ({
-              x: Number(region.x || 0),
-              y: Number(region.y || 0),
-              width: Number(region.width || 0),
-              height: Number(region.height || 0),
-              centerX: Number(region.centerX || 0),
-              centerY: Number(region.centerY || 0),
-              viewportWidth: Number(region.viewportWidth || 0),
-              viewportHeight: Number(region.viewportHeight || 0),
-              surfaceId: clampText(region.surfaceId, 80),
-              observationId: clampText(region.observationId, 120),
-              controlId: clampText(region.controlId, 140),
-              operation: clampText(region.operation, 40),
-              source: clampText(region.source, 120),
-              inViewport: region.inViewport !== false,
-              evidence: clampText(region.evidence, 120),
-              confidence: Number(region.confidence || 0)
-            })).slice(0, 4)
-          : []
-      } : null
-    ]));
   }
   
   function compactLogicalControl(control = {}) {
@@ -343,11 +322,7 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         : null,
       decisionGroupId: clampText(control.decisionGroupId, 140),
       stateElementId: clampText(control.stateElementId, 160),
-      visibleWidgetElementId: clampText(control.visibleWidgetElementId, 160),
-      preferredActivationElementId: clampText(control.preferredActivationElementId, 160),
-      actuators: compactActuators(control.actuators),
       operations: compactControlOperations(control.operations),
-      recovery: compactControlRecovery(control.recovery),
       visualRegion: control.visualRegion || null,
       visualRegions: Array.isArray(control.visualRegions) ? control.visualRegions.slice(0, 8) : [],
       sourceProvenance: control.sourceProvenance && typeof control.sourceProvenance === "object"
@@ -447,7 +422,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         if (!control) return [];
         return [{
           controlId,
-          targetId: control.preferredActivationElementId || control.stateElementId || "",
           visualRef: control.visualRef || "",
           label: control.label || "",
           semantic: control.semantic || "",
@@ -474,7 +448,9 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
       surfaceType: clampText(group.surfaceType, 80),
       sectionId: clampText(group.sectionId, 80),
       sectionLabel: clampText(group.sectionLabel, 160),
-      requiredStateObserved: group.requiredStateObserved === true,
+      ownerState: group.ownerState && typeof group.ownerState === "object" ? {
+        required: group.ownerState.required === true
+      } : null,
       selectedControlId: ids.includes(group.selectedControlId) ? clampText(group.selectedControlId, 140) : "",
       selectedLabel: clampText(group.selectedLabel, 220),
       selectedEvidence: group.selectedEvidence && typeof group.selectedEvidence === "object" ? {
@@ -495,7 +471,6 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         const control = controlsById.get(controlId) || {};
         return {
           controlId,
-          targetId: clampText(observed.targetId, 140),
           label: clampText(observed.label || control.label, 220),
           selected: observed.selected === true
             || control.selected === true
@@ -722,6 +697,18 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
   function compactAgentPayload(rawBody) {
     const body = hydrateIncrementalAgentBody(rawBody);
     const page = body.page || {};
+    if (page.observationContract !== "structural-observation/v1") {
+      const error = new Error("The loaded checkout observer is stale. Reload the extension before starting or continuing this checkout.");
+      error.code = "STALE_OBSERVATION_CONTRACT";
+      error.status = 409;
+      error.retryable = false;
+      error.details = {
+        expected: "structural-observation/v1",
+        received: clampText(page.observationContract || "missing", 80)
+      };
+      throw error;
+    }
+    const structuralObservation = page.observationContract === "structural-observation/v1";
     const traveler = body.traveler || {};
     const screenshot = screenshotForObservation(page, body);
     const screenshotDataUrl = screenshot.screenshotDataUrl;
@@ -845,6 +832,10 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
         special_assistance: clampText(traveler.special_assistance, 500),
         travel_purpose: normalizeTravelPurpose(traveler.travel_purpose),
         payment_preference: clampText(traveler.payment_preference, 120),
+        paid_extras_policy: clampText(traveler.paid_extras_policy, 40),
+        standard_booking_terms: clampText(traveler.standard_booking_terms, 40),
+        marketing_consent: clampText(traveler.marketing_consent, 40),
+        payment_submission: "never",
         baggage_preference: clampText(traveler.baggage_preference, 120),
         preferred_seat: clampText(traveler.preferred_seat, 120),
         seat_policy: seatPolicyFrom({ traveler }),
@@ -864,7 +855,17 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
           : "",
         site: clampText(page.site, 80),
         url: clampText(page.url, 500),
-        step: clampText(page.step, 80),
+        browserDiagnostics: {
+          step: clampText(page.step, 80),
+          stepEvidence: page.stepEvidence && typeof page.stepEvidence === "object"
+            ? agentContract.cloneSerializable(page.stepEvidence)
+            : null,
+          currentSurface: {
+            taskHint: clampText(page.currentSurface?.taskHint, 120),
+            surfaceClass: clampText(page.currentSurface?.surfaceClass, 80),
+            expectedResolution: clampText(page.currentSurface?.expectedResolution, 180)
+          }
+        },
         viewport: page.viewport && typeof page.viewport === "object" ? page.viewport : null,
         snapshotHash: clampText(page.snapshotHash, 120),
         graphIntegrity: page.graphIntegrity && typeof page.graphIntegrity === "object" ? {
@@ -890,10 +891,7 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
               label: clampText(item.label, 220),
               kind: clampText(item.kind, 80),
               role: clampText(item.role, 80),
-              semantic: clampText(item.semantic, 80),
-              risk: clampText(item.risk, 80),
               selected: Boolean(item.selected),
-              required: Boolean(item.required),
               source: clampText(item.source, 80),
               box: item.box || null
             })).filter((item) => item.visualRef && item.controlId && canonicalControlIds.has(item.controlId)).slice(0, 80)
@@ -990,7 +988,7 @@ function createRequestPayloadAdapter({ agentSessionStore, screenshotForObservati
                   )
             )).filter((group) => group.decisionGroupId && group.alternativeControlIds.length > 0)
           : [],
-        stageExit: page.stageExit || {},
+        stageExit: structuralObservation ? {} : (page.stageExit || {}),
         reconciliation: page.reconciliation || {},
         currentSurface,
         surfaceStack,

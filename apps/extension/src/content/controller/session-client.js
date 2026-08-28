@@ -10,7 +10,6 @@ export function createSessionClient({
   agent,
   compactActionResultForTransport,
   compactPageMap,
-  composeSelectedBookingContract,
   logAgentEvent,
   logFlow,
   observationHashForMap,
@@ -60,11 +59,11 @@ export function createSessionClient({
       }
       let selectedBookingContract = null;
       if (!resumeSessionId) {
-        const currentMap = agent.pageMap || pageStateStore.current() || pageStateStore.observe({ reason: "session_start_booking" }).map;
-        recordStartEvent("BOOKING_CAPTURE_STARTED", { startAttemptId });
-        // Consume already-available proof without waiting for this document to
-        // repeat itinerary copy. Explicit Start owns durable admission.
-        const admission = await admitSelectedBookingForStart({ initialMap: currentMap });
+        recordStartEvent("BOOKING_ADMISSION_STARTED", { startAttemptId });
+        // Start consumes only the final tab-scoped SelectedBooking produced by
+        // the app or the lightweight pre-checkout selection owner. The current
+        // checkout page can never manufacture transaction approval here.
+        const admission = await admitSelectedBookingForStart();
         if (admission.status === "candidate") {
           recordStartEvent("BOOKING_CANDIDATE_FOUND", {
             startAttemptId,
@@ -78,7 +77,7 @@ export function createSessionClient({
         selectedBookingContract = validStoredSelectedBookingContract(
           suppliedSelectedBooking,
           selectedTraveler
-        ) || composeSelectedBookingContract(admission.acquisition, selectedTraveler);
+        );
         if (suppliedSelectedBooking && !selectedBookingContract) {
           recordStartEvent("APP_SELECTED_BOOKING_INVALID", {
             startAttemptId,
@@ -101,9 +100,16 @@ export function createSessionClient({
             missingFacts: admission.missingFacts || []
           });
           const error = new Error(
-            "The selected booking could not be verified. Return to the selected itinerary and start checkout again."
+            admission.missingFacts?.length
+              ? `No approved booking was captured before this checkout. Return to the flight/fare selection, select it once, then continue and Start Fly. Missing: ${admission.missingFacts.join(", ")}.`
+              : "No approved booking was captured before checkout Start. Return to the flight/fare selection and select it once."
           );
           error.code = "SELECTED_BOOKING_REQUIRED";
+          error.details = {
+            admissionStatus: admission.status || "absent",
+            reason: admission.reason || "",
+            missingFacts: admission.missingFacts || []
+          };
           throw error;
         }
       }
@@ -131,6 +137,7 @@ export function createSessionClient({
         const error = new Error(session.error || `session returned ${response.status}`);
         error.code = session.code || `HTTP_${response.status}`;
         error.retryable = session.retryable === true;
+        error.details = session.details || null;
         throw error;
       }
       const sessionId = String(session.id || "");
@@ -143,15 +150,20 @@ export function createSessionClient({
       logAgentEvent("agent_session_started", { sessionId: agent.sessionId });
       return session;
     } catch (error) {
+      const failureMessage = String(error.message || "Checkout session could not be started.");
+      const failureCode = error.code || (/extension context invalidated/i.test(failureMessage)
+        ? "EXTENSION_CONTEXT_RELOADED"
+        : "SESSION_START_FAILED");
       agent.sessionStartFailure = {
-        code: String(error.code || "SESSION_START_FAILED"),
-        message: String(error.message || "Checkout session could not be started."),
+        code: String(failureCode),
+        message: failureMessage,
         details: error.details || null,
         startAttemptId
       };
       recordStartEvent("SESSION_START_FAILED", {
         startAttemptId,
         code: agent.sessionStartFailure.code,
+        message: agent.sessionStartFailure.message,
         details: agent.sessionStartFailure.details
       });
       logAgentEvent("agent_session_failed", { error: error.message });

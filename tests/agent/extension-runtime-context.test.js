@@ -37,20 +37,21 @@ test("extension wiring never hands a module the unrestricted runtime owner", () 
   assert.match(sidebar, /setUserGoal\(event\.target\.value\)/);
 });
 
-test("remaining acquisition and observation support live behind owned modules", () => {
+test("booking admission and observation support live behind owned modules", () => {
   const root = path.resolve(__dirname, "../..");
   const runtime = fs.readFileSync(path.join(root, "apps/extension/src/content/runtime.js"), "utf8");
-  const acquisition = fs.readFileSync(path.join(root, "apps/extension/src/content/selected-booking-acquisition.js"), "utf8");
+  const admission = fs.readFileSync(path.join(root, "apps/extension/src/content/selected-booking-admission.js"), "utf8");
   const signatures = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/signatures.js"), "utf8");
   const pageStateSupport = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/page-state-support.js"), "utf8");
 
-  assert.match(runtime, /createSelectedBookingAcquisition\s*\(/);
+  assert.match(runtime, /createSelectedBookingAdmission\s*\(/);
   assert.match(runtime, /createObservationSignatures\s*\(/);
   assert.match(runtime, /createPageStateSupport\s*\(/);
-  assert.doesNotMatch(runtime, /function captureSelectedBookingFromMap\s*\(/);
+  assert.doesNotMatch(runtime, /captureSelectedBookingFromMap/);
   assert.doesNotMatch(runtime, /function materialObservationSignature\s*\(/);
   assert.doesNotMatch(runtime, /function canonicalPageStateDiff\s*\(/);
-  assert.match(acquisition, /function schedule\s*\(/);
+  assert.match(admission, /async function admitForStart\s*\(/);
+  assert.doesNotMatch(admission, /transactionFacts|pageStateStore|schedule|capture/);
   assert.match(signatures, /function materialObservationSignature\s*\(/);
   assert.match(pageStateSupport, /function canonicalPageStateDiff\s*\(/);
 });

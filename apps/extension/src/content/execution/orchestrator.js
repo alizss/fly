@@ -19,7 +19,6 @@ export function createExecutionOrchestrator({
   elementId,
   elementSignature,
   expectedOutcomeForDecision,
-  failedLocalStrategyForDecision,
   flashElement,
   guardedHelperAllowed,
   inferCheckoutSite,
@@ -65,7 +64,6 @@ export function createExecutionOrchestrator({
   stableHash,
   stopWatchingCheckoutChanges,
   targetFingerprint,
-  targetLocalDispatchIdentity,
   traveler,
   validateResolvedTarget,
   validateVisualCoordinateTarget,
@@ -378,13 +376,6 @@ export function createExecutionOrchestrator({
 
 
   function repeatGuardFor(element, message, decision = null, map = agent.pageMap || null) {
-    if (decision && failedLocalStrategyForDecision(decision, map || buildPageMap())) {
-      logFlow("repeat_guard.blocked", {
-        signature: targetLocalDispatchIdentity(decision, map || buildPageMap()).strategySignature,
-        message: String(message || "")
-      });
-      return false;
-    }
     const signature = elementSignature(element);
     const actionLeaseId = String(decision?.actionId || decision?.id || "").trim();
     // A DOM signature identifies a mechanic, not an execution lease. Checkout
@@ -959,11 +950,6 @@ export function createExecutionOrchestrator({
       return;
     }
 
-    let failedLocalStrategy = null;
-    if (["click", "type", "select", "keypress", "click_xy"].includes(decision.action)) {
-      failedLocalStrategy = failedLocalStrategyForDecision(decision, map);
-    }
-
     if (decision.candidateId && ["click", "type", "select", "keypress", "click_xy"].includes(decision.action)) {
       const pipeline = decision.pipelineContract || null;
       const control = (map.controls || []).find((item) => item.controlId === decision.controlId) || {};
@@ -980,35 +966,16 @@ export function createExecutionOrchestrator({
           observationId: actionObservationId,
           page: map
         },
-        strategyAlreadyFailed: Boolean(failedLocalStrategy)
+        // The browser verifies mechanics; it does not own retry policy.
+        // Backend recovery is the sole consumer of prior canonical outcomes.
+        strategyAlreadyFailed: false
       }) || "deny";
       const contractValid = pipeline?.contractVersion === AGENT_CONTRACT?.CONTRACT_VERSION
         && ["normal", "bounded_recovery"].includes(executionLane);
       if (!contractValid) {
         await rejectMechanicalAction(actionId, actionObservationId, decision, {
-          code: failedLocalStrategy
-            ? "FAILED_STRATEGY_REUSE"
-            : "CAPABILITY_EXECUTION_LANE_DENIED",
+          code: "CAPABILITY_EXECUTION_LANE_DENIED",
           message: "The authoritative capability contract did not survive to dispatch with valid current proof."
-        });
-        return;
-      }
-    }
-
-    if (["click", "type", "select", "keypress", "click_xy"].includes(decision.action)) {
-      if (failedLocalStrategy) {
-        logFlow("repeat_guard.blocked", {
-          actionId,
-          observationId: actionObservationId,
-          controlId: decision.controlId || "",
-          operation: decision.operation || "",
-          interactionMethod: decision.interactionMethod || decision.action || "",
-          failedLocalStrategy
-        });
-        await rejectMechanicalAction(actionId, actionObservationId, decision, {
-          code: "FAILED_STRATEGY_REUSE",
-          message: "The identical failed actuator strategy is blocked while its target-local state is unchanged.",
-          dispatched: false
         });
         return;
       }

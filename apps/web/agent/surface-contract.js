@@ -12,10 +12,9 @@ function normalizeSurface(surface = {}, observationId = "") {
     type,
     label: clean(surface.label || surface.accessibleName || (isPage ? "Page" : "")),
     role: clean(surface.role),
-    // Preserve the observer's typed semantic classification. Dropping this at
-    // the extension/backend boundary forces downstream code to reinterpret
-    // prose and was the reason foreground site failures became stale form
-    // goals again.
+    // Preserve the raw observer classification for diagnostics. DecisionFrame
+    // removes it before semantic compilation and republishes a class derived
+    // from structural surface/control evidence.
     surfaceClass: clean(surface.surfaceClass),
     // Exclusivity must be proven structurally by the observer. A non-page
     // positioned panel is context unless it is an actual modal/open choice
@@ -67,9 +66,10 @@ function controlBelongsToCurrentSurface(control = {}, page = {}) {
   const surface = currentSurface(page);
   const aliases = new Set([
     control.stateElementId,
-    control.preferredActivationElementId,
-    ...(control.actuators || []).map((actuator) => actuator?.nodeId),
-    ...Object.values(control.operations || {}).flatMap((capability) => capability?.actuatorIds || [])
+    ...Object.values(control.operations || {}).flatMap((capability) => [
+      ...(capability?.actuatorIds || []),
+      ...(capability?.strategies || []).map((strategy) => strategy?.actuatorId)
+    ])
   ].map(clean).filter(Boolean));
   const explicitMembership = surface.memberControlIds.includes(clean(control.controlId))
     || surface.memberActuatorIds.some((id) => aliases.has(id));

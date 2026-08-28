@@ -30,6 +30,11 @@ function viewportRecoveryAction(blockedAction = {}, observation = {}, recoveryCo
     observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
     type: "scroll",
     intent: "recover_target_viewport",
+    // Viewport recovery belongs to the already-leased operation. Preserve the
+    // capability identity so the browser never has to treat an element alias
+    // as a separate execution authority.
+    operation: blockedAction.operation || "",
+    interactionMethod: blockedAction.interactionMethod || "",
     controlId: blockedAction.controlId || blockedAction.targetSnapshot?.controlId || "",
     actuatorId: blockedAction.actuatorId || blockedAction.targetSnapshot?.id || "",
     targetLabel: blockedAction.targetLabel || blockedAction.targetSnapshot?.label || "",

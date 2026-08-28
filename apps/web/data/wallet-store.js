@@ -95,6 +95,10 @@ function createWalletStore({ dataDir, dbFile, encryptionKey }) {
         billing_address: "22 Market Street, San Francisco, CA 94105",
         billing_email: "invoices@example.com",
         payment_preference: "browser saved card",
+        paid_extras_policy: "decline",
+        standard_booking_terms: "accept",
+        marketing_consent: "decline",
+        payment_submission: "never",
         booking_rules: "Avoid paid seats, insurance, support bundles, SMS updates, and paid extras unless I explicitly approve. Stop before real payment.",
         created_at: now(),
         updated_at: now()
@@ -161,6 +165,10 @@ function createWalletStore({ dataDir, dbFile, encryptionKey }) {
         billing_address: "22 Market Street, San Francisco, CA 94105",
         billing_email: traveler.email || "invoices@example.com",
         payment_preference: "browser saved card",
+        paid_extras_policy: "decline",
+        standard_booking_terms: "accept",
+        marketing_consent: "decline",
+        payment_submission: "never",
         travel_purpose: "leisure",
         booking_rules: "Avoid paid seats, insurance, support bundles, SMS updates, and paid extras unless I explicitly approve. Stop before real payment."
       };
@@ -292,6 +300,12 @@ function createWalletStore({ dataDir, dbFile, encryptionKey }) {
       billing_address: body.billing_address || "",
       billing_email: body.billing_email || body.email || "",
       payment_preference: body.payment_preference || "browser saved card",
+      paid_extras_policy: body.paid_extras_policy || existing.paid_extras_policy || "decline",
+      standard_booking_terms: body.standard_booking_terms || existing.standard_booking_terms || "accept",
+      marketing_consent: body.marketing_consent || existing.marketing_consent || "decline",
+      // The current milestone never submits payment. This is persisted as an
+      // explicit standing policy instead of being inferred from free text.
+      payment_submission: "never",
       booking_rules: body.booking_rules || "Avoid paid seats, insurance, support bundles, SMS updates, and paid extras unless I explicitly approve. Stop before real payment.",
       updated_at: now()
     };

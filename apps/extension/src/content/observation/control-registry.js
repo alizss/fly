@@ -18,17 +18,11 @@ export function createControlRegistryTools({
   function controlMemberNodeIds(control = {}) {
     const operationActuatorIds = Object.values(control.operations || {})
       .flatMap((capability) => capability?.actuatorIds || []);
-    const recoveryActuatorIds = Object.values(control.recovery || {})
-      .flatMap((recovery) => [
-        ...(recovery?.actuatorIds || []),
-        ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-      ]);
     return [
       control.stateElementId,
       control.preferredActivationElementId,
       ...(control.actuators || []).map((actuator) => actuator.nodeId),
-      ...operationActuatorIds,
-      ...recoveryActuatorIds
+      ...operationActuatorIds
     ].filter((nodeId, index, list) => nodeId && list.indexOf(nodeId) === index);
   }
 

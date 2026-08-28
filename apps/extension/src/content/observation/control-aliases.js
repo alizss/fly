@@ -1,25 +1,15 @@
 export function canonicalAliasRecords(control = {}) {
   const operationAliases = Object.entries(control.operations || {}).flatMap(([operation, capability]) =>
-    (capability?.actuatorIds || []).map((aliasId) => ({ aliasId, kind: `operation:${operation}` }))
-  );
-  const recoveryAliases = Object.entries(control.recovery || {}).flatMap(([operation, recovery]) =>
     [
-      ...(recovery?.actuatorIds || []),
-      ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-    ].map((aliasId) => ({ aliasId, kind: `recovery:${operation}` }))
+      ...(capability?.actuatorIds || []),
+      ...(capability?.strategies || []).map((strategy) => strategy?.actuatorId)
+    ].map((aliasId) => ({ aliasId, kind: `operation:${operation}` }))
   );
   return [
     { aliasId: control.controlId, kind: "control" },
     { aliasId: control.stableKey, kind: "stable_key" },
-    { aliasId: control.stateElementId, kind: "state" },
-    { aliasId: control.preferredActivationElementId, kind: "activation" },
     { aliasId: control.visualRef, kind: "visual" },
-    ...(control.actuators || []).map((actuator) => ({
-      aliasId: actuator?.nodeId,
-      kind: actuator?.relation || "actuator"
-    })),
-    ...operationAliases,
-    ...recoveryAliases
+    ...operationAliases
   ]
     .map((entry) => ({ ...entry, aliasId: String(entry.aliasId || "").trim() }))
     .filter((entry, index, list) => entry.aliasId
@@ -74,12 +64,10 @@ export function buildCanonicalAliasIndex(map = {}) {
   for (const annotation of map.screenshotAnnotations || []) {
     if (!annotation?.controlId) continue;
     register(annotation.visualRef, annotation.controlId, "visual", "screenshot_annotation");
-    register(annotation.targetId, annotation.controlId, "annotation_target", "screenshot_annotation");
   }
   for (const group of map.decisionGroups || []) {
     for (const alternative of group?.alternatives || []) {
       if (!alternative?.controlId) continue;
-      register(alternative.targetId, alternative.controlId, "decision_target", "decision_group");
       register(alternative.visualRef, alternative.controlId, "visual", "decision_group");
     }
   }
@@ -108,20 +96,14 @@ export function decisionTargetAliasIds(decision = {}) {
   return [
     decision.controlId,
     decision.stableKey,
+    decision.actuatorId,
     decision.targetId,
     decision.visualRef,
     target.controlId,
     target.stableKey,
     target.id,
     target.visualRef,
-    target.stateElementId,
-    target.preferredActivationElementId,
-    ...(target.actuators || []).map((actuator) => actuator?.nodeId),
-    ...Object.values(target.operations || {}).flatMap((capability) => capability?.actuatorIds || []),
-    ...Object.values(target.recovery || {}).flatMap((recovery) => [
-      ...(recovery?.actuatorIds || []),
-      ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-    ])
+    target.actuatorId
   ]
     .map((aliasId) => String(aliasId || "").trim())
     .filter((aliasId, index, list) => aliasId && list.indexOf(aliasId) === index);

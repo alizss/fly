@@ -289,8 +289,7 @@
       }),
       relationships: cloneSerializable({
         decisionGroupId: control.decisionGroupId || "",
-        stateElementId: control.stateElementId || "",
-        preferredActivationElementId: control.preferredActivationElementId || ""
+        stateElementId: control.stateElementId || ""
       })
     });
   }
@@ -730,11 +729,16 @@
 
   function exactActuatorFor(control = {}) {
     for (const [operation, capability] of Object.entries(control.operations || {})) {
+      const strategy = (capability?.strategies || []).find((candidate) => (
+        candidate?.actuatorId
+        && candidate?.actionability?.executable === true
+        && candidate?.actionability?.operationProven === true
+      )) || (capability?.strategies || []).find((candidate) => candidate?.actuatorId) || null;
       const actuatorId = text(
-        capability?.actuatorId
+        strategy?.actuatorId
+        || capability?.actuatorId
         || capability?.actuatorIds?.[0]
-        || control.preferredActivationElementId
-        || control.stateElementId,
+        || "",
         160
       );
       if (!actuatorId) continue;
@@ -748,7 +752,7 @@
     }
     return {
       controlId: text(control.controlId, 160),
-      targetId: text(control.preferredActivationElementId || control.stateElementId, 160),
+      targetId: "",
       operation: "",
       capabilityStatus: "",
       executable: false
@@ -829,20 +833,22 @@
     };
   }
 
-  function optionEvidenceFromPage(page = {}, descriptor = {}, orderedDescriptors = [], index = 0) {
-    const visibleText = normalizedText(page.visibleText || page.fullText || page.text);
-    if (!visibleText) return "";
-    const lowerText = visibleText.toLowerCase();
-    const marker = descriptor.label.toLowerCase();
-    const end = lowerText.indexOf(marker);
-    if (end < 0) return "";
-    let start = Math.max(0, end - 700);
-    if (index > 0) {
-      const previousMarker = orderedDescriptors[index - 1].label.toLowerCase();
-      const previous = lowerText.lastIndexOf(previousMarker, end - 1);
-      if (previous >= 0) start = previous + previousMarker.length;
-    }
-    return normalizedText(visibleText.slice(start, end + descriptor.label.length));
+  function optionOwnedEvidence(alternative = {}, control = {}) {
+    // Price/disposition evidence must belong to the exact option actuator.
+    // A text window from the surrounding page can contain a sibling's price
+    // or "included" copy and make opposite choices look equally free.
+    return normalizedText([
+      alternative.label,
+      control.ownText,
+      control.label,
+      control.accessibleName,
+      control.accessibleDescription,
+      control.ariaLabel,
+      control.title,
+      control.name,
+      control.id,
+      control.testId
+    ].filter(Boolean).join(" ")).slice(0, 700);
   }
 
   function canonicalAttributesFromEvidence(value = "") {
@@ -858,25 +864,22 @@
     };
   }
 
-  function boundedDecisionPriceEvidence(page = {}, alternatives = [], controlsById = new Map()) {
-    const descriptors = alternatives.map((alternative) => {
+  function boundedDecisionPriceEvidence(_page = {}, alternatives = [], controlsById = new Map()) {
+    let evidence = alternatives.map((alternative) => {
       const control = controlsById.get(alternative.controlId) || {};
-      return selectionCtaDescriptor(control) || {
+      const descriptor = selectionCtaDescriptor(control) || {
         command: "select",
         optionName: normalizedText(alternative.label || control.label),
         label: normalizedText(control.label || alternative.label)
       };
-    });
-    let evidence = alternatives.map((alternative, index) => {
-      const control = controlsById.get(alternative.controlId) || {};
-      const localText = optionEvidenceFromPage(page, descriptors[index], descriptors, index);
+      const localText = optionOwnedEvidence(alternative, control);
       const explicitlyIncluded = /\b(?:included|no extra (?:cost|charge)|at no extra (?:cost|charge))\b/i.test(localText)
         || /\b0(?:[.,]0{1,2})?\s*(?:eur|usd|gbp|try|tl|€|\$|£|₺)\b/i.test(localText);
       const incremental = priceFrom(alternative.structuredPrice || control.structuredPrice)
         || signedPriceFromText(localText)
         || (explicitlyIncluded ? { amount: 0, currency: "" } : null);
       const absolute = !incremental && !explicitlyIncluded
-        ? absolutePriceNearOption(localText, descriptors[index].optionName)
+        ? absolutePriceNearOption(localText, descriptor.optionName)
         : null;
       return {
         controlId: alternative.controlId,
@@ -1033,10 +1036,16 @@
         || ""
       ));
       const localOwnerKeys = new Set(localOwnerValues.filter(Boolean));
-      const evidenceText = normalizedText([
-        page.visibleText || page.fullText || page.text,
-        ...items.map((item) => `${item.control.sectionLabel || ""} ${item.control.accessibleName || ""}`)
-      ].join(" "));
+      const evidenceText = normalizedText(items.map((item) => [
+        item.control.sectionLabel,
+        item.control.ownText,
+        item.control.label,
+        item.control.accessibleName,
+        item.control.accessibleDescription,
+        item.control.name,
+        item.control.id,
+        item.control.testId
+      ].filter(Boolean).join(" ")).join(" "));
       const subject = subjectFromEvidence(evidenceText);
       // Repeated command wording across a whole page is not ownership. Only
       // unknown controls under one bounded local owner may become one
@@ -1053,9 +1062,8 @@
       ) return [];
       const instance = `repeated_${items[0].descriptor.command}_${subject}_${items.map((item) => normalizedKey(item.descriptor.optionName)).join("_")}`;
       const decisionGroupId = `dg_compiled_${normalizedKey(instance)}`.slice(0, 220);
-      const descriptors = items.map((item) => item.descriptor);
-      let options = items.map((item, index) => {
-        const optionEvidence = optionEvidenceFromPage(page, item.descriptor, descriptors, index);
+      let options = items.map((item) => {
+        const optionEvidence = optionOwnedEvidence({ label: item.descriptor.optionName }, item.control);
         const explicitlyIncluded = /\b(?:included|no extra (?:cost|charge)|at no extra (?:cost|charge))\b/i.test(optionEvidence)
           || /\b0(?:[.,]0{1,2})?\s*(?:eur|usd|gbp|try|tl|€|\$|£|₺)\b/i.test(optionEvidence);
         const structuredPrice = priceFrom(item.control.structuredPrice)
@@ -1332,7 +1340,10 @@
         decisionContract
       };
     });
-    const ownedControlIds = new Set(groups.flatMap((group) => group.alternativeControlIds || []));
+    const ownedControlIds = new Set(groups.flatMap((group) => [
+      ...(group.alternativeControlIds || []),
+      ...(group.presentationControlIds || [])
+    ]));
     const unownedMaterialControls = controls.filter((control) => (
       operationExecutable(control)
       && !ownedControlIds.has(control.controlId)
@@ -1438,7 +1449,9 @@
     operation = "",
     targetId = "",
     actionability = null,
-    recovery = null
+    strategies = [],
+    regions = [],
+    requiresVisualConfirmation = false
   } = {}) {
     const stateElementId = text(control.stateElementId, 160);
     const disabledState = control.disabled === true || control.state?.disabled === true;
@@ -1469,13 +1482,18 @@
       return CAPABILITY_STATUS.RECOVERABLE;
     }
     if (
-      recovery?.requiresVisualConfirmation === true
-      && Array.isArray(recovery.regions)
-      && recovery.regions.some((region) => (
+      requiresVisualConfirmation === true
+      && (
+        (Array.isArray(strategies) && strategies.some((strategy) => (
+          strategy?.status === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+          && (strategy?.proof?.targetable === true || strategy?.actionability?.targetable === true || strategy?.visualRegion)
+        )))
+        || (Array.isArray(regions) && regions.some((region) => (
         Number(region?.width) > 0
         && Number(region?.height) > 0
         && region?.inViewport !== false
-      ))
+        )))
+      )
     ) {
       return CAPABILITY_STATUS.UNPROVEN_EXPERIMENT;
     }
@@ -1531,10 +1549,9 @@
       strategy.proof || strategy.actionability || actionabilityByActuator[actuatorId] || {},
       operation
     );
-    const recovery = strategy.recovery || null;
     const status = Object.values(CAPABILITY_STATUS).includes(strategy.status)
       ? strategy.status
-      : capabilityStatusFor({ control, operation, targetId: actuatorId, actionability: proof, recovery });
+      : capabilityStatusFor({ control, operation, targetId: actuatorId, actionability: proof });
     return {
       ...cloneSerializable(strategy),
       strategyId: text(
@@ -1549,13 +1566,12 @@
       status,
       proof,
       expectedOutcome: cloneSerializable(strategy.expectedOutcome || null),
-      recovery: cloneSerializable(recovery)
+      visualRegion: cloneSerializable(strategy.visualRegion || null)
     };
   }
 
   function normalizeCapability(control = {}, operation = "", rawCapability = null) {
     const capability = rawCapability && typeof rawCapability === "object" ? rawCapability : {};
-    const recovery = control.recovery?.[operation] || null;
     const actuatorIds = [...new Set([
       ...(Array.isArray(capability.actuatorIds) ? capability.actuatorIds : []),
       capability.actuatorId
@@ -1585,13 +1601,6 @@
     const preferredActionability = preferredActuatorId
       ? actionabilityByActuator[preferredActuatorId]
       : normalizedActionability(capability.actionability, operation);
-    const status = capabilityStatusFor({
-      control,
-      operation,
-      targetId: preferredActuatorId,
-      actionability: preferredActionability,
-      recovery
-    });
     const rawStrategies = Array.isArray(capability.strategies) && capability.strategies.length
       ? capability.strategies
       : actuatorIds.flatMap((actuatorId) => defaultMethodsForOperation(operation).map((method) => ({
@@ -1606,23 +1615,16 @@
         strategy.method
         && list.findIndex((other) => other.strategyId === strategy.strategyId) === index
       ));
-    for (const rawRecoveryStrategy of recovery?.strategies || []) {
-      strategies.push(normalizeStrategy(control, operation, {
-        ...rawRecoveryStrategy,
-        status: CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
-        recovery
-      }, actionabilityByActuator));
-    }
-    if (recovery?.requiresVisualConfirmation === true && Array.isArray(recovery.regions)) {
-      recovery.regions.forEach((region) => strategies.push(normalizeStrategy(control, operation, {
-        actuatorId: "",
-        method: INTERACTION_METHOD.VISUAL_COORDINATE,
-        actionType: "click_xy",
-        status: CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
-        recovery: { ...recovery, regions: [region] },
-        expectedOutcome: capability.expectedOutcome || null
-      }, actionabilityByActuator)));
-    }
+    const regions = cloneSerializable(capability.regions || []);
+    const status = capabilityStatusFor({
+      control,
+      operation,
+      targetId: preferredActuatorId,
+      actionability: preferredActionability,
+      strategies,
+      regions,
+      requiresVisualConfirmation: capability.requiresVisualConfirmation === true
+    });
     return {
       ...cloneSerializable(capability),
       capabilityId: text(
@@ -1647,7 +1649,8 @@
       actionability: preferredActionability,
       actionabilityByActuator,
       strategies,
-      recovery: recovery ? cloneSerializable(recovery) : null
+      requiresVisualConfirmation: capability.requiresVisualConfirmation === true,
+      regions
     };
   }
 
@@ -1658,48 +1661,6 @@
         operation,
         normalizeCapability(control, operation, capability)
       ]));
-    const recoveryCapabilities = Object.entries(control.recovery || {})
-      .filter(([operation, recovery]) => recovery && !operations[operation])
-      .map(([operation, recovery]) => {
-        const recoveryActuatorIds = [...new Set((recovery.actuatorIds || [])
-          .map((id) => text(id, 160))
-          .filter(Boolean))];
-        return {
-        capabilityId: `${control.controlId || control.stableKey || "control"}::${operation}:recovery`,
-        operation,
-        status: capabilityStatusFor({ control, operation, recovery }),
-        actuatorId: recoveryActuatorIds[0] || "",
-        actuatorIds: recoveryActuatorIds,
-        exactActuators: recoveryActuatorIds.map((actuatorId) => ({
-          actuatorId,
-          status: CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
-          proof: normalizedActionability(
-            recovery.targetabilityByActuator?.[actuatorId] || {},
-            operation
-          )
-        })),
-        actionability: normalizedActionability({}, operation),
-        actionabilityByActuator: Object.fromEntries(recoveryActuatorIds.map((actuatorId) => [
-          actuatorId,
-          normalizedActionability(recovery.targetabilityByActuator?.[actuatorId] || {}, operation)
-        ])),
-        strategies: [
-          ...(recovery.strategies || []).map((strategy) => normalizeStrategy(control, operation, {
-            ...strategy,
-            status: CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
-            recovery
-          })),
-          ...(recovery.regions || []).map((region) => normalizeStrategy(control, operation, {
-            actuatorId: "",
-            method: INTERACTION_METHOD.VISUAL_COORDINATE,
-            actionType: "click_xy",
-            status: CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
-            recovery: { ...recovery, regions: [region] }
-          }))
-        ],
-        recovery: cloneSerializable(recovery)
-        };
-      });
     const currentCanonicalValue = text(
       control.currentCanonicalValue
         || control.state?.canonicalDateValue
@@ -1757,8 +1718,7 @@
           || control.dateField?.options
           || []
       ),
-      capabilities: [...Object.values(operations), ...recoveryCapabilities],
-      interactionLadder: cloneSerializable(control.interactionLadder || []),
+      capabilities: Object.values(operations),
       operations,
       compositeControl: {
         logicalRequirementId: logicalIdentity,
@@ -1768,14 +1728,20 @@
           currentCanonicalValue
         },
         visibleWidget: cloneSerializable(control.componentContract?.compositeControl?.visibleWidget) || {
-          nodeId: text(control.visibleWidgetElementId || control.preferredActivationElementId, 160),
+          nodeId: text(Object.values(operations)
+            .flatMap((capability) => capability?.strategies || [])
+            .find((strategy) => strategy?.proof?.visible === true || strategy?.actionability?.visible === true)
+            ?.actuatorId || "", 160),
           visualRegion: cloneSerializable(control.visualRegion || null)
         },
-        activationCandidates: cloneSerializable(
-          control.componentContract?.compositeControl?.activationCandidates
-          || control.actuators
-          || []
-        ),
+        activationCandidates: cloneSerializable(Object.values(operations).flatMap((capability) => (
+          (capability?.strategies || []).map((strategy) => ({
+            nodeId: strategy.actuatorId || "",
+            operation: capability.operation || "",
+            method: strategy.method || "",
+            proof: strategy.proof || strategy.actionability || null
+          }))
+        ))),
         popupSurface: cloneSerializable(
           control.componentContract?.compositeControl?.popupSurface
           || control.popupSurface
@@ -1793,7 +1759,7 @@
           || control.verificationContract
           || {
           validationOwnership: control.validationOwnership || null,
-          expectedOutcomes: [...Object.values(operations), ...recoveryCapabilities]
+          expectedOutcomes: Object.values(operations)
             .flatMap((capability) => (capability.strategies || []).map((strategy) => strategy.expectedOutcome))
             .filter(Boolean)
           }
@@ -1816,6 +1782,10 @@
 
   function serializeObservedControl(control = {}, context = {}) {
     const serialized = cloneSerializable(control) || {};
+    // The operation capability is the sole mechanical projection. Never let a
+    // stale producer preserve the superseded parallel recovery graph merely
+    // because it was present on the input object.
+    delete serialized.recovery;
     const componentContract = observedComponentContract(serialized, context);
     const {
       operations,
@@ -1832,12 +1802,8 @@
         status: capability.status,
         actuatorId: capability.actuatorId,
         actuatorIds: capability.actuatorIds,
-        exactActuators: (capability.exactActuators || []).map((actuator) => ({
-          actuatorId: actuator.actuatorId,
-          status: actuator.status,
-          proof: actuator.proof
-        })),
         actionability: capability.actionability,
+        exactActuators: capability.exactActuators,
         strategies: (capability.strategies || []).map((strategy) => ({
           strategyId: strategy.strategyId,
           operation: strategy.operation,
@@ -1846,10 +1812,12 @@
           actionType: strategy.actionType,
           keys: strategy.keys,
           status: strategy.status,
-          expectedOutcome: strategy.expectedOutcome
+          expectedOutcome: strategy.expectedOutcome,
+          visualRegion: strategy.visualRegion || strategy.proof?.visualRegion || null
         })),
         expectedOutcome: capability.expectedOutcome || null,
-        recovery: capability.recovery || null
+        requiresVisualConfirmation: capability.requiresVisualConfirmation === true,
+        regions: capability.regions || []
       }
     ]));
     return {
@@ -1931,7 +1899,8 @@
       strategies: cloneSerializable(capability.strategies || []),
       selectedStrategy: cloneSerializable(capability.selectedStrategy || capability.strategy || null),
       proof: cloneSerializable(capability.proof || capability.actionability || null),
-      recovery: cloneSerializable(capability.recovery || null)
+      requiresVisualConfirmation: capability.requiresVisualConfirmation === true,
+      regions: cloneSerializable(capability.regions || [])
     };
     const normalizedSurfaceOwnership = {
       kind: text(surfaceOwnership.kind, 80),
@@ -1964,7 +1933,7 @@
 
   function isBoundedRecoveryContract(contract = {}) {
     return contract?.capability?.status === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
-      && contract?.capability?.recovery?.requiresVisualConfirmation === true;
+      && contract?.capability?.requiresVisualConfirmation === true;
   }
 
   function sameVisualRegion(left = {}, right = {}) {
@@ -2022,7 +1991,10 @@
     if (declaredParentControlId && declaredParentControlId !== controlId) return false;
     const capability = control.operations?.[operation] || null;
     const executable = capability?.actionability?.executable === true
-      || capability?.actionabilityByActuator?.[targetId]?.executable === true;
+      || capability?.actionabilityByActuator?.[targetId]?.executable === true
+      || (capability?.exactActuators || []).some((actuator) => (
+        actuator?.actuatorId === targetId && actuator?.proof?.executable === true
+      ));
     if (!executable || !(capability?.actuatorIds || []).includes(targetId)) return false;
 
     const expandedOpeners = (page.controls || []).filter((candidate) => (
@@ -2151,6 +2123,7 @@
     if (capability.status === CAPABILITY_STATUS.PROVEN_EXECUTABLE) {
       const operationCapability = control.operations?.[operation] || null;
       const exactProof = operationCapability?.actionabilityByActuator?.[targetId]
+        || (operationCapability?.exactActuators || []).find((actuator) => actuator?.actuatorId === targetId)?.proof
         || capability.proof
         || selectedStrategy?.proof
         || null;
@@ -2180,7 +2153,6 @@
       return EXECUTION_LANE.REVEAL;
     }
 
-    const recovery = control.recovery?.[operation] || capability.recovery || null;
     const allowedRecoveryMethods = new Set([
       INTERACTION_METHOD.NATIVE_CLICK,
       INTERACTION_METHOD.POINTER_SEQUENCE,
@@ -2191,14 +2163,22 @@
       INTERACTION_METHOD.BROWSER_TRUSTED_INPUT,
       INTERACTION_METHOD.BROWSER_TRUSTED_CHOICE
     ]);
-    const exactRecoveryStrategy = (control.recovery?.[operation]?.strategies || [])
-      .find((strategy) => strategyMatchesAction(strategy, action, operation));
+    const operationCapability = control.operations?.[operation] || null;
+    const exactRecoveryStrategy = (operationCapability?.strategies || [])
+      .find((strategy) => (
+        strategy.status === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+        && strategyMatchesAction(strategy, action, operation)
+      ));
     const exactVisualRegion = actionType === "click_xy"
-      && (control.recovery?.[operation]?.regions || []).some((region) => (
+      && (operationCapability?.regions || []).some((region) => (
         sameVisualRegion(region, action.visualRegion || action.targetSnapshot?.visualRegion)
       ));
-    const selectedMatches = selectedStrategy
-      && strategyMatchesAction(selectedStrategy, action, operation);
+    // A coordinate fallback is bound by its exact observation-scoped region;
+    // it has no DOM actuator strategy to select. For every other mechanic the
+    // selected operation strategy must still match the action exactly.
+    const selectedMatches = exactVisualRegion || Boolean(
+      selectedStrategy && strategyMatchesAction(selectedStrategy, action, operation)
+    );
     const recoveryMethod = text(
       action.interactionMethod || selectedStrategy?.method || exactRecoveryStrategy?.method,
       80
@@ -2206,7 +2186,7 @@
     if (
       capability.status === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
       && action.boundedRecovery === true
-      && recovery?.requiresVisualConfirmation === true
+      && operationCapability?.requiresVisualConfirmation === true
       && allowedRecoveryMethods.has(recoveryMethod)
       && (exactRecoveryStrategy || exactVisualRegion)
       && selectedMatches

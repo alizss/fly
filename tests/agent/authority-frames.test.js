@@ -335,11 +335,11 @@ test("an unfamiliar hidden payment select compiles one exact bounded reveal obli
     role: "combobox",
     domRole: "combobox",
     state: { disabled: true, available: false, selected: false, valuePresent: false },
-    operations: { select: unavailableSelect },
-    recovery: {
+    operations: {
+      select: unavailableSelect,
       open: {
         operation: "open",
-        status: "unproven",
+        status: "unproven_experiment",
         requiresVisualConfirmation: true,
         actuatorIds: [actuatorId],
         targetabilityByActuator: { [actuatorId]: recoveryProof },
@@ -350,7 +350,7 @@ test("an unfamiliar hidden payment select compiles one exact bounded reveal obli
           actionType: "click",
           status: "unproven_experiment",
           operationProven: false,
-          actionability: recoveryProof
+          proof: recoveryProof
         }],
         regions: []
       }
@@ -423,7 +423,7 @@ test("an unfamiliar hidden payment select compiles one exact bounded reveal obli
   });
 
   assert.equal(group.subject, "payment_method");
-  assert.equal(group.required, true);
+  assert.equal(group.required, false);
   assert.ok(taskState.currentObligation, JSON.stringify({
     group,
     currentGoal: taskState.currentGoal,
@@ -820,4 +820,71 @@ test("strong unknown validation survives semantic uncertainty and outranks navig
   assert.equal(taskState.currentObligation.semanticOwner.family, "unknown");
   assert.deepEqual(taskState.currentObligation.admittedControlIds, ["unknown_input"]);
   assert.notEqual(taskState.currentObligation.semanticOwner.family, "navigation");
+});
+
+test("DecisionFrame collapses a placeholder payment selector and visible routes into one final decision", () => {
+  const active = { active: true, status: "active_rendered" };
+  const placeholder = {
+    controlId: "payment_selector",
+    stateElementId: "payment_selector_state",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    sectionId: "payment_section",
+    sectionLabel: "Please select payment method",
+    label: "Payment method selector",
+    name: "payment_type_selector",
+    kind: "select",
+    role: "select",
+    representationLifecycle: active,
+    state: { required: true, selected: false, valuePresent: false },
+    operations: { open: actionable("open", "payment_selector_state") }
+  };
+  const route = (controlId, label) => ({
+    controlId,
+    stateElementId: `${controlId}_state`,
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    sectionId: "payment_section",
+    sectionLabel: "Please select payment method",
+    label,
+    kind: "a",
+    role: "pressable",
+    representationLifecycle: active,
+    state: { selected: false },
+    operations: { activate: actionable("activate", `${controlId}_actuator`) }
+  });
+  const observation = {
+    observationId: "obs_payment_competing_presentations",
+    observationSnapshot: { snapshotHash: "hash_payment_competing_presentations" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://unfamiliar.test/payment",
+      currentSurface: { id: "surface-page", type: "page", label: "Payment" },
+      controls: [placeholder, route("visa", "Visa"), route("keks", "KEKS Pay")],
+      decisionGroups: [{
+        decisionGroupId: "browser_placeholder_group",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionId: "payment_section",
+        sectionLabel: "Please select payment method",
+        required: true,
+        status: "blocked",
+        alternativeControlIds: ["payment_selector"],
+        alternatives: [{ controlId: "payment_selector", label: "Payment method selector" }]
+      }],
+      validationIssues: []
+    }
+  };
+
+  const frame = compileDecisionFrame({ observation, observationFrame: createObservationFrame(observation) });
+  const groups = frame.observation.page.decisionGroups.filter((group) => group.sectionType === "payment_method");
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].decisionGroupId, "dg_payment_method_surface_page");
+  assert.deepEqual(groups[0].alternativeControlIds, ["visa", "keks"]);
+  assert.deepEqual(groups[0].presentationControlIds, ["payment_selector"]);
+  assert.equal(groups[0].alternatives.find((option) => option.controlId === "visa").paymentMethodKind, "card");
+  assert.equal(groups[0].alternatives.find((option) => option.controlId === "keks").paymentMethodKind, "wallet");
+  const presentation = frame.observation.page.controls.find((control) => control.controlId === "payment_selector");
+  assert.equal(presentation.semantic, "payment_presentation");
+  assert.equal(presentation.effectRole, "presentation_mode");
 });

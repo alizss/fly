@@ -377,7 +377,7 @@ function decisionGroupForDescriptor(descriptor = {}, page = {}) {
     const ownedControlIds = new Set([
       group.selectedControlId,
       ...(group.alternativeControlIds || []),
-      ...(group.alternatives || []).flatMap((alternative) => [alternative.controlId, alternative.targetId])
+      ...(group.alternatives || []).map((alternative) => alternative.controlId)
     ].filter(Boolean).map(String));
     return Boolean(control.controlId && ownedControlIds.has(String(control.controlId)));
   }) || null;

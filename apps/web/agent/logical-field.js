@@ -705,7 +705,6 @@ function mechanicalOperationsForControl(control = {}) {
   const serializedOperations = Object.keys(control.operations || {});
   return [...new Set([
     ...operationsFor(control),
-    ...Object.entries(control.recovery || {}).filter(([, value]) => Boolean(value)).map(([operation]) => operation),
     ...(serializedOperations.length
       ? []
       : (control.componentContract?.capabilities || []).map((capability) => capability.operation).filter(Boolean))
@@ -717,8 +716,10 @@ function representationIsStateOnly(control = {}) {
   const stableKey = String(control.stableKey || "").toLowerCase();
   const box = control.visualRegion || control.box || {};
   const hasArea = Number(box.width) > 0 && Number(box.height) > 0;
-  const hasRecoveryMechanic = Object.values(control.recovery || {}).some(Boolean)
-    || (!Object.keys(control.operations || {}).length && (control.componentContract?.capabilities || []).some((capability) => (
+  const hasBoundedMechanic = Object.values(control.operations || {}).some((capability) => (
+    capability?.requiresVisualConfirmation === true
+    && ((capability?.strategies || []).length > 0 || (capability?.regions || []).length > 0)
+  )) || (!Object.keys(control.operations || {}).length && (control.componentContract?.capabilities || []).some((capability) => (
       capability.status !== agentContract.CAPABILITY_STATUS.UNAVAILABLE
     )));
   const mechanicallyInert = operations.length === 0
@@ -733,7 +734,7 @@ function representationIsStateOnly(control = {}) {
     || control.hidden === true
     || control.accessibility?.hidden === true
     || !hasArea
-    || !hasRecoveryMechanic
+    || !hasBoundedMechanic
   );
 }
 
@@ -1036,7 +1037,7 @@ function interactionKindForControl(control = {}) {
       ? "native_choice"
       : "custom_choice";
   }
-  if (control.operations?.open || control.operations?.select || control.recovery?.select) return "custom_choice";
+  if (control.operations?.open || control.operations?.select) return "custom_choice";
   return "scalar";
 }
 

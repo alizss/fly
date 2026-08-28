@@ -27,6 +27,7 @@ const { compileCurrentObligation } = require("./obligation-test-helper");
 const { legacyGoalFromObligation } = require("./legacy-obligation-goal-adapter");
 const { recovery, withExecutionFixture } = require("./execution-episode-test-adapter");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
+const { stateWithSelectedBookingBaseline } = require("./governance-test-helper");
 
 function taskMechanics(taskState = {}) {
   return currentObligation(taskState);
@@ -34,7 +35,10 @@ function taskMechanics(taskState = {}) {
 const legacyRequirementReplay = require("./legacy-requirement-replay-adapter");
 
 async function runLoopTurn(args = {}) {
-  const result = await runRawLoopTurn(args);
+  const result = await runRawLoopTurn({
+    ...args,
+    state: stateWithSelectedBookingBaseline(args.state || {}, args.traveler || {}, args.observation || {})
+  });
   return {
     ...result,
     clientDecision: executableDecisionFromActionLease(result.clientDecision)

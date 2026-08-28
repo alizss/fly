@@ -1437,7 +1437,7 @@ test("completed exact outcomes survive scrolling, rerenders, missing controls an
   assert.equal(rerendered.stageOutcome, undefined);
 });
 
-test("only exact fresh paid selection evidence reopens a completed decision", () => {
+test("fresh required unselected evidence reopens a completed decision", () => {
   const previousTaskState = {
     completedOutcomes: [{ decisionGroupId: "seat_leg_2", surfaceId: "old_surface", status: "satisfied" }]
   };
@@ -1466,8 +1466,10 @@ test("only exact fresh paid selection evidence reopens a completed decision", ()
       }
     }
   });
-  assert.equal(alternativesOnly.activeDecisions.length, 0);
-  assert.equal(alternativesOnly.completedOutcomes.some((outcome) => outcome.decisionGroupId === "seat_leg_2"), true);
+  const unresolved = alternativesOnly.observedDecisions.find((decision) => decision.decisionGroupId === "seat_leg_2");
+  assert.equal(unresolved.status, "active");
+  assert.equal(unresolved.actionReason, "required_unresolved");
+  assert.equal(alternativesOnly.completedOutcomes.some((outcome) => outcome.decisionGroupId === "seat_leg_2"), false);
 
   const selectedPaid = reduceTaskState({
     previousTaskState: alternativesOnly,
@@ -1496,6 +1498,97 @@ test("only exact fresh paid selection evidence reopens a completed decision", ()
   });
   assert.equal(selectedPaid.activeDecisions[0].status, "conflicted");
   assert.equal(selectedPaid.completedOutcomes.some((outcome) => outcome.decisionGroupId === "seat_leg_2"), false);
+});
+
+test("an airline payment completion cannot satisfy a fresh hosted-provider payment choice", () => {
+  const groupId = "dg_payment_method_surface_page";
+  const airlineCard = {
+    ...control("airline_card", {
+      decisionGroupId: groupId,
+      label: "Credit or debit card",
+      semantic: "payment_method",
+      semanticType: "payment_method",
+      kind: "radio",
+      role: "radio",
+      selected: true
+    }),
+    state: { checked: true, selected: true }
+  };
+  const airline = reduceTaskState({
+    observation: {
+      observationId: "obs_airline_payment_selected",
+      page: {
+        url: "https://airline.example/checkout/payment",
+        currentSurface: { id: "surface-page", type: "page", label: "Payment" },
+        controls: [airlineCard],
+        decisionGroups: [{
+          decisionGroupId: groupId,
+          surfaceId: "surface-page",
+          surfaceType: "page",
+          sectionType: "payment_method",
+          sectionLabel: "Payment method",
+          required: true,
+          status: "satisfied",
+          selectedControlId: airlineCard.controlId,
+          alternatives: [airlineCard]
+        }],
+        validationIssues: []
+      }
+    },
+    traveler: { payment_method: "credit card" }
+  });
+  assert.equal(airline.observedDecisions[0].status, "satisfied");
+  assert.equal(airline.completedOutcomes.some((outcome) => outcome.decisionGroupId === groupId), true);
+
+  const visa = control("hosted_visa", {
+    decisionGroupId: groupId,
+    label: "Visa",
+    semantic: "payment_method",
+    semanticType: "payment_method",
+    kind: "button",
+    role: "button"
+  });
+  const mastercard = control("hosted_mastercard", {
+    decisionGroupId: groupId,
+    label: "Mastercard",
+    semantic: "payment_method",
+    semanticType: "payment_method",
+    kind: "button",
+    role: "button"
+  });
+  const hosted = reduceTaskState({
+    previousTaskState: airline,
+    observation: {
+      observationId: "obs_hosted_payment_unselected",
+      page: {
+        url: "https://hosted-payments.example/customer-data",
+        currentSurface: { id: "surface-page", type: "page", label: "Please select payment method" },
+        controls: [visa, mastercard],
+        decisionGroups: [{
+          decisionGroupId: groupId,
+          surfaceId: "surface-page",
+          surfaceType: "page",
+          sectionType: "payment_method",
+          sectionLabel: "Please select payment method",
+          required: true,
+          status: "missing",
+          selectedControlId: "",
+          alternatives: [visa, mastercard]
+        }],
+        validationIssues: []
+      }
+    },
+    traveler: { payment_method: "credit card" }
+  });
+
+  const paymentDecision = hosted.observedDecisions.find((decision) => decision.decisionGroupId === groupId);
+  assert.equal(paymentDecision.status, "active");
+  assert.equal(paymentDecision.currentState.selectedControlId, "");
+  assert.equal(paymentDecision.actionReason, "required_unresolved");
+  assert.equal(hosted.completedOutcomes.some((outcome) => outcome.decisionGroupId === groupId), false);
+  assert.equal(hosted.currentObligation?.desiredStateDelta?.decisionGroupId, groupId);
+  assert.equal(hosted.currentObligation?.admittedControlIds.includes(visa.controlId), true);
+  assert.equal(hosted.disposition.code, "EXECUTE_CURRENT_OBLIGATION");
 });
 
 test("direct paid semantics reopen a manually changed completion and an exact remove option resolves it", () => {
@@ -1613,6 +1706,13 @@ test("fresh policy-safe selection outranks a stale completed control id after re
   };
   const state = reduceTaskState({
     previousTaskState: {
+      surfaceFingerprint: JSON.stringify({
+        documentScope: "",
+        id: "surface-page",
+        type: "page",
+        label: "page",
+        progress: {}
+      }),
       completedOutcomes: [{
         decisionGroupId,
         requirementId: "insurance:travel",
@@ -1714,6 +1814,13 @@ test("a proven paid conflict with a current-surface reversal outranks navigation
 test("an unknown optional manual selection invalidates the old completion without blocking navigation", () => {
   const state = reduceTaskState({
     previousTaskState: {
+      surfaceFingerprint: JSON.stringify({
+        documentScope: "",
+        id: "surface-page",
+        type: "page",
+        label: "page",
+        progress: {}
+      }),
       completedOutcomes: [{
         decisionGroupId: "optional_unknown",
         surfaceId: "surface-page",
@@ -2159,11 +2266,11 @@ test("a lone card field outside review does not create a terminal boundary", () 
   assert.notEqual(state.terminalStatus, "card_credential_entry_reached");
 });
 
-test("exact card entry remains a visible capability but cannot complete without authoritative transaction evidence", () => {
+test("exact card entry cannot complete unless the admitted transaction review is ready", () => {
   const state = reduceTaskState({
     transactionReview: {
       ready: false,
-      baselineStatus: "collecting",
+      baselineStatus: "unavailable",
       missingFacts: ["itinerary.route", "travelers", "currency", "totalPrice"],
       contradictions: [],
       unauthorizedPaidExtras: []
@@ -2199,73 +2306,7 @@ test("exact card entry remains a visible capability but cannot complete without 
   assert.equal(state.processAwareness.finalOutcome.achieved, false);
 });
 
-test("a missing booking invariant cannot schedule exploratory evidence disclosure", () => {
-  const disclosure = {
-    ...control("booking_details", {
-      label: "Booking details",
-      semantic: "reveal_transaction_evidence",
-      physicalEffect: "open_surface",
-      effectRole: "information_disclosure",
-      risk: "safe"
-    }),
-    controlsInformationOnly: true,
-    controlledElementIds: ["booking_summary"],
-    ariaExpanded: "false",
-    state: { expanded: false }
-  };
-  const attestation = {
-    ...control("confirm_accuracy", {
-      decisionGroupId: "dg_factual_accuracy",
-      label: "I confirm the booking and passenger details are accurate",
-      semantic: "legal_acceptance",
-      physicalEffect: "accept_legal_terms",
-      effectRole: "legal_attestation",
-      risk: "legal",
-      kind: "checkbox",
-      role: "checkbox"
-    }),
-    required: true,
-    state: { checked: false, selected: false, required: true }
-  };
-  const observation = {
-    observationId: "obs_collecting_at_factual_boundary",
-    observationSnapshot: { snapshotHash: "hash_collecting_at_factual_boundary" },
-    page: {
-      step: "payment",
-      currentSurface: { id: "surface-page", type: "page", label: "Review and pay" },
-      controls: [disclosure, attestation],
-      decisionGroups: [{
-        decisionGroupId: "dg_factual_accuracy",
-        requirementId: "legal:factual-accuracy",
-        surfaceId: "surface-page",
-        surfaceType: "page",
-        sectionType: "legal_acceptance",
-        sectionLabel: "Factual accuracy",
-        required: true,
-        status: "missing",
-        alternatives: [{ ...attestation, selected: false }]
-      }],
-      validationIssues: []
-    }
-  };
-  const state = reduceTaskState({
-    observation,
-    userPolicy: { standardBookingTermsApproved: true },
-    transactionReview: {
-      ready: false,
-      baselineStatus: "collecting",
-      missingFacts: ["itinerary_route", "currency", "total_price"],
-      contradictions: []
-    }
-  });
-
-  assert.equal(state.currentObligation, null);
-  assert.equal(state.disposition.kind, "stop");
-  assert.equal(state.disposition.code, "SELECTED_BOOKING_INVARIANT_MISSING");
-  assert.equal(state.disposition.userActionRequired, false);
-});
-
-test("a legal or payment boundary without exact evidence acquisition stops internally until booking authority exists", () => {
+test("TaskState consumes an admitted booking review and never schedules booking-evidence acquisition", () => {
   const attestation = {
     ...control("confirm_accuracy_without_owner", {
       decisionGroupId: "dg_accuracy_without_owner",
@@ -2299,27 +2340,13 @@ test("a legal or payment boundary without exact evidence acquisition stops inter
       validationIssues: []
     }
   };
-  const collecting = reduceTaskState({
-    observation,
-    userPolicy: { standardBookingTermsApproved: true },
-    transactionReview: {
-      ready: false,
-      baselineStatus: "collecting",
-      missingFacts: ["itinerary_route", "total_price"],
-      contradictions: []
-    }
-  });
-  assert.equal(collecting.currentObligation, null);
-  assert.equal(collecting.disposition.kind, "stop");
-  assert.equal(collecting.disposition.code, "SELECTED_BOOKING_INVARIANT_MISSING");
-  assert.equal(collecting.disposition.userActionRequired, false);
-
   const ready = reduceTaskState({
     observation,
     userPolicy: { standardBookingTermsApproved: true },
     transactionReview: readyTransactionReview()
   });
   assert.deepEqual(ready.currentObligation.admittedControlIds, [attestation.controlId]);
+  assert.notEqual(ready.currentObligation.desiredStateDelta.kind, "transaction_evidence");
   assert.equal(ready.disposition.kind, "execute");
 });
 
@@ -4042,7 +4069,7 @@ test("GoToGate seat mode toggle yields to independently proven safe Next without
   assert.equal(candidateSet.candidates.some((candidate) => candidate.controlId === "back"), false);
 });
 
-test("acquisition attempt exhaustion cannot suppress harmless exact navigation", () => {
+test("an admitted transaction does not suppress harmless exact navigation", () => {
   const next = control("continue_after_unknown_booking", {
     label: "Continue",
     semantic: "continue",
@@ -4073,30 +4100,9 @@ test("acquisition attempt exhaustion cannot suppress harmless exact navigation",
     }
   };
   const state = reduceTaskState({
-    state: {
-      transactionInvariants: {
-        baseline: {
-          itinerary: { completeness: "unknown", segments: [] },
-          travelers: [],
-          currency: "",
-          totalPrice: { amount: null, currency: "" }
-        },
-        acquisition: {
-          contractVersion: "selected-booking-acquisition-state/v1",
-          status: "exhausted",
-          attempts: 6,
-          maximumAttempts: 6,
-          missingFacts: ["itinerary_route", "itinerary_date", "travelers", "currency", "total_price"]
-        }
-      }
-    },
+    state: {},
     observation,
-    transactionReview: {
-      ready: false,
-      baselineStatus: "collecting",
-      missingFacts: ["itinerary_route", "itinerary_date", "travelers", "currency", "total_price"],
-      contradictions: []
-    }
+    transactionReview: readyTransactionReview()
   });
 
   assert.deepEqual(state.currentObligation?.admittedControlIds, [next.controlId]);

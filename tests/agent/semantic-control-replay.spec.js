@@ -1,7 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { test, expect } = require("@playwright/test");
-const { governObservedAction: governAction } = require("./governance-test-helper");
+const { governObservedAction: governAction, stateWithSelectedBookingBaseline } = require("./governance-test-helper");
 const {
   selectNextProfileRequirement
 } = require("../../apps/web/agent/profile-mechanics");
@@ -61,6 +61,38 @@ function testSelectedBooking(travelerId) {
   };
 }
 
+function routineCheckoutTraveler(id, overrides = {}) {
+  return {
+    id,
+    first_name: "Ali",
+    last_name: "Sifrar",
+    date_of_birth: "1990-04-12",
+    email: "ali@example.test",
+    phone: "+38670328922",
+    paid_extras_policy: "decline",
+    standard_booking_terms: "accept",
+    marketing_consent: "decline",
+    payment_preference: "browser saved card",
+    payment_submission: "never",
+    ...overrides
+  };
+}
+
+function selectedBookingFactsFromObserved(transactionFacts = {}, travelerId = "trav_replay") {
+  const segments = transactionFacts.itinerary?.segments || [];
+  const total = transactionFacts.totalPrice || {};
+  return transactionFactsFromSelectedBooking({
+    contractVersion: "selected-booking/v1",
+    selectionId: `selected_booking_${travelerId}`,
+    selectedAt: new Date().toISOString(),
+    sourceUrl: "https://example.test/flights/selected",
+    itinerary: { segments },
+    approvedTotal: { amount: total.amount, currency: total.currency || transactionFacts.currency },
+    fareBrand: transactionFacts.fareBrand || "",
+    travelerIds: [travelerId]
+  });
+}
+
 function deriveProfileGoal(observation = {}, profile = {}, currentGoal = null) {
   return selectNextProfileRequirement(observation, profile, currentGoal, []).goal;
 }
@@ -70,9 +102,11 @@ function toClientDecision(action = {}) {
 }
 
 async function runLoopTurn(args = {}) {
+  const observation = structuralObservationForReplay(args.observation);
   const turn = await runRawLoopTurn({
     ...args,
-    observation: structuralObservationForReplay(args.observation)
+    state: stateWithSelectedBookingBaseline(args.state || {}, args.traveler || {}, observation),
+    observation
   });
   return {
     ...turn,
@@ -84,6 +118,7 @@ const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", 
 const profileFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "profile-form.html");
 const croatiaFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "croatia-passenger.html");
 const contentScriptPath = path.join(__dirname, "..", "..", "apps", "extension", "dist", "content.js");
+const precheckoutCapturePath = path.join(__dirname, "..", "..", "apps", "extension", "src", "content", "precheckout-capture.js");
 const TEST_API = `http://127.0.0.1:${Number(process.env.ATW_TEST_PORT || 4273)}/api`;
 
 function verifiedTransactionReview(totalPrice = 208) {
@@ -303,7 +338,6 @@ async function installBootChrome(page, initialStorage = {}, tabId = 42) {
   await page.evaluate(({ stored, contextTabId }) => {
     window.__ATW_BOOT_STORAGE__ = { ...stored };
     const checkoutContextKey = `atwCheckoutContextV1:${contextTabId}`;
-    const acquisitionKey = `atwSelectedBookingAcquisitionV1:${contextTabId}`;
     const newCheckoutContext = ({ source = "browser_selection", selectedBookingContract = null } = {}) => ({
       contractVersion: "checkout-context/v1",
       tabId: contextTabId,
@@ -338,12 +372,14 @@ async function installBootChrome(page, initialStorage = {}, tabId = 42) {
           if (message?.type === "ATW_CHECKOUT_CONTEXT") {
             return { ok: true, context: window.__ATW_BOOT_STORAGE__[checkoutContextKey] || null };
           }
+          if (message?.type === "ATW_CHECKOUT_CONTEXT_READ") {
+            return { ok: true, context: window.__ATW_BOOT_STORAGE__[checkoutContextKey] || null };
+          }
           if (message?.type === "ATW_CHECKOUT_LINEAGE_BEGIN") {
             let context = window.__ATW_BOOT_STORAGE__[checkoutContextKey] || null;
             if (!context || message.rotate === true) {
               context = newCheckoutContext();
               window.__ATW_BOOT_STORAGE__[checkoutContextKey] = context;
-              if (message.rotate === true) delete window.__ATW_BOOT_STORAGE__[acquisitionKey];
             }
             return { ok: true, context };
           }
@@ -353,7 +389,21 @@ async function installBootChrome(page, initialStorage = {}, tabId = 42) {
               selectedBookingContract: message.selectedBookingContract || null
             });
             window.__ATW_BOOT_STORAGE__[checkoutContextKey] = context;
-            delete window.__ATW_BOOT_STORAGE__[acquisitionKey];
+            return { ok: true, context };
+          }
+          if (message?.type === "ATW_BOOKING_SELECTION_CANDIDATE") {
+            return { ok: true };
+          }
+          if (message?.type === "ATW_BOOKING_SELECTION_CAPTURED") {
+            const previous = window.__ATW_BOOT_STORAGE__[checkoutContextKey] || newCheckoutContext();
+            const context = {
+              ...previous,
+              source: "browser_selection",
+              selectedBookingContract: message.selectedBookingContract || null,
+              updatedAt: new Date().toISOString()
+            };
+            window.__ATW_BOOT_STORAGE__[checkoutContextKey] = context;
+            window.__ATW_BOOT_STORAGE__.selectedBookingContract = message.selectedBookingContract || null;
             return { ok: true, context };
           }
           return { ok: false };
@@ -370,144 +420,157 @@ function bootAppData(travelerId = "trav_boot") {
       id: travelerId,
       first_name: "Ali",
       last_name: "Example",
+      date_of_birth: "1990-04-12",
       nationality: "Slovenian",
-      booking_rules: "No paid extras"
+      email: "ali@example.test",
+      phone: "+386 40 123 456",
+      booking_rules: "No paid extras",
+      paid_extras_policy: "decline",
+      standard_booking_terms: "accept",
+      marketing_consent: "decline",
+      payment_preference: "browser saved card",
+      payment_submission: "never"
     }],
     preferences: { selected_traveler_id: travelerId }
   };
 }
 
-test("idle checkout ignores unrelated Continue and captures a contextual flight Continue for a provider redirect", async ({ page }) => {
-  const bootstrap = bootAppData("trav_cross_origin_booking");
-  await page.route("https://book.lufthansa.test/**", async (route) => {
+test("lightweight unfamiliar-site selection persists the real booking through passenger Start", async ({ page }) => {
+  const travelerId = "trav_lightweight_producer";
+  let sessionBody = null;
+  await page.route("https://unfamiliar-air.test/**", async (route) => {
+    const url = route.request().url();
+    if (url.includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    if (url.includes("/api/agent/session")) {
+      sessionBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({ id: "chk_lightweight_producer" })
+      });
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: "text/html",
       body: `
         <main>
-          <h1>Select your flight</h1>
-          <section data-origin="LJU" data-destination="FRA" data-departure-date="2026-10-15">LJU → FRA</section>
-          <aside>Booking total 280 EUR</aside>
-          <button id="continue" type="button">Continue</button>
-          <button id="select-flight" type="button">Select flight</button>
+          <h1>Choose your flight</h1>
+          <article data-flight data-origin="LJU" data-destination="SPU" data-departure-date="2026-09-12">
+            <p>LJU → SPU</p>
+            <p>Trip total 152,62 EUR</p>
+            <button id="choose-flight" type="button">Choose this flight</button>
+          </article>
         </main>`
     });
   });
-  await page.route("https://book.lufthansa.test/api/extension/bootstrap", async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      headers: { "access-control-allow-origin": "*" },
-      body: JSON.stringify(bootstrap)
-    });
+  await page.goto("https://unfamiliar-air.test/flights");
+  await installBootChrome(page, {
+    apiBase: "https://unfamiliar-air.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: precheckoutCapturePath });
+
+  await page.locator("#choose-flight").click();
+  await expect.poll(() => page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ))).toMatchObject({
+    contractVersion: "selected-booking/v1",
+    itinerary: { segments: [{ origin: "LJU", destination: "SPU", departureDate: "2026-09-12" }] },
+    approvedTotal: { amount: 152.62, currency: "EUR" },
+    travelerIds: [travelerId]
   });
-  await page.goto("https://book.lufthansa.test/select?secret=must-not-leave-page#/flight?token=hidden");
+
   await page.evaluate(() => {
+    history.pushState({}, "", "/passengers");
+    document.body.innerHTML = "<main><h1>Passenger details</h1><p>No itinerary or price is repeated here.</p></main>";
     window.__ATW_ENABLE_TEST_HOOKS__ = true;
     window.__ATW_TEST_BOOT__ = true;
   });
-  await installBootChrome(page, {
-    apiBase: "https://book.lufthansa.test/api",
-    selectedTravelerId: "trav_cross_origin_booking"
-  }, 42);
   await page.addScriptTag({ path: contentScriptPath });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
-  await page.waitForFunction(() => document.getElementById("atw-sidebar")?.innerText.includes("Fly is idle until you press Start"));
-
-  const idle = await page.evaluate(() => ({
-    update: window.__ATW_TEST__.pageStateStoreState().lastUpdate,
-    sidebar: document.getElementById("atw-sidebar")?.innerText || ""
+  const session = await page.evaluate(() => window.__ATW_TEST__.startAgentSession("", {
+    bookingAcquisitionTimeoutMs: 0
   }));
-  expect(idle.update.mode).toBe("uninitialized");
-  expect(idle.sidebar).toContain("Fly is idle until you press Start");
 
-  await page.evaluate(() => {
-    for (let index = 0; index < 80; index += 1) {
-      document.querySelector("main").setAttribute("data-tick", String(index));
-    }
+  const sessionFailure = await page.evaluate(() => window.__ATW_TEST__.sessionStartFailure());
+  expect(sessionFailure).toBeNull();
+  expect(session).toMatchObject({ id: "chk_lightweight_producer" });
+  expect(sessionBody.selectedBookingContract).toMatchObject({
+    itinerary: { segments: [{ origin: "LJU", destination: "SPU", departureDate: "2026-09-12" }] },
+    approvedTotal: { amount: 152.62, currency: "EUR" },
+    travelerIds: [travelerId]
   });
-  await page.waitForTimeout(250);
-  expect(await page.evaluate(() => window.__ATW_TEST__.pageStateStoreState().lastUpdate.mode)).toBe("uninitialized");
+});
 
-  await page.evaluate(() => {
-    const unrelated = document.createElement("button");
-    unrelated.id = "account-continue";
-    unrelated.type = "button";
-    unrelated.textContent = "Continue";
-    document.body.appendChild(unrelated);
-  });
-  await page.locator("#account-continue").click();
-  await page.waitForTimeout(100);
-  const afterGenericContinue = await page.evaluate(() => ({
-    update: window.__ATW_TEST__.pageStateStoreState().lastUpdate,
-    acquisition: window.__ATW_TEST__.readSelectedBookingAcquisition()
-  }));
-  expect(afterGenericContinue.update.mode).toBe("uninitialized");
-  expect(afterGenericContinue.acquisition).toBeNull();
-
-  // Croatia-shaped selection pages commonly use a generic Continue label.
-  // The flight-owned surface, not the English button copy, is the authority.
-  await page.locator("#continue").click();
-  await page.waitForFunction(() => Boolean(window.__ATW_TEST__.readSelectedBookingAcquisition()));
-  const firstPage = await page.evaluate(() => ({
-    acquisition: window.__ATW_TEST__.readSelectedBookingAcquisition(),
-    storage: { ...window.__ATW_BOOT_STORAGE__ }
-  }));
-  expect(firstPage.acquisition.facts).toMatchObject({
-    itinerary: { segments: [expect.objectContaining({ origin: "LJU", destination: "FRA" })] },
-    totalPrice: { amount: 280, currency: "EUR" }
-  });
-  expect(firstPage.acquisition.sourceUrl).not.toContain("secret=");
-  expect(firstPage.acquisition.sourceUrl).not.toContain("token=");
-  expect(firstPage.storage["atwSelectedBookingAcquisitionV1:42"]).toBeTruthy();
-
-  const laterPage = await page.context().newPage();
-  let laterSessionBody = null;
-  await laterPage.route("https://checkout.booking-provider.test/**", async (route) => {
-    await route.fulfill({ status: 200, contentType: "text/html", body: "<main><h1>Passenger details</h1></main>" });
-  });
-  await laterPage.route("https://checkout.booking-provider.test/api/extension/bootstrap", async (route) => {
+test("selection producer prefers structured URL itinerary over hyphenated add-ons prose and strips query secrets", async ({ page }) => {
+  const travelerId = "trav_structured_url_selection";
+  await page.route("https://structured-selection.test/**", async (route) => {
     await route.fulfill({
       status: 200,
-      contentType: "application/json",
-      headers: { "access-control-allow-origin": "*" },
-      body: JSON.stringify(bootstrap)
+      contentType: "text/html",
+      body: `
+        <title>Choose your flight</title>
+        <main>
+          <h1>Select your flight</h1>
+          <p>ADD-ONS</p>
+          <p>Trip total 45 EUR</p>
+          <button id="continue-selection" type="button">Continue</button>
+        </main>`
     });
   });
-  await laterPage.route("https://checkout.booking-provider.test/api/agent/session", async (route) => {
-    laterSessionBody = route.request().postDataJSON();
-    await route.fulfill({
-      status: 201,
-      contentType: "application/json",
-      body: JSON.stringify({ id: "chk_lufthansa_cross_origin" })
-    });
-  });
-  await laterPage.goto("https://checkout.booking-provider.test/passengers?session=sensitive");
-  await laterPage.evaluate(() => {
-    window.__ATW_ENABLE_TEST_HOOKS__ = true;
-    window.__ATW_TEST_BOOT__ = true;
-  });
-  await installBootChrome(laterPage, {
-    ...firstPage.storage,
-    apiBase: "https://checkout.booking-provider.test/api"
+  await page.goto("https://structured-selection.test/results?B_LOCATION_1=ZAG&E_LOCATION_1=SJJ&B_DATE_1=202609150000&B_DATE_2=202609300000&TRIP_TYPE=R&secret=must-not-persist");
+  await installBootChrome(page, {
+    selectedTravelerId: travelerId
   }, 42);
-  await laterPage.addScriptTag({ path: contentScriptPath });
-  await laterPage.waitForFunction(() => Boolean(window.__ATW_TEST__));
-  await laterPage.waitForFunction(() => Boolean(window.__ATW_TEST__.readSelectedBookingAcquisition()));
-  const carried = await laterPage.evaluate(() => ({
-    acquisition: window.__ATW_TEST__.readSelectedBookingAcquisition(),
-    update: window.__ATW_TEST__.pageStateStoreState().lastUpdate
-  }));
-  expect(carried.acquisition.facts.totalPrice).toEqual({ amount: 280, currency: "EUR" });
-  expect(carried.update.mode).toBe("uninitialized");
-  const started = await laterPage.evaluate(() => window.__ATW_TEST__.startAgentSession());
-  expect(started).toMatchObject({ id: "chk_lufthansa_cross_origin" });
-  expect(laterSessionBody.selectedBookingContract).toMatchObject({
-    itinerary: { segments: [expect.objectContaining({ origin: "LJU", destination: "FRA" })] },
-    approvedTotal: { amount: 280, currency: "EUR" },
-    travelerIds: ["trav_cross_origin_booking"]
+  await page.addScriptTag({ path: precheckoutCapturePath });
+
+  await page.locator("#continue-selection").click();
+  await expect.poll(() => page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ))).toMatchObject({
+    itinerary: {
+      segments: [
+        { origin: "ZAG", destination: "SJJ", departureDate: "2026-09-15" },
+        { origin: "SJJ", destination: "ZAG", departureDate: "2026-09-30" }
+      ]
+    },
+    approvedTotal: { amount: 45, currency: "EUR" },
+    travelerIds: [travelerId]
   });
-  await laterPage.close();
+  const sourceUrl = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"].selectedBookingContract.sourceUrl
+  ));
+  expect(sourceUrl).toBe("https://structured-selection.test/results");
+  expect(sourceUrl).not.toContain("secret");
+});
+
+test("ordinary passenger-page Start is not reinterpreted as booking selection", async ({ page }) => {
+  await page.setContent(`
+    <title>Passenger details</title>
+    <main>
+      <h1>Passenger details</h1>
+      <p>ZAG → SJJ</p>
+      <p>Trip total 45 EUR</p>
+      <button id="start-agent" type="button">Start agent</button>
+    </main>`);
+  await installBootChrome(page, { selectedTravelerId: "trav_passenger_start" }, 42);
+  await page.addScriptTag({ path: precheckoutCapturePath });
+
+  await page.locator("#start-agent").click();
+  await page.waitForTimeout(450);
+  const context = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"] || null
+  ));
+  expect(context).toBeNull();
 });
 
 test("an app-supplied tab-scoped SelectedBooking starts on a passenger page with no visible itinerary", async ({ page }) => {
@@ -1124,101 +1187,6 @@ test("the governed executor dispatches a safe Pay by card route instead of reope
   });
 });
 
-test("pre-session selected-booking capture backs off on an unchanged incomplete surface", async ({ page }) => {
-  await loadProducer(page);
-  await page.evaluate(() => {
-    document.body.innerHTML = "<main><h1>Passenger details</h1><p>Checkout has no selected-flight summary.</p></main>";
-    const profile = { id: "trav_provisional_start", first_name: "Ali", last_name: "Example" };
-    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
-  });
-
-  expect(await page.evaluate(() => (
-    window.__ATW_TEST__.scheduleSelectedBookingCapture("incomplete_surface")
-  ))).toBe(true);
-  await page.waitForTimeout(900);
-  expect(await page.evaluate(() => (
-    window.__ATW_TEST__.scheduleSelectedBookingCapture("unchanged_surface")
-  ))).toBe(false);
-});
-
-for (const checkoutCase of [
-  { name: "EasyJet", origin: "LJU", destination: "EDI", total: 362 },
-  { name: "GoToGate", origin: "LHR", destination: "LJU", total: 208 }
-]) {
-  test(`delayed ${checkoutCase.name} hydration cannot create a provisional durable session`, async ({ page }) => {
-    await loadHtmlProducer(page, "<main><h1>Loading checkout…</h1></main>");
-    const travelerId = `trav_${checkoutCase.name.toLowerCase()}`;
-    let requestBody = null;
-    await page.route("https://agent.test/api/agent/session", async (route) => {
-      requestBody = route.request().postDataJSON();
-      await route.fulfill({
-        status: 201,
-        contentType: "application/json",
-        body: JSON.stringify({ id: `chk_provisional_${checkoutCase.name.toLowerCase()}` })
-      });
-    });
-    const started = await page.evaluate(async ({ id, origin, destination, total }) => {
-      window.chrome = {
-        storage: { local: { get: async () => ({ apiBase: "https://agent.test/api" }) } },
-        runtime: { sendMessage: async () => ({ ok: false }) }
-      };
-      const profile = { id, first_name: "Ali", last_name: "Example" };
-      window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
-      window.__ATW_TEST__.discardSelectedBookingAcquisition();
-      window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_loading_shell" });
-      setTimeout(() => {
-        document.body.innerHTML = `
-          <main>
-            <h1>Passenger details</h1>
-            <section data-origin="${origin}" data-destination="${destination}" data-departure-date="2026-10-15">
-              <p>${origin} → ${destination}</p>
-            </section>
-            <aside><p>Selected flight ${total} EUR</p></aside>
-            <button type="button">Continue</button>
-          </main>`;
-      }, 120);
-      const startedAt = performance.now();
-      const session = await window.__ATW_TEST__.startAgentSession("", { bookingAcquisitionTimeoutMs: 2_000 });
-      return { session, elapsedMs: performance.now() - startedAt };
-    }, { id: travelerId, ...checkoutCase });
-    expect(started.session).toBeNull();
-    expect(started.elapsedMs).toBeLessThan(1_000);
-    expect(requestBody).toBeNull();
-  });
-}
-
-test("a persisted booking acquisition composes immediately on a later checkout surface", async ({ page }) => {
-  await loadHtmlProducer(page, `
-    <main>
-      <section data-origin="LJU" data-destination="LGW" data-departure-date="2026-10-15">LJU → LGW</section>
-      <p>Booking total 250 EUR</p>
-    </main>
-  `);
-  let requestBody = null;
-  await page.route("https://agent.test/api/agent/session", async (route) => {
-    requestBody = route.request().postDataJSON();
-    await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ id: "chk_persisted_booking" }) });
-  });
-  const session = await page.evaluate(async () => {
-    window.chrome = {
-      storage: { local: { get: async () => ({ apiBase: "https://agent.test/api" }) } },
-      runtime: { sendMessage: async () => ({ ok: false }) }
-    };
-    const profile = { id: "trav_persisted_booking", first_name: "Ali", last_name: "Example" };
-    window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
-    const observed = window.__ATW_TEST__.observePageState({ forceFull: true, reason: "persist_booking" });
-    window.__ATW_TEST__.captureSelectedBookingFromMap(observed.map);
-    document.body.innerHTML = "<main><h1>Passenger details</h1></main>";
-    window.__ATW_TEST__.notePageMutations([{ type: "childList", target: document.body }]);
-    return window.__ATW_TEST__.startAgentSession();
-  });
-  expect(session.id).toBe("chk_persisted_booking");
-  expect(requestBody.selectedBookingContract).toMatchObject({
-    approvedTotal: { amount: 250, currency: "EUR" },
-    travelerIds: ["trav_persisted_booking"]
-  });
-});
-
 test("startup without authoritative booking evidence creates no provisional session", async ({ page }) => {
   await loadHtmlProducer(page, "<main><h1>Passenger details</h1><p>No booking summary</p></main>");
   let requestBody = null;
@@ -1233,7 +1201,6 @@ test("startup without authoritative booking evidence creates no provisional sess
     };
     const profile = { id: "trav_timeout", first_name: "Ali", last_name: "Example" };
     window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
-    window.__ATW_TEST__.discardSelectedBookingAcquisition();
     window.__ATW_TEST__.observePageState({ forceFull: true, reason: "booking_timeout_shell" });
     const startedAt = performance.now();
     const session = await window.__ATW_TEST__.startAgentSession("", { bookingAcquisitionTimeoutMs: 120 });
@@ -1270,7 +1237,6 @@ test("Start never promotes a passenger-page amount into the authoritative bookin
     };
     const profile = { id: "trav_unowned_page_amount", first_name: "Ali", last_name: "Example" };
     window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id);
-    window.__ATW_TEST__.discardSelectedBookingAcquisition();
     const observed = window.__ATW_TEST__.observePageState({ forceFull: true, reason: "unowned_page_amount" });
     const session = await window.__ATW_TEST__.startAgentSession();
     return { session, pagePrice: observed.map.price };
@@ -1281,7 +1247,7 @@ test("Start never promotes a passenger-page amount into the authoritative bookin
   expect(requestBody).toBeNull();
 });
 
-test("a tab-scoped booking from another checkout lineage cannot authorize an identity-free start", async ({ page }) => {
+test("a legacy acquisition record cannot authorize a tab-scoped Start", async ({ page }) => {
   await page.route("https://checkout.easyjet.test/**", async (route) => {
     if (route.request().url().includes("/api/extension/bootstrap")) {
       await route.fulfill({
@@ -1352,13 +1318,13 @@ test("a tab-scoped booking from another checkout lineage cannot authorize an ide
     return window.__ATW_TEST__.admitSelectedBookingForStart({ initialMap: map });
   });
   expect(admission).toMatchObject({
-    status: "conflict",
-    reason: "CURRENT_TAB_CHECKOUT_LINEAGE_MISMATCH",
-    acquisition: null
+    status: "absent",
+    reason: "SELECTED_BOOKING_NOT_CAPTURED",
+    selectedBookingContract: null
   });
 });
 
-test("an invalid stored booking falls back to fresh acquisition for the selected wallet traveler", async ({ page }) => {
+test("an invalid global booking cannot fall back to current-page transaction approval", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <section data-origin="LJU" data-destination="LGW" data-departure-date="2026-10-15">LJU → LGW</section>
@@ -1394,16 +1360,11 @@ test("an invalid stored booking falls back to fresh acquisition for the selected
     window.__ATW_TEST__.observePageState({ forceFull: true, reason: "stored_contract_fallback" });
     return window.__ATW_TEST__.startAgentSession();
   }, { stored: staleContract });
-  expect(session.id).toBe("chk_fresh_acquisition");
-  expect(requestBody.selectedBookingContract).toMatchObject({
-    contractVersion: "selected-booking/v1",
-    approvedTotal: { amount: 250, currency: "EUR" },
-    travelerIds: ["trav_current"]
-  });
-  expect(requestBody.selectedBookingContract.selectionId).not.toBe("stale_selection");
+  expect(session).toBeNull();
+  expect(requestBody).toBeNull();
 });
 
-test("a fresh checkout rejects a recent stored booking from another airline", async ({ page }) => {
+test("a fresh checkout rejects a global booking from another airline without tab-scoped authority", async ({ page }) => {
   await loadHtmlProducer(page, `
     <main>
       <h1>Passenger details</h1>
@@ -1452,18 +1413,8 @@ test("a fresh checkout rejects a recent stored booking from another airline", as
     window.__ATW_TEST__.observePageState({ forceFull: true, reason: "easyjet_after_kiwi" });
     return window.__ATW_TEST__.startAgentSession();
   }, { stored: kiwiContract });
-  expect(session).toMatchObject({ id: "chk_easyjet_after_kiwi" });
-  expect(requestBody.selectedBookingContract).toMatchObject({
-    itinerary: {
-      segments: [
-        expect.objectContaining({ origin: "LJU", destination: "LGW", departureDate: "2026-10-17" }),
-        expect.objectContaining({ origin: "LGW", destination: "LJU", departureDate: "2026-11-01" })
-      ]
-    },
-    approvedTotal: { amount: 76.03, currency: "EUR" },
-    travelerIds: ["trav_cross_airline"]
-  });
-  expect(requestBody.selectedBookingContract.selectionId).not.toBe("booking_start_kiwi");
+  expect(session).toBeNull();
+  expect(requestBody).toBeNull();
 });
 
 test("resume sends no stored booking contract and uses only the durable baseline", async ({ page }) => {
@@ -1897,6 +1848,9 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
   const decline = initial.page.controls.find((control) => /no,? thanks/i.test(control.label || control.accessibleName || ""));
   expect(decline).toBeTruthy();
   expect(decline.visualRegion?.inViewport).toBe(false);
+  const declineOperation = decline.operations?.choose ? "choose" : "activate";
+  const declineActuatorId = decline.operations?.[declineOperation]?.actuatorIds?.[0] || "";
+  expect(declineActuatorId).not.toBe("");
 
   const originalClick = loopPrivate.bindTargetSnapshot({
     id: "act_bundle_decline",
@@ -1906,7 +1860,9 @@ test("viewport recovery waits for fresh proof, survives snap-back, and resumes t
     intent: "decline_optional_extra",
     controlId: decline.controlId,
     decisionGroupId: decline.decisionGroupId,
-    targetId: decline.preferredActivationElementId || decline.stateElementId || decline.controlId,
+    operation: declineOperation,
+    actuatorId: declineActuatorId,
+    targetId: declineActuatorId,
     targetLabel: decline.label,
     risk: "safe",
     requiresApproval: false,
@@ -3183,7 +3139,8 @@ test("zero-quantity hold-bag counters remain offers and progress through Skip ba
   }, profile.id), traveler);
 
   const observation = await browserObservation(page, "obs_zero_hold_bags");
-  expect(observation.page.step).toBe("extras");
+  expect(observation.page.step).toBe("");
+  expect(observation.page.browserDiagnostics.step).toBe("extras");
   expect(classifyObservationReadiness({ observation }).classification).toBe(READINESS.READY);
   const skip = observation.page.controls.find((control) => /skip bags/i.test(control.label || control.ownText || ""));
   const removals = observation.page.controls.filter((control) => /remove a \d+kg bag/i.test(control.label || control.accessibleName || ""));
@@ -3448,14 +3405,7 @@ test("factual attestation cannot manufacture booking-disclosure work", async ({ 
   const priceDetails = observation.page.controls.find((control) => /full price details/i.test(control.label || ""));
   expect(bookingDetails.semantic).not.toBe("reveal_transaction_evidence");
   expect(priceDetails.semantic).not.toBe("reveal_transaction_evidence");
-  const transactionReview = {
-    ready: false,
-    baselineStatus: "collecting",
-    missingFacts: ["itinerary_route", "total_price"],
-    contradictions: [],
-    baseline: { itinerary: { completeness: "unknown", segments: [] }, travelers: [], currency: "", totalPrice: null },
-    current: { itinerary: { completeness: "unknown", segments: [] }, travelers: [], currency: "", totalPrice: null }
-  };
+  const transactionReview = verifiedTransactionReview();
   const taskState = reduceTaskState({ observation, traveler, transactionReview });
   expect(taskState.currentGoal?.kind).not.toBe("transaction_evidence");
   expect(taskState.currentGoal?.actionableControlIds || []).not.toContain(bookingDetails.controlId);
@@ -3494,34 +3444,11 @@ test("an owned booking disclosure cannot repair a missing selected-booking invar
   });
   expect(disclosure.controlledElementIds).toEqual(["booking-summary"]);
 
-  const taskState = reduceTaskState({
-    observation,
-    traveler,
-    userPolicy: { standardBookingTermsApproved: true },
-    transactionReview: {
-      ready: false,
-      baselineStatus: "collecting",
-      missingFacts: ["itinerary_route", "currency", "total_price"],
-      contradictions: []
-    }
-  });
-  const taskDiagnostic = JSON.stringify({
-    disposition: taskState.disposition,
-    ambiguityReason: taskState.ambiguityReason,
-    controls: observation.page.controls.map((control) => ({
-      controlId: control.controlId,
-      semantic: control.semantic,
-      physicalEffect: control.physicalEffect,
-      required: control.required
-    })),
-    decisions: taskState.canonicalDecisions
-  }, null, 2);
-  expect(taskState.currentGoal, taskDiagnostic).toBeNull();
-  expect(taskState.disposition).toMatchObject({
-    kind: "stop",
-    code: "SELECTED_BOOKING_INVARIANT_MISSING",
-    userActionRequired: false
-  });
+  expect(() => prepareTransactionInvariants(
+    createCheckoutSessionState({ travelerId: traveler.id }),
+    structuralObservationForReplay(observation),
+    traveler
+  )).toThrow(/Authoritative SelectedBooking required/);
   expect(await page.locator("#booking-summary").isVisible()).toBe(false);
 });
 
@@ -3535,15 +3462,7 @@ test("missing booking facts do not manufacture an evidence goal without a depend
   `);
   const observation = await browserObservation(page, "obs_review_evidence_no_legal");
   observation.page.step = "payment";
-  const taskState = reduceTaskState({
-    observation,
-    transactionReview: {
-      ready: false,
-      baselineStatus: "collecting",
-      missingFacts: ["itinerary_route", "currency", "total_price"],
-      contradictions: []
-    }
-  });
+  const taskState = reduceTaskState({ observation, transactionReview: verifiedTransactionReview() });
   expect(taskState.currentGoal?.kind).not.toBe("transaction_evidence");
 });
 
@@ -3563,12 +3482,7 @@ test("Croatia-shaped traveler navigation outranks optional booking disclosures",
   expect(observation.page.controls.filter((control) => control.label === "Booking details").length).toBeGreaterThan(0);
   const taskState = reduceTaskState({
     observation,
-    transactionReview: {
-      ready: false,
-      baselineStatus: "collecting",
-      missingFacts: ["itinerary_route", "currency", "total_price"],
-      contradictions: []
-    }
+    transactionReview: verifiedTransactionReview()
   });
   expect(taskState.currentGoal).toMatchObject({
     semanticType: "navigation",
@@ -4833,21 +4747,22 @@ test("Title visual recovery remains grounded through TaskState, governor, dispat
   const priorObservation = await browserObservation(page, "obs_title_visual_prior");
   const priorTitleRegion = priorObservation.page.controls
     .find((control) => control.fieldType === "title")
-    ?.recovery.open.regions[0];
+    ?.operations.open.regions[0];
   expect(priorTitleRegion?.observationId).toBe(priorObservation.observationId);
 
   const observation = await browserObservation(page, "obs_title_visual_chain");
   const titleControl = observation.page.controls.find((control) => control.fieldType === "title");
   expect(titleControl).toBeTruthy();
   expect(titleControl.state.disabled).toBe(true);
-  expect(titleControl.operations.open).toBeFalsy();
+  expect(titleControl.operations.open).toBeTruthy();
+  expect(titleControl.operations.open.status).toBe("unproven_experiment");
   expect(titleControl.contractVersion).toBe("agent-contract/v1");
   expect(agentContract.observedComponentContract(titleControl).capabilities
     .find((capability) => capability.operation === "open")?.status)
     .toBe("unproven_experiment");
-  expect(titleControl.recovery.open.regions).toHaveLength(1);
-  expect(titleControl.recovery.open.regions[0].observationId).toBe(observation.observationId);
-  expect(titleControl.recovery.open.regions[0].observationId).not.toBe(priorTitleRegion.observationId);
+  expect(titleControl.operations.open.regions).toHaveLength(1);
+  expect(titleControl.operations.open.regions[0].observationId).toBe(observation.observationId);
+  expect(titleControl.operations.open.regions[0].observationId).not.toBe(priorTitleRegion.observationId);
 
   const taskState = reduceTaskState({ observation, traveler });
   expect(taskState.currentGoal, JSON.stringify({ taskState, titleControl }, null, 2)).toBeTruthy();
@@ -5110,22 +5025,23 @@ test("one exact custom-control actuator does not repeat through a different clic
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } }), nativeResult.observation, initial);
   expect(failedLifecycle.transition.actionOutcome.status).toBe("NO_EFFECT");
   expect(executionRecovery(failedLifecycle.state).failedStrategies).toHaveLength(1);
-  const unchangedRepeat = await page.evaluate((decision) => {
+  const browserLeaseAuthority = await page.evaluate((decision) => {
     const hooks = window.__ATW_TEST__;
     decision = hooks.decisionFromActionLease(decision);
+    const freshDecision = { ...decision, actionId: `${decision.actionId}_fresh_backend_lease` };
     const initialMap = hooks.buildPageMap();
-    const target = hooks.resolveDecisionTarget(decision, initialMap);
-    const sameTargetState = hooks.repeatGuardFor(target, "same failed strategy", decision, initialMap);
+    const target = hooks.resolveDecisionTarget(freshDecision, initialMap);
+    const freshLeaseSameTargetState = hooks.repeatGuardFor(target, "fresh backend lease", freshDecision, initialMap);
     const unrelated = document.createElement("input");
     unrelated.name = "passengers.0.birthDay";
     unrelated.setAttribute("autocomplete", "bday-day");
     unrelated.value = "31";
     document.body.appendChild(unrelated);
     const unrelatedProgressMap = hooks.buildPageMap();
-    const afterUnrelatedProgress = hooks.repeatGuardFor(
-      hooks.resolveDecisionTarget(decision, unrelatedProgressMap),
+    const duplicateFreshLease = hooks.repeatGuardFor(
+      hooks.resolveDecisionTarget(freshDecision, unrelatedProgressMap),
       "unrelated component changed",
-      decision,
+      freshDecision,
       unrelatedProgressMap
     );
     const diagnosticOnlyMap = {
@@ -5135,19 +5051,19 @@ test("one exact custom-control actuator does not repeat through a different clic
         diagnostics: [{ code: "UNRELATED_REGISTRY_DIAGNOSTIC", controlId: "other_control" }]
       }
     };
-    const afterDiagnostic = hooks.repeatGuardFor(
-      hooks.resolveDecisionTarget(decision, diagnosticOnlyMap),
+    const duplicateAfterDiagnostic = hooks.repeatGuardFor(
+      hooks.resolveDecisionTarget(freshDecision, diagnosticOnlyMap),
       "unrelated registry diagnostic",
-      decision,
+      freshDecision,
       diagnosticOnlyMap
     );
     unrelated.remove();
-    return { sameTargetState, afterUnrelatedProgress, afterDiagnostic };
+    return { freshLeaseSameTargetState, duplicateFreshLease, duplicateAfterDiagnostic };
   }, toClientDecision(nativeAction));
-  expect(unchangedRepeat).toEqual({
-    sameTargetState: false,
-    afterUnrelatedProgress: false,
-    afterDiagnostic: false
+  expect(browserLeaseAuthority).toEqual({
+    freshLeaseSameTargetState: true,
+    duplicateFreshLease: true,
+    duplicateAfterDiagnostic: true
   });
 
   const retryObservation = nativeResult.observation;
@@ -5869,10 +5785,7 @@ test("dormant alternate forms stay observable without becoming active EasyJet-sh
   const itineraryEditControls = dormant.page.controls.filter((control) => /^Edit .+ flight on /i.test(control.label || ""));
   expect(itineraryEditControls).toHaveLength(2);
   expect(itineraryEditControls.every((control) => control.globalChrome === true)).toBe(true);
-  const selectedBooking = await page.evaluate(() => {
-    const observed = window.__ATW_TEST__.observePageState({ forceFull: true, reason: "test_selected_booking_capture" });
-    return window.__ATW_TEST__.captureSelectedBookingFromMap(observed.map)?.facts || null;
-  });
+  const selectedBooking = dormant.page.transactionFacts;
   expect(selectedBooking?.itinerary?.segments).toEqual([
     expect.objectContaining({ origin: "LJUBLJANA", destination: "EDINBURGH", departureDate: "2026-08-15" }),
     expect.objectContaining({ origin: "EDINBURGH", destination: "LJUBLJANA", departureDate: "2026-09-09" })
@@ -5884,12 +5797,6 @@ test("dormant alternate forms stay observable without becoming active EasyJet-sh
     totalPrice: { amount: null, currency: "" },
     factEvidence: { ...facts.factEvidence, totalPrice: null }
   }), selectedBooking)).toBeNull();
-  expect(await page.evaluate(() => {
-    window.__ATW_TEST__.setAgentSessionForTest("chk_capture_complete");
-    const scheduled = window.__ATW_TEST__.scheduleSelectedBookingCapture("post_session_mutation");
-    window.__ATW_TEST__.setAgentSessionForTest("");
-    return scheduled;
-  })).toBe(false);
   const withSelectedBooking = (currentObservation) => ({
     ...currentObservation,
     page: { ...currentObservation.page, selectedBooking }
@@ -6079,8 +5986,8 @@ test("final terms review with Pay by card remains unfinished before card entry",
   expect(paymentGroups).toHaveLength(1);
   expect(paymentGroups[0]).toMatchObject({
     sectionType: "payment_method",
-    required: true,
-    status: "missing"
+    required: false,
+    status: "optional"
   });
   expect(paymentGroups[0].alternatives.map((alternative) => alternative.controlId))
     .toEqual(paymentMethods.map((control) => control.controlId));
@@ -6146,7 +6053,8 @@ test("Croatia-shaped PAY review remains unfinished until the hosted card form", 
   `);
 
   const observation = await browserObservation(page, "obs_croatia_pay_review");
-  expect(observation.page.step).toBe("payment");
+  expect(observation.page.step).toBe("");
+  expect(observation.page.browserDiagnostics.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
     stage: "unknown",
     boundaryObserved: false,
@@ -6183,10 +6091,20 @@ test("Croatia-shaped PAY review remains unfinished until the hosted card form", 
   expect(termsLinks.every((control) => !control.fieldClassification?.fieldType)).toBe(true);
 
   const traveler = { id: "trav_replay", first_name: "Replay", last_name: "Traveler" };
-  const transactionContext = prepareTransactionInvariants({}, observation, traveler, {
-    authoritativeTransactionFacts: decidedObservation.page.transactionFacts
+  const admittedTransaction = prepareTransactionInvariants({}, {
+    observationId: `selected_booking_${traveler.id}`,
+    page: { transactionFacts: null }
+  }, traveler, {
+    authoritativeTransactionFacts: selectedBookingFactsFromObserved(decidedObservation.page.transactionFacts, traveler.id)
   });
-  expect(transactionContext.state.transactionInvariants.acquisition.status).toBe("locked");
+  const transactionContext = prepareTransactionInvariants(
+    admittedTransaction.state,
+    structuralObservationForReplay(observation),
+    traveler,
+    { authoritativeTransactionFacts: decidedObservation.page.transactionFacts }
+  );
+  expect(transactionContext.state.transactionInvariants.baselineAuthority).toBe("selected_booking");
+  expect(transactionContext.state.transactionInvariants.baselineLocked).toBe(true);
   expect(transactionContext.review.ready).toBe(true);
   expect(transactionContext.review.baseline.itinerary.segments).toHaveLength(2);
   const state = reduceTaskState({
@@ -6412,7 +6330,8 @@ test("Croatia-shaped checkout proves the full causal chain from visible booking 
     observation = executed.observation;
   }
 
-  expect(state.transactionInvariants.acquisition.status).toBe("locked");
+  expect(state.transactionInvariants.baselineAuthority).toBe("selected_booking");
+  expect(state.transactionInvariants.baselineLocked).toBe(true);
   expect(state.transactionInvariants.baseline.itinerary.segments).toHaveLength(2);
   expect(state.transactionInvariants.baseline.totalPrice).toEqual({ amount: 152.62, currency: "EUR" });
   expect(state.taskState.terminalStatus).toBe("card_credential_entry_reached");
@@ -6477,7 +6396,7 @@ test("an unfamiliar required attestation survives unknown semantics and blocks n
   }));
 });
 
-test("context-required legal checkbox from the live trace remains an admitted obligation", async ({ page }) => {
+test("a non-native-required legal checkbox does not manufacture site requiredness", async ({ page }) => {
   await loadHtmlProducer(page, `<main><h1>Payment</h1></main>`);
   const result = await page.evaluate(() => window.__ATW_TEST__.compileDecisionGroupsForTest([], [{
     controlId: "ctrl_trace_terms",
@@ -6489,27 +6408,22 @@ test("context-required legal checkbox from the live trace remains an admitted ob
     risk: "legal",
     surfaceId: "surface-page",
     decisionGroupId: "dg_trace_terms",
-    required: true,
+    required: false,
     selected: false,
     state: { checked: false, selected: false, required: false },
     representationLifecycle: { active: true },
     stateElementId: "trace-terms-input",
     preferredActivationElementId: "trace-terms-label",
-    operations: {}
+    operations: {
+      select: {
+        actuatorId: "trace-terms-input",
+        status: "proven_executable",
+        actionability: { executable: true, targetable: true }
+      }
+    }
   }], { id: "surface-page", type: "page" }));
 
-  expect(result).toHaveLength(1);
-  expect(result[0]).toMatchObject({
-    decisionGroupId: "dg_trace_terms",
-    sectionType: "legal_acceptance",
-    required: true,
-    status: "missing"
-  });
-  expect(result[0].alternatives[0]).toMatchObject({
-    controlId: "ctrl_trace_terms",
-    semantic: "legal_acceptance",
-    risk: "legal"
-  });
+  expect(result).toEqual([]);
 });
 
 test("opaque native choice completes open and select as one trusted episode", async ({ page }) => {
@@ -6590,7 +6504,7 @@ test("opaque native choice completes open and select as one trusted episode", as
   const observedTitle = observation.page.controls.find((control) => control.name === "passengers.0.title");
   expect(candidate, JSON.stringify({
     goal,
-    recovery: observedTitle?.recovery,
+    operations: observedTitle?.operations,
     capabilities: goal?.capabilityContracts,
     candidates: allCandidates
   }, null, 2)).toBeTruthy();
@@ -6729,7 +6643,7 @@ test("large country dropdown preserves and selects the profile match beyond the 
     optionsTruncated: true
   });
   expect(nationality.state.disabled).toBe(true);
-  expect(nationality.recovery.select).toBeTruthy();
+  expect(nationality.operations.select).toBeTruthy();
   expect(nationality.options).toHaveLength(120);
   expect(nationality.options).toContainEqual(expect.objectContaining({
     value: "SI",
@@ -6747,7 +6661,7 @@ test("large country dropdown preserves and selects the profile match beyond the 
   if (!scheduledSet.candidates[0]) {
     throw new Error(JSON.stringify({
       goal,
-      recovery: nationality.recovery,
+      operations: nationality.operations,
       candidateSet: scheduledSet
     }, null, 2));
   }
@@ -7156,7 +7070,7 @@ test("closed ARIA combobox with owned options exposes and verifies one trusted c
     expect.objectContaining({ value: "mr", label: "Male" }),
     expect.objectContaining({ value: "ms", label: "Female" })
   ]));
-  expect(titleControl.recovery.select.strategies).toEqual(expect.arrayContaining([
+  expect(titleControl.operations.select.strategies).toEqual(expect.arrayContaining([
     expect.objectContaining({ method: "browser_trusted_choice", operation: "select" })
   ]));
 
@@ -7275,7 +7189,7 @@ test("trusted choice closes and blurs a popup before publishing a settled commit
       commitState: afterControl?.commitState || null,
       hasActionableActuator: afterControl?.hasActionableActuator === true,
       logicalDisabled: afterControl?.logicalDisabled === true,
-      selectActuatorIds: afterControl?.recovery?.select?.actuatorIds || []
+      selectActuatorIds: afterControl?.operations?.select?.actuatorIds || []
     };
   }, {
     controlId: control.controlId
@@ -7392,16 +7306,17 @@ test("disabled semantic select with a targetable right-edge DIV exhausts synthet
 
   const observation = await browserObservation(page, "obs_right_edge_ladder");
   const titleControl = observation.page.controls.find((control) => control.name === "passengers.0.title");
-  expect(titleControl.operations.open).toBeFalsy();
+  expect(titleControl.operations.open).toBeTruthy();
+  expect(titleControl.operations.open.status).toBe("unproven_experiment");
   expect(titleControl.stateElementId).toBeTruthy();
-  expect(titleControl.recovery.open.actuatorIds).toEqual(expect.arrayContaining([
+  expect(titleControl.operations.open.actuatorIds).toEqual(expect.arrayContaining([
     await page.locator("#right-edge-wrapper").getAttribute("data-atw-element-id"),
     await page.locator("#right-edge-actuator").getAttribute("data-atw-element-id")
   ]));
-  expect(titleControl.recovery.select.strategies).toEqual(expect.arrayContaining([
+  expect(titleControl.operations.select.strategies).toEqual(expect.arrayContaining([
     expect.objectContaining({ method: "browser_trusted_choice", operation: "select" })
   ]));
-  expect(titleControl.recovery.select.strategies.some((strategy) => strategy.method === "browser_trusted_input")).toBe(false);
+  expect(titleControl.operations.select.strategies.some((strategy) => strategy.method === "browser_trusted_input")).toBe(false);
 
   const goal = deriveProfileGoal(observation, traveler);
   const attempted = [];
@@ -7555,17 +7470,38 @@ test("WSPay-shaped image payment methods reveal card entry and stop before crede
     <style>
       body { font-family: sans-serif; padding: 24px; }
       #payment-methods { width: 720px; min-height: 180px; }
+      .payment-selector { position: relative; width: 320px; height: 40px; }
+      .payment-selector select { width: 300px; height: 36px; }
       .method { display: inline-flex; width: 130px; height: 56px; margin: 8px; align-items: center; justify-content: center; }
       .method img { width: 110px; height: 42px; }
       #card-entry[hidden] { display: none; }
     </style>
     <main>
+      <section aria-label="Personal data">
+        <label>Country
+          <select id="customer-country" name="customerCountry" autocomplete="country" required>
+            <option value="HR" selected>Croatia</option>
+            <option value="TR">Turkey</option>
+          </select>
+        </label>
+      </section>
       <section id="payment-methods" aria-labelledby="payment-method-heading">
         <h1 id="payment-method-heading">Please select payment method</h1>
-        <a class="method card-method" id="amex-method" href="#card-entry-amex"><img alt="American Express"></a>
-        <a class="method card-method" id="visa-method" href="#card-entry-visa"><img alt="Visa"></a>
-        <a class="method card-method" id="mastercard-method" href="#card-entry-mastercard"><img src="/assets/mastercard-logo.svg"></a>
-        <a class="method" id="wallet-method" href="#wallet"><img alt="KEKS Pay"></a>
+        <label>Payment method selector
+          <span class="payment-selector">
+            <select id="payment-selector-state" name="payment_type_selector" required>
+              <option value="">Select payment method</option>
+              <option value="card">Credit card payment</option>
+            </select>
+          </span>
+        </label>
+        <!-- Real WSPay routes are script-owned anchors without href. Their
+             activate capability, not an implicit link role, proves that they
+             are pressable controls. -->
+        <a class="method card-method" id="amex-method"><img alt="American Express"></a>
+        <a class="method card-method" id="visa-method"><img alt="Visa"></a>
+        <a class="method card-method" id="mastercard-method"><img src="/assets/mastercard-logo.svg"></a>
+        <a class="method" id="wallet-method"><img alt="KEKS Pay"></a>
         <button type="button" id="cancel">Cancel</button>
       </section>
       <section id="card-entry" aria-label="Credit card details" hidden>
@@ -7586,8 +7522,35 @@ test("WSPay-shaped image payment methods reveal card entry and stop before crede
       document.getElementById('pay').addEventListener('click', () => { window.__payClicks += 1; });
     </script>
   `);
-  const traveler = { id: "trav_wspay_methods", payment_preference: "manual payment" };
-  let observation = await browserObservation(page, "obs_wspay_methods_0");
+  const traveler = {
+    id: "trav_wspay_methods",
+    address: { country: "Turkey" },
+    payment_preference: "manual payment"
+  };
+  await page.evaluate((profile) => window.__ATW_TEST__.setAppDataForTest({ travelers: [profile] }, profile.id), traveler);
+  const structural = await structuralBrowserObservation(page, "obs_wspay_methods_0");
+  const structuralVisa = structural.page.controls.find((control) => /visa/i.test(control.label || control.accessibleName || ""));
+  expect(structuralVisa, JSON.stringify(structural.page.controls, null, 2)).toBeTruthy();
+  expect(structuralVisa).toMatchObject({
+    kind: "a",
+    role: "pressable"
+  });
+  expect(structuralVisa.operations?.activate?.actionability?.executable).toBe(true);
+  let observation = decisionObservation(structural);
+  const countryGoal = deriveProfileGoal(observation, traveler);
+  expect(countryGoal).toMatchObject({ semanticType: "country" });
+  const countryCandidates = candidatesForProfileGoal(countryGoal, observation, traveler);
+  expect(countryCandidates).toHaveLength(1);
+  const countryAction = actionForProfileCandidate(countryGoal, countryCandidates[0], observation);
+  const countryExecution = await executeAtomicBrowserDecision(
+    page,
+    toClientDecision(countryAction),
+    "obs_wspay_methods_country"
+  );
+  expect(countryExecution.result.dispatched).toBe(true);
+  expect(countryExecution.verification.ok, JSON.stringify(countryExecution.verification, null, 2)).toBe(true);
+  await expect(page.locator("#customer-country")).toHaveValue("TR");
+  observation = countryExecution.observation;
   const methods = observation.page.controls.filter((control) => control.semantic === "payment_method");
   expect(methods.map((control) => control.label)).toEqual([
     "American Express",
@@ -7600,14 +7563,18 @@ test("WSPay-shaped image payment methods reveal card entry and stop before crede
     && control.risk === "safe"
     && control.operations?.activate?.actionability?.executable === true
   ))).toBe(true);
-  const paymentGroup = observation.page.decisionGroups.find((group) => group.sectionType === "payment_method");
+  const paymentGroups = observation.page.decisionGroups.filter((group) => group.sectionType === "payment_method");
+  expect(paymentGroups).toHaveLength(1);
+  const paymentGroup = paymentGroups[0];
   expect(paymentGroup, JSON.stringify(observation.page.decisionGroups, null, 2)).toBeTruthy();
   expect(paymentGroup).toMatchObject({
-    required: true,
-    status: "missing"
+    required: false,
+    status: "optional"
   });
   expect(paymentGroup.alternatives.map((alternative) => alternative.label)).toEqual(methods.map((control) => control.label));
   expect(paymentGroup.alternatives.every((alternative) => alternative.physicalEffect === "reveal_control")).toBe(true);
+  expect(methods.find((control) => control.label === "KEKS Pay")?.paymentMethodKind).toBe("wallet");
+  expect(methods.filter((control) => control.label !== "KEKS Pay").every((control) => control.paymentMethodKind === "card")).toBe(true);
 
   const state = createCheckoutSessionState({
     goal: "Reach card credential entry",
@@ -7685,17 +7652,16 @@ test("native payment-method radios follow the saved card preference and reveal c
   expect(methods.every((control) => (
     control.physicalEffect === "reveal_control"
     && control.risk === "safe"
-    && control.sectionType === "payment"
   ))).toBe(true);
   const paymentGroup = observation.page.decisionGroups.find((group) => (
     group.alternatives?.some((alternative) => alternative.semantic === "payment_method")
   ));
   expect(paymentGroup).toMatchObject({
     sectionType: "payment_method",
-    required: true,
-    status: "missing"
+    required: false,
+    status: "optional"
   });
-  expect(paymentGroup.requirementId).toMatch(/^payment:/);
+  expect(paymentGroup.requirementId).toBe("payment:method");
   expect(paymentGroup.decisionGroupId).not.toMatch(/legal-acceptance/);
   const card = methods.find((control) => /card/i.test(control.label));
   expect(card).toBeTruthy();
@@ -7851,7 +7817,8 @@ test("a generated combobox and its hidden native select compile as one profile c
   });
   expect(observation.page.graphIntegrity.ok).toBe(true);
   expect(observation.page.graphIntegrity.actionableConflictCount).toBe(0);
-  expect(countryControl.recovery.select.strategies).toEqual(expect.arrayContaining([
+  expect(countryControl.recovery).toBeUndefined();
+  expect(countryControl.operations.select.strategies).toEqual(expect.arrayContaining([
     expect.objectContaining({
       actuatorId: presentationNodeId,
       method: "browser_trusted_choice",
@@ -8121,13 +8088,13 @@ test("delegated React passenger controls ignore optional fields and keep one req
       if (candidate.type === "click_xy") {
         expect(candidate.targetId).toBe("");
         expect(candidate.visualRegion).toBeTruthy();
-        expect(control.operations.open).toBeFalsy();
-        expect(control.recovery.open.regions).toHaveLength(1);
+        expect(control.operations.open).toBeTruthy();
+        expect(control.operations.open.regions).toHaveLength(1);
       } else {
         expect(candidate.targetId).not.toBe(control.stateElementId);
-        expect(control.operations.open).toBeFalsy();
-        expect(control.recovery.open.status).toBe("unproven");
-        expect(control.recovery.open.strategies.some((strategy) => (
+        expect(control.operations.open).toBeTruthy();
+        expect(control.operations.open.status).toBe("unproven_experiment");
+        expect(control.operations.open.strategies.some((strategy) => (
           strategy.actuatorId === candidate.targetId
           && strategy.method === candidate.interactionMethod
           && strategy.status === "unproven_experiment"
@@ -8828,7 +8795,8 @@ test("GoToGate-shaped card credential form is terminal evidence without executab
     </main>
   `);
   const observation = await browserObservation(page, "obs_gotogate_payment_terminal");
-  expect(observation.page.step).toBe("payment");
+  expect(observation.page.step).toBe("");
+  expect(observation.page.browserDiagnostics.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
     contractVersion: "terminal-evidence/v2",
     stage: "card_credential_entry",
@@ -8879,7 +8847,8 @@ test("progressive payment entry compiles FROM/TO itinerary and outranks a generi
   await page.evaluate(() => { location.hash = "payments"; });
 
   const observation = await browserObservation(page, "obs_progressive_payment_entry");
-  expect(observation.page.step).toBe("payment");
+  expect(observation.page.step).toBe("");
+  expect(observation.page.browserDiagnostics.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
     boundaryObserved: false,
     signals: { route: true, entry: true },
@@ -8928,8 +8897,8 @@ test("repeated unfamiliar flight rows compile a complete selected-booking envelo
   const observation = await browserObservation(page, "obs_unfamiliar_flight_rows");
   expect(observation.page.transactionFacts.itinerary).toMatchObject({ completeness: "complete" });
   expect(observation.page.transactionFacts.itinerary.segments).toEqual([
-    expect.objectContaining({ origin: "ZAG", destination: "SJJ", departureDate: "15 September 2026", departureTime: "14:55", arrivalTime: "15:45" }),
-    expect.objectContaining({ origin: "SJJ", destination: "ZAG", departureDate: "30 September 2026", departureTime: "16:30", arrivalTime: "17:20" })
+    expect.objectContaining({ origin: "ZAG", destination: "SJJ", departureDate: "2026-09-15", departureTime: "14:55", arrivalTime: "15:45" }),
+    expect.objectContaining({ origin: "SJJ", destination: "ZAG", departureDate: "2026-09-30", departureTime: "16:30", arrivalTime: "17:20" })
   ]);
   expect(observation.page.transactionFacts.factEvidence.itinerary.every((entry) => (
     entry.source === "owned_flight_segment_sequence" && entry.authoritative === true
@@ -9057,7 +9026,8 @@ test("hosted payment widget with opaque native inputs contributes owned terminal
   `);
 
   const observation = await browserObservation(page, "obs_hosted_payment_terminal");
-  expect(observation.page.step).toBe("payment");
+  expect(observation.page.step).toBe("");
+  expect(observation.page.browserDiagnostics.step).toBe("payment");
   expect(observation.page.terminalEvidence).toMatchObject({
     contractVersion: "terminal-evidence/v2",
     stage: "card_credential_entry",
@@ -9138,7 +9108,8 @@ test("hidden future hosted payment markup does not become terminal evidence", as
   `);
 
   const observation = await browserObservation(page, "obs_hidden_hosted_payment_future");
-  expect(observation.page.step).toBe("traveler_information");
+  expect(observation.page.step).toBe("");
+  expect(observation.page.browserDiagnostics.step).toBe("traveler_information");
   expect(observation.page.terminalEvidence).toMatchObject({
     boundaryObserved: false,
     signals: { form: false },
@@ -9414,7 +9385,7 @@ test("commercial CTA cards bind option price and policy selects the included far
   expect(new Set([saver.decisionGroupId, standard.decisionGroupId, flexi.decisionGroupId]).size).toBe(1);
   const group = observation.page.decisionGroups.find((item) => item.decisionGroupId === saver.decisionGroupId);
   expect(group).toBeTruthy();
-  expect(group.required).toBe(true);
+  expect(group.required).toBe(false);
   expect(group.alternatives).toHaveLength(3);
   expect(saver.choiceContract).toBeUndefined();
   expect(group.decisionContract.options).toHaveLength(3);
@@ -10355,13 +10326,9 @@ test("real backend suppresses unchanged destination observations and wakes on tr
     </script>
   `);
 
-  const traveler = {
-    id: `trav_real_slow_destination_${Date.now()}`,
-    email: "ali@example.test",
-    first_name: "Ali",
-    last_name: "Sifrar",
+  const traveler = routineCheckoutTraveler(`trav_real_slow_destination_${Date.now()}`, {
     booking_rules: "No paid extras"
-  };
+  });
   const started = await request.post(`${TEST_API}/agent/session`, {
     data: {
       goal: "Continue checkout safely to payment review",
@@ -10466,7 +10433,16 @@ test("P0.9 executor refuses label-only mutation and P1.4 progress cannot overrid
     const map = window.__ATW_TEST__.buildPageMap();
     const canonical = map.controls.find((control) => control.label === "I'll go without");
     const labelOnly = window.__ATW_TEST__.resolveDecisionTarget({ action: "click", targetLabel: "I'll go without" }, map);
-    const resolved = window.__ATW_TEST__.resolveDecisionTarget({ action: "click", controlId: canonical.controlId, targetLabel: canonical.label }, map);
+    const operation = canonical.operations?.choose ? "choose" : "activate";
+    const canonicalActuatorId = canonical.operations?.[operation]?.actuatorIds?.[0] || "";
+    const resolved = window.__ATW_TEST__.resolveDecisionTarget({
+      action: "click",
+      operation,
+      controlId: canonical.controlId,
+      actuatorId: canonicalActuatorId,
+      targetId: canonicalActuatorId,
+      targetLabel: canonical.label
+    }, map);
     const merged = window.__ATW_TEST__.withOverlayProgressEvidence(
       { ok: false, code: "ACTIVE_SURFACE_NOT_DISMISSED", message: "Modal is still active.", evidence: { surfaceId: "bag-modal" } },
       { ok: true, reason: "content_changed" }
@@ -10474,7 +10450,7 @@ test("P0.9 executor refuses label-only mutation and P1.4 progress cannot overrid
     return {
       labelOnlyResolved: Boolean(labelOnly),
       canonicalResolvedId: resolved?.dataset?.atwElementId || "",
-      canonicalMemberIds: [canonical.stateElementId, canonical.preferredActivationElementId, ...(canonical.actuators || []).map((item) => item.nodeId)].filter(Boolean),
+      canonicalMemberIds: Object.values(canonical.operations || {}).flatMap((capability) => capability?.actuatorIds || []).filter(Boolean),
       merged
     };
   });
@@ -10498,16 +10474,18 @@ test("P0.4 type resolves the editable state member and survives a controlled-inp
     const input = document.getElementById("email-input");
     const label = document.getElementById("email-label");
     const control = beforeMap.controls.find((item) => item.stateElementId === input.dataset.atwElementId);
+    const operation = control.operations?.type ? "type" : "fill";
+    const operationActuatorId = control.operations?.[operation]?.actuatorIds?.[0] || "";
     const decision = {
       action: "type",
+      operation,
       controlId: control.controlId,
-      targetId: label.dataset.atwElementId,
+      actuatorId: operationActuatorId,
+      targetId: operationActuatorId,
       targetSnapshot: {
         controlId: control.controlId,
         stableKey: control.stableKey,
-        id: label.dataset.atwElementId,
-        stateElementId: control.stateElementId,
-        preferredActivationElementId: control.preferredActivationElementId
+        id: operationActuatorId
       }
     };
     const resolved = hooks.resolveDecisionTarget(decision, beforeMap);
@@ -10566,13 +10544,13 @@ test("P0.9 does not publish a combobox input as its opener without a proven actu
     return {
       controlFound: Boolean(control),
       openOperation: control?.operations?.open || null,
-      openRecovery: control?.recovery?.open || null
+      legacyRecovery: control?.recovery || null
     };
   });
 
   expect(result.controlFound).toBe(true);
   expect(result.openOperation).toBeNull();
-  expect(result.openRecovery).toBeNull();
+  expect(result.legacyRecovery).toBeNull();
 });
 
 test("an observed exact choice supersedes trusted-open fallback while preserving proven open", async ({ page }) => {
@@ -10586,12 +10564,12 @@ test("an observed exact choice supersedes trusted-open fallback while preserving
     const control = map.controls.find((item) => item.label === "Country code" || item.semantic === "phone_country_code");
     return {
       openActuatorId: control?.operations?.open?.actuatorId || "",
-      recoveryMethods: control?.recovery?.open?.strategies?.map((strategy) => ({
+      openMethods: control?.operations?.open?.strategies?.map((strategy) => ({
         actuatorId: strategy.actuatorId,
         method: strategy.method,
         status: strategy.status
       })) || [],
-      choiceMethods: control?.recovery?.select?.strategies?.map((strategy) => ({
+      choiceMethods: control?.operations?.select?.strategies?.map((strategy) => ({
         actuatorId: strategy.actuatorId,
         method: strategy.method,
         status: strategy.status
@@ -10601,7 +10579,7 @@ test("an observed exact choice supersedes trusted-open fallback while preserving
   });
 
   expect(result.openActuatorId).not.toBe("");
-  expect(result.recoveryMethods.some((strategy) => strategy.method === "browser_trusted_input")).toBe(false);
+  expect(result.openMethods.some((strategy) => strategy.method === "browser_trusted_input")).toBe(false);
   expect(result.choiceMethods).toContainEqual({
     actuatorId: result.openActuatorId,
     method: "browser_trusted_choice",
@@ -10610,7 +10588,7 @@ test("an observed exact choice supersedes trusted-open fallback while preserving
   expect(result.ladder.find((strategy) => (
     strategy.actuatorId === result.openActuatorId && strategy.method === "native_click"
   ))).toMatchObject({ status: "proven_executable", operationProven: true });
-  expect(result.ladder.at(-1)).toMatchObject({
+  expect(result.ladder.find((strategy) => strategy.method === "browser_trusted_choice")).toMatchObject({
     method: "browser_trusted_choice",
     operation: "select",
     status: "unproven_experiment",
@@ -10636,17 +10614,18 @@ test("P0.9 CSS pointer evidence makes an icon targetable without proving the com
     const control = map.controls.find((item) => item.label === "Country code" || item.semantic === "phone_country_code");
     return {
       openOperation: control?.operations?.open || null,
-      recoveryActuatorIds: control?.recovery?.open?.actuatorIds || [],
-      recoveryStrategies: control?.recovery?.open?.strategies || [],
-      choiceStrategies: control?.recovery?.select?.strategies || [],
+      openActuatorIds: control?.operations?.open?.actuatorIds || [],
+      openStrategies: control?.operations?.open?.strategies || [],
+      choiceStrategies: control?.operations?.select?.strategies || [],
       iconElementId: icon.dataset.atwElementId || ""
     };
   });
 
   expect(result.iconElementId).not.toBe("");
-  expect(result.openOperation).toBeNull();
-  expect(result.recoveryActuatorIds).toContain(result.iconElementId);
-  expect(result.recoveryStrategies.some((strategy) => strategy.method === "browser_trusted_input")).toBe(false);
+  expect(result.openOperation).toBeTruthy();
+  expect(result.openOperation.status).toBe("unproven_experiment");
+  expect(result.openActuatorIds).toContain(result.iconElementId);
+  expect(result.openStrategies.some((strategy) => strategy.method === "browser_trusted_input")).toBe(false);
   expect(result.choiceStrategies.some((strategy) => (
     strategy.actuatorId === result.iconElementId
     && strategy.method === "browser_trusted_choice"
@@ -10803,6 +10782,58 @@ test("fresh section-local payment validation owns the unique required attestatio
   expect(result.stageExit.continueAllowed).toBe(false);
 });
 
+test("an explicit checkbox validation owns the executable terms control and demotes its count banner", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <h1>Review booking</h1>
+      <label>Promotion code <input id="promotion" name="promotion_code" type="text"></label>
+      <label><input id="terms" name="TermsAndCondition" type="checkbox">Yes, I confirm the booking information and accept the terms and conditions</label>
+      <input id="hidden-helper" type="text" hidden>
+      <button id="confirm" type="button">Confirm</button>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const before = hooks.observePageState({ forceFull: true, reason: "explicit_terms_before" }).map;
+    const terms = before.controls.find((control) => control.name === "TermsAndCondition" || control.semantic === "legal_acceptance");
+    hooks.setActiveExecutionForTest("act_confirm", "obs_explicit_terms_before");
+
+    const count = document.createElement("div");
+    count.id = "validation-count";
+    count.setAttribute("role", "alert");
+    count.textContent = "1 error";
+    document.body.appendChild(count);
+
+    const instruction = document.createElement("a");
+    instruction.id = "terms-validation";
+    instruction.href = "#terms";
+    instruction.textContent = "Please check the terms and conditions related to this booking and confirm that you agree with them by clicking on the checkbox.";
+    document.body.appendChild(instruction);
+
+    hooks.notePageMutations([{ type: "childList", target: document.body, addedNodes: [count, instruction], removedNodes: [] }]);
+    const after = hooks.observePageState({ forceFull: true, reason: "explicit_terms_after" }).map;
+    return {
+      terms,
+      issues: after.validationIssues,
+      errors: after.errors,
+      stageExit: after.stageExit
+    };
+  });
+
+  const owned = result.issues.find((issue) => /clicking on the checkbox/i.test(issue.message));
+  const summary = result.issues.find((issue) => issue.message === "1 error");
+  expect(owned).toMatchObject({
+    controlId: result.terms.controlId,
+    status: "active_control_error",
+    active: true,
+    introducedAfterAction: true,
+    causedByActionId: "act_confirm"
+  });
+  expect(summary).toMatchObject({ status: "diagnostic", active: false });
+  expect(result.errors).toEqual([owned.message]);
+  expect(result.stageExit.continueAllowed).toBe(false);
+});
+
 test("P0.7 scroll recovery uses the nearest effective container and fails closed for a missing target", async ({ page }) => {
   await page.setContent(`
     <style>
@@ -10875,46 +10906,67 @@ test("P0.7 scroll recovery uses the nearest effective container and fails closed
   expect(result.missing.code).toBe("TARGET_DISAPPEARED");
 });
 
-test("P0.7/P0.9 canonical alias index resolves every present control member and visual ID", async ({ page }) => {
+test("P0.7/P0.9 canonical alias index executes only operation-owned actuators and visual IDs", async ({ page }) => {
   await loadProducer(page);
   const result = await page.evaluate(() => {
     const map = window.__ATW_TEST__.buildPageMap();
     const canonical = map.controls.find((control) => control.label === "I'll go without");
+    const operation = canonical.operations.activate ? "activate" : Object.keys(canonical.operations || {})[0];
+    const capability = canonical.operations[operation];
+    const operationIds = [...new Set([
+      ...(capability.actuatorIds || []),
+      ...(capability.strategies || []).map((strategy) => strategy.actuatorId)
+    ].filter(Boolean))];
     canonical.visualRef = "O99";
     map.screenshotAnnotations = [{
       visualRef: "O99",
-      targetId: canonical.preferredActivationElementId,
+      targetId: operationIds[0],
       controlId: canonical.controlId
     }];
     const index = window.__ATW_TEST__.buildCanonicalAliasIndex(map);
     const aliases = [
       canonical.controlId,
-      canonical.stateElementId,
-      canonical.preferredActivationElementId,
-      ...(canonical.actuators || []).map((actuator) => actuator.nodeId),
+      ...operationIds,
       canonical.visualRef
     ].filter((aliasId, position, list) => aliasId && list.indexOf(aliasId) === position);
+    const compatibilityOnlyAliases = [
+      canonical.stateElementId,
+      canonical.preferredActivationElementId,
+      ...(canonical.actuators || []).map((actuator) => actuator.nodeId)
+    ].filter((aliasId, position, list) => (
+      aliasId && !operationIds.includes(aliasId) && list.indexOf(aliasId) === position
+    ));
     return {
       canonicalControlId: canonical.controlId,
       resolutions: aliases.map((aliasId) => ({
         aliasId,
         kind: index.aliasKinds.get(aliasId) || "",
         controlId: index.resolve(aliasId)?.controlId || "",
-        resolvedElementId: window.__ATW_TEST__.resolveDecisionTarget({ action: "click", targetId: aliasId }, map)?.dataset?.atwElementId || ""
+        resolvedElementId: window.__ATW_TEST__.resolveDecisionTarget({
+          action: "click",
+          operation,
+          controlId: canonical.controlId,
+          targetId: aliasId
+        }, map)?.dataset?.atwElementId || ""
+      })),
+      compatibilityOnlyAliases: compatibilityOnlyAliases.map((aliasId) => ({
+        aliasId,
+        resolvedControlId: index.resolve(aliasId)?.controlId || ""
       })),
       conflicts: index.conflicts
     };
   });
 
   expect(result.conflicts).toEqual([]);
-  // A plain button has one physical actuator, so its canonical ID, actuator
-  // ID, and visual ref are the complete alias set. Composite controls add
-  // state, label, wrapper, and activation aliases to the same index.
+  // Control identity, the operation-owned actuator, and its visual reference
+  // remain resolvable. Raw state/label/wrapper aliases are structural evidence
+  // only and cannot become an execution target by compatibility fallback.
   expect(result.resolutions.length).toBeGreaterThanOrEqual(3);
   for (const resolution of result.resolutions) {
     expect(resolution.controlId, resolution.aliasId).toBe(result.canonicalControlId);
     expect(resolution.resolvedElementId, resolution.aliasId).toBeTruthy();
   }
+  expect(result.compatibilityOnlyAliases.every((entry) => entry.resolvedControlId === "")).toBe(true);
 });
 
 test("P0.7/P0.9 executor preserves canonical semantic authority through live label drift", async ({ page }) => {
@@ -11641,7 +11693,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
     travelers: [{ travelerId: traveler.id, name: "Ali SIFRAR" }]
   };
   state.transactionInvariants = {
-    version: 4,
+    version: 5,
     baseline: selectedTransaction,
     current: selectedTransaction,
     outcomeLedger: [],
@@ -11651,16 +11703,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
     baselineStatus: "approved",
     baselineObservationId: "selected_booking_candidate_replay",
     approvedAt: new Date().toISOString(),
-    evidence: [],
-    acquisition: {
-      contractVersion: "selected-booking-acquisition-state/v1",
-      status: "locked",
-      attempts: 1,
-      maximumAttempts: 6,
-      observationIds: ["selected_booking_candidate_replay"],
-      missingFacts: [],
-      lockedObservationId: "selected_booking_candidate_replay"
-    }
+    evidence: []
   };
   const history = [];
 
@@ -11809,7 +11852,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   state = staleRecovery.state;
 
   const currentOpenCandidate = flexiblePrepared.candidates.find((candidate) => (
-    candidate.operation === "open" && /flexible ticket/i.test(candidate.targetLabel)
+    candidate.physicalEffect === "open_surface" && /flexible ticket/i.test(candidate.targetLabel)
   ));
   expect(currentOpenCandidate, JSON.stringify(flexiblePrepared.candidateSet.contextCapabilities.map((item) => ({
     label: item.targetLabel,
@@ -11827,7 +11870,7 @@ test("stale modal history cannot target the new flexible-ticket dropdown", async
   }, flexiblePrepared.candidateSet);
   expect(Object.keys(flexibleWordingSelection).sort()).toEqual(["candidate", "candidateId"]);
   expect(flexibleWordingSelection.candidateId).toBe(currentOpenCandidate.candidateId);
-  expect(flexibleWordingSelection.candidate.operation).toBe("open");
+  expect(["open", "keyboard"]).toContain(flexibleWordingSelection.candidate.operation);
 
   const opened = await executeCandidate(
     observation,
@@ -12373,7 +12416,11 @@ test("nested seat chooser keeps parent paid intent pending and grounds the exact
   expect(candidateSet.candidates.some((candidate) => candidate.controlId === skipControl.controlId)).toBe(true);
   expect(candidateSet.candidates.some((candidate) => candidate.controlId === informationControl.controlId)).toBe(false);
 
-  const transaction = prepareTransactionInvariants({}, observation, traveler);
+  const transaction = prepareTransactionInvariants(
+    stateWithSelectedBookingBaseline({}, traveler, structuralObservationForReplay(observation)),
+    structuralObservationForReplay(observation),
+    traveler
+  );
   expect(transaction.envelope.current.selectedExtras.some((extra) => (
     extra.decisionGroupId === parentDecision.decisionGroupId
   ))).toBe(false);
@@ -12475,10 +12522,15 @@ test("one seat decision episode survives two unselected legs and the final confi
   const secondResult = verifiedAdvance(taskState.decisionEpisode);
   await page.locator("#seat-next").click();
   observation = await browserObservation(page, "obs_two_leg_seat_confirm");
-  const beforeFinal = prepareTransactionInvariants({
+  const beforeFinalState = stateWithSelectedBookingBaseline({
     taskState,
     userPolicy: policy
-  }, observation, traveler);
+  }, traveler, structuralObservationForReplay(observation));
+  const beforeFinal = prepareTransactionInvariants(
+    beforeFinalState,
+    structuralObservationForReplay(observation),
+    traveler
+  );
   expect(beforeFinal.observed.selectedExtras.some((extra) => extra.family === "seat")).toBe(false);
 
   taskState = reduceTaskState({
@@ -12524,9 +12576,10 @@ test("one seat decision episode survives two unselected legs and the final confi
   expect(taskState.outcomeJournal[0].segmentOutcomes).toHaveLength(2);
 
   const completedFacts = prepareTransactionInvariants({
+    ...beforeFinal.state,
     taskState,
     userPolicy: policy
-  }, observation, traveler);
+  }, structuralObservationForReplay(observation), traveler);
   const seatOutcomes = completedFacts.observed.selectedExtras.filter((extra) => extra.family === "seat");
   expect(seatOutcomes).toHaveLength(1);
   expect(seatOutcomes[0]).toMatchObject({
@@ -12731,8 +12784,11 @@ test("Kiwi-sized random-seat observation remains bounded and preserves Continue"
       surfaceId: "surface-page",
       state: { disabled: index < 239, selected: false },
       structuredPrice: { amount: 1000 + index, currency: "TRY" },
-      operations: { choose: { actuatorId: `seat_${index + 1}`, proof: heavyProof } },
-      recovery: { choose: { strategies: [{ actuatorId: `seat_${index + 1}`, proof: heavyProof }] } },
+      operations: { choose: {
+        actuatorId: `seat_${index + 1}`,
+        proof: heavyProof,
+        strategies: [{ actuatorId: `seat_${index + 1}`, proof: heavyProof }]
+      } },
       visualRegions: [{ x: index % 6 * 40, y: Math.floor(index / 6) * 40, width: 32, height: 32 }]
     }));
     const continueControl = {
@@ -12911,6 +12967,37 @@ test("only the identical navigation action lease is held while a reused Continue
   expect(result.immediateRepeat).toBe(false);
   expect(result.freshLeaseOnSameMechanic).toBe(true);
   expect(result.state.lastClickAt).toBeGreaterThan(0);
+});
+
+test("a fresh backend lease may reuse Confirm after its terms prerequisite changes", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <label><input id="terms" type="checkbox"> Accept booking terms</label>
+      <button id="confirm" type="button">Confirm</button>
+    </main>
+  `);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    const confirm = document.getElementById("confirm");
+    const firstLease = {
+      actionId: "act_confirm_before_terms",
+      action: "click",
+      interactionRole: "navigation",
+      semanticEffect: "advance",
+      intent: "navigate_stage"
+    };
+    const freshLease = { ...firstLease, actionId: "act_confirm_after_terms" };
+    const first = hooks.repeatGuardFor(confirm, "confirm before terms", firstLease);
+    const duplicateDelivery = hooks.repeatGuardFor(confirm, "duplicate delivery", firstLease);
+    document.getElementById("terms").checked = true;
+    const afterPrerequisite = hooks.repeatGuardFor(confirm, "confirm after terms", freshLease);
+    return { first, duplicateDelivery, afterPrerequisite, state: hooks.repeatGuardState() };
+  });
+
+  expect(result.first).toBe(true);
+  expect(result.duplicateDelivery).toBe(false);
+  expect(result.afterPrerequisite).toBe(true);
+  expect(result.state).not.toHaveProperty("failedLocalStrategies");
 });
 
 test("action transport strips embedded page maps before the first backend request", async ({ page }) => {
@@ -13132,14 +13219,9 @@ test("large canonical observation uploads screenshot separately and reaches a gr
     </main>
   `);
 
-  const traveler = {
-    id: `trav_transport_${Date.now()}`,
-    first_name: "Ali",
-    last_name: "Sifrar",
-    email: "ali@example.test",
-    phone: "+38670328922",
+  const traveler = routineCheckoutTraveler(`trav_transport_${Date.now()}`, {
     booking_rules: "No paid seats and no paid extras"
-  };
+  });
   const started = await request.post(`${TEST_API}/agent/session`, {
     data: {
       goal: "Continue checkout safely",
@@ -13683,7 +13765,8 @@ test("checkpoint checkout reaches payment through review without paid, close, ca
   const actionLabels = [];
 
   const execute = async (observation, matcher, nextObservationId) => {
-    const prepared = prepareTransactionInvariants(state, observation, traveler);
+    state = stateWithSelectedBookingBaseline(state, traveler, structuralObservationForReplay(observation));
+    const prepared = prepareTransactionInvariants(state, structuralObservationForReplay(observation), traveler);
     state = prepared.state;
     const taskState = reduceTaskState({
       previousTaskState: state.taskState || {},
@@ -13922,6 +14005,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
   state.approvals.skipPaidExtrasApproved = true;
 
   let observation = await browserObservation(page, "obs_dirty_initial");
+  state = stateWithSelectedBookingBaseline(state, traveler, structuralObservationForReplay(observation));
   const dirtyGroups = observation.page.decisionGroups.filter((group) => group.selectedControlId);
   expect(dirtyGroups).toHaveLength(4);
   const controlsById = new Map(observation.page.controls.map((control) => [control.controlId, control]));
@@ -13950,7 +14034,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
 
   const selectedLabels = [];
   for (let turn = 0; turn < 8; turn += 1) {
-    const prepared = prepareTransactionInvariants(state, observation, traveler);
+    const prepared = prepareTransactionInvariants(state, structuralObservationForReplay(observation), traveler);
     state = prepared.state;
     const taskState = reduceTaskState({
       previousTaskState: state.taskState || {},
@@ -14012,7 +14096,7 @@ test("dirty checkout repairs exact paid selections before continuing to payment"
     observation = executed.observation;
   }
 
-  const finalPrepared = prepareTransactionInvariants(state, observation, traveler);
+  const finalPrepared = prepareTransactionInvariants(state, structuralObservationForReplay(observation), traveler);
   state = finalPrepared.state;
   const finalTaskState = reduceTaskState({
     previousTaskState: state.taskState || {},
@@ -16062,7 +16146,8 @@ test("Kiwi-shaped seat shell ignores persistent extras query parameters and resu
   const transient = classifyObservationReadiness({ observation: shell });
 
   expect(page.url()).toContain("insurance=0");
-  expect(shell.page.step).toBe("seats");
+  expect(shell.page.step).toBe("");
+  expect(shell.page.browserDiagnostics.step).toBe("seats");
   expect(shell.page.readiness.loadingTextEvidence).toBe(true);
   expect(transient.classification).toBe(READINESS.TRANSIENT);
   expect(transient.evidence.expectedStage).toBeUndefined();
@@ -16084,7 +16169,8 @@ test("Kiwi-shaped seat shell ignores persistent extras query parameters and resu
     previousReadiness: transient
   });
 
-  expect(hydrated.page.step).toBe("seats");
+  expect(hydrated.page.step).toBe("");
+  expect(hydrated.page.browserDiagnostics.step).toBe("seats");
   expect(hydrated.page.readiness.loadingTextEvidence).toBe(false);
   expect(hydrated.page.controls.some((control) => control.label === "Continue")).toBe(true);
   expect(ready.classification).toBe(READINESS.READY);

@@ -70,6 +70,10 @@ type Traveler = {
   billing_address?: string;
   billing_email?: string;
   payment_preference?: string;
+  paid_extras_policy?: "decline" | "ask";
+  standard_booking_terms?: "accept" | "ask";
+  marketing_consent?: "decline" | "accept";
+  payment_submission?: "never";
   booking_rules?: string;
   document?: TravelerDocument | null;
 };
@@ -602,6 +606,25 @@ function TravelerForm({ data, id, onSave }: { data: Bootstrap; id?: string; onSa
             <option>manual payment</option>
           </select>
         </Label>
+        <Label title="Paid extras">
+          <select name="paid_extras_policy" defaultValue={traveler?.paid_extras_policy || "decline"}>
+            <option value="decline">decline</option>
+            <option value="ask">ask</option>
+          </select>
+        </Label>
+        <Label title="Standard booking terms">
+          <select name="standard_booking_terms" defaultValue={traveler?.standard_booking_terms || "accept"}>
+            <option value="accept">accept</option>
+            <option value="ask">ask</option>
+          </select>
+        </Label>
+        <Label title="Marketing consent">
+          <select name="marketing_consent" defaultValue={traveler?.marketing_consent || "decline"}>
+            <option value="decline">decline</option>
+            <option value="accept">accept</option>
+          </select>
+        </Label>
+        <input type="hidden" name="payment_submission" value="never" />
         <Label title="Booking rules / agent context" wide>
           <textarea
             name="booking_rules"

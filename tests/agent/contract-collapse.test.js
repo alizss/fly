@@ -36,6 +36,8 @@ test("request compaction preserves the structural observation authority marker",
     page: {
       observationContract: "structural-observation/v1",
       url: "https://example.test/checkout",
+      step: "payment",
+      stageExit: { continueAllowed: true },
       controls: [{
         controlId: "ctrl_continue",
         label: "Continue",
@@ -53,16 +55,46 @@ test("request compaction preserves the structural observation authority marker",
         alternativeControlIds: ["ctrl_continue"],
         alternatives: [{ controlId: "ctrl_continue", label: "Continue" }]
       }],
-      currentSurface: { id: "surface-page", type: "page" }
+      currentSurface: {
+        id: "surface-page",
+        type: "page",
+        taskHint: "payment_method",
+        surfaceClass: "payment"
+      }
     }
   });
 
   assert.equal(compact.page.observationContract, "structural-observation/v1");
   assert.equal(compact.page.stageExit?.continueAllowed, undefined);
+  assert.equal(compact.page.step, undefined);
+  assert.equal(compact.page.currentSurface.taskHint, undefined);
+  assert.equal(compact.page.currentSurface.surfaceClass, "");
+  assert.equal(compact.page.browserDiagnostics.step, "payment");
+  assert.equal(compact.page.browserDiagnostics.currentSurface.taskHint, "payment_method");
+  assert.equal(compact.page.browserDiagnostics.currentSurface.surfaceClass, "payment");
   assert.equal(compact.page.decisionGroups[0].required, undefined);
   assert.equal(compact.page.decisionGroups[0].status, undefined);
   assert.equal(compact.page.controls[0].semantic, undefined);
   assert.equal(compact.page.controls[0].physicalEffect, undefined);
+});
+
+test("request compaction rejects a stale observer instead of running legacy semantics", () => {
+  const { compactAgentPayload } = createRequestPayloadAdapter({
+    agentSessionStore: { getCurrentObservation: () => null },
+    screenshotForObservation: () => ({ screenshotId: "", screenshotDataUrl: "" })
+  });
+  assert.throws(() => compactAgentPayload({
+    observationId: "obs_stale_observer",
+    traveler: {},
+    page: {
+      url: "https://example.test/checkout",
+      controls: [{ controlId: "legacy", semantic: "continue" }]
+    }
+  }), (error) => (
+    error?.code === "STALE_OBSERVATION_CONTRACT"
+    && error?.status === 409
+    && error?.retryable === false
+  ));
 });
 
 test("MISSING_FACT cannot become an obligation, mechanics candidate, or lease", () => {
@@ -126,6 +158,8 @@ test("raw structural observation carries no business decision and DecisionFrame 
   assert.equal(decided.observation.page.controls[0].semanticAuthority, "decision-frame/v2");
   assert.equal(decided.observation.page.controls[0].semantic, "decline_paid_extra");
   assert.equal(decided.observation.page.controls[0].physicalEffect, "select_free_option");
+  assert.equal(Object.hasOwn(decided.observation.page.decisionGroups[0], "desiredByMilestone"), false);
+  assert.equal(Object.hasOwn(decided.observation.page.decisionGroups[0], "requiredByProduct"), false);
 
   const runtime = fs.readFileSync(path.resolve(__dirname, "../../apps/extension/src/content/runtime.js"), "utf8");
   const start = runtime.indexOf("function structuralControlForTransport");
@@ -145,11 +179,60 @@ test("raw structural observation carries no business decision and DecisionFrame 
   assert.doesNotMatch(groupTransport, /required:\s*group\.required/);
   assert.doesNotMatch(groupTransport, /status:\s*group\.status/);
   assert.doesNotMatch(groupTransport, /semanticOwnership:\s*group\.semanticOwnership/);
-  assert.match(groupTransport, /requiredStateObserved = memberControls\.some/);
-  assert.doesNotMatch(groupTransport, /requiredStateObserved:\s*group\.required === true/);
-  assert.match(runtime, /group\.projectionKind !== "synthetic_global_payment"/);
+  assert.doesNotMatch(groupTransport, /requiredStateObserved/);
+  assert.match(groupTransport, /ownerState:/);
+  assert.match(groupTransport, /required: exactOwnerRequired \|\| memberRequired/);
+  assert.doesNotMatch(runtime, /group\.projectionKind !== "synthetic_global_payment"/);
+  assert.match(groupTransport, /decisionGroupId: group\.decisionGroupId/);
   assert.doesNotMatch(runtime, /group\.requirementId !== "payment:payment-method"/);
   assert.doesNotMatch(runtime, /structuralProgressCandidates/);
+});
+
+test("browser surface classifiers remain diagnostic and do not enter DecisionFrame meaning", () => {
+  const observation = {
+    observationId: "obs_surface_diagnostics",
+    observationSnapshot: { snapshotHash: "hash_surface_diagnostics" },
+    page: {
+      observationContract: "structural-observation/v1",
+      step: "payment",
+      currentSurface: {
+        id: "surface-review",
+        type: "modal",
+        label: "Review your information",
+        taskHint: "browser_review_guess",
+        surfaceClass: "browser_review_guess",
+        parentSectionType: "browser_payment_guess",
+        expectedResolution: "browser_continue_guess"
+      },
+      controls: []
+    }
+  };
+  const frame = compileDecisionFrame({ observation });
+
+  assert.equal(frame.observationFrame.stageEvidence.observedStep, "payment");
+  assert.equal(frame.observation.page.currentSurface.taskHint, undefined);
+  assert.equal(frame.observation.page.currentSurface.surfaceClass, "information");
+  assert.equal(frame.observation.page.currentSurface.parentSectionType, undefined);
+  assert.equal(frame.observation.page.currentSurface.expectedResolution, undefined);
+});
+
+test("unfamiliar pages receive only the lightweight precheckout producer before Start", () => {
+  const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../../apps/extension/manifest.json"), "utf8"));
+  const universal = manifest.content_scripts.filter((entry) => entry.matches?.includes("<all_urls>"));
+  assert.equal(universal.length, 1);
+  assert.deepEqual(universal[0].js, ["src/content/precheckout-capture.js"]);
+  assert.equal(universal[0].css, undefined);
+  assert.equal(universal[0].run_at, "document_start");
+  assert.equal(manifest.content_scripts.some((entry) => (
+    entry.matches?.includes("<all_urls>") && entry.js?.includes("dist/content.js")
+  )), false);
+
+  const root = path.resolve(__dirname, "../..");
+  const admission = fs.readFileSync(path.join(root, "apps/extension/src/content/selected-booking-admission.js"), "utf8");
+  const sessionClient = fs.readFileSync(path.join(root, "apps/extension/src/content/controller/session-client.js"), "utf8");
+  assert.equal(fs.existsSync(path.join(root, "apps/extension/src/content/selected-booking-acquisition.js")), false);
+  assert.doesNotMatch(admission, /transactionFacts|pageStateStore|schedule|capture/);
+  assert.doesNotMatch(sessionClient, /composeSelectedBookingContract|session_start_booking|initialMap/);
 });
 
 test("DecisionFrame ignores browser-authored group requiredness and status", () => {

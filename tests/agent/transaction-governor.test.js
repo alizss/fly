@@ -7,7 +7,7 @@ const path = require("path");
 const { createStore } = require("../../apps/web/agent/session-store");
 const { listTraces } = require("../../apps/web/agent/trace-store");
 const { __private: governorPrivate } = require("../../apps/web/agent/action-governor");
-const { governObservedAction: governAction } = require("./governance-test-helper");
+const { governObservedAction: governAction, stateWithSelectedBookingBaseline } = require("./governance-test-helper");
 const {
   selectNextProfileRequirement
 } = require("../../apps/web/agent/profile-mechanics");
@@ -32,7 +32,7 @@ const { reduceTaskState } = require("./task-state-replay-adapter");
 const { deriveObservationGoal } = require("./legacy-observation-goal-adapter");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { semanticGoalKey } = require("../../packages/shared/agent-actions");
-const { invariantDecision } = require("../../apps/web/agent/invariants");
+const { invariantDecision, prepareTransactionInvariants } = require("../../apps/web/agent/invariants");
 const { compileCurrentObligation } = require("./obligation-test-helper");
 const {
   leasedAction,
@@ -43,7 +43,10 @@ const {
 } = require("./execution-episode-test-adapter");
 
 async function runLoopTurn(args = {}) {
-  const result = await runRawLoopTurn(args);
+  const result = await runRawLoopTurn({
+    ...args,
+    state: stateWithSelectedBookingBaseline(args.state || {}, args.traveler || {}, args.observation || {})
+  });
   return {
     ...result,
     clientDecision: executableDecisionFromActionLease(result.clientDecision)
@@ -85,55 +88,15 @@ test("the governor exposes no adaptive semantic authority", () => {
   assert.equal(governorPrivate.adaptiveEnvelopeFailure, undefined);
 });
 
-test("transaction invariants admit exact evidence disclosure but reject legal and payment work until booking authority is ready", () => {
-  const collecting = {
-    itinerary: { completeness: "unknown", segments: [] },
-    travelers: [],
-    currency: "",
-    totalPrice: { amount: null, currency: "" },
-    selectedExtras: []
-  };
-  const prepared = {
-    baseline: collecting,
-    observed: collecting,
-    envelope: {
-      baselineStatus: "collecting",
-      acquisition: { status: "collecting", attempts: 2 }
-    },
-    observation: { page: { controls: [], decisionGroups: [] } }
-  };
-  const evidence = invariantDecision(prepared, {
-    mechanicalEffect: "open_surface",
-    risk: "safe",
-    targetLabel: "Booking details",
-    targetSnapshot: {
-      semantic: "reveal_transaction_evidence",
-      effectRole: "information_disclosure",
-      risk: "safe"
-    },
-    expectedOutcome: { type: "information_surface_revealed" }
-  }, { approvals: {} });
-  assert.equal(evidence.allow, true);
-
-  const legal = invariantDecision(prepared, {
-    mechanicalEffect: "accept_legal_terms",
-    risk: "legal",
-    targetLabel: "I confirm the booking details are accurate",
-    targetSnapshot: { semantic: "legal_acceptance", risk: "legal" },
-    expectedOutcome: { type: "control_selected", legalScope: "factual_accuracy" }
-  }, { approvals: {} });
-  assert.equal(legal.allow, false);
-  assert.equal(legal.code, "SELECTED_BOOKING_INVARIANT_MISSING");
-
-  const paymentRoute = invariantDecision(prepared, {
-    mechanicalEffect: "reveal_control",
-    risk: "safe",
-    targetLabel: "Credit card",
-    targetSnapshot: { semantic: "payment_method", effectRole: "payment_route", risk: "safe" },
-    expectedOutcome: { type: "current_surface_advanced" }
-  }, { approvals: {} });
-  assert.equal(paymentRoute.allow, false);
-  assert.equal(paymentRoute.code, "SELECTED_BOOKING_INVARIANT_MISSING");
+test("missing SelectedBooking is rejected before the governor can schedule any action", () => {
+  const state = createCheckoutSessionState({ travelerId: "trav_1" });
+  assert.throws(
+    () => prepareTransactionInvariants(state, {
+      observationId: "obs_without_booking",
+      page: { controls: [], decisionGroups: [], transactionFacts: null }
+    }, { id: "trav_1" }),
+    (error) => error.code === "SELECTED_BOOKING_REQUIRED"
+  );
 });
 
 test("pre-surface discovery admits one exact reversible opener and rejects semantic side effects", () => {
@@ -554,7 +517,7 @@ test("P0.6 governor allows one current canonical safe action and rejects its dup
     reason: "Decline paid baggage."
   };
   const allowed = governAction({ action, state, observation, traveler: { id: "trav_1", booking_rules: "no extras" }, store, turnId: "turn_1" });
-  assert.equal(allowed.allow, true);
+  assert.equal(allowed.allow, true, JSON.stringify({ code: allowed.code, reason: allowed.reason, details: allowed.details }));
   assert.equal(lifecycle(allowed.state).status, "approved");
   assert.equal(lifecycle(allowed.state).approved, true);
   assert.equal(lifecycle(allowed.state).dispatched, false);
@@ -756,7 +719,7 @@ test("persisted failed-actuator diagnostics do not veto backend-scheduled retrie
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("P0.7/P0.9 governor accepts agreeing canonical aliases as one target", () => {
+test("P0.7/P0.9 governor accepts the exact canonical operation actuator", () => {
   const { dir, dbPath } = tempDb();
   const { state, observation } = fixture();
   const store = createStore({ dbPath });
@@ -768,9 +731,11 @@ test("P0.7/P0.9 governor accepts agreeing canonical aliases as one target", () =
     observationId: "obs_1",
     observationHash: "hash_1",
     intent: "decline_optional_extra",
+    operation: "activate",
     controlId: "ctrl_decline",
     decisionGroupId: "dg_baggage_confirm",
-    targetId: "el_decline_wrapper",
+    actuatorId: "el_decline",
+    targetId: "el_decline",
     targetSnapshot: {
       id: "el_decline",
       controlId: "ctrl_decline",
@@ -780,11 +745,7 @@ test("P0.7/P0.9 governor accepts agreeing canonical aliases as one target", () =
       surfaceId: "surface_1",
       surfaceType: "modal",
       stateElementId: "el_decline_state",
-      preferredActivationElementId: "el_decline",
-      actuators: [
-        { nodeId: "el_decline_label", relation: "label" },
-        { nodeId: "el_decline_wrapper", relation: "wrapper" }
-      ]
+      operations: { activate: actionableCapability("activate", "el_decline") }
     },
     expectedOutcome: {
       type: "active_surface_dismissed",
@@ -829,6 +790,10 @@ test("P0.4/P0.7 governor rejects typing through a label or activation member", (
       { nodeId: "el_email_input", relation: "state" },
       { nodeId: "el_email_label", relation: "label" }
     ],
+    operations: {
+      type: actionableCapability("type", "el_email_input"),
+      activate: actionableCapability("activate", "el_email_label")
+    },
     visualRegion: { x: 100, y: 220, width: 240, height: 40, inViewport: true }
   });
   const store = createStore({ dbPath });
@@ -842,7 +807,9 @@ test("P0.4/P0.7 governor rejects typing through a label or activation member", (
       observationId: "obs_1",
       observationHash: "hash_1",
       intent: "satisfy_field",
+      operation: "type",
       controlId: "ctrl_email",
+      actuatorId: "el_email_label",
       targetId: "el_email_label",
       targetLabel: "E-mail",
       value: "ali@example.test",
@@ -854,7 +821,10 @@ test("P0.4/P0.7 governor rejects typing through a label or activation member", (
         surfaceId: "surface_1",
         surfaceType: "modal",
         stateElementId: "el_email_input",
-        preferredActivationElementId: "el_email_label"
+        operations: {
+          type: actionableCapability("type", "el_email_input"),
+          activate: actionableCapability("activate", "el_email_label")
+        }
       },
       expectedOutcome: {
         type: "field_value_changed",
@@ -872,7 +842,7 @@ test("P0.4/P0.7 governor rejects typing through a label or activation member", (
   });
 
   assert.equal(governed.allow, false);
-  assert.equal(governed.code, "ACTION_ACTUATOR_KIND_MISMATCH");
+  assert.equal(governed.code, "ACTION_OPERATION_ACTUATOR_MISMATCH");
   store.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -2144,11 +2114,10 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
         stateElementId: "el_visual_country",
         preferredActivationElementId: "el_visual_country",
         actuators: [{ nodeId: "el_visual_country", relation: "state" }],
-        operations: { activate: null, open: null, choose: null, type: null, select: null },
-        recovery: {
+        operations: {
           open: {
             operation: "open",
-            status: "unproven",
+            status: "unproven_experiment",
             requiresVisualConfirmation: true,
             regions: [{
               x: 180,
@@ -2161,7 +2130,7 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
               observationId: "obs_visual_country",
               controlId: "ctrl_visual_country",
               operation: "open",
-              source: "control.recovery.open"
+              source: "control.operations.open"
             }]
           }
         }
@@ -2195,7 +2164,12 @@ test("P1.1/P1.5 governor allows only an owned bounded visual recovery region", (
     item.type === "click_xy"
     && item.controlId === "ctrl_visual_country"
     && item.targetId === ""
-  )));
+  )), JSON.stringify({
+    currentGoalCandidates: currentGoal.candidates,
+    scheduledCandidates: scheduled.candidates,
+    scheduledRecoveryCandidates: scheduled.recoveryCandidates,
+    excludedCandidates: scheduled.excludedCandidates
+  }, null, 2));
 
   const store = createStore({ dbPath });
   store.saveSession(state);

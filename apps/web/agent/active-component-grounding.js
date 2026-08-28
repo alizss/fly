@@ -34,12 +34,15 @@ function operationCapabilities(control = {}) {
   return Object.entries(control.operations || {}).flatMap(([operation, capability]) => {
     if (!capability) return [];
     const actionability = capability.actionability || {};
+    const strategy = (capability.strategies || []).find((candidate) => candidate?.actuatorId) || null;
+    const actuatorId = strategy?.actuatorId || capability.actuatorId || capability.actuatorIds?.[0] || "";
+    if (!actuatorId) return [];
     return [{
       candidateId: `semantic:${control.controlId}:${operation}`,
       controlId: control.controlId,
       logicalControlId: control.controlId,
-      actuatorId: capability.actuatorId || control.preferredActivationElementId || control.stateElementId || "",
-      targetId: capability.actuatorId || control.preferredActivationElementId || control.stateElementId || "",
+      actuatorId,
+      targetId: actuatorId,
       targetLabel: control.label || control.accessibleName || "",
       label: control.label || control.accessibleName || "",
       operation,

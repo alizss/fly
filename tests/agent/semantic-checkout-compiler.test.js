@@ -329,6 +329,63 @@ test("Continue labels never manufacture an included fare when price effects are 
   assert.equal(resolution.preferredControlId, "");
 });
 
+test("page-wide free copy cannot classify an unrelated option as included", () => {
+  const noThanks = executableControl({
+    controlId: "no_thanks",
+    targetId: "act_no_thanks",
+    label: "No, thanks",
+    x: 100,
+    semantic: "decline_paid_extra"
+  });
+  const yes = executableControl({
+    controlId: "yes",
+    targetId: "act_yes",
+    label: "Yes",
+    x: 350,
+    semantic: "choice"
+  });
+  const evidence = agentContract.boundedDecisionPriceEvidence({
+    visibleText: "Included at no extra cost. Do you need time to think? No, thanks Yes"
+  }, [
+    { controlId: "no_thanks", label: "No, thanks" },
+    { controlId: "yes", label: "Yes" }
+  ], new Map([
+    [noThanks.controlId, noThanks],
+    [yes.controlId, yes]
+  ]));
+
+  assert.deepEqual(evidence.map((option) => option.included), [false, false]);
+  assert.deepEqual(evidence.map((option) => option.structuredPrice), [null, null]);
+});
+
+test("exact option-owned price evidence remains authoritative", () => {
+  const included = executableControl({
+    controlId: "included",
+    targetId: "act_included",
+    label: "No protection — included",
+    x: 100
+  });
+  const paid = executableControl({
+    controlId: "paid",
+    targetId: "act_paid",
+    label: "Add protection",
+    x: 350,
+    price: { amount: 12, currency: "EUR" }
+  });
+  const evidence = agentContract.boundedDecisionPriceEvidence({}, [
+    { controlId: "included", label: included.label },
+    { controlId: "paid", label: paid.label, structuredPrice: paid.structuredPrice }
+  ], new Map([
+    [included.controlId, included],
+    [paid.controlId, paid]
+  ]));
+
+  assert.equal(evidence[0].included, true);
+  assert.deepEqual(evidence[0].structuredPrice, { amount: 0, currency: "EUR" });
+  assert.equal(evidence[1].included, false);
+  assert.deepEqual(evidence[1].structuredPrice, { amount: 12, currency: "EUR" });
+});
+
 test("a selected paid fare does not satisfy a no-paid constraint merely because something is selected", () => {
   const page = boundedFarePage(kiwiAbsoluteFareTotalsPage(), [0, 12, 25], "EUR", [33, 45, 58]);
   page.controls[1].selected = true;

@@ -142,6 +142,60 @@ function taskMechanics(taskState = {}) {
   return currentObligation(taskState);
 }
 
+function exactTypedExecutableOwner(decisionFrame = {}, item = {}) {
+  const controlId = String(item.controlId || "");
+  if (!controlId) return false;
+  const control = (decisionFrame.semanticCompilation?.controls || []).find((candidate) => (
+    String(candidate.controlId || "") === controlId
+  ));
+  if (!control) return false;
+  const semantic = String(control.semanticType || control.fieldType || control.semantic || "").toLowerCase();
+  const typed = semantic && !["unknown", "choice", "field", "value_field", "input", "control"].includes(semantic);
+  const executable = Object.values(control.operations || {}).some((capability) => (
+    capability?.status === "proven_executable"
+    && capability?.actionability?.executable === true
+  ));
+  return typed && executable;
+}
+
+function semanticReconciliationEligible(decisionFrame = {}) {
+  // Semantic sufficiency belongs to DecisionFrame and must be settled before
+  // TaskState runs. Using a provisional obligation as proof of sufficiency is
+  // circular: an incomplete frame can manufacture a plausible action and the
+  // existence of that action then suppresses the resolver that could correct
+  // it.
+  if (decisionFrame.terminalEvidence?.verified === true) return false;
+  const unresolvedEvidence = decisionFrame.unresolvedEvidence || [];
+  if (unresolvedEvidence.some((item) => (
+    ["unknown_validation", "unknown_required", "unknown_attestation"].includes(String(item.kind || ""))
+    && item.status !== "resolved"
+    && ["strong", "structural"].includes(String(item.evidenceStrength || ""))
+    && !exactTypedExecutableOwner(decisionFrame, item)
+  ))) return true;
+  if ((decisionFrame.semanticCompilation?.controls || []).some((control) => {
+    const lifecycle = control.representationLifecycle || {};
+    const active = lifecycle.active === true || lifecycle.status === "active_rendered";
+    const required = control.required === true || control.state?.required === true;
+    const semantic = String(control.fieldType || control.semantic || "").toLowerCase();
+    const unknown = !semantic || ["unknown", "choice", "field", "value_field", "input", "control"].includes(semantic);
+    return active && required && unknown && Object.keys(control.operations || {}).length > 0;
+  })) return true;
+  // Page-wide readiness is diagnostic only. A model pass is admitted solely
+  // for a required, unsatisfied decision that still lacks a typed contract.
+  // Optional and unrelated unknown controls cannot stall deterministic work.
+  return (decisionFrame.semanticCompilation?.decisionGroups || []).some((group) => {
+    const status = String(group.status || "").toLowerCase();
+    const subject = String(group.semanticOwnership?.family || group.subject?.key || group.subject || "").toLowerCase();
+    const blocking = group.required === true && !group.selectedControlId
+      && ["", "missing", "blocked", "required", "unresolved", "conflicted"].includes(status);
+    const typed = group.decisionContract?.valid === true
+      && Boolean(group.decisionContract?.kind)
+      && subject
+      && !/unknown|decision|additional/.test(subject);
+    return blocking && !typed;
+  });
+}
+
 function bufferedDiagnosticStore(store = null) {
   if (!store?.recordActionEvents || !store?.saveSession) return store;
   const events = [];
@@ -500,10 +554,9 @@ async function runLoopTurn({
     ambiguityModelCalls += 1;
     return resolveAmbiguity(request);
   };
-  // Deterministic semantics are the fast path, not an admission gate. The
-  // first reduction is provisional: when it cannot explain the active
-  // surface, one grounded semantic pass may enrich the DecisionFrame before
-  // the authoritative TaskState obligation is published.
+  // Deterministic semantics are the fast path, not an admission gate. When
+  // they cannot explain the active surface, one grounded semantic pass may
+  // enrich the DecisionFrame before TaskState is invoked.
   const semanticCompileStartedAt = Date.now();
   observation = applyRememberedSemanticBindings(observation, state.semanticBindingMemory, {
     traveler,
@@ -513,15 +566,6 @@ async function runLoopTurn({
   // reconciliation. The published semantic observation is for consumers; it
   // must never become the input to a second interpretation pass.
   let decisionFrameSourceObservation = observation;
-  // Acquire objective transaction structure before publishing semantics for
-  // this observation. Otherwise the observation that consumes the final
-  // bounded acquisition attempt can compile a DecisionFrame from the stale
-  // "collecting" state and publish one stage-changing action after durable
-  // acquisition has already become exhausted.
-  const structuralTransactionContext = prepareTransactionInvariants(state, observation, traveler, {
-    authoritativeTransactionFacts: observation.page?.transactionFacts || {}
-  });
-  state = structuralTransactionContext.state;
   const compileCurrentDecisionFrame = () => {
     observationFrame = createObservationFrame(decisionFrameSourceObservation);
     decisionFrame = compileDecisionFrame({
@@ -560,19 +604,18 @@ async function runLoopTurn({
   });
   const taskStateStartedAt = Date.now();
   const mechanicalEvidence = executionEpisodeFor(state).mechanicalEvidence || null;
-  // Semantic sufficiency belongs before TaskState. A provisional TaskState
-  // used to decide whether the scene was understood, which let a plausible
-  // but wrong obligation suppress unfamiliarity reasoning. DecisionFrame now
-  // declares its own incompleteness; TaskState is reduced exactly once from
-  // the final frame.
-  const semanticFallbackEligible = decisionFrame.semanticCompilation?.semanticReadiness === "unresolved"
-    || (decisionFrame.unresolvedEvidence || []).length > 0;
+  // Resolve semantic incompleteness before TaskState. TaskState is a reducer
+  // over one final DecisionFrame, not a probe used to decide whether that
+  // frame was sufficiently understood.
+  const semanticFallbackEligible = semanticReconciliationEligible(decisionFrame);
   const sceneUncertainty = semanticFallbackEligible
     ? semanticSceneUncertainty({
         observation,
         semanticCompilation: decisionFrame.semanticCompilation,
+        unresolvedEvidence: decisionFrame.unresolvedEvidence,
         traveler,
-        transactionReview: transactionContext.review
+        transactionReview: transactionContext.review,
+        currentObligation: null
       })
     : { needed: false, reason: "DECISION_FRAME_SEMANTICALLY_SUFFICIENT" };
   if (sceneUncertainty.needed) {
@@ -612,7 +655,13 @@ async function runLoopTurn({
       activeComponentGrounding = reconciled.reconciliation;
       activeComponentGroundingMeta = reconciled.meta;
       state = withUpdate(state, {
-        semanticBindingMemory: rememberSemanticBindings(state.semanticBindingMemory, observation)
+        semanticBindingMemory: rememberSemanticBindings(state.semanticBindingMemory, observation, {
+          unresolvedControls: (activeComponentGrounding?.hypotheses || []).length
+            || (activeComponentGrounding?.decisionHypotheses || []).length
+            || (activeComponentGrounding?.controlHypotheses || []).length
+            ? []
+            : sceneUncertainty.components
+        })
       });
       latency.classification_model_ms += Number(reconciled.meta?.durationMs || 0);
     } catch (error) {
@@ -629,6 +678,11 @@ async function runLoopTurn({
           semanticSceneReconciliation: activeComponentGrounding
         }
       };
+      state = withUpdate(state, {
+        semanticBindingMemory: rememberSemanticBindings(state.semanticBindingMemory, observation, {
+          unresolvedControls: sceneUncertainty.components
+        })
+      });
     }
     compileCurrentDecisionFrame();
     transactionContext = prepareTransactionInvariants(state, observation, traveler, {
@@ -1697,6 +1751,7 @@ module.exports = {
     failedStrategySignaturesForGoal,
     groundedObservationCandidateSet,
     observationSurfaceId,
+    semanticReconciliationEligible,
     staleIdentityRejection,
     targetSnapshotForAction,
     resolveActionControl,

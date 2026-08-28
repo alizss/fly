@@ -613,15 +613,13 @@ test("opaque dropdown date emits one trusted choice with a final date-value post
     ]
   });
   month.state.disabled = true;
-  month.operations = {};
-  month.stateElementId = "month_hidden_state";
-  month.preferredActivationElementId = "month_visible_widget";
-  month.recovery = {
+  month.operations = {
     select: {
       operation: "select",
+      status: "unproven_experiment",
       requiresVisualConfirmation: true,
       actuatorIds: ["month_visible_widget"],
-      targetabilityByActuator: {
+      actionabilityByActuator: {
         month_visible_widget: {
           rendered: true,
           visible: true,
@@ -645,6 +643,8 @@ test("opaque dropdown date emits one trusted choice with a final date-value post
       regions: []
     }
   };
+  month.stateElementId = "month_hidden_state";
+  month.preferredActivationElementId = "month_visible_widget";
   const observed = observation([
     dateControl("day", "31"),
     month,
@@ -686,9 +686,10 @@ test("atomic choice remains available when many open strategies exceed the candi
     operationAuthorized: true,
     operationProven: false
   };
-  month.recovery = {
+  month.operations = {
     open: {
       operation: "open",
+      status: "unproven_experiment",
       requiresVisualConfirmation: true,
       actuatorIds: Array.from({ length: 12 }, (_, index) => `month_open_${index}`),
       strategies: Array.from({ length: 12 }, (_, index) => ({
@@ -697,12 +698,13 @@ test("atomic choice remains available when many open strategies exceed the candi
         method: index < 6 ? "native_click" : "pointer_sequence",
         actionType: "click",
         status: "unproven_experiment",
-        actionability: proof
+        proof
       })),
       regions: []
     },
     select: {
       operation: "select",
+      status: "unproven_experiment",
       requiresVisualConfirmation: true,
       actuatorIds: ["month_atomic"],
       strategies: [{
@@ -711,7 +713,7 @@ test("atomic choice remains available when many open strategies exceed the candi
         method: "browser_trusted_choice",
         actionType: "click",
         status: "unproven_experiment",
-        actionability: proof
+        proof
       }],
       regions: []
     }

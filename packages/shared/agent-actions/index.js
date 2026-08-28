@@ -91,6 +91,7 @@ const {
  * @property {string} surfaceId
  * @property {string} observationId
  * @property {string} controlId
+ * @property {string} ownerElementId
  * @property {string} operation
  * @property {string} source
  * @property {number} confidence
@@ -121,6 +122,7 @@ function normalizeVisualRegion(raw = {}, context = {}) {
     surfaceId: String(raw.surfaceId || context.surfaceId || "").slice(0, 120),
     observationId: String(context.observationId || raw.observationId || "").slice(0, 120),
     controlId: String(raw.controlId || context.controlId || "").slice(0, 140),
+    ownerElementId: String(raw.ownerElementId || context.ownerElementId || "").slice(0, 140),
     operation: String(raw.operation || context.operation || "").slice(0, 40),
     source: String(raw.source || context.source || "").slice(0, 120),
     confidence: Math.max(0, Math.min(1, finiteNumber(raw.confidence, context.confidence))),
@@ -136,7 +138,7 @@ function visualRegionsMatch(left = {}, right = {}, tolerance = 2) {
   const geometryMatches = ["x", "y", "width", "height", "centerX", "centerY"]
     .every((key) => Math.abs(a[key] - b[key]) <= tolerance);
   if (!geometryMatches) return false;
-  return ["viewportWidth", "viewportHeight", "surfaceId", "observationId", "controlId", "operation", "source"]
+  return ["viewportWidth", "viewportHeight", "surfaceId", "observationId", "controlId", "ownerElementId", "operation", "source"]
     .every((key) => !a[key] || !b[key] || a[key] === b[key]);
 }
 

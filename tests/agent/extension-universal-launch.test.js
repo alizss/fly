@@ -229,6 +229,158 @@ test("a browser-selection context without an active session does not follow unre
   assert.equal(harness.calls.executedScripts.length, 0);
 });
 
+test("a real browser selection becomes the tab-scoped Start authority", async () => {
+  const harness = serviceWorkerHarness("https://search.unfamiliar-air.test/results");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const booking = selectedBooking("trav_unfamiliar");
+
+  const candidate = await harness.send({
+    type: "ATW_BOOKING_SELECTION_CANDIDATE",
+    phase: "selection_click",
+    missingFacts: ["approved_total", "currency"]
+  }, sender);
+  assert.equal(candidate.ok, true);
+  assert.deepEqual(
+    Array.from(harness.storage["atwCheckoutContextV1:73"].selectionCandidate.missingFacts),
+    ["approved_total", "currency"]
+  );
+
+  const captured = await harness.send({
+    type: "ATW_BOOKING_SELECTION_CAPTURED",
+    phase: "selection_click",
+    selectedBookingContract: booking
+  }, sender);
+
+  assert.equal(captured.ok, true);
+  assert.equal(captured.context.source, "browser_selection");
+  assert.equal(captured.context.selectionCandidate, null);
+  assert.equal(captured.context.selectedBookingContract.selectionId, booking.selectionId);
+  assert.equal(harness.storage["atwCheckoutContextV1:73"].selectedBookingContract.approvedTotal.amount, 280);
+
+  const read = await harness.send({ type: "ATW_CHECKOUT_CONTEXT_READ", tabId: 73 });
+  assert.equal(read.ok, true);
+  assert.equal(read.context.selectedBookingContract.selectionId, booking.selectionId);
+
+  const started = await harness.send({ type: "ATW_START_CHECKOUT", tabId: 73, autoStart: true });
+  assert.equal(started.ok, true);
+  assert.equal(started.context.checkoutLineageId, captured.context.checkoutLineageId);
+  assert.equal(started.context.selectedBookingContract.selectionId, booking.selectionId);
+});
+
+test("the background rejects a captured route that conflicts with structured source evidence", async () => {
+  const harness = serviceWorkerHarness("https://search.unfamiliar-air.test/results");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const booking = selectedBooking("trav_unfamiliar");
+  booking.sourceUrl = "https://search.unfamiliar-air.test/results?origin=ZAG&destination=SJJ&secret=private";
+  booking.itinerary.segments[0] = {
+    ...booking.itinerary.segments[0],
+    origin: "ADD",
+    destination: "ONS"
+  };
+
+  const captured = await harness.send({
+    type: "ATW_BOOKING_SELECTION_CAPTURED",
+    phase: "selection_click",
+    selectedBookingContract: booking
+  }, sender);
+
+  assert.equal(captured.ok, false);
+  assert.equal(captured.code, "INVALID_SELECTED_BOOKING");
+  assert.equal(harness.storage["atwCheckoutContextV1:73"], undefined);
+  assert.equal(harness.storage.selectedBookingContract, undefined);
+});
+
+test("the background persists route provenance without URL query data", async () => {
+  const harness = serviceWorkerHarness("https://search.unfamiliar-air.test/results");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const booking = selectedBooking("trav_unfamiliar");
+  booking.sourceUrl = "https://search.unfamiliar-air.test/results?origin=LJU&destination=FRA&secret=private";
+
+  const captured = await harness.send({
+    type: "ATW_BOOKING_SELECTION_CAPTURED",
+    phase: "selection_click",
+    selectedBookingContract: booking
+  }, sender);
+
+  assert.equal(captured.ok, true);
+  assert.equal(captured.context.selectedBookingContract.sourceUrl, "https://search.unfamiliar-air.test/results");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(captured.context.selectedBookingContract.sourceRouteEvidence)),
+    { origin: "LJU", destination: "FRA" }
+  );
+});
+
+test("a booking selection captured before traveler choice binds that traveler exactly at Start", async () => {
+  const harness = serviceWorkerHarness("https://search.unfamiliar-air.test/results");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const booking = selectedBooking("trav_bound_at_start");
+  const candidate = {
+    contractVersion: "selected-booking-candidate/v1",
+    selectionId: booking.selectionId,
+    selectedAt: booking.selectedAt,
+    sourceUrl: booking.sourceUrl,
+    itinerary: booking.itinerary,
+    approvedTotal: booking.approvedTotal,
+    fareBrand: ""
+  };
+
+  const captured = await harness.send({
+    type: "ATW_BOOKING_SELECTION_CANDIDATE",
+    phase: "selection_click",
+    missingFacts: ["selected_traveler"],
+    selectedBookingCandidate: candidate
+  }, sender);
+  assert.equal(captured.ok, true);
+  assert.equal(
+    harness.storage["atwCheckoutContextV1:73"].selectionCandidate.selectedBookingCandidate.selectionId,
+    booking.selectionId
+  );
+
+  const started = await harness.send({
+    type: "ATW_START_CHECKOUT",
+    tabId: 73,
+    autoStart: true,
+    selectedTravelerId: "trav_bound_at_start"
+  });
+
+  assert.equal(started.ok, true);
+  assert.equal(started.context.selectionCandidate, null);
+  assert.deepEqual(
+    Array.from(started.context.selectedBookingContract.travelerIds),
+    ["trav_bound_at_start"]
+  );
+  assert.equal(started.context.selectedBookingContract.selectionId, booking.selectionId);
+});
+
+test("content runtimes receive one background-instance epoch for reload ownership", async () => {
+  const harness = serviceWorkerHarness();
+  const first = await harness.send({ type: "ATW_EXTENSION_RUNTIME_PROBE" });
+  const second = await harness.send({ type: "ATW_EXTENSION_RUNTIME_PROBE" });
+
+  assert.equal(first.ok, true);
+  assert.match(first.epoch, /^runtime_/);
+  assert.equal(second.epoch, first.epoch);
+});
+
+test("a captured booking follows a pre-session new-tab checkout handoff", async () => {
+  const harness = serviceWorkerHarness("https://search.unfamiliar-air.test/results");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  const booking = selectedBooking("trav_unfamiliar");
+  const captured = await harness.send({
+    type: "ATW_BOOKING_SELECTION_CAPTURED",
+    phase: "selection_click",
+    selectedBookingContract: booking
+  }, sender);
+
+  await harness.createTab({ id: 74, openerTabId: 73, url: "about:blank" });
+
+  const inherited = harness.storage["atwCheckoutContextV1:74"];
+  assert.equal(inherited.checkoutLineageId, captured.context.checkoutLineageId);
+  assert.equal(inherited.selectedBookingContract.selectionId, booking.selectionId);
+  assert.equal(inherited.selectedBookingContract.approvedTotal.currency, "EUR");
+  assert.equal(harness.storage.atwAgentResume, undefined);
+});
+
 test("resume save claim and clear are isolated by checkout lineage rather than a global tab marker", async () => {
   const harness = serviceWorkerHarness();
   const first = await harness.send({ type: "ATW_START_CHECKOUT", tabId: 73, autoStart: true });
@@ -303,6 +455,7 @@ test("manifest and popup expose the explicit universal launch path", () => {
   assert.ok(manifest.permissions.includes("scripting"));
   assert.ok(manifest.host_permissions.includes("<all_urls>"));
   assert.match(popup, /ATW_START_CHECKOUT/);
+  assert.doesNotMatch(popup, /settings\.selectedBookingContract/);
   assert.match(sessionClient, /STARTUP_CONTEXT/);
   assert.match(flow, /entry\.payload\?\.startAttemptId/);
 });

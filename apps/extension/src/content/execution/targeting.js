@@ -29,7 +29,6 @@ export function createTargeting(dependencies) {
     lookupControlForElement,
     normalizeMatchText,
     semanticChoiceType,
-    stableHash,
     surfaceMembershipForElement,
     visualRegionContractsMatch
   } = dependencies;
@@ -80,104 +79,6 @@ export function createTargeting(dependencies) {
     };
   }
 
-  function targetLocalDispatchIdentity(decision = {}, map = agent.pageMap || buildPageMap()) {
-    const controlId = decision.controlId || decision.targetSnapshot?.controlId || "";
-    const control = (map.controls || []).find((item) => item.controlId === controlId) || null;
-    const selectedStrategy = decision.pipelineContract?.capability?.selectedStrategy || {};
-    const actuatorStableKey = selectedStrategy.actuatorStableKey
-      || [
-        control?.stableKey || controlId,
-        decision.operation || "",
-        (control?.actuators || []).find((item) => item.nodeId === decision.targetId)?.relation || "",
-        decision.targetId || (decision.visualRegion ? "visual-region" : "")
-      ].join("::");
-    const surface = map.currentSurface || {};
-    const surfaceInstanceKey = stableHash(JSON.stringify({
-      step: map.step || "unknown",
-      surfaceId: surface.id || "surface-page",
-      surfaceType: surface.type || "page",
-      surfaceInstanceId: surface.instanceId || "",
-      decisionGroupId: decision.decisionGroupId || control?.decisionGroupId || "",
-      requirementId: decision.requirementId
-        || decision.pipelineContract?.requirement?.requirementId
-        || ""
-    }));
-    const strategySignature = [
-      decision.pipelineContract?.requirement?.requirementId || decision.requirementId || "",
-      decision.pipelineContract?.component?.componentIdentity || control?.stableKey || controlId,
-      actuatorStableKey,
-      decision.operation || "",
-      decision.interactionMethod || decision.action || ""
-    ].join("::");
-    const localStrategies = [
-      ...Object.values(control?.operations || {}).flatMap((capability) => capability?.strategies || []),
-      ...Object.values(control?.recovery || {}).flatMap((recovery) => recovery?.strategies || [])
-    ].filter((strategy) => !selectedStrategy.actuatorStableKey
-      || strategy.actuatorStableKey === selectedStrategy.actuatorStableKey);
-    const targetLocalStateKey = stableHash(JSON.stringify({
-      stableControlKey: control?.stableKey || controlId,
-      state: control ? {
-        disabled: control.state?.disabled === true || control.disabled === true,
-        expanded: control.state?.expanded === true,
-        checked: control.state?.checked === true,
-        selected: control.state?.selected === true || control.selected === true,
-        normalizedValue: String(
-          control.state?.canonicalDateValue
-          || control.state?.selectedValue
-          || control.state?.normalizedValue
-          || control.currentCanonicalValue
-          || control.currentValue
-          || ""
-        ),
-        optionValue: String(control.state?.optionValue || ""),
-        visibleWidgetElementId: String(control.visibleWidgetElementId || "")
-      } : null,
-      actuator: localStrategies.map((strategy) => ({
-        actuatorStableKey: strategy.actuatorStableKey || "",
-        status: strategy.status || "",
-        visible: strategy.proof?.visible === true,
-        enabled: strategy.proof?.enabled === true,
-        hitTested: strategy.proof?.hitTested === true,
-        notOccluded: strategy.proof?.notOccluded === true
-      })).sort((a, b) => a.actuatorStableKey.localeCompare(b.actuatorStableKey))
-    }));
-    return {
-      strategySignature,
-      actuatorStableKey,
-      surfaceInstanceKey,
-      targetLocalStateKey
-    };
-  }
-
-  function failedLocalStrategyForDecision(decision = {}, map = agent.pageMap || buildPageMap()) {
-    const identity = targetLocalDispatchIdentity(decision, map);
-    return (agent.failedLocalStrategies || []).find((entry) => (
-      entry.strategySignature === identity.strategySignature
-      && entry.surfaceInstanceKey === identity.surfaceInstanceKey
-      && entry.targetLocalStateKey === identity.targetLocalStateKey
-    )) || null;
-  }
-
-  function rememberFailedLocalStrategy(decision = {}, map = agent.pageMap || buildPageMap(), code = "") {
-    const identity = targetLocalDispatchIdentity(decision, map);
-    const existing = failedLocalStrategyForDecision(decision, map);
-    if (existing) {
-      existing.failureCount = Number(existing.failureCount || 1) + 1;
-      existing.code = code || existing.code || "";
-      return existing;
-    }
-    const entry = {
-      ...identity,
-      controlId: decision.controlId || decision.targetSnapshot?.controlId || "",
-      operation: decision.operation || "",
-      interactionMethod: decision.interactionMethod || decision.action || "",
-      code: String(code || "OUTCOME_NOT_VERIFIED"),
-      failureCount: 1
-    };
-    agent.failedLocalStrategies = [...(agent.failedLocalStrategies || []), entry].slice(-80);
-    return entry;
-  }
-
   function normalizedElementLabel(element) {
     return normalizeMatchText(buttonText(element) || labelText(element) || element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || "");
   }
@@ -226,12 +127,8 @@ export function createTargeting(dependencies) {
       controlKind: control?.kind || "",
       state: control?.state || null,
       operations: control?.operations || {},
-      recovery: control?.recovery || {},
       ownershipIntegrity: control?.ownershipIntegrity || null,
-      actuators: control?.actuators || [],
       stateElementId: control?.stateElementId || "",
-      visibleWidgetElementId: control?.visibleWidgetElementId || "",
-      preferredActivationElementId: control?.preferredActivationElementId || "",
       visualRegion: control?.visualRegion || descriptor?.box || null
     };
   }
@@ -311,17 +208,20 @@ export function createTargeting(dependencies) {
     const expectedControlId = expected.controlId || decision.controlId || "";
     const liveControlId = live.controlId || element?.dataset?.atwControlId || "";
     const expectedDecisionGroupId = expected.decisionGroupId || decision.decisionGroupId || "";
+    const governedOperation = decision.operation || "";
+    const expectedCapability = governedOperation ? expected.operations?.[governedOperation] : null;
+    const liveCapability = governedOperation ? live.operations?.[governedOperation] : null;
     if (expectedDecisionGroupId && live.decisionGroupId && expectedDecisionGroupId !== live.decisionGroupId) {
       const expectedActuatorIdentity = new Set([
         expected.id,
-        expected.stateElementId,
-        expected.preferredActivationElementId,
-        expected.actuatorId
+        expected.actuatorId,
+        ...(expectedCapability?.actuatorIds || []),
+        ...(expectedCapability?.strategies || []).map((strategy) => strategy?.actuatorId)
       ].filter(validTargetId));
       const liveActuatorIdentity = [
         live.id,
-        live.stateElementId,
-        live.preferredActivationElementId
+        ...(liveCapability?.actuatorIds || []),
+        ...(liveCapability?.strategies || []).map((strategy) => strategy?.actuatorId)
       ].filter(validTargetId);
       const exactCompiledControlLease = Boolean(
         expectedControlId
@@ -354,29 +254,20 @@ export function createTargeting(dependencies) {
     // validates identity, foreground ownership, operation compatibility, and
     // actionability without independently reclassifying its text.
     const expectedActuatorIds = new Set([
-      expected.stateElementId,
-      expected.preferredActivationElementId,
-      ...(expected.actuators || []).map((item) => item.nodeId)
+      expected.id,
+      expected.actuatorId,
+      ...(expectedCapability?.actuatorIds || []),
+      ...(expectedCapability?.strategies || []).map((strategy) => strategy?.actuatorId)
     ].filter(validTargetId));
     const liveActuatorIds = new Set([
       live.id,
-      live.stateElementId,
-      live.preferredActivationElementId,
-      ...(live.actuators || []).map((item) => item.nodeId)
+      ...(liveCapability?.actuatorIds || []),
+      ...(liveCapability?.strategies || []).map((strategy) => strategy?.actuatorId)
     ].filter(validTargetId));
-    const governedOperation = decision.operation || "";
     if (governedOperation) {
-      const capability = expected.operations?.[governedOperation] || live.operations?.[governedOperation] || null;
-      const recovery = decision.boundedRecovery === true
-        ? expected.recovery?.[governedOperation] || live.recovery?.[governedOperation] || null
-        : null;
-      const allowed = new Set(recovery
-        ? [
-            ...(recovery.actuatorIds || []),
-            ...(recovery.strategies || []).map((strategy) => strategy.actuatorId)
-          ]
-        : capability?.actuatorIds || []);
-      if ((!capability && !recovery) || !allowed.has(live.id)) {
+      const capability = expectedCapability || liveCapability || null;
+      const allowed = new Set(capability?.actuatorIds || []);
+      if (!capability || !allowed.has(live.id)) {
         return { ok: false, code: "ACTION_OPERATION_ACTUATOR_MISMATCH", expected, live };
       }
     }
@@ -466,9 +357,9 @@ export function createTargeting(dependencies) {
     }
     if (controlledRecovery) {
       const control = (map.controls || []).find((item) => item.controlId === (decision.controlId || expected.controlId));
-      const recovery = control?.recovery?.[decision.operation || expected.recoveryOperation || ""];
-      const regionMatches = (recovery?.regions || []).some((candidate) => visualRegionContractsMatch(candidate, region));
-      if (!control || !recovery || recovery.requiresVisualConfirmation !== true || !regionMatches) {
+      const capability = control?.operations?.[decision.operation || expected.recoveryOperation || ""];
+      const regionMatches = (capability?.regions || []).some((candidate) => visualRegionContractsMatch(candidate, region));
+      if (!control || !capability || capability.requiresVisualConfirmation !== true || !regionMatches) {
         return { ok: false, code: "VISUAL_CONTROL_RECOVERY_UNPROVEN", expected, live: liveTargetSnapshot(hit, map) };
       }
       if (region.observationId && region.observationId !== decision.observationId) {
@@ -480,14 +371,8 @@ export function createTargeting(dependencies) {
       if (region.operation && region.operation !== decision.operation) {
         return { ok: false, code: "VISUAL_OPERATION_MISMATCH", expected, live: liveTargetSnapshot(hit, map) };
       }
-      const wrapperMember = (control.actuators || []).find((item) => (
-        item.relation === "wrapper"
-        && item.nodeId
-        && item.nodeId !== control.stateElementId
-        && boxesCloseEnough(item.box, region)
-      ));
       controlledRecoveryControl = control;
-      controlledRecoveryWrapper = wrapperMember ? elementById(wrapperMember.nodeId) : null;
+      controlledRecoveryWrapper = region.ownerElementId ? elementById(region.ownerElementId) : null;
       if (!controlledRecoveryWrapper
         || !isVisible(controlledRecoveryWrapper)
         || isDisabledLike(controlledRecoveryWrapper)) {
@@ -600,15 +485,12 @@ export function createTargeting(dependencies) {
       return null;
     }
 
-    const memberIds = new Set([
-      ...controlMemberNodeIds(control),
-      ...Object.values(control.operations || {}).flatMap((capability) => capability?.actuatorIds || [])
-    ]);
+    const memberIds = new Set(Object.values(control.operations || {}).flatMap((capability) => [
+      ...(capability?.actuatorIds || []),
+      ...(capability?.strategies || []).map((strategy) => strategy?.actuatorId)
+    ]).filter(validTargetId));
     const capability = decision.operation ? control.operations?.[decision.operation] : null;
-    const recovery = decision.boundedRecovery === true && decision.operation
-      ? control.recovery?.[decision.operation] || null
-      : null;
-    if (decision.operation && !capability && !recovery) {
+    if (decision.action !== "scroll" && (!decision.operation || !capability)) {
       logFlow("target.resolve_failed", {
         code: "CANONICAL_OPERATION_UNAVAILABLE",
         requested: { controlId: control.controlId, operation: decision.operation }
@@ -619,40 +501,18 @@ export function createTargeting(dependencies) {
     const requestedElementId = exactAliases.find((aliasId) => {
       if (!validTargetId(aliasId) || !memberIds.has(aliasId)) return false;
       const kind = aliasIndex.aliasKinds.get(aliasId) || "";
-      return ["click", "scroll"].includes(decision.action)
-        ? ["state", "activation", "label", "annotation_target", "decision_target"].includes(kind)
-          || kind === `recovery:${decision.operation}`
-        : kind === "state" && aliasId === control.stateElementId;
+      return decision.action === "scroll"
+        ? kind.startsWith("operation:")
+        : kind === `operation:${decision.operation}`;
     }) || "";
-    const candidateIds = (recovery
-      ? [
-          requestedElementId,
-          ...(recovery.actuatorIds || []),
-          ...(recovery.strategies || []).map((strategy) => strategy.actuatorId)
-        ]
-      : capability
+    const candidateIds = (capability
       ? [
           requestedElementId,
           capability.actuatorId,
-          ...(capability.actuatorIds || [])
+          ...(capability.actuatorIds || []),
+          ...(capability.strategies || []).map((strategy) => strategy?.actuatorId)
         ]
-      : ["click", "scroll"].includes(decision.action)
-      ? [
-          requestedElementId,
-          visualAnnotation?.targetId,
-          control.preferredActivationElementId,
-          ...(control.actuators || [])
-            .filter((item) => ["activation", "label", "state"].includes(item.relation || ""))
-            .map((item) => item.nodeId),
-          control.stateElementId
-        ]
-      : [
-          requestedElementId,
-          control.stateElementId,
-          ...(control.actuators || [])
-            .filter((item) => item.relation === "state")
-            .map((item) => item.nodeId)
-        ]
+      : decision.action === "scroll" ? [requestedElementId] : []
     ).filter((id, index, list) => validTargetId(id) && memberIds.has(id) && list.indexOf(id) === index);
     const operationCompatible = (element) => {
       if (!element) return false;
@@ -705,18 +565,15 @@ export function createTargeting(dependencies) {
     boxesCloseEnough,
     currentSurfaceEntryForElement,
     elementDescriptor,
-    failedLocalStrategyForDecision,
     isActionableClickTarget,
     isAuthorizedCompletedChoiceSurfaceExit,
     isStrictActionSurfaceType,
     liveTargetSnapshot,
     normalizedElementLabel,
-    rememberFailedLocalStrategy,
     resolveDecisionTarget,
     shortNavLabel,
     targetBelongsToCurrentSurface,
     targetFingerprint,
-    targetLocalDispatchIdentity,
     validateResolvedTarget,
     validateVisualCoordinateTarget,
     validTargetId

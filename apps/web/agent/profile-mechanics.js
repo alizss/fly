@@ -579,11 +579,13 @@ function strategyCandidatesForAtom(atom = {}, descriptor = null, observation = {
       });
     }
   }
-  const trustedSelectRecovery = control.recovery?.select;
-  if (trustedSelectRecovery?.requiresVisualConfirmation && (!enumOptionRequiresExactBinding || exactOption)) {
+  const trustedSelectCapability = agentContract.normalizeCapability(control, "select", operations.select);
+  if (trustedSelectCapability?.requiresVisualConfirmation && (!enumOptionRequiresExactBinding || exactOption)) {
     const choiceLabel = trustedChoiceLabel(atom, descriptor);
     if (choiceLabel) {
-      for (const strategy of trustedSelectRecovery.strategies || []) {
+      for (const strategy of (trustedSelectCapability.strategies || []).filter((item) => (
+        item.status === agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+      ))) {
         add({
           operation: "select",
           actionType: strategy.actionType || "click",
@@ -646,10 +648,13 @@ function strategyCandidatesForAtom(atom = {}, descriptor = null, observation = {
       });
     }
   }
-  for (const [operation, recovery] of Object.entries(control.recovery || {})) {
+  for (const [operation, rawCapability] of Object.entries(operations)) {
     if (operation === "select") continue;
-    if (!recovery?.requiresVisualConfirmation) continue;
-    for (const strategy of recovery.strategies || []) {
+    const capability = agentContract.normalizeCapability(control, operation, rawCapability);
+    if (!capability?.requiresVisualConfirmation) continue;
+    for (const strategy of (capability.strategies || []).filter((item) => (
+      item.status === agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+    ))) {
       add({
         operation,
         actionType: strategy.actionType || "click",
@@ -661,7 +666,7 @@ function strategyCandidatesForAtom(atom = {}, descriptor = null, observation = {
         requiresAI: false
       });
     }
-    for (const region of recovery.regions || []) {
+    for (const region of capability.regions || []) {
       add({
         operation,
         actionType: "click_xy",
@@ -880,7 +885,7 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
       descriptor.control?.operations?.type
       || descriptor.control?.operations?.select
       || descriptor.control?.operations?.open
-      || descriptor.control?.recovery?.open?.regions?.length
+      || descriptor.control?.operations?.open?.regions?.length
     )
   );
   if (descriptor.ambiguity && !boundedDateAmbiguity && !deterministicDateComponent) return [];
@@ -927,9 +932,21 @@ function candidatesForProfileGoal(goal = {}, observation = {}, traveler = {}, at
       strategy.visualRegion ? `visual=${strategy.visualRegion.source || "bounded-region"}` : ""
     ].filter(Boolean).join(" ")
   }));
-  if (options.includeAlternates === true) return mapped;
+  // A structural control can expose an unusable hidden/native actuator and a
+  // separately executable visible actuator for the same state owner. Prefer
+  // the executable binding without deleting bounded evidence: the sole
+  // upstream recovery authority, not this binder, owns final feasibility.
+  const admitted = mapped
+    .map((candidate, index) => ({ candidate, index }))
+    .sort((left, right) => {
+      const leftDenied = left.candidate.executionChannel === agentContract.EXECUTION_LANE.DENY ? 1 : 0;
+      const rightDenied = right.candidate.executionChannel === agentContract.EXECUTION_LANE.DENY ? 1 : 0;
+      return leftDenied - rightDenied || left.index - right.index;
+    })
+    .map(({ candidate }) => candidate);
+  if (options.includeAlternates === true) return admitted;
   const selected = new Set();
-  return mapped.filter((candidate) => {
+  return admitted.filter((candidate) => {
     if (!["click", "keypress"].includes(candidate.type)) return true;
     const key = `${candidate.controlId}::${candidate.operation}`;
     if (selected.has(key)) return false;

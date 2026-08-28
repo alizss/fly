@@ -285,6 +285,7 @@ function observationWithGroups() {
             { nodeId: "atw-bag-label", relation: "label" },
             { nodeId: "atw-bag-wrapper", relation: "wrapper" }
           ],
+          operations: { activate: actionableCapability("activate", "atw-bag-label") },
           selected: true,
           state: { checked: true },
           visualRegion: { x: 10, y: 10, width: 140, height: 24 }
@@ -302,6 +303,7 @@ function observationWithGroups() {
             { nodeId: "atw-flex-label", relation: "label" },
             { nodeId: "atw-flex-wrapper", relation: "wrapper" }
           ],
+          operations: { activate: actionableCapability("activate", "atw-flex-label") },
           selected: false,
           state: { checked: false },
           visualRegion: { x: 10, y: 80, width: 160, height: 24 }
@@ -317,6 +319,7 @@ function observationWithGroups() {
             { nodeId: "atw-sms-input", relation: "state" },
             { nodeId: "atw-sms-label", relation: "label" }
           ],
+          operations: { activate: actionableCapability("activate", "atw-sms-label") },
           selected: false,
           state: { checked: false },
           visualRegion: { x: 10, y: 140, width: 90, height: 24 }
@@ -332,6 +335,7 @@ function observationWithGroups() {
             { nodeId: "atw-support-input", relation: "state" },
             { nodeId: "atw-support-label", relation: "label" }
           ],
+          operations: { activate: actionableCapability("activate", "atw-support-label") },
           selected: false,
           state: { checked: false },
           visualRegion: { x: 10, y: 200, width: 90, height: 24 }
@@ -1415,7 +1419,10 @@ test("P0.9 binds repeated labels by canonical controlId instead of first matchin
   const observation = observationWithGroups();
   const action = {
     type: "click",
-    targetId: "ctrl_support_none",
+    operation: "activate",
+    controlId: "ctrl_support_none",
+    actuatorId: "atw-support-label",
+    targetId: "atw-support-label",
     targetLabel: "No thanks"
   };
 
@@ -1430,14 +1437,18 @@ test("P0.9 preserves decision-group identity when binding a logical control targ
   const observation = observationWithGroups();
   const bound = __private.bindTargetSnapshot({
     type: "click",
-    targetId: "ctrl_bag_none",
+    operation: "activate",
+    controlId: "ctrl_bag_none",
+    actuatorId: "atw-bag-label",
+    targetId: "atw-bag-label",
     targetLabel: "No checked baggage"
   }, observation);
 
   assert.equal(bound.controlId, "ctrl_bag_none");
   assert.equal(bound.decisionGroupId, "dg_baggage");
   assert.equal(bound.targetSnapshot.stateElementId, "atw-bag-input");
-  assert.equal(bound.targetSnapshot.preferredActivationElementId, "atw-bag-label");
+  assert.equal(bound.targetSnapshot.id, "atw-bag-label");
+  assert.equal(bound.targetSnapshot.operations.activate.actuatorId, "atw-bag-label");
 });
 
 test("P0.4/P0.7 binds type to the state element while click uses the activation element", () => {
@@ -1454,11 +1465,15 @@ test("P0.4/P0.7 binds type to the state element while click uses the activation 
     actuators: [
       { nodeId: "atw-email-input", relation: "state" },
       { nodeId: "atw-email-label", relation: "label" }
-    ]
+    ],
+    operations: {
+      type: actionableCapability("type", "atw-email-input"),
+      activate: actionableCapability("activate", "atw-email-label")
+    }
   });
 
-  const typed = __private.bindTargetSnapshot({ type: "type", targetId: "ctrl_email", value: "ali@example.test" }, observation);
-  const clicked = __private.bindTargetSnapshot({ type: "click", targetId: "ctrl_email" }, observation);
+  const typed = __private.bindTargetSnapshot({ type: "type", operation: "type", controlId: "ctrl_email", actuatorId: "atw-email-input", value: "ali@example.test" }, observation);
+  const clicked = __private.bindTargetSnapshot({ type: "click", operation: "activate", controlId: "ctrl_email", actuatorId: "atw-email-label" }, observation);
 
   assert.equal(typed.targetSnapshot.id, "atw-email-input");
   assert.equal(clicked.targetSnapshot.id, "atw-email-label");
@@ -1468,35 +1483,34 @@ test("P0.7/P0.9 resolves every canonical alias to one logical control", () => {
   const observation = observationWithGroups();
   const aliases = [
     "ctrl_bag_none",
-    "atw-bag-input",
-    "atw-bag-label",
-    "atw-bag-wrapper"
+    "atw-bag-label"
   ];
 
   for (const aliasId of aliases) {
     const resolution = __private.resolveActionControl({ type: "click", actuatorId: aliasId }, observation.page);
     assert.equal(resolution.ok, true, aliasId);
     assert.equal(resolution.control.controlId, "ctrl_bag_none", aliasId);
-    const bound = __private.bindTargetSnapshot({ type: "click", targetId: aliasId }, observation);
+    const bound = __private.bindTargetSnapshot({ type: "click", operation: "activate", controlId: "ctrl_bag_none", actuatorId: "atw-bag-label", targetId: aliasId }, observation);
     assert.equal(bound.controlId, "ctrl_bag_none", aliasId);
     assert.equal(bound.targetSnapshot.controlId, "ctrl_bag_none", aliasId);
     assert.equal(bound.targetSnapshot.decisionGroupId, "dg_baggage", aliasId);
   }
 
-  assert.equal(legacyRequirementReplay.controlDecisionGroupId("atw-bag-wrapper", observation.page), "dg_baggage");
+  assert.equal(__private.resolveActionControl({ type: "click", actuatorId: "atw-bag-wrapper" }, observation.page).ok, false);
+  assert.equal(__private.resolveActionControl({ type: "click", actuatorId: "atw-bag-input" }, observation.page).ok, false);
 });
 
 test("P0.7/P0.9 fails closed when one alias is owned by incompatible controls", () => {
   const observation = observationWithGroups();
-  observation.page.controls.find((control) => control.controlId === "ctrl_support_none")
-    .actuators.push({ nodeId: "atw-sms-label", relation: "label" });
+  const support = observation.page.controls.find((control) => control.controlId === "ctrl_support_none");
+  support.operations.activate.actuatorIds.push("atw-sms-label");
 
   const index = __private.buildControlAliasIndex(observation.page);
   assert.equal(index.resolve("atw-sms-label"), null);
   assert.equal(index.conflicts.some((conflict) => conflict.code === "ALIAS_OWNERSHIP_CONFLICT"), true);
 
-  const bound = __private.bindTargetSnapshot({ type: "click", targetId: "atw-sms-label" }, observation);
-  assert.equal(bound.controlId, "");
+  const bound = __private.bindTargetSnapshot({ type: "click", operation: "activate", controlId: "ctrl_support_none", actuatorId: "atw-sms-label", targetId: "atw-sms-label" }, observation);
+  assert.equal(bound.controlId, "ctrl_support_none");
   assert.equal(bound.targetSnapshot, null);
 });
 
@@ -1521,6 +1535,9 @@ test("P1.1 binds annotated screenshot visualRef to the canonical control", () =>
   const observation = observationWithGroups();
   const bound = __private.bindTargetSnapshot({
     type: "click",
+    operation: "activate",
+    controlId: "ctrl_flex_none",
+    actuatorId: "atw-flex-label",
     targetId: "O1",
     targetLabel: "None of the passengers"
   }, observation);

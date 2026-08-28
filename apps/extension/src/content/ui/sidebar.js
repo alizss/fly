@@ -10,7 +10,7 @@ export function createSidebarUi({
   inferCheckoutSite,
   observePageOnly,
   pageStateStore,
-  readSelectedBookingAcquisition,
+  readSelectedBookingContract,
   routeSummary,
   runRiskChecks,
   saveTrip,
@@ -144,7 +144,7 @@ export function createSidebarUi({
           <div><span>Where</span><strong>${escapeHtml(awareness.currentPosition?.stage || agent.pageMap?.step || "observing")}</strong></div>
           <div><span>Status</span><strong>${escapeHtml(awareness.status || (agent.running ? "in progress" : "waiting"))}</strong></div>
           <div class="is-wide"><span>Doing</span><strong>${escapeHtml(awareness.currentObjective || agent.currentAction || "observe and plan the next safe action")}</strong></div>
-          <div class="is-wide"><span>Selected booking</span><strong>${escapeHtml(route)} · ${escapeHtml(diagnosticPrice(baseline))} · ${escapeHtml(review.baselineStatus || "collecting")}</strong></div>
+          <div class="is-wide"><span>Selected booking</span><strong>${escapeHtml(route)} · ${escapeHtml(diagnosticPrice(baseline))} · ${escapeHtml(review.baselineStatus || "unavailable")}</strong></div>
           <div class="is-wide"><span>Current/review evidence</span><strong>${escapeHtml(diagnosticPrice(current))}${review.ready === true ? " · verified" : ""}</strong></div>
         </div>
         ${achievements.length ? `<div class="atw-process-list"><span>Done</span>${achievements.map((item) => `<em>✓ ${escapeHtml(item.label || item.kind || item.achievementId)}</em>`).join("")}</div>` : ""}
@@ -153,24 +153,24 @@ export function createSidebarUi({
     `;
   }
 
-  function selectedBookingAcquisitionHtml() {
-    const acquisition = readSelectedBookingAcquisition();
+  function selectedBookingAdmissionHtml() {
+    const contract = readSelectedBookingContract();
     const durable = agent.processDiagnostics?.transactionReview?.baseline || null;
-    const facts = acquisition?.facts || durable || null;
+    const facts = contract || durable || null;
     const segments = facts?.itinerary?.segments || [];
     const captured = segments.length > 0 && segments.every((segment) => (
       segment.origin && segment.destination && segment.departureDate
     ));
-    const route = captured ? diagnosticRoute(facts) : "collecting";
+    const route = captured ? diagnosticRoute(facts) : "not captured";
     const dates = captured
       ? segments.map((segment) => segment.departureDate).filter(Boolean).join(" · ")
       : "departure date unavailable";
-    const source = acquisition
-      ? "captured before session"
+    const source = contract
+      ? "selected before session"
       : captured
         ? "durable baseline"
-        : "current checkout";
-    return `<div class="atw-map-line">Checkout baseline: <strong>${captured ? "captured" : "collecting"}</strong> · ${escapeHtml(route)} · ${escapeHtml(dates)} · ${escapeHtml(source)}</div>`;
+        : "unavailable";
+    return `<div class="atw-map-line">Checkout baseline: <strong>${captured ? "captured" : "unavailable"}</strong> · ${escapeHtml(route)} · ${escapeHtml(dates)} · ${escapeHtml(source)}</div>`;
   }
 
   // Sidebar is logs-only by design: it starts the agent and shows what it's doing
@@ -197,14 +197,14 @@ export function createSidebarUi({
           <div class="atw-live-dot"></div>
           <div><strong>Ready</strong><span>Fly is idle until you press Start.</span></div>
         </div>
-        ${selectedBookingAcquisitionHtml()}
+        ${selectedBookingAdmissionHtml()}
       `;
     }
     const map = sidebarPageMap();
     return `
       ${agentStatusHtml(map)}
       <div class="atw-map-line">Reading ${map.site}: ${map.step.replace(/_/g, " ")} · ${map.summary.knownFields}/${map.summary.fields} fields · ${map.summary.paidChoices} paid areas</div>
-      ${selectedBookingAcquisitionHtml()}
+      ${selectedBookingAdmissionHtml()}
       ${agentProcessDiagnosticsHtml()}
       ${agentSectionsHtml(map)}
       ${agent.running ? agentReasoningHtml() : ""}
@@ -528,7 +528,7 @@ export function createSidebarUi({
     escapeHtml,
     renderCursorPrompt,
     renderSidebar,
-    selectedBookingAcquisitionHtml,
+    selectedBookingAdmissionHtml,
     warningHtml
   };
 }

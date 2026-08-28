@@ -10,6 +10,16 @@ const {
 } = require("../../apps/web/agent/semantic-scene-reconciliation");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
 const { compileDecisionFrame } = require("../../apps/web/agent/authority-frames");
+const { buildCanonicalDecisions } = require("../../apps/web/agent/canonical-decision");
+const { __private: { semanticReconciliationEligible } } = require("../../apps/web/agent/loop/orchestrator");
+
+function executable(actuatorId) {
+  return {
+    status: "proven_executable",
+    actuatorId,
+    actionability: { executable: true }
+  };
+}
 
 function control(overrides = {}) {
   return {
@@ -24,7 +34,7 @@ function control(overrides = {}) {
     state: { required: true, valuePresent: false },
     representationLifecycle: { active: true, status: "active_rendered" },
     surfaceId: "surface-page",
-    operations: { type: { actuatorId: "act_unknown" } },
+    operations: { type: executable("act_unknown") },
     ...overrides
   };
 }
@@ -71,6 +81,33 @@ test("known deterministic profile scenes do not request semantic reconciliation"
   assert.equal(scene.needed, false);
 });
 
+test("page-wide optional uncertainty cannot gate deterministic work", () => {
+  const unresolvedFrame = {
+    semanticCompilation: { semanticReadiness: "unresolved" },
+    unresolvedEvidence: [{ kind: "unknown_optional_context" }]
+  };
+  const exactObligation = {
+    contractVersion: "current-obligation/v3",
+    desiredStateDelta: { status: "EXACT_DELTA", actionRequired: true },
+    admittedControlIds: ["ctrl_title"]
+  };
+
+  assert.equal(semanticReconciliationEligible(unresolvedFrame, exactObligation), false);
+  assert.equal(semanticReconciliationEligible(unresolvedFrame, null), false);
+  assert.equal(semanticReconciliationEligible({
+    semanticCompilation: { semanticReadiness: "unresolved" },
+    unresolvedEvidence: [{
+      kind: "unknown_validation",
+      status: "unresolved",
+      evidenceStrength: "strong"
+    }]
+  }), true);
+  assert.equal(semanticReconciliationEligible({
+    semanticCompilation: { semanticReadiness: "ready" },
+    unresolvedEvidence: []
+  }, exactObligation), false);
+});
+
 test("uncertain required controls and unowned validation produce a closed hypothesis surface", () => {
   const unknown = control({ semantic: "choice" });
   const scene = semanticSceneUncertainty({
@@ -92,6 +129,223 @@ test("uncertain required controls and unowned validation produce a closed hypoth
   assert.deepEqual(scene.allowedValidationOwners, [{
     validationIssueId: "validation_1",
     controlId: "ctrl_unknown"
+  }]);
+});
+
+test("fresh stage-wide validation may be grounded to an exact observed non-profile control", () => {
+  const terms = control({
+    controlId: "ctrl_terms",
+    role: "checkbox",
+    kind: "checkbox",
+    label: "I accept the booking terms and conditions",
+    semantic: "legal_acceptance",
+    fieldType: "",
+    required: false,
+    state: { required: false, checked: false, selected: false, valuePresent: false },
+    operations: { select: executable("act_terms") }
+  });
+  const source = observation([terms], [{
+    issueId: "validation_terms",
+    message: "Please confirm the terms by clicking the checkbox",
+    controlId: "",
+    stageWide: true,
+    status: "active_stage_error",
+    active: true,
+    introducedAfterAction: true
+  }]);
+  const uncertainty = semanticSceneUncertainty({ observation: source, traveler: {} });
+
+  assert.equal(uncertainty.needed, true);
+  assert.deepEqual(uncertainty.validationIssues.map((issue) => issue.issueId), ["validation_terms"]);
+  assert.deepEqual(uncertainty.allowedValidationOwners, [{
+    validationIssueId: "validation_terms",
+    controlId: "ctrl_terms"
+  }]);
+
+  const reconciled = applySemanticSceneHypotheses(source, {
+    status: "grounded",
+    hypotheses: [{
+      controlId: "ctrl_terms",
+      semanticType: "unknown",
+      factSource: "",
+      validationIssueId: "validation_terms",
+      confidence: "high",
+      evidence: "The validation explicitly names the terms checkbox."
+    }],
+    decisionHypotheses: [],
+    controlHypotheses: []
+  }, uncertainty);
+
+  assert.equal(reconciled.page.semanticFieldHints.length, 0);
+  assert.deepEqual(reconciled.page.semanticValidationHints.map((hint) => ({
+    validationIssueId: hint.validationIssueId,
+    controlId: hint.controlId
+  })), [{ validationIssueId: "validation_terms", controlId: "ctrl_terms" }]);
+});
+
+test("Croatia-shaped validation keeps No thanks selected and reopens only the grounded terms owner", () => {
+  const terms = control({
+    controlId: "ctrl_terms",
+    role: "checkbox",
+    kind: "checkbox",
+    label: "Yes, I accept the booking terms and conditions",
+    semantic: "",
+    fieldType: "",
+    required: false,
+    state: { required: false, checked: false, selected: false, valuePresent: false },
+    decisionGroupId: "dg_terms",
+    operations: { select: executable("act_terms") }
+  });
+  const noThanks = control({
+    controlId: "ctrl_no_thanks",
+    role: "button",
+    kind: "button",
+    label: "No, thanks",
+    semantic: "",
+    fieldType: "",
+    required: false,
+    selected: true,
+    state: { required: false, checked: true, selected: true, valuePresent: true },
+    decisionGroupId: "dg_time_to_think",
+    operations: { activate: executable("act_no_thanks") }
+  });
+  const yes = control({
+    controlId: "ctrl_yes",
+    role: "button",
+    kind: "button",
+    label: "Yes",
+    semantic: "",
+    fieldType: "",
+    required: false,
+    state: { required: false, checked: false, selected: false, valuePresent: true },
+    decisionGroupId: "dg_time_to_think",
+    operations: { activate: executable("act_yes") }
+  });
+  const source = observation([noThanks, yes, terms], [{
+    issueId: "validation_terms",
+    message: "Please check the terms and conditions and confirm by clicking the checkbox",
+    controlId: "",
+    stageWide: true,
+    status: "active_stage_error",
+    active: true,
+    introducedAfterAction: true
+  }]);
+  source.page.observationContract = "structural-observation/v1";
+  source.page.step = "payment";
+  source.page.decisionGroups = [{
+    decisionGroupId: "dg_time_to_think",
+    sectionLabel: "Do you need time to think?",
+    requiredStateObserved: false,
+    selectedControlId: "ctrl_no_thanks",
+    alternativeControlIds: ["ctrl_no_thanks", "ctrl_yes"],
+    alternatives: [
+      { controlId: "ctrl_no_thanks", label: "No, thanks", selected: true },
+      { controlId: "ctrl_yes", label: "Yes", selected: false }
+    ]
+  }, {
+    decisionGroupId: "dg_terms",
+    sectionLabel: "Booking terms",
+    requiredStateObserved: false,
+    selectedControlId: "",
+    alternativeControlIds: ["ctrl_terms"],
+    alternatives: [{ controlId: "ctrl_terms", label: terms.label, selected: false }]
+  }];
+
+  const initialFrame = compileDecisionFrame({ observation: source });
+  const initialDecisions = buildCanonicalDecisions({
+    page: initialFrame.observation.page,
+    userPolicy: { paidExtras: "decline", standardBookingTermsApproved: true }
+  });
+  assert.equal(initialDecisions.some((decision) => decision.actionReason === "fresh_validation"), false);
+
+  const uncertainty = semanticSceneUncertainty({
+    observation: initialFrame.observation,
+    semanticCompilation: initialFrame.semanticCompilation,
+    traveler: {}
+  });
+  assert.deepEqual(uncertainty.allowedValidationOwners.map((owner) => owner.controlId), ["ctrl_terms"]);
+  const grounded = applySemanticSceneHypotheses(source, {
+    status: "grounded",
+    hypotheses: [{
+      controlId: "ctrl_terms",
+      semanticType: "unknown",
+      factSource: "",
+      validationIssueId: "validation_terms",
+      confidence: "high",
+      evidence: "The error explicitly requests the terms checkbox."
+    }],
+    decisionHypotheses: [],
+    controlHypotheses: []
+  }, uncertainty);
+  const finalFrame = compileDecisionFrame({ observation: grounded });
+  const decisions = buildCanonicalDecisions({
+    page: finalFrame.observation.page,
+    userPolicy: { paidExtras: "decline", standardBookingTermsApproved: true }
+  });
+  const timeToThink = decisions.find((decision) => decision.decisionGroupId === "dg_time_to_think");
+  const legal = decisions.find((decision) => decision.decisionGroupId === "dg_terms");
+
+  assert.equal(finalFrame.observation.page.validationIssues[0].controlId, "ctrl_terms");
+  assert.equal(timeToThink.selectedControlId, "ctrl_no_thanks");
+  assert.notEqual(timeToThink.actionReason, "fresh_validation");
+  assert.equal(legal.actionReason, "fresh_validation");
+  assert.equal(legal.needsAction, true);
+  assert.deepEqual(legal.userIntent.desiredControlIds, ["ctrl_terms"]);
+});
+
+test("live-shaped generic validation excludes promotion and hidden controls when an executable typed owner exists", () => {
+  const promotion = control({
+    controlId: "ctrl_promotion",
+    label: "Enter promotion code",
+    name: "promotion_code",
+    semantic: "unknown",
+    fieldType: "",
+    required: false,
+    state: { required: false, valuePresent: false },
+    operations: { type: executable("act_promotion") }
+  });
+  const terms = control({
+    controlId: "ctrl_terms",
+    role: "checkbox",
+    kind: "checkbox",
+    label: "Yes, I confirm the booking information and accept the terms and conditions",
+    semantic: "legal_acceptance",
+    fieldType: "",
+    required: false,
+    state: { required: false, checked: false, selected: false, valuePresent: false },
+    operations: { choose: executable("act_terms") }
+  });
+  const hidden = control({
+    controlId: "ctrl_hidden",
+    label: "",
+    semantic: "unknown",
+    fieldType: "",
+    required: false,
+    state: { required: false, valuePresent: false },
+    operations: {
+      type: {
+        status: "unavailable",
+        actuatorId: "act_hidden",
+        actionability: { executable: false, visible: false }
+      }
+    }
+  });
+  const source = observation([promotion, terms, hidden], [{
+    issueId: "validation_summary",
+    message: "1 error",
+    controlId: "",
+    stageWide: true,
+    status: "active_stage_error",
+    active: true,
+    introducedAfterAction: true
+  }]);
+
+  const uncertainty = semanticSceneUncertainty({ observation: source, traveler: {} });
+
+  assert.deepEqual(uncertainty.components.map((item) => item.controlId), ["ctrl_terms"]);
+  assert.deepEqual(uncertainty.allowedValidationOwners, [{
+    validationIssueId: "validation_summary",
+    controlId: "ctrl_terms"
   }]);
 });
 
@@ -154,7 +408,7 @@ test("an unfamiliar decision receives only a closed descriptive type and determi
   assert.equal(decision.status, "optional");
 });
 
-test("a grounded control hypothesis cannot add an unrelated control to an existing decision", () => {
+test("a grounded control hypothesis excludes controls outside the structural decision owner", () => {
   const source = observation([]);
   source.page.step = "payment";
   source.page.controls = [
@@ -196,7 +450,7 @@ test("a grounded control hypothesis cannot add an unrelated control to an existi
 
   const uncertainty = semanticSceneUncertainty({ observation: source, traveler: { payment_preference: "manual payment" } });
   assert.equal(uncertainty.needed, true);
-  assert.equal(uncertainty.allowedControlIds.includes("ctrl_card"), true);
+  assert.equal(uncertainty.allowedControlIds.includes("ctrl_card"), false);
   assert.equal(uncertainty.allowedDecisionGroupIds.includes("dg_payment_method"), true);
 
   const reconciled = applySemanticSceneHypotheses(source, {
@@ -310,7 +564,7 @@ test("an evidence-identical grounded binding is reused without another model req
     traveler: { first_name: "Ali" }
   });
   assert.equal(frame.observation.page.controls[0].fieldType, "first_name");
-  assert.equal(frame.semanticCompilation.semanticReadiness, "ready");
+  assert.equal(frame.semanticCompilation.semanticReadiness, "unresolved");
 });
 
 test("a grounded binding is invalidated when its local semantic evidence changes", () => {
@@ -346,6 +600,28 @@ test("a grounded binding is invalidated when its local semantic evidence changes
     traveler: { first_name: "Ali" },
     currentObligation: admittedObligation()
   }).needed, true);
+});
+
+test("an unchanged unresolved semantic signature is not sent to the model again", () => {
+  const sourceControl = control({
+    stableKey: "traveler|passenger_1|opaque_unresolved",
+    sectionId: "passenger_1",
+    sectionLabel: "Passenger 1"
+  });
+  const source = observation([sourceControl]);
+  const memory = rememberSemanticBindings([], source, { unresolvedControls: [sourceControl] });
+  const next = applyRememberedSemanticBindings(observation([{ ...sourceControl, controlId: "ctrl_unknown_rerender" }]), memory, {
+    traveler: { first_name: "Ali" }
+  });
+  const uncertainty = semanticSceneUncertainty({
+    observation: next,
+    traveler: { first_name: "Ali" },
+    currentObligation: admittedObligation(["ctrl_unknown_rerender"])
+  });
+
+  assert.equal(memory[0].status, "unresolved");
+  assert.deepEqual(next.page.semanticUnresolvedControlIds, ["ctrl_unknown_rerender"]);
+  assert.equal(uncertainty.needed, false);
 });
 
 test("an ambiguous scene uses one closed-ID hypothesis call and returns no action authority", async () => {

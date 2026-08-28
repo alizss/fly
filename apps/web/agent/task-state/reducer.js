@@ -245,10 +245,22 @@ function canonicalDecisionOwnerId(decision = {}, observation = {}) {
 
 
 function surfaceFingerprint(surface = {}, observation = {}) {
+  const rawUrl = clean(observation.page?.url);
+  let documentScope = rawUrl.split(/[?#]/)[0];
+  if (rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      documentScope = `${parsed.origin}${parsed.pathname}`;
+    } catch {
+      // Relative and synthetic replay URLs still get a stable query/hash-free
+      // document identity from the fallback above.
+    }
+  }
   const progress = observation.page?.foreground?.progressMarkers
     || observation.page?.visualState?.foreground?.progressMarkers
     || {};
   return JSON.stringify({
+    documentScope,
     id: surface.id || "surface-page",
     type: surface.type || "page",
     label: lower(surface.label),
@@ -311,32 +323,13 @@ function capabilitiesForDecision(decision = {}, observation = {}) {
   });
 }
 
-function optionPrice(control = {}) {
-  const rawAmount = control.structuredPrice?.amount ?? control.priceAmount;
-  if (rawAmount === null || rawAmount === undefined || rawAmount === "") return null;
-  const amount = Number(rawAmount);
-  return Number.isFinite(amount) ? amount : null;
-}
-
-function optionLooksPaid(control = {}) {
-  if (optionLooksExplicitlyFree(control)) return false;
-  return agentContract.isPaidCommerceOption({
-    effectRole: control.effectRole,
-    priceAmount: optionPrice(control),
-    disposition: control.disposition,
-    semanticEffect: control.physicalEffect || control.semantic
-  });
-}
-
-function optionLooksExplicitlyFree(control = {}) {
-  return optionPrice(control) === 0
-    || /safe_decline|decline|free|\bincluded\b|no[_ -]?extra|no (?:checked|hand|cabin|hold) (?:bag|baggage)|without|none|skip|remove|opt[_ -]?out|not included/.test(
-      lower(`${control.risk || ""} ${control.semantic || ""} ${control.label || ""}`)
+function transitionIsFree(transition = {}) {
+  const amount = transition.structuredPrice?.amount ?? transition.priceDelta;
+  return transition.included === true
+    || (amount !== null && amount !== undefined && amount !== "" && Number(amount) === 0)
+    || ["select_free_option", "decline_paid_extra", "remove_paid_selection"].includes(
+      clean(transition.physicalEffect || transition.semanticEffect || transition.semantic)
     );
-}
-
-function optionIsBoundedChoice(control = {}) {
-  return /radio|checkbox|option|choice/.test(lower(`${control.kind || ""} ${control.role || ""} ${control.semantic || ""}`));
 }
 
 function decisionOptionContract(decision = {}, observation = {}) {
@@ -356,18 +349,24 @@ function decisionOptionContract(decision = {}, observation = {}) {
     const paidIds = transitions.filter((transition) => transition.paid).map((transition) => transition.controlId);
     const generallyFreeIds = transitions.filter((transition) => (
       !transition.paid && (
-        optionLooksExplicitlyFree(transition)
+        transitionIsFree(transition)
         || (unselectDesiredToggle && desiredIds.has(transition.controlId))
       )
     )).map((transition) => transition.controlId);
     const eligibleIntentIds = new Set(decision.userIntent?.eligibleOptionIds || []);
     const exactFreeIds = generallyFreeIds.filter((controlId) => desiredIds.has(controlId));
-    const legalDecision = /legal|attestation/.test(lower([
+    const legalDecision = [
       decision.family,
       decision.subject?.key,
       decision.subject?.family,
       decision.sectionType
-    ].filter(Boolean).join(" ")));
+    ].map((value) => clean(value)).some((value) => [
+      "legal",
+      "legal_attestation",
+      "standard_terms",
+      "factual_accuracy_attestation",
+      "unknown_attestation"
+    ].includes(value));
     // A legal attestation is an obligation even when the generic preference
     // resolver has no "desired option" vocabulary for it. Admit its exact
     // observed actuator here; the typed legal-scope policy remains the sole
@@ -401,32 +400,14 @@ function decisionOptionContract(decision = {}, observation = {}) {
       policyChoiceBounded
     };
   }
-  const eligible = capabilitiesForDecision(decision, observation);
-  const linkedCorrectionIds = new Set((observation.page?.semanticOwnershipLinks || [])
-    .filter((link) => (
-      link.status === "resolved"
-      && link.sourceDecisionGroupId === decision.decisionGroupId
-      && link.intendedOutcome
-      && link.intendedOutcome !== "unknown"
-    ))
-    .map((link) => link.correctionControlId));
-  const paidIds = new Set(eligible.filter(optionLooksPaid).map((control) => control.controlId));
-  const hasPaidSibling = paidIds.size > 0;
-  const freeIds = eligible.filter((control) => (
-    !paidIds.has(control.controlId)
-    && (
-      optionLooksExplicitlyFree(control)
-      // Inferring "free" from a paid sibling is needed for raw baggage
-      // choices such as No hand baggage versus 8 kg. A seat modal is broader:
-      // it also contains traveler rows, legends and navigation controls.
-      || (hasPaidSibling && decision.family === "baggage" && optionIsBoundedChoice(control))
-    )
-  )).map((control) => control.controlId);
+  // Canonical DecisionFrame decisions always publish typed transitions. If a
+  // decision reaches TaskState without them, semantics are incomplete; do not
+  // reconstruct paid/free meaning from labels or nearby controls here.
   return {
-    eligibleControlIds: eligible.map((control) => control.controlId),
-    freeControlIds: freeIds,
-    paidControlIds: [...paidIds],
-    correctionControlIds: eligible.filter((control) => linkedCorrectionIds.has(control.controlId)).map((control) => control.controlId),
+    eligibleControlIds: [],
+    freeControlIds: [],
+    paidControlIds: [],
+    correctionControlIds: [],
     policyAllowedControlIds: [],
     policyChoiceBounded: false
   };
@@ -450,9 +431,11 @@ function goalForDecision(decision = {}, observation = {}, userPolicy = {}, trave
       : explicitDesiredOutcome;
   const desiredPolicyOutcome = desiredSemanticOutcome || "selected_policy_allowed_option";
   const observationId = observation.observationId || "observation";
-  const unknownAttestation = /unknown_attestation/.test(lower(
-    `${decision.sectionType || ""} ${decision.subject?.key || ""} ${decision.semanticType || ""}`
-  ));
+  const unknownAttestation = [
+    decision.sectionType,
+    decision.subject?.key,
+    decision.semanticType
+  ].some((value) => clean(value) === "unknown_attestation");
   return Object.freeze({
     goalId: `decision:${decision.decisionGroupId || decision.decisionId}`,
     kind: unknownAttestation ? "unknown_attestation" : "checkout_decision",
@@ -548,43 +531,6 @@ function navigationGoal(observation = {}, controlIds = []) {
     actionableControlIds: [...new Set(controlIds)],
     postcondition: { type: "stage_exit_or_feedback" }
   });
-}
-
-function transactionBoundWork(work = null, observation = {}, stage = "unknown") {
-  if (!work || work.kind === "transaction_evidence") return false;
-  if (work.kind === "profile_field") return false;
-  const admitted = new Set(admittedControlIdsForGoal(work));
-  const controls = (observation.page?.controls || []).filter((control) => admitted.has(control.controlId));
-  const meaning = lower([
-    work.kind,
-    work.semanticType,
-    work.canonicalSubject?.family,
-    work.canonicalSubject?.key,
-    work.riskClass,
-    work.desiredSemanticOutcome,
-    work.desiredPolicyOutcome,
-    work.desiredStateDelta?.family,
-    work.desiredStateDelta?.desiredEffect,
-    work.postcondition?.legalScope,
-    ...controls.map((control) => [
-      control.semantic,
-      control.physicalEffect,
-      control.effectRole,
-      control.risk,
-      control.label,
-      control.formAction
-    ].filter(Boolean).join(" "))
-  ].filter(Boolean).join(" "));
-  const exactSafeCorrection = /select_free_option|decline_paid_extra|remove_paid_selection|dismiss_surface/.test(meaning)
-    && !/accept_legal|legal_acceptance|attestation|payment_method|payment_route|submit_purchase|select_paid_option/.test(meaning);
-  if (exactSafeCorrection) return false;
-  if (/legal|attestation|factual_accuracy|accept_terms|accept_legal/.test(meaning)) return true;
-  if (/payment_method|payment_route|submit_purchase|select_paid_option|enter_payment_credentials/.test(meaning)) return true;
-  if (/\bmoney\b|\bpayment\b|\bpurchase\b/.test(meaning) && !/decline|remove|without|no extra/.test(meaning)) return true;
-  return work.semanticType === "navigation" && (
-    stage === "payment"
-    || /continue to payment|go to payment|review and pay|pay by card|paymentform/.test(meaning)
-  );
 }
 
 function completedChoiceSurfaceGoal(observation = {}, episode = {}) {
@@ -735,29 +681,41 @@ function reduceDecisionFrame({
     });
   }
   const observedDecisions = (authoritativeDecisionFrame.commerceEntities || []).filter((group) => groupId(group)).map((group) => {
+    // Product/milestone desire belongs to TaskState, not semantic
+    // interpretation. DecisionFrame tells us this is a payment-method or fare
+    // decision; the reducer decides whether the current product objective
+    // requires resolving it.
+    const taskRequired = group.required === true
+      || ["payment_method", "fare"].includes(clean(group.subject || group.sectionType));
+    const taskGroup = taskRequired === group.required
+      ? group
+      : { ...group, required: taskRequired };
     const instanceId = decisionInstanceKey(group, observation);
     const previousGroupCompletion = [...(previousTaskState.completedOutcomes || [])]
       .reverse()
       .find((record) => groupId(record) === groupId(group)) || null;
-    const progress = page.foreground?.progressMarkers
-      || page.visualState?.foreground?.progressMarkers
-      || {};
-    const repeatedInstanceVisible = Boolean(
-      progress.flightOrdinal
-      || progress.route
-      || progress.passengerOrdinal
-      || progress.travelerOrdinal
-      || progress.segment
+    const sameSurface = Boolean(
+      previousTaskState.surfaceFingerprint
+      && previousTaskState.surfaceFingerprint === fingerprint
     );
-    const sameSurfaceCompletion = previousGroupCompletion && (
-      (previousTaskState.surfaceFingerprint && previousTaskState.surfaceFingerprint === fingerprint)
-      || !repeatedInstanceVisible
-    )
+    const sameSurfaceCompletion = previousGroupCompletion && sameSurface
       ? previousGroupCompletion
       : null;
-    const previousCompletion = completions.get(instanceId) || sameSurfaceCompletion;
+    // completedOutcomes is settlement memory for the exact observed decision
+    // instance, not semantic approval for a similarly named group on a later
+    // document. A hosted payment provider commonly publishes the same generic
+    // payment group id as the airline even though it is a fresh required
+    // choice. Fresh page state must own that decision.
+    if (!sameSurface && previousGroupCompletion) {
+      for (const [completionId, completion] of completions.entries()) {
+        if (groupId(completion) === groupId(group)) completions.delete(completionId);
+      }
+    }
+    const previousCompletion = sameSurface
+      ? (completions.get(instanceId) || sameSurfaceCompletion)
+      : null;
     const normalizedDecision = resolveCanonicalDecision({
-      group,
+      group: taskGroup,
       page,
       previousCompletion,
       userPolicy,
@@ -1376,13 +1334,6 @@ function reduceDecisionFrame({
       desiredStateDelta
     });
   }
-  if (!transactionAuthorityReady && transactionBoundWork(currentWork, observation, stage)) {
-    // The selected booking is an admission invariant. Current-page evidence
-    // may compare against the locked baseline, but it may never manufacture
-    // that baseline or schedule exploratory clicks to recover it mid-checkout.
-    currentWork = null;
-    ambiguityReason = "selected_booking_invariant_missing";
-  }
   const semanticAchievements = [...completions.values()].map((completion) => Object.freeze({
     achievementId: clean(completion.instanceId || completion.decisionGroupId || completion.requirementId),
     kind: completion.requirementId ? "requirement" : "decision",
@@ -1437,15 +1388,7 @@ function reduceDecisionFrame({
     })
   });
 
-  const exactWorkDelta = currentWork?.desiredStateDelta
-    || compileDesiredStateDeltas({
-      work: currentWork,
-      admittedControlIds: admittedControlIdsForGoal(currentWork || {})
-    })[0]
-    || null;
-  const exactCurrentWork = currentWork && exactWorkDelta
-    ? Object.freeze({ ...currentWork, desiredStateDelta: exactWorkDelta })
-    : currentWork;
+  const exactCurrentWork = currentWork;
   const currentObligation = compileCurrentObligation({
     work: exactCurrentWork,
     decisionFrame: authoritativeDecisionFrame
@@ -1470,8 +1413,6 @@ function reduceDecisionFrame({
       : transactionChangeRequiresApproval ? "TRANSACTION_CHANGE_REQUIRES_APPROVAL"
       : transactionReviewBlocked ? "TRANSACTION_REVIEW_INCOMPLETE"
       : authorizationConflict ? "PAID_SELECTION_POLICY_AUTHORIZATION_CONFLICT"
-      : ambiguityReason === "selected_booking_invariant_missing"
-        ? "SELECTED_BOOKING_INVARIANT_MISSING"
       : admittedMechanicsExhausted ? "STRATEGIES_EXHAUSTED"
       : currentObligation ? "EXECUTE_CURRENT_OBLIGATION"
       : blockingDesiredStateEvaluation?.status === "BLOCKED_EXTERNAL" ? "EXTERNAL_BLOCKER"
@@ -1545,10 +1486,6 @@ function reduceDecisionFrame({
           : null
       })
     };
-  } else if (ambiguityReason === "selected_booking_invariant_missing") {
-    disposition = stopForEngineReconciliation(
-      "The session violated its selected-booking admission invariant; no mid-checkout action may repair that missing authority."
-    );
   } else if (admittedMechanicsExhausted) {
     disposition = {
       kind: "stop",
@@ -1668,7 +1605,7 @@ function reduceDecisionFrame({
       )),
       paymentSubmissionRequiresApproval: true,
       paymentCredentialsBlocked: true,
-      standardBookingTermsAuthorized: true
+      standardBookingTermsAuthorized: normalizedProfilePolicy.standingPolicy?.standardBookingTerms === "accept"
     }),
     terminalGoalLatch,
     checkoutBoundary,

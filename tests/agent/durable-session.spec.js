@@ -80,6 +80,23 @@ function selectedBookingContract(observationId, travelerId = "trav_selected_book
   };
 }
 
+function routineTraveler(id, overrides = {}) {
+  return {
+    id,
+    first_name: "Ali",
+    last_name: "Example",
+    date_of_birth: "2003-05-31",
+    email: "ali@example.test",
+    phone: "+38640111222",
+    paid_extras_policy: "decline",
+    standard_booking_terms: "accept",
+    marketing_consent: "decline",
+    payment_preference: "card",
+    payment_submission: "never",
+    ...overrides
+  };
+}
+
 test("P0.2 next-action refuses to create a replacement transaction without a session", async ({ request }) => {
   const response = await request.post(`${API}/agent/next-action`, {
     data: {
@@ -99,7 +116,7 @@ test("a final selected booking contract starts the durable transaction", async (
   const response = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
-      traveler: { id: travelerId },
+      traveler: routineTraveler(travelerId),
       selectedBookingContract: bookingContract,
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
@@ -117,6 +134,29 @@ test("a final selected booking contract starts the durable transaction", async (
         totalPrice: { amount: 362, currency: "EUR" }
       }
     }
+  });
+});
+
+test("a malformed captured route is rejected before durable transaction creation", async ({ request }) => {
+  const travelerId = `trav_malformed_booking_${Date.now()}`;
+  const bookingContract = selectedBookingContract(`obs_malformed_${Date.now()}`, travelerId);
+  bookingContract.itinerary.segments[0] = {
+    ...bookingContract.itinerary.segments[0],
+    origin: "ADD",
+    destination: "ONS"
+  };
+  const response = await request.post(`${API}/agent/session`, {
+    data: {
+      goal: "Complete checkout safely.",
+      traveler: routineTraveler(travelerId),
+      selectedBookingContract: bookingContract,
+      page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
+    }
+  });
+  expect(response.status()).toBe(422);
+  expect(await response.json()).toMatchObject({
+    code: "SELECTED_BOOKING_INVALID",
+    details: { missingFacts: expect.arrayContaining(["itinerary_route"]) }
   });
 });
 
@@ -142,7 +182,7 @@ test("raw airline acquisition cannot create a transaction without a final select
   const response = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
-      traveler: { id: travelerId },
+      traveler: routineTraveler(travelerId),
       selectedBooking: selectedBookingAcquisition(`obs_raw_acquisition_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
@@ -158,7 +198,7 @@ test("a traveler checkout with hidden itinerary creates no provisional session",
   const response = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
-      traveler: { id: travelerId },
+      traveler: routineTraveler(travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
   });
@@ -173,7 +213,7 @@ test("an engine-only stop remains the same resumable durable transaction", async
   const startedResponse = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Continue checkout safely.",
-      traveler: { id: travelerId },
+      traveler: routineTraveler(travelerId),
       selectedBookingContract: selectedBookingContract(`obs_engine_pause_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "payment" }
     }
@@ -213,7 +253,7 @@ test("P0.2 one session handshake resumes the exact transaction and rejects repla
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
-      traveler: { id: travelerId, booking_rules: "No paid extras" },
+      traveler: routineTraveler(travelerId, { booking_rules: "No paid extras" }),
       selectedBookingContract: selectedBookingContract(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
@@ -268,7 +308,7 @@ test("resume rejects a changed wallet traveler and preserves the durable identit
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
-      traveler: { id: durableTravelerId },
+      traveler: routineTraveler(durableTravelerId),
       selectedBookingContract: selectedBookingContract(`obs_durable_traveler_${Date.now()}`, durableTravelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
@@ -301,7 +341,7 @@ test("selected flight facts enter the durable baseline before the passenger page
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Complete checkout safely.",
-      traveler: { id: travelerId, date_of_birth: "2003-05-31" },
+      traveler: routineTraveler(travelerId),
       selectedBookingContract: selectedBookingContract(observationId, travelerId),
       page: {
         site: "example.test",
@@ -347,9 +387,7 @@ test("selected flight facts enter the durable baseline before the passenger page
 
 test("a structured missing traveler answer crosses HTTP and resumes the exact field", async ({ request }) => {
   const traveler = {
-    id: `trav_missing_nationality_${Date.now()}`,
-    first_name: "Ali",
-    last_name: "Example",
+    ...routineTraveler(`trav_missing_nationality_${Date.now()}`),
     nationality: "",
     booking_rules: "No paid extras"
   };
@@ -369,6 +407,7 @@ test("a structured missing traveler answer crosses HTTP and resumes the exact fi
   expect(started.status(), JSON.stringify(session)).toBe(201);
 
   const pageFor = (observationId) => ({
+    observationContract: "structural-observation/v1",
     site: "example.test",
     url: "https://example.test/checkout/traveler",
     step: "traveler_information",
@@ -498,7 +537,7 @@ test("oversized observations receive a typed retryable transport error", async (
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Test observation transport",
-      traveler: { id: travelerId, booking_rules: "No paid extras" },
+      traveler: routineTraveler(travelerId, { booking_rules: "No paid extras" }),
       selectedBookingContract: selectedBookingContract(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "seats" }
     }
@@ -512,6 +551,7 @@ test("oversized observations receive a typed retryable transport error", async (
       observationId: `obs_large_${Date.now()}`,
       observationSnapshot: { snapshotHash: "hash_large" },
       page: {
+        observationContract: "structural-observation/v1",
         site: "example.test",
         url: "https://example.test/checkout",
         step: "seats",
@@ -554,7 +594,7 @@ test("the selected booking contract creates authoritative ownership evidence in 
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Reach verified payment review",
-      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "No paid extras" },
+      traveler: routineTraveler(travelerId, { booking_rules: "No paid extras" }),
       selectedBookingContract: bookingContract,
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
@@ -573,6 +613,7 @@ test("the selected booking contract creates authoritative ownership evidence in 
       observationSnapshot: { snapshotHash: `hash_${observationId}` },
       traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "No paid extras" },
       page: {
+        observationContract: "structural-observation/v1",
         site: "example.test",
         url: "https://example.test/checkout",
         step: "traveler_information",
@@ -666,7 +707,7 @@ test("authoritative terminal evidence survives HTTP compaction without payment c
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Reach verified payment review",
-      traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "Stop before real payment" },
+      traveler: routineTraveler(travelerId, { booking_rules: "Stop before real payment" }),
       selectedBookingContract: selectedBookingContract(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "traveler_information" }
     }
@@ -682,6 +723,7 @@ test("authoritative terminal evidence survives HTTP compaction without payment c
       observationSnapshot: { snapshotHash: `hash_${observationId}` },
       traveler: { id: travelerId, first_name: "Ali", last_name: "Example", booking_rules: "Stop before real payment" },
       page: {
+        observationContract: "structural-observation/v1",
         site: "example.test",
         url: "https://example.test/checkout/payment",
         step: "payment",
@@ -737,7 +779,7 @@ test("non-empty decision-group alternatives survive HTTP compaction with their c
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Decline paid seats safely",
-      traveler: { id: travelerId, booking_rules: "No paid seats" },
+      traveler: routineTraveler(travelerId, { booking_rules: "No paid seats" }),
       selectedBookingContract: selectedBookingContract(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "seats" }
     }
@@ -754,6 +796,7 @@ test("non-empty decision-group alternatives survive HTTP compaction with their c
       userIntent: "Continue without paid seats",
       traveler: { id: session.travelerId || "trav_decision_group", booking_rules: "No paid seats" },
       page: {
+        observationContract: "structural-observation/v1",
         site: "example.test",
         url: "https://example.test/checkout",
         step: "seats",
@@ -807,9 +850,7 @@ test("non-empty decision-group alternatives survive HTTP compaction with their c
     alternativeControlIds: ["ctrl_no_thanks"],
     alternatives: [{
       controlId: "ctrl_no_thanks",
-      targetId: "seat-free",
-      label: "No thanks",
-      semantic: "decline_paid_extra"
+      label: "No thanks"
     }]
   });
 });
@@ -819,7 +860,7 @@ test("selected paid evidence and owned reversal survive the extension-to-backend
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Continue without paid extras",
-      traveler: { id: travelerId, booking_rules: "No paid extras" },
+      traveler: routineTraveler(travelerId, { booking_rules: "No paid extras" }),
       selectedBookingContract: selectedBookingContract(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "seats" }
     }
@@ -836,6 +877,7 @@ test("selected paid evidence and owned reversal survive the extension-to-backend
       userIntent: "No paid extras",
       traveler: { id: session.travelerId || "trav_paid_boundary", booking_rules: "No paid extras" },
       page: {
+        observationContract: "structural-observation/v1",
         site: "example.test",
         url: "https://example.test/checkout/seats",
         step: "seats",
@@ -940,20 +982,15 @@ test("selected paid evidence and owned reversal survive the extension-to-backend
   const transaction = await transactionResponse.json();
   const group = transaction.currentObservation.page.decisionGroups.find((item) => item.decisionGroupId === "dg_paid_summary");
   expect(group).toMatchObject({
-    removalControlId: "ctrl_remove_paid",
+    alternativeControlIds: ["ctrl_remove_paid"],
     selectedEvidence: {
       selected: true,
-      disposition: "paid",
       structuredPrice: { amount: 23, currency: "EUR" },
       ownerElementId: "selected-item-node"
-    },
-    semanticOwnership: {
-      status: "resolved",
-      family: "seat",
-      controlId: "ctrl_remove_paid",
-      policyCompatibility: "conflict"
     }
   });
+  expect(group.removalControlId).toBeUndefined();
+  expect(group.semanticOwnership).toBeUndefined();
 });
 
 test("incremental observation transport reconstructs the canonical page and rejects a stale base", async ({ request }) => {
@@ -961,7 +998,7 @@ test("incremental observation transport reconstructs the canonical page and reje
   const started = await request.post(`${API}/agent/session`, {
     data: {
       goal: "Continue without paid extras",
-      traveler: { id: travelerId, booking_rules: "No paid extras" },
+      traveler: routineTraveler(travelerId, { booking_rules: "No paid extras" }),
       selectedBookingContract: selectedBookingContract(`obs_session_${Date.now()}`, travelerId),
       page: { site: "example.test", url: "https://example.test/checkout", step: "extras" }
     }
@@ -1025,6 +1062,7 @@ test("incremental observation transport reconstructs the canonical page and reje
       observationSnapshot: { snapshotHash: initialHash },
       traveler: { id: session.travelerId || "trav_incremental", booking_rules: "No paid extras" },
       page: {
+        observationContract: "structural-observation/v1",
         site: "example.test",
         url: "https://example.test/checkout",
         step: "extras",
@@ -1099,11 +1137,9 @@ test("incremental observation transport reconstructs the canonical page and reje
   expect(transaction.currentObservation.page.controls.find((control) => control.controlId === freeControl.controlId)?.selected).toBe(true);
   expect(transaction.currentObservation.page.controls.some((control) => control.controlId === unchangedControl.controlId)).toBe(true);
   expect(transaction.currentObservation.page.controls.find((control) => control.controlId === profileControl.controlId)).toMatchObject({
-    fieldType: "title",
     currentValue: "mr",
     selected: true,
-    state: { selectedValue: "mr", optionValue: "mr" },
-    fieldClassification: { fieldType: "title", source: "radio_group_label" }
+    state: { selectedValue: "mr", optionValue: "mr" }
   });
 
   const stale = await request.post(`${API}/agent/next-action`, {

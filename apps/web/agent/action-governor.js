@@ -430,9 +430,9 @@ function validateVisualFallback(action, observation, checks) {
     }
     const resolution = resolveActionControl(action, observation.page || {});
     const control = resolution.control;
-    const recovery = control?.recovery?.[action.operation || target.recoveryOperation || ""];
-    const regionMatches = (recovery?.regions || []).some((candidate) => visualRegionsMatch(candidate, region));
-    if (!resolution.ok || !recovery || !regionMatches || recovery.requiresVisualConfirmation !== true) {
+    const capability = control?.operations?.[action.operation || target.operation || ""];
+    const regionMatches = (capability?.regions || []).some((candidate) => visualRegionsMatch(candidate, region));
+    if (!resolution.ok || !capability || !regionMatches || capability.requiresVisualConfirmation !== true) {
       return fail("VISUAL_CONTROL_RECOVERY_UNPROVEN", "The coordinate is not one of the current canonical control's bounded visual recovery regions.", checks);
     }
     const canonicalRegion = normalizeVisualRegion(region);

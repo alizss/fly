@@ -298,8 +298,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
       && goal?.desiredStateDelta?.desiredEffect === "open"
       && (goal?.admittedControlIds || []).includes(control.controlId);
     const operationEntries = [...new Set([
-      ...Object.keys(control.operations || {}),
-      ...(exactChoiceDiscovery ? Object.keys(control.recovery || {}) : [])
+      ...Object.keys(control.operations || {})
     ])];
     const usable = operationEntries.flatMap((operation) => {
       const rawCapability = control.operations?.[operation] || null;
@@ -316,7 +315,7 @@ function rawObservationCandidates(observation = {}, goal = {}) {
               exactChoiceDiscovery
               && operation === "open"
               && strategy.status === agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
-              && control.recovery?.open?.requiresVisualConfirmation === true
+              && capability.requiresVisualConfirmation === true
             )
           )
         ))

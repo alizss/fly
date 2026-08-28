@@ -1206,6 +1206,7 @@ export function createLogicalControlCompiler(dependencies) {
       surfaceId: String(raw.surfaceId || context.surfaceId || "").slice(0, 120),
       observationId: String(context.observationId || raw.observationId || "").slice(0, 120),
       controlId: String(raw.controlId || context.controlId || "").slice(0, 140),
+      ownerElementId: String(raw.ownerElementId || context.ownerElementId || "").slice(0, 140),
       operation: String(raw.operation || context.operation || "").slice(0, 40),
       source: String(raw.source || context.source || "").slice(0, 120),
       confidence: Math.max(0, Math.min(1, finite(raw.confidence, context.confidence))),
@@ -1221,7 +1222,7 @@ export function createLogicalControlCompiler(dependencies) {
     if (!["x", "y", "width", "height", "centerX", "centerY"].every((key) => Math.abs(a[key] - b[key]) <= tolerance)) {
       return false;
     }
-    return ["viewportWidth", "viewportHeight", "surfaceId", "observationId", "controlId", "operation", "source"]
+    return ["viewportWidth", "viewportHeight", "surfaceId", "observationId", "controlId", "ownerElementId", "operation", "source"]
       .every((key) => !a[key] || !b[key] || a[key] === b[key]);
   }
   
@@ -1319,6 +1320,13 @@ export function createLogicalControlCompiler(dependencies) {
       || stateElement?.getAttribute?.("aria-haspopup") === "listbox";
     if (editable && dropdownLike && tag !== "select") return "editable_combobox";
     if (tag === "select") return "select";
+    // Some payment gateways use <a> without href as a script-owned command.
+    // That node has no implicit ARIA link role, but its exact activate
+    // capability proves an objective pressable actuator. Preserve the raw
+    // element family in `kind`; publish the mechanical role separately so
+    // DecisionFrame does not need browser-authored business semantics or a
+    // tag-name heuristic to understand that it is an actionable choice.
+    if (!domRole && operations.activate) return "pressable";
     return domRole || kind || "control";
   }
   
@@ -2384,7 +2392,10 @@ export function createLogicalControlCompiler(dependencies) {
       openTargetCandidates,
       choiceActuatorCandidates: presentationBinding?.actuatorCandidates || []
     });
-    const recovery = { open: null, select: null };
+    // Bounded strategies are assembled locally and folded into the canonical
+    // operation capability below. They are not published as a second
+    // mechanical authority beside `operations`.
+    const boundedCapabilities = { open: null, select: null };
     for (const [operation, capability] of Object.entries(operations)) {
       if (!capability) continue;
       const actionabilityByActuator = Object.fromEntries((capability?.actuatorIds || []).map((nodeId) => {
@@ -2529,7 +2540,7 @@ export function createLogicalControlCompiler(dependencies) {
           actionability: targetabilityByActuator[candidate.nodeId],
           evidence: "Governed browser-level trusted input on an exact targetable control-owned node."
         }));
-        recovery.open = {
+        boundedCapabilities.open = {
           operation: "open",
           status: "unproven",
           requiresVisualConfirmation: true,
@@ -2546,6 +2557,7 @@ export function createLogicalControlCompiler(dependencies) {
                 operation: "open",
                 source: "select-like-control-region",
                 surfaceId: surface.id || "",
+                ownerElementId: elementId(wrapper),
                 confidence: 0.95,
                 evidence: "Exact visible region for a select-like control without a targetable DOM actuator."
               })]
@@ -2559,7 +2571,7 @@ export function createLogicalControlCompiler(dependencies) {
               operationProof: ""
             })
           ]));
-          recovery.select = {
+          boundedCapabilities.select = {
             operation: "select",
             status: "unproven",
             requiresVisualConfirmation: true,
@@ -2593,9 +2605,9 @@ export function createLogicalControlCompiler(dependencies) {
         ].join("::");
       }
     }
-    for (const [operation, recoveryStrategy] of Object.entries(recovery)) {
-      if (!recoveryStrategy) continue;
-      for (const strategy of recoveryStrategy.strategies || []) {
+    for (const [operation, boundedCapability] of Object.entries(boundedCapabilities)) {
+      if (!boundedCapability) continue;
+      for (const strategy of boundedCapability.strategies || []) {
         const actuator = elementById(strategy.actuatorId);
         const candidate = openTargetCandidates.find((item) => item.nodeId === strategy.actuatorId) || {};
         strategy.actuatorStableKey = [
@@ -2608,64 +2620,113 @@ export function createLogicalControlCompiler(dependencies) {
         ].join("::");
       }
     }
-    if (recovery.open?.regions?.length) {
-      recovery.open.regions = recovery.open.regions.map((region) => normalizeVisualRegionContract(region, {
+    if (boundedCapabilities.open?.regions?.length) {
+      boundedCapabilities.open.regions = boundedCapabilities.open.regions.map((region) => normalizeVisualRegionContract(region, {
         controlId,
         operation: "open",
-        source: "control.recovery.open",
+        source: "control.operations.open",
         surfaceId: surface.id || ""
       }));
     }
-    const interactionLadder = selectLike ? [
-      {
-        order: 1,
-        operation: "select",
-        method: "native_select",
-        actuatorId: elementId(stateElement),
-        status: operations.select?.actionability?.executable === true
-          ? "proven_executable"
-          : "unavailable",
-        targetable: operations.select?.actionability?.targetable === true,
-        operationProven: operations.select?.actionability?.operationProven === true
-      },
-      ...(operations.open?.strategies || []).map((strategy) => ({
-        order: 2,
-        operation: "open",
-        method: strategy.method,
-        actuatorId: strategy.actuatorId,
-        status: strategy.actionability?.executable === true ? "proven_executable" : "recoverable",
-        targetable: strategy.actionability?.targetable === true,
-        operationProven: strategy.actionability?.operationProven === true
-      })),
-      ...(recovery.open?.strategies || []).map((strategy, index) => ({
-        order: 3 + index,
-        operation: "open",
-        method: strategy.method,
-        actuatorId: strategy.actuatorId,
-        status: "unproven_experiment",
-        targetable: strategy.actionability?.targetable === true,
-        operationProven: false
-      })),
-      ...(recovery.open?.regions || []).map((region, index) => ({
-        order: 3 + (recovery.open?.strategies || []).length + index,
-        operation: "open",
-        method: "visual_coordinate",
+    for (const [operation, boundedCapability] of Object.entries(boundedCapabilities)) {
+      if (!boundedCapability) continue;
+      const capability = operations[operation] || {
+        operation,
         actuatorId: "",
-        visualRegion: region,
-        status: "unproven_experiment",
-        targetable: true,
-        operationProven: false
-      })),
-      ...(recovery.select?.strategies || []).map((strategy) => ({
-        order: 0,
-        operation: "select",
-        method: strategy.method,
-        actuatorId: strategy.actuatorId,
-        status: "unproven_experiment",
-        targetable: strategy.actionability?.targetable === true,
-        operationProven: false
-      }))
-    ].map((strategy, index) => ({ ...strategy, order: index + 1 })) : [];
+        actuatorIds: [],
+        candidates: [],
+        actionabilityByActuator: {},
+        actionability: null,
+        strategies: [],
+        expectedOutcome: operation === "select" ? "normalized_value_changed" : "options_surface_appeared"
+      };
+      const boundedActionability = boundedCapability.targetabilityByActuator || {};
+      capability.actuatorIds = [...new Set([
+        ...(capability.actuatorIds || []),
+        ...(boundedCapability.actuatorIds || [])
+      ].filter(Boolean))];
+      // A bounded hypothesis may reuse the same physical actuator as a proven
+      // operation. It contributes another strategy, but it must never replace
+      // the stronger exact proof for that actuator.
+      capability.actionabilityByActuator = Object.fromEntries([...new Set([
+        ...Object.keys(capability.actionabilityByActuator || {}),
+        ...Object.keys(boundedActionability)
+      ])].map((actuatorId) => {
+        const proven = capability.actionabilityByActuator?.[actuatorId] || null;
+        const bounded = boundedActionability[actuatorId] || null;
+        const preferred = proven?.executable === true && proven?.operationProven === true
+          ? proven
+          : bounded || proven;
+        return [actuatorId, preferred];
+      }));
+      capability.strategies = [
+        ...(capability.strategies || []),
+        ...(boundedCapability.strategies || []),
+        ...(boundedCapability.regions || []).map((region) => ({
+          operation,
+          actuatorId: "",
+          method: "visual_coordinate",
+          actionType: "click_xy",
+          status: "unproven_experiment",
+          operationProven: false,
+          actionability: {
+            rendered: true,
+            visible: true,
+            enabled: true,
+            inViewport: region.inViewport !== false,
+            inCurrentSurface: true,
+            hitTested: false,
+            notOccluded: false,
+            operationAuthorized: true,
+            operationProven: false,
+            executable: false,
+            revealable: false,
+            targetable: true,
+            code: "BOUNDED_VISUAL_STRATEGY"
+          },
+          visualRegion: region,
+          evidence: "Bounded visual strategy on the exact component region."
+        }))
+      ].filter((strategy, index, list) => list.findIndex((other) => (
+        other.actuatorStableKey === strategy.actuatorStableKey
+        && other.method === strategy.method
+        && other.actuatorId === strategy.actuatorId
+      )) === index);
+      capability.regions = [...(boundedCapability.regions || [])];
+      capability.requiresVisualConfirmation = true;
+      const executableStrategy = capability.strategies.find((strategy) => (
+        strategy.actionability?.executable === true
+        && strategy.actionability?.operationProven === true
+      ));
+      const boundedStrategy = capability.strategies.find((strategy) => (
+        strategy.status === "unproven_experiment"
+        && (strategy.actionability?.targetable === true || strategy.visualRegion)
+      ));
+      const preferredStrategy = executableStrategy || boundedStrategy || capability.strategies[0];
+      capability.actuatorId = preferredStrategy?.actuatorId || capability.actuatorId || "";
+      capability.actionability = preferredStrategy?.actionability
+        || capability.actionabilityByActuator?.[capability.actuatorId]
+        || capability.actionability;
+      capability.status = executableStrategy
+        ? "proven_executable"
+        : boundedStrategy
+          ? "unproven_experiment"
+          : "unavailable";
+      operations[operation] = capability;
+    }
+    const interactionLadder = selectLike
+      ? Object.values(operations).flatMap((capability) => (
+          (capability?.strategies || []).map((strategy) => ({
+            operation: capability.operation,
+            method: strategy.method,
+            actuatorId: strategy.actuatorId,
+            visualRegion: strategy.visualRegion || null,
+            status: strategy.status || (strategy.actionability?.executable === true ? "proven_executable" : "unavailable"),
+            targetable: strategy.actionability?.targetable === true,
+            operationProven: strategy.actionability?.operationProven === true
+          }))
+        )).map((strategy, index) => ({ ...strategy, order: index + 1 }))
+      : [];
     members.forEach((item) => {
       try {
         item.element.dataset.atwControlId = controlId;
@@ -2715,7 +2776,7 @@ export function createLogicalControlCompiler(dependencies) {
         capability?.actionability?.executable === true
         || capability?.actionability?.revealable === true
       ))
-      || Object.values(recovery).some((capability) => (
+      || Object.values(operations).some((capability) => (
         (capability?.strategies || []).some((strategy) => (
           strategy.actionability?.targetable === true
           && strategy.actionability?.visible === true
@@ -2745,11 +2806,11 @@ export function createLogicalControlCompiler(dependencies) {
         source: "control.visual_region",
         surfaceId: surface.id || ""
       }) : null,
-      ...Object.entries(recovery).flatMap(([operation, strategy]) => (strategy?.regions || []).map((region) => (
+      ...Object.entries(operations).flatMap(([operation, capability]) => (capability?.regions || []).map((region) => (
         normalizeVisualRegionContract(region, {
           controlId,
           operation,
-          source: `control.recovery.${operation}`,
+          source: `control.operations.${operation}`,
           surfaceId: surface.id || ""
         })
       )))
@@ -2860,7 +2921,6 @@ export function createLogicalControlCompiler(dependencies) {
         .filter(([, capability]) => Boolean(capability))
         .map(([operation, capability]) => [operation, capability.actionability])),
       interactionLadder,
-      recovery,
       visualRegions,
       selected: Boolean(state.checked || state.selected),
       required: Boolean(state.required || context.required),

@@ -47,7 +47,7 @@ const EXPECTED_EFFECTS = Object.freeze([
 const INSTRUCTIONS = [
   "Reconcile uncertain semantic meaning in the supplied current checkout scene.",
   "Return only grounded hypotheses using supplied controlId, semanticType, factSource, and validationIssueId values.",
-  "A field hypothesis may identify a traveler field and may attribute a supplied validation issue to that exact control.",
+  "A hypothesis may identify a traveler field, or it may attribute a supplied validation issue to one exact observed control without inventing a profile fact.",
   "A decision hypothesis may map one supplied decisionGroupId to one supplied closed decisionType.",
   "A control hypothesis may explain one supplied observed control, attach it to one supplied decision group, and describe its likely reversible effect.",
   "Every hypothesis must be supported by the control's local label, attributes, helper text, owner region, options, or validation text.",
@@ -65,6 +65,33 @@ function operationNames(control = {}) {
   return Object.entries(control.operations || {})
     .filter(([, capability]) => Boolean(capability))
     .map(([operation]) => operation);
+}
+
+function executableOperationNames(control = {}) {
+  return Object.entries(control.operations || {})
+    .filter(([, capability]) => (
+      capability?.status === "proven_executable"
+      && capability?.actionability?.executable === true
+    ))
+    .map(([operation]) => operation);
+}
+
+function unresolvedControlState(control = {}) {
+  return control.selected !== true
+    && control.state?.selected !== true
+    && control.state?.checked !== true
+    && control.state?.valuePresent !== true;
+}
+
+function typedValidationOwner(control = {}) {
+  const semantic = clean(control.semanticType || control.fieldType || control.semantic).toLowerCase();
+  const required = control.required === true || control.state?.required === true;
+  const invalid = control.invalid === true || control.state?.invalid === true;
+  return unresolvedControlState(control) && (
+    required
+    || invalid
+    || ["legal_acceptance", "unknown_attestation"].includes(semantic)
+  );
 }
 
 function semanticBindingIdentity(control = {}) {
@@ -104,6 +131,7 @@ function applyRememberedSemanticBindings(observation = {}, memory = [], {
     `${fact.semanticType}|${fact.factSource}`
   )));
   const receipts = new Map(memory.flatMap((entry) => {
+    if (entry?.status === "unresolved") return [];
     const identity = clean(entry?.identity, 500);
     const signature = String(entry?.evidenceSignature || "");
     const semanticType = clean(entry?.semanticType, 120);
@@ -111,9 +139,15 @@ function applyRememberedSemanticBindings(observation = {}, memory = [], {
     if (!identity || !signature || !allowedFacts.has(`${semanticType}|${factSource}`)) return [];
     return [[`${identity}|${signature}`, { ...entry, semanticType, factSource }]];
   }));
-  if (!receipts.size) return observation;
+  const unresolvedReceipts = new Set(memory.flatMap((entry) => (
+    entry?.status === "unresolved" && entry?.identity && entry?.evidenceSignature
+      ? [`${clean(entry.identity, 500)}|${String(entry.evidenceSignature)}`]
+      : []
+  )));
+  if (!receipts.size && !unresolvedReceipts.size) return observation;
   const semanticFieldHints = [...(page.semanticFieldHints || [])];
   const reusedControlIds = [];
+  const unresolvedControlIds = [];
   for (const control of (page.controls || [])) {
     const existing = clean(control.fieldType || control.semantic).toLowerCase();
     const mayNeedBinding = !existing || ["unknown", "choice", "field", "value_field", "input", "control"].includes(existing)
@@ -121,6 +155,10 @@ function applyRememberedSemanticBindings(observation = {}, memory = [], {
     if (!mayNeedBinding || !controlBelongsToCurrentSurface(control, page)) continue;
     const identity = semanticBindingIdentity(control);
     const evidenceSignature = semanticBindingEvidenceSignature(control);
+    if (unresolvedReceipts.has(`${identity}|${evidenceSignature}`)) {
+      unresolvedControlIds.push(control.controlId);
+      continue;
+    }
     const receipt = receipts.get(`${identity}|${evidenceSignature}`);
     if (!receipt) continue;
     reusedControlIds.push(control.controlId);
@@ -134,24 +172,25 @@ function applyRememberedSemanticBindings(observation = {}, memory = [], {
       evidence: "Reused an evidence-identical grounded semantic binding."
     });
   }
-  if (!reusedControlIds.length) return observation;
+  if (!reusedControlIds.length && !unresolvedControlIds.length) return observation;
   return {
     ...observation,
     page: {
       ...page,
       semanticFieldHints,
       semanticBindingReuse: {
-        status: "reused",
+        status: reusedControlIds.length ? "reused" : "unresolved_evidence_unchanged",
         controlIds: reusedControlIds,
+        unresolvedControlIds,
         authority: "evidence_identical_hypothesis"
-      }
+      },
+      semanticUnresolvedControlIds: unresolvedControlIds
     }
   };
 }
 
-function rememberSemanticBindings(memory = [], observation = {}) {
+function rememberSemanticBindings(memory = [], observation = {}, { unresolvedControls = [] } = {}) {
   const hypotheses = observation.page?.semanticSceneReconciliation?.hypotheses || [];
-  if (!hypotheses.length) return Array.isArray(memory) ? memory : [];
   const controls = new Map((observation.page?.controls || []).map((control) => [control.controlId, control]));
   const additions = hypotheses.flatMap((hypothesis) => {
     const control = controls.get(hypothesis.controlId);
@@ -160,6 +199,7 @@ function rememberSemanticBindings(memory = [], observation = {}) {
     const evidenceSignature = semanticBindingEvidenceSignature(control);
     if (!identity || !evidenceSignature) return [];
     return [{
+      status: "resolved",
       identity,
       evidenceSignature,
       semanticType: hypothesis.semanticType,
@@ -167,7 +207,15 @@ function rememberSemanticBindings(memory = [], observation = {}) {
       confidence: hypothesis.confidence === "high" ? 0.95 : 0.82
     }];
   });
-  const combined = [...(Array.isArray(memory) ? memory : []), ...additions];
+  const unresolvedAdditions = unresolvedControls.flatMap((candidate) => {
+    const control = controls.get(candidate?.controlId || candidate) || candidate;
+    if (!control?.controlId) return [];
+    const identity = semanticBindingIdentity(control);
+    const evidenceSignature = semanticBindingEvidenceSignature(control);
+    if (!identity || !evidenceSignature) return [];
+    return [{ status: "unresolved", identity, evidenceSignature }];
+  });
+  const combined = [...(Array.isArray(memory) ? memory : []), ...unresolvedAdditions, ...additions];
   const deduped = new Map(combined.map((entry) => [
     `${entry.identity}|${entry.evidenceSignature}`,
     entry
@@ -178,6 +226,7 @@ function rememberSemanticBindings(memory = [], observation = {}) {
 function semanticSceneUncertainty({
   observation = {},
   semanticCompilation = null,
+  unresolvedEvidence = [],
   traveler = {},
   transactionReview = null,
   currentObligation = null
@@ -191,7 +240,21 @@ function semanticSceneUncertainty({
       ? (currentObligation.admittedControlIds || []).map(String).filter(Boolean)
       : []
   );
-  const admittedDecisionGroupId = clean(currentObligation?.desiredStateDelta?.decisionGroupId, 180);
+  const obligationDelta = currentObligation?.desiredStateDelta || currentObligation?.delta || {};
+  const admittedDecisionGroupId = clean(obligationDelta.decisionGroupId || obligationDelta.subject?.decisionGroupId, 180);
+  const activeUnresolvedControlIds = new Set((unresolvedEvidence || []).flatMap((item) => [
+    item.controlId,
+    ...(item.evidenceIds || [])
+  ]).map(String).filter(Boolean));
+  const blockingDecisionControlIds = new Set((page.decisionGroups || []).filter((group) => {
+    const status = clean(group.status).toLowerCase();
+    return group.required === true
+      && !group.selectedControlId
+      && ["", "missing", "blocked", "required", "unresolved", "conflicted"].includes(status);
+  }).flatMap((group) => [
+    ...(group.alternativeControlIds || []),
+    ...(group.alternatives || []).map((option) => option.controlId)
+  ]).map(String).filter(Boolean));
   if (page.terminalEvidence?.verified === true || page.semanticTerminal === true) {
     return Object.freeze({
       needed: false,
@@ -226,6 +289,7 @@ function semanticSceneUncertainty({
     return 5;
   };
   const components = (page.controls || []).filter((control) => {
+    if ((page.semanticUnresolvedControlIds || []).includes(control.controlId)) return false;
     if (admittedControlIds.size && !admittedControlIds.has(String(control.controlId || ""))) return false;
     const lifecycle = control.representationLifecycle || {};
     const active = lifecycle.active === true || lifecycle.status === "active_rendered";
@@ -253,47 +317,59 @@ function semanticSceneUncertainty({
     const ownsValidation = validationIssues.some((issue) => issue.controlId === control.controlId);
     const required = control.required === true || control.state?.required === true;
     if (!admittedControlIds.size) {
-      const shape = clean(`${control.role || ""} ${control.kind || ""} ${control.domRole || ""}`);
-      const knownProfileInput = INPUT_ROLE.test(shape) && !unknown && !ambiguous && !ownsValidation;
-      if (knownProfileInput) return false;
-      const knownDecisionMember = Boolean(
-        control.decisionGroupId
-        && (page.decisionGroups || []).some((group) => (
-          clean(group.decisionGroupId || group.requirementId, 180) === clean(control.decisionGroupId, 180)
-        ))
-        && !unknown
-      );
-      const knownCommand = [
-        "continue",
-        "navigation",
-        "safe_continue",
-        "decline_paid_extra",
-        "safe_decline",
-        "dismiss_surface",
-        "legal_acceptance",
-        "payment_method"
-      ].includes(semantic);
-      return unknown || ambiguous || ownsValidation || (!knownDecisionMember && !knownCommand);
+      return ownsValidation
+        || activeUnresolvedControlIds.has(String(control.controlId || ""))
+        || blockingDecisionControlIds.has(String(control.controlId || ""))
+        || (required && (unknown || ambiguous));
     }
-    if (!["profile_field", "profile_fact", "unknown_required", "unknown_validation"].includes(clean(currentObligation?.desiredStateDelta?.kind))) return true;
+    if (!["profile_field", "profile_fact", "unknown_required", "unknown_validation"].includes(clean(obligationDelta.kind))) return true;
     return (unknown && (required || ownsValidation)) || ambiguous;
   }).sort((left, right) => componentScore(left) - componentScore(right)).slice(0, MAX_COMPONENTS);
 
+  // stageWide describes lifecycle/blocking scope, not semantic ownership.
+  // A fresh stage-wide error is precisely the evidence that may need bounded
+  // grounding to one observed control; excluding it leaves no owner and lets
+  // downstream navigation or unrelated decisions compete with the blocker.
   const unownedValidationIssues = validationIssues.filter((issue) => (
     !issue.controlId
     && !issue.logicalOwnerKey
-    && issue.stageWide !== true
+    && !issue.decisionGroupId
+    && !issue.requirementId
+    && !issue.sectionId
   )).slice(0, 6);
-  const validationCandidateControls = unownedValidationIssues.length
+  const observedCandidateOwnerIds = new Set(
+    (observation.lastActionResult?.actionOutcome?.candidateOwnerControlIds || [])
+      .map(String)
+      .filter(Boolean)
+  );
+  const executableValidationControls = unownedValidationIssues.length
     ? (page.controls || []).filter((control) => {
+        if ((page.semanticUnresolvedControlIds || []).includes(control.controlId)) return false;
         const lifecycle = control.representationLifecycle || {};
         return (!admittedControlIds.size || admittedControlIds.has(String(control.controlId || "")))
           && (lifecycle.active === true || lifecycle.status === "active_rendered")
           && controlBelongsToCurrentSurface(control, page)
           && INPUT_ROLE.test(clean(`${control.role || ""} ${control.kind || ""} ${control.domRole || ""}`))
-          && operationNames(control).length;
-      }).slice(0, MAX_COMPONENTS)
+          && executableOperationNames(control).length;
+      })
     : [];
+  const exactObservedOwners = executableValidationControls.filter((control) => (
+    observedCandidateOwnerIds.has(String(control.controlId || ""))
+  ));
+  const typedOwners = executableValidationControls.filter(typedValidationOwner);
+  // An unowned validation may ask the grounded resolver to choose an owner,
+  // but its hypothesis surface must contain only controls that can actually
+  // settle the blocker. Exact browser ownership wins. Otherwise a typed,
+  // unsatisfied control (for example an unchecked legal attestation) is a
+  // tighter boundary than unrelated optional or promotion inputs. Unknown
+  // controls remain available only when no stronger structural owner exists.
+  const validationCandidateControls = (
+    exactObservedOwners.length
+      ? exactObservedOwners
+      : typedOwners.length
+        ? typedOwners
+        : executableValidationControls
+  ).slice(0, MAX_COMPONENTS);
   const candidateMap = new Map([...components, ...validationCandidateControls]
     .map((control) => [control.controlId, control]));
   const candidateControls = [...candidateMap.values()];
@@ -301,8 +377,19 @@ function semanticSceneUncertainty({
     if (admittedDecisionGroupId
       && clean(group.decisionGroupId || group.requirementId, 180) !== admittedDecisionGroupId) return false;
     const subject = clean(`${group.subject?.key || group.subject || ""} ${group.sectionType || ""}`).toLowerCase();
-    const material = group.material === true || group.required === true || (group.alternatives || []).length > 0;
-    if (!material) return false;
+    const groupControlIds = [
+      ...(group.alternativeControlIds || []),
+      ...(group.alternatives || []).map((option) => option.controlId)
+    ].filter(Boolean);
+    if (groupControlIds.length && groupControlIds.every((controlId) => (
+      (page.semanticUnresolvedControlIds || []).includes(controlId)
+    ))) return false;
+    const status = clean(group.status).toLowerCase();
+    const groupOwnsActiveBlocker = groupControlIds.some((controlId) => activeUnresolvedControlIds.has(String(controlId)));
+    const blocking = group.required === true
+      && !group.selectedControlId
+      && ["", "missing", "blocked", "required", "unresolved", "conflicted"].includes(status);
+    if (!blocking && !groupOwnsActiveBlocker && !admittedDecisionGroupId) return false;
     const typedContract = group.decisionContract?.valid === true
       && Boolean(group.decisionContract?.kind)
       && Boolean(subject)
@@ -315,7 +402,11 @@ function semanticSceneUncertainty({
     semanticType: fact.semanticType,
     factSource: fact.factSource
   })));
-  const allowedValidationOwners = unownedValidationIssues.flatMap((issue) => candidateControls.map((control) => ({
+  // General semantic candidates may include buttons and links, but a form
+  // validation owner must be one of the bounded mutable state controls. This
+  // prevents grounding from attaching a terms error to an unrelated Yes,
+  // Continue, utility link, or error-summary link.
+  const allowedValidationOwners = unownedValidationIssues.flatMap((issue) => validationCandidateControls.map((control) => ({
     validationIssueId: issue.issueId,
     controlId: control.controlId
   })));
@@ -342,9 +433,9 @@ function semanticSceneUncertainty({
   });
   return Object.freeze({
     needed: Boolean(
-      ((components.length || unownedValidationIssues.length) && candidateControls.length && facts.length)
+      (components.length && candidateControls.length && facts.length)
+      || (unownedValidationIssues.length && candidateControls.length)
       || uncertainDecisionGroups.length
-      || (!currentObligation && candidateControls.length)
     ),
     reason: currentObligation ? "ADMITTED_OBLIGATION_AMBIGUOUS" : "CURRENT_SURFACE_SEMANTICALLY_INCOMPLETE",
     components: candidateControls,
@@ -376,7 +467,11 @@ function applySemanticSceneHypotheses(observation = {}, response = {}, uncertain
     const bindingAllowed = allowedBindings.has(`${hypothesis.controlId}|${hypothesis.semanticType}|${hypothesis.factSource}`);
     const ownerAllowed = !hypothesis.validationIssueId
       || allowedOwners.has(`${hypothesis.validationIssueId}|${hypothesis.controlId}`);
-    return bindingAllowed && ownerAllowed;
+    const validationOwnerOnly = Boolean(hypothesis.validationIssueId)
+      && hypothesis.semanticType === "unknown"
+      && !hypothesis.factSource
+      && ownerAllowed;
+    return ownerAllowed && (bindingAllowed || validationOwnerOnly);
   }).slice(0, 4);
   const allowedDecisionBindings = new Set((uncertainty.allowedDecisionBindings || []).map((binding) => (
     `${binding.decisionGroupId}|${binding.decisionType}`
@@ -411,7 +506,9 @@ function applySemanticSceneHypotheses(observation = {}, response = {}, uncertain
     evidence: clean(hypothesis.evidence)
   });
   const dedupe = (items, keyFor) => [...new Map(items.map((item) => [keyFor(item), item])).values()];
-  const fieldHints = accepted.map(withAuthority);
+  const fieldHints = accepted.filter((hypothesis) => (
+    allowedBindings.has(`${hypothesis.controlId}|${hypothesis.semanticType}|${hypothesis.factSource}`)
+  )).map(withAuthority);
   const validationHints = accepted.filter((hypothesis) => hypothesis.validationIssueId).map((hypothesis) => withAuthority({
     validationIssueId: hypothesis.validationIssueId,
     controlId: hypothesis.controlId,
@@ -536,12 +633,7 @@ async function reconcileSemanticScene({
             relationships: {
               decisionGroupId: clean(control.rawEvidenceChannels?.relationships?.decisionGroupId || control.decisionGroupId, 180),
               logicalFieldId: clean(control.rawEvidenceChannels?.relationships?.logicalFieldId || control.logicalFieldId, 180),
-              stateElementId: clean(control.rawEvidenceChannels?.relationships?.stateElementId || control.stateElementId, 160),
-              preferredActivationElementId: clean(
-                control.rawEvidenceChannels?.relationships?.preferredActivationElementId
-                || control.preferredActivationElementId,
-                160
-              )
+              stateElementId: clean(control.rawEvidenceChannels?.relationships?.stateElementId || control.stateElementId, 160)
             }
           },
           placeholder: clean(control.placeholder),

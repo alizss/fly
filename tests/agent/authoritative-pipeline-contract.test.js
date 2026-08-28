@@ -428,11 +428,10 @@ test("geometry never becomes proven and modal Dismiss/Advance remain separate ou
     kind: "select",
     disabled: true
   });
-  visual.operations = {};
-  visual.recovery = {
+  visual.operations = {
     open: {
       operation: "open",
-      status: "unproven",
+      status: agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
       requiresVisualConfirmation: true,
       regions: [{ x: 10, y: 20, width: 100, height: 30, inViewport: true }]
     }
@@ -581,11 +580,10 @@ test("shared execution-lane classifier admits only fresh exact bounded recovery"
     kind: "select",
     disabled: true
   });
-  control.operations = {};
-  control.recovery = {
+  control.operations = {
     open: {
       operation: "open",
-      boundedRecovery: true,
+      status: agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
       requiresVisualConfirmation: true,
       actuatorIds: [wrapperId],
       regions: [{
@@ -701,18 +699,13 @@ test("target binding preserves the exact bounded-recovery actuator instead of su
     disabled: true,
     options: [{ value: "mr", label: "Male" }, { value: "ms", label: "Female" }]
   });
-  control.operations = {};
-  control.actuators = [
-    { nodeId: control.stateElementId, relation: "state" },
-    { nodeId: preferredActivationId, relation: "activation" }
-  ];
-  control.recovery = {
+  control.operations = {
     open: {
       operation: "open",
-      status: "unproven",
+      status: agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
       requiresVisualConfirmation: true,
       actuatorIds: [recoveryActuatorId],
-      targetabilityByActuator: {
+      actionabilityByActuator: {
         [recoveryActuatorId]: {
           rendered: true,
           visible: true,
@@ -740,6 +733,10 @@ test("target binding preserves the exact bounded-recovery actuator instead of su
       regions: []
     }
   };
+  control.actuators = [
+    { nodeId: control.stateElementId, relation: "state" },
+    { nodeId: preferredActivationId, relation: "activation" }
+  ];
   const observed = observation([control], "obs_recovery_binding");
   const capability = agentContract.observedComponentContract(control, {
     surfaceId: "surface-page"

@@ -322,9 +322,11 @@ export function createInteractionMechanics(dependencies) {
     const relatedElements = [
       target,
       elementById(control?.stateElementId || ""),
-      elementById(control?.preferredActivationElementId || ""),
       ...Object.values(control?.operations || {}).flatMap((capability) => (
-        capability?.actuatorIds || []
+        [
+          ...(capability?.actuatorIds || []),
+          ...(capability?.strategies || []).map((strategy) => strategy?.actuatorId)
+        ]
       )).map(elementById)
     ].filter(Boolean);
     const focusInsideTarget = Boolean(

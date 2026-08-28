@@ -113,7 +113,8 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, Number(error.status), {
         error: error.message || "Request failed",
         code: error.code,
-        retryable: error.retryable === true
+        retryable: error.retryable === true,
+        details: error.details || null
       });
     }
     console.error("Unhandled server request error:", error);

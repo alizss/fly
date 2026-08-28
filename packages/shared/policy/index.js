@@ -142,7 +142,9 @@ function optionalConsentAuthorized(action = {}, merged = {}, profile = {}) {
   ))) return true;
   const consent = String(target.consentCategory || action.consentCategory || "").toLowerCase();
   if (/marketing|newsletter|promotion/.test(consent)) {
-    return profile.marketing_opt_in === true || profile.marketingConsent === true;
+    return profile.marketing_opt_in === true
+      || profile.marketingConsent === true
+      || profile.marketing_consent === "accept";
   }
   return false;
 }

@@ -135,14 +135,6 @@ export function createControlGraphCompiler(dependencies) {
             strategies: (capability.strategies || []).filter((strategy) => !conflictingNodes.has(strategy.actuatorId))
           } : null
         ])),
-        recovery: Object.fromEntries(Object.entries(control.recovery || {}).map(([operation, recovery]) => [
-          operation,
-          recovery ? {
-            ...recovery,
-            actuatorIds: (recovery.actuatorIds || []).filter((nodeId) => !conflictingNodes.has(nodeId)),
-            strategies: (recovery.strategies || []).filter((strategy) => !conflictingNodes.has(strategy.actuatorId))
-          } : null
-        ])),
         actuators,
         ownershipIntegrity: {
           ok: selectedConflictNodeIds.length === 0,

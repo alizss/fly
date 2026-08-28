@@ -130,13 +130,12 @@ function executable(control = {}) {
 
 function boundedChoiceDiscoveryStrategy(control = {}) {
   const shape = lower(`${control.kind || ""} ${control.role || ""} ${control.domRole || ""}`);
-  const recovery = control.recovery?.open || null;
-  if (!/select|combobox|listbox/.test(shape) || recovery?.requiresVisualConfirmation !== true) return null;
-  return (recovery.strategies || []).find((strategy) => {
+  const capability = control.operations?.open || null;
+  if (!/select|combobox|listbox/.test(shape) || capability?.requiresVisualConfirmation !== true) return null;
+  return (capability.strategies || []).find((strategy) => {
     const actuatorId = clean(strategy.actuatorId);
     const proof = strategy.proof
       || strategy.actionability
-      || recovery.targetabilityByActuator?.[actuatorId]
       || {};
     return Boolean(
       actuatorId
@@ -147,6 +146,21 @@ function boundedChoiceDiscoveryStrategy(control = {}) {
       && proof.targetable === true
     );
   }) || null;
+}
+
+function canonicalOperationActuator(control = {}, operation = "", preferredStrategy = null) {
+  const capability = operation ? control.operations?.[operation] : null;
+  if (!capability) return "";
+  const selected = preferredStrategy?.actuatorId
+    ? preferredStrategy
+    : (capability.strategies || []).find((strategy) => (
+        strategy?.actuatorId
+        && strategy?.actionability?.executable === true
+        && strategy?.actionability?.operationProven === true
+      ))
+      || (capability.strategies || []).find((strategy) => strategy?.actuatorId)
+      || null;
+  return clean(selected?.actuatorId || capability.actuatorId || capability.actuatorIds?.[0]);
 }
 
 function isPlaceholderValue(value = "") {
@@ -473,6 +487,7 @@ function transitionFor(control = {}, alternative = {}) {
     ? executableOperations.find(([name]) => ["open", "activate", "keyboard"].includes(name))
     : executableOperations[0])?.[0]
     || ((opensChoice || selectLike) && boundedDiscovery ? "open" : "");
+  const targetId = canonicalOperationActuator(control, operation, operation === "open" ? boundedDiscovery : null);
   const controlEffectRole = clean(control.effectRole);
   const effectRole = clean(
     controlEffectRole && controlEffectRole !== "unknown"
@@ -493,11 +508,7 @@ function transitionFor(control = {}, alternative = {}) {
   return Object.freeze({
     transitionId: `${clean(control.controlId || alternative.controlId)}:${operation || "unavailable"}`,
     controlId: clean(control.controlId || alternative.controlId),
-    targetId: clean(
-      operation === "open" && boundedDiscovery?.actuatorId
-        ? boundedDiscovery.actuatorId
-        : control.preferredActivationElementId || control.stateElementId || alternative.targetId
-    ),
+    targetId,
     operation,
     label: clean(alternative.label || control.label),
     canonicalValue: alternative.canonicalValue ?? control.canonicalValue ?? alternative.value ?? control.currentValue ?? clean(alternative.label || control.label),
@@ -742,12 +753,29 @@ function canonicalDecisionForGroup({
           ? "committed"
           : "unresolved";
   const required = group.required === true;
-  const validation = activeValidationIssues(page.validationIssues || []).find((issue) => (
-    issue.stageWide === true
-    || [id, group.requirementId, group.sectionId, selectedId].filter(Boolean).includes(
-      clean(issue.decisionGroupId || issue.requirementId || issue.sectionId || issue.controlId)
-    )
-  )) || null;
+  // A page-wide error proves only that navigation is blocked. It does not
+  // identify which decision owns the error. Attaching it to every decision
+  // lets the first unrelated group manufacture an exact local obligation.
+  // Decision-local validation requires an exact observed or grounded owner.
+  const decisionOwnerIds = new Set([
+    id,
+    group.requirementId,
+    group.sectionId,
+    selectedId,
+    ...(group.alternativeControlIds || []),
+    ...(group.alternatives || []).map((alternative) => alternative.controlId)
+  ].map(clean).filter(Boolean));
+  const validation = activeValidationIssues(page.validationIssues || []).find((issue) => {
+    const issueOwnerIds = [
+      issue.decisionGroupId,
+      issue.requirementId,
+      issue.sectionId,
+      issue.controlId,
+      issue.ownerControlId,
+      issue.logicalOwnerKey
+    ].map(clean).filter(Boolean);
+    return issueOwnerIds.some((ownerId) => decisionOwnerIds.has(ownerId));
+  }) || null;
   const selectionChanged = Boolean(
     previousCompletion?.selectedControlId
     && selectedId
@@ -805,8 +833,7 @@ function canonicalDecisionForGroup({
       ].map(clean).filter(Boolean));
       const explicitStageExit = [
         control.controlId,
-        control.stateElementId,
-        control.preferredActivationElementId
+        ...Object.values(control.operations || {}).flatMap((capability) => capability?.actuatorIds || [])
       ].map(clean).some((id) => explicitStageExitIds.has(id));
       return clean(control.surfaceId || "surface-page") === clean(group.surfaceId || "surface-page")
         && isTypedNavigationControl(control, { explicitStageExit });
@@ -949,14 +976,22 @@ function canonicalDecisionForGroup({
     status = "active";
     needsAction = true;
     actionReason = "blocking_surface_has_exact_safe_transition";
+  } else if (required && !selected) {
+    // Exact fresh state outranks settlement memory. History may confirm a
+    // compatible current selection, but it cannot turn a visibly unresolved
+    // required choice into a satisfied one.
+    status = "active";
+    needsAction = true;
+    actionReason = "required_unresolved";
+    reopenEvidence = previousCompletion ? {
+      code: "FRESH_REQUIRED_DECISION_UNSELECTED",
+      decisionGroupId: id,
+      previousControlId: clean(previousCompletion.selectedControlId)
+    } : null;
   } else if (previousCompletion) {
     status = previousCompletion.status;
     completionReason = "preserved_exact_outcome";
     actionReason = "preserved_verified_completion";
-  } else if (required && !selected) {
-    status = "active";
-    needsAction = true;
-    actionReason = "required_unresolved";
   } else if (intent.match === "exact" && !desiredSelected) {
     status = "active";
     needsAction = true;

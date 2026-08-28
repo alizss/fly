@@ -4,26 +4,16 @@ function cleanId(value = "") {
 
 function aliasRecordsForControl(control = {}) {
   const operationRecords = Object.entries(control.operations || {}).flatMap(([operation, capability]) =>
-    (capability?.actuatorIds || []).map((aliasId) => ({ aliasId, kind: `operation:${operation}` }))
-  );
-  const recoveryRecords = Object.entries(control.recovery || {}).flatMap(([operation, recovery]) =>
     [
-      ...(recovery?.actuatorIds || []),
-      ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-    ].map((aliasId) => ({ aliasId, kind: `recovery:${operation}` }))
+      ...(capability?.actuatorIds || []),
+      ...(capability?.strategies || []).map((strategy) => strategy?.actuatorId)
+    ].map((aliasId) => ({ aliasId, kind: `operation:${operation}` }))
   );
   const records = [
     { aliasId: control.controlId, kind: "control" },
     { aliasId: control.stableKey, kind: "stable_key" },
-    { aliasId: control.stateElementId, kind: "state" },
-    { aliasId: control.preferredActivationElementId, kind: "activation" },
     { aliasId: control.visualRef, kind: "visual" },
-    ...(control.actuators || []).map((actuator) => ({
-      aliasId: actuator?.nodeId,
-      kind: actuator?.relation || "actuator"
-    })),
-    ...operationRecords,
-    ...recoveryRecords
+    ...operationRecords
   ];
   return records
     .map((record) => ({ ...record, aliasId: cleanId(record.aliasId) }))
@@ -87,14 +77,12 @@ function buildControlAliasIndex(page = {}) {
     const controlId = cleanId(annotation?.controlId);
     if (!controlId) continue;
     register(annotation.visualRef, controlId, "visual", "screenshot_annotation");
-    register(annotation.targetId, controlId, "annotation_target", "screenshot_annotation");
   }
 
   for (const group of page.decisionGroups || []) {
     for (const alternative of group?.alternatives || []) {
       const controlId = cleanId(alternative?.controlId);
       if (!controlId) continue;
-      register(alternative.targetId, controlId, "decision_target", "decision_group");
       register(alternative.visualRef, controlId, "visual", "decision_group");
     }
   }
@@ -134,14 +122,7 @@ function actionTargetAliases(action = {}) {
     target.stableKey,
     target.id,
     target.visualRef,
-    target.stateElementId,
-    target.preferredActivationElementId,
-    ...(target.actuators || []).map((actuator) => actuator?.nodeId),
-    ...Object.values(target.operations || {}).flatMap((capability) => capability?.actuatorIds || []),
-    ...Object.values(target.recovery || {}).flatMap((recovery) => [
-      ...(recovery?.actuatorIds || []),
-      ...(recovery?.strategies || []).map((strategy) => strategy.actuatorId)
-    ])
+    ...Object.values(target.operations || {}).flatMap((capability) => capability?.actuatorIds || [])
   ].map(cleanId).filter((aliasId, index, list) => aliasId && list.indexOf(aliasId) === index);
 }
 

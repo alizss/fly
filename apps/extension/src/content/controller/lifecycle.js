@@ -53,15 +53,21 @@ export function createAgentLifecycle({
     const wait = agent.destinationWait;
     clearDestinationWait(reason);
     if (!agent.running) return;
+    // A bounded readiness deadline ends active polling, not the durable
+    // checkout. Keep the watcher armed and resume automatically when the
+    // destination eventually publishes fresh structural evidence. Turning
+    // this into `awaiting = manual` made slow airline pages require a second
+    // Start even though no user decision was missing.
     agent.running = false;
-    agent.awaiting = "manual";
+    agent.engineReconciliationPending = true;
+    agent.awaiting = "";
     setAgentActivity(
-      "Destination did not become ready",
-      "The page did not expose usable checkout controls before the bounded readiness timeout."
+      "Waiting for the checkout page",
+      "Active polling ended; Fly will continue automatically when fresh checkout controls appear."
     );
     addAgentMessage(
       "assistant",
-      "The destination stayed incomplete for too long. I stopped without guessing; please check whether the site is still loading."
+      "The destination is still loading. I will continue automatically when its checkout controls appear."
     );
     renderSidebar("agent");
   }

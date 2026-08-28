@@ -3,6 +3,20 @@ const agentContract = require("../../extension/src/shared/agent-contract");
 
 const TRANSACTION_CONTRACT_VERSION = "transaction-facts/v2";
 const COMMERCE_FAMILIES = new Set(["fare", "baggage", "seat", "insurance", "extras"]);
+const MONTH_NUMBER = Object.freeze({
+  jan: 1, january: 1,
+  feb: 2, february: 2,
+  mar: 3, march: 3,
+  apr: 4, april: 4,
+  may: 5,
+  jun: 6, june: 6,
+  jul: 7, july: 7,
+  aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9,
+  oct: 10, october: 10,
+  nov: 11, november: 11,
+  dec: 12, december: 12
+});
 
 function text(value, limit = 180) {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, limit);
@@ -21,6 +35,34 @@ function number(value) {
 
 function semanticToken(value, limit = 120) {
   return normalizedText(value, limit).replace(/\s+/g, "_");
+}
+
+function validCanonicalDate(year, month, day) {
+  const date = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+  if (date.getUTCFullYear() !== Number(year)
+    || date.getUTCMonth() !== Number(month) - 1
+    || date.getUTCDate() !== Number(day)) return "";
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+// Transaction identity owns a calendar day, not its presentation. Preserve
+// unknown formats as uncertainty; never turn a localized display string into
+// a contradictory date merely because its spelling differs from ISO.
+function canonicalTransactionDate(value = "") {
+  const raw = text(value, 80);
+  const iso = raw.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s].*)?$/);
+  if (iso) return validCanonicalDate(iso[1], iso[2], iso[3]);
+  const dayFirst = raw.match(/^(\d{1,2})[\s,./-]+([A-Za-z]+)[\s,./-]+(\d{4})$/);
+  if (dayFirst) {
+    const month = MONTH_NUMBER[dayFirst[2].toLowerCase()];
+    return month ? validCanonicalDate(dayFirst[3], month, dayFirst[1]) : "";
+  }
+  const monthFirst = raw.match(/^([A-Za-z]+)[\s,./-]+(\d{1,2})(?:st|nd|rd|th)?[\s,]+(\d{4})$/i);
+  if (monthFirst) {
+    const month = MONTH_NUMBER[monthFirst[1].toLowerCase()];
+    return month ? validCanonicalDate(monthFirst[3], month, monthFirst[2]) : "";
+  }
+  return "";
 }
 
 function canonicalFareBrand(value = "") {
@@ -123,11 +165,12 @@ function normalizeSegment(segment = {}, index = 0) {
   const origin = normalizedRouteEndpoint(segment.origin);
   const destination = normalizedRouteEndpoint(segment.destination);
   const evidence = normalizeFactEvidence(segment.evidence);
+  const observedDepartureDate = text(segment.departureDate, 40);
   return {
     segmentId: text(segment.segmentId || `segment_${index + 1}`, 120),
     origin,
     destination,
-    departureDate: text(segment.departureDate, 40),
+    departureDate: canonicalTransactionDate(observedDepartureDate) || observedDepartureDate,
     departureTime: text(segment.departureTime, 20),
     arrivalTime: text(segment.arrivalTime, 20),
     flightNumber: text(segment.flightNumber, 30).toUpperCase(),
@@ -511,6 +554,7 @@ module.exports = {
   TRANSACTION_CONTRACT_VERSION,
   canonicalDecisionOwnerKey,
   canonicalFareBrand,
+  canonicalTransactionDate,
   canonicalOutcomeKey,
   canonicalSubjectKey,
   commerceSelectionFromEpisode,

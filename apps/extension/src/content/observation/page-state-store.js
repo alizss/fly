@@ -228,6 +228,30 @@ export function createPageStateStore({
           causedByActionId
         };
       });
+      const activeOwnedValidation = next.validationIssues.filter((issue) => (
+        issue.active === true && Boolean(issue.controlId)
+      ));
+      if (activeOwnedValidation.length) {
+        next.validationIssues = next.validationIssues.map((issue) => {
+          const count = Number(issue.errorCount || 0);
+          const countOnlySummary = !issue.controlId
+            && issue.stageWide === true
+            && count > 0
+            && /^\s*\d+\s+(?:validation\s+)?errors?\s*$/i.test(String(issue.message || ""));
+          if (!countOnlySummary || activeOwnedValidation.length < count) return issue;
+          // Once exact control-owned validation accounts for the reported
+          // count, the count banner is diagnostic context, not a second
+          // blocker competing for ownership.
+          return {
+            ...issue,
+            status: "diagnostic",
+            active: false,
+            stageWide: false,
+            introducedAfterAction: true,
+            causedByActionId: String(activeActionAttemptId() || "")
+          };
+        });
+      }
       if (promoted) {
         next.errors = actionableCheckoutErrors(next.validationIssues);
         next.stageExit = buildAuthoritativeStageExit({

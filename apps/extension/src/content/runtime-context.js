@@ -72,7 +72,6 @@ function initialAgentRuntimeState(defaultApi = "") {
     lastClickSignature: "",
     repeatClickCount: 0,
     lastClickAt: 0,
-    failedLocalStrategies: [],
     skipPaidExtrasApproved: false,
     skipRoutineRunning: false,
     autopilotMode: true,
@@ -133,7 +132,7 @@ const RUNTIME_SCOPES = Object.freeze({
   transactionEvidence: { read: ["activeObservationId"] },
   perception: { read: ["lastPageMutationAt", "pageMap"] },
   foregroundSurface: { read: ["pageMap"] },
-  targeting: { write: ["failedLocalStrategies", "pageMap"] },
+  targeting: { write: ["pageMap"] },
   debug: {
     read: [
       "actionHistory", "actionLedger", "activeObservationId", "activeTurnId", "awaiting", "debugLog",

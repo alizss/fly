@@ -1,5 +1,6 @@
-const { prepareTransactionInvariants } = require("./invariants");
-const { canonicalizeUserPolicy } = require("./policy-profile");
+const { prepareTransactionInvariants, transactionFactGaps } = require("./invariants");
+const { canonicalizeUserPolicy, routineCheckoutAdmission } = require("./policy-profile");
+const { normalizeFacts } = require("./transaction-facts");
 const { withUpdate } = require("../../../packages/shared/agent-state");
 const {
   normalizeSelectedBooking,
@@ -61,7 +62,7 @@ function createSessionService(agentSessionStore) {
         409
       );
     }
-    const selectedBooking = admittedSelectedBooking
+    let selectedBooking = admittedSelectedBooking
       ? {
           observationId: admittedSelectedBooking.selectionId,
           sourceUrl: admittedSelectedBooking.sourceUrl,
@@ -94,7 +95,45 @@ function createSessionService(agentSessionStore) {
         409
       );
     }
+    if (!existing && selectedBooking) {
+      const normalizedSelectedFacts = normalizeFacts(selectedBooking.facts, {
+        observationId: selectedBooking.observationId,
+        traveler
+      });
+      const missingFacts = transactionFactGaps(normalizedSelectedFacts);
+      if (missingFacts.length) {
+        const error = requestBodyError(
+          "SELECTED_BOOKING_INVALID",
+          `The captured booking does not contain a valid route, date, traveler and total. Missing: ${missingFacts.join(", ")}.`,
+          422
+        );
+        error.details = { missingFacts };
+        throw error;
+      }
+      selectedBooking = { ...selectedBooking, facts: normalizedSelectedFacts };
+    }
     const primaryTravelerId = existing ? durableTravelerId : requestedTravelerId;
+    const userPolicy = canonicalizeUserPolicy({
+      bookingRules: clampText(traveler.booking_rules, 800),
+      baggagePreference: clampText(traveler.baggage_preference, 120),
+      paymentPreference: clampText(traveler.payment_preference, 120),
+      paidExtras: clampText(traveler.paid_extras_policy, 40),
+      standardBookingTerms: clampText(traveler.standard_booking_terms, 40),
+      marketingConsent: clampText(traveler.marketing_consent, 40),
+      paymentSubmission: "never"
+    }, traveler);
+    if (!existing) {
+      const profileAdmission = routineCheckoutAdmission({ traveler, userPolicy });
+      if (!profileAdmission.ready) {
+        const error = requestBodyError(
+          "PROFILE_CONFIGURATION_REQUIRED",
+          `The selected traveler and routine checkout policy are incomplete. Missing: ${profileAdmission.missingFacts.join(", ")}.`,
+          422
+        );
+        error.details = { missingFacts: [...profileAdmission.missingFacts] };
+        throw error;
+      }
+    }
     const state = existing || agentSessionStore.getOrCreateSession(requestedSessionId, {
       goal: clampText(body.goal || body.userIntent || "Complete checkout safely.", 500),
       travelerId: primaryTravelerId,
@@ -113,19 +152,11 @@ function createSessionService(agentSessionStore) {
       userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
       travelerId: primaryTravelerId,
       travelerIds: [...new Set([...selectedTravelerIds, primaryTravelerId].filter(Boolean))],
-      userPolicy: canonicalizeUserPolicy({
-        bookingRules: clampText(traveler.booking_rules, 800),
-        baggagePreference: clampText(traveler.baggage_preference, 120),
-        paymentPreference: clampText(traveler.payment_preference, 120)
-      }, traveler),
+      userPolicy,
       approvals: {
         ...state.approvals,
-        skipPaidExtrasApproved: Boolean(body.approvalState?.skipPaidExtrasApproved || /no paid|no extras|no add-?ons|no seat|avoid paid/i.test(traveler.booking_rules || "")),
-        // Admission has already locked the selected transaction, so starting
-        // this checkout is a transaction-bound mandate for ordinary booking
-        // terms. Exceptional declarations and optional consent remain outside
-        // this authority.
-        standardBookingTermsApproved: true,
+        skipPaidExtrasApproved: userPolicy.standingPolicy.paidExtras === "decline",
+        standardBookingTermsApproved: userPolicy.standingPolicy.standardBookingTerms === "accept",
         paymentApproved: false,
         paymentAuthorization: body.approvalState?.paymentAuthorization || state.approvals?.paymentAuthorization || null,
         priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null

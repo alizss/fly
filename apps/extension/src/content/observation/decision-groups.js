@@ -48,7 +48,6 @@ export function createDecisionGroupCompiler(dependencies) {
     model.capabilities = control.capabilities || [];
     model.operations = control.operations;
     model.actionability = control.actionability || {};
-    model.recovery = control.recovery || {};
     model.stateElementId = control.stateElementId;
     model.preferredActivationElementId = control.preferredActivationElementId;
     model.actuators = control.actuators;

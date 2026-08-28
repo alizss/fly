@@ -105,17 +105,17 @@ export function createScreenshotObservation({
     const finalControls = (map.controls || []).filter((control) => control?.controlId);
     const controlsById = new Map(finalControls.map((control) => [control.controlId, control]));
     (map.controls || []).forEach((control) => {
-      (control.recovery?.open?.regions || []).forEach((region, index) => {
+      (control.operations?.open?.regions || []).forEach((region, index) => {
         const canonicalRegion = normalizeVisualRegionContract(region, {
           observationId,
           controlId: control.controlId,
           operation: "open",
-          source: "control.recovery.open",
+          source: "control.operations.open",
           surfaceId: control.surfaceId || ""
         });
         Object.assign(region, canonicalRegion);
         addScreenshotAnnotationCandidate(groups, {
-          annotationKey: `recovery:${control.controlId}:open:${index}`,
+          annotationKey: `operation:${control.controlId}:open:${index}`,
           controlId: control.controlId,
           decisionGroupId: control.decisionGroupId || "",
           label: `${control.label || control.semantic || "Control"} open region`,
@@ -125,7 +125,7 @@ export function createScreenshotObservation({
           risk: "safe",
           prefix: "R",
           visualRegion: canonicalRegion
-        }, "control.recovery.open");
+        }, "control.operations.open");
       });
     });
     // Screenshot grounding is a projection of the finalized canonical
@@ -139,7 +139,7 @@ export function createScreenshotObservation({
       .filter((group) => {
         const control = controlsById.get(group.controlId);
         if (!control) return false;
-        if (!group.targetId) return group.source === "control.recovery.open";
+        if (!group.targetId) return group.source === "control.operations.open";
         return controlMemberNodeIds(control).includes(group.targetId)
           || group.targetId === control.controlId;
       })

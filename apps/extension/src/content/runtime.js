@@ -1,11 +1,10 @@
 import {
   authoritativeSelectedBookingFacts,
-  composeSelectedBookingContract,
   selectedBookingMissingFacts,
   validStoredSelectedBookingContract
 } from "./selected-booking.js";
 import { createAgentRuntimeContext } from "./runtime-context.js";
-import { createSelectedBookingAcquisition } from "./selected-booking-acquisition.js";
+import { createSelectedBookingAdmission } from "./selected-booking-admission.js";
 import { currentNavigationUrl } from "./navigation-identity.js";
 import { createActionTransport } from "./observation/action-transport.js";
 import { createAccessibilityProjection } from "./observation/accessibility.js";
@@ -64,8 +63,17 @@ import {
 } from "./observation/prices.js";
 
 (async function bootAirTravelWallet() {
-  if (globalThis.__ATW_RUNTIME_V1__ === true) return;
-  globalThis.__ATW_RUNTIME_V1__ = true;
+  let runtimeEpoch = "unavailable";
+  try {
+    const probe = await chrome.runtime.sendMessage({ type: "ATW_EXTENSION_RUNTIME_PROBE" });
+    runtimeEpoch = String(probe?.epoch || "unavailable");
+  } catch (_error) {
+    // Do not let an orphaned runtime from a reloaded unpacked extension keep
+    // ownership. The current injection will report its concrete failure.
+  }
+  const existingOwner = globalThis.__ATW_RUNTIME_OWNER__;
+  if (existingOwner?.epoch === runtimeEpoch && ["booting", "booted"].includes(existingOwner?.status)) return;
+  globalThis.__ATW_RUNTIME_OWNER__ = Object.freeze({ epoch: runtimeEpoch, status: "booting" });
 
   let explicitStartRequested = false;
   let runtimeReadyForExplicitStart = false;
@@ -81,7 +89,9 @@ import {
       .then((started) => sendResponse({
         ok: started !== false,
         status: started === false ? "failed" : "started",
-        code: started === false ? String(agent.sessionStartFailure?.code || "SESSION_START_FAILED") : ""
+        code: started === false ? String(agent.sessionStartFailure?.code || "SESSION_START_FAILED") : "",
+        error: started === false ? String(agent.sessionStartFailure?.message || "Checkout session could not be started.") : "",
+        details: started === false ? (agent.sessionStartFailure?.details || null) : null
       }))
       .catch((error) => sendResponse({ ok: false, status: "failed", error: error.message }));
     return true;
@@ -327,7 +337,6 @@ import {
     return chrome.storage.local.get(keys);
   }
 
-  const SELECTED_BOOKING_DURABLE_PREFIX = "atwSelectedBookingAcquisitionV1";
   let tabContextPromise = null;
 
   async function tabContextId() {
@@ -339,14 +348,12 @@ import {
     return tabContextPromise;
   }
 
-  async function selectedBookingDurableKey() {
-    const contextId = await tabContextId();
-    return contextId ? `${SELECTED_BOOKING_DURABLE_PREFIX}:${contextId}` : "";
-  }
-
   async function readCheckoutContext() {
     try {
-      const response = await chrome.runtime.sendMessage({ type: "ATW_CHECKOUT_CONTEXT" });
+      const response = await chrome.runtime.sendMessage({
+        type: "ATW_CHECKOUT_CONTEXT",
+        selectedTravelerId: String(selectedTravelerId || "")
+      });
       return response?.ok === true ? response.context || null : null;
     } catch (error) {
       return null;
@@ -372,27 +379,6 @@ import {
     } catch (error) {
       return null;
     }
-  }
-
-  async function readDurableSelectedBookingAcquisition() {
-    const key = await selectedBookingDurableKey();
-    if (!key) return null;
-    const stored = await storageGet(key);
-    return stored?.[key] || null;
-  }
-
-  async function writeDurableSelectedBookingAcquisition(acquisition = null) {
-    const key = await selectedBookingDurableKey();
-    if (!key || !acquisition) return false;
-    await chrome.storage.local.set({ [key]: acquisition });
-    return true;
-  }
-
-  async function clearDurableSelectedBookingAcquisition() {
-    const key = await selectedBookingDurableKey();
-    if (!key) return false;
-    await chrome.storage.local.remove(key);
-    return true;
   }
 
   const RESUME_KEY = "atwAgentResume";
@@ -1040,9 +1026,6 @@ import {
       expectedOutcome,
       outcome: verification
     };
-    if (!verification.ok && !destinationLoading) {
-      rememberFailedLocalStrategy(decision, agent.pageMap || buildPageMap(), verification.code || "OUTCOME_NOT_VERIFIED");
-    }
     agent.lastActionResult = result;
     agent.actionHistory.push({
       at: result.at,
@@ -2247,18 +2230,15 @@ import {
     boxesCloseEnough,
     currentSurfaceEntryForElement,
     elementDescriptor,
-    failedLocalStrategyForDecision,
     isActionableClickTarget,
     isAuthorizedCompletedChoiceSurfaceExit,
     isStrictActionSurfaceType,
     liveTargetSnapshot,
     normalizedElementLabel,
-    rememberFailedLocalStrategy,
     resolveDecisionTarget,
     shortNavLabel,
     targetBelongsToCurrentSurface,
     targetFingerprint,
-    targetLocalDispatchIdentity,
     validateResolvedTarget,
     validateVisualCoordinateTarget,
     validTargetId
@@ -2293,7 +2273,6 @@ import {
     meaningfulActionBox,
     normalizeMatchText,
     semanticChoiceType,
-    stableHash,
     surfaceMembershipForElement,
     visualRegionContractsMatch
   });
@@ -2669,23 +2648,12 @@ import {
 
   const {
     admitForStart: admitSelectedBookingForStart,
-    armSelectionCapture: armSelectedBookingCapture,
-    cancel: cancelSelectedBookingCapture,
-    capture: captureSelectedBookingFromMap,
-    discard: discardSelectedBookingAcquisition,
-    disarmSelectionCapture: disarmSelectedBookingCapture,
-    hydrate: hydrateSelectedBookingAcquisition,
-    read: readSelectedBookingAcquisition,
-    schedule: scheduleSelectedBookingCapture
-  } = createSelectedBookingAcquisition({
+    hydrate: hydrateSelectedBookingAdmission,
+    read: readSelectedBookingContract
+  } = createSelectedBookingAdmission({
     checkoutContextRead: readCheckoutContext,
     checkoutLineageBegin: beginCheckoutLineage,
-    durableClear: clearDurableSelectedBookingAcquisition,
-    durableRead: readDurableSelectedBookingAcquisition,
-    durableWrite: writeDurableSelectedBookingAcquisition,
-    isSessionActive: () => Boolean(agent.running || agent.sessionId),
-    observationHashForMap,
-    pageStateStore
+    recordEvent: (event, payload = {}) => logFlow("booking.capture", { event, ...payload })
   });
 
   const {
@@ -2714,7 +2682,6 @@ import {
     agent: runtimeScopes.session,
     compactActionResultForTransport,
     compactPageMap: (...args) => compactPageMap(...args),
-    composeSelectedBookingContract,
     logAgentEvent,
     logFlow,
     observationHashForMap,
@@ -2885,6 +2852,11 @@ import {
       return [];
     }
     const issues = [];
+    const explicitCheckboxInstruction = (value = "") => {
+      const text = compactText(value, 600).toLowerCase();
+      return /(?:please|must|need to|required to).{0,180}(?:check|select|confirm|click).{0,180}(?:checkbox|check box)/.test(text)
+        || /(?:checkbox|check box).{0,180}(?:must|required|please|confirm|agree)/.test(text);
+    };
     const referencedErrorIds = new Set(fields
       .flatMap((field) => `${field.element?.getAttribute?.("aria-errormessage") || ""} ${field.element?.getAttribute?.("aria-describedby") || ""}`.split(/\s+/))
       .filter(Boolean));
@@ -2996,6 +2968,27 @@ import {
           control = unresolvedRequiredAttestations[0];
         }
       }
+      if (!control && !logicalGroupOwned && explicitCheckboxInstruction(issueText)) {
+        const ownershipRoot = semanticSectionElement || containingSection?.element || surfaceElement || document.body;
+        const uncheckedVisibleCheckboxes = controls.filter((item) => {
+          if (item.representationLifecycle?.active === false) return false;
+          if (!/checkbox/.test(`${item.role || ""} ${item.kind || ""}`.toLowerCase())) return false;
+          if (item.selected || item.state?.checked || item.state?.selected) return false;
+          const executable = Object.values(item.operations || {}).some((capability) => (
+            capability?.actionability?.executable === true
+            && capability?.actionability?.visible !== false
+          ));
+          if (!executable) return false;
+          const stateElement = elementById(item.stateElementId || item.preferredActivationElementId);
+          return Boolean(stateElement && ownershipRoot?.contains?.(stateElement) && isVisible(stateElement));
+        });
+        // The page explicitly named the mechanical role. Exact unique DOM
+        // ownership is objective evidence; it does not decide whether the
+        // checkbox is legal, optional, or policy-authorized.
+        if (uncheckedVisibleCheckboxes.length === 1) {
+          control = uncheckedVisibleCheckboxes[0];
+        }
+      }
       const stageWide = !control && !containingSection && !inSurface && Boolean(
         element.matches?.("[role='alert'], [aria-live='assertive']")
         || /error-summary|validation-summary|alert-banner|error-banner/i.test(element.className || "")
@@ -3072,11 +3065,15 @@ import {
 
     for (const { element, text } of visibleText) {
       const normalized = text.toLowerCase();
-      if (normalized.length > 180) continue;
+      const explicitControlInstruction = explicitCheckboxInstruction(normalized);
+      if (normalized.length > 180 && !explicitControlInstruction) continue;
       if (/^\*?\s*field required\.?$/.test(normalized)) continue;
       if (/^passenger\s+\d+,\s*(adult|child|infant)\s+\*?field required\.?$/.test(normalized)) continue;
       if (/please enter your name and surname exactly/.test(normalized)) continue;
-      if (VALIDATION_TERMS.some((term) => normalized.includes(term)) && /must enter|too long|too short|invalid|not valid|please enter a valid|error|you must|required.+field|field.+required/.test(normalized)) {
+      if (explicitControlInstruction || (
+        VALIDATION_TERMS.some((term) => normalized.includes(term))
+        && /must enter|too long|too short|invalid|not valid|please enter a valid|error|you must|required.+field|field.+required/.test(normalized)
+      )) {
         addIssue(text, element);
       }
       if (issues.length >= 12) break;
@@ -3431,6 +3428,8 @@ import {
       type: surface.type || "page",
       label: surface.label || "",
       role: surface.role || "",
+      // Browser surface labels are transported as diagnostic evidence only;
+      // DecisionFrame remains the publisher of control/group meaning.
       taskHint: surface.taskHint || "",
       surfaceClass: surface.surfaceClass || "unknown",
       blocksBackground: Boolean(surface.blocksBackground),
@@ -3447,15 +3446,20 @@ import {
   }
 
   function structuralControlForTransport(control = {}, observationId = "") {
-    const machineIdentity = [
-      control.testId,
-      control.stableKey,
-      control.formId,
-      control.id
-    ].filter(Boolean).join(" ").toLowerCase();
     // Page chrome (for example itinerary edit actions) is still checkout
-    // evidence. Only Fly's own injected controls are excluded.
-    const nonPageUi = /split-notch-(?:chat-button|agent-trigger)|agent-management-(?:settings|close)|assistant-controls/.test(machineIdentity);
+    // evidence. Only controls proven to descend from Fly's exact injected
+    // root are excluded; page identifiers are never interpreted with a
+    // blacklist because an unfamiliar site may legitimately reuse them.
+    const ownedElementIds = uniqueControlIds([
+      control.preferredActivationElementId,
+      control.visibleWidgetElementId,
+      control.stateElementId,
+      control.elementId,
+      control.targetId
+    ]);
+    const nonPageUi = ownedElementIds.some((elementId) => (
+      elementById(elementId)?.closest?.("#atw-sidebar")
+    ));
     return {
       controlId: control.controlId || "",
       stableKey: control.stableKey || "",
@@ -3515,26 +3519,12 @@ import {
       // exact state/actuator graph; DecisionFrame alone owns the group's
       // subject, policy consequence, and required work.
       decisionGroupId: control.decisionGroupId || "",
+      decisionOwnerId: control.choiceContract?.decisionOwnerId || control.tightOwnerId || "",
       stateElementId: control.stateElementId || "",
       visibleWidgetElementId: control.visibleWidgetElementId || "",
       preferredActivationElementId: control.preferredActivationElementId || "",
       actuators: control.actuators || [],
       operations: control.operations || {},
-      recovery: Object.fromEntries(Object.entries(control.recovery || {}).map(([operation, recovery]) => [
-        operation,
-        recovery
-          ? {
-              ...recovery,
-              regions: (recovery.regions || []).map((region) => normalizeVisualRegionContract(region, {
-                observationId,
-                controlId: control.controlId,
-                operation,
-                source: `control.recovery.${operation}`,
-                surfaceId: control.surfaceId || ""
-              }))
-            }
-          : null
-      ])),
       visualRegions: (control.visualRegions || []).map((region) => normalizeVisualRegionContract(region, {
         observationId,
         controlId: control.controlId,
@@ -3563,40 +3553,40 @@ import {
     const memberIds = uniqueControlIds(group.alternativeControlIds || group.alternatives || [])
       .filter((controlId) => controlsById.has(controlId));
     const memberControls = memberIds.map((controlId) => controlsById.get(controlId)).filter(Boolean);
-    const exactChoiceOwnerRequired = memberControls.some((control) => {
+    const exactOwnerRequired = memberControls.some((control) => {
       const ownerId = control.choiceContract?.decisionOwnerId || "";
       const owner = ownerId ? elementById(ownerId) : null;
-      return Boolean(
-        owner
-        && (
-          owner.required === true
-          || owner.getAttribute?.("required") !== null
-          || owner.getAttribute?.("aria-required") === "true"
-        )
-      );
+      return Boolean(owner && (
+        owner.required === true
+        || owner.getAttribute?.("required") !== null
+        || owner.getAttribute?.("aria-required") === "true"
+      ));
     });
-    const requiredStateObserved = memberControls.some((control) => (
-      control.state?.required === true
-    )) || exactChoiceOwnerRequired;
+    const memberRequired = memberControls.some((control) => control.state?.required === true);
     return {
-      decisionGroupId: group.decisionGroupId || group.decisionId || group.requirementId || "",
+      // The identifier and members preserve observed topology only. Subject,
+      // consequence, policy intent, required work, and risk are deliberately
+      // absent and are published once by DecisionFrame.
+      decisionGroupId: group.decisionGroupId || group.decisionId || "",
+      decisionOwnerId: group.decisionOwnerId || "",
       surfaceId: group.surfaceId || "surface-page",
       surfaceType: group.surfaceType || "page",
       sectionId: group.sectionId || "",
       sectionLabel: group.sectionLabel || group.label || "",
-      // This is locally owned state of the exact bounded choice owner, not a
-      // business requirement or scheduler status. DecisionFrame remains the
-      // sole layer that decides what the state means and whether it creates
-      // work.
-      requiredStateObserved,
+      // Objective DOM state of the exact bounded owner. It carries no
+      // scheduler status or business conclusion; DecisionFrame alone decides
+      // whether this observed state creates required checkout work.
+      ownerState: {
+        required: exactOwnerRequired || memberRequired
+      },
       selectedControlId: memberIds.includes(group.selectedControlId) ? group.selectedControlId : "",
-      selectedLabel: group.selectedLabel || "",
+      selectedLabel: memberIds.includes(group.selectedControlId) ? (group.selectedLabel || "") : "",
       // Selected-item ownership and price are objective current-state facts.
       // Preserve them across the compact boundary so DecisionFrame can be the
       // one layer that interprets paid/free meaning and schedules correction.
       selectedEvidence: group.selectedEvidence ? {
         selected: group.selectedEvidence.selected === true,
-        selectedControlId: group.selectedEvidence.selectedControlId || "",
+        selectedControlId: memberIds.includes(group.selectedEvidence.selectedControlId) ? group.selectedEvidence.selectedControlId : "",
         ownerElementId: group.selectedEvidence.ownerElementId || "",
         source: group.selectedEvidence.source || "",
         structuredPrice: group.selectedEvidence.structuredPrice || null
@@ -3633,16 +3623,17 @@ import {
       .filter((control) => structuralControlIds.has(control.controlId))
       .map((control) => [control.controlId, control]));
     const structuralDecisionGroups = (map.decisionGroups || [])
-      .filter((group) => group.projectionKind !== "synthetic_global_payment")
       .map((group) => structuralDecisionGroupForTransport(group, sourceControlsById))
-      .filter((group) => group.alternativeControlIds.length > 0);
+      .filter((group) => group.decisionGroupId && group.alternativeControlIds.length > 0);
     return {
       observationContract: "structural-observation/v1",
       site: map.site,
       url: currentNavigationUrl(),
+      // This is a fresh browser diagnostic, not scheduler authority. The
+      // backend validates it against active structural/semantic evidence.
       step: map.step || "unknown",
       stepEvidence: {
-        source: "extension_fresh_observation",
+        source: "extension_fresh_observation_diagnostic",
         value: map.step || "unknown",
         snapshotHash: observationHashForMap(map)
       },
@@ -3656,7 +3647,6 @@ import {
       coverage: map.coverage || null,
       readiness: map.readiness || null,
       terminalEvidence: map.terminalEvidence || null,
-      stageExit: null,
       text: map.text || map.fullText,
       snapshotHash: observationHashForMap(map),
       graphIntegrity,
@@ -3868,7 +3858,6 @@ import {
     elementId,
     elementSignature,
     expectedOutcomeForDecision,
-    failedLocalStrategyForDecision,
     flashElement,
     guardedHelperAllowed,
     inferCheckoutSite,
@@ -3914,7 +3903,6 @@ import {
     stableHash,
     stopWatchingCheckoutChanges: () => stopWatchingCheckoutChanges(),
     targetFingerprint,
-    targetLocalDispatchIdentity,
     traveler,
     validateResolvedTarget,
     validateVisualCoordinateTarget,
@@ -4013,7 +4001,7 @@ import {
     escapeHtml,
     renderCursorPrompt,
     renderSidebar,
-    selectedBookingAcquisitionHtml,
+    selectedBookingAdmissionHtml,
     warningHtml
   } = createSidebarUi({
     agent: runtimeScopes.sidebar,
@@ -4027,7 +4015,7 @@ import {
     inferCheckoutSite,
     observePageOnly,
     pageStateStore,
-    readSelectedBookingAcquisition,
+    readSelectedBookingContract,
     routeSummary,
     runRiskChecks,
     saveTrip,
@@ -4082,8 +4070,6 @@ import {
 
   window.addEventListener("pagehide", () => {
     stopWatchingCheckoutChanges();
-    cancelSelectedBookingCapture();
-    disarmSelectedBookingCapture();
     saveResumeMarker();
   });
   document.addEventListener("visibilitychange", () => {
@@ -4118,7 +4104,6 @@ import {
         lastClickSignature: agent.lastClickSignature,
         repeatClickCount: agent.repeatClickCount,
         lastClickAt: agent.lastClickAt,
-        failedLocalStrategies: (agent.failedLocalStrategies || []).map((entry) => ({ ...entry })),
         running: agent.running,
         awaiting: agent.awaiting
       }),
@@ -4153,16 +4138,10 @@ import {
       authoritativeSelectedBookingFacts,
       selectedBookingMissingFacts,
       admitSelectedBookingForStart,
-      composeSelectedBookingContract,
       validStoredSelectedBookingContract,
-      captureSelectedBookingFromMap,
-      discardSelectedBookingAcquisition,
-      armSelectedBookingCapture,
-      disarmSelectedBookingCapture,
-      hydrateSelectedBookingAcquisition,
-      readSelectedBookingAcquisition,
-      scheduleSelectedBookingCapture,
+      readSelectedBookingContract,
       startAgentSession,
+      sessionStartFailure: () => agent.sessionStartFailure ? { ...agent.sessionStartFailure } : null,
       reportActionResult,
       compactSurfaceReference,
       observationTransportBytes,
@@ -4238,13 +4217,15 @@ import {
       withOverlayProgressEvidence,
       withChoiceCommitEvidence
     });
-    if (window.__ATW_TEST_BOOT__ !== true) return;
+    if (window.__ATW_TEST_BOOT__ !== true) {
+      globalThis.__ATW_RUNTIME_OWNER__ = Object.freeze({ epoch: runtimeEpoch, status: "booted" });
+      return;
+    }
   }
 
   try {
     await fetchData();
-    await hydrateSelectedBookingAcquisition();
-    armSelectedBookingCapture();
+    await hydrateSelectedBookingAdmission();
     runtimeReadyForExplicitStart = true;
     warnings = [];
     const resumeMarker = await readResumeMarker();
@@ -4265,7 +4246,9 @@ import {
       renderSidebar();
     }
     if (explicitStartRequested && !agent.running) await executeExplicitStart();
+    globalThis.__ATW_RUNTIME_OWNER__ = Object.freeze({ epoch: runtimeEpoch, status: "booted" });
   } catch (error) {
+    globalThis.__ATW_RUNTIME_OWNER__ = Object.freeze({ epoch: runtimeEpoch, status: "failed" });
     const root = document.createElement("aside");
     root.id = "atw-sidebar";
     root.innerHTML = `<div class="atw-panel"><h2>Air Travel Wallet</h2><p class="atw-muted">${error.message}</p></div>`;

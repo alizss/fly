@@ -235,15 +235,6 @@ function assessOutcomeCompatibility({
       ? { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "field_postcondition_matches_obligation" }
       : { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "does_not_complete_profile_field" };
   }
-  if ((goal?.kind) === "transaction_evidence") {
-    const exactDisclosure = expectedPostconditions.some((condition) => (
-      condition?.type === "information_surface_revealed"
-      && condition?.controlId === control.controlId
-    ));
-    return mechanicalEffect === "open_surface" && exactDisclosure
-      ? { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "exact_information_disclosure_matches_transaction_evidence_obligation" }
-      : { status: OUTCOME_COMPATIBILITY.CONTEXT_ONLY, reason: "control_cannot_reveal_the_admitted_transaction_evidence" };
-  }
   if (["decision_resolved", "optional_extra_declined"].includes(taskOutcome)) {
     if (mechanicalEffect === "select_free_option") return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "exact_safe_choice_matches_decision" };
     if (mechanicalEffect === "select_paid_option") return { status: OUTCOME_COMPATIBILITY.COMPATIBLE, reason: "exact_choice_matches_decision_subject_to_policy" };
