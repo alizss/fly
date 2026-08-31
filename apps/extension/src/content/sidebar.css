@@ -179,6 +179,54 @@
   font-weight: 750;
 }
 
+.atw-booking-admission {
+  padding: 9px 10px;
+  border: 1px solid #dce3df;
+  border-radius: 12px;
+  background: #f7faf8;
+}
+
+.atw-booking-admission.is-ready {
+  border-color: #9fd3c5;
+  background: #eff8f4;
+}
+
+.atw-booking-admission.is-missing {
+  border-color: #e9c9a4;
+  background: #fff8ef;
+}
+
+.atw-booking-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 9px;
+  margin-top: 7px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.atw-booking-facts span {
+  color: #6d7772;
+}
+
+.atw-booking-facts strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.atw-booking-scan {
+  display: grid;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px dashed #b9c5bf;
+  border-radius: 12px;
+  background: #ffffff;
+}
+
+.atw-booking-scan .atw-primary {
+  width: 100%;
+}
+
 .atw-process-diagnostics {
   border: 1px solid #dce3df;
   border-radius: 14px;

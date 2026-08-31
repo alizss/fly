@@ -153,6 +153,7 @@ export function createExecutionOrchestrator({
         semanticIntent: "wait_for_dispatched_stage_exit",
         observationId,
         actionId,
+        settlementActionId: actionId,
         expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
         reobserveRetryToken: `stage_exit:${actionId}`
       });
@@ -233,6 +234,7 @@ export function createExecutionOrchestrator({
       semanticIntent: "wait_for_dispatched_stage_exit",
       observationId,
       actionId,
+      settlementActionId: actionId,
       expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
       reobserveRetryToken: `stage_exit:${actionId}`
     });
@@ -536,15 +538,22 @@ export function createExecutionOrchestrator({
     const beforeMap = options.beforeMap || pageStateStore.observe({ reason: "before_advance" }).map;
     const governedDecision = options.decision || { action: "stop", reason: "Missing governed navigation decision." };
     const expectedOutcome = options.expectedOutcome || expectedOutcomeForDecision(governedDecision, beforeMap, element);
+    const actionId = options.actionId || agent.activeExecutionActionId || nextFlowId("act");
+    const observationId = options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "";
     addAgentMessage("assistant", `Clicking: ${label}.`);
     await showAgentThought(element, "Exit", `Act: click ${label}`, "Checking whether the page advances.");
     flashElement(element);
+    // Cross-document continuation is authorized only by this exact governed
+    // stage-exit dispatch. A durable session existing in the same tab is not
+    // sufficient evidence that an arbitrary later navigation belongs to it.
+    await saveResumeMarker({ navigationExpected: true, navigationActionId: actionId });
     const dispatch = await dispatchGovernedClickMechanic(element, governedDecision, {
-      actionId: options.actionId || agent.activeExecutionActionId || "",
-      observationId: options.observationId || agent.activeExecutionObservationId || "",
+      actionId,
+      observationId,
       operation: governedDecision.operation || ""
     });
     if (dispatch?.ok !== true) {
+      await saveResumeMarker();
       await rejectMechanicalAction(
         options.actionId || agent.activeExecutionActionId || nextFlowId("act"),
         options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "",
@@ -565,8 +574,6 @@ export function createExecutionOrchestrator({
       action: governedDecision,
       targetFingerprint: targetFingerprint(element, governedDecision)
     });
-    const actionId = options.actionId || agent.activeExecutionActionId || nextFlowId("act");
-    const observationId = options.observationId || agent.activeExecutionObservationId || agent.activeObservationId || "";
     await persistDispatchedStageExitReceipt(
       actionId,
       observationId,
@@ -633,6 +640,7 @@ export function createExecutionOrchestrator({
       await holdDispatchedStageExit(actionId, observationId, governedDecision, expectedOutcome, afterMap);
       return false;
     }
+    await saveResumeMarker();
     if (!advanced && inferCheckoutSite() !== "demo") {
       if (agent.running) {
         addAgentMessage("assistant", `${label} did not advance, so I am rescanning and sending the updated page back to the AI.`);

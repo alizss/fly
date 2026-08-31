@@ -111,15 +111,13 @@ export function createCheckoutController({
     if (!session || !agent.sessionId) {
       stopWatchingCheckoutChanges();
       agent.running = false;
-      agent.awaiting = "manual";
+      agent.awaiting = "";
       await clearResumeMarker();
-      addAgentMessage(
-        "assistant",
-        ["SELECTED_BOOKING_REQUIRED", "SELECTED_TRAVELER_REQUIRED"].includes(agent.sessionStartFailure?.code)
-          ? agent.sessionStartFailure.message
-          : `I could not establish one durable checkout session, so I stopped before planning or changing the page.${agent.sessionStartFailure?.message ? ` ${agent.sessionStartFailure.message}` : ""}`
+      setAgentActivity(
+        "Checkout not started",
+        agent.sessionStartFailure?.message || "A durable checkout session could not be established."
       );
-      renderSidebar("agent");
+      renderSidebar("ready");
       return false;
     }
     startWatchingCheckoutChanges();

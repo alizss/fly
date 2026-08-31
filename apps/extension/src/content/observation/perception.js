@@ -63,6 +63,7 @@ export function createPerceptionFacade(dependencies) {
     return {
       documentReadyState: document.readyState || "unknown",
       ariaBusy: Boolean(queryAllDeep("[aria-busy='true']").some((element) => isVisible(element))),
+      mainAriaBusy: main?.getAttribute?.("aria-busy") === "true",
       loadingIndicatorCount: loadingIndicators.length,
       loadingTextEvidence,
       mainTextLength: mainText.length,

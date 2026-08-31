@@ -1,4 +1,190 @@
 export const SELECTED_BOOKING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const DEV_BOOKING_HORIZON_DAYS = 400;
+
+function normalizedCalendarToken(value = "") {
+  return String(value || "")
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "")
+    .trim();
+}
+
+function localizedCalendarTokens(locale = "en") {
+  const locales = [...new Set([String(locale || "").trim(), "en"].filter(Boolean))];
+  const months = new Map();
+  const weekdays = new Map();
+  for (const candidateLocale of locales) {
+    for (const style of ["long", "short"]) {
+      const monthFormatter = new Intl.DateTimeFormat(candidateLocale, { month: style, timeZone: "UTC" });
+      const weekdayFormatter = new Intl.DateTimeFormat(candidateLocale, { weekday: style, timeZone: "UTC" });
+      for (let month = 0; month < 12; month += 1) {
+        months.set(normalizedCalendarToken(monthFormatter.format(new Date(Date.UTC(2024, month, 1)))), month);
+      }
+      for (let weekday = 0; weekday < 7; weekday += 1) {
+        weekdays.set(normalizedCalendarToken(weekdayFormatter.format(new Date(Date.UTC(2024, 0, 7 + weekday)))), weekday);
+      }
+    }
+  }
+  return { months, weekdays };
+}
+
+function validUtcDate(year, month, day) {
+  const date = new Date(Date.UTC(Number(year), Number(month), Number(day)));
+  return date.getUTCFullYear() === Number(year)
+    && date.getUTCMonth() === Number(month)
+    && date.getUTCDate() === Number(day)
+    ? date
+    : null;
+}
+
+function isoCalendarDate(date) {
+  return [date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()]
+    .map((value, index) => index === 0 ? String(value).padStart(4, "0") : String(value).padStart(2, "0"))
+    .join("-");
+}
+
+// This is deliberately bounded normalization, not semantic booking authority.
+// It converts a date already owned by authoritative structural itinerary
+// evidence into one calendar day. Ambiguous values remain unresolved.
+export function canonicalSelectedBookingDate(value = "", {
+  referenceAt = Date.now(),
+  notBefore = "",
+  locale = "en",
+  horizonDays = DEV_BOOKING_HORIZON_DAYS
+} = {}) {
+  const raw = String(value || "").replace(/\s+/g, " ").trim();
+  const iso = raw.match(/\b(20\d{2})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])\b/);
+  if (iso) {
+    const exact = validUtcDate(iso[1], Number(iso[2]) - 1, iso[3]);
+    return exact ? isoCalendarDate(exact) : "";
+  }
+
+  const tokens = raw.match(/[\p{L}\p{M}]+|\d{1,4}/gu) || [];
+  const normalized = tokens.map(normalizedCalendarToken).filter(Boolean);
+  const { months, weekdays } = localizedCalendarTokens(locale);
+  const monthToken = normalized.find((token) => months.has(token));
+  const dayToken = normalized.find((token) => /^\d{1,2}$/.test(token) && Number(token) >= 1 && Number(token) <= 31);
+  const yearToken = normalized.find((token) => /^20\d{2}$/.test(token));
+  const weekdayToken = normalized.find((token) => weekdays.has(token));
+  if (!monthToken || !dayToken) return "";
+
+  const month = months.get(monthToken);
+  const day = Number(dayToken);
+  if (yearToken) {
+    const exact = validUtcDate(Number(yearToken), month, day);
+    if (!exact || (weekdayToken && exact.getUTCDay() !== weekdays.get(weekdayToken))) return "";
+    return isoCalendarDate(exact);
+  }
+
+  const reference = new Date(referenceAt);
+  if (!Number.isFinite(reference.getTime())) return "";
+  const referenceDay = Date.UTC(reference.getUTCFullYear(), reference.getUTCMonth(), reference.getUTCDate());
+  const minimum = notBefore
+    ? Date.parse(`${notBefore}T00:00:00.000Z`)
+    : referenceDay - 24 * 60 * 60 * 1000;
+  const maximum = referenceDay + Math.max(1, Number(horizonDays) || DEV_BOOKING_HORIZON_DAYS) * 24 * 60 * 60 * 1000;
+  const candidates = [];
+  for (let year = reference.getUTCFullYear() - 1; year <= reference.getUTCFullYear() + 2; year += 1) {
+    const candidate = validUtcDate(year, month, day);
+    if (!candidate) continue;
+    const time = candidate.getTime();
+    if (time < minimum || time > maximum) continue;
+    if (weekdayToken && candidate.getUTCDay() !== weekdays.get(weekdayToken)) continue;
+    candidates.push(candidate);
+  }
+  return candidates.length === 1 ? isoCalendarDate(candidates[0]) : "";
+}
+
+export function testSelectedBookingFromObservedFacts(facts = null, {
+  travelerId = "",
+  referenceAt = Date.now(),
+  sourceUrl = "",
+  locale = "en"
+} = {}) {
+  const authoritativeItinerary = authoritativeSelectedBookingItinerary(facts);
+  const authoritativeTotal = authoritativeSelectedBookingTotal(facts);
+  const observedSegments = Array.isArray(facts?.itinerary?.segments)
+    ? facts.itinerary.segments
+    : [];
+  const rawSegments = Array.isArray(authoritativeItinerary?.itinerary?.segments)
+    ? authoritativeItinerary.itinerary.segments
+    : [];
+  const amount = Number(authoritativeTotal?.amount);
+  const currency = String(authoritativeTotal?.currency || "").trim().toUpperCase();
+  const selectedTravelerId = String(travelerId || "").trim();
+  const observed = {
+    itinerary: { segments: observedSegments },
+    approvedTotal: Number.isFinite(Number(facts?.totalPrice?.amount)) && String(facts?.totalPrice?.currency || facts?.currency || "").trim()
+      ? { amount: Number(facts.totalPrice.amount), currency: String(facts.totalPrice.currency || facts.currency).trim().toUpperCase() }
+      : null
+  };
+  const missingFacts = [];
+  if (!rawSegments.length) missingFacts.push("itinerary");
+  if (!Number.isFinite(amount)) missingFacts.push("approved_total");
+  if (!currency) missingFacts.push("currency");
+  if (!selectedTravelerId) missingFacts.push("selected_traveler");
+  if (missingFacts.length) {
+    return { ok: false, captured: false, code: "BOOKING_FACTS_INCOMPLETE", missingFacts, observed };
+  }
+
+  const segments = [];
+  for (const [index, segment] of rawSegments.entries()) {
+    const previous = segments.at(-1) || null;
+    const departureDate = canonicalSelectedBookingDate(segment.departureDate, {
+      referenceAt,
+      notBefore: previous?.departureDate || "",
+      locale
+    });
+    if (!departureDate) {
+      return {
+        ok: false,
+        captured: false,
+        code: "BOOKING_DATE_AMBIGUOUS",
+        missingFacts: ["departure_date"],
+        observed
+      };
+    }
+    if (previous && previous.destination !== String(segment.origin || "").trim().toUpperCase()) {
+      return {
+        ok: false,
+        captured: false,
+        code: "BOOKING_ITINERARY_AMBIGUOUS",
+        missingFacts: ["one coherent itinerary"],
+        observed
+      };
+    }
+    segments.push({
+      segmentId: String(segment.segmentId || `segment_${index + 1}`),
+      origin: String(segment.origin || "").trim().toUpperCase(),
+      destination: String(segment.destination || "").trim().toUpperCase(),
+      departureDate,
+      departureTime: String(segment.departureTime || "").trim(),
+      arrivalTime: String(segment.arrivalTime || "").trim(),
+      flightNumber: String(segment.flightNumber || "").trim().toUpperCase()
+    });
+  }
+
+  const selectedAt = new Date(referenceAt).toISOString();
+  return {
+    ok: true,
+    captured: true,
+    code: "DEV_OBSERVED_BOOKING_CONFIRMED",
+    missingFacts: [],
+    observed,
+    selectedBookingContract: {
+      contractVersion: "selected-booking/v1",
+      selectionId: `test_page_confirmation_${Date.parse(selectedAt).toString(36)}`,
+      selectedAt,
+      sourceUrl: String(sourceUrl || ""),
+      itinerary: { segments },
+      approvedTotal: { amount, currency },
+      fareBrand: String(authoritativeItinerary?.fareBrand || "").trim(),
+      travelerIds: [selectedTravelerId],
+      testOnlyPageConfirmation: true
+    }
+  };
+}
 
 function authoritativeSelectedBookingItinerary(facts = null) {
   if (!facts || facts.evidenceMode !== "typed") return null;
@@ -173,6 +359,11 @@ export function selectedBookingCompatibilityWithMap(candidate = null, map = null
 export function authoritativeSelectedBookingFacts(facts = null) {
   const itineraryFacts = authoritativeSelectedBookingItinerary(facts);
   if (!itineraryFacts) return null;
+  return authoritativeSelectedBookingTotal(facts) ? itineraryFacts : null;
+}
+
+function authoritativeSelectedBookingTotal(facts = null) {
+  if (!facts || facts.evidenceMode !== "typed") return null;
   const totalAmount = Number(facts.totalPrice?.amount);
   const totalCurrency = String(facts.totalPrice?.currency || facts.currency || "").trim().toUpperCase();
   const totalEvidence = facts.factEvidence?.totalPrice || null;
@@ -182,7 +373,7 @@ export function authoritativeSelectedBookingFacts(facts = null) {
     && totalEvidence?.authoritative === true
     && totalEvidence?.role === "booking_total"
     && Boolean(String(totalEvidence.ownerKey || "").trim());
-  return authoritativeTotal ? itineraryFacts : null;
+  return authoritativeTotal ? { amount: totalAmount, currency: totalCurrency } : null;
 }
 
 export function validStoredSelectedBookingContract(

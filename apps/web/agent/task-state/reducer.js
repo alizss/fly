@@ -1067,22 +1067,64 @@ function reduceDecisionFrame({
   const previousProfileObligation = previousGoal?.desiredStateDelta?.kind === "profile_field"
     ? previousGoal
     : null;
-  const verifiedOwnedProfileChildSurface = Boolean(
+  const previousProfileGoalIds = new Set([
+    previousProfileObligation?.id,
+    previousProfileObligation?.goalId,
+    previousProfileObligation?.obligationId,
+    previousProfileObligation?.requirementId
+  ].map(clean).filter(Boolean));
+  const verifiedProfileGoalIds = new Set([
+    authoritativeActionResult?.goalId,
+    authoritativeActionResult?.obligationId,
+    authoritativeActionResult?.requirementId,
+    verifiedAction.goalId,
+    verifiedAction.obligationId,
+    verifiedAction.requirementId
+  ].map(clean).filter(Boolean));
+  const previousProfileLogicalFieldId = clean(
+    previousProfileObligation?.logicalFieldId
+    || previousProfileObligation?.desiredStateDelta?.logicalFieldId
+    || previousProfileObligation?.successCondition?.logicalFieldId
+  );
+  const verifiedProfileLogicalFieldId = clean(
+    verifiedExpectedOutcome.logicalFieldId
+    || authoritativeActionResult?.logicalFieldId
+    || verifiedAction.logicalFieldId
+  );
+  const previousProfileOwnerId = semanticIdentity(previousProfileObligation || {});
+  const verifiedProfileOwnerId = clean(
+    semanticIdentity(authoritativeActionResult || {})
+    || semanticIdentity(verifiedAction)
+  );
+  const actionOwnsPreviousProfileObligation = Boolean(
+    (previousProfileOwnerId && verifiedProfileOwnerId && previousProfileOwnerId === verifiedProfileOwnerId)
+    || (previousProfileLogicalFieldId && verifiedProfileLogicalFieldId === previousProfileLogicalFieldId)
+    || [...verifiedProfileGoalIds].some((goalId) => previousProfileGoalIds.has(goalId))
+    || [
+      ...(previousProfileObligation?.admittedControlIds || []),
+      previousProfileObligation?.controlId,
+      previousProfileObligation?.successCondition?.controlId
+    ].map(clean).filter(Boolean).includes(clean(verifiedExpectedOutcome.controlId || verifiedAction.controlId))
+  );
+  const verifiedMechanicalEffect = clean(
+    authoritativeActionResult?.mechanicalEffect
+    || verifiedAction.mechanicalEffect
+    || verifiedAction.affordance?.physicalEffect
+  );
+  const intermediateProfileInteraction = Boolean(
+    verifiedExpectedOutcome.type === "options_surface_appeared"
+    || verifiedMechanicalEffect === "filter_options"
+    || (
+      verifiedExpectedOutcome.type === "normalized_value_changed"
+      && verifiedExpectedOutcome.commitRequirement === "logical_component_committed"
+    )
+  );
+  const verifiedOwnedProfileInteraction = Boolean(
     foreground
     && previousProfileObligation
     && verifiedActionSucceeded(authoritativeActionResult)
-    && verifiedExpectedOutcome.type === "options_surface_appeared"
-    && (
-      [
-        ...(previousProfileObligation.admittedControlIds || []),
-        previousProfileObligation.successCondition?.controlId
-      ].filter(Boolean).includes(verifiedExpectedOutcome.controlId || verifiedAction.controlId)
-      || (
-        !verifiedExpectedOutcome.controlId
-        && !verifiedAction.controlId
-        && verifiedAction.goalId === previousProfileObligation.id
-      )
-    )
+    && actionOwnsPreviousProfileObligation
+    && intermediateProfileInteraction
   );
   let currentWork = null;
   let ambiguityReason = "";
@@ -1099,10 +1141,10 @@ function reduceDecisionFrame({
         : transactionReviewBlocked
           ? "transaction_review_incomplete"
           : "payment_review_boundary";
-    } else if (verifiedOwnedProfileChildSurface) {
-      // Opening an owned custom choice changes mechanics, not the semantic
-      // obligation. Keep the exact v3 obligation until its desired value is
-      // causally committed or recovery is exhausted.
+    } else if (verifiedOwnedProfileInteraction) {
+      // Opening, filtering, or revealing an owned custom choice changes only
+      // the available mechanics. Preserve the exact semantic obligation until
+      // the logical component's state owner commits the desired value.
       currentWork = previousProfileObligation;
     } else if (profileGoal && !lockedActiveDecision && (!foreground || foregroundOwnsProfileGoal)) {
       currentWork = Object.freeze(profileGoal);

@@ -141,17 +141,98 @@
     return amount == null || !currency ? null : { amount, currency, labeled: Boolean(labeled) };
   }
 
+  function directText(node) {
+    return clean([...(node?.childNodes || [])]
+      .filter((child) => child.nodeType === Node.TEXT_NODE)
+      .map((child) => child.textContent || "")
+      .join(" "));
+  }
+
+  function boundedText(node) {
+    return clean([...(node?.childNodes || [])]
+      .map((child) => child.nodeType === Node.TEXT_NODE
+        ? child.textContent || ""
+        : visibleText(child))
+      .join(" "));
+  }
+
+  function ownedSummaryMoney(scope) {
+    const exactTotalCue = /^(?:amount to pay|grand total|booking total|trip total|order total|total(?:\s+(?:amount|price)(?:\s+for\s+\d+\s+passengers?)?)?)\b/i;
+    const candidates = [];
+    for (const cue of [...scope.querySelectorAll?.("strong, b, dt, th, label, span, div") || []].slice(0, 500)) {
+      if (cue.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]")) continue;
+      const cueText = directText(cue);
+      if (!exactTotalCue.test(cueText) || /^total\s+duration\b/i.test(cueText)) continue;
+      let owner = cue;
+      for (let depth = 0; owner && depth < 4 && scope.contains(owner); depth += 1, owner = owner.parentElement) {
+        const ownerText = boundedText(owner);
+        if (!ownerText || ownerText.length > 320 || /^total\s+duration\b/i.test(ownerText)) continue;
+        const money = moneyFromText(ownerText);
+        if (!money) continue;
+        candidates.push({ ...money, labeled: true, textLength: ownerText.length });
+        break;
+      }
+    }
+    const selected = candidates.sort((left, right) => left.textLength - right.textLength)[0] || null;
+    if (!selected) return null;
+    const { textLength, ...money } = selected;
+    return money;
+  }
+
   function explicitMoney(node) {
     const amount = numericAmount(attribute(node, ["data-total", "data-total-price", "data-price", "data-amount"]));
     const rawCurrency = attribute(node, ["data-currency", "data-price-currency"]).toUpperCase();
     const currency = CURRENCY_SYMBOLS[rawCurrency] || rawCurrency;
     if (amount != null && currency) return { amount, currency, labeled: true };
-    const totalNodes = [...node.querySelectorAll?.("[data-total], [data-total-price], [data-amount], [aria-label*='total' i], [class*='total' i], [id*='total' i]") || []];
+    const totalNodes = [...node.querySelectorAll?.("[data-total], [data-total-price], [data-amount], [aria-label*='total' i], [class*='total' i], [id*='total' i]") || []]
+      .filter((candidate) => !candidate.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]"));
     for (const totalNode of totalNodes.slice(0, 24)) {
       const candidate = moneyFromText(`${attribute(totalNode, ["aria-label"])} ${visibleText(totalNode)}`);
       if (candidate) return { ...candidate, labeled: true };
     }
+    const owned = ownedSummaryMoney(node);
+    if (owned) return owned;
+    const structured = structuredMoneyFromControls(node);
+    if (structured) return structured;
     return moneyFromText(visibleText(node));
+  }
+
+  function normalizedControlKey(node) {
+    return clean(attribute(node, ["name", "id", "data-field", "data-testid"]))
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+  }
+
+  function controlValue(node) {
+    return clean(node?.value ?? attribute(node, ["value", "content", "data-value"]));
+  }
+
+  function exactStructuredControlValue(scope, patterns = []) {
+    const controls = [...scope.querySelectorAll?.("input, select, textarea, meta[content], [data-field][data-value]") || []].slice(0, 300);
+    for (const control of controls) {
+      const key = normalizedControlKey(control);
+      if (patterns.some((pattern) => pattern.test(key))) {
+        const value = controlValue(control);
+        if (value) return value;
+      }
+    }
+    return "";
+  }
+
+  function structuredMoneyFromControls(scope) {
+    const rawAmount = exactStructuredControlValue(scope, [
+      /^(?:booking_)?total(?:_price|_amount)?$/,
+      /^(?:grand|trip|fare)_total$/,
+      /^(?:approved|final)_total(?:_price|_amount)?$/
+    ]);
+    const rawCurrency = exactStructuredControlValue(scope, [
+      /^(?:booking_)?currency(?:_code)?$/,
+      /^(?:price|total)_currency$/
+    ]).toUpperCase();
+    const amount = numericAmount(rawAmount);
+    const currency = CURRENCY_SYMBOLS[rawCurrency] || rawCurrency;
+    return amount == null || !currency ? null : { amount, currency, labeled: true };
   }
 
   function segmentFromNode(node, index = 0) {
@@ -214,9 +295,44 @@
     return segments;
   }
 
+  function structuredSegmentsFromControls(scope) {
+    const origin = airportCode(exactStructuredControlValue(scope, [
+      /^(?:origin|from|departure_airport|departure_airport_code|departure_location|b_location_1)$/
+    ]));
+    const destination = airportCode(exactStructuredControlValue(scope, [
+      /^(?:destination|to|arrival_airport|arrival_airport_code|arrival_location|e_location_1)$/
+    ]));
+    const departure = isoDate(exactStructuredControlValue(scope, [
+      /^(?:departure|depart|outbound)(?:_flight)?_date$/,
+      /^(?:flight_date|b_date_1)$/
+    ]));
+    if (!origin || !destination || origin === destination || !departure) return [];
+    const segments = [{
+      segmentId: `segment_1_${origin}_${destination}_${departure}`,
+      origin,
+      destination,
+      departureDate: departure
+    }];
+    const returnDate = isoDate(exactStructuredControlValue(scope, [
+      /^(?:return|inbound)(?:_flight)?_date$/,
+      /^b_date_2$/
+    ]));
+    if (returnDate) {
+      segments.push({
+        segmentId: `segment_2_${destination}_${origin}_${returnDate}`,
+        origin: destination,
+        destination: origin,
+        departureDate: returnDate
+      });
+    }
+    return segments;
+  }
+
   function segmentsFromScope(scope) {
     const urlSegments = structuredSegmentsFromUrl();
     if (urlSegments.length) return urlSegments;
+    const controlSegments = structuredSegmentsFromControls(scope);
+    if (controlSegments.length) return controlSegments;
     const candidates = [
       ...scope.querySelectorAll?.("[data-flight], [data-segment], [data-origin], [data-origin-airport], article, [role='row']") || []
     ].slice(0, 80);
@@ -247,9 +363,13 @@
   }
 
   function candidateFromScope(scope, target) {
+    const text = visibleText(scope);
     const segments = segmentsFromScope(scope);
     const total = explicitMoney(scope);
-    const text = visibleText(scope);
+    const observedRoute = segments[0]
+      ? { origin: segments[0].origin, destination: segments[0].destination }
+      : explicitRoute(scope, text);
+    const observedDepartureDate = segments[0]?.departureDate || departureDate(scope, text);
     const score = (segments.length * 5)
       + (total ? (total.labeled ? 5 : 2) : 0)
       + (/selected|your flight|trip summary|booking summary|fare|itinerary/i.test(text) ? 2 : 0)
@@ -258,6 +378,8 @@
       scope,
       segments,
       total,
+      observedRoute,
+      observedDepartureDate,
       complete: Boolean(segments.length && total),
       score,
       containsTarget: scope.contains(target)
@@ -294,31 +416,45 @@
     }
   }
 
-  async function publishSelection(target, phase, gestureId) {
-    if (!explicitSelectionGesture(target)) return;
-    const candidates = scopesFor(target)
-      .map((scope) => candidateFromScope(scope, target))
-      .filter(Boolean)
-      .sort((a, b) => Number(b.complete) - Number(a.complete)
-        || b.score - a.score
-        || visibleText(a.scope).length - visibleText(b.scope).length);
-    const selected = candidates[0];
+  function candidateSummary(selected) {
+    return {
+      itinerary: { segments: selected?.segments || [] },
+      observedRoute: selected?.observedRoute || null,
+      observedDepartureDate: selected?.observedDepartureDate || "",
+      approvedTotal: selected?.total
+        ? { amount: selected.total.amount, currency: selected.total.currency }
+        : null
+    };
+  }
+
+  async function publishCandidate(selected, phase, gestureId, evidence = {}) {
     const missingFacts = [];
-    if (!selected?.segments?.length) missingFacts.push("itinerary");
+    if (!selected?.segments?.length) {
+      if (selected?.observedRoute && !selected?.observedDepartureDate) missingFacts.push("departure_date");
+      else missingFacts.push("itinerary");
+    }
     if (!selected?.total) missingFacts.push("approved_total", "currency");
     if (!selected?.complete) {
-      chrome.runtime.sendMessage({
+      const result = await chrome.runtime.sendMessage({
         type: "ATW_BOOKING_SELECTION_CANDIDATE",
         phase,
+        gestureId,
         missingFacts,
         evidence: {
           producerEpoch: runtimeEpoch,
-          explicitSelectionGesture: true,
+          explicitSelectionGesture: evidence.explicitSelectionGesture === true,
           itineraryObserved: Boolean(selected?.segments?.length),
           totalObserved: Boolean(selected?.total)
         }
-      }).catch(() => undefined);
-      return;
+      }).catch(() => null);
+      return {
+        ok: false,
+        captured: false,
+        code: "BOOKING_FACTS_INCOMPLETE",
+        missingFacts,
+        observed: candidateSummary(selected),
+        transportOk: result?.ok === true
+      };
     }
     const now = new Date().toISOString();
     const sourceSegments = structuredSegmentsFromUrl();
@@ -339,24 +475,50 @@
     };
     const travelerId = selectedTravelerId || clean((await chrome.storage.local.get(["selectedTravelerId"])).selectedTravelerId);
     if (!travelerId) {
-      chrome.runtime.sendMessage({
+      await chrome.runtime.sendMessage({
         type: "ATW_BOOKING_SELECTION_CANDIDATE",
         phase,
+        gestureId,
         missingFacts: ["selected_traveler"],
         selectedBookingCandidate
-      }).catch(() => undefined);
-      return;
+      }).catch(() => null);
+      return {
+        ok: false,
+        captured: false,
+        code: "SELECTED_TRAVELER_MISSING",
+        missingFacts: ["selected_traveler"],
+        observed: candidateSummary(selected)
+      };
     }
     const contract = {
       ...selectedBookingCandidate,
       contractVersion: "selected-booking/v1",
       travelerIds: [travelerId]
     };
-    chrome.runtime.sendMessage({
+    const result = await chrome.runtime.sendMessage({
       type: "ATW_BOOKING_SELECTION_CAPTURED",
       phase,
       selectedBookingContract: contract
-    }).catch(() => undefined);
+    }).catch(() => null);
+    return {
+      ok: result?.ok === true,
+      captured: result?.ok === true,
+      code: result?.ok === true ? "BOOKING_CAPTURED" : (result?.code || "BOOKING_CAPTURE_FAILED"),
+      missingFacts: [],
+      observed: candidateSummary(selected),
+      selectedBookingContract: result?.ok === true ? contract : null
+    };
+  }
+
+  async function publishSelection(target, phase, gestureId) {
+    if (!explicitSelectionGesture(target)) return null;
+    const candidates = scopesFor(target)
+      .map((scope) => candidateFromScope(scope, target))
+      .filter(Boolean)
+      .sort((a, b) => Number(b.complete) - Number(a.complete)
+        || b.score - a.score
+        || visibleText(a.scope).length - visibleText(b.scope).length);
+    return publishCandidate(candidates[0], phase, gestureId, { explicitSelectionGesture: true });
   }
 
   document.addEventListener("click", (event) => {

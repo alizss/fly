@@ -174,7 +174,7 @@ const RUNTIME_SCOPES = Object.freeze({
   sidebar: {
     read: [
       "awaiting", "currentAction", "currentReason", "messages", "observerTab", "pageMap", "pageUnderstanding",
-      "processDiagnostics", "reasoningLog", "running", "skipRoutineRunning", "userGoal"
+      "processDiagnostics", "reasoningLog", "running", "sessionId", "sessionStartFailure", "skipRoutineRunning", "userGoal"
     ]
   }
 });

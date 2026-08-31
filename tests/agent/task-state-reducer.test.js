@@ -332,9 +332,7 @@ test("a Turkish-shaped phone-code opener keeps surface continuity when child opt
     traveler
   });
 
-  assert.equal(state.currentGoal, null);
-  assert.equal(state.ambiguityReason, "unknown_foreground_surface");
-  return;
+  assert.equal(state.currentGoal?.semanticType, "phone_country_code");
 
   const candidateSet = buildCurrentCandidateSet({
     goal: state.currentGoal,
@@ -464,31 +462,59 @@ test("a Turkish-shaped phone-code opener keeps surface continuity when child opt
   );
   assert.equal(boundRecovery.surfaceId, undefined);
   assert.equal(boundRecovery.targetSnapshot.surfaceId, surfaceId);
-  const adaptiveChecks = [];
-  assert.equal(
-    governorPrivate.adaptiveEnvelopeFailure(boundRecovery, { taskState: state }, offscreenObservation, adaptiveChecks),
-    null
-  );
-  assert.equal(adaptiveChecks.at(-1).code, "ADAPTIVE_ENVELOPE_VALID");
   assert.equal(
     governorPrivate.validateCanonicalTarget(boundRecovery, offscreenObservation, []).code,
     "TARGET_OUT_OF_VIEW"
   );
 
+  // Some portal widgets remove the opener and expose the query/option in
+  // separate DOM groups. The field obligation must survive that structural
+  // discontinuity; ownership comes from the leased action, not DOM ancestry.
+  const detachedFilteredObservation = {
+    ...observation,
+    observationId: "obs_country_options_filtered",
+    page: {
+      ...observation.page,
+      controls: [slovenia, turkey, paid],
+      fields: [],
+      decisionGroups: [
+        { decisionGroupId: "dg_search_query", memberControlIds: [] },
+        { decisionGroupId: "dg_visible_options", memberControlIds: [slovenia.controlId, turkey.controlId] }
+      ]
+    }
+  };
   const continued = reduceTaskState({
     previousTaskState: state,
-    observation: { ...observation, observationId: "obs_country_options_filtered" },
+    observation: detachedFilteredObservation,
     previousActionResult: {
       dispatched: true,
       verified: true,
       expectedOutcomeObserved: true,
       postconditionSatisfied: true,
-      action: { goalId: state.currentGoal.goalId, operation: "type", value: "386" },
-      expectedOutcome: { type: "normalized_value_changed" }
+      action: {
+        goalId: state.currentGoal.goalId,
+        operation: "type",
+        mechanicalEffect: "filter_options",
+        value: "386"
+      },
+      expectedOutcome: {
+        type: "normalized_value_changed",
+        logicalFieldId: state.currentGoal.logicalFieldId,
+        semanticType: "phone_country_code",
+        commitRequirement: "logical_component_committed"
+      }
     },
     traveler
   });
-  assert.equal(continued.currentGoal, null);
+  assert.equal(continued.currentGoal?.semanticType, "phone_country_code");
+  const continuedCandidates = buildCurrentCandidateSet({
+    goal: continued.currentGoal,
+    observation: detachedFilteredObservation,
+    traveler,
+    state: { taskState: continued, approvals: {} }
+  });
+  assert.equal(continuedCandidates.candidates[0]?.controlId, slovenia.controlId);
+  assert.ok(["activate", "choose"].includes(continuedCandidates.candidates[0]?.operation));
 });
 
 test("a GoToGate-shaped editable country code keeps its obligation when typing reveals the exact option", () => {
@@ -645,9 +671,7 @@ test("a GoToGate-shaped editable country code keeps its obligation when typing r
     traveler
   });
 
-  assert.equal(state.currentGoal, null);
-  assert.equal(state.ambiguityReason, "unknown_foreground_surface");
-  return;
+  assert.equal(state.currentGoal?.semanticType, "phone_country_code");
 
   const candidateSet = buildCurrentCandidateSet({
     goal: state.currentGoal,
@@ -4883,6 +4907,23 @@ test("profile completion accepts only exact success contracts", () => {
     outcome: { ok: true, code: "NORMALIZED_VALUE_VERIFIED", evidence: {} }
   };
   assert.ok(verifiedProfileComponentFromActionResult(base, "obs_exact_profile_contract"));
+  assert.equal(verifiedProfileComponentFromActionResult({
+    ...base,
+    action: {
+      ...base.action,
+      mechanicalEffect: "filter_options",
+      value: "386"
+    },
+    expectedOutcome: {
+      ...base.expectedOutcome,
+      logicalFieldId: "lf_phone_country_code",
+      semanticType: "phone_country_code",
+      componentRole: "country_code",
+      expectedNormalizedValue: "386",
+      expectedCanonicalValue: "+386",
+      commitRequirement: "logical_component_committed"
+    }
+  }, "obs_query_filtered_options"), null);
   for (const exactContract of [
     {
       type: "logical_component_committed",

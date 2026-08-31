@@ -107,6 +107,14 @@ export function createTransactionEvidenceCompiler(dependencies) {
     const visibleElementText = (element, limit = 720) => String(
       element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || ""
     ).replace(/\s+/g, " ").trim().slice(0, limit);
+    const boundedElementText = (element, limit = 720) => Array.from(element?.childNodes || [])
+      .map((node) => node.nodeType === Node.TEXT_NODE
+        ? node.textContent || ""
+        : visibleElementText(node, limit))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, limit);
     const itineraryCommand = (element) => /\b(?:view|show|open)?\s*(?:full\s+)?(?:flight\s+)?(?:itinerary|trip details|travel details|flight details)\b/i.test(
       String(element?.innerText || element?.textContent || element?.getAttribute?.("aria-label") || "")
     );
@@ -549,6 +557,7 @@ export function createTransactionEvidenceCompiler(dependencies) {
       const candidates = [];
       for (const match of normalized.matchAll(cue)) {
         const bounded = normalized.slice(match.index, match.index + 180);
+        if (/^total\s+duration\b/i.test(bounded)) continue;
         const found = structuredPricesFromText(bounded)[0] || null;
         if (found) candidates.push({
           ...found,
@@ -558,7 +567,37 @@ export function createTransactionEvidenceCompiler(dependencies) {
       }
       return candidates.at(-1) || null;
     };
-    const stronglyOwnedBookingTotal = bookingTotalFromText(text);
+    const bookingTotalFromOwnedStructure = () => {
+      const candidates = [];
+      const exactTotalCue = /^(?:amount to pay|grand total|booking total|trip total|order total|total(?:\s+(?:amount|price)(?:\s+for\s+\d+\s+passengers?)?)?)\b/i;
+      for (const element of queryAllDeep("strong, b, dt, th, label, span, div")) {
+        if (!isVisible(element)) continue;
+        if (element.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]")) continue;
+        const direct = directElementText(element);
+        if (!exactTotalCue.test(direct) || /^total\s+duration\b/i.test(direct)) continue;
+        let owner = element;
+        for (let depth = 0; owner && depth < 4; depth += 1, owner = owner.parentElement) {
+          if (!isVisible(owner)) continue;
+          const ownerText = normalizedMonetaryText(boundedElementText(owner, 320));
+          if (!ownerText || ownerText.length > 320 || /^total\s+duration\b/i.test(ownerText)) continue;
+          const ownedPrices = structuredPricesFromText(ownerText);
+          if (ownedPrices.length !== 1) continue;
+          const found = ownedPrices[0];
+          candidates.push({
+            ...found,
+            ownerKey: stableHash(`owned-booking-total:${ownerText}`),
+            qualification: "exact_owned_total",
+            textLength: ownerText.length
+          });
+          break;
+        }
+      }
+      const selected = candidates.sort((left, right) => left.textLength - right.textLength)[0] || null;
+      if (!selected) return null;
+      const { textLength, ...bookingTotal } = selected;
+      return bookingTotal;
+    };
+    const stronglyOwnedBookingTotal = bookingTotalFromOwnedStructure() || bookingTotalFromText(text);
     const coherentSelectedBooking = completeness === "complete"
       && segments.length > 0
       && segments.every((segment) => segment.origin && segment.destination && segment.departureDate);

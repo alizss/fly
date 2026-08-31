@@ -48,6 +48,7 @@ function observation({
       readiness: {
         documentReadyState: loading ? "loading" : "complete",
         ariaBusy: loading,
+        mainAriaBusy: loading,
         loadingIndicatorCount: loading ? 1 : 0,
         loadingTextEvidence: loading,
         stableForMs
@@ -108,8 +109,11 @@ test("readiness does not infer traveler, seats, extras, or payment meaning", () 
 
 test("a dispatched action hands off immediately when the fresh surface is mechanically usable", () => {
   const actionResult = dispatchedNavigation();
+  const sourceUrl = "https://example.test/passengers";
+  const destinationUrl = "https://example.test/extras";
   const settling = observation({
     id: "obs_settling",
+    url: destinationUrl,
     stableForMs: 120,
     controls: [{ controlId: "header", operations: operation("header_node") }],
     lastActionResult: actionResult
@@ -121,7 +125,12 @@ test("a dispatched action hands off immediately when the fresh surface is mechan
       status: "dispatched",
       dispatched: true,
       closed: false,
-      awaitingDestination: true
+      awaitingDestination: true,
+      origin: {
+        url: sourceUrl,
+        surfaceId: "surface-page",
+        progressFingerprint: JSON.stringify({})
+      }
     }
   };
   const usable = classifyObservationReadiness({ observation: settling, navigationContext, nowMs: 1_000 });
@@ -130,6 +139,7 @@ test("a dispatched action hands off immediately when the fresh surface is mechan
 
   const stable = observation({
     id: "obs_stable",
+    url: destinationUrl,
     stableForMs: 800,
     controls: [{ controlId: "header", operations: operation("header_node") }],
     lastActionResult: actionResult
@@ -146,7 +156,13 @@ test("a dispatched action hands off immediately when the fresh surface is mechan
 
 test("a dispatched empty surface is temporarily incomplete until its deadline", () => {
   const result = dispatchedNavigation("act_empty");
-  const current = observation({ id: "obs_empty", controls: [], stableForMs: 900, lastActionResult: result });
+  const current = observation({
+    id: "obs_empty",
+    url: "https://example.test/destination",
+    controls: [],
+    stableForMs: 900,
+    lastActionResult: result
+  });
   const navigationContext = {
     result,
     lifecycle: {
@@ -154,7 +170,12 @@ test("a dispatched empty surface is temporarily incomplete until its deadline", 
       status: "waiting_for_destination",
       dispatched: true,
       closed: false,
-      awaitingDestination: true
+      awaitingDestination: true,
+      origin: {
+        url: "https://example.test/source",
+        surfaceId: "surface-page",
+        progressFingerprint: JSON.stringify({})
+      }
     }
   };
   const transient = classifyObservationReadiness({
@@ -179,7 +200,13 @@ test("a dispatched empty surface is temporarily incomplete until its deadline", 
 
 test("genuine loading is bounded and degrades at the mechanical deadline", () => {
   const result = dispatchedNavigation("act_loading");
-  const current = observation({ id: "obs_loading", controls: [], loading: true, lastActionResult: result });
+  const current = observation({
+    id: "obs_loading",
+    url: "https://example.test/destination",
+    controls: [],
+    loading: true,
+    lastActionResult: result
+  });
   const navigationContext = {
     result,
     lifecycle: {
@@ -187,7 +214,12 @@ test("genuine loading is bounded and degrades at the mechanical deadline", () =>
       status: "waiting_for_destination",
       dispatched: true,
       closed: false,
-      awaitingDestination: true
+      awaitingDestination: true,
+      origin: {
+        url: "https://example.test/source",
+        surfaceId: "surface-page",
+        progressFingerprint: JSON.stringify({})
+      }
     }
   };
   const transient = classifyObservationReadiness({
@@ -208,6 +240,136 @@ test("genuine loading is bounded and degrades at the mechanical deadline", () =>
   });
   assert.equal(degraded.classification, READINESS.DEGRADED);
   assert.equal(degraded.handoffEligible, true);
+});
+
+test("the browser settlement deadline is authoritative on the first backend loading observation", () => {
+  const result = dispatchedNavigation("act_browser_deadline");
+  const current = observation({
+    id: "obs_browser_deadline",
+    controls: [],
+    loading: true,
+    lastActionResult: result
+  });
+  const browserDeadlineAt = 41_000;
+  const browserStartedAt = 21_000;
+  const readiness = classifyObservationReadiness({
+    observation: current,
+    navigationContext: {
+      result,
+      lifecycle: {
+        actionId: "act_browser_deadline",
+        status: "waiting_for_destination",
+        dispatched: true,
+        closed: false,
+        awaitingDestination: true
+      }
+    },
+    readinessStartedAt: browserStartedAt,
+    readinessDeadlineAt: browserDeadlineAt,
+    nowMs: 40_500,
+    readinessTimeoutMs: 20_000
+  });
+
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.startedAt, browserStartedAt);
+  assert.equal(readiness.deadlineAt, browserDeadlineAt);
+  assert.equal(readiness.remainingMs, 500);
+});
+
+test("a later readiness observation cannot extend the original settlement deadline", () => {
+  const result = dispatchedNavigation("act_immutable_deadline");
+  const current = observation({
+    id: "obs_immutable_deadline",
+    controls: [],
+    loading: true,
+    lastActionResult: result
+  });
+  const navigationContext = {
+    result,
+    lifecycle: {
+      actionId: "act_immutable_deadline",
+      status: "waiting_for_destination",
+      dispatched: true,
+      closed: false,
+      awaitingDestination: true
+    }
+  };
+  const first = classifyObservationReadiness({
+    observation: current,
+    navigationContext,
+    readinessDeadlineAt: 51_000,
+    nowMs: 50_000
+  });
+  const redirected = observation({
+    id: "obs_immutable_deadline_redirected",
+    url: "https://payments.example.test/hosted",
+    controls: [],
+    loading: true,
+    lastActionResult: result
+  });
+  const repeated = classifyObservationReadiness({
+    observation: redirected,
+    previousReadiness: first,
+    navigationContext,
+    readinessDeadlineAt: 70_000,
+    nowMs: 50_500
+  });
+
+  assert.equal(repeated.deadlineAt, 51_000);
+  assert.equal(repeated.startedAt, first.startedAt);
+  assert.equal(repeated.attempts, 2);
+});
+
+test("an unrelated busy indicator cannot block an executable settled surface", () => {
+  const current = observation({
+    id: "obs_local_spinner",
+    controls: [{ controlId: "continue", operations: operation("continue_node") }],
+    loading: true
+  });
+  current.page.readiness.documentReadyState = "complete";
+  current.page.readiness.mainAriaBusy = false;
+  current.page.readiness.loadingTextEvidence = false;
+
+  const readiness = classifyObservationReadiness({ observation: current, nowMs: 60_000 });
+  assert.equal(readiness.classification, READINESS.READY);
+  assert.equal(readiness.evidence.loadingSignal, true);
+  assert.equal(readiness.evidence.explicitLoading, false);
+  assert.equal(readiness.evidence.mechanicallyUsable, true);
+});
+
+test("loading remains blocking while the exact stage exit is unsettled", () => {
+  const result = dispatchedNavigation("act_pending_with_controls");
+  const current = observation({
+    id: "obs_pending_with_controls",
+    controls: [{ controlId: "source_confirm", operations: operation("source_confirm_node") }],
+    loading: true,
+    lastActionResult: {
+      ...result,
+      actionOutcome: {
+        status: "DESTINATION_LOADING",
+        code: "NAVIGATION_TRANSITION_PENDING"
+      }
+    }
+  });
+  current.page.readiness.documentReadyState = "complete";
+
+  const readiness = classifyObservationReadiness({
+    observation: current,
+    navigationContext: {
+      result: current.lastActionResult,
+      lifecycle: {
+        actionId: "act_pending_with_controls",
+        status: "waiting_for_destination",
+        dispatched: true,
+        closed: false,
+        awaitingDestination: true
+      }
+    },
+    nowMs: 70_000
+  });
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.evidence.pendingSettlement, true);
+  assert.equal(readiness.evidence.explicitLoading, true);
 });
 
 test("a prior transient state cannot perpetuate waiting after the action closes", () => {
@@ -234,7 +396,7 @@ test("a prior transient state cannot perpetuate waiting after the action closes"
   assert.equal(readiness.attempts, 0);
 });
 
-test("navigation lifecycle closes on a usable frame without inventing destination progress", () => {
+test("an unchanged usable source page cannot close or replan an unsettled navigation", () => {
   const action = {
     id: "act_advance",
     observationId: "obs_before",
@@ -248,7 +410,14 @@ test("navigation lifecycle closes on a usable frame without inventing destinatio
     id: "obs_before",
     controls: [{ controlId: "next", operations: operation("next_node") }]
   });
-  const result = { ...dispatchedNavigation(action.id), action };
+  const result = {
+    ...dispatchedNavigation(action.id),
+    action,
+    actionOutcome: {
+      status: "DESTINATION_LOADING",
+      code: "NAVIGATION_TRANSITION_PENDING"
+    }
+  };
   const shell = observation({
     id: "obs_shell",
     stableForMs: 100,
@@ -256,15 +425,135 @@ test("navigation lifecycle closes on a usable frame without inventing destinatio
     lastActionResult: result
   });
   const lifecycle = approveActionLifecycle(proposeActionLifecycle(action, before));
-  const navigationContext = { result, lifecycle: { ...lifecycle, dispatched: true, status: "dispatched" } };
-  const ready = classifyObservationReadiness({ observation: shell, navigationContext });
-  const closed = advanceActionLifecycle({
+  const navigationContext = {
+    result,
+    lifecycle: {
+      ...lifecycle,
+      dispatched: true,
+      status: "waiting_for_destination",
+      awaitingDestination: true
+    }
+  };
+  const readiness = classifyObservationReadiness({ observation: shell, navigationContext });
+  const waiting = advanceActionLifecycle({
     state: { lastAction: action, actionLifecycle: lifecycle },
     observation: shell,
     previousObservation: before,
-    observationReadiness: ready
+    observationReadiness: readiness
   });
-  assert.equal(ready.classification, READINESS.READY);
-  assert.equal(closed.transition.actionOutcome.status, "NO_RESULT");
-  assert.equal(closed.lifecycle.closed, true);
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.reason, "NAVIGATION_ACTION_STILL_UNSETTLED");
+  assert.equal(readiness.evidence.mechanicallyUsable, true);
+  assert.equal(readiness.evidence.destinationChange.changed, false);
+  assert.equal(waiting.transition, null);
+  assert.equal(waiting.lifecycle.closed, false);
+  assert.equal(waiting.lifecycle.awaitingDestination, true);
+  assert.equal(waiting.directive, "reobserve_destination");
+});
+
+test("an unchanged source returns to bounded action recovery only after the navigation deadline", () => {
+  const action = {
+    id: "act_expired_navigation",
+    observationId: "obs_expired_source",
+    type: "click",
+    controlId: "next",
+    intent: "navigate_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    expectedOutcome: { type: "stage_exit_or_feedback", controlId: "next" }
+  };
+  const before = observation({
+    id: "obs_expired_source",
+    controls: [{ controlId: "next", operations: operation("next_node") }]
+  });
+  const result = {
+    ...dispatchedNavigation(action.id),
+    action,
+    actionOutcome: {
+      status: "DESTINATION_LOADING",
+      code: "NAVIGATION_TRANSITION_PENDING"
+    }
+  };
+  const unchanged = observation({
+    id: "obs_expired_result",
+    controls: [{ controlId: "next", operations: operation("next_node") }],
+    lastActionResult: result
+  });
+  const lifecycle = {
+    ...approveActionLifecycle(proposeActionLifecycle(action, before)),
+    dispatched: true,
+    status: "waiting_for_destination",
+    awaitingDestination: true
+  };
+  const readiness = classifyObservationReadiness({
+    observation: unchanged,
+    navigationContext: { result, lifecycle },
+    readinessStartedAt: 1_000,
+    readinessDeadlineAt: 2_000,
+    nowMs: 2_000
+  });
+  const recovered = advanceActionLifecycle({
+    state: { lastAction: action, actionLifecycle: lifecycle },
+    observation: unchanged,
+    previousObservation: before,
+    observationReadiness: readiness
+  });
+
+  assert.equal(readiness.classification, READINESS.READY);
+  assert.equal(readiness.reason, "NAVIGATION_SETTLEMENT_DEADLINE_EXPIRED");
+  assert.equal(recovered.lifecycle.closed, true);
+  assert.equal(recovered.lifecycle.status, "failed");
+  assert.equal(recovered.directive, "try_distinct_capability");
+});
+
+test("a structurally proven destination may settle the navigation lifecycle", () => {
+  const action = {
+    id: "act_destination",
+    observationId: "obs_source",
+    type: "click",
+    controlId: "next",
+    semanticIntent: "advance_checkout_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    expectedOutcome: { type: "checkout_stage_advanced" }
+  };
+  const before = observation({
+    id: "obs_source",
+    url: "https://example.test/passengers",
+    controls: [{ controlId: "next", operations: operation("next_node") }]
+  });
+  const result = {
+    ...dispatchedNavigation(action.id),
+    action,
+    actionOutcome: {
+      status: "DESTINATION_LOADING",
+      code: "NAVIGATION_TRANSITION_PENDING"
+    }
+  };
+  const destination = observation({
+    id: "obs_destination",
+    url: "https://example.test/extras",
+    controls: [{ controlId: "extras_continue", operations: operation("extras_continue_node") }],
+    lastActionResult: result
+  });
+  const lifecycle = approveActionLifecycle(proposeActionLifecycle(action, before));
+  const dispatchedLifecycle = {
+    ...lifecycle,
+    dispatched: true,
+    status: "waiting_for_destination",
+    awaitingDestination: true
+  };
+  const readiness = classifyObservationReadiness({
+    observation: destination,
+    navigationContext: { result, lifecycle: dispatchedLifecycle }
+  });
+  const settled = advanceActionLifecycle({
+    state: { lastAction: action, actionLifecycle: dispatchedLifecycle },
+    observation: destination,
+    previousObservation: before,
+    observationReadiness: readiness
+  });
+
+  assert.equal(readiness.classification, READINESS.READY);
+  assert.deepEqual(readiness.evidence.destinationChange.evidence, ["url"]);
+  assert.equal(settled.lifecycle.closed, true);
+  assert.notEqual(settled.directive, "reobserve_destination");
 });

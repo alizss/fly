@@ -47,6 +47,7 @@
  * @property {VisualRegion} [visualRegion]
  * @property {number} [scrollY]
  * @property {string} [keys]
+ * @property {string} [settlementActionId]
  * @property {string} reason
  * @property {string} [requirementId]
  * @property {"safe"|"money"|"payment"|"legal"|"uncertain"} risk
@@ -266,6 +267,7 @@ function normalizeAction(raw = {}) {
     readinessDeadlineAt: Number.isFinite(Number(raw.readinessDeadlineAt)) ? Number(raw.readinessDeadlineAt) : 0,
     readinessAttempts: Number.isFinite(Number(raw.readinessAttempts)) ? Number(raw.readinessAttempts) : 0,
     reobserveRetryToken: raw.reobserveRetryToken ? String(raw.reobserveRetryToken).slice(0, 180) : "",
+    settlementActionId: raw.settlementActionId ? String(raw.settlementActionId).slice(0, 180) : "",
     reason: String(raw.reason || "").slice(0, 500),
     requirementId: raw.requirementId ? String(raw.requirementId) : "",
     risk: RISK_LEVELS.has(raw.risk) ? raw.risk : "uncertain",

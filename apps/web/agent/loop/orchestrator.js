@@ -334,8 +334,15 @@ async function runLoopTurn({
       action: state.lastAction || leasedActionFor(state)?.originalAction || null,
       feedback: observation.lastActionResult?.feedback || state.lastAction?.feedback || null,
       result: observation.lastActionResult || null,
-      lifecycle: activeExecutionEpisode
+      lifecycle: activeExecutionEpisode,
+      destinationReadiness: observation.destinationReadiness || null
     },
+    readinessStartedAt: Number(
+      observation.destinationReadiness?.startedAt
+      || activeExecutionEpisode.destinationReadiness?.startedAt
+      || state.observationReadiness?.startedAt
+      || 0
+    ),
     readinessDeadlineAt: Number(
       observation.destinationReadiness?.deadlineAt
       || activeExecutionEpisode.destinationReadiness?.deadlineAt
@@ -445,18 +452,32 @@ async function runLoopTurn({
   // reasoning. A post-navigation shell is not a checkout state, so it cannot
   // create TaskState goals, candidates, recovery failures, or a user handoff.
   state = withUpdate(state, { observationReadiness });
-  if (observationReadiness.classification === READINESS.TRANSIENT) {
+  if (lifecycleDirective === "reobserve_destination"
+    || observationReadiness.classification === READINESS.TRANSIENT) {
+    const awaitingExactDestination = lifecycleDirective === "reobserve_destination";
     const action = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
       type: "wait",
-      intent: "reobserve_after_transient_observation",
+      intent: awaitingExactDestination
+        ? "reobserve_dispatched_navigation_destination"
+        : "reobserve_after_transient_observation",
       mechanicalEffect: "unknown",
       expectedPostconditions: [{ type: "observation_readiness", status: READINESS.READY }],
+      settlementActionId: awaitingExactDestination
+        ? String(
+            activeExecutionEpisode.actionId
+            || observation.destinationReadiness?.actionId
+            || observation.lastActionResult?.actionId
+            || ""
+          )
+        : "",
       readinessStartedAt: observationReadiness.startedAt,
       readinessDeadlineAt: observationReadiness.deadlineAt,
       readinessAttempts: observationReadiness.attempts,
-      reason: `The page is still settling (${observationReadiness.reason}, observation ${observationReadiness.attempts}). Reobserve before the readiness deadline.`,
+      reason: awaitingExactDestination
+        ? `The dispatched navigation still owns continuation (${observationReadiness.reason}, observation ${observationReadiness.attempts}). Reobserve without replanning the unchanged source page.`
+        : `The page is still settling (${observationReadiness.reason}, observation ${observationReadiness.attempts}). Reobserve before the readiness deadline.`,
       risk: "safe",
       requiresApproval: false
     });
@@ -465,7 +486,9 @@ async function runLoopTurn({
     transactionStore?.recordActionEvent?.(waitingState.id, {
       observationId: observation.observationId || "",
       turnId: clientTurnId || turnId,
-      stage: "observation_transient_wait",
+      stage: awaitingExactDestination
+        ? "navigation_destination_wait"
+        : "observation_transient_wait",
       readiness: observationReadiness,
       dispatched: false,
       modelCalled: false

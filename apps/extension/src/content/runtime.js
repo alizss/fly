@@ -1,5 +1,6 @@
 import {
   authoritativeSelectedBookingFacts,
+  testSelectedBookingFromObservedFacts,
   selectedBookingMissingFacts,
   validStoredSelectedBookingContract
 } from "./selected-booking.js";
@@ -386,7 +387,7 @@ import {
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
   const DESTINATION_RETRY_INTERVAL_MS = 300;
   const DESTINATION_MUTATION_SETTLE_MS = 450;
-  async function saveResumeMarker() {
+  async function saveResumeMarker({ navigationExpected = false, navigationActionId = "" } = {}) {
     try {
       if ((!agent.running && !agent.engineReconciliationPending) || !agent.sessionId) {
         await clearResumeMarker();
@@ -398,7 +399,10 @@ import {
         travelerId: selectedTravelerId,
         sessionId: agent.sessionId,
         skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
-        navigationUrl: currentNavigationUrl()
+        navigationUrl: currentNavigationUrl(),
+        navigationExpected: navigationExpected === true,
+        navigationExpectedAt: navigationExpected === true ? Date.now() : 0,
+        navigationActionId: navigationExpected === true ? String(navigationActionId || "") : ""
       };
       const response = await chrome.runtime.sendMessage({
         type: "ATW_CHECKOUT_RESUME_SAVE",
@@ -3994,6 +3998,36 @@ import {
     return takeOverCheckout();
   };
 
+  async function scanPageForSelectedBooking() {
+    const map = buildPageMap();
+    const result = testSelectedBookingFromObservedFacts(map?.transactionFacts || null, {
+      travelerId: String(traveler()?.id || ""),
+      referenceAt: Date.now(),
+      sourceUrl: currentNavigationUrl(),
+      locale: document.documentElement.lang || navigator.language || "en"
+    });
+    if (result.captured) {
+      const installed = await chrome.runtime.sendMessage({
+        type: "ATW_DEV_OBSERVED_BOOKING_CONFIRM",
+        selectedBookingContract: result.selectedBookingContract
+      });
+      if (installed?.ok !== true) {
+        result.ok = false;
+        result.captured = false;
+        result.code = installed?.code || "DEV_OBSERVED_BOOKING_REJECTED";
+        result.missingFacts = [installed?.error || "The observed test booking could not be installed."];
+      }
+    }
+    await hydrateSelectedBookingAdmission();
+    logFlow("booking.capture", {
+      event: result?.captured ? "DEV_OBSERVED_BOOKING_CONFIRMED" : "DEV_OBSERVED_BOOKING_INCOMPLETE",
+      code: result?.code || "BOOKING_SCAN_FAILED",
+      missingFacts: result?.missingFacts || [],
+      observed: result?.observed || null
+    });
+    return result;
+  }
+
   const {
     agentDecisionHtml,
     agentProcessDiagnosticsHtml,
@@ -4016,6 +4050,7 @@ import {
     observePageOnly,
     pageStateStore,
     readSelectedBookingContract,
+    scanPageForSelectedBooking,
     routeSummary,
     runRiskChecks,
     saveTrip,
@@ -4070,10 +4105,6 @@ import {
 
   window.addEventListener("pagehide", () => {
     stopWatchingCheckoutChanges();
-    saveResumeMarker();
-  });
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") saveResumeMarker();
   });
 
   if (window.__ATW_ENABLE_TEST_HOOKS__ === true) {

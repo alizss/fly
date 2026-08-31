@@ -37,6 +37,62 @@ function foregroundReady(page = {}) {
   return surface.type !== "page" && executableControlsForCurrentSurface(page).length > 0;
 }
 
+function navigationSettlementPending(observation = {}, navigationContext = {}) {
+  const result = observation.lastActionResult || navigationContext.result || {};
+  const lifecycle = navigationContext.lifecycle || {};
+  const destinationReadiness = navigationContext.destinationReadiness || {};
+  const outcome = result.actionOutcome || {};
+  return Boolean(
+    lifecycle.closed !== true
+    && (
+      lifecycle.awaitingDestination === true
+      || lifecycle.status === "waiting_for_destination"
+      || destinationReadiness.status === "WAITING_FOR_DESTINATION"
+      || outcome.status === "DESTINATION_LOADING"
+      || outcome.code === "NAVIGATION_TRANSITION_PENDING"
+      || result.failureCode === "NAVIGATION_TRANSITION_PENDING"
+    )
+  );
+}
+
+function progressFingerprint(page = {}) {
+  return JSON.stringify(
+    page.foreground?.progressMarkers
+      || page.visualState?.foreground?.progressMarkers
+      || page.progressMarkers
+      || {}
+  );
+}
+
+function destinationIdentity(observation = {}) {
+  const page = observation.page || {};
+  const surface = currentSurface(page);
+  return Object.freeze({
+    url: cleanIdentity(page.url || observation.url || ""),
+    surfaceId: cleanIdentity(surface.id || ""),
+    progressFingerprint: progressFingerprint(page)
+  });
+}
+
+function destinationChangedFromOrigin(observation = {}, navigationContext = {}) {
+  const origin = navigationContext.lifecycle?.origin || {};
+  const current = destinationIdentity(observation);
+  const evidence = [];
+  if (origin.url && cleanIdentity(origin.url) !== current.url) evidence.push("url");
+  if (origin.surfaceId && cleanIdentity(origin.surfaceId) !== current.surfaceId) evidence.push("surface");
+  if (origin.progressFingerprint && origin.progressFingerprint !== current.progressFingerprint) evidence.push("progress");
+  return Object.freeze({
+    changed: evidence.length > 0,
+    evidence: Object.freeze(evidence),
+    origin: Object.freeze({
+      url: cleanIdentity(origin.url || ""),
+      surfaceId: cleanIdentity(origin.surfaceId || ""),
+      progressFingerprint: origin.progressFingerprint || ""
+    }),
+    current
+  });
+}
+
 function navigationShaped(observation = {}, previousReadiness = {}, navigationContext = {}) {
   const result = observation.lastActionResult || navigationContext.result || {};
   const feedback = result.feedback || navigationContext.feedback || {};
@@ -69,10 +125,21 @@ function readinessKey(observation = {}, navigationContext = {}) {
   const page = observation.page || {};
   const lifecycle = navigationContext.lifecycle || {};
   const result = observation.lastActionResult || navigationContext.result || {};
+  const destinationReadiness = navigationContext.destinationReadiness || {};
   const action = result.action || navigationContext.action || navigationContext.originalAction || {};
   const surface = currentSurface(page);
+  const actionId = cleanIdentity(
+    lifecycle.actionId
+    || destinationReadiness.actionId
+    || result.actionId
+    || action.id
+    || "no-action"
+  );
+  if (actionId !== "no-action" && navigationSettlementPending(observation, navigationContext)) {
+    return `navigation|${actionId}`;
+  }
   return [
-    cleanIdentity(lifecycle.actionId || result.actionId || action.id || "no-action"),
+    actionId,
     cleanIdentity(page.url || observation.url || "same-route"),
     cleanIdentity(surface.id || "surface-page"),
     cleanIdentity(surface.type || "page")
@@ -87,6 +154,7 @@ function classifyObservationReadiness({
   observation = {},
   previousReadiness = {},
   navigationContext = {},
+  readinessStartedAt = 0,
   readinessDeadlineAt = 0,
   nowMs = Date.now(),
   readinessTimeoutMs = DESTINATION_READINESS_TIMEOUT_MS
@@ -99,25 +167,40 @@ function classifyObservationReadiness({
     && afterNavigation
     && [READINESS.TRANSIENT, READINESS.UNRESOLVED, READINESS.DEGRADED].includes(previousReadiness.classification);
   const attempts = samePendingDestination ? Number(previousReadiness.attempts || 0) + 1 : 1;
+  const suppliedStartedAt = Number(readinessStartedAt || 0);
   const startedAt = samePendingDestination
     ? Number(previousReadiness.startedAt || nowMs)
-    : Number(nowMs);
+    : (suppliedStartedAt > 0 ? suppliedStartedAt : Number(nowMs));
   const suppliedDeadline = Number(readinessDeadlineAt || 0);
   const previousDeadline = samePendingDestination ? Number(previousReadiness.deadlineAt || 0) : 0;
-  // A deadline belongs to one exact destination key. A new stage, surface,
-  // or URL starts a fresh readiness episode instead of inheriting time spent
-  // hydrating the previous page.
+  // The browser creates the settlement deadline when the original action is
+  // dispatched. That action identity survives URL/document changes, and a
+  // later loading observation must never replace or extend its deadline.
   const deadlineAt = previousDeadline > 0
     ? previousDeadline
-    : (samePendingDestination && suppliedDeadline > 0
+    : (suppliedDeadline > 0
         ? suppliedDeadline
         : startedAt + Math.max(1, Number(readinessTimeoutMs || 0)));
   const deadlineExpired = Number(nowMs) >= deadlineAt;
   const controls = actionableControlCount(page);
-  const explicitLoading = facts.documentReadyState === "loading"
-    || facts.ariaBusy === true
+  const loadingSignal = facts.ariaBusy === true
     || Number(facts.loadingIndicatorCount || 0) > 0
     || facts.loadingTextEvidence === true;
+  const mainLoadingSignal = facts.mainAriaBusy === true
+    || facts.loadingTextEvidence === true;
+  const pendingSettlement = navigationSettlementPending(observation, navigationContext);
+  const destinationChange = destinationChangedFromOrigin(observation, navigationContext);
+  // An exact browser-owned navigation result remains authoritative while the
+  // source document is still structurally the same. Source controls remaining
+  // clickable is not proof that the destination arrived, and must not reopen
+  // TaskState or permit the same stage exit to be planned again.
+  const unsettledSource = pendingSettlement && destinationChange.changed !== true;
+  // A local spinner is diagnostic when the current surface already exposes
+  // executable mechanics. It becomes page-blocking only when no executable
+  // surface exists or an exact dispatched navigation is still unsettled.
+  const explicitLoading = facts.documentReadyState === "loading"
+    || mainLoadingSignal
+    || (loadingSignal && (controls === 0 || pendingSettlement));
   const usableForeground = foregroundReady(page) && !explicitLoading;
   const hasReadinessEvidence = Boolean(
     facts.documentReadyState
@@ -138,9 +221,14 @@ function classifyObservationReadiness({
   // lost-mutation race: the destination can become usable before the wait is
   // installed and then never mutate again. Only explicit loading or a truly
   // incomplete post-action surface may hold the controller.
-  const transient = explicitLoading || temporarilyIncomplete;
+  const transient = explicitLoading || temporarilyIncomplete || unsettledSource;
   const evidence = Object.freeze({
     controls,
+    loadingSignal,
+    mainLoadingSignal,
+    pendingSettlement,
+    unsettledSource,
+    destinationChange,
     explicitLoading,
     mechanicallyUsable,
     temporarilyIncomplete,
@@ -148,6 +236,42 @@ function classifyObservationReadiness({
     stable,
     facts
   });
+
+  if (unsettledSource && !deadlineExpired) {
+    return Object.freeze({
+      classification: READINESS.TRANSIENT,
+      key,
+      attempts,
+      startedAt,
+      deadlineAt,
+      elapsedMs: Math.max(0, Number(nowMs) - startedAt),
+      remainingMs: Math.max(0, deadlineAt - Number(nowMs)),
+      deadlineExpired,
+      reason: "NAVIGATION_ACTION_STILL_UNSETTLED",
+      handoffEligible: false,
+      evidence
+    });
+  }
+
+  if (unsettledSource) {
+    // The lease, not TaskState, owns this deadline. Once it expires, hand the
+    // unchanged source back to ActionLifecycle so bounded recovery can record
+    // a no-effect result and choose a distinct proven strategy. Do not create
+    // an unbounded destination wait or require a manual restart.
+    return Object.freeze({
+      classification: READINESS.READY,
+      key,
+      attempts,
+      startedAt,
+      deadlineAt,
+      elapsedMs: Math.max(0, Number(nowMs) - startedAt),
+      remainingMs: 0,
+      deadlineExpired: true,
+      reason: "NAVIGATION_SETTLEMENT_DEADLINE_EXPIRED",
+      handoffEligible: true,
+      evidence
+    });
+  }
 
   if (transient && !deadlineExpired) {
     return Object.freeze({

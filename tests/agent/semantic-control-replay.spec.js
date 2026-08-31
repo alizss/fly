@@ -34,7 +34,7 @@ const { resolveSemanticOwnership } = require("./legacy-semantic-ownership-adapte
 const { resolveLogicalFields, logicalFieldSatisfied } = require("../../apps/web/agent/logical-field");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 const { transactionFactsFromSelectedBooking } = require("../../packages/shared/selected-booking");
-const { actuatorSignature, semanticGoalKey } = require("../../packages/shared/agent-actions");
+const { actuatorSignature, normalizeAction, semanticGoalKey } = require("../../packages/shared/agent-actions");
 const { compileDecisionFrame } = require("../../apps/web/agent/authority-frames");
 const { compileCurrentObligation } = require("./obligation-test-helper");
 const agentContract = require("../../apps/extension/src/shared/agent-contract");
@@ -404,6 +404,18 @@ async function installBootChrome(page, initialStorage = {}, tabId = 42) {
             };
             window.__ATW_BOOT_STORAGE__[checkoutContextKey] = context;
             window.__ATW_BOOT_STORAGE__.selectedBookingContract = message.selectedBookingContract || null;
+            return { ok: true, context };
+          }
+          if (message?.type === "ATW_DEV_OBSERVED_BOOKING_CONFIRM") {
+            if (message.selectedBookingContract?.testOnlyPageConfirmation !== true) {
+              return { ok: false, code: "TEST_BOOKING_MARKER_REQUIRED" };
+            }
+            const context = newCheckoutContext({
+              source: "test_page_confirmation",
+              selectedBookingContract: message.selectedBookingContract
+            });
+            window.__ATW_BOOT_STORAGE__[checkoutContextKey] = context;
+            window.__ATW_BOOT_STORAGE__.selectedBookingContract = message.selectedBookingContract;
             return { ok: true, context };
           }
           return { ok: false };
@@ -6918,9 +6930,14 @@ test("only positive loading enters the mutation-or-deadline lifecycle", async ({
       action: "wait",
       intent: "reobserve_after_strategy_exhaustion"
     });
-    const pendingCrossDocumentResultRecognized = hooks.isDestinationReadinessDecision({
+    const legacyIntentOnlyRecognized = hooks.isDestinationReadinessDecision({
       action: "wait",
       intent: "await_pending_action_result"
+    });
+    const typedCrossDocumentResultRecognized = hooks.isDestinationReadinessDecision({
+      action: "wait",
+      intent: "any_diagnostic_name",
+      expectedPostconditions: [{ type: "observation_readiness", status: "READY" }]
     });
     hooks.beginDestinationWait(decision);
     const state = hooks.agentLoopState();
@@ -6954,7 +6971,8 @@ test("only positive loading enters the mutation-or-deadline lifecycle", async ({
       groundingRecoveryRecognized,
       taskStateRecognized,
       strategyExhaustionRecognized,
-      pendingCrossDocumentResultRecognized,
+      legacyIntentOnlyRecognized,
+      typedCrossDocumentResultRecognized,
       state,
       referencePayload,
       fullBytes: hooks.observationTransportBytes(fullPayload),
@@ -6966,7 +6984,8 @@ test("only positive loading enters the mutation-or-deadline lifecycle", async ({
   expect(result.groundingRecoveryRecognized).toBe(false);
   expect(result.taskStateRecognized).toBe(false);
   expect(result.strategyExhaustionRecognized).toBe(false);
-  expect(result.pendingCrossDocumentResultRecognized).toBe(true);
+  expect(result.legacyIntentOnlyRecognized).toBe(false);
+  expect(result.typedCrossDocumentResultRecognized).toBe(true);
   expect(result.state.destinationWait.status).toBe("WAITING_FOR_DESTINATION");
   expect(result.state.destinationWait.startedAt).toBe(now);
   expect(result.state.destinationWait.deadlineAt).toBe(now + 8_000);
@@ -6984,6 +7003,81 @@ test("only positive loading enters the mutation-or-deadline lifecycle", async ({
   expect(result.referenceBytes).toBeLessThan(result.fullBytes / 2);
 });
 
+test("typed navigation readiness survives backend transport for SPA and fresh-document continuation", async ({ page }) => {
+  await loadProducer(page);
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + 8_000;
+  const clientDecision = toRawClientDecision(normalizeAction({
+    id: "act_backend_navigation_wait",
+    type: "wait",
+    intent: "diagnostic_name_may_change",
+    settlementActionId: "act_original_stage_exit",
+    expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
+    readinessStartedAt: startedAt,
+    readinessDeadlineAt: deadlineAt,
+    reason: "Reobserve the destination owned by the dispatched stage exit.",
+    risk: "safe",
+    requiresApproval: false
+  }));
+
+  expect(clientDecision.expectedPostconditions).toEqual([{
+    type: "observation_readiness",
+    status: "READY"
+  }]);
+  expect(clientDecision.settlementActionId).toBe("act_original_stage_exit");
+
+  const result = await page.evaluate(({ decision, started, deadline }) => {
+    const hooks = window.__ATW_TEST__;
+    hooks.setAppDataForTest({
+      travelers: [{ id: "trav_typed_navigation", first_name: "Ali", last_name: "Sifrar" }],
+      preferences: {}
+    }, "trav_typed_navigation");
+    hooks.setAgentRunningForTest(true);
+
+    hooks.beginDestinationWait({
+      action: "wait",
+      settlementActionId: "act_original_stage_exit",
+      expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
+      observationId: "obs_original_source",
+      actionId: "act_original_stage_exit",
+      readinessStartedAt: started,
+      readinessDeadlineAt: deadline
+    });
+    const recognized = hooks.isDestinationReadinessDecision(decision);
+    if (!recognized) hooks.clearDestinationWait("semantic_destination_ready");
+    else hooks.beginDestinationWait(decision);
+    const spaState = hooks.agentLoopState().destinationWait;
+
+    // A reload or cross-domain redirect creates a fresh content runtime. The
+    // transported settlement owner must reconstruct the same exact wait
+    // without relying on the old runtime or the diagnostic intent name.
+    hooks.clearDestinationWait("simulate_fresh_document");
+    hooks.beginDestinationWait(decision);
+    const freshDocumentState = hooks.agentLoopState().destinationWait;
+
+    hooks.clearDestinationWait("test_complete");
+    hooks.setAgentRunningForTest(false);
+    return { recognized, spaState, freshDocumentState };
+  }, { decision: clientDecision, started: startedAt, deadline: deadlineAt });
+
+  expect(result.recognized).toBe(true);
+  expect(result.spaState).toMatchObject({
+    status: "WAITING_FOR_DESTINATION",
+    kind: "dispatched_stage_exit",
+    actionId: "act_original_stage_exit",
+    startedAt,
+    deadlineAt,
+    backendWaits: 2
+  });
+  expect(result.freshDocumentState).toMatchObject({
+    status: "WAITING_FOR_DESTINATION",
+    kind: "dispatched_stage_exit",
+    actionId: "act_original_stage_exit",
+    startedAt,
+    deadlineAt
+  });
+});
+
 test("destination wait arms its own deadline after the active loop releases ownership", async ({ page }) => {
   await loadProducer(page);
   const result = await page.evaluate(() => {
@@ -6997,6 +7091,8 @@ test("destination wait arms its own deadline after the active loop releases owne
     hooks.beginDestinationWait({
       action: "wait",
       intent: "wait_for_dispatched_stage_exit",
+      settlementActionId: "act_wait_owned_by_lifecycle",
+      expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
       observationId: "obs_wait_owned_by_lifecycle",
       actionId: "act_wait_owned_by_lifecycle",
       readinessDeadlineAt: Date.now() + 8_000
@@ -7015,6 +7111,49 @@ test("destination wait arms its own deadline after the active loop releases owne
   expect(result.afterLoop.loopBusy).toBe(false);
   expect(result.afterLoop.destinationWaitTimerActive).toBe(true);
   expect(result.afterLoop.destinationWait.lastWakeReason).toBe("readiness_deadline");
+});
+
+test("backend loading waits cannot replace the original browser settlement episode", async ({ page }) => {
+  await loadProducer(page);
+  const result = await page.evaluate(() => {
+    const hooks = window.__ATW_TEST__;
+    hooks.setAppDataForTest({
+      travelers: [{ id: "trav_immutable_wait", first_name: "Ali", last_name: "Sifrar" }],
+      preferences: {}
+    }, "trav_immutable_wait");
+    hooks.setAgentRunningForTest(true);
+    const startedAt = Date.now();
+    const originalDeadlineAt = startedAt + 8_000;
+    hooks.beginDestinationWait({
+      action: "wait",
+      intent: "wait_for_dispatched_stage_exit",
+      settlementActionId: "act_original_confirm",
+      expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
+      observationId: "obs_original_confirm",
+      actionId: "act_original_confirm",
+      readinessStartedAt: startedAt,
+      readinessDeadlineAt: originalDeadlineAt
+    });
+    hooks.beginDestinationWait({
+      action: "wait",
+      intent: "reobserve_after_transient_observation",
+      expectedPostconditions: [{ type: "observation_readiness", status: "READY" }],
+      observationId: "obs_loading_after_confirm",
+      actionId: "act_backend_loading_wait",
+      readinessStartedAt: startedAt + 2_000,
+      readinessDeadlineAt: originalDeadlineAt + 20_000
+    });
+    const state = hooks.agentLoopState();
+    hooks.clearDestinationWait("test_complete");
+    hooks.setAgentRunningForTest(false);
+    return { state, startedAt, originalDeadlineAt };
+  });
+
+  expect(result.state.destinationWait.actionId).toBe("act_original_confirm");
+  expect(result.state.destinationWait.kind).toBe("dispatched_stage_exit");
+  expect(result.state.destinationWait.startedAt).toBe(result.startedAt);
+  expect(result.state.destinationWait.deadlineAt).toBe(result.originalDeadlineAt);
+  expect(result.state.destinationWait.backendWaits).toBe(2);
 });
 
 test("closed ARIA combobox with owned options exposes and verifies one trusted choice", async ({ page }) => {
@@ -8317,7 +8456,9 @@ test("one dispatched stage exit stays in flight until a mutation or bounded dead
     const state = hooks.agentLoopState();
     const recognized = hooks.isDestinationReadinessDecision({
       action: "wait",
-      intent: "wait_for_dispatched_stage_exit"
+      intent: "wait_for_dispatched_stage_exit",
+      settlementActionId: "act_stage_exit_pending",
+      expectedPostconditions: [{ type: "observation_readiness", status: "READY" }]
     });
     const slowSpaWithoutLoadingSignal = hooks.shouldHoldDispatchedStageExit({
       advanced: false,
@@ -8816,7 +8957,17 @@ test("GoToGate-shaped card credential form is terminal evidence without executab
 
   const readiness = classifyObservationReadiness({
     observation,
-    navigationContext: { lifecycle: { awaitingDestination: true, status: "waiting_for_destination" } }
+    navigationContext: {
+      lifecycle: {
+        awaitingDestination: true,
+        status: "waiting_for_destination",
+        origin: {
+          url: "https://merchant.example.test/review",
+          surfaceId: "surface-page",
+          progressFingerprint: "{}"
+        }
+      }
+    }
   });
   expect(readiness.classification).toBe(READINESS.READY);
   expect(readiness.evidence.strongPaymentEvidence).toBeUndefined();
@@ -8868,7 +9019,17 @@ test("progressive payment entry compiles FROM/TO itinerary and outranks a generi
 
   const readiness = classifyObservationReadiness({
     observation,
-    navigationContext: { lifecycle: { awaitingDestination: true, status: "waiting_for_destination" } }
+    navigationContext: {
+      lifecycle: {
+        awaitingDestination: true,
+        status: "waiting_for_destination",
+        origin: {
+          url: "https://merchant.example.test/review",
+          surfaceId: "surface-page",
+          progressFingerprint: "{}"
+        }
+      }
+    }
   });
   expect(readiness.classification).toBe(READINESS.READY);
   expect(readiness.evidence.strongPaymentEvidence).toBeUndefined();
@@ -9003,6 +9164,380 @@ test("testing sidebar shows process position, objective, achievements, and selec
   await expect(diagnostics).toContainText("payment_review");
 });
 
+test("missing booking admission can scan and lock one visible booking through the existing producer", async ({ page }) => {
+  const travelerId = "trav_scanned_booking";
+  let sessionBody = null;
+  await page.route("https://manual-booking.test/**", async (route) => {
+    const url = route.request().url();
+    if (url.includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    if (url.includes("/api/agent/session")) {
+      sessionBody = route.request().postDataJSON();
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({ id: "chk_manual_booking" })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `<main>
+        <h1>Your selected flight</h1>
+        <article data-flight data-origin="LJU" data-destination="IST" data-departure-date="2026-10-15">
+          <strong>LJU → IST</strong><time datetime="2026-10-15">15 October 2026</time>
+        </article>
+        <div aria-label="Booking total">Booking total: 317.54 EUR</div>
+        <h2>Passenger details</h2>
+      </main>`
+    });
+  });
+  await page.goto("https://manual-booking.test/passengers?private=discard");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://manual-booking.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: precheckoutCapturePath });
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  await expect(page.locator(".atw-agent-card")).toContainText("Checkout baseline: unavailable");
+  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  await expect(page.locator("#atw-scan-booking")).toContainText("Scan & use observed booking [DEV]");
+  await page.locator("#atw-scan-booking").click();
+
+  await expect(page.locator(".atw-agent-card")).toContainText("Checkout baseline: captured");
+  await expect(page.locator(".atw-agent-card")).toContainText("LJU → IST");
+  await expect(page.locator(".atw-agent-card")).toContainText("317.54 EUR");
+  await expect(page.locator(".atw-agent-card")).toContainText("DEV page confirmation");
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
+
+  const stored = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ));
+  expect(stored).toMatchObject({
+    contractVersion: "selected-booking/v1",
+    sourceUrl: "https://manual-booking.test/passengers",
+    itinerary: {
+      segments: [
+        { origin: "LJU", destination: "IST", departureDate: "2026-10-15" }
+      ]
+    },
+    approvedTotal: { amount: 317.54, currency: "EUR" },
+    travelerIds: [travelerId]
+  });
+
+  const session = await page.evaluate(() => window.__ATW_TEST__.startAgentSession("", {
+    bookingAcquisitionTimeoutMs: 0
+  }));
+  expect(session).toMatchObject({ id: "chk_manual_booking" });
+  expect(sessionBody.selectedBookingContract.selectionId).toMatch(/^test_page_confirmation_/);
+  expect(sessionBody.selectedBookingContract.testOnlyPageConfirmation).toBe(true);
+  expect(sessionBody.selectedBookingContract.approvedTotal).toEqual({ amount: 317.54, currency: "EUR" });
+});
+
+test("DEV booking confirmation reuses main observation and resolves a Turkish-shaped yearless round trip", async ({ page }) => {
+  const travelerId = "trav_yearless_booking_scan";
+  await page.clock.setFixedTime(new Date("2026-08-29T10:00:00.000Z"));
+  await page.route("https://yearless-booking.test/**", async (route) => {
+    if (route.request().url().includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `<main><h1>Passenger information</h1></main>
+        <aside class="booking-summary" aria-label="Booking summary">
+          <div>Departure LJU - IST | 15 Oct Thu Departure: 09:45 | Arrival: 13:10</div>
+          <div>Return IST - LJU | 24 Nov Tue Departure: 07:55 | Arrival: 08:15</div>
+          <strong>Total price for 1 passenger EUR 241.00</strong>
+        </aside>`
+    });
+  });
+  await page.goto("https://yearless-booking.test/passenger-details");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://yearless-booking.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  await expect(page.locator("#atw-scan-booking")).toContainText("Scan & use observed booking [DEV]");
+  await page.locator("#atw-scan-booking").click();
+  await expect(page.locator(".atw-booking-admission")).toContainText("Checkout baseline: captured");
+  await expect(page.locator(".atw-booking-admission")).toContainText("LJU → IST · IST → LJU");
+  await expect(page.locator(".atw-booking-admission")).toContainText("2026-10-15 · 2026-11-24");
+  await expect(page.locator(".atw-booking-admission")).toContainText("241 EUR");
+  await expect(page.locator(".atw-booking-admission")).toContainText("DEV page confirmation");
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
+
+  const stored = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ));
+  expect(stored).toMatchObject({
+    testOnlyPageConfirmation: true,
+    itinerary: {
+      segments: [
+        { origin: "LJU", destination: "IST", departureDate: "2026-10-15" },
+        { origin: "IST", destination: "LJU", departureDate: "2026-11-24" }
+      ]
+    },
+    approvedTotal: { amount: 241, currency: "EUR" },
+    travelerIds: [travelerId]
+  });
+});
+
+test("DEV booking confirmation owns the exact booking total instead of fare-grid prices or total duration", async ({ page }) => {
+  const travelerId = "trav_owned_booking_total";
+  await page.clock.setFixedTime(new Date("2026-08-31T10:00:00.000Z"));
+  await page.route("https://fare-grid-booking.test/**", async (route) => {
+    if (route.request().url().includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `<main>
+        <h1>Select flights</h1>
+        <section class="fare-grid">
+          <div>FlyEasy EUR 105.08</div>
+          <div>FlyOpti EUR 145.58</div>
+          <div>FlyFlexi EUR 191.58</div>
+        </section>
+        <aside aria-label="Your booking">
+          <article data-flight data-origin="ZAG" data-destination="SJJ" data-departure-date="2026-09-15">
+            <strong>ZAG → SJJ</strong><time datetime="2026-09-15">Tue 15 Sep 2026</time>
+            <span>Total duration 00h50m</span>
+          </article>
+          <article data-flight data-origin="SJJ" data-destination="ZAG" data-departure-date="2026-09-30">
+            <strong>SJJ → ZAG</strong><time datetime="2026-09-30">Wed 30 Sep 2026</time>
+            <span>Total duration 00h50m</span>
+          </article>
+          <div class="checkout-total"><strong>TOTAL</strong><span>EUR 167.62</span></div>
+        </aside>
+      </main>`
+    });
+  });
+  await page.goto("https://fare-grid-booking.test/flights");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://fare-grid-booking.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  const observed = await page.evaluate(() => window.__ATW_TEST__.compactPageMap(window.__ATW_TEST__.buildPageMap()));
+  expect(observed.transactionFacts).toMatchObject({
+    totalPrice: { amount: 167.62, currency: "EUR" },
+    factEvidence: { totalPrice: { qualification: "exact_owned_total" } }
+  });
+
+  await page.locator("#atw-scan-booking").click();
+  await expect(page.locator(".atw-booking-admission")).toContainText("Checkout baseline: captured");
+  await expect(page.locator(".atw-booking-admission")).toContainText("ZAG → SJJ · SJJ → ZAG");
+  await expect(page.locator(".atw-booking-admission")).toContainText("167.62 EUR");
+
+  const stored = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ));
+  expect(stored).toMatchObject({
+    itinerary: {
+      segments: [
+        { origin: "ZAG", destination: "SJJ", departureDate: "2026-09-15" },
+        { origin: "SJJ", destination: "ZAG", departureDate: "2026-09-30" }
+      ]
+    },
+    approvedTotal: { amount: 167.62, currency: "EUR" },
+    travelerIds: [travelerId]
+  });
+});
+
+test("DEV booking scan reports only the genuinely missing total when itinerary evidence is complete", async ({ page }) => {
+  const travelerId = "trav_missing_total_only";
+  await page.route("https://missing-total-booking.test/**", async (route) => {
+    if (route.request().url().includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `<main>
+        <h1>Passenger details</h1>
+        <aside aria-label="Booking summary">
+          <article data-flight data-origin="LJU" data-destination="IST" data-departure-date="2026-10-15">
+            <strong>LJU → IST</strong><time datetime="2026-10-15">15 October 2026</time>
+          </article>
+        </aside>
+      </main>`
+    });
+  });
+  await page.goto("https://missing-total-booking.test/passengers");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://missing-total-booking.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  await page.locator("#atw-scan-booking").click();
+  const scan = page.locator(".atw-booking-scan");
+  await expect(scan).toContainText("LJU → IST");
+  await expect(scan).toContainText("Missing: approved_total, currency");
+  await expect(scan).not.toContainText("Missing: itinerary");
+  await expect(page.locator("#atw-takeover")).toBeDisabled();
+});
+
+test("testing sidebar ignores a legacy last-booking record and requires fresh page authority", async ({ page }) => {
+  const travelerId = "trav_reuse_booking";
+  const reusable = {
+    ...testSelectedBooking(travelerId),
+    selectionId: "selection_reusable_checkout",
+    sourceUrl: "https://reuse-booking.test/flights",
+    itinerary: {
+      segments: [
+        { segmentId: "seg_out", origin: "LJU", destination: "IST", departureDate: "2026-10-15" },
+        { segmentId: "seg_back", origin: "IST", destination: "LJU", departureDate: "2026-10-30" }
+      ]
+    },
+    approvedTotal: { amount: 241, currency: "EUR" }
+  };
+  await page.route("https://reuse-booking.test/**", async (route) => {
+    if (route.request().url().includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<main><h1>Passenger information</h1><p>The year and selected total are not repeated on this page.</p></main>"
+    });
+  });
+  await page.goto("https://reuse-booking.test/passengers");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://reuse-booking.test/api",
+    selectedTravelerId: travelerId,
+    atwLastSelectedBookingV1: {
+      contractVersion: "last-selected-booking/v1",
+      capturedAt: new Date().toISOString(),
+      sourceSite: "reuse-booking.test",
+      selectedBookingContract: reusable
+    }
+  }, 42);
+  await page.addScriptTag({ path: precheckoutCapturePath });
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  await expect(page.locator("#atw-reuse-test-booking")).toHaveCount(0);
+  await expect(page.locator(".atw-booking-scan")).not.toContainText("LJU → IST · IST → LJU");
+  await expect(page.locator(".atw-booking-scan")).not.toContainText("241 EUR");
+  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  await page.locator("#atw-scan-booking").click();
+  await expect(page.locator(".atw-booking-admission")).toContainText("Checkout baseline: unavailable");
+  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  const stored = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ));
+  expect(stored).toBeNull();
+});
+
+test("DEV booking confirmation refuses multiple conflicting visible bookings", async ({ page }) => {
+  const travelerId = "trav_ambiguous_scan";
+  await page.route("https://ambiguous-booking.test/**", async (route) => {
+    if (route.request().url().includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `<main><h1>Choose a flight</h1>
+        <article data-flight data-origin="LJU" data-destination="IST" data-departure-date="2026-10-15">
+          LJU → IST · 15 October 2026 <span aria-label="Total">Total 317.54 EUR</span>
+        </article>
+        <article data-flight data-origin="LJU" data-destination="IST" data-departure-date="2026-10-16">
+          LJU → IST · 16 October 2026 <span aria-label="Total">Total 412.00 EUR</span>
+        </article>
+      </main>`
+    });
+  });
+  await page.goto("https://ambiguous-booking.test/flights");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://ambiguous-booking.test/api",
+    selectedTravelerId: travelerId
+  }, 43);
+  await page.addScriptTag({ path: precheckoutCapturePath });
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  await page.locator("#atw-scan-booking").click();
+  await expect(page.locator(".atw-booking-scan")).toContainText("conflicting bookings");
+  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  const stored = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:43"]?.selectedBookingContract || null
+  ));
+  expect(stored).toBeNull();
+});
+
 test("hosted payment widget with opaque native inputs contributes owned terminal evidence", async ({ page }) => {
   await loadHtmlProducer(page, `
     <nav aria-label="Checkout progress"><span>Traveller information</span><span aria-current="step">Payment</span></nav>
@@ -9055,7 +9590,17 @@ test("hosted payment widget with opaque native inputs contributes owned terminal
 
   const readiness = classifyObservationReadiness({
     observation,
-    navigationContext: { lifecycle: { awaitingDestination: true, status: "waiting_for_destination" } }
+    navigationContext: {
+      lifecycle: {
+        awaitingDestination: true,
+        status: "waiting_for_destination",
+        origin: {
+          url: "https://merchant.example.test/review",
+          surfaceId: "surface-page",
+          progressFingerprint: "{}"
+        }
+      }
+    }
   });
   expect(readiness.classification).toBe(READINESS.READY);
   expect(readiness.evidence.strongPaymentEvidence).toBeUndefined();

@@ -1041,6 +1041,108 @@ test("a ready destination closes a compact DESTINATION_LOADING receipt without p
   assert.deepEqual(recovery(settled.state).failedStrategySignatures, []);
 });
 
+test("the composed loop cannot replan an unchanged source while its navigation lease is open", async () => {
+  const traveler = { id: "trav_open_navigation", first_name: "Ali", last_name: "Sifrar" };
+  const source = observation("source_continue_result", {
+    step: "traveler_information",
+    url: "https://airline.test/passengers",
+    currentSurface: { id: "surface-page", type: "page", label: "Passenger details" },
+    readiness: {
+      documentReadyState: "complete",
+      ariaBusy: false,
+      mainAriaBusy: false,
+      loadingIndicatorCount: 0,
+      loadingTextEvidence: false,
+      stableForMs: 1_000
+    },
+    controls: [{
+      controlId: "ctrl_continue",
+      label: "Continue",
+      semantic: "continue",
+      operations: { activate: actionableCapability("activate", "continue_button") }
+    }]
+  });
+  const action = {
+    id: "act_open_navigation",
+    observationId: "source_continue_dispatch",
+    type: "click",
+    intent: "navigate_stage",
+    semanticIntent: "advance_checkout_stage",
+    mechanicalEffect: "advance_checkout_stage",
+    controlId: "ctrl_continue",
+    targetId: "continue_button",
+    expectedOutcome: { type: "stage_exit_or_feedback", controlId: "ctrl_continue" }
+  };
+  source.lastActionResult = {
+    actionId: action.id,
+    action,
+    dispatched: true,
+    executed: true,
+    verified: false,
+    failureCode: "NAVIGATION_TRANSITION_PENDING",
+    actionOutcome: agentContract.compileActionOutcome({
+      status: agentContract.ACTION_OUTCOME.DESTINATION_LOADING,
+      causedByActionId: action.id,
+      code: "NAVIGATION_TRANSITION_PENDING"
+    })
+  };
+
+  let state = createCheckoutSessionState({
+    goal: "Reach card entry",
+    travelerId: traveler.id,
+    site: { host: "airline.test", url: source.page.url }
+  });
+  state.lastAction = action;
+  state = withExecutionFixture(state, {
+    leasedAction: leasedActionRecord({
+      action,
+      goal: { goalId: "goal_continue", obligationId: "obligation_continue" },
+      status: "dispatched"
+    }),
+    lifecycle: {
+      actionId: action.id,
+      observationId: action.observationId,
+      status: "waiting_for_destination",
+      approved: true,
+      dispatched: true,
+      observed: true,
+      verified: false,
+      closed: false,
+      awaitingDestination: true,
+      navigation: true,
+      origin: {
+        observationId: action.observationId,
+        url: source.page.url,
+        surfaceId: "surface-page",
+        progressFingerprint: "{}"
+      }
+    }
+  });
+
+  const turn = await runLoopTurn({
+    apiKey: "",
+    model: "unused",
+    dataDir: "",
+    state,
+    observation: source,
+    traveler,
+    actionHistory: []
+  });
+
+  assert.equal(turn.clientDecision.action, "wait");
+  assert.equal(turn.clientDecision.intent, "reobserve_dispatched_navigation_destination");
+  assert.equal(turn.clientDecision.settlementActionId, action.id);
+  assert.deepEqual(turn.clientDecision.expectedPostconditions, [{
+    type: "observation_readiness",
+    status: "READY"
+  }]);
+  assert.equal(turn.state.executionEpisode.actionId, action.id);
+  assert.equal(turn.state.executionEpisode.awaitingDestination, true);
+  assert.equal(turn.state.executionEpisode.closed, false);
+  assert.equal(turn.debug.observationReadiness.reason, "NAVIGATION_ACTION_STILL_UNSETTLED");
+  assert.equal(turn.debug.modelCalled, false);
+});
+
 test("DOB transition requires the exact canonical date and no owned validation error", () => {
   const before = observation("dob_before", {
     step: "traveler_information",

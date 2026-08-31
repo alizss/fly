@@ -58,6 +58,15 @@ function verifiedProfileSelectedValue(actionResult = {}, expected = {}, proof = 
 function verifiedProfileComponentFromActionResult(actionResult = null, observationId = "") {
   if (!actionResult || typeof actionResult !== "object") return null;
   const expected = actionResult.expectedOutcome || {};
+  const mechanicalEffect = clean(
+    actionResult.mechanicalEffect
+    || actionResult.action?.mechanicalEffect
+    || actionResult.action?.affordance?.physicalEffect
+  );
+  // Typing into an editable-combobox query proves only that the option set was
+  // filtered. The query input is not the profile state owner, so its local
+  // value must never become a durable profile-completion receipt.
+  if (mechanicalEffect === "filter_options") return null;
   const proof = actionResult.outcome?.evidence?.exactChildSettlement || {};
   const expectedSuccessCode = VERIFIED_PROFILE_OUTCOME_CODE_BY_TYPE[clean(expected.type)] || "";
   // FIELD_VALUE_VERIFIED without an expected normalized value proves only

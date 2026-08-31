@@ -25,12 +25,9 @@ export function createAgentLifecycle({
 
   function isDestinationReadinessDecision(decision = {}) {
     if (decision.action !== "wait") return false;
-    const intent = `${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase();
-    return /wait_for_ready_observation|wait_for_dispatched_stage_exit|reobserve_after_transient_observation|reobserve_degraded_loading_destination/.test(intent)
-      || /await_pending_action_result/.test(intent)
-      || (decision.expectedPostconditions || []).some((postcondition) => (
-        postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
-      ));
+    return (decision.expectedPostconditions || []).some((postcondition) => (
+      postcondition?.type === "observation_readiness" && postcondition?.status === "READY"
+    ));
   }
 
   function clearDestinationWait(reason = "cleared") {
@@ -77,15 +74,36 @@ export function createAgentLifecycle({
     const existing = agent.destinationWait;
     const backendStartedAt = Number(decision.readinessStartedAt || 0);
     const backendDeadlineAt = Number(decision.readinessDeadlineAt || 0);
-    const dispatchedStageExitWait = /wait_for_dispatched_stage_exit|await_pending_action_result/.test(`${decision.intent || ""} ${decision.semanticIntent || ""}`.toLowerCase());
+    const settlementActionId = String(decision.settlementActionId || "");
+    const dispatchedStageExitWait = Boolean(settlementActionId || existing?.kind === "dispatched_stage_exit");
     const retryToken = String(decision.reobserveRetryToken || "");
+    const startedAt = Number(existing?.startedAt || 0) > 0
+      ? Number(existing.startedAt)
+      : (backendStartedAt > 0 ? backendStartedAt : now);
+    const deadlineAt = Number(existing?.deadlineAt || 0) > 0
+      ? Number(existing.deadlineAt)
+      : (backendDeadlineAt > 0 ? backendDeadlineAt : (startedAt + DESTINATION_WAIT_TIMEOUT_MS));
+    const actionId = String(
+      existing?.actionId
+      || settlementActionId
+      || decision.navigationActionId
+      || decision.causedByActionId
+      || decision.actionId
+      || decision.id
+      || ""
+    );
+    if (existing && backendDeadlineAt > 0 && backendDeadlineAt !== deadlineAt) {
+      logFlow("destination_wait.replacement_deadline_ignored", {
+        actionId,
+        authoritativeDeadlineAt: new Date(deadlineAt).toISOString(),
+        proposedDeadlineAt: new Date(backendDeadlineAt).toISOString()
+      });
+    }
     agent.destinationWait = {
       status: "WAITING_FOR_DESTINATION",
-      kind: dispatchedStageExitWait
-            ? "dispatched_stage_exit"
-            : "destination",
-      startedAt: backendStartedAt > 0 ? backendStartedAt : (existing?.startedAt || now),
-      deadlineAt: backendDeadlineAt > 0 ? backendDeadlineAt : (existing?.deadlineAt || (now + DESTINATION_WAIT_TIMEOUT_MS)),
+      kind: existing?.kind || (dispatchedStageExitWait ? "dispatched_stage_exit" : "destination"),
+      startedAt,
+      deadlineAt,
       attempts: Number(existing?.attempts || 0),
       backendWaits: Number(existing?.backendWaits || 0) + 1,
       wakeRequested: decision.wakeRequested === true,
@@ -93,16 +111,17 @@ export function createAgentLifecycle({
       lastMutationAt: Number(decision.lastMutationAt || existing?.lastMutationAt || 0),
       deadlineObservationSent: Boolean(existing?.deadlineObservationSent),
       observationId: decision.observationId || existing?.observationId || "",
-      actionId: decision.actionId || decision.id || existing?.actionId || "",
+      actionId,
       retryToken: retryToken || existing?.retryToken || ""
     };
+    const remainingSeconds = Math.max(1, Math.ceil((deadlineAt - now) / 1000));
     setAgentActivity(
-      dispatchedStageExitWait
+      agent.destinationWait.kind === "dispatched_stage_exit"
             ? "Waiting for the checkout stage to change"
             : "Waiting for destination",
-      dispatchedStageExitWait
-          ? "The stage exit was dispatched once. I will resume on a material page change or verify it at the bounded deadline."
-        : "Navigation completed, but the destination controls are still hydrating. I will continue automatically."
+      agent.destinationWait.kind === "dispatched_stage_exit"
+          ? `The stage exit was dispatched once. I will resume on navigation or verify it within ${remainingSeconds} seconds.`
+        : `The destination controls are still hydrating. I will continue automatically within ${remainingSeconds} seconds or on a material change.`
     );
     renderSidebar("agent");
     logFlow("destination_wait.enter", {

@@ -263,6 +263,8 @@ export function createDecisionClient({
         traveler: traveler(),
         destinationReadiness: agent.destinationWait ? {
           status: agent.destinationWait.status,
+          kind: agent.destinationWait.kind,
+          actionId: agent.destinationWait.actionId,
           startedAt: agent.destinationWait.startedAt,
           deadlineAt: agent.destinationWait.deadlineAt,
           attempts: agent.destinationWait.attempts,
@@ -402,6 +404,8 @@ export function createDecisionClient({
           targetLabel: decision.targetLabel,
           targetSnapshot: decision.targetSnapshot || null,
           expectedOutcome: decision.expectedOutcome || null,
+          expectedPostconditions: decision.expectedPostconditions || [],
+          settlementActionId: decision.settlementActionId || "",
           value: decision.value,
           x: decision.x,
           y: decision.y,

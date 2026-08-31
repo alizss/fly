@@ -17,6 +17,8 @@ const STARTUP_DIAGNOSTICS_PREFIX = "atwStartupDiagnosticsV1";
 const RESUME_SESSIONS_KEY = "atwAgentResumeByLineageV1";
 const LEGACY_RESUME_KEY = "atwAgentResume";
 const RESUME_MAX_AGE_MS = 3 * 60 * 1000;
+const NAVIGATION_INTENT_MAX_AGE_MS = 45 * 1000;
+const SELECTION_HANDOFF_MAX_AGE_MS = 2 * 60 * 1000;
 const SELECTED_BOOKING_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DIAGNOSTIC_LIMIT = 40;
 
@@ -342,6 +344,8 @@ async function writeCheckoutContext(tabId, update = {}) {
     source: String(update.source || "browser_selection"),
     selectedBookingContract: update.selectedBookingContract || null,
     selectionCandidate: update.selectionCandidate || null,
+    boundUrl: publicSelectionSourceUrl(update.boundUrl || ""),
+    navigationHandoff: update.navigationHandoff || null,
     createdAt: String(update.createdAt || now),
     updatedAt: now
   };
@@ -357,28 +361,166 @@ async function ensureCheckoutContext(tabId, { rotate = false, source = "browser_
 
 async function installSelectedBookingLaunch(tabId, rawContract = null, {
   source = "app_launch",
-  preserveLineage = false
+  preserveLineage = false,
+  navigationHandoff = null
 } = {}) {
   const selectedBookingContract = validSelectedBookingContract(rawContract);
   if (!Number.isInteger(tabId)) return { ok: false, code: "CHECKOUT_TAB_REQUIRED" };
   if (!selectedBookingContract) return { ok: false, code: "INVALID_SELECTED_BOOKING" };
-  const existing = preserveLineage ? await readCheckoutContext(tabId) : null;
+  const [existing, tab] = await Promise.all([
+    preserveLineage ? readCheckoutContext(tabId) : null,
+    chrome.tabs.get(tabId)
+  ]);
   const context = await writeCheckoutContext(tabId, {
     source,
     selectedBookingContract,
     checkoutLineageId: existing?.checkoutLineageId,
-    createdAt: existing?.createdAt
+    createdAt: existing?.createdAt,
+    boundUrl: tab?.url || selectedBookingContract.sourceUrl,
+    navigationHandoff
   });
   return { ok: true, context };
 }
 
+function sameBoundDocument(context = null, url = "") {
+  const current = publicSelectionSourceUrl(url);
+  return Boolean(current && context?.boundUrl && current === publicSelectionSourceUrl(context.boundUrl));
+}
+
+function freshSelectionHandoff(context = null) {
+  const handoff = context?.navigationHandoff || null;
+  const selectedBookingContract = validSelectedBookingContract(context?.selectedBookingContract);
+  const createdAt = Date.parse(String(handoff?.createdAt || ""));
+  return Boolean(
+    handoff?.contractVersion === "checkout-navigation-handoff/v1"
+    && selectedBookingContract
+    && String(handoff.selectionId || "") === String(selectedBookingContract.selectionId || "")
+    && Number(handoff.remainingNavigations || 0) > 0
+    && Number.isFinite(createdAt)
+    && createdAt > Date.now() - SELECTION_HANDOFF_MAX_AGE_MS
+  );
+}
+
+function freshNavigationIntent(marker = null) {
+  const expectedAt = Number(marker?.navigationExpectedAt || 0);
+  return Boolean(
+    freshResumeMarker(marker)
+    && marker?.navigationExpected === true
+    && expectedAt > Date.now() - NAVIGATION_INTENT_MAX_AGE_MS
+  );
+}
+
+async function resumeMarkerForContext(tabId, context = null) {
+  if (!context) return null;
+  const stored = await chrome.storage.local.get([RESUME_SESSIONS_KEY, LEGACY_RESUME_KEY]);
+  const lineageId = String(context.checkoutLineageId || "");
+  const lineaged = stored?.[RESUME_SESSIONS_KEY]?.[lineageId] || null;
+  const legacy = stored?.[LEGACY_RESUME_KEY] || null;
+  if (freshResumeMarker(lineaged)) return lineaged;
+  return String(legacy?.tabContextId || "") === String(tabId) && freshResumeMarker(legacy)
+    ? legacy
+    : null;
+}
+
+async function authorizeCheckoutNavigation(tabId, destinationUrl = "") {
+  const context = await readCheckoutContext(tabId);
+  if (!context || !injectableCheckoutUrl(destinationUrl)) return { allowed: false, context };
+  if (sameBoundDocument(context, destinationUrl)) {
+    const resume = await resumeMarkerForContext(tabId, context);
+    return { allowed: Boolean(resume), reason: resume ? "ACTIVE_DOCUMENT_RELOAD" : "", context };
+  }
+  const resume = await resumeMarkerForContext(tabId, context);
+  const selectionHandoff = freshSelectionHandoff(context);
+  const navigationIntent = freshNavigationIntent(resume);
+  if (!selectionHandoff && !navigationIntent) return { allowed: false, context };
+  const nextHandoff = selectionHandoff
+    ? Number(context.navigationHandoff.remainingNavigations || 0) > 1
+      ? {
+          ...context.navigationHandoff,
+          remainingNavigations: Number(context.navigationHandoff.remainingNavigations) - 1
+        }
+      : null
+    : context.navigationHandoff || null;
+  const nextContext = await writeCheckoutContext(tabId, {
+    ...context,
+    boundUrl: destinationUrl,
+    navigationHandoff: nextHandoff
+  });
+  await appendStartupDiagnostic(tabId, "CHECKOUT_NAVIGATION_BOUND", {
+    reason: navigationIntent ? "AGENT_NAVIGATION_INTENT" : "SELECTION_HANDOFF",
+    checkoutLineageId: nextContext.checkoutLineageId,
+    selectionId: nextContext.selectedBookingContract?.selectionId || "",
+    destination: publicSelectionSourceUrl(destinationUrl)
+  });
+  return {
+    allowed: true,
+    reason: navigationIntent ? "AGENT_NAVIGATION_INTENT" : "SELECTION_HANDOFF",
+    context: nextContext
+  };
+}
+
+async function checkoutContextForPage(tabId, pageUrl = "") {
+  const context = await readCheckoutContext(tabId);
+  if (!context) return null;
+  if (sameBoundDocument(context, pageUrl)) return context;
+  const navigation = await authorizeCheckoutNavigation(tabId, pageUrl);
+  if (navigation.allowed) return navigation.context;
+  const previousLineageId = String(context.checkoutLineageId || "");
+  const previousSelectionId = String(context.selectedBookingContract?.selectionId || "");
+  const rotated = await writeCheckoutContext(tabId, {
+    source: "page_context_reset",
+    boundUrl: pageUrl
+  });
+  await appendStartupDiagnostic(tabId, "CHECKOUT_CONTEXT_ROTATED", {
+    reason: "UNRELATED_DOCUMENT",
+    previousLineageId,
+    previousSelectionId,
+    checkoutLineageId: rotated.checkoutLineageId,
+    destination: publicSelectionSourceUrl(pageUrl)
+  });
+  return rotated;
+}
+
 async function captureSelectedBooking(tabId, rawContract = null, { phase = "selection" } = {}) {
+  const selectedBookingContract = validSelectedBookingContract(rawContract);
+  if (!selectedBookingContract) return { ok: false, code: "INVALID_SELECTED_BOOKING" };
+  const existing = await readCheckoutContext(tabId);
+  const sameSelection = String(existing?.selectedBookingContract?.selectionId || "")
+    === String(selectedBookingContract.selectionId || "");
   const installed = await installSelectedBookingLaunch(tabId, rawContract, {
     source: "browser_selection",
-    preserveLineage: true
+    preserveLineage: sameSelection,
+    navigationHandoff: {
+      contractVersion: "checkout-navigation-handoff/v1",
+      selectionId: selectedBookingContract.selectionId,
+      createdAt: new Date().toISOString(),
+      remainingNavigations: 1
+    }
   });
   await appendStartupDiagnostic(tabId, installed.ok ? "BOOKING_SELECTION_PERSISTED" : "BOOKING_SELECTION_REJECTED", {
     phase: String(phase || "selection"),
+    code: installed.code || "",
+    selectionId: installed.context?.selectedBookingContract?.selectionId || "",
+    checkoutLineageId: installed.context?.checkoutLineageId || ""
+  });
+  return installed;
+}
+
+async function confirmObservedTestBooking(tabId, rawContract = null) {
+  if (rawContract?.testOnlyPageConfirmation !== true) {
+    return { ok: false, code: "TEST_BOOKING_MARKER_REQUIRED", context: null };
+  }
+  const installed = await installSelectedBookingLaunch(tabId, rawContract, {
+    source: "test_page_confirmation",
+    preserveLineage: false,
+    navigationHandoff: {
+      contractVersion: "checkout-navigation-handoff/v1",
+      selectionId: rawContract.selectionId,
+      createdAt: new Date().toISOString(),
+      remainingNavigations: 1
+    }
+  });
+  await appendStartupDiagnostic(tabId, installed.ok ? "DEV_OBSERVED_BOOKING_CONFIRMED" : "DEV_OBSERVED_BOOKING_REJECTED", {
     code: installed.code || "",
     selectionId: installed.context?.selectedBookingContract?.selectionId || "",
     checkoutLineageId: installed.context?.checkoutLineageId || ""
@@ -419,6 +561,8 @@ async function startCheckoutOnTab(tabId, {
   autoStart = true
 } = {}) {
   if (!Number.isInteger(tabId)) return { ok: false, code: "CHECKOUT_TAB_REQUIRED" };
+  const tab = await chrome.tabs.get(tabId);
+  await checkoutContextForPage(tabId, tab?.url || "");
   const existingContext = await finalizeSelectionCandidateForTraveler(tabId, selectedTravelerId);
   const existingContract = validSelectedBookingContract(existingContext?.selectedBookingContract);
   const suppliedContract = validSelectedBookingContract(selectedBookingContract);
@@ -479,18 +623,6 @@ async function startCheckoutOnTab(tabId, {
   }
 }
 
-async function shouldFollowActiveCheckout(tabId) {
-  const context = await readCheckoutContext(tabId);
-  if (!context) return false;
-  if (validSelectedBookingContract(context.selectedBookingContract)) return true;
-  const stored = await chrome.storage.local.get([RESUME_SESSIONS_KEY, LEGACY_RESUME_KEY]);
-  const lineageId = String(context.checkoutLineageId || "");
-  const lineaged = stored?.[RESUME_SESSIONS_KEY]?.[lineageId] || null;
-  const legacy = stored?.[LEGACY_RESUME_KEY] || null;
-  return freshResumeMarker(lineaged)
-    || (String(legacy?.tabContextId || "") === String(tabId) && freshResumeMarker(legacy));
-}
-
 async function adoptCheckoutHandoff(tab = {}) {
   const tabId = Number(tab.id);
   const openerTabId = Number(tab.openerTabId);
@@ -504,15 +636,13 @@ async function adoptCheckoutHandoff(tab = {}) {
   const resume = freshResumeMarker(lineagedResume) ? lineagedResume : legacyResume;
   const selectedBookingContract = validSelectedBookingContract(openerContext.selectedBookingContract);
   const hasCapturedBooking = Boolean(selectedBookingContract);
-  const resumeIsFresh = freshResumeMarker(resume)
+  const resumeIsFresh = freshNavigationIntent(resume)
     && (
       String(resume.checkoutLineageId || "") === lineageId
       || (!resume.checkoutLineageId && String(resume.tabContextId || "") === String(openerTabId))
     );
-  // A selected booking is the pre-session handoff authority. Requiring a
-  // resume marker here made new-tab provider redirects lose the booking before
-  // a durable session could even exist.
-  if (!resumeIsFresh && !hasCapturedBooking) return false;
+  const selectionHandoff = hasCapturedBooking && freshSelectionHandoff(openerContext);
+  if (!resumeIsFresh && !selectionHandoff) return false;
   const now = new Date().toISOString();
   const inheritedContext = {
     ...openerContext,
@@ -555,9 +685,11 @@ chrome.tabs.onCreated.addListener((tab) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete" || !injectableCheckoutUrl(tab?.url)) return;
   (async () => {
-    if (!await shouldFollowActiveCheckout(tabId)) return;
+    const navigation = await authorizeCheckoutNavigation(tabId, tab.url);
+    if (!navigation.allowed) return;
     await appendStartupDiagnostic(tabId, "RUNTIME_REINJECTION_STARTED", {
-      origin: new URL(tab.url).origin
+      origin: new URL(tab.url).origin,
+      reason: navigation.reason
     });
     await injectCheckoutRuntime(tabId);
     await appendStartupDiagnostic(tabId, "RUNTIME_REINJECTED");
@@ -610,7 +742,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
     chrome.storage.local.get(["selectedTravelerId"])
-      .then((stored) => finalizeSelectionCandidateForTraveler(tabId, message.selectedTravelerId || stored.selectedTravelerId))
+      .then(async (stored) => {
+        await checkoutContextForPage(tabId, sender.tab?.url || "");
+        return finalizeSelectionCandidateForTraveler(tabId, message.selectedTravelerId || stored.selectedTravelerId);
+      })
       .then((context) => sendResponse({ ok: true, context }))
       .catch((error) => sendResponse({ ok: false, code: "CHECKOUT_CONTEXT_UNAVAILABLE", error: error.message }));
     return true;
@@ -687,26 +822,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
     const missingFacts = Array.isArray(message.missingFacts) ? message.missingFacts.slice(0, 12) : [];
-    ensureCheckoutContext(tabId)
-      .then((context) => writeCheckoutContext(tabId, {
-        ...context,
-        selectionCandidate: {
-          observedAt: new Date().toISOString(),
-          phase: String(message.phase || "selection"),
-          missingFacts,
-          selectedBookingCandidate: validSelectionCandidate(message.selectedBookingCandidate) || null,
-          evidence: {
-            producerEpoch: String(message.evidence?.producerEpoch || ""),
-            explicitSelectionGesture: message.evidence?.explicitSelectionGesture === true,
-            itineraryObserved: message.evidence?.itineraryObserved === true,
-            totalObserved: message.evidence?.totalObserved === true
-          }
+    const gestureId = String(message.gestureId || "").trim();
+    Promise.all([readCheckoutContext(tabId), chrome.tabs.get(tabId)])
+      .then(async ([existing, tab]) => {
+        // An incomplete observation is diagnostic evidence only. It cannot
+        // replace or revoke an already approved SelectedBooking, and it does
+        // not own checkout identity or lineage.
+        if (validSelectedBookingContract(existing?.selectedBookingContract)) {
+          return { context: existing, preservedApprovedBooking: true };
         }
-      }))
-      .then(() => appendStartupDiagnostic(tabId, "BOOKING_SELECTION_INCOMPLETE", {
+        const context = existing || await ensureCheckoutContext(tabId, {
+          source: "browser_selection_candidate"
+        });
+        const updated = await writeCheckoutContext(tabId, {
+          ...context,
+          boundUrl: context.boundUrl || sender.tab?.url || tab?.url || "",
+          selectionCandidate: {
+            gestureId,
+            observedAt: new Date().toISOString(),
+            phase: String(message.phase || "selection"),
+            missingFacts,
+            selectedBookingCandidate: validSelectionCandidate(message.selectedBookingCandidate) || null,
+            evidence: {
+              producerEpoch: String(message.evidence?.producerEpoch || ""),
+              explicitSelectionGesture: message.evidence?.explicitSelectionGesture === true,
+              itineraryObserved: message.evidence?.itineraryObserved === true,
+              totalObserved: message.evidence?.totalObserved === true
+            }
+          }
+        });
+        return { context: updated, preservedApprovedBooking: false };
+      })
+      .then(({ preservedApprovedBooking }) => appendStartupDiagnostic(tabId, "BOOKING_SELECTION_INCOMPLETE", {
         phase: String(message.phase || "selection"),
         missingFacts,
-        evidence: message.evidence || {}
+        evidence: message.evidence || {},
+        preservedApprovedBooking
       }))
       .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ ok: false, code: "BOOKING_SELECTION_DIAGNOSTIC_FAILED", error: error.message }));
@@ -722,6 +873,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     captureSelectedBooking(tabId, message.selectedBookingContract, { phase: message.phase })
       .then(sendResponse)
       .catch((error) => sendResponse({ ok: false, code: "BOOKING_SELECTION_CAPTURE_FAILED", error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "ATW_DEV_OBSERVED_BOOKING_CONFIRM") {
+    const tabId = sender.tab?.id;
+    if (!Number.isInteger(tabId)) {
+      sendResponse({ ok: false, code: "CHECKOUT_TAB_REQUIRED", context: null });
+      return false;
+    }
+    confirmObservedTestBooking(tabId, message.selectedBookingContract)
+      .then(sendResponse)
+      .catch((error) => sendResponse({ ok: false, code: "DEV_OBSERVED_BOOKING_CONFIRM_FAILED", error: error.message, context: null }));
     return true;
   }
 

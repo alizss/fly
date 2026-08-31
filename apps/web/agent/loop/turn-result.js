@@ -112,6 +112,7 @@ function toClientDecision(action) {
     readinessDeadlineAt: Number(action.readinessDeadlineAt || 0),
     readinessAttempts: Number(action.readinessAttempts || 0),
     reobserveRetryToken: action.reobserveRetryToken || "",
+    settlementActionId: action.settlementActionId || "",
     message: action.reason || "Working on the next step.",
     needsApproval: action.requiresApproval,
     userActionRequired: action.userActionRequired === true,
@@ -122,6 +123,9 @@ function toClientDecision(action) {
     decision.observationId = action.observationId || "";
     decision.observationHash = action.observationHash || "";
     decision.intent = action.intent || action.type || "";
+    decision.expectedPostconditions = (action.expectedPostconditions || [])
+      .filter((postcondition) => postcondition && typeof postcondition === "object")
+      .map((postcondition) => ({ ...postcondition }));
   }
   return decision;
 }
