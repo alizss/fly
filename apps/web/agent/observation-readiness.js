@@ -32,6 +32,24 @@ function actionableControlCount(page = {}) {
   return executableControlsForCurrentSurface(page).length;
 }
 
+function operationOccluded(operation = {}) {
+  const actionability = operation?.actionability || {};
+  return actionability.code === "ACTUATOR_OCCLUDED"
+    && actionability.rendered !== false
+    && actionability.visible !== false
+    && actionability.enabled !== false;
+}
+
+function occludedControlCount(page = {}) {
+  const surface = currentSurface(page);
+  return (page.controls || []).filter((control) => {
+    if (surface.type !== "page"
+      && surface.blocksBackground === true
+      && !controlBelongsToCurrentSurface(control, page)) return false;
+    return Object.values(control.operations || {}).some(operationOccluded);
+  }).length;
+}
+
 function foregroundReady(page = {}) {
   const surface = currentSurface(page);
   return surface.type !== "page" && executableControlsForCurrentSurface(page).length > 0;
@@ -183,6 +201,7 @@ function classifyObservationReadiness({
         : startedAt + Math.max(1, Number(readinessTimeoutMs || 0)));
   const deadlineExpired = Number(nowMs) >= deadlineAt;
   const controls = actionableControlCount(page);
+  const occludedControls = occludedControlCount(page);
   const loadingSignal = facts.ariaBusy === true
     || Number(facts.loadingIndicatorCount || 0) > 0
     || facts.loadingTextEvidence === true;
@@ -195,11 +214,20 @@ function classifyObservationReadiness({
   // clickable is not proof that the destination arrived, and must not reopen
   // TaskState or permit the same stage exit to be planned again.
   const unsettledSource = pendingSettlement && destinationChange.changed !== true;
+  // A framework hydration layer can leave the document "complete" while one
+  // full-page element temporarily intercepts every otherwise rendered
+  // actuator. That is browser readiness evidence, not a semantic absence of
+  // checkout work. Do not let TaskState turn this transient zero-capability
+  // snapshot into `no_goal_relevant_candidate`.
+  const pageMechanicallyOccluded = controls === 0
+    && occludedControls > 0
+    && Number(facts.visibleMainCount || 0) === 0;
   // A local spinner is diagnostic when the current surface already exposes
   // executable mechanics. It becomes page-blocking only when no executable
   // surface exists or an exact dispatched navigation is still unsettled.
   const explicitLoading = facts.documentReadyState === "loading"
     || mainLoadingSignal
+    || pageMechanicallyOccluded
     || (loadingSignal && (controls === 0 || pendingSettlement));
   const usableForeground = foregroundReady(page) && !explicitLoading;
   const hasReadinessEvidence = Boolean(
@@ -213,6 +241,15 @@ function classifyObservationReadiness({
     && Number(facts.loadingIndicatorCount || 0) === 0
     && (Number(facts.stableForMs || 0) >= MIN_DESTINATION_STABLE_MS || !hasReadinessEvidence);
   const mechanicallyUsable = !explicitLoading && controls > 0;
+  // An interactive document with no executable mechanics is not a semantic
+  // checkout surface yet. Frameworks commonly commit the document before
+  // hydrating its real controls; handing that snapshot to TaskState turns a
+  // render race into `no_goal_relevant_candidate` and strands the durable
+  // session. Once any executable mechanic exists, stability remains purely
+  // diagnostic and cannot delay ordinary work.
+  const unstableMechanicallyEmpty = controls === 0
+    && facts.documentReadyState === "interactive"
+    && !stable;
   const temporarilyIncomplete = afterNavigation && !mechanicallyUsable;
   // Readiness owns only browser mechanics. Stage, field, commerce and payment
   // meaning belongs to DecisionFrame/TaskState and is deliberately absent.
@@ -220,10 +257,17 @@ function classifyObservationReadiness({
   // executable mechanic. Waiting solely for a quiet-time threshold creates a
   // lost-mutation race: the destination can become usable before the wait is
   // installed and then never mutate again. Only explicit loading or a truly
-  // incomplete post-action surface may hold the controller.
-  const transient = explicitLoading || temporarilyIncomplete || unsettledSource;
+  // incomplete post-action surface may hold the controller. A mechanically
+  // empty document that has not settled is likewise browser lifecycle state,
+  // not evidence that checkout has no remaining obligation.
+  const transient = explicitLoading
+    || unstableMechanicallyEmpty
+    || temporarilyIncomplete
+    || unsettledSource;
   const evidence = Object.freeze({
     controls,
+    occludedControls,
+    pageMechanicallyOccluded,
     loadingSignal,
     mainLoadingSignal,
     pendingSettlement,
@@ -231,6 +275,7 @@ function classifyObservationReadiness({
     destinationChange,
     explicitLoading,
     mechanicallyUsable,
+    unstableMechanicallyEmpty,
     temporarilyIncomplete,
     actionDispatched: afterNavigation,
     stable,
@@ -284,10 +329,12 @@ function classifyObservationReadiness({
       remainingMs: Math.max(0, deadlineAt - Number(nowMs)),
       deadlineExpired: false,
       reason: explicitLoading
-        ? "PAGE_LOADING"
-        : temporarilyIncomplete
-          ? "POST_ACTION_SURFACE_TEMPORARILY_INCOMPLETE"
-          : "POST_ACTION_SURFACE_SETTLING",
+        ? (pageMechanicallyOccluded ? "PAGE_MECHANICALLY_OCCLUDED" : "PAGE_LOADING")
+        : unstableMechanicallyEmpty
+          ? "MECHANICALLY_EMPTY_SURFACE_SETTLING"
+          : temporarilyIncomplete
+            ? "POST_ACTION_SURFACE_TEMPORARILY_INCOMPLETE"
+            : "POST_ACTION_SURFACE_SETTLING",
       handoffEligible: false,
       evidence
     });
@@ -303,7 +350,10 @@ function classifyObservationReadiness({
       remainingMs: 0,
       deadlineExpired: true,
       reason: "DESTINATION_READINESS_DEADLINE_EXPIRED_WHILE_LOADING",
-      handoffEligible: true,
+      // A readiness deadline bounds active polling. It does not create a
+      // semantic blocker or authorize a terminal stop. The browser watcher
+      // remains responsible for waking this durable session on fresh structure.
+      handoffEligible: false,
       evidence
     });
   }

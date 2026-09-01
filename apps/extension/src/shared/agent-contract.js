@@ -1347,6 +1347,10 @@
     const unownedMaterialControls = controls.filter((control) => (
       operationExecutable(control)
       && !ownedControlIds.has(control.controlId)
+      // DecisionFrame-owned profile fields are governed by the logical-field
+      // requirement queue. They are intentionally absent from generic
+      // decision groups and therefore are not unowned commerce decisions.
+      && control.effectRole !== "profile_field"
       && (
         control.semantic === "choice"
         || control.semantic === "selection_cta"

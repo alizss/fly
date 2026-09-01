@@ -522,7 +522,7 @@ test("scene hypotheses may refine supplied evidence but cannot invent owners or 
   assert.equal(frame.observation.page.validationIssues[0].controlId, "ctrl_unknown");
 });
 
-test("an evidence-identical grounded binding is reused without another model request", () => {
+test("an evidence-identical grounded profile binding is reused without another model request or generic decision", () => {
   const sourceControl = control({
     controlId: "ctrl_unknown_1",
     stableKey: "traveler|passenger_1|opaque_1",
@@ -564,7 +564,8 @@ test("an evidence-identical grounded binding is reused without another model req
     traveler: { first_name: "Ali" }
   });
   assert.equal(frame.observation.page.controls[0].fieldType, "first_name");
-  assert.equal(frame.semanticCompilation.semanticReadiness, "unresolved");
+  assert.equal(frame.semanticCompilation.semanticReadiness, "ready");
+  assert.equal(frame.profileRequirements[0].semanticType, "first_name");
 });
 
 test("a grounded binding is invalidated when its local semantic evidence changes", () => {

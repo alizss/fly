@@ -500,56 +500,31 @@ async function runLoopTurn({
     };
   }
   if (observationReadiness.classification === READINESS.DEGRADED) {
-    if (observationReadiness.handoffEligible !== true) {
-      const action = normalizeAction({
-        observationId: observation.observationId || "",
-        observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-        type: "wait",
-        intent: "reobserve_degraded_loading_destination",
-        mechanicalEffect: "unknown",
-        expectedPostconditions: [{ type: "observation_readiness", status: READINESS.READY }],
-        readinessStartedAt: observationReadiness.startedAt,
-        readinessDeadlineAt: observationReadiness.deadlineAt,
-        readinessAttempts: observationReadiness.attempts,
-        reason: "The destination is still loading. Keep the navigation pending and reobserve without planning or asking the user.",
-        risk: "safe",
-        requiresApproval: false
-      });
-      const waitingState = withUpdate(state, { lastAction: action, status: "running" });
-      transactionStore?.saveSession?.(waitingState);
-      return {
-        state: waitingState,
-        clientDecision: toClientDecision(action),
-        debug: withLatencyDebug({
-          observationReadiness,
-          finalAction: action,
-          modelCalled: false,
-          navigationStillPending: true
-        }, latency, modelUsageFromMetas(model, []))
-      };
-    }
     const action = normalizeAction({
       observationId: observation.observationId || "",
       observationHash: observation.observationSnapshot?.snapshotHash || observation.page?.snapshotHash || "",
-      type: "stop",
-      intent: "site_readiness_failure",
+      type: "wait",
+      intent: "reobserve_degraded_loading_destination",
       mechanicalEffect: "unknown",
-      expectedPostconditions: [],
-      reason: "SITE_READINESS_FAILURE: the destination remained genuinely loading or unstable until the readiness deadline.",
+      expectedPostconditions: [{ type: "observation_readiness", status: READINESS.READY }],
+      readinessStartedAt: observationReadiness.startedAt,
+      readinessDeadlineAt: observationReadiness.deadlineAt,
+      readinessAttempts: observationReadiness.attempts,
+      reason: "The destination is still mechanically unavailable. End active polling and keep the durable checkout ready to resume on fresh browser structure.",
       risk: "safe",
       requiresApproval: false
     });
-    const degradedState = withUpdate(state, { lastAction: action, status: "stopped" });
-    transactionStore?.saveSession?.(degradedState);
+    const waitingState = withUpdate(state, { lastAction: action, status: "running" });
+    transactionStore?.saveSession?.(waitingState);
     return {
-      state: degradedState,
+      state: waitingState,
       clientDecision: toClientDecision(action),
       debug: withLatencyDebug({
         observationReadiness,
         finalAction: action,
         modelCalled: false,
-        stopCategory: "site_readiness_failure",
-        userActionRequired: false
+        navigationStillPending: true,
+        activePollingComplete: true
       }, latency, modelUsageFromMetas(model, []))
     };
   }

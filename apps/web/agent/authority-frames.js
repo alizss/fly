@@ -84,7 +84,7 @@ const PROFILE_MACHINE_RULES = Object.freeze([
   { semantic: "address_line2", specificity: 120, pattern: /addressline2|address2/ },
   { semantic: "age_at_departure", specificity: 110, pattern: /ageat(?:travel|departure)|passengerage|agegroup/ },
   { semantic: "travel_purpose", specificity: 110, pattern: /reasonfortravel|travelpurpose|purposeoftrip/ },
-  { semantic: "date_of_birth", specificity: 110, pattern: /dateofbirth|birthdate|birthday|dob/ },
+  { semantic: "date_of_birth", specificity: 110, pattern: /dateofbirth|birthdate|birth(?:day|month|year)|dob/ },
   { semantic: "document_expiry", specificity: 110, pattern: /passportexpiry|documentexpiry|expirationdate/ },
   { semantic: "passport_number", specificity: 110, pattern: /passportnumber/ },
   { semantic: "document_number", specificity: 100, pattern: /documentnumber|traveldocument/ },
@@ -188,7 +188,7 @@ function profileSemanticFromStructure(control = {}) {
       ? new Set()
       : /button/.test(shape)
         ? new Set(["phone_country_code", "age_at_departure", "travel_purpose", "title", "gender", "nationality", "country_of_residence", "country"])
-        : new Set(["phone_country_code", "age_at_departure", "travel_purpose", "title", "gender", "nationality", "country_of_residence", "country"]);
+        : new Set(["phone_country_code", "age_at_departure", "travel_purpose", "title", "gender", "nationality", "country_of_residence", "country", "date_of_birth", "document_expiry"]);
     // The state-owner machine identity is authoritative for choice controls:
     // an aggregate radio label often contains the whole surrounding form.
     // Only the closed profile-choice vocabulary is admitted, so legal and
@@ -238,6 +238,7 @@ function profileComponentRoleFromStructure(control = {}, semanticType = "", phon
   if (["day", "month", "year"].includes(declaredDateRole)) return declaredDateRole;
   if (["date_of_birth", "document_expiry"].includes(semanticType)) {
     const evidence = clean(`${control.autocomplete || ""} ${control.name || ""} ${control.id || ""} ${control.placeholder || ""}`)
+      .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "_");
     if (/(?:^|_)(?:day|dd)(?:_|$)/.test(evidence)) return "day";
@@ -629,11 +630,20 @@ function interpretStructuralPage(page = {}) {
     )
   ));
   const controlsById = new Map(controls.map((control) => [control.controlId, control]));
+  const profileOwnedControlIds = new Set(controls
+    .filter((control) => control.effectRole === "profile_field")
+    .map((control) => clean(control.controlId))
+    .filter(Boolean));
   const decisionGroups = structuralGroups.map((group) => {
     const ids = unique([
       ...(group.alternativeControlIds || []),
       ...(group.alternatives || []).map((option) => option.controlId)
-    ]);
+    ]).filter((controlId) => !profileOwnedControlIds.has(clean(controlId)));
+    // A profile component may be implemented by a select, radio, or custom
+    // choice widget, but its desired state and completion are owned by the
+    // parent logical profile field. Publishing the same control as a generic
+    // checkout decision creates a second requiredness/completion authority.
+    if (!ids.length) return null;
     const memberIds = new Set(ids);
     const groupControls = ids.map((controlId) => controlsById.get(controlId)).filter(Boolean);
     // Selection is an observed relationship owned by the structural group.
@@ -903,7 +913,7 @@ function interpretStructuralPage(page = {}) {
       alternatives: boundedAlternatives,
       alternativeControlIds: boundedAlternatives.map((option) => option.controlId)
     };
-  });
+  }).filter(Boolean);
   const structurallyOwnedControlIds = new Set(decisionGroups.flatMap((group) => group.alternativeControlIds || []));
   const inferredRepeatedGroups = agentContract.boundedRepeatedChoiceGroups({ ...page, controls }, controls)
     .filter((group) => !(group.alternativeControlIds || []).some((controlId) => structurallyOwnedControlIds.has(controlId)));

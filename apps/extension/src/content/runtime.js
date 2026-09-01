@@ -387,7 +387,11 @@ import {
   const DESTINATION_WAIT_TIMEOUT_MS = 20_000;
   const DESTINATION_RETRY_INTERVAL_MS = 300;
   const DESTINATION_MUTATION_SETTLE_MS = 450;
-  async function saveResumeMarker({ navigationExpected = false, navigationActionId = "" } = {}) {
+  async function saveResumeMarker({
+    navigationExpected = false,
+    navigationExpectedAt = 0,
+    navigationActionId = ""
+  } = {}) {
     try {
       if ((!agent.running && !agent.engineReconciliationPending) || !agent.sessionId) {
         await clearResumeMarker();
@@ -401,7 +405,12 @@ import {
         skipPaidExtrasApproved: agent.skipPaidExtrasApproved,
         navigationUrl: currentNavigationUrl(),
         navigationExpected: navigationExpected === true,
-        navigationExpectedAt: navigationExpected === true ? Date.now() : 0,
+        // The original governed action owns the navigation-intent lifetime.
+        // Intermediate redirect documents may preserve that lease, but must
+        // not silently renew it into an unbounded navigation authority.
+        navigationExpectedAt: navigationExpected === true
+          ? (Number(navigationExpectedAt || 0) > 0 ? Number(navigationExpectedAt) : Date.now())
+          : 0,
         navigationActionId: navigationExpected === true ? String(navigationActionId || "") : ""
       };
       const response = await chrome.runtime.sendMessage({

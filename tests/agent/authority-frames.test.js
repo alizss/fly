@@ -147,7 +147,7 @@ test("V3 frames compile once and publish one flat mechanics-binding obligation",
   }), /BIND_MECHANICS_DECISION_FRAME_MISMATCH/);
 });
 
-test("DecisionFrame preserves an exact native-select group selection instead of reopening it", () => {
+test("a profile-owned native select does not retain a competing generic decision", () => {
   const titleControlId = "ctrl_title";
   const titleGroupId = "dg_title";
   const title = {
@@ -222,12 +222,12 @@ test("DecisionFrame preserves an exact native-select group selection instead of 
   const group = decisionFrame.semanticCompilation.decisionGroups.find((entry) => (
     entry.decisionGroupId === titleGroupId
   ));
+  const requirement = decisionFrame.profileRequirements.find((entry) => entry.semanticType === "title");
 
-  assert.ok(group);
-  assert.equal(group.status, "satisfied");
-  assert.equal(group.selectedControlId, titleControlId);
-  assert.equal(group.selectedLabel, "mr");
-  assert.equal(group.alternatives.find((entry) => entry.controlId === titleControlId)?.selected, true);
+  assert.equal(group, undefined);
+  assert.ok(requirement);
+  assert.equal(requirement.hasValue, true);
+  assert.equal(requirement.currentNormalizedValue, "mr");
 });
 
 test("a payment section cannot turn local optional marketing consent into a required payment method", () => {
@@ -820,6 +820,119 @@ test("strong unknown validation survives semantic uncertainty and outranks navig
   assert.equal(taskState.currentObligation.semanticOwner.family, "unknown");
   assert.deepEqual(taskState.currentObligation.admittedControlIds, ["unknown_input"]);
   assert.notEqual(taskState.currentObligation.semanticOwner.family, "navigation");
+});
+
+test("split profile dates remain one logical obligation and never become optional generic decisions", () => {
+  const dateControl = ({ controlId, name, role, kind, value = "", operation }) => ({
+    controlId,
+    stableKey: `${kind}|name:${name}`,
+    name,
+    label: name.endsWith("birthDay") ? "DD" : name.endsWith("birthMonth") ? "Month" : "YYYY",
+    role,
+    kind,
+    surfaceId: "surface-page",
+    representationLifecycle: { status: "active_rendered", active: true, stateRendered: true },
+    state: {
+      required: false,
+      valuePresent: Boolean(value),
+      normalizedValue: value,
+      selected: false,
+      checked: false,
+      disabled: false
+    },
+    options: name.endsWith("birthMonth")
+      ? [{ value: "", label: "Month", selected: !value }, { value: "05", label: "May", selected: value === "05" }]
+      : [],
+    operations: { [operation]: actionable(operation, `${controlId}_node`) }
+  });
+  const day = dateControl({
+    controlId: "birth_day",
+    name: "passengers.0.birthDay",
+    role: "textbox",
+    kind: "text",
+    value: "31",
+    operation: "type"
+  });
+  const month = dateControl({
+    controlId: "birth_month",
+    name: "passengers.0.birthMonth",
+    role: "select",
+    kind: "select",
+    operation: "select"
+  });
+  const year = dateControl({
+    controlId: "birth_year",
+    name: "passengers.0.birthYear",
+    role: "textbox",
+    kind: "text",
+    operation: "type"
+  });
+  const observation = {
+    observationId: "obs_split_profile_date_owner",
+    observationSnapshot: { snapshotHash: "hash_split_profile_date_owner" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://unfamiliar.example/checkout/passengers",
+      currentSurface: { id: "surface-page", type: "page", memberControlIds: [day.controlId, month.controlId, year.controlId] },
+      controls: [day, month, year],
+      decisionGroups: [{
+        decisionGroupId: "dg_structural_birth_month",
+        surfaceId: "surface-page",
+        sectionLabel: "Passenger details",
+        required: false,
+        status: "optional",
+        selectedControlId: "",
+        alternativeControlIds: [month.controlId],
+        alternatives: [{ controlId: month.controlId, label: "Month", selected: false }]
+      }],
+      validationIssues: []
+    }
+  };
+  const traveler = { id: "traveler_1", date_of_birth: "2003-05-31" };
+  const decisionFrame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation),
+    traveler
+  });
+  const dateRequirements = decisionFrame.profileRequirements.filter((requirement) => (
+    requirement.semanticType === "date_of_birth"
+  ));
+  const logicalFieldId = dateRequirements[0]?.logicalFieldId || "";
+  const taskState = reduceTaskState({
+    observation,
+    decisionFrame,
+    traveler,
+    previousTaskState: {
+      verifiedProfileComponents: [{
+        contractVersion: "verified-profile-component/v1",
+        completionId: `traveler_1::${logicalFieldId}::day`,
+        status: "verified",
+        actionId: "act_verified_birth_day",
+        observationId: "obs_verified_birth_day",
+        logicalFieldId,
+        subjectId: "traveler_1",
+        semanticType: "date_of_birth",
+        componentRole: "day",
+        parentControlId: day.controlId,
+        selectedControlId: day.controlId,
+        selectedActuatorId: `${day.controlId}_node`,
+        desiredCanonicalValue: "31",
+        selectedCanonicalValue: "31",
+        evidenceSource: "canonical_normalized_value_verifier"
+      }]
+    }
+  });
+
+  assert.deepEqual(dateRequirements.map((requirement) => requirement.componentRole), ["day", "month", "year"]);
+  assert.equal(new Set(dateRequirements.map((requirement) => requirement.logicalFieldId)).size, 1);
+  assert.ok(dateRequirements.every((requirement) => requirement.logicalStructure === "composite"));
+  assert.ok(decisionFrame.commerceEntities.every((group) => (
+    !(group.alternativeControlIds || []).includes(month.controlId)
+  )));
+  assert.equal(taskState.currentGoal.semanticType, "date_of_birth");
+  assert.equal(taskState.currentGoal.componentRole, "month");
+  assert.equal(taskState.currentGoal.controlId, month.controlId);
+  assert.equal(taskState.currentGoal.desiredValue, "05");
 });
 
 test("DecisionFrame collapses a placeholder payment selector and visible routes into one final decision", () => {

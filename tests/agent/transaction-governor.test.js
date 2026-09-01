@@ -99,6 +99,126 @@ test("missing SelectedBooking is rejected before the governor can schedule any a
   );
 });
 
+test("a fully occluded current surface waits before TaskState can manufacture a no-goal stop", async () => {
+  const traveler = { id: "trav_occluded_surface", first_name: "Ali", last_name: "Sifrar" };
+  const state = createCheckoutSessionState({
+    travelerId: traveler.id,
+    site: { host: "example.test", url: "https://example.test/services" }
+  });
+  state.id = "txn_occluded_surface";
+  const occludedActionability = {
+    rendered: true,
+    visible: true,
+    enabled: true,
+    inViewport: true,
+    inCurrentSurface: true,
+    hitTested: false,
+    notOccluded: false,
+    executable: false,
+    revealable: false,
+    code: "ACTUATOR_OCCLUDED"
+  };
+  const observation = {
+    observationId: "obs_occluded_surface",
+    observationSnapshot: { snapshotHash: "hash_occluded_surface" },
+    page: {
+      url: "https://example.test/services",
+      snapshotHash: "hash_occluded_surface",
+      currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+      controls: ["seat", "continue"].map((id) => ({
+        controlId: `ctrl_${id}`,
+        operations: {
+          activate: {
+            actuatorId: `el_${id}`,
+            actuatorIds: [`el_${id}`],
+            actionability: occludedActionability
+          }
+        }
+      })),
+      decisionGroups: [],
+      validationIssues: [],
+      readiness: {
+        documentReadyState: "complete",
+        ariaBusy: false,
+        mainAriaBusy: false,
+        loadingIndicatorCount: 0,
+        stableForMs: 900,
+        visibleMainCount: 0
+      }
+    }
+  };
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    state,
+    observation,
+    traveler
+  });
+
+  assert.equal(result.clientDecision.action, "wait");
+  assert.equal(result.clientDecision.intent, "reobserve_after_transient_observation");
+  assert.equal(result.state.status, "running");
+  assert.equal(result.state.observationReadiness.reason, "PAGE_MECHANICALLY_OCCLUDED");
+  assert.equal(result.debug.modelCalled, false);
+});
+
+test("an interactive empty shell waits before TaskState can manufacture a no-goal stop", async () => {
+  const traveler = { id: "trav_hydrating_surface", first_name: "Ali", last_name: "Sifrar" };
+  const state = createCheckoutSessionState({
+    travelerId: traveler.id,
+    site: { host: "example.test", url: "https://example.test/payment" }
+  });
+  state.id = "txn_hydrating_surface";
+  const observation = {
+    observationId: "obs_hydrating_surface",
+    observationSnapshot: { snapshotHash: "hash_hydrating_surface" },
+    page: {
+      url: "https://example.test/payment",
+      snapshotHash: "hash_hydrating_surface",
+      currentSurface: { id: "surface-page", type: "page", blocksBackground: false },
+      controls: [{
+        controlId: "utility_shell",
+        operations: {
+          activate: {
+            actuatorId: "utility_shell_node",
+            actuatorIds: ["utility_shell_node"],
+            actionability: {
+              executable: false,
+              revealable: false,
+              code: "ACTUATOR_NOT_VISIBLE"
+            }
+          }
+        }
+      }],
+      decisionGroups: [],
+      validationIssues: [],
+      readiness: {
+        documentReadyState: "interactive",
+        ariaBusy: false,
+        mainAriaBusy: false,
+        loadingIndicatorCount: 0,
+        stableForMs: 213,
+        visibleMainCount: 0
+      }
+    }
+  };
+
+  const result = await runLoopTurn({
+    apiKey: "",
+    model: "must-not-be-called",
+    state,
+    observation,
+    traveler
+  });
+
+  assert.equal(result.clientDecision.action, "wait");
+  assert.equal(result.clientDecision.intent, "reobserve_after_transient_observation");
+  assert.equal(result.state.status, "running");
+  assert.equal(result.state.observationReadiness.reason, "MECHANICALLY_EMPTY_SURFACE_SETTLING");
+  assert.equal(result.debug.modelCalled, false);
+});
+
 test("pre-surface discovery admits one exact reversible opener and rejects semantic side effects", () => {
   const controlId = "ctrl_title";
   const actuatorId = "actuator_title_trigger";

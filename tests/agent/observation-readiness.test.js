@@ -22,6 +22,23 @@ function operation(id, executable = true) {
   };
 }
 
+function occludedOperation(id) {
+  return {
+    activate: {
+      actuatorId: id,
+      actuatorIds: [id],
+      actionability: {
+        executable: false,
+        revealable: false,
+        code: "ACTUATOR_OCCLUDED",
+        rendered: true,
+        visible: true,
+        enabled: true
+      }
+    }
+  };
+}
+
 function observation({
   id = "obs",
   hash = `hash_${id}`,
@@ -30,6 +47,7 @@ function observation({
   stableForMs = 800,
   controls = [],
   loading = false,
+  visibleMainCount = controls.length > 0 ? 1 : 0,
   lastActionResult = null,
   surface = { id: "surface-page", type: "page", blocksBackground: false }
 } = {}) {
@@ -51,6 +69,7 @@ function observation({
         mainAriaBusy: loading,
         loadingIndicatorCount: loading ? 1 : 0,
         loadingTextEvidence: loading,
+        visibleMainCount,
         stableForMs
       }
     }
@@ -198,7 +217,7 @@ test("a dispatched empty surface is temporarily incomplete until its deadline", 
   assert.equal(expired.reason, "STABLE_DESTINATION_CONTROLLER_HANDOFF");
 });
 
-test("genuine loading is bounded and degrades at the mechanical deadline", () => {
+test("genuine loading ends active polling without creating a terminal authority", () => {
   const result = dispatchedNavigation("act_loading");
   const current = observation({
     id: "obs_loading",
@@ -239,7 +258,69 @@ test("genuine loading is bounded and degrades at the mechanical deadline", () =>
     nowMs: transient.deadlineAt
   });
   assert.equal(degraded.classification, READINESS.DEGRADED);
-  assert.equal(degraded.handoffEligible, true);
+  assert.equal(degraded.handoffEligible, false);
+});
+
+test("a complete document whose rendered controls are all occluded remains transient", () => {
+  const current = observation({
+    id: "obs_framework_overlay",
+    controls: [
+      { controlId: "seat_selection", operations: occludedOperation("seat_node") },
+      { controlId: "continue", operations: occludedOperation("continue_node") }
+    ],
+    stableForMs: 900,
+    visibleMainCount: 0
+  });
+
+  const readiness = classifyObservationReadiness({
+    observation: current,
+    nowMs: 30_000,
+    readinessTimeoutMs: 2_000
+  });
+
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.reason, "PAGE_MECHANICALLY_OCCLUDED");
+  assert.equal(readiness.evidence.controls, 0);
+  assert.equal(readiness.evidence.occludedControls, 2);
+  assert.equal(readiness.evidence.pageMechanicallyOccluded, true);
+});
+
+test("an interactive mechanically empty document remains transient until real mechanics render", () => {
+  const current = observation({
+    id: "obs_interactive_empty",
+    controls: [{
+      controlId: "utility_shell",
+      operations: operation("utility_shell_node", false)
+    }],
+    stableForMs: 213,
+    visibleMainCount: 0
+  });
+  current.page.readiness.documentReadyState = "interactive";
+
+  const readiness = classifyObservationReadiness({
+    observation: current,
+    nowMs: 31_000,
+    readinessTimeoutMs: 2_000
+  });
+
+  assert.equal(readiness.classification, READINESS.TRANSIENT);
+  assert.equal(readiness.reason, "MECHANICALLY_EMPTY_SURFACE_SETTLING");
+  assert.equal(readiness.evidence.controls, 0);
+  assert.equal(readiness.evidence.stable, false);
+  assert.equal(readiness.evidence.unstableMechanicallyEmpty, true);
+
+  const rendered = observation({
+    id: "obs_payment_rendered",
+    controls: [{ controlId: "card_route", operations: operation("card_route_node") }],
+    stableForMs: 120,
+    visibleMainCount: 1
+  });
+  rendered.page.readiness.documentReadyState = "interactive";
+  const actionable = classifyObservationReadiness({ observation: rendered, nowMs: 31_100 });
+
+  assert.equal(actionable.classification, READINESS.READY);
+  assert.equal(actionable.evidence.mechanicallyUsable, true);
+  assert.equal(actionable.evidence.unstableMechanicallyEmpty, false);
 });
 
 test("the browser settlement deadline is authoritative on the first backend loading observation", () => {

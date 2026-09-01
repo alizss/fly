@@ -3212,7 +3212,7 @@ test("zero-quantity hold-bag counters remain offers and progress through Skip ba
   expect(await page.locator("#stage").textContent()).toBe("Add-ons");
 });
 
-test("split state and actuator nodes compile into one owned traveler-title decision", async ({ page }) => {
+test("split state and actuator nodes compile into one logical traveler-title field without a generic decision", async ({ page }) => {
   await loadHtmlProducer(page, `
     <style>
       body { font-family: sans-serif; padding: 24px; }
@@ -3277,12 +3277,7 @@ test("split state and actuator nodes compile into one owned traveler-title decis
     choiceContract: control.choiceContract
   })), null, 2)).toHaveLength(2);
   expect(titleGroups.size).toBe(1);
-  expect(titleDecision).toMatchObject({
-    sectionType: "title",
-    sectionLabel: "title",
-    requirementId: "title:title",
-    required: true
-  });
+  expect(titleDecision).toBeUndefined();
   expect(mr, JSON.stringify(titleControls, null, 2)).toBeTruthy();
   expect(ms, JSON.stringify(titleControls, null, 2)).toBeTruthy();
   expect(mr).toMatchObject({
@@ -3292,7 +3287,6 @@ test("split state and actuator nodes compile into one owned traveler-title decis
   });
   expect(mr?.choiceContract).toBeUndefined();
   expect(ms?.choiceContract).toBeUndefined();
-  expect(titleDecision.decisionContract.options).toHaveLength(2);
   expect(mr?.stateElementId).toBe(await page.locator("#title-mr-state").getAttribute("data-atw-element-id"));
   expect(mr?.operations?.choose?.actuatorId).toBe(await page.locator("#title-mr-actuator").getAttribute("data-atw-element-id"));
   expect(observation.page.controls.filter((control) => (
@@ -3301,6 +3295,11 @@ test("split state and actuator nodes compile into one owned traveler-title decis
     && /passenger.*passenger/i.test(control.decisionGroupId)
     && /mr|mrs|ms/i.test(control.label)
   ))).toEqual([]);
+
+  const titleField = resolveLogicalFields(observation.page, profile)
+    .find((field) => field.semanticType === "title");
+  expect(titleField?.components).toHaveLength(2);
+  expect(titleField?.components.every((component) => component.componentRole === "option")).toBe(true);
 
   const goal = deriveProfileGoal(observation, profile);
   const candidates = candidatesForProfileGoal(goal, observation, profile);

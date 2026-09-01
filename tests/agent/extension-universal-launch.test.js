@@ -234,6 +234,38 @@ test("a sidebar-started active checkout follows a same-tab redirect to an unfami
   assert.equal(harness.calls.tabMessages.length, 0);
 });
 
+test("one governed navigation intent follows a bounded chain of intermediate redirect documents", async () => {
+  const harness = serviceWorkerHarness("https://booking.supported-air.test/payment");
+  const sender = { id: "extension-test", tab: { id: 73 } };
+  await harness.send({ type: "ATW_CHECKOUT_LINEAGE_BEGIN" }, sender);
+  const navigationExpectedAt = Date.now();
+  await harness.send({
+    type: "ATW_CHECKOUT_RESUME_SAVE",
+    marker: {
+      travelerId: "trav_unfamiliar",
+      sessionId: "chk_redirect_chain",
+      navigationExpected: true,
+      navigationExpectedAt,
+      navigationActionId: "act_open_payment_provider"
+    }
+  }, sender);
+
+  await harness.completeNavigation(73, "https://redirect.unfamiliar-provider.test/handoff");
+  await harness.completeNavigation(73, "https://payments.unfamiliar-provider.test/card-entry");
+
+  assert.equal(harness.calls.executedScripts.length, 2);
+  assert.deepEqual(
+    harness.calls.executedScripts.map((call) => JSON.parse(JSON.stringify(call.target))),
+    [{ tabId: 73 }, { tabId: 73 }]
+  );
+  const marker = harness.storage.atwAgentResumeByLineageV1[
+    harness.storage["atwCheckoutContextV1:73"].checkoutLineageId
+  ];
+  assert.equal(marker.navigationExpected, true);
+  assert.equal(marker.navigationExpectedAt, navigationExpectedAt);
+  assert.equal(marker.navigationActionId, "act_open_payment_provider");
+});
+
 test("page lifecycle cannot revoke an action-bound checkout redirect", () => {
   const runtime = fs.readFileSync(
     path.join(root, "apps/extension/src/content/runtime.js"),

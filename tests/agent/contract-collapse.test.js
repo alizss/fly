@@ -801,6 +801,22 @@ test("extension controller modules own session, backend decisions, and checkout 
   assert.match(session, /function startAgentSession\s*\(/);
   assert.match(decisions, /function requestAgentDecision\s*\(/);
   assert.match(checkout, /function processCheckoutAgent\s*\(/);
+
+  const resumeStart = checkout.indexOf("async function resumeCheckoutAfterNavigation");
+  const resumeEnd = checkout.indexOf("async function processCheckoutAgent", resumeStart);
+  const resume = checkout.slice(resumeStart, resumeEnd);
+  const markerRefresh = resume.indexOf("await saveResumeMarker({");
+  assert.ok(markerRefresh >= 0 && markerRefresh < resume.indexOf("await sleep(650)"));
+  assert.match(resume, /navigationExpected:\s*marker\.navigationExpected === true/);
+  assert.match(resume, /navigationExpectedAt:\s*marker\.navigationExpected === true/);
+  assert.match(resume, /navigationActionId:\s*marker\.navigationExpected === true/);
+
+  const runtimeResumeMarker = runtime.match(
+    /async function saveResumeMarker\(([\s\S]*?)\n\s*}\n\n\s*async function clearResumeMarker/
+  );
+  assert.ok(runtimeResumeMarker);
+  assert.match(runtimeResumeMarker[1], /navigationExpectedAt\s*=\s*0/);
+  assert.match(runtimeResumeMarker[1], /Number\(navigationExpectedAt\)/);
 });
 
 test("extension sidebar module owns rendering and diagnostic presentation", () => {
@@ -907,6 +923,7 @@ test("agent loop modules preserve one turn orchestrator behind the compatibility
   assert.match(facade, /module\.exports = require\("\.\/loop\/orchestrator"\)/);
   assert.doesNotMatch(facade, /async function runLoopTurn\s*\(/);
   assert.match(orchestrator, /async function runLoopTurn\s*\(/);
+  assert.doesNotMatch(orchestrator, /SITE_READINESS_FAILURE|site_readiness_failure/);
   for (const moduleSource of modules) {
     assert.doesNotMatch(moduleSource, /async function runLoopTurn\s*\(/);
   }

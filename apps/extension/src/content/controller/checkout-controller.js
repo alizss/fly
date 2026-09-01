@@ -179,13 +179,26 @@ export function createCheckoutController({
       renderSidebar("ready");
       return;
     }
+    // The committed document owns continuation. Preserve the exact governed
+    // navigation intent before yielding to framework hydration so an
+    // intermediate redirect document cannot clear the authority needed by the
+    // next hop. Preserve the original timestamp as well: intermediate pages
+    // may carry an existing lease, but cannot renew it indefinitely.
+    startWatchingCheckoutChanges();
+    await saveResumeMarker({
+      navigationExpected: marker.navigationExpected === true,
+      navigationExpectedAt: marker.navigationExpected === true
+        ? Number(marker.navigationExpectedAt || 0)
+        : 0,
+      navigationActionId: marker.navigationExpected === true
+        ? String(marker.navigationActionId || "")
+        : ""
+    });
     // Let initial framework work land before the first planning observation.
     // processCheckoutAgent owns that one observation; doing a separate resume
     // scan here made every cross-document advance scan the same large airline
     // page twice before it could plan.
     await sleep(650);
-    startWatchingCheckoutChanges();
-    await saveResumeMarker();
     addAgentMessage("assistant", "Picking back up where I left off after the page changed.");
     renderSidebar("agent");
     // Yield once so the passive sidebar can paint before the observation loop
