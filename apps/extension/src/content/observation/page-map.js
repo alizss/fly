@@ -37,6 +37,7 @@ export function createPageMapCompiler(dependencies) {
     implicitRole,
     inferCheckoutSite,
     isAuxiliaryNavigationAction,
+    isNonPageOwnedElement,
     isPaymentField,
     isPlaceholderChoiceValue,
     isVisible,
@@ -66,7 +67,7 @@ export function createPageMapCompiler(dependencies) {
     const text = primaryPageText();
     const fullText = visiblePageText();
     const sourceActionElements = queryAllDeep("button, a, input[type='button'], input[type='submit'], [role='button'], [role='option'], [role='menuitem'], [role='checkbox'], [role='radio']")
-      .filter((button) => isVisible(button) && !button.closest("#atw-sidebar") && !isPaymentField(button) && !isAuxiliaryNavigationAction(button));
+      .filter((button) => isVisible(button) && !isNonPageOwnedElement(button) && !isPaymentField(button) && !isAuxiliaryNavigationAction(button));
     const structuralCollections = discoverStructuralActionCollections(sourceActionElements, `${text} ${fullText.slice(0, 2500)}`);
     const seatInventoryCount = structuralCollections
       .filter((collection) => collection.type === "seat_inventory")
@@ -83,7 +84,7 @@ export function createPageMapCompiler(dependencies) {
       structuralEvidence: { seatInventoryCount, ...terminalStructure },
       terminalEvidence
     });
-    const fields = candidateInputs().map((input) => {
+    const fields = candidateInputs().filter((input) => !isNonPageOwnedElement(input)).map((input) => {
       const detected = detectField(input);
       const semantic = detected?.fieldType || detected?.field || "unknown";
       const value = fieldValue(input);

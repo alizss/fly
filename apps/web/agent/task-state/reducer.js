@@ -989,9 +989,11 @@ function reduceDecisionFrame({
   const unresolvedAuthorityFacts = (transactionReview?.missingFacts || []).filter((fact) => (
     fact !== "payment_review" && !String(fact || "").startsWith("review_")
   ));
-  const transactionAuthorityReady = transactionReview?.baselineStatus === "approved"
+  const transactionAuthorityReady = transactionReview?.developmentCheckout === true || (
+    transactionReview?.baselineStatus === "approved"
     && unresolvedAuthorityFacts.length === 0
-    && (transactionReview?.contradictions || []).length === 0;
+    && (transactionReview?.contradictions || []).length === 0
+  );
   const transactionEvidenceReady = transactionReview?.ready === true
     && outcomeCoverage.complete === true;
   // The current milestone is a browser capability boundary: the user can now

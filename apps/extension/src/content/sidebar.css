@@ -1118,3 +1118,52 @@
 #atw-cursor-prompt input::placeholder {
   color: #8b8d96;
 }
+
+/* The sidebar owns only its presentation. Collapsing it must leave the agent,
+   page watcher, cursor, and checkout lifecycle untouched. */
+.atw-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: none;
+}
+
+#atw-sidebar button.atw-sidebar-toggle {
+  width: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: 999px;
+  font-size: 20px;
+  line-height: 1;
+}
+
+#atw-sidebar.atw-is-minimized {
+  width: auto;
+  max-width: calc(100vw - 32px);
+  border-radius: 999px;
+}
+
+#atw-sidebar.atw-is-minimized .atw-panel {
+  display: block;
+  padding: 8px 10px;
+  overflow: hidden;
+}
+
+#atw-sidebar.atw-is-minimized .atw-panel > :not(.atw-head),
+#atw-sidebar.atw-is-minimized .atw-brand {
+  display: none !important;
+}
+
+#atw-sidebar.atw-is-minimized .atw-head {
+  gap: 0;
+}
+
+#atw-sidebar.atw-is-minimized button.atw-sidebar-toggle {
+  width: auto;
+  min-width: 54px;
+  padding: 0 13px;
+  font-size: 12px;
+}

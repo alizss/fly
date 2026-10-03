@@ -322,7 +322,13 @@ function groundedControlMeaning(hint = {}) {
   return mapped || null;
 }
 
-function interpretStructuralControl(control = {}, groupLabel = "", currentSurface = {}, hints = {}) {
+function interpretStructuralControl(control = {}, groupEvidence = null, currentSurface = {}, hints = {}) {
+  const groupLabel = clean(groupEvidence?.sectionLabel);
+  // Exact membership in a group published by the current structural
+  // observation is the only decision-ownership proof. A control-local group
+  // id may survive a rerender after its group disappeared; treating that
+  // orphan projection as authority suppresses valid current-surface exits.
+  const canonicalDecisionOwner = Boolean(clean(groupEvidence?.decisionGroupId));
   const evidence = `${structuralText(control)} ${clean(groupLabel).toLowerCase()}`.trim();
   // Disposition is owned by the exact actuator, never by its surrounding
   // section. A paid option and a "No, thanks" sibling commonly share the
@@ -420,21 +426,24 @@ function interpretStructuralControl(control = {}, groupLabel = "", currentSurfac
   const purchase = !paymentMethod && agentContract.isPaymentCommitText(localEvidence);
   const scopeToggle = /checkbox|switch|button/.test(shape)
     && /same for all flights|apply to all (?:flights|segments|travellers|travelers)|use for all/.test(localEvidence);
-  const explicitSkipExit = /^(?:skip (?:bags?|baggage|seats?|insurance|extras?|selection)|continue without (?:bags?|baggage|seats?|insurance|extras?)|choose seats? for me)\b/.test(localActionText);
-  const foregroundChoiceDecline = explicitSkipExit && (
-    activeForegroundControl
-    || control.choiceContract?.ownershipComplete === true
-    || Boolean(clean(control.choiceContract?.decisionInstance))
-    || control.state?.pressable === true
-  );
+  // "Skip" and "continue without" describe an operation on the current
+  // surface. They must not depend on a growing catalogue of product nouns:
+  // an unfamiliar car-rental, meal, transfer, or future optional surface has
+  // the same structural exit. Exact decision ownership below still keeps a
+  // skip control inside a real bounded choice when one is proven.
+  const explicitSkipExit = /^(?:skip\b|continue without\b|choose\b.*\bfor me\b)/.test(localActionText);
+  const foregroundChoiceDecline = explicitSkipExit && canonicalDecisionOwner;
+  const safeUnownedSkipExit = explicitSkipExit
+    && !canonicalDecisionOwner
+    && hints.blockingStructuralEvidence !== true;
   const stageExit = !foregroundChoiceDecline && !purchase && !surfaceDismiss && !surfaceOpen && !surfaceAdvance && !commercialSelectionCta && (
     /^(?:continue|next|proceed|confirm|done|save and continue|go to payment)\b/.test(localActionText)
-    || explicitSkipExit
+    || safeUnownedSkipExit
     || hintedStageExit
   );
   const rawPriceAmount = control.structuredPrice?.amount;
   const hasPriceAmount = rawPriceAmount !== null && rawPriceAmount !== undefined && rawPriceAmount !== "";
-  const explicitlyFree = /no thanks|no,? thank|no (?:insurance|bundle|baggage|bags?|extras?)|without|decline|skip|none|not now|remove|random assignment|free/.test(localEvidence)
+  const explicitlyFree = /^(?:no\b|without\b|decline\b|skip\b|none\b|not now\b|remove\b|random assignment\b|free\b)|\bno,?\s+thanks?\b/.test(localActionText)
     || (hasPriceAmount && Number(rawPriceAmount) === 0);
   const priced = hasPriceAmount && Number(rawPriceAmount) > 0;
   const semantic = disabledStateRepresentation
@@ -612,20 +621,34 @@ function interpretStructuralPage(page = {}) {
     if (!decisionGroupId || !decisionType || hint?.authority !== "grounded_hypothesis_only") return [];
     return [[decisionGroupId, { ...hint, decisionType }]];
   }));
-  const groupLabelByControl = new Map(structuralGroups.flatMap((group) => (
+  const canonicalGroupByControl = new Map(structuralGroups.flatMap((group) => (
     (group.alternativeControlIds || group.alternatives || []).map((option) => [
       typeof option === "string" ? option : option.controlId,
-      group.sectionLabel || ""
+      group
     ])
   )));
+  const blockingStructuralEvidence = activeValidationIssues(validationIssues).length > 0
+    || structuralGroups.some((group) => {
+      if (group.required !== true && group.requiredBySite !== true && group.ownerState?.required !== true) return false;
+      const selectedControlId = clean(group.selectedEvidence?.selectedControlId || group.selectedControlId);
+      return !selectedControlId;
+    })
+    || (page.controls || []).some((control) => {
+      const required = control.required === true || control.state?.required === true;
+      const invalid = control.invalid === true || control.state?.invalid === true;
+      const hasValue = control.state?.valuePresent === true
+        || Boolean(clean(control.currentValue || control.state?.normalizedValue || control.state?.value));
+      return required && (invalid || !hasValue);
+    });
   let controls = (page.controls || []).map((control) => (
     interpretStructuralControl(
       control,
-      groupLabelByControl.get(control.controlId) || "",
+      canonicalGroupByControl.get(control.controlId) || null,
       page.currentSurface || page.activeSurface || {},
       {
         fieldHint: fieldHints.get(clean(control.controlId)),
-        controlHint: controlHints.get(clean(control.controlId))
+        controlHint: controlHints.get(clean(control.controlId)),
+        blockingStructuralEvidence
       }
     )
   ));
@@ -1325,7 +1348,12 @@ function structuralPageForDecisionFrame(rawPage = {}) {
       expectedResolution: _expectedResolution,
       ...structuralSurface
     } = surface;
-    return structuralSurface;
+    // A page label is a browser stage projection and may lag behind a route
+    // change. A foreground dialog/listbox label is its current accessible
+    // name and therefore remains objective structural evidence.
+    if (clean(surface.type || "page").toLowerCase() !== "page") return structuralSurface;
+    const { label: _pageLabel, ...pageSurface } = structuralSurface;
+    return pageSurface;
   };
   const structuralPage = {
     ...rawPage,
@@ -1339,6 +1367,7 @@ function structuralPageForDecisionFrame(rawPage = {}) {
       stepEvidence: rawPage.browserDiagnostics?.stepEvidence || rawPage.stepEvidence || null,
       currentSurface: {
         ...(rawPage.browserDiagnostics?.currentSurface || {}),
+        label: clean(rawPage.browserDiagnostics?.currentSurface?.label || rawPage.currentSurface?.label),
         taskHint: clean(rawPage.browserDiagnostics?.currentSurface?.taskHint || rawPage.currentSurface?.taskHint),
         surfaceClass: clean(rawPage.browserDiagnostics?.currentSurface?.surfaceClass || rawPage.currentSurface?.surfaceClass),
         expectedResolution: clean(rawPage.browserDiagnostics?.currentSurface?.expectedResolution || rawPage.currentSurface?.expectedResolution)

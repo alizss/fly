@@ -10,20 +10,32 @@ function number(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function endpointAliases(primary = "", aliases = []) {
+  return [...new Set([primary, ...(Array.isArray(aliases) ? aliases : [])]
+    .map((value) => text(value, 120).toUpperCase())
+    .filter(Boolean))].slice(0, 6);
+}
+
 function normalizeSelectedBooking(raw = null) {
   if (!raw || typeof raw !== "object") return null;
   const itinerary = raw.itinerary || {};
-  const segments = (Array.isArray(itinerary.segments) ? itinerary.segments : []).map((segment, index) => ({
-    segmentId: text(segment.segmentId || `segment_${index + 1}`, 120),
-    origin: text(segment.origin, 20).toUpperCase(),
-    destination: text(segment.destination, 20).toUpperCase(),
-    departureDate: text(segment.departureDate, 20),
-    departureTime: text(segment.departureTime, 20),
-    arrivalDate: text(segment.arrivalDate, 20),
-    arrivalTime: text(segment.arrivalTime, 20),
-    carrier: text(segment.carrier, 120),
-    flightNumber: text(segment.flightNumber, 40)
-  }));
+  const segments = (Array.isArray(itinerary.segments) ? itinerary.segments : []).map((segment, index) => {
+    const origin = text(segment.origin, 120).toUpperCase();
+    const destination = text(segment.destination, 120).toUpperCase();
+    return {
+      segmentId: text(segment.segmentId || `segment_${index + 1}`, 120),
+      origin,
+      originAliases: Object.freeze(endpointAliases(origin, segment.originAliases)),
+      destination,
+      destinationAliases: Object.freeze(endpointAliases(destination, segment.destinationAliases)),
+      departureDate: text(segment.departureDate, 20),
+      departureTime: text(segment.departureTime, 20),
+      arrivalDate: text(segment.arrivalDate, 20),
+      arrivalTime: text(segment.arrivalTime, 20),
+      carrier: text(segment.carrier, 120),
+      flightNumber: text(segment.flightNumber, 40)
+    };
+  });
   const approvedTotal = raw.approvedTotal || raw.totalPrice || {};
   const amount = number(approvedTotal.amount);
   const currency = text(approvedTotal.currency || raw.currency, 20).toUpperCase();

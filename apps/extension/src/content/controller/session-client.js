@@ -42,9 +42,19 @@ export function createSessionClient({
 
   async function startAgentSession(resumeSessionId = "", options = {}) {
     const startAttemptId = String(options.startAttemptId || `start_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`);
+    const startSource = String(options.startSource || (resumeSessionId ? "auto_resume" : "user_start"));
     try {
       agent.sessionStartFailure = null;
-      recordStartEvent("START_CLICKED", { startAttemptId, resume: Boolean(resumeSessionId) });
+      const startEventType = startSource === "auto_resume"
+        ? "AUTO_RESUME_STARTED"
+        : startSource === "user_resume"
+          ? "USER_RESUME_STARTED"
+          : "USER_START_STARTED";
+      recordStartEvent(startEventType, {
+        startAttemptId,
+        startSource,
+        resume: Boolean(resumeSessionId)
+      });
       const startupEvents = await readStartupDiagnostics();
       recordStartEvent("STARTUP_CONTEXT", {
         startAttemptId,
@@ -93,24 +103,12 @@ export function createSessionClient({
           });
         }
         if (!selectedBookingContract) {
-          recordStartEvent("BOOKING_EVIDENCE_REQUIRED", {
+          recordStartEvent("BOOKING_EVIDENCE_DIAGNOSTIC_ONLY", {
             startAttemptId,
             status: admission.status || "absent",
             reason: admission.reason || "",
             missingFacts: admission.missingFacts || []
           });
-          const error = new Error(
-            admission.missingFacts?.length
-              ? `No approved booking was captured before this checkout. Return to the flight/fare selection, select it once, then continue and Start Fly. Missing: ${admission.missingFacts.join(", ")}.`
-              : "No approved booking was captured before checkout Start. Return to the flight/fare selection and select it once."
-          );
-          error.code = "SELECTED_BOOKING_REQUIRED";
-          error.details = {
-            admissionStatus: admission.status || "absent",
-            reason: admission.reason || "",
-            missingFacts: admission.missingFacts || []
-          };
-          throw error;
         }
       }
       const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/session`, {
@@ -123,6 +121,10 @@ export function createSessionClient({
           userIntent: userIntentText(),
           traveler: traveler(),
           selectedBookingContract,
+          // The local server may admit a diagnostics-only mechanics run. A
+          // production server ignores this request and retains strict
+          // SelectedBooking admission.
+          developmentCheckout: true,
           // A durable resume handshake proves that the transaction still
           // exists before this document is allowed to perform an expensive
           // semantic observation. The next controller step supplies the full
@@ -146,7 +148,12 @@ export function createSessionClient({
         throw new Error("session handshake returned a replacement transaction id");
       }
       agent.sessionId = sessionId;
-      recordStartEvent("SESSION_CREATED", { startAttemptId, sessionId: agent.sessionId, resume: Boolean(resumeSessionId) });
+      recordStartEvent("SESSION_CREATED", {
+        startAttemptId,
+        startSource,
+        sessionId: agent.sessionId,
+        resume: Boolean(resumeSessionId)
+      });
       logAgentEvent("agent_session_started", { sessionId: agent.sessionId });
       return session;
     } catch (error) {

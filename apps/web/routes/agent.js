@@ -1,6 +1,7 @@
 function createAgentRoutes({
   MAX_OBSERVATION_BYTES,
   MAX_SCREENSHOT_UPLOAD_BYTES,
+  allowDevBookingProposal,
   agentLoopFailurePayload,
   agentSessionStore,
   agentTraceStore,
@@ -9,6 +10,9 @@ function createAgentRoutes({
   dataDir,
   decideAgentNextActionViaLoop,
   logAgent,
+  model,
+  openAiApiKey,
+  proposeBookingCandidate,
   readBody,
   reportAgentResult,
   sendJson,
@@ -71,6 +75,32 @@ function createAgentRoutes({
   }
 
   return async function handleAgentRoutes(req, res, pathname) {
+    if (req.method === "POST" && pathname === "/api/agent/dev/booking-proposal") {
+      if (!allowDevBookingProposal) {
+        sendJson(res, 404, { error: "Not found", code: "NOT_FOUND" });
+        return true;
+      }
+      if (!openAiApiKey) {
+        sendJson(res, 503, {
+          error: "OPENAI_API_KEY is required for the DEV booking proposal.",
+          code: "AI_BOOKING_PROPOSAL_UNAVAILABLE"
+        });
+        return true;
+      }
+      const body = await readBody(req, { maxBytes: MAX_SCREENSHOT_UPLOAD_BYTES, tooLargeCode: "SCREENSHOT_TOO_LARGE" });
+      const result = await proposeBookingCandidate({
+        apiKey: openAiApiKey,
+        model,
+        sourceUrl: clampText(body.sourceUrl || "", 500),
+        pageTitle: clampText(body.pageTitle || "", 240),
+        pageText: clampText(body.pageText || "", 16_000),
+        observed: body.observed || null,
+        screenshotDataUrl: String(body.screenshotDataUrl || ""),
+        referenceDate: clampText(body.referenceDate || "", 10)
+      });
+      sendJson(res, 200, { ok: true, ...result });
+      return true;
+    }
     if (req.method === "POST" && pathname === "/api/agent/client-log") {
       const summary = await writeClientFlowLog(await readBody(req));
       logAgent("client flow", summary);

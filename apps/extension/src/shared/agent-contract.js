@@ -1549,13 +1549,37 @@
     const actuatorId = text(strategy.actuatorId || strategy.targetId, 160);
     const method = text(strategy.method || strategy.interactionMethod, 80);
     const keys = text(strategy.keys || keysForMethod(method), 40);
-    const proof = normalizedActionability(
+    const declaredStatus = Object.values(CAPABILITY_STATUS).includes(strategy.status)
+      ? strategy.status
+      : "";
+    const observedProof = normalizedActionability(
       strategy.proof || strategy.actionability || actionabilityByActuator[actuatorId] || {},
       operation
     );
-    const status = Object.values(CAPABILITY_STATUS).includes(strategy.status)
-      ? strategy.status
-      : capabilityStatusFor({ control, operation, targetId: actuatorId, actionability: proof });
+    // Opening a choice surface is the one mechanical discovery operation whose
+    // result can be verified without assuming what any option means. Preserve
+    // an observer-declared bounded experiment when its exact DOM actuator is
+    // objectively clickable. The normal execution lane still requires
+    // operation authorization/proof; this only keeps the strategy eligible for
+    // the separately governed, one-attempt bounded-recovery lane.
+    const boundedChoiceDiscovery = operation === "open"
+      && declaredStatus === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+      && observedProof.rendered === true
+      && observedProof.visible === true
+      && observedProof.enabled === true
+      && observedProof.inViewport === true
+      && observedProof.inCurrentSurface === true
+      && observedProof.hitTested === true
+      && observedProof.notOccluded === true;
+    const proof = boundedChoiceDiscovery
+      ? { ...observedProof, targetable: true }
+      : observedProof;
+    const status = declaredStatus || capabilityStatusFor({
+      control,
+      operation,
+      targetId: actuatorId,
+      actionability: proof
+    });
     return {
       ...cloneSerializable(strategy),
       strategyId: text(
@@ -1578,7 +1602,10 @@
     const capability = rawCapability && typeof rawCapability === "object" ? rawCapability : {};
     const actuatorIds = [...new Set([
       ...(Array.isArray(capability.actuatorIds) ? capability.actuatorIds : []),
-      capability.actuatorId
+      capability.actuatorId,
+      ...(Array.isArray(capability.strategies)
+        ? capability.strategies.map((strategy) => strategy?.actuatorId || strategy?.targetId)
+        : [])
     ].map((id) => text(id, 160)).filter(Boolean))];
     const actionabilityByActuator = Object.fromEntries(actuatorIds.map((actuatorId) => {
       const raw = capability.actionabilityByActuator?.[actuatorId]
@@ -1620,6 +1647,11 @@
         && list.findIndex((other) => other.strategyId === strategy.strategyId) === index
       ));
     const regions = cloneSerializable(capability.regions || []);
+    const requiresVisualConfirmation = capability.requiresVisualConfirmation === true
+      || (operation === "open" && strategies.some((strategy) => (
+        strategy.status === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+        && strategy.proof?.targetable === true
+      )));
     const status = capabilityStatusFor({
       control,
       operation,
@@ -1627,7 +1659,7 @@
       actionability: preferredActionability,
       strategies,
       regions,
-      requiresVisualConfirmation: capability.requiresVisualConfirmation === true
+      requiresVisualConfirmation
     });
     return {
       ...cloneSerializable(capability),
@@ -1646,14 +1678,16 @@
           control,
           operation,
           targetId: actuatorId,
-          actionability: actionabilityByActuator[actuatorId]
+          actionability: actionabilityByActuator[actuatorId],
+          strategies: strategies.filter((strategy) => strategy.actuatorId === actuatorId),
+          requiresVisualConfirmation
         }),
         proof: actionabilityByActuator[actuatorId]
       })),
       actionability: preferredActionability,
       actionabilityByActuator,
       strategies,
-      requiresVisualConfirmation: capability.requiresVisualConfirmation === true,
+      requiresVisualConfirmation,
       regions
     };
   }
@@ -2167,7 +2201,14 @@
       INTERACTION_METHOD.BROWSER_TRUSTED_INPUT,
       INTERACTION_METHOD.BROWSER_TRUSTED_CHOICE
     ]);
-    const operationCapability = control.operations?.[operation] || null;
+    // Bounded recovery consumes the same normalized capability contract that
+    // planning published. Raw browser fields cannot independently veto or
+    // promote an experimental opener at dispatch time.
+    const operationCapability = normalizeCapability(
+      control,
+      operation,
+      control.operations?.[operation] || null
+    );
     const exactRecoveryStrategy = (operationCapability?.strategies || [])
       .find((strategy) => (
         strategy.status === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
@@ -2190,7 +2231,7 @@
     if (
       capability.status === CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
       && action.boundedRecovery === true
-      && operationCapability?.requiresVisualConfirmation === true
+      && capability.requiresVisualConfirmation === true
       && allowedRecoveryMethods.has(recoveryMethod)
       && (exactRecoveryStrategy || exactVisualRegion)
       && selectedMatches

@@ -161,15 +161,25 @@ function normalizedRouteEndpoint(value = "") {
   return endpoint;
 }
 
+function normalizedRouteAliases(primary = "", aliases = []) {
+  return [...new Set([primary, ...(Array.isArray(aliases) ? aliases : [])]
+    .map(normalizedRouteEndpoint)
+    .filter(Boolean))].slice(0, 6);
+}
+
 function normalizeSegment(segment = {}, index = 0) {
   const origin = normalizedRouteEndpoint(segment.origin);
   const destination = normalizedRouteEndpoint(segment.destination);
+  const originAliases = normalizedRouteAliases(origin, segment.originAliases);
+  const destinationAliases = normalizedRouteAliases(destination, segment.destinationAliases);
   const evidence = normalizeFactEvidence(segment.evidence);
   const observedDepartureDate = text(segment.departureDate, 40);
   return {
     segmentId: text(segment.segmentId || `segment_${index + 1}`, 120),
     origin,
+    ...(Array.isArray(segment.originAliases) ? { originAliases } : {}),
     destination,
+    ...(Array.isArray(segment.destinationAliases) ? { destinationAliases } : {}),
     departureDate: canonicalTransactionDate(observedDepartureDate) || observedDepartureDate,
     departureTime: text(segment.departureTime, 20),
     arrivalTime: text(segment.arrivalTime, 20),

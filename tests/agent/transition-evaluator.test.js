@@ -15,6 +15,7 @@ const { executableDecisionFromActionLease } = require("./action-lease-replay-ada
 const { groundedObservationCandidateSet } = require("./legacy-mechanics-binding-adapter");
 const { allRequiredSatisfied, missingRequired, normalizeRequirement } = require("../../packages/shared/requirements");
 const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
+const { actuatorSignature } = require("../../packages/shared/agent-actions");
 const {
   applyAuthoritativeOutcomeToRequirements,
   deriveAuthoritativeTaskContext
@@ -1519,7 +1520,7 @@ test("FAILED_STRATEGY_REUSE becomes authoritative scheduler exclusion on unchang
   }, { recovery: { attempts: 0, phase: "idle", failedStrategies: [], failedStrategySignatures: [] } });
 
   const applied = loopPrivate.applyTransitionStatus(state, after, before);
-  const signature = "open:ctrl_title:,";
+  const signature = actuatorSignature(action);
   assert.equal(applied.transition, null);
   assert.equal(applied.directive, "rebuild_candidates");
   assert.deepEqual(recovery(applied.state).failedStrategySignatures, [signature]);

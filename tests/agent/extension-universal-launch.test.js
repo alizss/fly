@@ -286,6 +286,13 @@ test("page lifecycle cannot revoke an action-bound checkout redirect", () => {
     executionOrchestrator,
     /saveResumeMarker\(\{ navigationExpected: true, navigationActionId: actionId \}\)/
   );
+  const ordinaryClickStart = executionOrchestrator.indexOf("const surfaceWasActive");
+  const ordinaryClickEnd = executionOrchestrator.indexOf("if (decision.action === \"type\"", ordinaryClickStart);
+  const ordinaryClick = executionOrchestrator.slice(ordinaryClickStart, ordinaryClickEnd);
+  const markerIndex = ordinaryClick.indexOf("saveResumeMarker({ navigationExpected: true, navigationActionId: actionId })");
+  const dispatchIndex = ordinaryClick.indexOf("dispatchGovernedClickMechanic(target, decision");
+  assert.ok(markerIndex >= 0, "every governed click must preserve continuation before dispatch");
+  assert.ok(dispatchIndex > markerIndex, "continuation must be durable before a click can replace the document");
 });
 
 test("a browser-selection context without an active session does not follow unrelated navigation", async () => {

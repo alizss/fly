@@ -24,6 +24,7 @@ const {
 const { desiredStateEvaluationForDecision } = require("../../apps/web/agent/desired-state-delta");
 const { bindMechanics } = require("../../apps/web/agent/mechanics-binder");
 const { createRequestPayloadAdapter } = require("../../apps/web/agent/request-payload");
+const BOOKING_TOTAL_CONTRACT = require("../../apps/extension/src/shared/booking-total-contract");
 
 test("request compaction preserves the structural observation authority marker", () => {
   const { compactAgentPayload } = createRequestPayloadAdapter({
@@ -170,6 +171,10 @@ test("raw structural observation carries no business decision and DecisionFrame 
   assert.doesNotMatch(transport, /const outgoing = \{ \.\.\.control \}/);
   assert.match(transport, /sourceProvenance:/);
   assert.match(transport, /kind: nonPageUi \? "non_page_ui" : "page_dom"/);
+  assert.match(runtime, /\[data-atw-ui\]/);
+  assert.doesNotMatch(runtime, /\[data-agent-ui\]/);
+  assert.match(runtime, /BROWSER_ASSISTANT_CONTROL_SELECTOR/);
+  assert.match(transport, /isNonPageOwnedElement\(elementById\(elementId\)\)/);
 
   const groupStart = runtime.indexOf("function structuralDecisionGroupForTransport");
   const groupEnd = runtime.indexOf("function compactPageMap", groupStart);
@@ -216,11 +221,14 @@ test("browser surface classifiers remain diagnostic and do not enter DecisionFra
   assert.equal(frame.observation.page.currentSurface.expectedResolution, undefined);
 });
 
-test("unfamiliar pages receive only the lightweight precheckout producer before Start", () => {
+test("unfamiliar pages receive only lightweight booking capture contracts before Start", () => {
   const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../../apps/extension/manifest.json"), "utf8"));
   const universal = manifest.content_scripts.filter((entry) => entry.matches?.includes("<all_urls>"));
   assert.equal(universal.length, 1);
-  assert.deepEqual(universal[0].js, ["src/content/precheckout-capture.js"]);
+  assert.deepEqual(universal[0].js, [
+    "src/shared/booking-total-contract.js",
+    "src/content/precheckout-capture.js"
+  ]);
   assert.equal(universal[0].css, undefined);
   assert.equal(universal[0].run_at, "document_start");
   assert.equal(manifest.content_scripts.some((entry) => (
@@ -233,6 +241,43 @@ test("unfamiliar pages receive only the lightweight precheckout producer before 
   assert.equal(fs.existsSync(path.join(root, "apps/extension/src/content/selected-booking-acquisition.js")), false);
   assert.doesNotMatch(admission, /transactionFacts|pageStateStore|schedule|capture/);
   assert.doesNotMatch(sessionClient, /composeSelectedBookingContract|session_start_booking|initialMap/);
+});
+
+test("one lightweight contract owns booking-summary totals across capture and checkout observation", () => {
+  assert.deepEqual(
+    BOOKING_TOTAL_CONTRACT.ownedBookingTotalEvidence({
+      cueText: "Basket",
+      ownerText: "Basket €89.47"
+    }),
+    { amount: 89.47, currency: "EUR", qualification: "checkout_summary_balance" }
+  );
+  assert.deepEqual(
+    BOOKING_TOTAL_CONTRACT.ownedBookingTotalEvidence({
+      cueText: "Trip total 152,62 EUR",
+      ownerText: "Trip total 152,62 EUR"
+    }),
+    { amount: 152.62, currency: "EUR", qualification: "exact_owned_total" }
+  );
+  assert.deepEqual(
+    BOOKING_TOTAL_CONTRACT.ownedBookingTotalEvidence({
+      cueText: "Basket",
+      ownerText: "Basket €89.47 Open Ljubljana to London Gatwick Adult 1 x €49.99 London Gatwick to Ljubljana Adult 1 x €39.48"
+    }),
+    { amount: 89.47, currency: "EUR", qualification: "checkout_summary_balance" }
+  );
+  assert.equal(BOOKING_TOTAL_CONTRACT.ownedBookingTotalEvidence({
+    cueText: "Basket",
+    ownerText: "Basket Adult €49.99"
+  }), null);
+  assert.equal(BOOKING_TOTAL_CONTRACT.bookingTotalCue("Total duration 00h50m"), "");
+
+  const root = path.resolve(__dirname, "../..");
+  const producer = fs.readFileSync(path.join(root, "apps/extension/src/content/precheckout-capture.js"), "utf8");
+  const observation = fs.readFileSync(path.join(root, "apps/extension/src/content/observation/transaction-evidence.js"), "utf8");
+  assert.match(producer, /AtwBookingTotalContract/);
+  assert.match(observation, /BOOKING_TOTAL_CONTRACT\.ownedBookingTotalEvidence/);
+  assert.doesNotMatch(producer, /exactTotalCue/);
+  assert.doesNotMatch(observation, /exactTotalCue/);
 });
 
 test("DecisionFrame ignores browser-authored group requiredness and status", () => {
@@ -520,7 +565,9 @@ test("selected booking contract creates an immutable authoritative baseline befo
       segments: [{
         segmentId: "outbound",
         origin: "LJU",
+        originAliases: ["LJU", "Ljubljana"],
         destination: "LGW",
+        destinationAliases: ["LGW", "London Gatwick"],
         departureDate: "2026-10-15",
         carrier: "U2",
         flightNumber: "1234"
@@ -538,6 +585,8 @@ test("selected booking contract creates an immutable authoritative baseline befo
   assert.equal(facts.totalPrice.currency, "EUR");
   assert.equal(facts.factEvidence.totalPrice.authoritative, true);
   assert.equal(facts.factEvidence.totalPrice.role, "booking_total");
+  assert.deepEqual(facts.itinerary.segments[0].originAliases, ["LJU", "LJUBLJANA"]);
+  assert.deepEqual(facts.itinerary.segments[0].destinationAliases, ["LGW", "LONDON GATWICK"]);
   assert.equal(normalizeSelectedBooking({ contractVersion: "selected-booking/v1" }), null);
   assert.equal(normalizeSelectedBooking({
     contractVersion: "selected-booking/v1",
@@ -721,6 +770,9 @@ test("extension interaction module owns click, choice, keyboard, and scroll mech
   assert.match(interaction, /function trustedBrowserChoice\s*\(/);
   assert.match(interaction, /function trustedBrowserKey\s*\(/);
   assert.match(interaction, /function scrollElementWithinNearestContainer\s*\(/);
+  assert.match(interaction, /bounded_local_click_revalidate/);
+  assert.match(interaction, /local_mechanic_fallback/);
+  assert.match(interaction, /resolveDecisionTarget\s*\(/);
 });
 
 test("extension field interaction owns controlled typing, native select, and phone choice mechanics", () => {
@@ -799,6 +851,14 @@ test("extension controller modules own session, backend decisions, and checkout 
   assert.doesNotMatch(runtime, /function requestAgentDecision\s*\(/);
   assert.doesNotMatch(runtime, /function processCheckoutAgent\s*\(/);
   assert.match(session, /function startAgentSession\s*\(/);
+  assert.match(session, /startSource/);
+  assert.match(session, /USER_START_STARTED/);
+  assert.match(session, /USER_RESUME_STARTED/);
+  assert.match(session, /AUTO_RESUME_STARTED/);
+  assert.doesNotMatch(session, /recordStartEvent\("START_CLICKED"/);
+  assert.match(checkout, /startSource:\s*"user_start"/);
+  assert.match(checkout, /startSource:\s*"user_resume"/);
+  assert.match(checkout, /startSource:\s*"auto_resume"/);
   assert.match(decisions, /function requestAgentDecision\s*\(/);
   assert.match(checkout, /function processCheckoutAgent\s*\(/);
 

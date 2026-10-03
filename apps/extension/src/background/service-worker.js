@@ -91,7 +91,7 @@ async function installPrecheckoutProducerOnOpenTabs() {
     .filter((tab) => Number.isInteger(tab?.id) && injectableCheckoutUrl(tab?.url))
     .map((tab) => chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      files: ["src/content/precheckout-capture.js"]
+      files: ["src/shared/booking-total-contract.js", "src/content/precheckout-capture.js"]
     })));
 }
 

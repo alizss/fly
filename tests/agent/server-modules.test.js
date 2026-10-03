@@ -12,11 +12,17 @@ const { createAgentRoutes } = require("../../apps/web/routes/agent");
 const { createScreenshotStore } = require("../../apps/web/agent/screenshot-store");
 const { createRequestPayloadAdapter } = require("../../apps/web/agent/request-payload");
 const { createNextActionService } = require("../../apps/web/agent/next-action-service");
+const { createSessionService } = require("../../apps/web/agent/session-service");
+const {
+  normalizeBookingProposal,
+  proposeBookingCandidate
+} = require("../../apps/web/agent/booking-proposal");
 const {
   summarizeActionLedgerRow,
   summarizeClientFlowLog
 } = require("../../apps/web/agent/request-diagnostics");
 const { createWalletStore } = require("../../apps/web/data/wallet-store");
+const { createCheckoutSessionState } = require("../../packages/shared/agent-state");
 
 function request(body, headers = {}) {
   const req = new EventEmitter();
@@ -43,6 +49,59 @@ function response() {
   };
 }
 
+function memorySessionStore() {
+  const sessions = new Map();
+  return {
+    getSession: (id) => sessions.get(id) || null,
+    getOrCreateSession(id, seed) {
+      const session = createCheckoutSessionState(seed);
+      if (id) session.id = id;
+      sessions.set(session.id, session);
+      return session;
+    },
+    saveSession(session) {
+      sessions.set(session.id, session);
+      return session;
+    },
+    recordActionResult: () => null
+  };
+}
+
+function routineDevelopmentTraveler(id = "trav_development") {
+  return {
+    id,
+    first_name: "Ali",
+    last_name: "Example",
+    date_of_birth: "2003-05-31",
+    email: "ali@example.test",
+    phone: "+38640111222",
+    paid_extras_policy: "decline",
+    standard_booking_terms: "accept",
+    marketing_consent: "decline",
+    payment_preference: "card",
+    payment_submission: "never"
+  };
+}
+
+test("only a development-enabled server can admit a mechanics run without SelectedBooking", () => {
+  const body = {
+    traveler: routineDevelopmentTraveler(),
+    developmentCheckout: true,
+    page: { site: "unfamiliar.test", url: "https://unfamiliar.test/passengers" }
+  };
+  const strict = createSessionService(memorySessionStore());
+  assert.throws(
+    () => strict.createAgentSession(body),
+    (error) => error.code === "SELECTED_BOOKING_REQUIRED"
+  );
+
+  const development = createSessionService(memorySessionStore(), { allowDevelopmentCheckout: true });
+  const session = development.createAgentSession(body);
+  assert.equal(session.developmentCheckout, true);
+  assert.equal(session.travelerId, "trav_development");
+  assert.equal(session.transactionInvariants, null);
+});
+
 test("HTTP body parsing owns JSON, empty bodies, and typed size failures", async () => {
   assert.deepEqual(await readBody(request("")), {});
   assert.deepEqual(await readBody(request('{"ok":true}')), { ok: true });
@@ -59,6 +118,136 @@ test("JSON response owns the common API and CORS envelope", () => {
   assert.equal(res.headers["content-type"], "application/json");
   assert.equal(res.headers["access-control-allow-origin"], "*");
   assert.deepEqual(JSON.parse(res.body), { ok: true });
+});
+
+test("booking proposal accepts only a coherent itinerary and exact booking total", async () => {
+  const calls = [];
+  const result = await proposeBookingCandidate({
+    apiKey: "test-key",
+    model: "test-model",
+    sourceUrl: "https://unfamiliar.test/checkout",
+    pageText: "LJU to LGW 17 October 2026. Return 1 November 2026. Basket EUR 86.97.",
+    screenshotDataUrl: "data:image/jpeg;base64,test",
+    referenceDate: "2026-09-01",
+    callStructuredFn: async (request) => {
+      calls.push(request);
+      return {
+        data: {
+          status: "proposed",
+          segments: [
+            { origin: "Ljubljana", originAliases: ["Ljubljana", "LJU"], destination: "London Gatwick", destinationAliases: ["London Gatwick", "LGW"], departureDate: "2026-10-17" },
+            { origin: "London Gatwick", originAliases: ["London Gatwick", "LGW"], destination: "Ljubljana", destinationAliases: ["Ljubljana", "LJU"], departureDate: "2026-11-01" }
+          ],
+          approvedTotal: { amount: 86.97, currency: "eur" },
+          confidence: "high",
+          evidence: [{ fact: "booking total", value: "Basket €86.97", source: "screenshot" }]
+        },
+        meta: { attempts: 1 }
+      };
+    }
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].schemaName, "booking_proposal");
+  assert.equal(calls[0].returnMeta, true);
+  assert.equal(result.proposal.status, "proposed");
+  assert.deepEqual(result.proposal.approvedTotal, { amount: 86.97, currency: "EUR" });
+  assert.deepEqual(result.proposal.segments[0].originAliases, ["Ljubljana", "LJU"]);
+});
+
+test("booking proposal retains only structurally proven endpoint aliases", () => {
+  const proposal = normalizeBookingProposal({
+    status: "proposed",
+    segments: [
+      { origin: "Zagreb", originAliases: ["Zagreb"], destination: "Sarajevo", destinationAliases: ["Sarajevo"], departureDate: "2026-09-15" },
+      { origin: "Sarajevo", originAliases: ["Sarajevo"], destination: "Zagreb", destinationAliases: ["Zagreb"], departureDate: "2026-09-30" }
+    ],
+    approvedTotal: { amount: 167.62, currency: "EUR" },
+    confidence: "high",
+    evidence: []
+  }, {
+    observed: {
+      itinerary: {
+        segments: [
+          { origin: "ZAG", originAliases: ["ZAG", "Zagreb"], destination: "SJJ", destinationAliases: ["SJJ", "Sarajevo"], departureDate: "2026-09-15" },
+          { origin: "SJJ", originAliases: ["SJJ", "Sarajevo"], destination: "ZAG", destinationAliases: ["ZAG", "Zagreb"], departureDate: "2026-09-30" }
+        ]
+      }
+    }
+  });
+
+  assert.deepEqual(proposal.segments[0].originAliases, ["Zagreb", "ZAG"]);
+  assert.deepEqual(proposal.segments[0].destinationAliases, ["Sarajevo", "SJJ"]);
+});
+
+test("booking proposal cannot turn partial or invalid model output into approval", () => {
+  assert.deepEqual(
+    normalizeBookingProposal({
+      status: "proposed",
+      segments: [{ origin: "LJU", destination: "LGW", departureDate: "17 October" }],
+      approvedTotal: { amount: 49.99, currency: "EUR" },
+      confidence: "high",
+      evidence: []
+    }),
+    {
+      status: "unknown",
+      segments: [],
+      approvedTotal: { amount: 0, currency: "" },
+      confidence: "high",
+      evidence: []
+    }
+  );
+});
+
+test("DEV booking proposal route is proposal-only and available without a durable session", async () => {
+  let proposed = null;
+  const handle = createAgentRoutes({
+    MAX_OBSERVATION_BYTES: 1000,
+    MAX_SCREENSHOT_UPLOAD_BYTES: 10_000,
+    allowDevBookingProposal: true,
+    agentLoopFailurePayload: (error) => ({ code: error.code }),
+    agentSessionStore: { getSession: () => null },
+    agentTraceStore: { listTraces: () => [] },
+    clampText: (value, max) => String(value || "").slice(0, max),
+    createAgentSession: () => null,
+    dataDir: "",
+    decideAgentNextActionViaLoop: () => assert.fail("loop must not run"),
+    logAgent: () => {},
+    model: "test-model",
+    openAiApiKey: "test-key",
+    proposeBookingCandidate: async (input) => {
+      proposed = input;
+      return {
+        proposal: {
+          status: "proposed",
+          segments: [{ origin: "LJU", destination: "LGW", departureDate: "2026-10-17" }],
+          approvedTotal: { amount: 86.97, currency: "EUR" },
+          confidence: "high",
+          evidence: []
+        },
+        meta: { attempts: 1 }
+      };
+    },
+    readBody,
+    reportAgentResult: () => null,
+    sendJson,
+    storeScreenshotUpload: () => "",
+    summarizeAgentSession: (session) => session,
+    writeActionLedgerRow: async () => ({}),
+    writeClientFlowLog: async () => ({})
+  });
+  const req = request(JSON.stringify({
+    sourceUrl: "https://unfamiliar.test/checkout",
+    pageText: "visible booking",
+    screenshotDataUrl: "data:image/jpeg;base64,test"
+  }));
+  req.method = "POST";
+  const res = response();
+  assert.equal(await handle(req, res, "/api/agent/dev/booking-proposal"), true);
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).proposal.status, "proposed");
+  assert.equal(proposed.apiKey, "test-key");
+  assert.equal(proposed.model, "test-model");
+  assert.equal(proposed.screenshotDataUrl, "data:image/jpeg;base64,test");
 });
 
 test("static handler preserves app routes and rejects path traversal", async () => {

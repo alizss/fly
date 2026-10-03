@@ -80,7 +80,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["src/content/precheckout-capture.js"],
+      "js": ["src/shared/booking-total-contract.js", "src/content/precheckout-capture.js"],
       "run_at": "document_start"
     },
     {

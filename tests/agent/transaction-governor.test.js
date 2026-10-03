@@ -362,6 +362,8 @@ test("an exhausted commerce correction remains the current obligation and stops"
       if (!failedSignatures.includes(signature)) failedSignatures.push(signature);
     }
   }
+  // Dispatch mechanics do not create separate semantic mutations for the
+  // same unchanged state owner.
   assert.equal(failedSignatures.length, 1);
 
   const { dir, dbPath } = tempDb();

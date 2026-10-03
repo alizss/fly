@@ -610,6 +610,81 @@ test("P0.5 blocks only explicit route, date, traveler, and currency contradictio
   assert.equal(invariantDecision({ baseline, observed: unrelatedPartial }, { type: "wait" }, { approvals: {}, paymentState: {} }).allow, true);
 });
 
+test("development mechanics keep transaction conflicts diagnostic without weakening paid or payment guards", () => {
+  const baseline = normalizeFacts(facts({ origin: "ZAG", destination: "SJJ", totalPrice: 192.62 }));
+  const observed = normalizeFacts(facts({ origin: "ZAGREB", destination: "SARAJEVO", totalPrice: 192.62 }));
+  const state = {
+    developmentCheckout: true,
+    approvals: {},
+    paymentState: {}
+  };
+  const prepared = {
+    baseline,
+    observed,
+    envelope: { baselineAuthority: "development_test", baselineStatus: "diagnostic" }
+  };
+
+  const profileField = invariantDecision(prepared, {
+    type: "select",
+    intent: "fill_profile_field",
+    risk: "safe"
+  }, state);
+  assert.equal(profileField.allow, true);
+  assert.equal(
+    profileField.checks.some((check) => check.code === "DEVELOPMENT_TRANSACTION_DIAGNOSTIC_ONLY"),
+    true
+  );
+
+  const payment = invariantDecision(prepared, {
+    type: "click",
+    intent: "submit_purchase",
+    mechanicalEffect: "submit_purchase",
+    risk: "payment"
+  }, state);
+  assert.equal(payment.allow, false);
+  assert.equal(payment.code, "PAYMENT_AUTHORIZATION_MISSING");
+});
+
+test("development mechanics can establish a diagnostic transaction envelope from incomplete page facts", () => {
+  const state = {
+    ...createCheckoutSessionState({ travelerId: "trav_1" }),
+    developmentCheckout: true
+  };
+  const prepared = prepareTransactionInvariants(
+    state,
+    observation("obs_development_checkout", null),
+    { id: "trav_1" }
+  );
+
+  assert.equal(prepared.envelope.baselineAuthority, "development_test");
+  assert.equal(prepared.envelope.baselineStatus, "diagnostic");
+  assert.equal(prepared.envelope.baselineLocked, false);
+  assert.equal(prepared.review.developmentCheckout, true);
+  assert.ok(prepared.review.missingFacts.includes("itinerary_route"));
+});
+
+test("development mechanics demote an older approved session baseline instead of preserving its veto", () => {
+  let state = createCheckoutSessionState({ travelerId: "trav_1" });
+  state = prepareTransactionInvariants(
+    state,
+    observation("obs_old_approved", selectedBookingFacts(facts({ origin: "ZAG", destination: "SJJ" }))),
+    { id: "trav_1" }
+  ).state;
+  state = { ...state, developmentCheckout: true };
+
+  const resumed = prepareTransactionInvariants(
+    state,
+    observation("obs_old_resumed", facts({ origin: "ZAGREB", destination: "SARAJEVO" })),
+    { id: "trav_1" }
+  );
+  assert.equal(resumed.envelope.baselineAuthority, "development_test");
+  assert.equal(resumed.envelope.baselineStatus, "diagnostic");
+  assert.equal(
+    invariantDecision(resumed, { type: "select", intent: "fill_profile_field", risk: "safe" }, resumed.state).allow,
+    true
+  );
+});
+
 test("transaction dates have one calendar identity across ISO and display formats", () => {
   assert.equal(canonicalTransactionDate("2026-09-15"), "2026-09-15");
   assert.equal(canonicalTransactionDate("15 September 2026"), "2026-09-15");
@@ -627,6 +702,37 @@ test("transaction dates have one calendar identity across ISO and display format
     ).allow,
     true
   );
+});
+
+test("transaction endpoints have one identity across proven IATA and display aliases", () => {
+  const baselineRaw = facts({ origin: "LJU", destination: "LGW", flightNumber: "" });
+  baselineRaw.itinerary.segments[0].originAliases = ["LJU", "Ljubljana"];
+  baselineRaw.itinerary.segments[0].destinationAliases = ["LGW", "London Gatwick"];
+  const baseline = normalizeFacts(baselineRaw);
+  const observed = normalizeFacts(facts({
+    origin: "Ljubljana",
+    destination: "London Gatwick",
+    flightNumber: ""
+  }));
+
+  assert.equal(explicitItineraryConflict(baseline, observed), null);
+
+  const displayOnlyBaseline = normalizeFacts(facts({
+    origin: "Zagreb",
+    destination: "Sarajevo",
+    flightNumber: ""
+  }));
+  const codeObservationRaw = facts({ origin: "ZAG", destination: "SJJ", flightNumber: "" });
+  codeObservationRaw.itinerary.segments[0].originAliases = ["ZAG", "Zagreb"];
+  codeObservationRaw.itinerary.segments[0].destinationAliases = ["SJJ", "Sarajevo"];
+  assert.equal(explicitItineraryConflict(displayOnlyBaseline, normalizeFacts(codeObservationRaw)), null);
+
+  const changed = normalizeFacts(facts({
+    origin: "Ljubljana",
+    destination: "Paris Charles de Gaulle",
+    flightNumber: ""
+  }));
+  assert.equal(explicitItineraryConflict(baseline, changed)?.code, "ITINERARY_ROUTE_CHANGED");
 });
 
 test("the final transaction review compares fresh identity instead of a retained stale current route", () => {

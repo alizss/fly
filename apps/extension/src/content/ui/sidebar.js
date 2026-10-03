@@ -1,6 +1,7 @@
 export function createSidebarUi({
   agent,
   bookingDetected,
+  confirmProposedPageBooking,
   copyDebugLog,
   getAppData,
   getFilledFields,
@@ -24,6 +25,9 @@ export function createSidebarUi({
   travelerRules
 }) {
   let bookingScanResult = null;
+  // Presentation-only state. Keeping this inside the sidebar owner means
+  // minimizing Fly cannot pause, restart, or otherwise influence checkout.
+  let sidebarMinimized = false;
 
   function warningHtml(dormant = false) {
     if (dormant) return "<p class='atw-muted'>Risk checks begin after Start.</p>";
@@ -164,13 +168,18 @@ export function createSidebarUi({
   function selectedBookingAdmissionHtml() {
     const contract = readSelectedBookingContract();
     const durable = agent.processDiagnostics?.transactionReview?.baseline || null;
+    const observed = bookingScanResult?.observed || null;
     const facts = contract || durable || null;
-    const segments = facts?.itinerary?.segments || [];
-    const captured = segments.length > 0 && segments.every((segment) => (
+    const displayFacts = facts || observed || null;
+    const segments = displayFacts?.itinerary?.segments || [];
+    const itineraryObserved = segments.length > 0 && segments.every((segment) => (
       segment.origin && segment.destination && segment.departureDate
     ));
-    const route = captured ? diagnosticRoute(facts) : "not captured";
-    const dates = captured
+    const total = displayFacts?.approvedTotal || displayFacts?.totalPrice || null;
+    const totalObserved = total?.amount != null && Boolean(total?.currency || displayFacts?.currency);
+    const captured = Boolean(facts && itineraryObserved && totalObserved);
+    const route = itineraryObserved ? diagnosticRoute(displayFacts) : "not observed";
+    const dates = itineraryObserved
       ? segments.map((segment) => segment.departureDate).filter(Boolean).join(" · ")
       : "departure date unavailable";
     const source = contract
@@ -179,13 +188,14 @@ export function createSidebarUi({
         : String(contract.selectionId || "").includes("_page_scan_")
           ? "captured from this page"
         : "selected before session"
-      : captured
+      : facts
         ? "durable baseline"
+        : observed
+          ? "page observation (not approved)"
         : "unavailable";
-    const total = facts?.approvedTotal || facts?.totalPrice || null;
     const price = total?.amount == null
       ? "total unavailable"
-      : `${total.amount} ${total.currency || facts?.currency || ""}`.trim();
+      : `${total.amount} ${total.currency || displayFacts?.currency || ""}`.trim();
     const selectedTraveler = traveler();
     const travelerName = [selectedTraveler?.first_name, selectedTraveler?.middle_name, selectedTraveler?.last_name]
       .filter(Boolean)
@@ -193,7 +203,6 @@ export function createSidebarUi({
     const missingFacts = bookingScanResult?.missingFacts
       || agent.sessionStartFailure?.details?.missingFacts
       || ["itinerary", "approved_total", "currency"];
-    const observed = bookingScanResult?.observed || null;
     const canonicalObservedRoute = observed ? diagnosticRoute(observed) : "";
     const observedRoute = canonicalObservedRoute || (
       observed?.observedRoute?.origin && observed?.observedRoute?.destination
@@ -201,6 +210,18 @@ export function createSidebarUi({
         : ""
     );
     const observedTotal = observed?.approvedTotal;
+    const proposal = bookingScanResult?.proposal?.status === "proposed"
+      ? bookingScanResult.proposal
+      : null;
+    const proposedRoute = proposal
+      ? proposal.segments.map((segment) => `${segment.origin} → ${segment.destination}`).join(" · ")
+      : "";
+    const proposedDates = proposal
+      ? proposal.segments.map((segment) => segment.departureDate).join(" · ")
+      : "";
+    const proposedTotal = proposal
+      ? `${proposal.approvedTotal.amount} ${proposal.approvedTotal.currency}`
+      : "";
     const scanStatus = bookingScanResult
       ? String(bookingScanResult.code || "").includes("AMBIGUOUS")
         ? `Scan found ${bookingScanResult.candidateCount || "multiple"} conflicting bookings. Open one selected-booking summary and scan again.`
@@ -216,11 +237,19 @@ export function createSidebarUi({
           <span>Traveler</span><strong>${escapeHtml(travelerName)}</strong>
           <span>Source</span><strong>${escapeHtml(source)}</strong>
         </div>
-        ${captured ? "" : `<div class="atw-mini-note">Start needs an approved booking. Missing: ${missingFacts.map(escapeHtml).join(", ")}.</div>`}
+        ${captured ? "" : `<div class="atw-mini-note">Booking facts are incomplete (${missingFacts.map(escapeHtml).join(", ")}). Local mechanics testing may still Start; production requires the selected-booking handoff.</div>`}
       </div>
       ${captured || agent.running ? "" : `
         <div class="atw-booking-scan">
-          <button class="atw-primary" id="atw-scan-booking" type="button">Scan &amp; use observed booking [DEV]</button>
+          ${proposal ? `
+            <div class="atw-mini-note">
+              <strong>AI proposal — not approved</strong><br />
+              ${escapeHtml(proposedRoute)}<br />
+              ${escapeHtml(proposedDates)} · ${escapeHtml(proposedTotal)} · ${escapeHtml(proposal.confidence)} confidence
+            </div>
+            <button class="atw-primary" id="atw-confirm-booking-proposal" type="button">Confirm proposed booking [DEV]</button>
+          ` : ""}
+          <button class="${proposal ? "" : "atw-primary"}" id="atw-scan-booking" type="button">${proposal ? "Scan again" : "Scan booking [DEV]"}</button>
           <div class="atw-muted">${escapeHtml(scanStatus)} Confirmation always starts a fresh checkout identity; production uses the selected-booking handoff.</div>
         </div>
       `}
@@ -481,17 +510,28 @@ export function createSidebarUi({
       || Boolean(agent.pageMap || pageStateStore.current())
       || dormant
       || bookingDetected();
-    const bookingReady = Boolean(readSelectedBookingContract() || agent.sessionId);
     const root = document.getElementById("atw-sidebar") || document.createElement("aside");
     root.id = "atw-sidebar";
+    root.classList.toggle("atw-is-minimized", sidebarMinimized);
+    root.setAttribute("aria-label", "Fly checkout assistant");
     root.innerHTML = `
       <div class="atw-panel">
         <div class="atw-head">
-          <div>
+          <div class="atw-brand">
             <h2>Air Travel Agent</h2>
             <p>${location.host}</p>
           </div>
-          <span class="atw-pill">${mode === "saved" ? "Saved" : detected ? "Live" : "Idle"}</span>
+          <div class="atw-head-actions">
+            <span class="atw-pill">${mode === "saved" ? "Saved" : detected ? "Live" : "Idle"}</span>
+            <button
+              class="atw-sidebar-toggle"
+              id="atw-toggle-sidebar"
+              type="button"
+              aria-label="${sidebarMinimized ? "Expand" : "Minimize"} Fly sidebar"
+              aria-expanded="${sidebarMinimized ? "false" : "true"}"
+              title="${sidebarMinimized ? "Expand" : "Minimize"} Fly sidebar"
+            >${sidebarMinimized ? "Open" : "−"}</button>
+          </div>
         </div>
         <label class="atw-label">Traveler
           <select id="atw-traveler">
@@ -505,7 +545,7 @@ export function createSidebarUi({
           <textarea id="atw-user-goal" placeholder="e.g. book free, nothing extra, no seat" ${agent.running ? "disabled" : ""}>${escapeHtml(agent.userGoal)}</textarea>
         </label>
         <div class="atw-buttons">
-          <button class="atw-primary" id="atw-takeover" ${detected && !agent.running && bookingReady ? "" : "disabled"}>Start agent</button>
+          <button class="atw-primary" id="atw-takeover" ${detected && !agent.running ? "" : "disabled"}>Start agent</button>
           <button id="atw-observe-only" ${detected ? "" : "disabled"}>Observe page (no actions) [TEMP]</button>
         </div>
         ${!agent.running ? `<div class="atw-mini-note">Start binds Fly to this checkout and traveler. Visible trip facts are preserved as they appear. Fly stops at card entry.</div>` : ""}
@@ -545,12 +585,16 @@ export function createSidebarUi({
     `;
     if (!root.parentElement) document.body.appendChild(root);
     renderCursorPrompt();
+    document.getElementById("atw-toggle-sidebar")?.addEventListener("click", () => {
+      sidebarMinimized = !sidebarMinimized;
+      renderSidebar(mode);
+    });
     document.getElementById("atw-user-goal")?.addEventListener("input", (event) => setUserGoal(event.target.value));
     document.getElementById("atw-takeover").addEventListener("click", () => takeOverCheckout().catch((error) => alert(error.message)));
     document.getElementById("atw-scan-booking")?.addEventListener("click", async (event) => {
       const button = event.currentTarget;
       button.disabled = true;
-      button.textContent = "Observing and confirming test booking…";
+      button.textContent = "Observing booking…";
       try {
         bookingScanResult = await scanPageForSelectedBooking();
       } catch (error) {
@@ -560,6 +604,23 @@ export function createSidebarUi({
           code: "BOOKING_SCAN_UNAVAILABLE",
           missingFacts: [error.message],
           observed: null
+        };
+      }
+      renderSidebar("ready");
+    });
+    document.getElementById("atw-confirm-booking-proposal")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      button.disabled = true;
+      button.textContent = "Confirming booking…";
+      try {
+        bookingScanResult = await confirmProposedPageBooking(bookingScanResult?.proposal || null);
+      } catch (error) {
+        bookingScanResult = {
+          ok: false,
+          captured: false,
+          code: "AI_BOOKING_CONFIRMATION_FAILED",
+          missingFacts: [error.message],
+          proposal: bookingScanResult?.proposal || null
         };
       }
       renderSidebar("ready");

@@ -430,7 +430,8 @@ function profileChildCandidateScore(goal = {}, candidate = {}, control = {}) {
     && desiredTerms.some((term) => boundedSemanticMatch(label, term))) return 100;
   const desiredDigitTokens = desiredTerms.flatMap(numericMeaningTokens);
   const labelDigitTokens = new Set(numericMeaningTokens(label));
-  if (desiredDigitTokens.some((token) => labelDigitTokens.has(token))) return 90;
+  if (["choose", "select", "activate"].includes(candidateOperation(candidate))
+    && desiredDigitTokens.some((token) => labelDigitTokens.has(token))) return 90;
   if (candidate.operation === "keyboard") return 30;
   return 10;
 }

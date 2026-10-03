@@ -151,12 +151,30 @@ function travelerKey(entry = {}) {
   return text(entry.travelerId, 120) || normalizedText(entry.name, 160);
 }
 
+function segmentEndpointAliases(segment = {}, field = "origin") {
+  const aliasField = field === "origin" ? "originAliases" : "destinationAliases";
+  return [...new Set([segment[field], ...(Array.isArray(segment[aliasField]) ? segment[aliasField] : [])]
+    .map((value) => text(value, 120).toUpperCase())
+    .filter(Boolean))];
+}
+
+function sameEndpoint(left = {}, right = {}, field = "origin") {
+  const leftAliases = new Set(segmentEndpointAliases(left, field));
+  return segmentEndpointAliases(right, field).some((alias) => leftAliases.has(alias));
+}
+
 function mergeSegmentIdentity(existing = {}, observed = {}, index = 0) {
   const evidence = existing.evidence || observed.evidence || null;
+  const origin = text(existing.origin || observed.origin, 80).toUpperCase();
+  const destination = text(existing.destination || observed.destination, 80).toUpperCase();
+  const originAliases = segmentEndpointAliases(existing.origin ? existing : observed, "origin");
+  const destinationAliases = segmentEndpointAliases(existing.destination ? existing : observed, "destination");
   return {
     segmentId: text(existing.segmentId || observed.segmentId || `segment_${index + 1}`, 120),
-    origin: text(existing.origin || observed.origin, 80).toUpperCase(),
-    destination: text(existing.destination || observed.destination, 80).toUpperCase(),
+    origin,
+    ...(originAliases.length ? { originAliases } : {}),
+    destination,
+    ...(destinationAliases.length ? { destinationAliases } : {}),
     departureDate: text(existing.departureDate || observed.departureDate, 40),
     departureTime: text(existing.departureTime || observed.departureTime, 20),
     arrivalTime: text(existing.arrivalTime || observed.arrivalTime, 20),
@@ -174,8 +192,8 @@ function enrichBaseline(existing = {}, observed = {}) {
       !usedObserved.has(candidateIndex)
       && segment.origin
       && segment.destination
-      && segment.origin === candidate.origin
-      && segment.destination === candidate.destination
+      && sameEndpoint(segment, candidate, "origin")
+      && sameEndpoint(segment, candidate, "destination")
       && (!segment.departureDate || !candidate.departureDate || segment.departureDate === candidate.departureDate)
     ));
     const selectedIndex = matchingIndex >= 0
@@ -251,7 +269,13 @@ function mergeCurrentFacts(previous = {}, observed = {}, baseline = {}) {
         // identity. Otherwise a changed route would be hidden by the retained
         // prior observation and could incorrectly pass final review.
         origin: text(segment.origin || previousSegments[index]?.origin, 80).toUpperCase(),
+        originAliases: segment.origin
+          ? segmentEndpointAliases(segment, "origin")
+          : segmentEndpointAliases(previousSegments[index] || {}, "origin"),
         destination: text(segment.destination || previousSegments[index]?.destination, 80).toUpperCase(),
+        destinationAliases: segment.destination
+          ? segmentEndpointAliases(segment, "destination")
+          : segmentEndpointAliases(previousSegments[index] || {}, "destination"),
         departureDate: text(segment.departureDate || previousSegments[index]?.departureDate, 40),
         departureTime: text(segment.departureTime || previousSegments[index]?.departureTime, 20),
         arrivalTime: text(segment.arrivalTime || previousSegments[index]?.arrivalTime, 20),
@@ -342,7 +366,8 @@ function reviewTransactionEnvelope(envelope = {}, state = {}) {
     baseline,
     current,
     reviewFacts,
-    outcomeLedger: durableSelections
+    outcomeLedger: durableSelections,
+    developmentCheckout: envelope.baselineAuthority === "development_test"
   });
 }
 
@@ -387,39 +412,72 @@ function prepareTransactionInvariants(state = {}, observation = {}, traveler = {
   let envelope;
   if (!existing) {
     const missingFacts = transactionFactGaps(observed);
-    if (!selectedBookingAuthority || missingFacts.length) {
+    if (state.developmentCheckout === true) {
+      envelope = {
+        version: 5,
+        baseline: observed,
+        current: observed,
+        outcomeLedger: mergeCommerceSelections(admittedOutcomes),
+        reviewFacts: finalReviewObservation ? observed : null,
+        baselineAuthority: "development_test",
+        baselineLocked: false,
+        baselineStatus: "diagnostic",
+        baselineObservationId: observation.observationId || "",
+        approvedAt: "",
+        evidence: []
+      };
+    } else if (!selectedBookingAuthority || missingFacts.length) {
       const error = new Error(`Authoritative SelectedBooking required: ${missingFacts.join(", ") || "unowned booking facts"}`);
       error.code = "SELECTED_BOOKING_REQUIRED";
       error.details = { missingFacts, selectedBookingAuthority };
       throw error;
     }
-    envelope = {
-      version: 5,
-      baseline: observed,
-      current: observed,
-      outcomeLedger: mergeCommerceSelections(admittedOutcomes),
-      reviewFacts: finalReviewObservation ? observed : null,
-      baselineAuthority: "selected_booking",
-      baselineLocked: true,
-      baselineStatus: "approved",
-      baselineObservationId: observation.observationId || "",
-      approvedAt: at,
-      evidence: []
-    };
+    if (!envelope) {
+      envelope = {
+        version: 5,
+        baseline: observed,
+        current: observed,
+        outcomeLedger: mergeCommerceSelections(admittedOutcomes),
+        reviewFacts: finalReviewObservation ? observed : null,
+        baselineAuthority: "selected_booking",
+        baselineLocked: true,
+        baselineStatus: "approved",
+        baselineObservationId: observation.observationId || "",
+        approvedAt: at,
+        evidence: []
+      };
+    }
   } else {
-    if (
+    // A local server may resume a session created before mechanics-test mode
+    // was enabled. Demote its transaction baseline to diagnostics at this
+    // single owner instead of leaving the old production veto active until
+    // the user starts a brand-new checkout.
+    const developmentEnvelope = state.developmentCheckout === true;
+    if (!developmentEnvelope && (
       existing.baselineAuthority !== "selected_booking"
       || existing.baselineStatus !== "approved"
       || existing.baselineLocked !== true
       || !existing.baseline
-    ) {
+    )) {
       const error = new Error("Durable checkout is missing its locked SelectedBooking baseline.");
       error.code = "DURABLE_SELECTED_BOOKING_MISSING";
       throw error;
     }
     // Current observations may compare with the immutable product-owned
     // baseline, but can never fill, replace, or promote its facts.
-    envelope = {
+    envelope = developmentEnvelope ? {
+      ...existing,
+      version: 5,
+      baseline: existing.baseline || observed,
+      current: mergeCurrentFacts(existing.current || existing.baseline || observed, observed, existing.baseline || observed),
+      outcomeLedger: finalReviewObservation
+        ? mergeCommerceSelections(existing.outcomeLedger, verifiedActionOutcomes)
+        : mergeCommerceSelections(existing.outcomeLedger, admittedOutcomes),
+      reviewFacts: finalReviewObservation ? observed : (existing.reviewFacts || null),
+      baselineAuthority: "development_test",
+      baselineLocked: false,
+      baselineStatus: "diagnostic"
+    } : {
       ...existing,
       version: 5,
       baseline: existing.baseline,
@@ -475,7 +533,7 @@ function comparableSegments(baseline = {}, observed = {}) {
     if (matchIndex < 0) {
       matchIndex = after.findIndex((candidate, candidateIndex) => (
         !used.has(candidateIndex) && segment.origin && segment.destination
-        && segment.origin === candidate.origin && segment.destination === candidate.destination
+        && sameEndpoint(segment, candidate, "origin") && sameEndpoint(segment, candidate, "destination")
       ));
     }
     if (matchIndex < 0
@@ -492,8 +550,8 @@ function comparableSegments(baseline = {}, observed = {}) {
 
 function explicitItineraryConflict(baseline = {}, observed = {}) {
   for (const [before, after] of comparableSegments(baseline, observed)) {
-    if (before.origin && after.origin && before.origin !== after.origin) return { code: "ITINERARY_ROUTE_CHANGED", field: "origin", before: before.origin, after: after.origin };
-    if (before.destination && after.destination && before.destination !== after.destination) return { code: "ITINERARY_ROUTE_CHANGED", field: "destination", before: before.destination, after: after.destination };
+    if (before.origin && after.origin && !sameEndpoint(before, after, "origin")) return { code: "ITINERARY_ROUTE_CHANGED", field: "origin", before: before.origin, after: after.origin };
+    if (before.destination && after.destination && !sameEndpoint(before, after, "destination")) return { code: "ITINERARY_ROUTE_CHANGED", field: "destination", before: before.destination, after: after.destination };
     const beforeDate = canonicalTransactionDate(before.departureDate);
     const afterDate = canonicalTransactionDate(after.departureDate);
     if (beforeDate && afterDate && beforeDate !== afterDate) return { code: "ITINERARY_DATE_CHANGED", field: "departureDate", before: beforeDate, after: afterDate };
@@ -627,19 +685,25 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
   const checks = [];
   const deny = (code, reason, details = {}, decision = "blocked_by_safety") => ({ allow: false, decision, code, reason, details, checks: [...checks, { code, ok: false }] });
   const pass = (code, detail = "") => checks.push({ code, ok: true, detail });
+  const developmentCheckout = state.developmentCheckout === true
+    && prepared.envelope?.baselineAuthority === "development_test";
 
-  const travelerConflict = explicitTravelerConflict(baseline.travelers, observed.travelers);
-  if (travelerConflict) return deny("TRAVELER_SET_CHANGED", "Explicit traveler evidence conflicts with the immutable approved transaction baseline.", travelerConflict);
-  pass("TRAVELER_SET_STABLE", observed.travelers.length ? "matching evidence" : "current evidence absent");
+  if (developmentCheckout) {
+    pass("DEVELOPMENT_TRANSACTION_DIAGNOSTIC_ONLY", "transaction identity cannot veto local mechanics testing");
+  } else {
+    const travelerConflict = explicitTravelerConflict(baseline.travelers, observed.travelers);
+    if (travelerConflict) return deny("TRAVELER_SET_CHANGED", "Explicit traveler evidence conflicts with the immutable approved transaction baseline.", travelerConflict);
+    pass("TRAVELER_SET_STABLE", observed.travelers.length ? "matching evidence" : "current evidence absent");
 
-  const itineraryConflict = explicitItineraryConflict(baseline, observed);
-  if (itineraryConflict) return deny(itineraryConflict.code, `Explicit ${itineraryConflict.field} evidence conflicts with the immutable approved itinerary.`, itineraryConflict);
-  pass("ITINERARY_STABLE", `${baseline.itinerary.completeness} baseline / ${observed.itinerary.completeness} current; absence and partial evidence are non-conflicting`);
+    const itineraryConflict = explicitItineraryConflict(baseline, observed);
+    if (itineraryConflict) return deny(itineraryConflict.code, `Explicit ${itineraryConflict.field} evidence conflicts with the immutable approved itinerary.`, itineraryConflict);
+    pass("ITINERARY_STABLE", `${baseline.itinerary.completeness} baseline / ${observed.itinerary.completeness} current; absence and partial evidence are non-conflicting`);
 
-  if (baseline.currency && observed.currency && baseline.currency !== observed.currency) {
-    return deny("CURRENCY_CHANGED", `Currency changed from ${baseline.currency} to ${observed.currency}.`, { before: baseline.currency, after: observed.currency });
+    if (baseline.currency && observed.currency && baseline.currency !== observed.currency) {
+      return deny("CURRENCY_CHANGED", `Currency changed from ${baseline.currency} to ${observed.currency}.`, { before: baseline.currency, after: observed.currency });
+    }
+    pass("CURRENCY_STABLE", baseline.currency && observed.currency ? observed.currency : "current evidence absent or baseline unknown");
   }
-  pass("CURRENCY_STABLE", baseline.currency && observed.currency ? observed.currency : "current evidence absent or baseline unknown");
 
   const actionEffect = action.mechanicalEffect
     || action.affordance?.mechanicalEffect
@@ -708,7 +772,8 @@ function invariantDecision(prepared = {}, action = {}, state = prepared.state ||
     || action.targetSnapshot?.risk === "legal"
     || /legal_acceptance|accept legal|accept terms|conditions of carriage/.test(actionMeaning);
   const paymentRoute = /payment_method|payment route|pay by card|continue to payment|go to payment/.test(actionMeaning);
-  const authoritativeTransactionReady = baselineApproved && transactionFactGaps(baseline).length === 0;
+  const authoritativeTransactionReady = developmentCheckout
+    || (baselineApproved && transactionFactGaps(baseline).length === 0);
   if (!authoritativeTransactionReady && (
     factualAttestation
     || legalAttestation

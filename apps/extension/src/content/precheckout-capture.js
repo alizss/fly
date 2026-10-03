@@ -129,18 +129,6 @@
     return Number.isFinite(amount) && amount >= 0 ? amount : null;
   }
 
-  function moneyFromText(value = "") {
-    const text = clean(value);
-    const labeled = text.match(/(?:total|amount due|grand total|trip total|booking total|fare total|price)\s*[:\-]?\s*(?:(EUR|USD|GBP|TRY|CAD|AUD|NZD|CHF|JPY|CNY|AED|SAR|INR|SEK|NOK|DKK|PLN|CZK|HUF|RON|€|\$|£|₺)\s*)?([\d][\d\s.,]*)(?:\s*(EUR|USD|GBP|TRY|CAD|AUD|NZD|CHF|JPY|CNY|AED|SAR|INR|SEK|NOK|DKK|PLN|CZK|HUF|RON|€|\$|£|₺))?/i);
-    const general = text.match(/(?:(EUR|USD|GBP|TRY|CAD|AUD|NZD|CHF|JPY|CNY|AED|SAR|INR|SEK|NOK|DKK|PLN|CZK|HUF|RON|€|\$|£|₺)\s*)([\d][\d\s.,]*)|([\d][\d\s.,]*)\s*(EUR|USD|GBP|TRY|CAD|AUD|NZD|CHF|JPY|CNY|AED|SAR|INR|SEK|NOK|DKK|PLN|CZK|HUF|RON|€|\$|£|₺)/i);
-    const match = labeled || general;
-    if (!match) return null;
-    const rawCurrency = clean(labeled ? (match[1] || match[3]) : (match[1] || match[4])).toUpperCase();
-    const amount = numericAmount(labeled ? match[2] : (match[2] || match[3]));
-    const currency = CURRENCY_SYMBOLS[rawCurrency] || rawCurrency;
-    return amount == null || !currency ? null : { amount, currency, labeled: Boolean(labeled) };
-  }
-
   function directText(node) {
     return clean([...(node?.childNodes || [])]
       .filter((child) => child.nodeType === Node.TEXT_NODE)
@@ -157,17 +145,18 @@
   }
 
   function ownedSummaryMoney(scope) {
-    const exactTotalCue = /^(?:amount to pay|grand total|booking total|trip total|order total|total(?:\s+(?:amount|price)(?:\s+for\s+\d+\s+passengers?)?)?)\b/i;
+    const contract = globalThis.AtwBookingTotalContract;
+    if (!contract?.ownedBookingTotalEvidence) return null;
     const candidates = [];
-    for (const cue of [...scope.querySelectorAll?.("strong, b, dt, th, label, span, div") || []].slice(0, 500)) {
-      if (cue.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]")) continue;
+    for (const cue of [...scope.querySelectorAll?.("strong, b, dt, th, label, p, span, div") || []].slice(0, 500)) {
+      if (cue.closest?.("#atw-sidebar, [data-atw-ui]")) continue;
       const cueText = directText(cue);
-      if (!exactTotalCue.test(cueText) || /^total\s+duration\b/i.test(cueText)) continue;
+      if (!contract.bookingTotalCue(cueText)) continue;
       let owner = cue;
       for (let depth = 0; owner && depth < 4 && scope.contains(owner); depth += 1, owner = owner.parentElement) {
         const ownerText = boundedText(owner);
-        if (!ownerText || ownerText.length > 320 || /^total\s+duration\b/i.test(ownerText)) continue;
-        const money = moneyFromText(ownerText);
+        if (!ownerText) continue;
+        const money = contract.ownedBookingTotalEvidence({ cueText, ownerText });
         if (!money) continue;
         candidates.push({ ...money, labeled: true, textLength: ownerText.length });
         break;
@@ -184,17 +173,11 @@
     const rawCurrency = attribute(node, ["data-currency", "data-price-currency"]).toUpperCase();
     const currency = CURRENCY_SYMBOLS[rawCurrency] || rawCurrency;
     if (amount != null && currency) return { amount, currency, labeled: true };
-    const totalNodes = [...node.querySelectorAll?.("[data-total], [data-total-price], [data-amount], [aria-label*='total' i], [class*='total' i], [id*='total' i]") || []]
-      .filter((candidate) => !candidate.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]"));
-    for (const totalNode of totalNodes.slice(0, 24)) {
-      const candidate = moneyFromText(`${attribute(totalNode, ["aria-label"])} ${visibleText(totalNode)}`);
-      if (candidate) return { ...candidate, labeled: true };
-    }
     const owned = ownedSummaryMoney(node);
     if (owned) return owned;
     const structured = structuredMoneyFromControls(node);
     if (structured) return structured;
-    return moneyFromText(visibleText(node));
+    return null;
   }
 
   function normalizedControlKey(node) {

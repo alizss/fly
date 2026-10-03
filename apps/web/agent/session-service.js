@@ -37,7 +37,7 @@ function summarizeAgentSession(session) {
   };
 }
 
-function createSessionService(agentSessionStore) {
+function createSessionService(agentSessionStore, { allowDevelopmentCheckout = false } = {}) {
   function createAgentSession(body = {}) {
     const traveler = body.traveler || {};
     const requestedSessionId = clampText(body.sessionId || "", 120);
@@ -47,15 +47,21 @@ function createSessionService(agentSessionStore) {
     const durableBaselineApproved = existing?.transactionInvariants?.baselineStatus === "approved"
       && existing?.transactionInvariants?.baselineAuthority === "selected_booking"
       && Boolean(durableBaseline);
+    // The server, never page content, owns this exception. It exists only so
+    // local development can exercise checkout mechanics without turning a
+    // best-effort page scrape into transaction approval. Production keeps the
+    // SelectedBooking startup invariant unchanged.
+    const developmentCheckout = allowDevelopmentCheckout === true
+      && (body.developmentCheckout === true || existing?.developmentCheckout === true);
     const admittedSelectedBooking = existing ? null : normalizeSelectedBooking(body.selectedBookingContract);
-    if (!existing && !admittedSelectedBooking) {
+    if (!existing && !admittedSelectedBooking && !developmentCheckout) {
       throw requestBodyError(
         "SELECTED_BOOKING_REQUIRED",
         "An authoritative selected booking is required before checkout can start.",
         422
       );
     }
-    if (existing && !durableBaselineApproved) {
+    if (existing && !durableBaselineApproved && !developmentCheckout) {
       throw requestBodyError(
         "DURABLE_SELECTED_BOOKING_MISSING",
         "This checkout has no locked selected-booking baseline and cannot be resumed safely.",
@@ -150,6 +156,7 @@ function createSessionService(agentSessionStore) {
       // same ask again on the unchanged checkout state.
       status: preserveAwaitingUser ? "awaiting_user" : "running",
       userIntent: clampText(body.userIntent || body.goal || state.userIntent || state.goal, 800),
+      developmentCheckout,
       travelerId: primaryTravelerId,
       travelerIds: [...new Set([...selectedTravelerIds, primaryTravelerId].filter(Boolean))],
       userPolicy,
@@ -162,7 +169,7 @@ function createSessionService(agentSessionStore) {
         priceAuthorization: body.approvalState?.priceAuthorization || state.approvals?.priceAuthorization || null
       }
     });
-    if (!existing) {
+    if (!existing && selectedBooking) {
       const sessionStartObservation = {
         observationId: selectedBooking.observationId,
         page: {

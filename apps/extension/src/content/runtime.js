@@ -1246,6 +1246,7 @@ import {
 
   const { transactionFactsEvidence } = createTransactionEvidenceCompiler({
     AGENT_CONTRACT,
+    BOOKING_TOTAL_CONTRACT: globalThis.AtwBookingTotalContract,
     agent: runtimeScopes.transactionEvidence,
     implicitRole,
     isVisible,
@@ -2602,6 +2603,7 @@ import {
     implicitRole,
     inferCheckoutSite,
     isAuxiliaryNavigationAction,
+    isNonPageOwnedElement,
     isPaymentField,
     isPlaceholderChoiceValue,
     isVisible,
@@ -3174,10 +3176,22 @@ import {
     return null;
   }
 
-  const AGENT_OWNED_SELECTOR = "#atw-sidebar, #atw-agent-cursor, #atw-screenshot-annotations, .atw-section-outline";
+  const AGENT_OWNED_SELECTOR = "#atw-sidebar, #atw-agent-cursor, #atw-screenshot-annotations, .atw-section-outline, [data-atw-ui]";
+  const BROWSER_ASSISTANT_CONTROL_SELECTOR = "[data-testid='split-notch-chat-button'], [data-testid='split-notch-agent-trigger']";
 
   function isAgentOwnedElement(element) {
     return Boolean(element?.closest?.(AGENT_OWNED_SELECTOR));
+  }
+
+  function isBrowserAssistantElement(element) {
+    if (!element) return false;
+    if (element.matches?.(BROWSER_ASSISTANT_CONTROL_SELECTOR)) return true;
+    const exactAssistantGroup = element.closest?.("fieldset");
+    return Boolean(exactAssistantGroup?.querySelector?.(BROWSER_ASSISTANT_CONTROL_SELECTOR));
+  }
+
+  function isNonPageOwnedElement(element) {
+    return isAgentOwnedElement(element) || isBrowserAssistantElement(element);
   }
 
   function agentOwnedInteractionRoots() {
@@ -3185,7 +3199,7 @@ import {
       document.getElementById("atw-sidebar"),
       document.getElementById("atw-agent-cursor"),
       document.getElementById("atw-screenshot-annotations"),
-      ...document.querySelectorAll(".atw-section-outline")
+      ...document.querySelectorAll(".atw-section-outline, [data-atw-ui]")
     ].filter(Boolean))];
   }
 
@@ -3471,7 +3485,7 @@ import {
       control.targetId
     ]);
     const nonPageUi = ownedElementIds.some((elementId) => (
-      elementById(elementId)?.closest?.("#atw-sidebar")
+      isNonPageOwnedElement(elementById(elementId))
     ));
     return {
       controlId: control.controlId || "",
@@ -4026,6 +4040,46 @@ import {
         result.code = installed?.code || "DEV_OBSERVED_BOOKING_REJECTED";
         result.missingFacts = [installed?.error || "The observed test booking could not be installed."];
       }
+    } else if (!String(result.code || "").includes("AMBIGUOUS")) {
+      const flyElements = [
+        document.getElementById("atw-sidebar"),
+        document.getElementById("atw-agent-cursor")
+      ].filter(Boolean);
+      const previousDisplays = flyElements.map((element) => element.style.display);
+      let screenshotDataUrl = "";
+      let pageText = "";
+      try {
+        flyElements.forEach((element) => { element.style.display = "none"; });
+        await waitForPaint(80);
+        pageText = compactText(document.body?.innerText || "", 16_000);
+        screenshotDataUrl = await captureVisibleScreenshot([]);
+      } finally {
+        flyElements.forEach((element, index) => { element.style.display = previousDisplays[index]; });
+      }
+      const settings = await storageGet(["apiBase"]);
+      const response = await fetch(`${settings.apiBase || DEFAULT_API}/agent/dev/booking-proposal`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          sourceUrl: currentNavigationUrl(),
+          pageTitle: document.title,
+          pageText,
+          observed: result.observed || null,
+          screenshotDataUrl,
+          referenceDate: new Date().toISOString().slice(0, 10)
+        })
+      });
+      const proposalResponse = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        result.code = proposalResponse.code || "AI_BOOKING_PROPOSAL_FAILED";
+        result.missingFacts = [proposalResponse.error || `Booking proposal failed (${response.status}).`];
+      } else if (proposalResponse.proposal?.status === "proposed") {
+        result.code = "AI_BOOKING_PROPOSAL_READY";
+        result.proposal = proposalResponse.proposal;
+        result.proposalMeta = proposalResponse.meta || null;
+      } else {
+        result.code = "AI_BOOKING_PROPOSAL_UNKNOWN";
+      }
     }
     await hydrateSelectedBookingAdmission();
     logFlow("booking.capture", {
@@ -4035,6 +4089,85 @@ import {
       observed: result?.observed || null
     });
     return result;
+  }
+
+  async function confirmProposedPageBooking(proposal = null) {
+    const segments = Array.isArray(proposal?.segments) ? proposal.segments : [];
+    const amount = Number(proposal?.approvedTotal?.amount);
+    const currency = String(proposal?.approvedTotal?.currency || "").trim().toUpperCase();
+    const selectedTravelerId = String(traveler()?.id || "").trim();
+    const validSegments = segments.length > 0 && segments.length <= 8 && segments.every((segment) => {
+      const date = String(segment?.departureDate || "").trim();
+      let exactDate = false;
+      try {
+        exactDate = new Date(`${date}T00:00:00.000Z`).toISOString().slice(0, 10) === date;
+      } catch (_error) {
+        exactDate = false;
+      }
+      return Boolean(
+        String(segment?.origin || "").trim()
+        && String(segment?.destination || "").trim()
+        && /^20\d{2}-\d{2}-\d{2}$/.test(date)
+        && exactDate
+      );
+    });
+    if (!validSegments || !Number.isFinite(amount) || amount <= 0 || !/^[A-Z]{3}$/.test(currency) || !selectedTravelerId) {
+      return {
+        ok: false,
+        captured: false,
+        code: "AI_BOOKING_PROPOSAL_INVALID",
+        missingFacts: ["The proposed booking is incomplete or invalid."],
+        proposal
+      };
+    }
+    const selectedAt = new Date().toISOString();
+    const selectedBookingContract = {
+      contractVersion: "selected-booking/v1",
+      selectionId: `test_ai_page_confirmation_${Date.parse(selectedAt).toString(36)}`,
+      selectedAt,
+      sourceUrl: currentNavigationUrl(),
+      itinerary: {
+        segments: segments.map((segment, index) => ({
+          segmentId: `segment_${index + 1}`,
+          origin: compactText(segment.origin, 120),
+          originAliases: [...new Set([segment.origin, ...(Array.isArray(segment.originAliases) ? segment.originAliases : [])]
+            .map((value) => compactText(value, 120))
+            .filter(Boolean))].slice(0, 6),
+          destination: compactText(segment.destination, 120),
+          destinationAliases: [...new Set([segment.destination, ...(Array.isArray(segment.destinationAliases) ? segment.destinationAliases : [])]
+            .map((value) => compactText(value, 120))
+            .filter(Boolean))].slice(0, 6),
+          departureDate: String(segment.departureDate)
+        }))
+      },
+      approvedTotal: { amount, currency },
+      fareBrand: "",
+      travelerIds: [selectedTravelerId],
+      testOnlyPageConfirmation: true
+    };
+    const installed = await chrome.runtime.sendMessage({
+      type: "ATW_DEV_OBSERVED_BOOKING_CONFIRM",
+      selectedBookingContract
+    });
+    await hydrateSelectedBookingAdmission();
+    const captured = installed?.ok === true;
+    logFlow("booking.capture", {
+      event: captured ? "DEV_AI_BOOKING_CONFIRMED" : "DEV_AI_BOOKING_REJECTED",
+      code: installed?.code || "",
+      proposal
+    });
+    return {
+      ok: captured,
+      captured,
+      code: captured ? "DEV_AI_BOOKING_CONFIRMED" : (installed?.code || "DEV_OBSERVED_BOOKING_REJECTED"),
+      missingFacts: captured ? [] : [installed?.error || "The proposed booking could not be installed."],
+      observed: {
+        itinerary: selectedBookingContract.itinerary,
+        approvedTotal: selectedBookingContract.approvedTotal
+      },
+      proposal,
+      selectedBookingContract: captured ? selectedBookingContract : null
+    };
   }
 
   const {
@@ -4049,6 +4182,7 @@ import {
   } = createSidebarUi({
     agent: runtimeScopes.sidebar,
     bookingDetected,
+    confirmProposedPageBooking,
     copyDebugLog,
     getAppData: () => appData,
     getFilledFields: () => filledFields,

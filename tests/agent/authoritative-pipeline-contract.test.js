@@ -8,6 +8,7 @@ const {
   actionForCurrentCandidate,
   buildCurrentCandidateSet
 } = require("./legacy-mechanics-binding-adapter");
+const { bindMechanics } = require("../../apps/web/agent/mechanics-binder");
 const { governObservedAction: governAction } = require("./governance-test-helper");
 const { toClientDecision, __private: loopPrivate } = require("../../apps/web/agent/loop");
 const { executableDecisionFromActionLease } = require("./action-lease-replay-adapter");
@@ -683,6 +684,127 @@ test("shared execution-lane classifier admits only fresh exact bounded recovery"
     control,
     observation
   }), agentContract.EXECUTION_LANE.DENY);
+});
+
+test("objective opener proof survives normalization as one bounded choice-discovery capability", () => {
+  const actuatorId = "age_visible_opener";
+  const control = profileControl({
+    controlId: "age_at_departure_control",
+    name: "passengers.0.age_at_departure",
+    fieldType: "age_at_departure",
+    operation: "open",
+    actuatorId,
+    role: "editable_combobox",
+    kind: "select",
+    disabled: true
+  });
+  const objectiveActionability = {
+    rendered: true,
+    visible: true,
+    enabled: true,
+    inViewport: true,
+    inCurrentSurface: true,
+    hitTested: true,
+    notOccluded: true,
+    executable: false,
+    revealable: false,
+    code: "OPERATION_NOT_PROVEN",
+    operation: "open"
+  };
+  control.operations = {
+    open: {
+      operation: "open",
+      actuatorId,
+      status: agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT,
+      actionability: objectiveActionability,
+      strategies: [{
+        operation: "open",
+        actuatorId,
+        method: agentContract.INTERACTION_METHOD.NATIVE_CLICK,
+        actionType: "click",
+        status: agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT
+      }]
+    }
+  };
+
+  const capability = agentContract.normalizeCapability(
+    control,
+    "open",
+    control.operations.open
+  );
+  assert.equal(capability.status, agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT);
+  assert.equal(capability.requiresVisualConfirmation, true);
+  assert.equal(capability.strategies[0].proof.targetable, true);
+  assert.equal(capability.exactActuators[0].status, agentContract.CAPABILITY_STATUS.UNPROVEN_EXPERIMENT);
+
+  // A semantic match on a mechanically unavailable strategy must not hide the
+  // exact bounded opener. This is the composed failure the live trace exposed:
+  // the hidden editable input carried the desired age as its action value,
+  // while the visible opener was the only mechanic capable of revealing the
+  // actual choices.
+  const hiddenInputId = "age_hidden_input";
+  control.operations.type = {
+    operation: "type",
+    actuatorId: hiddenInputId,
+    actionability: {
+      rendered: true,
+      visible: false,
+      enabled: false,
+      inViewport: false,
+      inCurrentSurface: true,
+      hitTested: false,
+      notOccluded: false,
+      executable: false,
+      revealable: false,
+      code: "ACTUATOR_NOT_VISIBLE",
+      operation: "type"
+    },
+    strategies: [{
+      operation: "type",
+      actuatorId: hiddenInputId,
+      method: agentContract.INTERACTION_METHOD.DIRECT_INPUT,
+      actionType: "type",
+      status: agentContract.CAPABILITY_STATUS.UNAVAILABLE
+    }]
+  };
+  const composedObservation = observation([control], "obs_composed_age_opener");
+  const obligation = {
+    contractVersion: "current-obligation/v3",
+    id: "profile:age_at_departure:0",
+    observationId: composedObservation.observationId,
+    decisionFrameId: "frame_age",
+    semanticOwner: {
+      family: "age_at_departure",
+      subjectId: "traveler_1"
+    },
+    desiredStateDelta: {
+      contractVersion: "desired-state-delta/v1",
+      status: "EXACT_DELTA",
+      kind: "profile_field",
+      actionRequired: true,
+      desiredValue: "23",
+      admittedControlIds: [control.controlId]
+    },
+    admittedControlIds: [control.controlId],
+    successCondition: {
+      type: "logical_component_committed",
+      semanticType: "age_at_departure",
+      controlId: control.controlId,
+      expectedNormalizedValue: "23"
+    }
+  };
+  const binding = bindMechanics({
+    obligation,
+    observation: composedObservation,
+    traveler: { id: "traveler_1", date_of_birth: "2003-05-31" },
+    state: { taskState: { currentObligation: obligation }, approvals: {} },
+    approvals: {}
+  });
+  assert.equal(binding.candidates.length, 1);
+  assert.equal(binding.candidates[0].operation, "open");
+  assert.equal(binding.candidates[0].targetId, actuatorId);
+  assert.equal(binding.candidates[0].executionChannel, agentContract.EXECUTION_LANE.BOUNDED_RECOVERY);
+  assert.equal(binding.candidates[0].mechanicalHypothesis, true);
 });
 
 test("target binding preserves the exact bounded-recovery actuator instead of substituting the preferred control member", () => {

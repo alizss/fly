@@ -297,6 +297,14 @@ test("one durable execution episode replaces parallel lifecycle and recovery cop
   });
 });
 
+test("development mechanics authority survives durable session compaction", () => {
+  const compacted = compactSessionState({
+    ...createCheckoutSessionState({ travelerId: "trav_development" }),
+    developmentCheckout: true
+  });
+  assert.equal(compacted.developmentCheckout, true);
+});
+
 test("observation persistence retains metadata but only two active payloads", () => {
   const store = createStore({ dbPath: ":memory:" });
   const state = createCheckoutSessionState({ goal: "Reach payment review" });

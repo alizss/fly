@@ -64,7 +64,10 @@ export function createCheckoutController({
   async function takeOverCheckout() {
     if (agent.engineReconciliationPending && agent.sessionId) {
       const existingSessionId = agent.sessionId;
-      const session = await startAgentSession(existingSessionId, { validateBeforeObservation: true });
+      const session = await startAgentSession(existingSessionId, {
+        validateBeforeObservation: true,
+        startSource: "user_resume"
+      });
       if (!session || agent.sessionId !== existingSessionId) return false;
       agent.engineReconciliationPending = false;
       agent.running = true;
@@ -107,7 +110,7 @@ export function createCheckoutController({
     resetFieldProgress();
     setAgentActivity("Starting checkout agent", travelerRules() || "Using saved traveler profile");
     agent.pageMap = pageStateStore.observe({ forceFull: true, reason: "agent_start" }).map;
-    const session = await startAgentSession();
+    const session = await startAgentSession("", { startSource: "user_start" });
     if (!session || !agent.sessionId) {
       stopWatchingCheckoutChanges();
       agent.running = false;
@@ -156,7 +159,10 @@ export function createCheckoutController({
     // earn a multi-second main-thread scan merely because the local server is
     // reachable.
     const session = resumeSessionId
-      ? await startAgentSession(resumeSessionId, { validateBeforeObservation: true })
+      ? await startAgentSession(resumeSessionId, {
+          validateBeforeObservation: true,
+          startSource: "auto_resume"
+        })
       : null;
     if (!session || agent.sessionId !== resumeSessionId) {
       stopWatchingCheckoutChanges();

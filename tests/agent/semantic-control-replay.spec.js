@@ -118,6 +118,8 @@ const fixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", 
 const profileFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "profile-form.html");
 const croatiaFixturePath = path.join(__dirname, "..", "fixtures", "semantic-controls", "croatia-passenger.html");
 const contentScriptPath = path.join(__dirname, "..", "..", "apps", "extension", "dist", "content.js");
+const sidebarCssPath = path.join(__dirname, "..", "..", "apps", "extension", "src", "content", "sidebar.css");
+const bookingTotalContractPath = path.join(__dirname, "..", "..", "apps", "extension", "src", "shared", "booking-total-contract.js");
 const precheckoutCapturePath = path.join(__dirname, "..", "..", "apps", "extension", "src", "content", "precheckout-capture.js");
 const TEST_API = `http://127.0.0.1:${Number(process.env.ATW_TEST_PORT || 4273)}/api`;
 
@@ -489,6 +491,7 @@ test("lightweight unfamiliar-site selection persists the real booking through pa
     apiBase: "https://unfamiliar-air.test/api",
     selectedTravelerId: travelerId
   }, 42);
+  await page.addScriptTag({ path: bookingTotalContractPath });
   await page.addScriptTag({ path: precheckoutCapturePath });
 
   await page.locator("#choose-flight").click();
@@ -543,6 +546,7 @@ test("selection producer prefers structured URL itinerary over hyphenated add-on
   await installBootChrome(page, {
     selectedTravelerId: travelerId
   }, 42);
+  await page.addScriptTag({ path: bookingTotalContractPath });
   await page.addScriptTag({ path: precheckoutCapturePath });
 
   await page.locator("#continue-selection").click();
@@ -575,6 +579,7 @@ test("ordinary passenger-page Start is not reinterpreted as booking selection", 
       <button id="start-agent" type="button">Start agent</button>
     </main>`);
   await installBootChrome(page, { selectedTravelerId: "trav_passenger_start" }, 42);
+  await page.addScriptTag({ path: bookingTotalContractPath });
   await page.addScriptTag({ path: precheckoutCapturePath });
 
   await page.locator("#start-agent").click();
@@ -1199,7 +1204,7 @@ test("the governed executor dispatches a safe Pay by card route instead of reope
   });
 });
 
-test("startup without authoritative booking evidence creates no provisional session", async ({ page }) => {
+test("development startup without booking evidence creates a diagnostics-only mechanics session", async ({ page }) => {
   await loadHtmlProducer(page, "<main><h1>Passenger details</h1><p>No booking summary</p></main>");
   let requestBody = null;
   await page.route("https://agent.test/api/agent/session", async (route) => {
@@ -1218,9 +1223,12 @@ test("startup without authoritative booking evidence creates no provisional sess
     const session = await window.__ATW_TEST__.startAgentSession("", { bookingAcquisitionTimeoutMs: 120 });
     return { session, elapsedMs: performance.now() - startedAt };
   });
-  expect(started.session).toBeNull();
+  expect(started.session).toMatchObject({ id: "chk_provisional_no_booking" });
   expect(started.elapsedMs).toBeLessThan(1_000);
-  expect(requestBody).toBeNull();
+  expect(requestBody).toMatchObject({
+    selectedBookingContract: null,
+    developmentCheckout: true
+  });
 });
 
 test("Start never promotes a passenger-page amount into the authoritative booking total", async ({ page }) => {
@@ -1254,9 +1262,12 @@ test("Start never promotes a passenger-page amount into the authoritative bookin
     return { session, pagePrice: observed.map.price };
   });
 
-  expect(result.session).toBeNull();
+  expect(result.session).toMatchObject({ id: "chk_unowned_page_amount" });
   expect(Number(result.pagePrice?.amount)).toBe(30);
-  expect(requestBody).toBeNull();
+  expect(requestBody).toMatchObject({
+    selectedBookingContract: null,
+    developmentCheckout: true
+  });
 });
 
 test("a legacy acquisition record cannot authorize a tab-scoped Start", async ({ page }) => {
@@ -1372,8 +1383,11 @@ test("an invalid global booking cannot fall back to current-page transaction app
     window.__ATW_TEST__.observePageState({ forceFull: true, reason: "stored_contract_fallback" });
     return window.__ATW_TEST__.startAgentSession();
   }, { stored: staleContract });
-  expect(session).toBeNull();
-  expect(requestBody).toBeNull();
+  expect(session).toMatchObject({ id: "chk_fresh_acquisition" });
+  expect(requestBody).toMatchObject({
+    selectedBookingContract: null,
+    developmentCheckout: true
+  });
 });
 
 test("a fresh checkout rejects a global booking from another airline without tab-scoped authority", async ({ page }) => {
@@ -1425,8 +1439,11 @@ test("a fresh checkout rejects a global booking from another airline without tab
     window.__ATW_TEST__.observePageState({ forceFull: true, reason: "easyjet_after_kiwi" });
     return window.__ATW_TEST__.startAgentSession();
   }, { stored: kiwiContract });
-  expect(session).toBeNull();
-  expect(requestBody).toBeNull();
+  expect(session).toMatchObject({ id: "chk_easyjet_after_kiwi" });
+  expect(requestBody).toMatchObject({
+    selectedBookingContract: null,
+    developmentCheckout: true
+  });
 });
 
 test("resume sends no stored booking contract and uses only the durable baseline", async ({ page }) => {
@@ -2933,9 +2950,13 @@ test("cabin-bag scope, paid option, and free skip compile into one safe governed
     risk: "money",
     structuredPrice: { amount: 41.24, currency: "EUR" }
   });
+  // This control is an exact member of the current optional baggage
+  // decision. It remains the safe free outcome; if its single dispatch also
+  // replaces the page, destination verification owns that observed result.
   expect(skip).toMatchObject({
-    effectRole: "navigation",
-    physicalEffect: "advance_checkout_stage",
+    semantic: "decline_paid_extra",
+    effectRole: "commerce_option",
+    physicalEffect: "select_free_option",
     risk: "safe"
   });
   expect(observation.page.transactionFacts.itinerary.segments).toEqual(expect.arrayContaining([
@@ -9057,8 +9078,24 @@ test("repeated unfamiliar flight rows compile a complete selected-booking envelo
   const observation = await browserObservation(page, "obs_unfamiliar_flight_rows");
   expect(observation.page.transactionFacts.itinerary).toMatchObject({ completeness: "complete" });
   expect(observation.page.transactionFacts.itinerary.segments).toEqual([
-    expect.objectContaining({ origin: "ZAG", destination: "SJJ", departureDate: "2026-09-15", departureTime: "14:55", arrivalTime: "15:45" }),
-    expect.objectContaining({ origin: "SJJ", destination: "ZAG", departureDate: "2026-09-30", departureTime: "16:30", arrivalTime: "17:20" })
+    expect.objectContaining({
+      origin: "ZAG",
+      originAliases: ["ZAG", "ZAGREB"],
+      destination: "SJJ",
+      destinationAliases: ["SJJ", "SARAJEVO"],
+      departureDate: "2026-09-15",
+      departureTime: "14:55",
+      arrivalTime: "15:45"
+    }),
+    expect.objectContaining({
+      origin: "SJJ",
+      originAliases: ["SJJ", "SARAJEVO"],
+      destination: "ZAG",
+      destinationAliases: ["ZAG", "ZAGREB"],
+      departureDate: "2026-09-30",
+      departureTime: "16:30",
+      arrivalTime: "17:20"
+    })
   ]);
   expect(observation.page.transactionFacts.factEvidence.itinerary.every((entry) => (
     entry.source === "owned_flight_segment_sequence" && entry.authoritative === true
@@ -9163,6 +9200,40 @@ test("testing sidebar shows process position, objective, achievements, and selec
   await expect(diagnostics).toContainText("payment_review");
 });
 
+test("sidebar minimizes without changing agent state and survives presentation rerenders", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main><h1>Passenger details</h1><label>Email <input type="email"></label></main>
+  `);
+  await page.addStyleTag({ path: sidebarCssPath });
+  await page.evaluate(() => {
+    window.__ATW_TEST__.setAppDataForTest({
+      travelers: [{ id: "trav_minimize", first_name: "Ali", last_name: "SIFRAR" }],
+      preferences: {}
+    }, "trav_minimize");
+    window.__ATW_TEST__.setAgentRunningForTest(true);
+    window.__ATW_TEST__.setAgentSessionForTest("chk_minimize");
+    window.__ATW_TEST__.renderSidebarForTest("agent");
+  });
+
+  const sidebar = page.locator("#atw-sidebar");
+  const toggle = page.locator("#atw-toggle-sidebar");
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await toggle.click();
+  await expect(sidebar).toHaveClass(/atw-is-minimized/);
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toHaveText("Open");
+  await expect(page.locator("#atw-traveler")).toBeHidden();
+
+  await page.evaluate(() => window.__ATW_TEST__.renderSidebarForTest("agent"));
+  await expect(sidebar).toHaveClass(/atw-is-minimized/);
+  await expect(page.locator("#atw-traveler")).toBeHidden();
+  expect(await page.evaluate(() => window.__ATW_TEST__.agentLoopState().sessionId)).toBe("chk_minimize");
+
+  await page.locator("#atw-toggle-sidebar").click();
+  await expect(sidebar).not.toHaveClass(/atw-is-minimized/);
+  await expect(page.locator("#atw-traveler")).toBeVisible();
+});
+
 test("missing booking admission can scan and lock one visible booking through the existing producer", async ({ page }) => {
   const travelerId = "trav_scanned_booking";
   let sessionBody = null;
@@ -9208,13 +9279,19 @@ test("missing booking admission can scan and lock one visible booking through th
     apiBase: "https://manual-booking.test/api",
     selectedTravelerId: travelerId
   }, 42);
+  await page.addScriptTag({ path: bookingTotalContractPath });
   await page.addScriptTag({ path: precheckoutCapturePath });
   await page.addScriptTag({ path: contentScriptPath });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
 
   await expect(page.locator(".atw-agent-card")).toContainText("Checkout baseline: unavailable");
-  await expect(page.locator("#atw-takeover")).toBeDisabled();
-  await expect(page.locator("#atw-scan-booking")).toContainText("Scan & use observed booking [DEV]");
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
+  const diagnosticSession = await page.evaluate(() => window.__ATW_TEST__.startAgentSession(""));
+  expect(diagnosticSession).toMatchObject({ id: "chk_manual_booking" });
+  expect(sessionBody.selectedBookingContract).toBeNull();
+  expect(sessionBody.developmentCheckout).toBe(true);
+  sessionBody = null;
+  await expect(page.locator("#atw-scan-booking")).toContainText("Scan booking [DEV]");
   await page.locator("#atw-scan-booking").click();
 
   await expect(page.locator(".atw-agent-card")).toContainText("Checkout baseline: captured");
@@ -9242,6 +9319,7 @@ test("missing booking admission can scan and lock one visible booking through th
     bookingAcquisitionTimeoutMs: 0
   }));
   expect(session).toMatchObject({ id: "chk_manual_booking" });
+  expect(sessionBody.developmentCheckout).toBe(true);
   expect(sessionBody.selectedBookingContract.selectionId).toMatch(/^test_page_confirmation_/);
   expect(sessionBody.selectedBookingContract.testOnlyPageConfirmation).toBe(true);
   expect(sessionBody.selectedBookingContract.approvedTotal).toEqual({ amount: 317.54, currency: "EUR" });
@@ -9283,7 +9361,7 @@ test("DEV booking confirmation reuses main observation and resolves a Turkish-sh
   await page.addScriptTag({ path: contentScriptPath });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
 
-  await expect(page.locator("#atw-scan-booking")).toContainText("Scan & use observed booking [DEV]");
+  await expect(page.locator("#atw-scan-booking")).toContainText("Scan booking [DEV]");
   await page.locator("#atw-scan-booking").click();
   await expect(page.locator(".atw-booking-admission")).toContainText("Checkout baseline: captured");
   await expect(page.locator(".atw-booking-admission")).toContainText("LJU → IST · IST → LJU");
@@ -9306,6 +9384,93 @@ test("DEV booking confirmation reuses main observation and resolves a Turkish-sh
     approvedTotal: { amount: 241, currency: "EUR" },
     travelerIds: [travelerId]
   });
+});
+
+test("DEV AI booking proposal remains non-authoritative until the user confirms it", async ({ page }) => {
+  const travelerId = "trav_ai_booking_proposal";
+  let proposalRequests = 0;
+  await page.route("https://ai-booking.test/**", async (route) => {
+    const url = route.request().url();
+    if (url.includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    if (url.includes("/api/agent/dev/booking-proposal")) {
+      proposalRequests += 1;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify({
+          ok: true,
+          proposal: {
+            status: "proposed",
+            segments: [
+              { origin: "LJU", destination: "LGW", departureDate: "2026-10-17" },
+              { origin: "LGW", destination: "LJU", departureDate: "2026-11-01" }
+            ],
+            approvedTotal: { amount: 86.97, currency: "EUR" },
+            confidence: "high",
+            evidence: [
+              { fact: "selected itinerary", value: "LJU-LGW return", source: "screenshot" },
+              { fact: "basket total", value: "EUR 86.97", source: "screenshot" }
+            ]
+          },
+          meta: { attempts: 1 }
+        })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `<main>
+        <h1>Passenger details</h1>
+        <p>Your selected flights are shown in the visual basket.</p>
+      </main>`
+    });
+  });
+  await page.goto("https://ai-booking.test/passenger-details");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://ai-booking.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  await page.locator("#atw-scan-booking").click();
+  await expect(page.locator(".atw-booking-scan")).toContainText("AI proposal — not approved");
+  await expect(page.locator(".atw-booking-scan")).toContainText("LJU → LGW · LGW → LJU");
+  await expect(page.locator(".atw-booking-scan")).toContainText("86.97 EUR");
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
+  expect(proposalRequests).toBe(1);
+  expect(await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ))).toBeNull();
+
+  await page.locator("#atw-confirm-booking-proposal").click();
+  await expect(page.locator(".atw-booking-admission")).toContainText("Checkout baseline: captured");
+  await expect(page.locator(".atw-booking-admission")).toContainText("LJU → LGW · LGW → LJU");
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
+  const stored = await page.evaluate(() => (
+    window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
+  ));
+  expect(stored).toMatchObject({
+    contractVersion: "selected-booking/v1",
+    testOnlyPageConfirmation: true,
+    approvedTotal: { amount: 86.97, currency: "EUR" },
+    travelerIds: [travelerId]
+  });
+  expect(stored.selectionId).toMatch(/^test_ai_page_confirmation_/);
 });
 
 test("DEV booking confirmation owns the exact booking total instead of fare-grid prices or total duration", async ({ page }) => {
@@ -9383,6 +9548,63 @@ test("DEV booking confirmation owns the exact booking total instead of fare-grid
   });
 });
 
+test("owned checkout-summary balance is the approved total even when child fares are also visible", async ({ page }) => {
+  const travelerId = "trav_summary_balance";
+  await page.route("https://summary-balance.test/**", async (route) => {
+    if (route.request().url().includes("/api/extension/bootstrap")) {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        headers: { "access-control-allow-origin": "*" },
+        body: JSON.stringify(bootAppData(travelerId))
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: `<main>
+        <h1>Passenger details</h1>
+        <aside aria-label="Selected booking summary">
+          <span>Basket</span>
+          <strong>&euro;89.47</strong>
+          <button type="button">Open</button>
+          <article data-origin="LJU" data-destination="LGW" data-departure-date="2026-10-17">
+            Ljubljana to London Gatwick · 17 October 2026
+            <span>Adult 1 x &euro;49.99</span>
+          </article>
+          <article data-origin="LGW" data-destination="LJU" data-departure-date="2026-11-02">
+            London Gatwick to Ljubljana · 2 November 2026
+            <span>Adult 1 x &euro;39.48</span>
+          </article>
+        </aside>
+      </main>`
+    });
+  });
+  await page.goto("https://summary-balance.test/passengers");
+  await page.evaluate(() => {
+    window.__ATW_ENABLE_TEST_HOOKS__ = true;
+    window.__ATW_TEST_BOOT__ = true;
+  });
+  await installBootChrome(page, {
+    apiBase: "https://summary-balance.test/api",
+    selectedTravelerId: travelerId
+  }, 42);
+  await page.addScriptTag({ path: contentScriptPath });
+  await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
+
+  const observed = await page.evaluate(() => window.__ATW_TEST__.compactPageMap(window.__ATW_TEST__.buildPageMap()));
+  expect(observed.transactionFacts).toMatchObject({
+    totalPrice: { amount: 89.47, currency: "EUR" },
+    factEvidence: { totalPrice: { qualification: "checkout_summary_balance" } }
+  });
+
+  await page.locator("#atw-scan-booking").click();
+  await expect(page.locator(".atw-booking-admission")).toContainText("Checkout baseline: captured");
+  await expect(page.locator(".atw-booking-admission")).toContainText("LJU → LGW · LGW → LJU");
+  await expect(page.locator(".atw-booking-admission")).toContainText("89.47 EUR");
+});
+
 test("DEV booking scan reports only the genuinely missing total when itinerary evidence is complete", async ({ page }) => {
   const travelerId = "trav_missing_total_only";
   await page.route("https://missing-total-booking.test/**", async (route) => {
@@ -9422,10 +9644,15 @@ test("DEV booking scan reports only the genuinely missing total when itinerary e
 
   await page.locator("#atw-scan-booking").click();
   const scan = page.locator(".atw-booking-scan");
+  const admission = page.locator(".atw-booking-admission");
   await expect(scan).toContainText("LJU → IST");
   await expect(scan).toContainText("Missing: approved_total, currency");
   await expect(scan).not.toContainText("Missing: itinerary");
-  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  await expect(admission).toContainText("Checkout baseline: unavailable");
+  await expect(admission).toContainText("LJU → IST");
+  await expect(admission).toContainText("2026-10-15");
+  await expect(admission).toContainText("total unavailable");
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
 });
 
 test("testing sidebar ignores a legacy last-booking record and requires fresh page authority", async ({ page }) => {
@@ -9473,6 +9700,7 @@ test("testing sidebar ignores a legacy last-booking record and requires fresh pa
       selectedBookingContract: reusable
     }
   }, 42);
+  await page.addScriptTag({ path: bookingTotalContractPath });
   await page.addScriptTag({ path: precheckoutCapturePath });
   await page.addScriptTag({ path: contentScriptPath });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
@@ -9480,10 +9708,10 @@ test("testing sidebar ignores a legacy last-booking record and requires fresh pa
   await expect(page.locator("#atw-reuse-test-booking")).toHaveCount(0);
   await expect(page.locator(".atw-booking-scan")).not.toContainText("LJU → IST · IST → LJU");
   await expect(page.locator(".atw-booking-scan")).not.toContainText("241 EUR");
-  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
   await page.locator("#atw-scan-booking").click();
   await expect(page.locator(".atw-booking-admission")).toContainText("Checkout baseline: unavailable");
-  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
   const stored = await page.evaluate(() => (
     window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:42"]?.selectedBookingContract || null
   ));
@@ -9524,13 +9752,14 @@ test("DEV booking confirmation refuses multiple conflicting visible bookings", a
     apiBase: "https://ambiguous-booking.test/api",
     selectedTravelerId: travelerId
   }, 43);
+  await page.addScriptTag({ path: bookingTotalContractPath });
   await page.addScriptTag({ path: precheckoutCapturePath });
   await page.addScriptTag({ path: contentScriptPath });
   await page.waitForFunction(() => Boolean(window.__ATW_TEST__));
 
   await page.locator("#atw-scan-booking").click();
   await expect(page.locator(".atw-booking-scan")).toContainText("conflicting bookings");
-  await expect(page.locator("#atw-takeover")).toBeDisabled();
+  await expect(page.locator("#atw-takeover")).toBeEnabled();
   const stored = await page.evaluate(() => (
     window.__ATW_BOOT_STORAGE__["atwCheckoutContextV1:43"]?.selectedBookingContract || null
   ));
@@ -16884,4 +17113,25 @@ test("one reversible local mechanic retries an unchanged native opener with the 
   expect(result.dispatched).toMatchObject({ ok: true, fallbackUsed: true, method: "browser_trusted_input" });
   expect(result.expanded).toBe("true");
   expect(result.trustedFallback).toBe("used");
+});
+
+test("exact browser-assistant provenance is excluded while page controls remain", async ({ page }) => {
+  await loadHtmlProducer(page, `
+    <main>
+      <button id="continue" type="button">Continue</button>
+      <fieldset id="browser-assistant-controls">
+        <button type="button" data-testid="split-notch-chat-button">Open chat</button>
+        <button type="button" data-testid="split-notch-agent-trigger">Agents for writing</button>
+        <button type="button">Manage</button>
+        <button type="button">Close</button>
+      </fieldset>
+    </main>
+  `);
+
+  const labels = await page.evaluate(() => (
+    window.__ATW_TEST__.buildPageMap().controls.map((control) => control.label)
+  ));
+
+  expect(labels.some((label) => label.includes("Continue"))).toBe(true);
+  expect(labels.some((label) => /Open chat|Agents for writing|Manage|Close/.test(label))).toBe(false);
 });

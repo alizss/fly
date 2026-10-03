@@ -1350,12 +1350,19 @@ export function createExecutionOrchestrator({
       flashElement(target);
       rememberChoiceVisualStateBeforeDispatch(target, decision);
       rememberCanonicalSelectionCommitment(target, decision);
+      // Any governed click can synchronously replace the document, even when
+      // its semantic purpose is a local choice (for example declining an
+      // optional surface). Preserve the leased session before dispatch. This
+      // marker authorizes lifecycle continuation only; it does not turn DOM
+      // change into action success or weaken exact postcondition verification.
+      await saveResumeMarker({ navigationExpected: true, navigationActionId: actionId });
       const clickDispatch = await dispatchGovernedClickMechanic(target, decision, {
         actionId,
         observationId: actionObservationId,
         operation: decision.operation || ""
       });
       if (clickDispatch?.ok !== true) {
+        await saveResumeMarker();
         await rejectMechanicalAction(actionId, actionObservationId, decision, {
           code: clickDispatch?.code || "CLICK_DISPATCH_UNAVAILABLE",
           message: "The governed click mechanic was unavailable before dispatch.",

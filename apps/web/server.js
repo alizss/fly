@@ -22,6 +22,7 @@ const { createSessionService } = require("./agent/session-service");
 const { createScreenshotStore } = require("./agent/screenshot-store");
 const { createRequestPayloadAdapter } = require("./agent/request-payload");
 const { createNextActionService } = require("./agent/next-action-service");
+const { proposeBookingCandidate } = require("./agent/booking-proposal");
 const { readBody } = require("./http/body");
 const { sendJson } = require("./http/response");
 const { createStaticHandler } = require("./http/static");
@@ -33,7 +34,9 @@ function clampText(value, max = 4000) {
   return String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-const { createAgentSession, reportAgentResult, summarizeAgentSession } = createSessionService(agentSessionStore);
+const { createAgentSession, reportAgentResult, summarizeAgentSession } = createSessionService(agentSessionStore, {
+  allowDevelopmentCheckout: process.env.NODE_ENV !== "production"
+});
 const { screenshotForObservation, storeScreenshotUpload } = createScreenshotStore();
 const { writeActionLedgerRow, writeClientFlowLog } = createRequestDiagnostics({
   diagnosticDir: DIAGNOSTIC_DIR,
@@ -63,6 +66,7 @@ const { decideAgentNextActionViaLoop } = createNextActionService({
 const handleAgentRoutes = createAgentRoutes({
   MAX_OBSERVATION_BYTES,
   MAX_SCREENSHOT_UPLOAD_BYTES,
+  allowDevBookingProposal: process.env.NODE_ENV !== "production",
   agentLoopFailurePayload,
   agentSessionStore,
   agentTraceStore,
@@ -71,6 +75,9 @@ const handleAgentRoutes = createAgentRoutes({
   dataDir: DATA_DIR,
   decideAgentNextActionViaLoop,
   logAgent,
+  model: AGENT_MODEL,
+  openAiApiKey: OPENAI_API_KEY,
+  proposeBookingCandidate,
   readBody,
   reportAgentResult,
   sendJson,

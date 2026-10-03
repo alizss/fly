@@ -230,6 +230,175 @@ test("a profile-owned native select does not retain a competing generic decision
   assert.equal(requirement.currentNormalizedValue, "mr");
 });
 
+test("an unowned Skip command is a generic current-surface exit without product vocabulary", () => {
+  const skip = {
+    controlId: "ctrl_skip_unfamiliar_optional_surface",
+    stateElementId: "skip_unfamiliar_optional_surface",
+    preferredActivationElementId: "skip_unfamiliar_optional_surface",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    // This is deliberately orphaned. A control-local projection is not
+    // ownership unless the current structural group contains the control.
+    decisionGroupId: "dg_stale_previous_surface",
+    label: "Skip airport transfer",
+    kind: "button",
+    role: "button",
+    state: { pressable: true, disabled: false },
+    operations: { activate: actionable("activate", "skip_unfamiliar_optional_surface") }
+  };
+  const observation = {
+    observationId: "obs_skip_unfamiliar_optional_surface",
+    observationSnapshot: { snapshotHash: "hash_skip_unfamiliar_optional_surface" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://example.test/checkout/unfamiliar-optional-surface",
+      step: "unknown",
+      currentSurface: { id: "surface-page", type: "page", label: "" },
+      controls: [skip],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+
+  const decisionFrame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation)
+  });
+  const decided = decisionFrame.semanticCompilation.controls.find((control) => control.controlId === skip.controlId);
+
+  assert.equal(decided.semantic, "navigation");
+  assert.equal(decided.physicalEffect, "advance_checkout_stage");
+  assert.equal(decided.risk, "safe");
+  const taskState = reduceTaskState({
+    observation: decisionFrame.observation,
+    decisionFrame,
+    traveler: { booking_rules: "Decline paid extras" }
+  });
+  assert.equal(taskState.currentGoal?.semanticType, "navigation");
+  assert.ok(taskState.currentGoal?.actionableControlIds?.includes(skip.controlId));
+});
+
+test("a Skip command with exact decision ownership remains a bounded choice", () => {
+  const skip = {
+    controlId: "ctrl_skip_owned_choice",
+    stateElementId: "skip_owned_choice",
+    preferredActivationElementId: "skip_owned_choice",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    decisionGroupId: "dg_owned_choice",
+    label: "Skip unfamiliar selection",
+    kind: "button",
+    role: "button",
+    state: { pressable: true, disabled: false },
+    operations: { activate: actionable("activate", "skip_owned_choice") }
+  };
+  const observation = {
+    observationId: "obs_skip_owned_choice",
+    observationSnapshot: { snapshotHash: "hash_skip_owned_choice" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://example.test/checkout/owned-choice",
+      step: "unknown",
+      currentSurface: { id: "surface-page", type: "page", label: "" },
+      controls: [skip],
+      decisionGroups: [{
+        decisionGroupId: "dg_owned_choice",
+        surfaceId: "surface-page",
+        surfaceType: "page",
+        sectionLabel: "Optional choice",
+        ownerState: { required: false },
+        selectedControlId: "",
+        alternativeControlIds: [skip.controlId],
+        alternatives: [{ controlId: skip.controlId, label: skip.label, selected: false }]
+      }],
+      validationIssues: []
+    }
+  };
+
+  const decisionFrame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation)
+  });
+  const decided = decisionFrame.semanticCompilation.controls.find((control) => control.controlId === skip.controlId);
+
+  assert.equal(decided.semantic, "decline_paid_extra");
+  assert.equal(decided.physicalEffect, "select_free_option");
+  assert.notEqual(decided.semantic, "navigation");
+});
+
+test("a Skip command cannot bypass fresh required structural evidence", () => {
+  const requiredIdentity = {
+    controlId: "identity_number",
+    stateElementId: "identity_number_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    label: "Required identity number",
+    kind: "text",
+    role: "textbox",
+    required: true,
+    state: { required: true, invalid: true, valuePresent: false, normalizedValue: "" },
+    operations: { type: actionable("type", "identity_number_node") }
+  };
+  const skip = {
+    controlId: "skip_identity_verification",
+    stateElementId: "skip_identity_verification_node",
+    surfaceId: "surface-page",
+    surfaceType: "page",
+    label: "Skip identity verification",
+    kind: "button",
+    role: "button",
+    state: { disabled: false },
+    operations: { activate: actionable("activate", "skip_identity_verification_node") }
+  };
+  const observation = {
+    observationId: "obs_required_identity_skip",
+    observationSnapshot: { snapshotHash: "hash_required_identity_skip" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://example.test/checkout/identity",
+      currentSurface: { id: "surface-page", type: "page", label: "Identity" },
+      controls: [requiredIdentity, skip],
+      decisionGroups: [],
+      validationIssues: [{ issueId: "identity_required", controlId: requiredIdentity.controlId, active: true, status: "active" }]
+    }
+  };
+
+  const frame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation)
+  });
+  const decided = frame.semanticCompilation.controls.find((control) => control.controlId === skip.controlId);
+
+  assert.notEqual(decided.semantic, "navigation");
+  assert.notEqual(decided.physicalEffect, "advance_checkout_stage");
+});
+
+test("browser surface labels remain diagnostic and cannot become DecisionFrame meaning", () => {
+  const observation = {
+    observationId: "obs_stale_surface_label",
+    observationSnapshot: { snapshotHash: "hash_stale_surface_label" },
+    page: {
+      observationContract: "structural-observation/v1",
+      url: "https://example.test/checkout/car-rental",
+      step: "seats",
+      currentSurface: { id: "surface-page", type: "page", label: "Seats", taskHint: "seats" },
+      controls: [],
+      decisionGroups: [],
+      validationIssues: []
+    }
+  };
+
+  const frame = compileDecisionFrame({
+    observation,
+    observationFrame: createObservationFrame(observation)
+  });
+
+  assert.equal(frame.observation.page.currentSurface.label, undefined);
+  assert.equal(frame.observation.page.currentSurface.taskHint, undefined);
+  assert.equal(frame.observation.page.browserDiagnostics.currentSurface.label, "Seats");
+  assert.equal(frame.observation.page.browserDiagnostics.step, "seats");
+});
+
 test("a payment section cannot turn local optional marketing consent into a required payment method", () => {
   const marketing = {
     controlId: "third_party_offers",

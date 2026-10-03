@@ -1,6 +1,7 @@
 export function createTransactionEvidenceCompiler(dependencies) {
   const {
     AGENT_CONTRACT,
+    BOOKING_TOTAL_CONTRACT,
     agent,
     implicitRole,
     isVisible,
@@ -20,7 +21,7 @@ export function createTransactionEvidenceCompiler(dependencies) {
     const transactionTexts = [primaryPageText(), visiblePageText()];
     queryAllDeep("main, [role='main'], form, section, article, aside, dialog, [role='dialog'], [aria-label*='booking' i], [aria-label*='itinerary' i], [aria-label*='route' i], [data-testid*='booking' i], [data-testid*='itinerary' i], [data-testid*='route' i]")
       .filter((element) => isVisible(element))
-      .filter((element) => !element.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]"))
+      .filter((element) => !element.closest?.("#atw-sidebar, [data-atw-ui]"))
       .forEach((element) => transactionTexts.push(
         String(element.innerText || element.textContent || element.getAttribute?.("aria-label") || "").slice(0, 12000)
       ));
@@ -50,6 +51,30 @@ export function createTransactionEvidenceCompiler(dependencies) {
         .trim();
       const airportCode = endpoint.match(/(?:^|\s|\()([A-Z]{3})(?:\)|\s|$)/)?.[1];
       return (airportCode || endpoint).slice(0, 80).toUpperCase();
+    };
+    const explicitEndpointAliases = (value = "", inheritedAliases = []) => {
+      const primary = normalizeRouteEndpoint(value);
+      const aliases = [primary, ...(Array.isArray(inheritedAliases) ? inheritedAliases : [])]
+        .map((alias) => normalizeRouteEndpoint(alias))
+        .filter(Boolean);
+      const code = /^[A-Z]{3}$/.test(primary) ? primary : "";
+      if (code) {
+        // Parenthetical endpoint ownership is an exact structural relation:
+        // "Zagreb (ZAG)" proves that both tokens name the same endpoint. Keep
+        // that evidence instead of collapsing the component to the IATA code.
+        // This is deliberately not fuzzy airport knowledge.
+        const pattern = new RegExp(
+          String.raw`(?:^|[^\p{L}])((?:[\p{L}][\p{L}.'’-]*\s*){1,5})\(\s*${code}\s*\)`,
+          "giu"
+        );
+        for (const match of text.matchAll(pattern)) {
+          const display = normalizeRouteEndpoint(
+            String(match[1] || "").replace(/^(?:from|to|departure|arrival)\s*:?\s*/i, "")
+          );
+          if (display && display !== code && !reservedRouteEndpoint(display)) aliases.push(display);
+        }
+      }
+      return [...new Set(aliases)].slice(0, 6);
     };
     const reservedRouteEndpoint = (value = "") => {
       const endpoint = String(value || "").trim();
@@ -445,6 +470,14 @@ export function createTransactionEvidenceCompiler(dependencies) {
         const departureTime = valueFor("departureTime");
         const arrivalTime = valueFor("arrivalTime");
         const flightNumber = valueFor("flightNumber");
+        const originAliases = explicitEndpointAliases(
+          origin,
+          claims.flatMap((claim) => Array.isArray(claim.originAliases) ? claim.originAliases : [])
+        );
+        const destinationAliases = explicitEndpointAliases(
+          destination,
+          claims.flatMap((claim) => Array.isArray(claim.destinationAliases) ? claim.destinationAliases : [])
+        );
         const proofs = Object.values(chosenProofByField).filter(Boolean);
         const sources = [...new Set(proofs.map((proof) => proof.source).filter(Boolean))];
         const ownerKeys = [...new Set(proofs.map((proof) => proof.ownerKey).filter(Boolean))];
@@ -455,7 +488,9 @@ export function createTransactionEvidenceCompiler(dependencies) {
           ...backbone,
           segmentId: backbone.segmentId || `merged_segment_${index + 1}`,
           origin,
+          ...(originAliases.length > 1 ? { originAliases } : {}),
           destination,
+          ...(destinationAliases.length > 1 ? { destinationAliases } : {}),
           departureDate,
           departureTime,
           arrivalTime,
@@ -551,42 +586,26 @@ export function createTransactionEvidenceCompiler(dependencies) {
       .replace(/(\d)\s+([.,])\s*(\d)/g, "$1$2$3")
       .replace(/\s+/g, " ")
       .trim();
-    const bookingTotalFromText = (value = "") => {
-      const normalized = normalizedMonetaryText(value);
-      const cue = /\b(?:amount to pay|grand total|booking total|trip total|order total|total(?:\s+(?:amount|price)(?:\s+for\s+\d+\s+passengers?)?)?)\b/gi;
-      const candidates = [];
-      for (const match of normalized.matchAll(cue)) {
-        const bounded = normalized.slice(match.index, match.index + 180);
-        if (/^total\s+duration\b/i.test(bounded)) continue;
-        const found = structuredPricesFromText(bounded)[0] || null;
-        if (found) candidates.push({
-          ...found,
-          ownerKey: stableHash(`booking-total:${bounded.slice(0, 160)}`),
-          qualification: match[0].toLowerCase().replace(/\s+/g, "_")
-        });
-      }
-      return candidates.at(-1) || null;
-    };
     const bookingTotalFromOwnedStructure = () => {
       const candidates = [];
-      const exactTotalCue = /^(?:amount to pay|grand total|booking total|trip total|order total|total(?:\s+(?:amount|price)(?:\s+for\s+\d+\s+passengers?)?)?)\b/i;
-      for (const element of queryAllDeep("strong, b, dt, th, label, span, div")) {
+      for (const element of queryAllDeep("strong, b, dt, th, label, p, span, div")) {
         if (!isVisible(element)) continue;
-        if (element.closest?.("#atw-sidebar, [data-atw-ui], [data-agent-ui]")) continue;
+        if (element.closest?.("#atw-sidebar, [data-atw-ui]")) continue;
         const direct = directElementText(element);
-        if (!exactTotalCue.test(direct) || /^total\s+duration\b/i.test(direct)) continue;
+        if (!BOOKING_TOTAL_CONTRACT.bookingTotalCue(direct)) continue;
         let owner = element;
         for (let depth = 0; owner && depth < 4; depth += 1, owner = owner.parentElement) {
           if (!isVisible(owner)) continue;
           const ownerText = normalizedMonetaryText(boundedElementText(owner, 320));
-          if (!ownerText || ownerText.length > 320 || /^total\s+duration\b/i.test(ownerText)) continue;
-          const ownedPrices = structuredPricesFromText(ownerText);
-          if (ownedPrices.length !== 1) continue;
-          const found = ownedPrices[0];
+          if (!ownerText) continue;
+          const found = BOOKING_TOTAL_CONTRACT.ownedBookingTotalEvidence({
+            cueText: direct,
+            ownerText
+          });
+          if (!found) continue;
           candidates.push({
             ...found,
             ownerKey: stableHash(`owned-booking-total:${ownerText}`),
-            qualification: "exact_owned_total",
             textLength: ownerText.length
           });
           break;
@@ -597,7 +616,9 @@ export function createTransactionEvidenceCompiler(dependencies) {
       const { textLength, ...bookingTotal } = selected;
       return bookingTotal;
     };
-    const stronglyOwnedBookingTotal = bookingTotalFromOwnedStructure() || bookingTotalFromText(text);
+    // A booking total must have an exact DOM owner. Page-wide text is useful
+    // for diagnostics but cannot promote an arbitrary fare into approval.
+    const stronglyOwnedBookingTotal = bookingTotalFromOwnedStructure();
     const coherentSelectedBooking = completeness === "complete"
       && segments.length > 0
       && segments.every((segment) => segment.origin && segment.destination && segment.departureDate);

@@ -145,7 +145,16 @@ export function testSelectedBookingFromObservedFacts(facts = null, {
         observed
       };
     }
-    if (previous && previous.destination !== String(segment.origin || "").trim().toUpperCase()) {
+    const origin = String(segment.origin || "").trim().toUpperCase();
+    const destination = String(segment.destination || "").trim().toUpperCase();
+    const originAliases = [...new Set([origin, ...(Array.isArray(segment.originAliases) ? segment.originAliases : [])]
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim().toUpperCase())
+      .filter(Boolean))].slice(0, 6);
+    const destinationAliases = [...new Set([destination, ...(Array.isArray(segment.destinationAliases) ? segment.destinationAliases : [])]
+      .map((value) => String(value || "").replace(/\s+/g, " ").trim().toUpperCase())
+      .filter(Boolean))].slice(0, 6);
+    const previousDestinationAliases = new Set(previous?.destinationAliases || [previous?.destination].filter(Boolean));
+    if (previous && !originAliases.some((alias) => previousDestinationAliases.has(alias))) {
       return {
         ok: false,
         captured: false,
@@ -156,8 +165,10 @@ export function testSelectedBookingFromObservedFacts(facts = null, {
     }
     segments.push({
       segmentId: String(segment.segmentId || `segment_${index + 1}`),
-      origin: String(segment.origin || "").trim().toUpperCase(),
-      destination: String(segment.destination || "").trim().toUpperCase(),
+      origin,
+      originAliases,
+      destination,
+      destinationAliases,
       departureDate,
       departureTime: String(segment.departureTime || "").trim(),
       arrivalTime: String(segment.arrivalTime || "").trim(),
